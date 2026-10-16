@@ -758,7 +758,7 @@ def _append_cute_wrapper_plan(
                 or not all(type(d) is int and d >= 0 for d in dims)
                 or len(set(dims)) != len(dims)
                 or not all(type(b) is int and 1 <= b <= 256 for b in box)
-                or swizzle not in ("none", "s32b", "s64b", "s128b")
+                or swizzle not in ("none", "s32b", "s64b", "s128b", "s128b_atom_32b")
             ):
                 raise exc.BackendUnsupported(
                     "cute", "invalid mma_dag tensor-map wrapper plan"

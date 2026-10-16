@@ -118,12 +118,38 @@ MMA_DAG_EXCHANGE_CHOICES: tuple[str, ...] = (
     MMA_DAG_EXCHANGE_AUTO,
     MMA_DAG_EXCHANGE_SMEM,
 )
+MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
+MMA_DAG_PASS_WARPS_OFF = "off"
+MMA_DAG_PASS_WARPS_ON = "on"
+# tcgen05 at eight warps with loop operand passes: ``on`` has warps 4-7
+# rewrite the operand tiles one tile ahead of the epilogue warps' chain
+# (handing each over through a per-stage mbarrier); ``off`` runs the passes
+# on the chain, the extra warps draining the stores.
+MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
+    MMA_DAG_PASS_WARPS_OFF,
+    MMA_DAG_PASS_WARPS_ON,
+)
+# Ring depth the pass-warp seed asks for: the next tile must land before
+# its pass is due (at two slots the TMA of tile i + 1 goes out with
+# iteration i and the pass warps wait on it: gated fwd_h_delta at s2 305 us
+# against 268 at three).
+MMA_DAG_PASS_WARP_STAGES = 3
+# Pass work per pass-warp thread (16-byte packets per iteration) from which
+# the pass-warp seed leads for a one-wave grid: measured at s2 on a B200,
+# gated fwd_h_delta's k pass of 8 packets 338 -> 270 us (s1 70 -> 62, s0
+# 31 -> 24; at bdv 64 451 -> 411), gated dstate's two 2-packet passes 548 ->
+# 619, bwd_dh's 4-packet q*scale 180 -> 198 (the handoff costs ~90 cycles an
+# iteration); the CTA-rich K-loop kernels (dqk, dv: 8 packets, grids far
+# beyond the SM count) lose a CTA per SM to the pass seed's ring depth
+# (318 -> 430, 186 -> 289) and stay with the autotuner.
+MMA_DAG_PASS_WARP_PACKETS = 8
 MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_KEY,
     MMA_DAG_WARPS_KEY,
     MMA_DAG_STAGES_KEY,
     MMA_DAG_STORE_KEY,
     MMA_DAG_EXCHANGE_KEY,
+    MMA_DAG_PASS_WARPS_KEY,
 )
 # Live fp32 fragment words per thread the carry may occupy.
 MMA_DAG_MAX_FRAG_REGS = 128
@@ -1991,6 +2017,62 @@ def mma_dag_repair(
         # Powers of two below the fragment floors are hopeless for that axis.
         if current[largest] < 8:
             return None
+    return None
+
+
+def mma_dag_pass_packets(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> int:
+    """16-byte packets of the loop's passed operand tiles per pass-warp
+    thread and iteration at the resolved sizes."""
+    tc = facts.tcgen05
+    if tc is None:
+        return 0
+    packets = sum(
+        resolved[tile.rows] * resolved[tile.cols] * tile.source_bytes // 16
+        for tile in tc.tiles
+        if tile.region == "loop" and tile.passed
+    )
+    return packets // (32 * 4)
+
+
+def mma_dag_cta_count(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> int:
+    """CTAs of the grid at the resolved sizes: the leading tiles times the
+    root tiles' counts (one CTA per root tile)."""
+    ctas = facts.grid_blocks
+    for index, axis in enumerate(facts.axes):
+        if axis.kind == AXIS_ROOT:
+            ctas *= axis.extent // resolved[index]
+    return ctas
+
+
+def mma_dag_pass_warps_lead(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> bool:
+    """Whether the pass-warp seed leads (becomes the default): a grid of
+    one wave -- the serial state chains, one CTA per SM, where the extra
+    ring depth costs no occupancy -- whose passes are worth at least
+    ``MMA_DAG_PASS_WARP_PACKETS`` per thread and iteration."""
+    return (
+        facts.sm_count > 0
+        and mma_dag_cta_count(facts, resolved) <= facts.sm_count
+        and mma_dag_pass_packets(facts, resolved) >= MMA_DAG_PASS_WARP_PACKETS
+    )
+
+
+def mma_dag_pass_warps_reason(
+    facts: CuteMmaDagFacts, warps: int, stages: int, mode: str
+) -> str | None:
+    """Why ``cute_mma_dag_pass_warps='on'`` has no subject for this config
+    (None: it has): the tcgen05 single-loop emitter at eight warps with loop
+    operand passes and a ring of at least two slots (the pass warps rewrite
+    the next tile while the chain's MMA reads the current one)."""
+    if mode != MMA_DAG_TCGEN05:
+        return "the warp mode runs its passes on every warp"
+    if facts.tcgen05 is None or facts.tcgen05.regions:
+        return "the region renderer has no pass warps"
+    if facts.loop_passes == 0:
+        return "no loop operand needs a pass"
+    if warps != max(MMA_DAG_WARP_CHOICES):
+        return f"the pass warps are warps 4-7 of {max(MMA_DAG_WARP_CHOICES)}"
+    if stages < 2:
+        return "the next tile needs its own ring slot (stages >= 2)"
     return None
 
 
@@ -4785,6 +4867,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     stages = get(MMA_DAG_STAGES_KEY, MMA_DAG_DEFAULT_STAGES)
     store_mode = get(MMA_DAG_STORE_KEY, MMA_DAG_STORE_STAGED)
     exchange_mode = get(MMA_DAG_EXCHANGE_KEY, MMA_DAG_EXCHANGE_AUTO)
+    pass_warps = get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_OFF)
     facts = mma_dag_facts(program)
     reason = mma_dag_config_reason(
         facts, sizes_by_block, warps, stages, cast("str", mode)
@@ -4799,7 +4882,15 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         raise _decline(
             f"{MMA_DAG_EXCHANGE_KEY} {exchange_mode!r} must be one of {MMA_DAG_EXCHANGE_CHOICES}"
         )
+    if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
+        raise _decline(
+            f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
+        )
     assert type(warps) is int and type(stages) is int
+    if pass_warps == MMA_DAG_PASS_WARPS_ON:
+        reason = mma_dag_pass_warps_reason(facts, warps, stages, cast("str", mode))
+        if reason:
+            raise _decline(f"{MMA_DAG_PASS_WARPS_KEY}: {reason}")
     if get("pid_type", "flat") != "flat":
         raise _decline("the lowering needs the flat program-id grid")
     sizes = tuple(
@@ -4850,7 +4941,14 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         from .cute_mma_dag_tcgen05 import plan_tcgen05
 
         tc = plan_tcgen05(
-            program, facts, sizes, routes, warps, stages, cast("str", store_mode)
+            program,
+            facts,
+            sizes,
+            routes,
+            warps,
+            stages,
+            cast("str", store_mode),
+            pass_warps == MMA_DAG_PASS_WARPS_ON,
         )
         return MmaDagPlan(
             program=program,
@@ -4896,6 +4994,11 @@ __all__ = [
     "MMA_DAG_KEYS",
     "MMA_DAG_MODES",
     "MMA_DAG_OFF",
+    "MMA_DAG_PASS_WARPS_CHOICES",
+    "MMA_DAG_PASS_WARPS_KEY",
+    "MMA_DAG_PASS_WARPS_OFF",
+    "MMA_DAG_PASS_WARPS_ON",
+    "MMA_DAG_PASS_WARP_STAGES",
     "MMA_DAG_SEED_STAGES",
     "MMA_DAG_STAGES_KEY",
     "MMA_DAG_STAGE_CHOICES",

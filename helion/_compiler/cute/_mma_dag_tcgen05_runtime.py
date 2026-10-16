@@ -22,6 +22,7 @@ __all__ = [
     "cuda",
     "make_tensor_map",
     "mbar_wait",
+    "mbar_wait_sleep",
     "prims",
     "sts_v4_f32",
     "tma_swizzle",
@@ -34,6 +35,38 @@ TMEM_SPACE = 6
 def mbar_wait(mbar, parity) -> None:
     """Spin until the mbarrier phase with ``parity`` has completed."""
     while not prims.mbarrier_wait_parity(mbar, parity, prims.MBarrierWait.TRY):
+        pass
+
+
+@dsl_user_op
+def _try_wait_suspend(addr, parity, *, loc=None, ip=None) -> object:
+    """``mbarrier.try_wait.parity`` with a suspend-time hint: the thread
+    sleeps in the barrier unit instead of polling shared memory."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            cutlass.Int32(0).ir_value(loc=loc, ip=ip).type,
+            [
+                cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(parity).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred P1;\n\tmbarrier.try_wait.parity.shared::cta.b64 P1, [$1], $2, 10000000;"
+            "\n\tselp.b32 $0, 1, 0, P1;\n\t}",
+            "=r,r,r",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+            **_ASM_KW,
+        )
+    )
+
+
+@cute.jit
+def mbar_wait_sleep(mbar, parity) -> None:
+    """``mbar_wait`` for warps with slack (the pass warps between tiles):
+    suspended waits, so their polling does not load the shared-memory
+    pipe the chain's warps use."""
+    addr = cutlass.Int32(mbar.toint())
+    while _try_wait_suspend(addr, parity) == 0:
         pass
 
 
@@ -70,6 +103,7 @@ def tma_swizzle(name: str) -> cuda.TensorMapSwizzle:
         "s32b": cuda.TensorMapSwizzle.s32b,
         "s64b": cuda.TensorMapSwizzle.s64b,
         "s128b": cuda.TensorMapSwizzle.s128b,
+        "s128b_atom_32b": cuda.TensorMapSwizzle.s128b_atom_32b,
     }[name]
 
 

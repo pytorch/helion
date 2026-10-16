@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
+from typing import cast
 
 import pytest
 import torch
@@ -34,14 +35,22 @@ from test.test_cute_mma_dag_gpu import _probe_kernels
 from test.test_cute_mma_dag_gpu import _randn
 from test.test_cute_mma_dag_gpu import _run_triton
 from test.test_cute_mma_dag_gpu import _tensors
+from test.test_cute_mma_dag_tcgen05 import _bind_fwd_o_anch_f32  # noqa: F401
 from test.test_cute_mma_dag_tcgen05 import _probe_h1
 from test.test_cute_mma_dag_tcgen05 import _probe_h3
 from test.test_cute_mma_dag_tcgen05 import _probe_h4
+from test.test_cute_mma_dag_tcgen05 import _rmw_scalar_first
+from test.test_cute_mma_dag_tcgen05 import _snap_reread
+from test.test_cute_mma_dag_tcgen05 import _snap_reread2
+from test.test_cute_mma_dag_tcgen05 import _snap_reread_view
+from test.test_cute_mma_dag_tcgen05 import _snap_same_dst
+from test.test_cute_mma_dag_tcgen05 import _store_after
 from test.test_cute_mma_dag_tcgen05 import _store_first
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion.exc import InvalidConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -789,3 +798,276 @@ def test_chain_probes_match_the_triton_backend(
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
         if index not in inexact:
             assert torch.equal(lhs, rhs), index
+
+
+def _launches(
+    fn: Callable[..., object],
+    args: tuple[object, ...],
+    config: helion.Config,
+    count: int,
+) -> tuple[str, list[tuple[torch.Tensor, ...]]]:
+    """``count`` launches of the pinned tcgen05 config (every output
+    tuple) and the source."""
+    bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    assert normalized.config["cute_mma_dag"] == "tcgen05", normalized
+    compiled = bound.compile_config(normalized)
+    outputs = [_tensors(compiled(*args)) for _ in range(count)]
+    torch.cuda.synchronize()
+    return bound.to_code(normalized), outputs
+
+
+def _probe_kv(bh: int, n: int, d: int, dv: int) -> tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    return (
+        _randn(g, bh, n, 64, d, scale=0.25, dtype=torch.bfloat16),
+        _randn(g, bh, n, 64, dv, scale=0.25, dtype=torch.bfloat16),
+    )
+
+
+def test_tensors_accessed_after_their_snapshot_see_the_stored_values() -> None:
+    # By TMA the snapshot's global writes completed at the kernel end only.
+    # The epilogue re-reading the last snapshot (snap_reread) now declines the
+    # lowering altogether (a load sharing storage with a store: no dag knob;
+    # the cute backend's tile lowering declines the program as well, so nothing
+    # silently falls back); the epilogue's own store of the snapshot tile
+    # (snap_same_dst, vs Triton) keeps the packet drain.
+    args = _probe_kv(128, 8, 64, 64)
+    config = _config([64, 16], 4, 2)
+    bound = helion.kernel(_snap_reread, backend="cute", static_shapes=True).bind(args)
+    assert bound.config_spec.cute_mma_dag is None
+    assert bound.config_spec.cute_mma_dag_facts is None
+    source, outputs = _launches(_snap_same_dst, args, config, 20)
+    assert f"{RT}.prims.cp_async_bulk_tensor_global_shared_cta(" not in source
+    (ref,) = _run_triton(_snap_same_dst, args, [64, 16])
+    for (out,) in outputs:
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("stages", (1, 2))
+def test_trailing_tma_stores_match_the_triton_backend(stages: int) -> None:
+    # The trailing block's bulk store now waits for the previous iteration's
+    # group in the loop (ordered before the stage-in that reuses its buffer).
+    args = _probe_kv(128, 8, 64, 64)
+    for cols in (16, 64):
+        source, outputs = _launches(
+            _store_after, args, _config([64, cols], 4, stages), 20
+        )
+        assert source.count(f"{RT}.prims.cp_async_bulk_wait_group(1, read=True)") == 1
+        (ref,) = _run_triton(_store_after, args, [64, cols])
+        for (out,) in outputs:
+            assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages"),
+    (([1, 64, 64], 4, 2), ([1, 64, 32], 4, 1), ([1, 32, 64], 8, 2)),
+)
+def test_fp32_gla_output_reads_h_mn_major_by_tma(
+    block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # The GLA example over fp32 inputs: ``h[bhn, tile_d, tile_dv]`` is an
+    # fp32 source read with K along its rows -- an MN-major tf32 B tile
+    # fetched by TMA under the 32-byte-unit swizzle (box of 32 columns per
+    # slab) and read with SBO 512.  Bit-equal to Triton (tcgen05 tf32 over
+    # the same K order), deterministic over the launches.
+    g = torch.Generator(device=DEVICE).manual_seed(11)
+    bhn, c, d, dv = 8, 64, 128, 128
+    f32 = torch.float32
+    gc = -_randn(g, bhn, c, d, scale=0.1, dtype=f32).abs().cumsum(1)
+    args = (
+        _randn(g, bhn, c, d, dtype=f32),
+        _randn(g, bhn, c, dv, dtype=f32),
+        gc,
+        _randn(g, bhn, d, dv, dtype=f32),
+        _randn(g, bhn, c, c, scale=0.3, dtype=f32),
+        0.125,
+    )
+    fn = _kernel_fn("fwd_o_anch")
+    source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    assert "'s128b_atom_32b'" in source
+    assert f"{RT}.prims.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B" in source
+    ref = _run_triton(fn, args, block_sizes)
+    for lhs, rhs in zip(out, ref, strict=True):
+        assert torch.equal(lhs, rhs)
+
+
+@pytest.mark.parametrize("cols", (16, 32))
+def test_snapshot_rereads_through_views_see_the_stores(cols: int) -> None:
+    # A host-side view of the snapshot tensor read after the loop, and an
+    # epilogue derived value over the snapshot tile: both load a tensor the
+    # loop stores, so the matcher declines the lowering in both modes -- no dag
+    # knob, no facts.
+    args = _probe_kv(128, 8, 64, 64)
+    for fn in (_snap_reread_view, _snap_reread2):
+        bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+        assert bound.config_spec.cute_mma_dag is None, fn.__name__
+        assert bound.config_spec.cute_mma_dag_facts is None, fn.__name__
+        with bound.env, pytest.raises(InvalidConfig):
+            bound.config_spec.normalize(
+                dict(_config([64, cols], 4, 2).config), _fix_invalid=False
+            )
+
+
+_PASS_WARP_CASES = (
+    ("fwd_h_delta", True, (8, 128, 64), 32, 4),
+    ("fwd_h_delta", True, (8, 128, 64), 32, 2),
+    ("fwd_h_delta", True, (1, 128, 64), 32, 4),
+    ("fwd_h_delta", True, (2, 128, 128), 64, 3),
+    ("dstate", True, (8, 128, 64), 32, 2),
+    ("dstate", True, (2, 128, 64), 32, 3),
+    ("dstate", True, (1, 128, 128), 64, 2),
+    ("bwd", "scalar", (8, 64, 64), 64, 4),
+    ("bwd", "scalar", (1, 64, 64), 64, 2),
+    ("bwd", "scalar", (64, 128, 128), 64, 8),
+    # The K-loop kernels' fp32 dh convert pass (a raw tile beside the operand).
+    ("dqk", "vanilla", (6, 128, 128), 64, 3),
+    ("dqk", "gated", (6, 128, 128), 64, 2),
+    ("dv", "vanilla", (6, 128, 128), 64, 2),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "mode", "shape", "bn", "stages"),
+    _PASS_WARP_CASES,
+    ids=[
+        f"{k}-{m}-n{s[0]}d{s[1]}dv{s[2]}-{bn}s{st}"
+        for k, m, s, bn, st in _PASS_WARP_CASES
+    ],
+)
+def test_pass_warps_match_the_chain_passes(
+    kernel: str, mode: object, shape: tuple[int, int, int], bn: int, stages: int
+) -> None:
+    # ``cute_mma_dag_pass_warps='on'``: warps 4-7 rewrite the operand tiles
+    # one tile ahead and hand them over through the pass barriers.  Same
+    # bytes written in the same order per tile as the chain's own passes:
+    # bit-equal to the eight-warp render without pass warps and to the
+    # four-warp one, deterministic over the launches, within the Triton
+    # tolerance (bit-equal where the chain is); trips 1, 2 and N, stages
+    # 2, 3, 4 and 8.
+    n, d, dv = shape
+    if kernel == "bwd":
+        t = _inputs(bh=2, n=n, d=d, dv=dv, dtype=torch.bfloat16)
+        args = _bwd_args(t, cast("str", mode))
+        block_sizes = [bn, bn]
+    elif kernel in ("dqk", "dv"):
+        t = _inputs3(bhn=n, d=d, dv=dv, dtype=torch.bfloat16)
+        args = (_dqk_args if kernel == "dqk" else _dv_args)(t, cast("str", mode))
+        block_sizes = [1, bn, 128 if kernel == "dv" else bn]
+        if kernel == "dv":
+            block_sizes = [1, 128, bn]
+    else:
+        t = _inputs4(bh=2, n=n, d=d, dv=dv, dtype=torch.bfloat16)
+        args = (_fwd_h_delta_args if kernel == "fwd_h_delta" else _dstate_args)(
+            t, cast("bool", mode)
+        )
+        block_sizes = [bn]
+    fn = _kernel_fn(kernel)
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, 8, stages, cute_mma_dag_pass_warps="on")
+    )
+    assert "for md_j in cutlass.range(" in source
+    assert f"{RT}.prims.mbarrier_arrive(md_pass + md_stage)" in source
+    assert "barrier_id=1, number_of_threads=128" in source
+    for warps in (8, 4):
+        _source, other = _run_cute(fn, args, _config(block_sizes, warps, stages))
+        for lhs, rhs in zip(out, other, strict=True):
+            assert torch.equal(lhs, rhs)
+    _assert_close(out, _run_triton(fn, args, block_sizes))
+
+
+def test_in_loop_vector_stores_run_on_the_warp_mode() -> None:
+    # The single-loop tcgen05 emitter dropped an in-loop vector store with its
+    # reduction and load (s_out stayed zero); such programs decline the mode
+    # now and the warp mode renders them, matching Triton.
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    s_in = _randn(g, 2, 64, dtype=torch.float32)
+    args = (
+        0.5,
+        t["k"],
+        t["v"],
+        s_in,
+        torch.zeros(2, 64, dtype=torch.float32, device=DEVICE),
+    )
+    bound = helion.kernel(_rmw_scalar_first, backend="cute", static_shapes=True).bind(
+        args
+    )
+    assert bound.config_spec.cute_mma_dag is not None
+    assert bound.config_spec.cute_mma_dag.choices == ("off", "warp")
+    config = helion.Config(
+        block_sizes=[64, 64],
+        cute_mma_dag="warp",
+        cute_mma_dag_warps=4,
+        cute_mma_dag_stages=2,
+    )
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    assert normalized.config["cute_mma_dag"] == "warp", normalized
+    compiled = bound.compile_config(normalized)
+    outs = []
+    for _ in range(LAUNCHES):
+        args[4].zero_()
+        h_out = compiled(*args)
+        torch.cuda.synchronize()
+        outs.append((h_out.clone(), args[4].clone()))
+    for h_out, s_out in outs[1:]:
+        assert torch.equal(h_out, outs[0][0]) and torch.equal(s_out, outs[0][1])
+    ref_args = (
+        0.5,
+        t["k"],
+        t["v"],
+        s_in,
+        torch.zeros(2, 64, dtype=torch.float32, device=DEVICE),
+    )
+    tb = helion.kernel(_rmw_scalar_first, backend="triton", static_shapes=True).bind(
+        ref_args
+    )
+    h_ref = tb.compile_config(helion.Config(block_sizes=[64, 64]))(*ref_args)
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0][0], h_ref)
+    # The row sum's fp32 products are fused into FMAs by the cute lowering and
+    # rounded first by Triton >= 3.9; over 64 cancelling terms of magnitude
+    # ~30 that is a few 1e-6 of absolute difference.
+    torch.testing.assert_close(outs[0][1], ref_args[4], atol=1e-4, rtol=1e-4)
+    assert outs[0][1].abs().sum() > 0
+
+
+@pytest.mark.parametrize(("n", "stages"), ((64, 2), (256, 3)))
+def test_sync_route_pass_tiles_are_paced_by_the_free_barrier(
+    n: int, stages: int
+) -> None:
+    # With k and v sliced out of 80-wide rows the scalar forward's passes copy
+    # from global memory and never arm the ring barrier; the pass warps ran
+    # unpaced (0/10 launches right at trips 64 / stages 2, 6/10 at 256 / 3).
+    # Paced by the slot's free barrier they match Triton bit for bit over ten
+    # launches.
+    t = _inputs(bh=4, n=n, d=64, dv=64, dtype=torch.bfloat16, seed=1)
+
+    def unalign(x: torch.Tensor) -> torch.Tensor:
+        wide = torch.zeros((*x.shape[:-1], 80), dtype=x.dtype, device=x.device)
+        wide[..., 4:68] = x
+        return wide[..., 4:68]
+
+    t["k"], t["v"] = unalign(t["k"]), unalign(t["v"])
+    args = _fwd_args(t, "scalar", True)
+    fn = _kernel_fn("fwd")
+    bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(
+            _config([64, 64], 8, stages, cute_mma_dag_pass_warps="on")
+        )
+    assert normalized.config["cute_mma_dag"] == "tcgen05"
+    assert normalized.config["cute_mma_dag_pass_warps"] == "on"
+    source = bound.to_code(normalized)
+    pass_loop = source.split("if md_warp >= 4:", 1)[1].split("\n    else:\n", 1)[0]
+    assert f"{RT}.mbar_wait_sleep(md_free + md_stage, md_round)" in pass_loop
+    assert "md_full" not in pass_loop and f"{RT}.ldg_" not in pass_loop
+    compiled = bound.compile_config(normalized)
+    outputs = [_tensors(compiled(*args)) for _ in range(10)]
+    torch.cuda.synchronize()
+    ref = _run_triton(fn, args, [64, 64])
+    for out in outputs:
+        for lhs, rhs in zip(out, ref, strict=True):
+            assert torch.equal(lhs, rhs)

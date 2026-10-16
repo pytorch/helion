@@ -55,6 +55,8 @@ from .cute_mma_dag_codegen import _shape
 from .cute_mma_dag_tcgen05 import _PRIMS
 from .cute_mma_dag_tcgen05 import _RT
 from .cute_mma_dag_tcgen05 import _SWIZZLE_BY_ROW_BYTES
+from .cute_mma_dag_tcgen05 import ATOM_32B_SWIZZLE
+from .cute_mma_dag_tcgen05 import ATOM_MAX_BYTES
 from .cute_mma_dag_tcgen05 import REGION_EPILOGUE
 from .cute_mma_dag_tcgen05 import REGION_EXCHANGE
 from .cute_mma_dag_tcgen05 import REGION_LOOP
@@ -134,18 +136,11 @@ def region_program_reason(program: MmaDagProgram) -> str | None:
         if dot.a.dtype != dot.b.dtype or dot.a.dtype not in OPERAND_DTYPES:
             return f"a dot over {dot.a.dtype} x {dot.b.dtype} operands"
         for operand in (dot.a, dot.b):
-            # UMMA reads tf32 tiles K-major here (the MN-major layout wants
-            # the ATOM_32B swizzle, which neither TMA nor the exchange
-            # writes produce).  Only a B fragment or a widened 16-bit B load
-            # takes the planner's transposed [N, K] tile (the latter once the
-            # source proves aligned, at plan time), so an A operand or an
-            # fp32 source read with K along its rows stays MN-major.
-            if operand.dtype == torch.float32 and operand.trans:
-                load = operand.load
-                if operand.role == "a" or (
-                    load is not None and load.dtype == operand.dtype
-                ):
-                    return f"{operand.value.name}: an MN-major tf32 operand"
+            # MN-major tf32 tiles are read under the 32-byte-unit swizzle
+            # (verified for B operands); an A operand with K along its rows is
+            # not.
+            if operand.dtype == torch.float32 and operand.trans and operand.role == "a":
+                return f"{operand.value.name}: an MN-major tf32 A operand"
     for step in program.vec_stores:
         slot = program.vec_leaves[step.vec]
         if program.vec_slots[slot].orient == "cols" and (
@@ -159,11 +154,12 @@ def operand_geometry(
     program: MmaDagProgram, operand: Operand
 ) -> tuple[Axis, Axis, bool]:
     """``(rows, cols, k_major)`` of the operand's shared tile as the tensor
-    core reads it.  The planner's transposed fp32 B tiles (``[N, K]``) are
-    kept and read K-major: an MN-major tf32 operand under the 16-byte
-    SW128 layout (TMA's, and the exchange writes') returned garbage on
-    sm100 -- 32-bit MN-major wants the BASE32B swizzle variant -- so the
-    exchange / widen passes scatter into the transposed tile instead."""
+    core reads it: the natural orientation.  An fp32 B operand the matcher
+    stores transposed for the warp mode (``[N, K]``: ``ldmatrix`` cannot
+    read fp32 MN-major) is natural here, read MN-major under the 32-byte
+    unit swizzle (``ATOM_32B_SWIZZLE``)."""
+    if operand.transposed_tile:
+        return operand.cols, operand.rows, False
     return operand.rows, operand.cols, not operand.trans
 
 
@@ -594,6 +590,8 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                     elem_bytes=item.elem_bytes,
                     source_bytes=load.dtype.itemsize,
                     region=REGION_LOOP if dot.loop >= 0 else REGION_EPILOGUE,
+                    mn_major=not operand_geometry(program, operand)[2],
+                    passed=operand.pointwise or load.dtype != operand.dtype,
                 )
             )
         elif item.kind == ITEM_EXCHANGE:
@@ -605,6 +603,7 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                     cols=item.cols,
                     elem_bytes=item.elem_bytes,
                     region=REGION_LOOP if dot.loop >= 0 else REGION_EPILOGUE,
+                    mn_major=not operand_geometry(program, operand)[2],
                 )
             )
     derived_cols = tuple(
@@ -645,6 +644,24 @@ def region_config_reason(
 ) -> str | None:
     """The region-specific legality of the resolved sizes (the shared tile
     / fragment rules ran already)."""
+    tc = facts.tcgen05
+    assert tc is not None
+    # 32-bit MN-major tiles live under the 32-byte-unit swizzle, whose rows
+    # are 128 bytes: 32 fp32 columns at least (the planner would decline the
+    # config at codegen otherwise, after normalization admitted it).
+    for cols, elem_bytes, mn_major in (
+        *((t.cols, t.elem_bytes, t.mn_major) for t in tc.tiles),
+        *((x.cols, x.elem_bytes, x.mn_major) for x in tc.exchanges),
+    ):
+        if (
+            mn_major
+            and elem_bytes == 4
+            and resolved[cols] * elem_bytes < ATOM_MAX_BYTES
+        ):
+            return (
+                f"an MN-major tf32 tile of {resolved[cols]} columns needs "
+                f"{ATOM_MAX_BYTES}-byte rows ({ATOM_MAX_BYTES // elem_bytes} columns)"
+            )
     columns = region_tmem_columns(facts, resolved)
     if columns > TCGEN05_MAX_TMEM_COLS:
         return (
@@ -748,13 +765,22 @@ def plan_tcgen05_regions(
         if item.kind not in (ITEM_TILE, ITEM_EXCHANGE):
             continue
         dot, operand = cast("tuple[Dot, Operand]", payload)
-        rows_axis, cols_axis, _k_major = operand_geometry(program, operand)
+        rows_axis, cols_axis, k_major = operand_geometry(program, operand)
         rows, cols = sizes[rows_axis.index], sizes[cols_axis.index]
         es = operand.dtype.itemsize
         atom = tcgen05_atom_bytes(cols * es)
         if atom is None:
             raise _decline(f"operand {operand.value.name} has no swizzled UMMA layout")
         swizzle = _SWIZZLE_BY_ROW_BYTES[atom]
+        if es == 4 and not k_major:
+            # 32-bit MN-major: 128-byte rows under the 32-byte-unit swizzle
+            # (the exchange / widen writes and TMA's s128b_atom_32b boxes).
+            if atom != ATOM_MAX_BYTES:
+                raise _decline(
+                    f"operand {operand.value.name}: an MN-major tf32 tile needs "
+                    "128-byte rows"
+                )
+            swizzle = ATOM_32B_SWIZZLE
         key = tile_key(program, operand)
         if item.kind == ITEM_EXCHANGE:
             tile = Tcgen05Tile(
@@ -780,20 +806,15 @@ def plan_tcgen05_regions(
             assert load is not None
             if route != ROUTE_SYNC and len(_tma_dims(load)) > TMA_MAX_RANK:
                 route = ROUTE_SYNC
+            if route == ROUTE_INPLACE and es == 4:
+                # The in-place pass rewrites 16-bit pairs.
+                raise _decline(
+                    f"operand {operand.value.name}: no in-place pass over fp32"
+                )
             spec = raw_spec = None
             raw_offset = raw_row_bytes = 0
             src_rows_axis, src_cols_axis = source_geometry(operand)
             src_rows, src_cols = sizes[src_rows_axis.index], sizes[src_cols_axis.index]
-            if operand.transposed_tile and route != ROUTE_CONVERT:
-                raise _decline(
-                    f"operand {operand.value.name}: a transposed fp32 tile needs the "
-                    "widen pass"
-                )
-            if es == 4 and operand.trans and not operand.transposed_tile:
-                raise _decline(
-                    f"operand {operand.value.name}: an MN-major tf32 tile needs the "
-                    "ATOM_32B TMA swizzle"
-                )
             if route in (ROUTE_DIRECT, ROUTE_INPLACE):
                 spec = tma_spec(
                     load,
@@ -1030,32 +1051,48 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         value = self.pass_value(operand)
         self.hoist_scalars(value)
         row = self.row_var(slot)
+        cols = self.local_cols(slot)
+        packets = cols // 4
+        # Under the 32-byte-unit swizzle a packet column lands on four of
+        # the eight bank groups across a warp's rows (the XOR runs over the
+        # row mod 4), so every store instruction took twice the wavefronts:
+        # the lanes of rows 4-7 of each eight write the next packet instead
+        # (packets of adjacent indices differ in parity, hence in bank
+        # group half), which spreads each instruction over all eight.
+        rotate = tile.swizzle == ATOM_32B_SWIZZLE and packets > 1
         with self.row_guard(slot):
-            if operand.transposed_tile:
-                # Element (row, c) of the fragment is row ``c`` of the [N, K]
-                # tile at column ``row``: one 4-byte store per element.
-                chunk = f"({row} // 4)"
-                within = f"({row} % 4) * 4"
-                for c in range(self.local_cols(slot)):
-                    self.evaluator.reg = (c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS)  # type: ignore[assignment]
-                    coords = self.element_coords(value, slot, c, operand.swap)
-                    scalar = self.evaluator.evaluate(value, coords)
-                    address = self.tile_address(
-                        tile, "0", self.col_expr(slot, c), chunk
+            values = []
+            for c in range(cols):
+                self.evaluator.reg = (c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS)  # type: ignore[assignment]
+                coords = self.element_coords(value, slot, c, operand.swap)
+                values.append(self.evaluator.evaluate(value, coords))
+            self.evaluator.reg = None
+            turn = odd = ""
+            if rotate:
+                turn = self.bind("md_rot", "(md_lane // 4) % 2")
+                odd = self.bind("md_rot", f"{turn} == 1")
+            for packet in range(packets):
+                if rotate:
+                    other = (packet + 1) % packets
+                    words = [
+                        self.bind(
+                            "md_v",
+                            f"cutlass.Float32({values[4 * other + e]}) if {odd} "
+                            f"else cutlass.Float32({values[4 * packet + e]})",
+                        )
+                        for e in range(4)
+                    ]
+                    index = f"({packet} + {turn}) % {packets}"
+                    chunk = (
+                        f"(md_cb{slot} // 4 + {index})"
+                        if self.half_cols(slot)
+                        else index
                     )
-                    self.emit(f"{_RUNTIME}.sts_f32({address} + {within}, {scalar})")
-                self.evaluator.reg = None
-                return
-            for col in range(0, self.local_cols(slot), 4):
-                values = []
-                for c in range(col, col + 4):
-                    self.evaluator.reg = (c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS)  # type: ignore[assignment]
-                    coords = self.element_coords(value, slot, c, operand.swap)
-                    values.append(self.evaluator.evaluate(value, coords))
-                self.evaluator.reg = None
-                chunk = self.chunk_expr(slot, col // 4, 4)
+                else:
+                    words = values[4 * packet : 4 * packet + 4]
+                    chunk = self.chunk_expr(slot, packet, 4)
                 address = self.tile_address(tile, "0", row, chunk)
-                self.emit(f"{_RT}.sts_v4_f32({address}, {', '.join(values)})")
+                self.emit(f"{_RT}.sts_v4_f32({address}, {', '.join(words)})")
 
     def emit_convert_pass(  # type: ignore[override]
         self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int
@@ -1085,21 +1122,6 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 self.emit(f"{lo}, {hi} = {_RUNTIME}.{unpack}({word})")
                 self.evaluator.tile_leaves[(load.node, 2 * q)] = lo
                 self.evaluator.tile_leaves[(load.node, 2 * q + 1)] = hi
-            if operand.transposed_tile:
-                # Source element (prow, 8 pch + e) is row ``8 pch + e`` of the
-                # [N, K] tile at column ``prow``.
-                chunk = f"({prow} // 4)"
-                within = f"({prow} % 4) * 4"
-                for e in range(8):
-                    self.evaluator.element = e
-                    coords = self.tile_coords(operand, prow, f"({pch} * 8 + {e})")
-                    scalar = self.evaluator.evaluate(value, coords)
-                    address = self.tile_address(
-                        tile, stage, f"({pch} * 8 + {e})", chunk
-                    )
-                    self.emit(f"{_RUNTIME}.sts_f32({address} + {within}, {scalar})")
-                self.evaluator.element = None
-                return
             for half in range(2):
                 values = []
                 for e in range(4 * half, 4 * half + 4):
@@ -1113,10 +1135,9 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     f"{', '.join(values)})"
                 )
 
-        src_rows = (
-            self.plan.size(operand.cols) if operand.transposed_tile else tile.rows
+        self.packets(
+            tile.rows * raw_cpr, threads, idx_base, raw_cpr, body, tag=tile.tag
         )
-        self.packets(src_rows * raw_cpr, threads, idx_base, raw_cpr, body, tag=tile.tag)
 
     def tile_base(self, tile: Tcgen05Tile, stage: str) -> str:  # type: ignore[override]
         if tile.ring:

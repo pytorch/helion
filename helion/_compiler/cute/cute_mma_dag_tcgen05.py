@@ -106,6 +106,7 @@ from .cute_mma_dag import MmaDagProgram
 from .cute_mma_dag import Operand
 from .cute_mma_dag import Store
 from .cute_mma_dag import _decline
+from .cute_mma_dag import _storage
 from .cute_mma_dag import staged_store_reason
 from .cute_mma_dag_codegen import _RUNTIME
 from .cute_mma_dag_codegen import Coords
@@ -128,6 +129,10 @@ if TYPE_CHECKING:
 
 TCGEN05_WARP_CHOICES: tuple[int, ...] = (4, 8)
 TCGEN05_EPILOGUE_WARPS = 4
+# The epilogue warps' own barrier while the pass warps run their loop.
+EPILOGUE_WARPS_BARRIER = (
+    f"cute.arch.barrier(barrier_id=1, number_of_threads={32 * TCGEN05_EPILOGUE_WARPS})"
+)
 TCGEN05_M_CHOICES: tuple[int, ...] = (64, 128)
 TCGEN05_MAX_N = 256
 TCGEN05_MAX_ROWS = 256
@@ -153,6 +158,12 @@ TCGEN05_LD_COLS = 64
 TCGEN05_K_STEP_BYTES = 32
 # Side loads (decay scalars / rows) carried one iteration ahead in registers.
 TCGEN05_MAX_PREFETCH = 16
+# Full packet rounds of an operand pass loaded ahead of their rewrites
+# (four 32-bit words each held live).
+TCGEN05_PASS_ROUNDS = 8
+# Registers (entries plus the vector elements they read) an iteration-ahead
+# table set may take per thread; beyond it the values stay inline.
+TCGEN05_MAX_TABLE_REGS = 96
 # The epilogue's per-column side loads (one register per column of the
 # thread's half-row, carried through the loop) go out ahead of the drain only
 # when the half-row has at most this many columns.
@@ -161,9 +172,26 @@ TCGEN05_EPILOGUE_PREFETCH_COLS = 32
 ATOM_MAX_BYTES = 128
 SLAB_ALIGNMENT = 1024
 TMA_MAX_RANK = 5
+# Tensor maps the launcher passes to one kernel.
+TMA_MAX_MAPS = 16
+# The thread issuing the TMA stores (bulk groups are tracked per thread):
+# warp 0's first lane, between the batch's MMAs and its commit -- ahead of
+# the MMAs the issue delayed them by ~15 us at s2 on the delta chains, and
+# the wait for the previous iteration's groups must precede the commit the
+# other threads wait for before reusing a staging buffer.
+TMA_STORE_THREAD = 0
 TMA_KIND = "helion_mma_dag_tma"
 _SWIZZLE_BY_ROW_BYTES = {32: "s32b", 64: "s64b", 128: "s128b"}
-_DESC_SWIZZLE = {"s32b": "SWIZZLE_32B", "s64b": "SWIZZLE_64B", "s128b": "SWIZZLE_128B"}
+# The 32-bit MN-major UMMA layout: 128-byte rows whose 32-byte units XOR with
+# the row mod 4 (``Swizzle<2,5,2>``); the descriptor's stride byte offset is
+# the four-row swizzle period.
+ATOM_32B_SWIZZLE = "s128b_atom_32b"
+_DESC_SWIZZLE = {
+    "s32b": "SWIZZLE_32B",
+    "s64b": "SWIZZLE_64B",
+    "s128b": "SWIZZLE_128B",
+    ATOM_32B_SWIZZLE: "SWIZZLE_128B_ATOM_32B",
+}
 _RT = "_helion_mma_dag_tc"
 _PRIMS = f"{_RT}.prims"
 _PREAMBLE = f"import helion._compiler.cute._mma_dag_tcgen05_runtime as {_RT}\n"
@@ -189,6 +217,11 @@ class Tcgen05TileFacts:
     elem_bytes: int
     source_bytes: int
     region: str
+    # The tensor core reads the tile MN-major (its K along the rows).
+    mn_major: bool = False
+    # A per-element pass rewrites the tile (a pointwise chain or a dtype
+    # change between the source and the operand).
+    passed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,6 +235,7 @@ class Tcgen05ExchangeFacts:
     cols: int
     elem_bytes: int
     region: str = "epilogue"
+    mn_major: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -282,6 +316,11 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         output = program.resolve(carry.output)
         if output is not carry.placeholder and program.frag_slots[output] != carry.slot:
             return None
+    # This emitter's epilogue issues dots and stores only: a derived value
+    # there (a pointwise value over a fragment and a 2-D tile input) would
+    # be dropped, its store staging the input fragment instead.
+    if any(step.loop < 0 for step in program.derived):
+        return None
     # The single-loop emitter packs 16-bit operands only (tf32 dots take the
     # region renderer).
     if any(
@@ -289,6 +328,16 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         for dot in program.dots
         for operand in (dot.a, dot.b)
     ):
+        return None
+    # What this emitter renders: the loop's dots over staged (passed /
+    # exchanged) operands accumulating into TMEM carries, the carries'
+    # snapshots and body stores, derived fragment values of the loop, the
+    # epilogue's dots and fragment stores.  Vector values -- reductions of
+    # a fragment, vector ops, vector / scalar stores -- are the region
+    # renderer's; here they would be dropped (``s_out[idx, tile_d] =
+    # s_in[...] + h.sum(-1) * scale`` inside the recurrence rendered
+    # without the reduction, the load or the store).
+    if program.reduces or program.vec_ops or program.vec_stores or program.vec_leaves:
         return None
     tiles: list[Tcgen05TileFacts] = []
     exchanges: list[Tcgen05ExchangeFacts] = []
@@ -308,6 +357,8 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                         elem_bytes=operand.dtype.itemsize,
                         source_bytes=load.dtype.itemsize,
                         region=dot.region,
+                        mn_major=not operand_k_major(operand),
+                        passed=operand.pointwise or load.dtype != operand.dtype,
                     )
                 )
             else:
@@ -320,6 +371,7 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                         cols=operand.cols.index,
                         elem_bytes=operand.dtype.itemsize,
                         region=dot.region,
+                        mn_major=not operand_k_major(operand),
                     )
                 )
     loop_stores = tuple(
@@ -518,6 +570,9 @@ def tcgen05_config_reason(
                 f"a fragment operand of {cols} columns has no swizzled UMMA "
                 "layout (32 / 64 bytes or multiples of 128)"
             )
+    for tile in tc.tiles:
+        if tile.passed and tile.elem_bytes == 4 and tile.source_bytes == 4:
+            return "no in-place pass over fp32 (the pass rewrites 16-bit pairs)"
     for cols in tc.derived_cols:
         live = sum(resolved[c] for c in cols)
         if live > TCGEN05_MAX_DERIVED_COLS:
@@ -847,6 +902,10 @@ class Tcgen05Tile:
 
     @property
     def stride_byte_offset(self) -> int:
+        """Stride between the row groups of one swizzle period: eight
+        128-byte rows, four under the 32-byte-unit swizzle."""
+        if self.swizzle == ATOM_32B_SWIZZLE:
+            return 4 * self.atom_bytes
         return 8 * self.atom_bytes
 
 
@@ -902,9 +961,19 @@ class Tcgen05Plan:
     # The fragment slots holding tensor-memory columns (the others stay in
     # registers).
     tmem_slots: tuple[int, ...] = ()
+    # Loop stores whose staging tile goes to global memory by TMA (store
+    # access node -> its tensor map), one bulk group per issue point.
+    store_tma: dict[Node, TmaSpec] = dataclasses.field(default_factory=dict)
+    # Warps 4-7 rewrite the loop's operand tiles (the passes) one tile ahead
+    # of the epilogue warps' chain, handing each over through a per-stage
+    # mbarrier (``cute_mma_dag_pass_warps``); the stores then take the
+    # four-warp path.
+    pass_warps: bool = False
 
     @property
     def store_warps(self) -> int:
+        if self.pass_warps:
+            return 0
         return self.warps - TCGEN05_EPILOGUE_WARPS
 
     def tile(self, dot: Dot, operand: Operand) -> Tcgen05Tile:
@@ -919,6 +988,7 @@ def plan_tcgen05(
     warps: int,
     stages: int,
     store_mode: str,
+    pass_warps: bool = False,
 ) -> Tcgen05Plan:
     """The tcgen05 plan for the resolved ``sizes`` (the config passed
     :func:`tcgen05_config_reason`)."""
@@ -997,6 +1067,9 @@ def plan_tcgen05(
             route = ROUTE_SYNC
         rows, cols = sizes[operand.rows.index], sizes[operand.cols.index]
         es = operand.dtype.itemsize
+        if route == ROUTE_INPLACE and es == 4:
+            # The in-place pass rewrites 16-bit pairs.
+            raise _decline(f"operand {operand.value.name}: no in-place pass over fp32")
         atom = tcgen05_atom_bytes(cols * es)
         assert atom is not None
         swizzle = _SWIZZLE_BY_ROW_BYTES[atom]
@@ -1128,6 +1201,7 @@ def plan_tcgen05(
     # stores through one staging tile (reusing the ring when it fits).
     staged: list[Store] = []
     staging_offsets: dict[Node, int] = {}
+    store_tma: dict[Node, TmaSpec] = {}
     for store in program.stores:
         slot = slots[program.frag_slots[store.frag]]
         if store_mode != MMA_DAG_STORE_STAGED:
@@ -1146,6 +1220,44 @@ def plan_tcgen05(
             # comes two iterations later, past at least one more barrier.
             staging_offsets[store.access.node] = fixed_offset + fixed
             fixed += 2 * slot.rows * slot.cols * store.access.dtype.itemsize
+            # Without store warps the epilogue warps drain the packets on
+            # the chain (59 of 259 us on fwd_h_delta at s2); the staging
+            # tile's swizzle is TMA's for rows of one atom, so one thread
+            # stores the whole tile by TMA instead.  Store warps drain off
+            # the chain already, and the TMA issue would only add to it.
+            row_bytes = slot.cols * store.access.dtype.itemsize
+            # A bulk store completes at the kernel's end only (the in-loop
+            # waits order the staging reads, not the global writes): any
+            # other access of the storage would race it.  The matcher
+            # declines programs that load a storage they store, so this is
+            # about a second store to it -- the epilogue storing the same
+            # tile.
+            storage = _storage(store.access)
+            aliased = sum(1 for a in program.accesses if _storage(a) == storage) > 1
+            if (
+                (warps == TCGEN05_EPILOGUE_WARPS or pass_warps)
+                and not aliased
+                and (row_bytes in (16, 32, 64) or row_bytes % ATOM_MAX_BYTES == 0)
+                and len(_tma_dims(store.access)) <= TMA_MAX_RANK
+                and len(tma) < TMA_MAX_MAPS
+                # Rows wider than one atom are staged as 128-byte slabs
+                # (``staging_address``): one box per slab; the swizzle
+                # pattern needs a 1024-byte aligned base.
+                and staging_offsets[store.access.node] % SLAB_ALIGNMENT == 0
+            ):
+                atom = min(row_bytes, ATOM_MAX_BYTES)
+                rows_axis, cols_axis = program.slots[program.frag_slots[store.frag]]
+                store_tma[store.access.node] = tma_spec(
+                    store.access,
+                    rows_axis,
+                    cols_axis,
+                    slot.rows,
+                    slot.cols,
+                    store.access.dtype.itemsize,
+                    _SWIZZLE_BY_ROW_BYTES.get(atom, "none"),
+                    atom,
+                    staging_offsets[store.access.node],
+                )
     epilogue_staging = max(
         (
             slots[program.frag_slots[store.frag]].rows
@@ -1162,7 +1274,12 @@ def plan_tcgen05(
         epilogue_staging_offset = fixed_offset + fixed
         fixed += epilogue_staging
     general = program_order_loop(program)
-    smem = fixed_offset + fixed + 8 * (stages + 3 + int(general)) + 16
+    smem = (
+        fixed_offset
+        + fixed
+        + 8 * (stages + 3 + int(general) + (2 * stages if pass_warps else 0))
+        + 16
+    )
     if facts.smem_capacity and smem > facts.smem_capacity:
         raise _decline(
             f"{smem} B of shared memory exceed the capacity {facts.smem_capacity}"
@@ -1187,6 +1304,8 @@ def plan_tcgen05(
         epilogue_staging_offset=epilogue_staging_offset,
         tmem_cols=tcgen05_tmem_cols(column),
         smem_bytes=fixed_offset + fixed,
+        store_tma=store_tma,
+        pass_warps=pass_warps,
     )
 
 
@@ -1276,12 +1395,36 @@ class _PassEvaluator(_Evaluator):
         super().__init__(emitter)
         self.round_root: Node | None = None
 
+    def evaluate(self, node: Node, coords: Coords) -> str:
+        em = cast("_Tcgen05Emitter", self.emitter)
+        if em.table_recording is not None:
+            if node in em.table_nodes:
+                em.table_recording.append((node, coords))
+                return "0.0"
+        elif em.table_lookup and not em.computing_tables:
+            register = em.table_regs.get((node, coords))
+            if register is not None:
+                return register
+        return super().evaluate(node, coords)
+
     def _load(self, node: Node, coords: Coords) -> str:
         em = cast("_Tcgen05Emitter", self.emitter)
         access = em.accesses[node]
         if len(access.tile_dims) == 2:
+            # A tile leaf: nothing to record (the scratch render has none).
+            if em.table_recording is not None:
+                return "0.0"
             return super()._load(node, coords)
         key = (node, coords)
+        if em.computing_tables:
+            # The table's vectors: registers loaded an iteration earlier.
+            if em.table_load_recording is not None:
+                em.table_load_recording.append(key)
+            else:
+                register = em.table_loads.get(key)
+                if register is not None:
+                    return em.bind("md_v", em.typed(register, access.dtype))
+            return super()._load(node, coords)
         register = em.prefetched.get(key)
         if register is not None:
             return em.bind("md_v", em.typed(register, access.dtype))
@@ -1413,6 +1556,11 @@ class _Tcgen05Emitter(_Emitter):
         self.es = self.program.elem_bytes
         self.kind = "bf16" if self.program.dtype == torch.bfloat16 else "f16"
         self.sync = "cute.arch.barrier()"
+        # The loop body's thread count: the epilogue warps alone when the
+        # pass warps run their own loop.
+        self.loop_threads = (
+            32 * TCGEN05_EPILOGUE_WARPS if tc.pass_warps else plan.threads
+        )
         self.loop_var = "md_i"
         self.tensor_names: dict[Node, str] = {}
         # Name prefix of the fragment row vectors (``md_v{slot}_{chunk}``).
@@ -1423,6 +1571,26 @@ class _Tcgen05Emitter(_Emitter):
         self.prefetched: dict[tuple[Node, Coords], str] = {}
         self.recording: list[tuple[Node, Coords]] | None = None
         self.row_exprs: dict[str, tuple[str, str | None]] = {}
+        # Iteration-ahead tables: pointwise values over the iteration's
+        # vectors alone (a decay factor), computed one iteration ahead into
+        # registers at the coordinates this thread evaluates them at --
+        # (table node, site value, slot, swap) and (node, coords) -> register.
+        self.table_nodes: dict[Node, int] = {}
+        self.table_regs: dict[tuple[Node, Coords], str] = {}
+        self.table_recording: list[tuple[Node, Coords]] | None = None
+        self.computing_tables = False
+        # The vector elements the tables read, (load node, coords) ->
+        # register: loaded two iterations ahead (the compute runs under the
+        # MMAs of the iteration before, a global load's latency exceeds it).
+        self.table_loads: dict[tuple[Node, Coords], str] = {}
+        self.table_load_recording: list[tuple[Node, Coords]] | None = None
+        # Entry -> the window (a batch issue, or the iteration end = the
+        # batch count) its next-iteration value is computed in: after the
+        # last consumer of its table in the iteration; the loads reload in
+        # the last window used.  Lookups serve the loop body only.
+        self.table_entry_window: dict[tuple[Node, Coords], int] = {}
+        self.table_reload_window = 0
+        self.table_lookup = False
         # The epilogue's side loads with per-thread coordinates, loaded into
         # ``md_ex{i}`` under the last iteration's MMAs (or after the loop).
         self.epilogue_sites: list[tuple[Node, Coords]] = []
@@ -1577,7 +1745,12 @@ class _Tcgen05Emitter(_Emitter):
         else:
             slab = f"({pch} // {cpa})"
             local = f"({pch} % {cpa})"
-        swz = _swizzled_chunk(prow, local, cpa)
+        if tile.swizzle == ATOM_32B_SWIZZLE:
+            # 32-byte units XOR the row mod 4: the 16-byte chunk index
+            # XORs with twice it.
+            swz = f"(({local}) ^ ((({prow}) % 4) * 2))"
+        else:
+            swz = _swizzled_chunk(prow, local, cpa)
         terms = [
             self.tile_base(tile, stage),
             f"{prow} * {tile.atom_bytes}",
@@ -1634,6 +1807,52 @@ class _Tcgen05Emitter(_Emitter):
             self.evaluator.pop()
             if nest is not None:
                 nest.__exit__(None, None, None)
+
+    def packet_rounds(
+        self, count: int, threads: int, idx_base: str, cpr: int, tag: str
+    ) -> list[tuple[str, str, str | None]]:
+        """``(prow, pch, guard)`` of every packet round of a ``count``-packet
+        tile over ``threads`` threads, the row / chunk names fixed per round
+        (``packets`` with a tag) and defined up front; only the last round
+        can be partial (its guard)."""
+        rounds: list[tuple[str, str, str | None]] = []
+        for rep in range(-(-count // threads)):
+            idx = f"({rep * threads} + {idx_base})" if rep else idx_base
+            guard = f"{idx} < {count}" if count < (rep + 1) * threads else None
+            prow, pch = f"md_pr_{tag}_{rep}", f"md_pc_{tag}_{rep}"
+            self.emit(f"{prow} = {idx} // {cpr}")
+            self.emit(f"{pch} = {idx} % {cpr}")
+            self.row_exprs[prow] = (f"({idx} // {cpr})", guard)
+            rounds.append((prow, pch, guard))
+        return rounds
+
+    def emit_pipelined_pass(
+        self,
+        rounds: Sequence[tuple[str, str, str | None]],
+        load: object,
+        rewrite: object,
+    ) -> None:
+        """The packet rounds of an in-place / convert pass as every full
+        round's ``load(prow, pch) -> state`` first, then every round's
+        ``rewrite(state, prow, pch)``: the compiler cannot tell the packets
+        of one shared tile apart, so a store ahead of the next round's load
+        serializes the rounds on the shared-memory latency (the gated
+        fwd_h_delta pass cost 156 of 434 us at s2 that way), in groups of
+        ``TCGEN05_PASS_ROUNDS`` rounds (the live words).  A partial last
+        round runs under its guard, load and rewrite together."""
+        full = [r for r in rounds if r[2] is None]
+        for start in range(0, len(full), TCGEN05_PASS_ROUNDS):
+            group = full[start : start + TCGEN05_PASS_ROUNDS]
+            states = [load(prow, pch) for prow, pch, _guard in group]  # type: ignore[operator]
+            for state, (prow, pch, _guard) in zip(states, group, strict=True):
+                self.evaluator.push()
+                rewrite(state, prow, pch)  # type: ignore[operator]
+                self.evaluator.pop()
+        for prow, pch, guard in rounds[len(full) :]:
+            with self.nest(f"if {guard}:"):
+                self.evaluator.push()
+                rewrite(load(prow, pch), prow, pch)  # type: ignore[operator]
+                self.evaluator.pop()
 
     # -- TMA ------------------------------------------------------------------------
 
@@ -1800,10 +2019,14 @@ class _Tcgen05Emitter(_Emitter):
         value = self.pass_value(operand)
         self.hoist_scalars(value)
 
-        def body(prow: str, pch: str) -> None:
+        def packet_load(prow: str, pch: str) -> tuple[str, list[str]]:
             address = self.bind("md_pa", self.tile_address(tile, stage, prow, pch))
             words = [self.df.new_var("md_w") for _ in range(4)]
             self.emit(f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32({address})")
+            return address, words
+
+        def rewrite(state: tuple[str, list[str]], prow: str, pch: str) -> None:
+            address, words = state
             for q, word in enumerate(words):
                 lo, hi = self.df.new_var("md_lo"), self.df.new_var("md_hi")
                 self.emit(f"{lo}, {hi} = {_RUNTIME}.{unpack}({word})")
@@ -1820,13 +2043,11 @@ class _Tcgen05Emitter(_Emitter):
                 packed.append(self.pack(values[0], values[1], operand.dtype))
             self.emit(f"{_RUNTIME}.sts_v4_b32({address}, {', '.join(packed)})")
 
-        self.packets(
-            tile.rows * tile.chunks_per_row,
-            threads,
-            idx_base,
-            tile.chunks_per_row,
-            body,
-            tag=tile.tag,
+        cpr = tile.chunks_per_row
+        self.emit_pipelined_pass(
+            self.packet_rounds(tile.rows * cpr, threads, idx_base, cpr, tile.tag),
+            packet_load,
+            rewrite,
         )
 
     def emit_convert_pass(  # type: ignore[override]
@@ -1842,11 +2063,14 @@ class _Tcgen05Emitter(_Emitter):
         raw_cpr = tile.raw_row_bytes // 16
         es = tile.elem_bytes
 
-        def body(prow: str, pch: str) -> None:
+        def packet_load(prow: str, pch: str) -> list[str]:
             raws = [self.df.new_var("md_f") for _ in range(4)]
             self.emit(
                 f"{', '.join(raws)} = {_RT}.lds_v4_f32({self.raw_address(tile, stage, prow, pch)})"
             )
+            return raws
+
+        def rewrite(raws: list[str], prow: str, pch: str) -> None:
             for e, raw in enumerate(raws):
                 self.evaluator.tile_leaves[(load.node, e)] = raw
             packed = []
@@ -1866,8 +2090,12 @@ class _Tcgen05Emitter(_Emitter):
                 f"+ ({pch} % 2) * {4 * es}, {', '.join(packed)})"
             )
 
-        self.packets(
-            tile.rows * raw_cpr, threads, idx_base, raw_cpr, body, tag=tile.tag
+        self.emit_pipelined_pass(
+            self.packet_rounds(
+                tile.rows * raw_cpr, threads, idx_base, raw_cpr, tile.tag
+            ),
+            packet_load,
+            rewrite,
         )
 
     def emit_passes(
@@ -1877,10 +2105,12 @@ class _Tcgen05Emitter(_Emitter):
         wait: str | None,
         idx_base: str,
         threads: int,
+        fence: bool = True,
     ) -> None:
         """Every pass of ``tiles`` by the ``threads`` threads with local
         index ``idx_base``: ``wait`` (the TMA of in-place rewrites), the
-        passes, then publish the generic writes to the async proxy."""
+        passes, then publish the generic writes to the async proxy (unless
+        a later fence of the same threads precedes the reading batch)."""
         if wait is not None and any(
             tile.route in (ROUTE_INPLACE, ROUTE_CONVERT) for tile in tiles
         ):
@@ -1892,12 +2122,344 @@ class _Tcgen05Emitter(_Emitter):
                 self.emit_inplace_pass(tile, stage, idx_base, threads)
             elif tile.route == ROUTE_CONVERT:
                 self.emit_convert_pass(tile, stage, idx_base, threads)
-        self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+        if fence:
+            self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
 
     def has_passes(self, tiles: Sequence[Tcgen05Tile]) -> bool:
         return any(
             tile.route in (ROUTE_SYNC, ROUTE_INPLACE, ROUTE_CONVERT) for tile in tiles
         )
+
+    def late_pass_windows(
+        self, blocks: Sequence[tuple[list[Derived | Store], list[Dot]]]
+    ) -> dict[tuple[object, ...], int]:
+        """Loop pass tiles no dot of the first batch reads: tile key -> the
+        window (batch index) after whose issue the pass runs, the one
+        before the tile's first reading batch."""
+        first: dict[tuple[object, ...], int] = {}
+        batch = 0
+        for _steps, dots in blocks:
+            if not dots:
+                continue
+            for dot in dots:
+                for operand in (dot.a, dot.b):
+                    if operand.kind != "load":
+                        continue
+                    tile = self.tc.tile(dot, operand)
+                    if tile.route in (ROUTE_SYNC, ROUTE_INPLACE, ROUTE_CONVERT):
+                        first.setdefault(tile.key, batch)
+            batch += 1
+        return {key: b - 1 for key, b in first.items() if b > 0}
+
+    # -- iteration-ahead tables ---------------------------------------------------
+
+    def iteration_only(self, node: Node) -> bool:
+        """Whether ``node``'s value depends on the iteration's vectors and
+        scalars alone (no fragment, no 2-D tile), so it is the same for
+        every thread evaluating it at a coordinate and can be computed
+        ahead."""
+        from ...language import _tracing_ops
+        from ...language import memory_ops
+
+        program = self.program
+        memo: dict[Node, bool] = {}
+        stored = {
+            _storage(store.access) for store in (*program.stores, *program.vec_stores)
+        }
+
+        def visit(current: Node) -> bool:
+            if current in memo:
+                return memo[current]
+            if current in program.aliases:
+                result = visit(program.aliases[current])
+            elif (
+                current in program.frag_slots
+                or current in program.vec_leaves
+                or current.op != "call_function"
+            ):
+                result = False
+            elif current.target is memory_ops.load:
+                # A vector of a storage the program never writes (it is
+                # read two iterations ahead; the matcher declines programs
+                # loading a stored storage -- defense in depth).
+                access = self.accesses.get(current)
+                result = (
+                    access is not None
+                    and len(access.tile_dims) <= 1
+                    and _storage(access) not in stored
+                )
+            elif current.target in (
+                _tracing_ops._get_symnode,
+                torch.ops.prims.iota.default,
+                torch.ops.aten.scalar_tensor.default,
+            ):
+                result = True
+            else:
+                result = all(visit(arg) for arg in current.all_input_nodes)
+            memo[current] = result
+            return result
+
+        return visit(node)
+
+    def table_roots(self, value: Node) -> list[Node]:
+        """The maximal iteration-only sub-values of ``value`` holding an
+        exponential over a loop-dependent vector."""
+        from ...language import memory_ops
+
+        program = self.program
+        roots: list[Node] = []
+        seen: set[Node] = set()
+
+        def worth(current: Node) -> tuple[bool, bool]:
+            """(has an exp, reads a loop-dependent vector)."""
+            exp = current.op == "call_function" and current.target in (
+                torch.ops.aten.exp2.default,
+                torch.ops.aten.exp.default,
+            )
+            loop = (
+                current.op == "call_function"
+                and current.target is memory_ops.load
+                and current in self.accesses
+                and self.loop_dependent(self.accesses[current])
+            )
+            for arg in current.all_input_nodes:
+                e, lo = worth(arg)
+                exp, loop = exp or e, loop or lo
+            return exp, loop
+
+        def walk(current: Node, root: bool = False) -> None:
+            if current in seen:
+                return
+            seen.add(current)
+            if current in program.aliases:
+                walk(program.aliases[current], root)
+                return
+            if self.iteration_only(current):
+                if all(worth(current)):
+                    roots.append(current)
+                return
+            if not root and (
+                current in program.frag_slots or current in program.vec_leaves
+            ):
+                return  # a register: nothing under it is evaluated
+            for arg in current.all_input_nodes:
+                walk(arg)
+
+        # The value itself may be a derived fragment: its definition.
+        walk(value, root=True)
+        return roots
+
+    def table_sites(self) -> list[tuple[Node, int, bool, bool]]:
+        """The loop's per-element value sites: (value, slot, swap, derived)
+        of the exchanged fragment operands and the derived steps."""
+        program = self.program
+        sites: list[tuple[Node, int, bool, bool]] = []
+        for dot in program.dots_in("loop"):
+            for operand in (dot.a, dot.b):
+                if operand.kind == "frag" and operand.pointwise:
+                    assert operand.frag is not None
+                    sites.append(
+                        (
+                            self.pass_value(operand),
+                            program.frag_slots[operand.frag],
+                            operand.swap,
+                            False,
+                        )
+                    )
+        for step in program.derived:
+            if step.loop >= 0:
+                sites.append((step.node, step.slot, False, True))
+        return sites
+
+    def discover_tables(self) -> None:
+        """Render the loop's value sites once into scratch, recording the
+        coordinates each table is evaluated at by this thread: one register
+        per (table, coordinates)."""
+        sites = self.table_sites()
+        for value, _slot, _swap, _derived in sites:
+            for table in self.table_roots(value):
+                self.table_nodes.setdefault(table, len(self.table_nodes))
+        if not self.table_nodes:
+            return
+        saved = (
+            self.lines,
+            self.indent,
+            self.iter_vars,
+            self.values,
+            self.evaluator,
+            self.deferred,
+        )
+        self.lines, self.indent, self.deferred = [], "", []
+        self.define_iteration_bases(in_loop=True)
+        self.evaluator = _PassEvaluator(self)
+        self.table_recording = []
+        for value, slot, swap, derived in sites:
+            self.hoist_scalars(value)
+            for c in range(self.local_cols(slot)):
+                self.evaluator.reg = (c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS)  # type: ignore[assignment]
+                self.evaluator.element = c % 2
+                coords = self.element_coords(value, slot, c, swap)
+                if derived:
+                    self.evaluator.define(value, coords)
+                else:
+                    self.evaluator.evaluate(value, coords)
+        for table, coords in self.table_recording:
+            key = (table, coords)
+            if key not in self.table_regs:
+                index = self.table_nodes[table]
+                self.table_regs[key] = f"md_tb{index}_{len(self.table_regs)}"
+        self.table_recording = None
+        # The compute's vector loads, from a scratch render of it.
+        self.table_load_recording = []
+        self.emit_table_compute("md_i")
+        for key in self.table_load_recording:
+            if key not in self.table_loads:
+                self.table_loads[key] = f"md_tl{len(self.table_loads)}"
+        self.table_load_recording = None
+        (
+            self.lines,
+            self.indent,
+            self.iter_vars,
+            self.values,
+            self.evaluator,
+            self.deferred,
+        ) = saved
+        if len(self.table_regs) + len(self.table_loads) > TCGEN05_MAX_TABLE_REGS:
+            self.table_nodes, self.table_regs, self.table_loads = {}, {}, {}
+            return
+        self.assign_table_windows()
+
+    def consumer_windows(self) -> tuple[list[tuple[Node, int]], int]:
+        """The loop body's evaluated values with the first window after
+        them, and the batch count (window index of the iteration end)."""
+        program = self.program
+        consumers: list[tuple[Node, int]] = []
+
+        def dot_values(dot: Dot) -> list[Node]:
+            values = [
+                self.pass_value(operand)
+                for operand in (dot.a, dot.b)
+                if operand.kind == "frag"
+            ]
+            if dot.acc is not None and self.prepares(dot):
+                values.append(dot.acc)
+            return values
+
+        if self.general_loop:
+            batches = 0
+            blocks = self.loop_blocks()
+            for index, (steps, dots) in enumerate(blocks):
+                window = batches if dots else sum(1 for _s, d in blocks if d)
+                if index == 0:
+                    for store in program.stores:
+                        if store.source == "carry_in":
+                            consumers.append((store.value, window))
+                for step in steps:
+                    value = step.node if isinstance(step, Derived) else step.value
+                    consumers.append((value, window))
+                for dot in dots:
+                    consumers.extend((value, window) for value in dot_values(dot))
+                if dots:
+                    batches += 1
+            return consumers, batches
+        for store in program.stores:
+            consumers.append((store.value, 1 if store.source == "body" else 0))
+        for dot in program.dots_in("loop"):
+            consumers.extend((value, 0) for value in dot_values(dot))
+        for step in program.derived:
+            if step.loop >= 0:
+                consumers.append((step.node, 0))
+        return consumers, 1
+
+    def assign_table_windows(self) -> None:
+        """Spread each table's entries over the windows after its last
+        consumer (the iteration end when none follows)."""
+        program = self.program
+        consumers, batches = self.consumer_windows()
+        memo: dict[Node, set[Node]] = {}
+
+        def tables_under(node: Node) -> set[Node]:
+            """The tables an evaluation of ``node`` reaches (a fragment leaf
+            below it is a register: nothing under it is evaluated)."""
+            if node in memo:
+                return memo[node]
+            memo[node] = set()
+            found: set[Node] = set()
+            if node in self.table_nodes:
+                found.add(node)
+            if node in program.aliases:
+                found |= tables_under(program.aliases[node])
+            elif node not in program.frag_slots and node not in program.vec_leaves:
+                for arg in node.all_input_nodes:
+                    found |= tables_under(arg)
+            memo[node] = found
+            return found
+
+        ready: dict[Node, int] = dict.fromkeys(self.table_nodes, 0)
+        for value, window in consumers:
+            under = set(tables_under(program.aliases.get(value, value)))
+            if value in program.frag_slots:
+                # A derived step: its own definition is evaluated.
+                for arg in value.all_input_nodes:
+                    under |= tables_under(arg)
+            for table in under:
+                ready[table] = max(ready[table], window)
+        counts: dict[Node, int] = dict.fromkeys(self.table_nodes, 0)
+        for table, coords in self.table_regs:
+            first = ready[table]
+            avail = list(range(first, batches)) or [batches]
+            self.table_entry_window[(table, coords)] = avail[counts[table] % len(avail)]
+            counts[table] += 1
+        self.table_reload_window = max(self.table_entry_window.values())
+
+    def emit_table_loads(self, loop_value: str) -> None:
+        """Load the tables' vector elements of iteration ``loop_value`` into
+        their registers."""
+        saved = self.iter_vars
+        self.iter_vars = {}
+        for (node, coords), register in self.table_loads.items():
+            access = self.accesses[node]
+            if node not in self.iter_vars:
+                self.iter_vars[node] = self.iteration_base(access, loop_value)
+            load = self.scalar_load(self.address(access, coords), access.dtype)
+            self.emit(f"{register} = {load}")
+        self.iter_vars = saved
+
+    def emit_table_compute(self, loop_value: str, window: int | None = None) -> None:
+        """This thread's table entries (those of ``window``, or all) for
+        iteration ``loop_value``, from the vectors read at that iteration's
+        bases."""
+        saved = (self.iter_vars, self.evaluator)
+        self.iter_vars = dict(saved[0])
+        for access in self.program.accesses:
+            if self.loop_dependent(access):
+                self.iter_vars[access.node] = self.iteration_base(access, loop_value)
+        self.evaluator = _PassEvaluator(self)
+        self.computing_tables = True
+        entries = [
+            (key, register)
+            for key, register in self.table_regs.items()
+            if window is None or self.table_entry_window[key] == window
+        ]
+        for table in dict.fromkeys(table for (table, _coords), _r in entries):
+            self.hoist_scalars(table)
+        for key, register in entries:
+            result = self.evaluator.evaluate(*key)
+            self.emit(f"{register} = cutlass.Float32({result})")
+        self.computing_tables = False
+        self.iter_vars, self.evaluator = saved
+
+    def emit_tables_ahead(self, loop: str, end: str, window: int) -> None:
+        """The next iteration's table entries of ``window`` (after a batch
+        issue, before its wait: under its MMAs); the last window used then
+        reloads the vectors for the iteration after."""
+        if window not in self.table_entry_window.values():
+            return
+        with self.nest(f"if {loop} + 1 < {end}:"):
+            self.emit_table_compute(f"({loop} + 1)", window)
+        if window == self.table_reload_window and self.table_loads:
+            with self.nest(f"if {loop} + 2 < {end}:"):
+                self.emit_table_loads(f"({loop} + 2)")
 
     # -- side loads one iteration ahead ------------------------------------------
 
@@ -1905,7 +2467,7 @@ class _Tcgen05Emitter(_Emitter):
         """The per-iteration work whose side loads are prefetched: the loop
         operand passes and the carry rescales."""
         tc = self.tc
-        if self.has_passes(tc.loop_tiles):
+        if self.has_passes(tc.loop_tiles) and not tc.pass_warps:
             self.emit_passes(
                 tc.loop_tiles,
                 "md_stage",
@@ -2023,8 +2585,7 @@ class _Tcgen05Emitter(_Emitter):
         ):
             return []
         written = {
-            self.tensor_names[store.access.node]
-            for store in (*program.stores, *program.vec_stores)
+            _storage(store.access) for store in (*program.stores, *program.vec_stores)
         }
         saved = (
             self.lines,
@@ -2050,7 +2611,7 @@ class _Tcgen05Emitter(_Emitter):
                 key in sites
                 or key in columns
                 or self.loop_dependent(access)
-                or self.tensor_names[node] in written
+                or _storage(access) in written
             ):
                 continue
             if not all(
@@ -2226,6 +2787,8 @@ class _Tcgen05Emitter(_Emitter):
         register prefetch at the iteration top runs one iteration ahead,
         less than the DRAM latency of a first touch."""
         for step in self.program.derived:
+            if step.loop < 0:
+                continue
             geometry = self.slot(step.slot)
             for access in step.loads:
                 base = self.iteration_base(access, loop_value)
@@ -2339,33 +2902,57 @@ class _Tcgen05Emitter(_Emitter):
             )
         return f"md_s0 + {self.tc.epilogue_staging_offset}"
 
+    def staging_address(
+        self, base: str, rows: int, row_bytes: int, row: str, chunk: str
+    ) -> str:
+        """Byte address of 16-byte chunk ``chunk`` of row ``row`` of a
+        staging tile: rows of one swizzle atom (<= 128 B) with the atom's
+        XOR, wider rows as 128-byte slabs side by side (the TMA box layout,
+        so the tile can go out by TMA)."""
+        cpr = row_bytes // 16
+        if cpr <= 8:
+            return f"{base} + {row} * {row_bytes} + {_swizzled_chunk(row, chunk, cpr)} * 16"
+        slab = f"({chunk}) // 8"
+        local = f"({chunk}) % 8"
+        return (
+            f"{base} + {slab} * {rows * ATOM_MAX_BYTES} + {row} * {ATOM_MAX_BYTES} "
+            f"+ {_swizzled_chunk(row, local, 8)} * 16"
+        )
+
     def emit_stage_in(  # type: ignore[override]
         self, store: Store, parity: str, evaluate: bool
     ) -> None:
         """This thread's fragment row as 16-byte packets of the store dtype
-        into the staging buffer (chunk ``c`` of row ``r`` at ``c ^ (r % 8)``).
-        ``evaluate`` renders the store's pointwise chain per element (its
-        trailing cast folded into the pack); otherwise the value is the
-        fragment itself or its cast and the registers are packed directly."""
+        into the staging buffer (``staging_address``).  ``evaluate`` renders
+        the store's pointwise chain per element (its trailing cast folded
+        into the pack); otherwise the value is the fragment itself or its
+        cast and the registers are packed directly."""
         slot = self.program.frag_slots[store.frag]
         geometry = self.slot(slot)
         dtype = store.access.dtype
         es = dtype.itemsize
         row_bytes = geometry.cols * es
-        cpr = row_bytes // 16
         per_packet = 16 // es
         base = self.staging_base(store, parity)
         row = self.row_var(slot)
-        row_base = self.bind("md_srow", f"{base} + {row} * {row_bytes}")
+        if row_bytes <= ATOM_MAX_BYTES:
+            row_base = self.bind("md_srow", f"{base} + {row} * {row_bytes}")
+        else:
+            row_base = self.bind("md_srow", f"{base} + {row} * {ATOM_MAX_BYTES}")
         pack = "pack_f16x2" if dtype == torch.float16 else "pack_bf16x2"
         if evaluate:
             self.fold_root(store.value)
             self.hoist_scalars(store.value)
         for col in range(0, self.local_cols(slot), per_packet):
-            swz = _swizzled_chunk(
-                row, self.chunk_expr(slot, col // per_packet, per_packet), cpr
-            )
-            address = f"{row_base} + {swz} * 16"
+            chunk = self.chunk_expr(slot, col // per_packet, per_packet)
+            if row_bytes <= ATOM_MAX_BYTES:
+                swz = _swizzled_chunk(row, chunk, row_bytes // 16)
+                address = f"{row_base} + {swz} * 16"
+            else:
+                address = (
+                    f"{row_base} + ({chunk}) // 8 * {geometry.rows * ATOM_MAX_BYTES} "
+                    f"+ {_swizzled_chunk(row, f'({chunk}) % 8', 8)} * 16"
+                )
             values = []
             for c in range(col, col + per_packet):
                 chunk_index, j = c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS
@@ -2401,10 +2988,10 @@ class _Tcgen05Emitter(_Emitter):
         base = self.staging_base(store, parity)
 
         def body(prow: str, pch: str) -> None:
-            swz = _swizzled_chunk(prow, pch, cpr)
             words = [self.df.new_var("md_w") for _ in range(4)]
             self.emit(
-                f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32({base} + {prow} * {row_bytes} + {swz} * 16)"
+                f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32("
+                f"{self.staging_address(base, geometry.rows, row_bytes, prow, pch)})"
             )
             self.emit(
                 f"{_RUNTIME}.stg_v4_b32({gbase} + cutlass.Int64({prow}) * {row_stride} "
@@ -2412,6 +2999,37 @@ class _Tcgen05Emitter(_Emitter):
             )
 
         self.packets(geometry.rows * cpr, threads, idx, cpr, body)
+
+    def tma_stores(self, stores: Sequence[Store]) -> list[Store]:
+        """The staged stores of ``stores`` that go out by TMA."""
+        return [
+            store
+            for store in stores
+            if store in self.tc.staged_stores and store.access.node in self.tc.store_tma
+        ]
+
+    def emit_tma_stores(
+        self, stores: Sequence[Store], parity: str, loop_value: str
+    ) -> None:
+        """The store thread: the staging tiles of ``stores`` to global memory
+        as one bulk group.  The caller then waits until at most one
+        iteration's groups are still reading their staging buffers, ahead
+        of a barrier every thread passes before the stage-ins reusing those
+        buffers (two iterations after the write): the batch's commit in
+        the program-order loop, the next iteration's barrier in the simple
+        loop (whose drain follows its own barrier, after the MMA issue)."""
+        for store in stores:
+            spec = self.tc.store_tma[store.access.node]
+            slot = self.slot(self.program.frag_slots[store.frag])
+            tile = slot.rows * slot.cols * store.access.dtype.itemsize
+            for slab in range(spec.slabs):
+                coords = ", ".join(self.tma_coords(spec, loop_value, slab))
+                src = f"{spec.offset + slab * spec.slab_bytes} + ({parity}) * {tile}"
+                self.emit(
+                    f"{_PRIMS}.cp_async_bulk_tensor_global_shared_cta({spec.param}.get_ptr(), "
+                    f"md_smem + ({src}), [{coords}])"
+                )
+        self.emit(f"{_PRIMS}.cp_async_bulk_commit_group()")
 
     def emit_direct_store(self, store: Store) -> None:
         """Pair stores of the store value straight from the fragment row."""
@@ -2522,14 +3140,36 @@ class _Tcgen05Emitter(_Emitter):
             # Commits of the loop body's intermediate dot batches.
             self.emit("md_stepb = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)")
         self.emit("md_tslot = cute.arch.alloc_smem(cutlass.Int32, 1, alignment=4)")
+        if tc.pass_warps:
+            # Per ring slot: the pass warps' threads arrive on ``md_pass``
+            # once the slot's tile is rewritten (and fenced to the async
+            # proxy); the MMAs reading the slot commit to ``md_free`` when
+            # they complete, which paces the pass warps' rewrite of the
+            # slot's next tile whatever route fills it (a tile they copy
+            # from global memory themselves never arms the full barrier).
+            self.emit(
+                f"md_pass = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
+            )
+            self.emit(
+                f"md_free = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
+            )
         with self.nest("if md_tidx == 0:"):
             for stage in range(tc.stages):
                 self.emit(f"{_PRIMS}.mbarrier_init(md_full + {stage}, 1)")
+                if tc.pass_warps:
+                    self.emit(
+                        f"{_PRIMS}.mbarrier_init(md_pass + {stage}, {32 * TCGEN05_EPILOGUE_WARPS})"
+                    )
+                    self.emit(f"{_PRIMS}.mbarrier_init(md_free + {stage}, 1)")
             for name in ("md_accb", "md_efull", "md_eacc"):
                 self.emit(f"{_PRIMS}.mbarrier_init({name}, 1)")
             if general:
                 self.emit(f"{_PRIMS}.mbarrier_init(md_stepb, 1)")
             self.emit(f"{_PRIMS}.fence_mbarrier_init()")
+            if tc.pass_warps:
+                # Every slot starts free: its first tile has no earlier reader.
+                for stage in range(tc.stages):
+                    self.emit(f"{_PRIMS}.mbarrier_arrive(md_free + {stage})")
             self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
         with self.nest("if md_warp == 0:"):
             self.emit(
@@ -2596,7 +3236,24 @@ class _Tcgen05Emitter(_Emitter):
                 elif trip_static is None:
                     with self.nest(f"if {value} < {end}:"):
                         self.emit_line_prefetch(value)
-        if general and any(step.loads for step in program.derived):
+        self.discover_tables()
+        if self.table_regs:
+            for register in (*self.table_regs.values(), *self.table_loads.values()):
+                self.emit(f"{register} = cutlass.Float32(0.0)")
+            with (
+                self.nest(f"if {end} > {begin}:") if trip_static is None else _NoNest()
+            ):
+                if trip_static != 0:
+                    self.emit_table_loads(begin)
+                    self.emit_table_compute(begin)
+            if self.table_loads:
+                value = f"({begin} + 1)"
+                if trip_static is None:
+                    with self.nest(f"if {value} < {end}:"):
+                        self.emit_table_loads(value)
+                elif trip_static > 1:
+                    self.emit_table_loads(value)
+        if general and any(step.loads for step in program.derived if step.loop >= 0):
             for ahead in range(1, max(tc.stages - 1, 2)):
                 value = f"({begin} + {ahead})"
                 if trip_static is not None and ahead < trip_static:
@@ -2622,11 +3279,31 @@ class _Tcgen05Emitter(_Emitter):
                 if tc.epilogue_tx_bytes:
                     self.emit_epilogue_tma_issue()
         self.emit(self.sync)
-        with self.nest(f"for {self.loop_var} in cutlass.range({begin}, {end}):"):
-            if general:
-                self.emit_general_iteration(begin, end)
-            else:
-                self.emit_iteration(begin, end)
+        self.table_lookup = True
+        if tc.pass_warps:
+            # Warps 4-7 rewrite the operand tiles as their TMA lands, up to
+            # S - 1 tiles ahead; the epilogue warps run the chain on their
+            # own barrier and warp 0 waits each tile's pass before the batch
+            # that reads it.
+            with self.nest(f"if md_warp >= {TCGEN05_EPILOGUE_WARPS}:"):
+                self.emit_pass_warp_loop(begin, end)
+            self.sync = EPILOGUE_WARPS_BARRIER
+            with (
+                self.nest("else:"),
+                self.nest(f"for {self.loop_var} in cutlass.range({begin}, {end}):"),
+            ):
+                if general:
+                    self.emit_general_iteration(begin, end)
+                else:
+                    self.emit_iteration(begin, end)
+            self.sync = "cute.arch.barrier()"
+        else:
+            with self.nest(f"for {self.loop_var} in cutlass.range({begin}, {end}):"):
+                if general:
+                    self.emit_general_iteration(begin, end)
+                else:
+                    self.emit_iteration(begin, end)
+        self.table_lookup = False
         if self.epilogue_sites and not self.epilogue_sites_in_loop:
             self.define_iteration_bases(in_loop=False)
             self.emit_epilogue_prefetch_loads()
@@ -2640,6 +3317,8 @@ class _Tcgen05Emitter(_Emitter):
             with guard:
                 self.emit(f"{_RT}.mbar_wait(md_accb, ({end} - {begin} - 1) & 1)")
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)")
+        # The epilogue's derived values load their tile inputs themselves.
+        self.derived_words = {}
         self.emit_epilogue()
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)")
         self.emit(self.sync)
@@ -2650,8 +3329,84 @@ class _Tcgen05Emitter(_Emitter):
             self.emit(
                 f"{_PRIMS}.tcgen05_dealloc(md_acc0, {tc.tmem_cols}, group={_PRIMS}.CTAGroup.CTA_1)"
             )
+        if tc.store_tma:
+            # The TMA stores complete before the kernel ends.
+            with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(0)")
         assert plan.threads == 32 * tc.warps
         return "\n".join(self.lines) + "\n"
+
+    def pass_tiles(self) -> list[Tcgen05Tile]:
+        """The loop operand tiles rewritten by a pass."""
+        return [
+            tile
+            for tile in self.tc.loop_tiles
+            if tile.route in (ROUTE_SYNC, ROUTE_INPLACE, ROUTE_CONVERT)
+        ]
+
+    def pass_batch(
+        self, blocks: Sequence[tuple[list[Derived | Store], list[Dot]]]
+    ) -> int:
+        """The first batch reading a passed tile (warp 0 waits the pass
+        warps' arrival ahead of it)."""
+        passed = {tile.key for tile in self.pass_tiles()}
+        batch = 0
+        for _steps, dots in blocks:
+            if not dots:
+                continue
+            for dot in dots:
+                for operand in (dot.a, dot.b):
+                    if (
+                        operand.kind == "load"
+                        and self.tc.tile(dot, operand).key in passed
+                    ):
+                        return batch
+            batch += 1
+        return 0
+
+    def emit_pass_warp_loop(self, begin: str, end: str) -> None:
+        """The pass warps' loop: tile ``md_j`` is rewritten in its ring slot
+        as soon as its TMA landed (the slot's previous reader, MMA(j - S),
+        completed before that TMA was issued), published to the async
+        proxy and signalled on the slot's pass barrier; the side loads run
+        at that tile's bases (no prefetch registers: the warps have the
+        whole iteration of slack)."""
+        saved = (
+            self.loop_var,
+            self.iter_vars,
+            self.evaluator,
+            self.prefetched,
+            self.recording,
+        )
+        self.loop_var = "md_j"
+        self.prefetched = {}
+        self.recording = None
+        with self.nest(f"for md_j in cutlass.range({begin}, {end}):"):
+            self.emit_iteration_header(begin)
+            self.iter_vars = dict(saved[1])
+            for access in self.program.accesses:
+                if self.loop_dependent(access):
+                    self.iter_vars[access.node] = self.iteration_base(access, "md_j")
+            self.evaluator = _PassEvaluator(self)
+            # The slot's previous tile's MMAs completed (the prologue arrived
+            # once per slot for the first tiles); then its TMA landed, when
+            # a tile comes by TMA.
+            self.emit(f"{_RT}.mbar_wait_sleep(md_free + md_stage, md_round)")
+            self.emit_passes(
+                self.pass_tiles(),
+                "md_stage",
+                f"{_RT}.mbar_wait_sleep(md_full + (md_stage), md_round)",
+                f"(md_tidx - {32 * TCGEN05_EPILOGUE_WARPS})",
+                32 * TCGEN05_EPILOGUE_WARPS,
+            )
+            self.emit(f"{_PRIMS}.mbarrier_arrive(md_pass + md_stage)")
+        (
+            self.loop_var,
+            self.iter_vars,
+            self.evaluator,
+            self.prefetched,
+            self.recording,
+        ) = saved
 
     def emit_iteration_header(self, begin: str) -> str:
         """The loop axis base, the ring slot and its phase of iteration
@@ -2681,58 +3436,294 @@ class _Tcgen05Emitter(_Emitter):
         # Every thread runs this iteration's operand passes into slot i % S
         # (its previous reader, MMA(i - S), completed with the acc_ready
         # just waited) before the barrier.
-        waited_full = any(
+        waited_full = not tc.pass_warps and any(
             tile.route in (ROUTE_INPLACE, ROUTE_CONVERT) for tile in tc.loop_tiles
         )
-        if self.has_passes(tc.loop_tiles):
+        if self.has_passes(tc.loop_tiles) and not tc.pass_warps:
             self.emit_passes(
                 tc.loop_tiles,
                 "md_stage",
                 f"{_RT}.mbar_wait(md_full + (md_stage), md_round)",
                 "md_tidx",
-                self.plan.threads,
+                self.loop_threads,
             )
         loop_dots = program.dots_in("loop")
         carry_in = [s for s in program.stores if s.source == "carry_in"]
         carry_out = [s for s in program.stores if s.source == "body"]
         prepared = [dot for dot in loop_dots if self.prepares(dot)]
-        if carry_in or prepared:
-            with self.block("if md_epi:"):
-                loaded: set[int] = set()
-                for store in carry_in:
-                    slot = program.frag_slots[store.frag]
-                    if slot not in loaded:
-                        self.emit_ld(slot)
-                        loaded.add(slot)
-                    with self.row_guard(slot):
-                        if store in tc.staged_stores:
-                            self.emit_stage_in(store, "md_parity", evaluate=False)
-                        else:
+        tma_stores = self.tma_stores(carry_in)
+        loop_staged = [
+            s
+            for s in tc.staged_stores
+            if s.region == "loop"
+            and s.source == "carry_in"
+            and s.access.node not in tc.store_tma
+        ]
+        # The snapshot stores of the carry go out after the MMA issue: the
+        # tensor-memory read alone gates the MMA (the WAR hazard), while
+        # the pack, the staging writes and their proxy fence run under the
+        # MMA; a second barrier then hands the staging tile to its drain
+        # (the store warps, the TMA store thread or every thread).  On the
+        # s2 vanilla forward the pack and staging writes ahead of the
+        # barrier were 6 of 122 us.  With store warps the epilogue warps'
+        # iteration is one branch of ``md_epi`` (the registers of a staged
+        # ``if`` do not outlive it) and the store warps' the other; both
+        # branches run the same barriers.  Under pass warps the snapshot
+        # keeps its place ahead of the barrier: the operand passes are
+        # already off the chain there and the second (named) barrier cost
+        # the pinned s2 bwd_dh 175 -> 179 us.
+        late = bool(carry_in) and not tc.pass_warps
+        split = late and tc.store_warps > 0
+        # The ring refill (iteration i + S - 1 into slot (i - 1) % S, whose
+        # reader MMA(i - 1) completed with the acc wait at the top): with
+        # store warps the first of them issues it right after the barrier
+        # (they idle until the hand-off); otherwise the MMA warp issues it
+        # after its commit, under the MMA.  On an epilogue warp ahead of its
+        # pack it delayed the hand-off (gated s2 forward 177 -> 182 us).
+        refill = bool(tc.tx_bytes) and tc.stages > 1
+        refill_warp = TCGEN05_EPILOGUE_WARPS if split else None
+        ahead = tc.stages - 1
+
+        def emit_loads() -> None:
+            loaded: set[int] = set()
+            for store in carry_in:
+                slot = program.frag_slots[store.frag]
+                if slot not in loaded:
+                    self.emit_ld(slot)
+                    loaded.add(slot)
+            for dot in prepared:
+                self.emit_rescale(dot, loaded)
+
+        def emit_snapshots() -> None:
+            for store in carry_in:
+                slot = program.frag_slots[store.frag]
+                with self.row_guard(slot):
+                    if store in tc.staged_stores:
+                        self.emit_stage_in(store, "md_parity", evaluate=False)
+                    else:
+                        self.emit_direct_store(store)
+            if tma_stores:
+                # The staging writes, to the async proxy (the writers
+                # only: the fence costs every thread that runs it).
+                self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+
+        def emit_mmas() -> None:
+            with self.nest("if md_warp == 0:"):
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+                )
+                if tc.tx_bytes and not waited_full:
+                    self.emit(f"{_RT}.mbar_wait(md_full + md_stage, md_round)")
+                if tc.pass_warps:
+                    self.emit(f"{_RT}.mbar_wait(md_pass + md_stage, md_round)")
+                for dot in loop_dots:
+                    self.emit_dot_mmas(dot, "md_stage", accumulate=dot.acc is not None)
+                with self.nest(f"if {_PRIMS}.elect_sync():"):
+                    self.emit(
+                        f"{_PRIMS}.tcgen05_commit(md_accb, group={_PRIMS}.CTAGroup.CTA_1)"
+                    )
+                    if tc.pass_warps:
+                        self.emit(
+                            f"{_PRIMS}.tcgen05_commit(md_free + md_stage, group={_PRIMS}.CTAGroup.CTA_1)"
+                        )
+                    if refill and refill_warp is None:
+                        with self.nest(f"if {loop} + {ahead} < {end}:"):
+                            self.emit_tma_issue(
+                                f"({loop} + {ahead})",
+                                f"(md_stage + {ahead}) % {tc.stages}",
+                            )
+
+        def emit_refill() -> None:
+            if not refill or refill_warp is None:
+                return
+            with (
+                self.nest(f"if md_warp == {refill_warp}:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest(f"if {loop} + {ahead} < {end}:"),
+            ):
+                self.emit_tma_issue(
+                    f"({loop} + {ahead})", f"(md_stage + {ahead}) % {tc.stages}"
+                )
+
+        def emit_side_loads() -> None:
+            # The next iteration's side loads land in their registers while
+            # the MMA runs (issued after the drain they stalled the gated
+            # forward's pass: 177 -> 186 us at s2); the lines of the
+            # iteration a ring depth ahead go to L2.
+            if not self.prefetched:
+                return
+            with self.nest(f"if {loop} + 1 < {end}:"):
+                self.emit_prefetch_loads(f"({loop} + 1)")
+            ahead_lines = max(tc.stages - 1, 2)
+            with self.nest(f"if {loop} + {ahead_lines} < {end}:"):
+                self.emit_line_prefetch(f"({loop} + {ahead_lines})")
+
+        def emit_drain(idx: str, threads: int) -> None:
+            if tma_stores:
+                with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                    self.emit_tma_stores(tma_stores, "md_parity", loop)
+                    self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(1, read=True)")
+            for store in loop_staged:
+                self.emit_stage_out(store, "md_parity", loop, idx, threads)
+
+        if not late:
+            # Fail closed: the snapshot ahead of the barrier, the refill by
+            # the MMA warp after its commit, the drain after the MMA block.
+            if carry_in or prepared:
+                with self.block("if md_epi:"):
+                    loaded: set[int] = set()
+                    for store in carry_in:
+                        slot = program.frag_slots[store.frag]
+                        if slot not in loaded:
+                            self.emit_ld(slot)
+                            loaded.add(slot)
+                        with self.row_guard(slot):
+                            if store in tc.staged_stores:
+                                self.emit_stage_in(store, "md_parity", evaluate=False)
+                            else:
+                                self.emit_direct_store(store)
+                    for dot in prepared:
+                        self.emit_rescale(dot, loaded)
+                    if tma_stores:
+                        # The staging writes, to the async proxy (the writers
+                        # only: the fence costs every thread that runs it).
+                        self.emit(
+                            'cute.arch.fence_proxy(kind="async.shared", space="cta")'
+                        )
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
+                )
+            self.emit(self.sync)
+            with self.nest("if md_warp == 0:"):
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+                )
+                if tc.tx_bytes and not waited_full:
+                    self.emit(f"{_RT}.mbar_wait(md_full + md_stage, md_round)")
+                if tc.pass_warps:
+                    self.emit(f"{_RT}.mbar_wait(md_pass + md_stage, md_round)")
+                for dot in loop_dots:
+                    self.emit_dot_mmas(dot, "md_stage", accumulate=dot.acc is not None)
+                if tma_stores:
+                    with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                        self.emit_tma_stores(tma_stores, "md_parity", loop)
+                        self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(1, read=True)")
+                with self.nest(f"if {_PRIMS}.elect_sync():"):
+                    self.emit(
+                        f"{_PRIMS}.tcgen05_commit(md_accb, group={_PRIMS}.CTAGroup.CTA_1)"
+                    )
+                    if tc.pass_warps:
+                        self.emit(
+                            f"{_PRIMS}.tcgen05_commit(md_free + md_stage, group={_PRIMS}.CTAGroup.CTA_1)"
+                        )
+                    if tc.tx_bytes and tc.stages > 1:
+                        ahead = tc.stages - 1
+                        with self.nest(f"if {loop} + {ahead} < {end}:"):
+                            self.emit_tma_issue(
+                                f"({loop} + {ahead})",
+                                f"(md_stage + {ahead}) % {tc.stages}",
+                            )
+            # The epilogue's side loads go out under the last iteration's MMAs.
+            if self.epilogue_sites_in_loop:
+                with self.nest(f"if {loop} + 1 == {end}:"):
+                    self.emit_epilogue_prefetch_loads()
+            if tc.tx_bytes and tc.stages == 1:
+                # Refill after the MMA completed: every thread waits the commit
+                # (the next iteration's wait is then immediate).
+                self.emit(f"{_RT}.mbar_wait(md_accb, md_parity)")
+                with (
+                    self.nest("if md_warp == 0:"),
+                    self.nest(f"if {_PRIMS}.elect_sync():"),
+                    self.nest(f"if {loop} + 1 < {end}:"),
+                ):
+                    self.emit_tma_issue(f"({loop} + 1)", "0")
+            # The next iteration's side loads land in their registers while the
+            # MMA runs; the lines of the iteration a ring depth ahead go to L2.
+            if self.prefetched:
+                with self.nest(f"if {loop} + 1 < {end}:"):
+                    self.emit_prefetch_loads(f"({loop} + 1)")
+                ahead = max(tc.stages - 1, 2)
+                with self.nest(f"if {loop} + {ahead} < {end}:"):
+                    self.emit_line_prefetch(f"({loop} + {ahead})")
+            self.emit_tables_ahead(loop, end, 0)
+            # The snapshots stream out while the MMA runs: the store warps, or
+            # the epilogue warps when there are none (packing the rows after the
+            # issue instead, with the previous iteration's drain, measured 122
+            # vs 104 us on the s2 forward).
+            if loop_staged:
+                if tc.store_warps:
+                    nest = self.nest(f"if md_warp >= {TCGEN05_EPILOGUE_WARPS}:")
+                    idx, threads = (
+                        f"(md_tidx - {32 * TCGEN05_EPILOGUE_WARPS})",
+                        32 * tc.store_warps,
+                    )
+                else:
+                    nest = _NoNest()
+                    idx, threads = "md_tidx", self.loop_threads
+                with nest:
+                    for store in loop_staged:
+                        self.emit_stage_out(store, "md_parity", loop, idx, threads)
+            if carry_out:
+                # A snapshot after the dot: wait for this iteration's MMA.
+                self.emit(f"{_RT}.mbar_wait(md_accb, md_parity)")
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+                )
+                self.vec = "md_vo"
+                with self.block("if md_epi:"):
+                    loaded = set()
+                    for store in carry_out:
+                        slot = program.frag_slots[store.frag]
+                        if slot not in loaded:
+                            self.emit_ld(slot)
+                            loaded.add(slot)
+                        with self.row_guard(slot):
                             self.emit_direct_store(store)
-                for dot in prepared:
-                    self.emit_rescale(dot, loaded)
+                self.vec = "md_v"
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
+                )
+            self.emit_tables_ahead(loop, end, 1)
+            return
+        if not split:
+            # Every warp of the loop is an epilogue warp (``md_epi`` holds).
+            emit_loads()
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
             )
-        self.emit(self.sync)
-        with self.nest("if md_warp == 0:"):
-            self.emit(
-                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
-            )
-            if tc.tx_bytes and not waited_full:
-                self.emit(f"{_RT}.mbar_wait(md_full + md_stage, md_round)")
-            for dot in loop_dots:
-                self.emit_dot_mmas(dot, "md_stage", accumulate=dot.acc is not None)
-            with self.nest(f"if {_PRIMS}.elect_sync():"):
+            self.emit(self.sync)
+            emit_refill()
+            emit_mmas()
+            emit_side_loads()
+            emit_snapshots()
+            if tma_stores or loop_staged:
+                self.emit(self.sync)
+                emit_drain("md_tidx", self.loop_threads)
+        else:
+            # The store warps alone drain the staging tile: the epilogue
+            # warps taking half of the packets after their pack lengthened
+            # their path (130 vs 122 us on the s2 forward).
+            with self.block("if md_epi:"):
+                emit_loads()
                 self.emit(
-                    f"{_PRIMS}.tcgen05_commit(md_accb, group={_PRIMS}.CTAGroup.CTA_1)"
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
                 )
-                if tc.tx_bytes and tc.stages > 1:
-                    ahead = tc.stages - 1
-                    with self.nest(f"if {loop} + {ahead} < {end}:"):
-                        self.emit_tma_issue(
-                            f"({loop} + {ahead})", f"(md_stage + {ahead}) % {tc.stages}"
-                        )
+                self.emit(self.sync)
+                emit_mmas()
+                emit_side_loads()
+                emit_snapshots()
+                if loop_staged:
+                    self.emit(self.sync)
+            with self.nest("else:"):
+                self.emit(self.sync)
+                emit_refill()
+                emit_side_loads()
+                if loop_staged:
+                    self.emit(self.sync)
+                    emit_drain(
+                        f"(md_tidx - {32 * TCGEN05_EPILOGUE_WARPS})",
+                        32 * tc.store_warps,
+                    )
         # The epilogue's side loads go out under the last iteration's MMAs.
         if self.epilogue_sites_in_loop:
             with self.nest(f"if {loop} + 1 == {end}:"):
@@ -2747,34 +3738,7 @@ class _Tcgen05Emitter(_Emitter):
                 self.nest(f"if {loop} + 1 < {end}:"),
             ):
                 self.emit_tma_issue(f"({loop} + 1)", "0")
-        # The next iteration's side loads land in their registers while the
-        # MMA runs; the lines of the iteration a ring depth ahead go to L2.
-        if self.prefetched:
-            with self.nest(f"if {loop} + 1 < {end}:"):
-                self.emit_prefetch_loads(f"({loop} + 1)")
-            ahead = max(tc.stages - 1, 2)
-            with self.nest(f"if {loop} + {ahead} < {end}:"):
-                self.emit_line_prefetch(f"({loop} + {ahead})")
-        # The snapshots stream out while the MMA runs: the store warps, or
-        # the epilogue warps when there are none (packing the rows after the
-        # issue instead, with the previous iteration's drain, measured 122
-        # vs 104 us on the s2 forward).
-        loop_staged = [
-            s for s in tc.staged_stores if s.region == "loop" and s.source == "carry_in"
-        ]
-        if loop_staged:
-            if tc.store_warps:
-                nest = self.nest(f"if md_warp >= {TCGEN05_EPILOGUE_WARPS}:")
-                idx, threads = (
-                    f"(md_tidx - {32 * TCGEN05_EPILOGUE_WARPS})",
-                    32 * tc.store_warps,
-                )
-            else:
-                nest = _NoNest()
-                idx, threads = "md_tidx", self.plan.threads
-            with nest:
-                for store in loop_staged:
-                    self.emit_stage_out(store, "md_parity", loop, idx, threads)
+        self.emit_tables_ahead(loop, end, 0)
         if carry_out:
             # A snapshot after the dot: wait for this iteration's MMA.
             self.emit(f"{_RT}.mbar_wait(md_accb, md_parity)")
@@ -2795,6 +3759,7 @@ class _Tcgen05Emitter(_Emitter):
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
             )
+        self.emit_tables_ahead(loop, end, 1)
 
     # -- the program-order loop body ---------------------------------------------
 
@@ -2870,28 +3835,60 @@ class _Tcgen05Emitter(_Emitter):
         batches = [index for index, (_steps, dots) in enumerate(blocks) if dots]
         assert batches, "a loop body without a dot"
         step_commits = len(batches) - 1
+        carry_in = [s for s in program.stores if s.source == "carry_in"]
+        # The loop's derived values' tile inputs (an epilogue derived value
+        # loads its own in the epilogue: hoisted here they would read a
+        # stored tensor ahead of the last iteration's store).
         self.derived_words = {}
-        for step in program.derived:
+        loop_derived = [step for step in program.derived if step.loop >= 0]
+        for step in loop_derived:
             self.emit_derived_prefetch(step)
-        if any(step.loads for step in program.derived):
+        if any(step.loads for step in loop_derived):
             ahead = max(tc.stages - 1, 2)
             with self.nest(f"if {loop} + {ahead} < {end}:"):
                 self.emit_derived_line_prefetch(f"({loop} + {ahead})")
+        # Bulk groups per iteration issued with a batch (a trailing block's
+        # group has no commit behind it and is drained by the next
+        # iteration's first batch).
+        groups = 0
+        pending_stores: list[Store] = self.tma_stores(carry_in)
+        for steps, dots in blocks:
+            pending_stores.extend(
+                self.tma_stores([step for step in steps if isinstance(step, Store)])
+            )
+            if dots and pending_stores:
+                groups += 1
+                pending_stores = []
         with self.nest(f"if {loop} > {begin}:"):
             self.emit(f"{_RT}.mbar_wait(md_accb, md_parity ^ 1)")
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
             )
+        # The passes no dot of the first batch reads run together after the
+        # issue of the batch before their earliest reader (under those MMAs)
+        # instead of ahead of the first barrier, published by the next
+        # block's proxy fence; the window is shorter than a pass, so only its
+        # slack is won (s2: gated fwd_h_delta 372 -> 352 us, dstate 557 ->
+        # 550; a second window and its own fence cost dstate 14 us).
+        late_passes = {} if tc.pass_warps else self.late_pass_windows(blocks)
+        late_window = min(late_passes.values(), default=-1)
+        late_tiles = [t for t in tc.loop_tiles if t.key in late_passes]
+        pass_pending = False
+        passed = {t.key for t in self.pass_tiles()} if tc.pass_warps else set()
+        top_tiles = [
+            t for t in tc.loop_tiles if t.key not in late_passes and t.key not in passed
+        ]
+        pass_batch = self.pass_batch(blocks) if tc.pass_warps else -1
         waited_full = any(
-            tile.route in (ROUTE_INPLACE, ROUTE_CONVERT) for tile in tc.loop_tiles
+            tile.route in (ROUTE_INPLACE, ROUTE_CONVERT) for tile in top_tiles
         )
-        if self.has_passes(tc.loop_tiles):
+        if self.has_passes(top_tiles):
             self.emit_passes(
-                tc.loop_tiles,
+                top_tiles,
                 "md_stage",
                 f"{_RT}.mbar_wait(md_full + (md_stage), md_round)",
                 "md_tidx",
-                self.plan.threads,
+                self.loop_threads,
             )
         if tc.tx_bytes and tc.stages > 1:
             # The slot refilled here was read by the previous iteration's
@@ -2905,7 +3902,6 @@ class _Tcgen05Emitter(_Emitter):
                 self.emit_tma_issue(
                     f"({loop} + {ahead})", f"(md_stage + {ahead}) % {tc.stages}"
                 )
-        carry_in = [s for s in program.stores if s.source == "carry_in"]
         written: set[tuple[object, ...]] = set()
         # Exchange tiles of the carry at loop entry are written in the first
         # block when nothing before their dot rewrites the carry.
@@ -2927,6 +3923,7 @@ class _Tcgen05Emitter(_Emitter):
         batch_index = 0
         # Staged body stores waiting for the barrier of the next batch.
         drains: list[Store] = []
+        tma_snapshots = self.tma_stores(carry_in)
         for index, (steps, dots) in enumerate(blocks):
             if index > 0:
                 previous = batch_index - 1
@@ -2989,38 +3986,68 @@ class _Tcgen05Emitter(_Emitter):
                             dot, loaded, prefix=self.df.new_var("md_rs") + "_"
                         )
                     self.slot_regs = {}
-                if exchanges:
+                    staged_tma = self.tma_stores(
+                        [step for step in steps if isinstance(step, Store)]
+                    )
+                    if staged_tma or (index == 0 and tma_snapshots):
+                        self.emit(
+                            'cute.arch.fence_proxy(kind="async.shared", space="cta")'
+                        )
+                if exchanges or pass_pending:
                     self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+                    pass_pending = False
                 self.emit(
                     f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
                 )
+            elif pass_pending and dots:
+                self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+                pass_pending = False
             if not dots:
                 continue
             self.emit(self.sync)
+            tma_now = [
+                *(tma_snapshots if batch_index == 0 else []),
+                *self.tma_stores(drains),
+            ]
             with self.nest("if md_warp == 0:"):
                 self.emit(
                     f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
                 )
                 if batch_index == 0 and tc.tx_bytes and not waited_full:
                     self.emit(f"{_RT}.mbar_wait(md_full + md_stage, md_round)")
+                if batch_index == pass_batch:
+                    self.emit(f"{_RT}.mbar_wait(md_pass + md_stage, md_round)")
                 for dot in dots:
                     self.emit_dot_mmas(dot, "md_stage", accumulate=dot.acc is not None)
+                if tma_now:
+                    with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                        self.emit_tma_stores(tma_now, "md_parity", loop)
+                        self.emit(
+                            f"{_PRIMS}.cp_async_bulk_wait_group({groups}, read=True)"
+                        )
                 barrier = "md_accb" if batch_index == step_commits else "md_stepb"
                 with self.nest(f"if {_PRIMS}.elect_sync():"):
                     self.emit(
                         f"{_PRIMS}.tcgen05_commit({barrier}, group={_PRIMS}.CTAGroup.CTA_1)"
                     )
+                    if tc.pass_warps and batch_index == step_commits:
+                        self.emit(
+                            f"{_PRIMS}.tcgen05_commit(md_free + md_stage, group={_PRIMS}.CTAGroup.CTA_1)"
+                        )
             for store in drains:
-                self.emit_stage_out(
-                    store, "md_parity", loop, "md_tidx", self.plan.threads
-                )
+                if store.access.node not in tc.store_tma:
+                    self.emit_stage_out(
+                        store, "md_parity", loop, "md_tidx", self.loop_threads
+                    )
             drains = []
             if batch_index == 0:
                 # The snapshots stream out while the first batch runs.
                 loop_staged = [
                     s
                     for s in tc.staged_stores
-                    if s.region == "loop" and s.source == "carry_in"
+                    if s.region == "loop"
+                    and s.source == "carry_in"
+                    and s.access.node not in tc.store_tma
                 ]
                 if loop_staged:
                     if tc.store_warps:
@@ -3031,18 +4058,40 @@ class _Tcgen05Emitter(_Emitter):
                         )
                     else:
                         nest = _NoNest()
-                        idx, threads = "md_tidx", self.plan.threads
+                        idx, threads = "md_tidx", self.loop_threads
                     with nest:
                         for store in loop_staged:
                             self.emit_stage_out(store, "md_parity", loop, idx, threads)
+            if batch_index == late_window:
+                self.emit_passes(
+                    late_tiles,
+                    "md_stage",
+                    f"{_RT}.mbar_wait(md_full + (md_stage), md_round)",
+                    "md_tidx",
+                    self.loop_threads,
+                    fence=False,
+                )
+                pass_pending = True
+            self.emit_tables_ahead(loop, end, batch_index)
             batch_index += 1
         if drains:
             # Body stores of the trailing block drain behind their own barrier.
             self.emit(self.sync)
+            trailing = self.tma_stores(drains)
+            if trailing:
+                with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                    self.emit_tma_stores(trailing, "md_parity", loop)
+                    if not groups:
+                        # No batch waits in this loop: the previous
+                        # iteration's group is read out here, before the
+                        # commit of the next iteration's batch that the
+                        # stage-in reusing its buffer waits on.
+                        self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(1, read=True)")
             for store in drains:
-                self.emit_stage_out(
-                    store, "md_parity", loop, "md_tidx", self.plan.threads
-                )
+                if store.access.node not in tc.store_tma:
+                    self.emit_stage_out(
+                        store, "md_parity", loop, "md_tidx", self.loop_threads
+                    )
         if tc.tx_bytes and tc.stages == 1:
             # Refill after every batch read the slot (the next iteration's
             # acc wait is then immediate).
@@ -3053,6 +4102,7 @@ class _Tcgen05Emitter(_Emitter):
                 self.nest(f"if {loop} + 1 < {end}:"),
             ):
                 self.emit_tma_issue(f"({loop} + 1)", "0")
+        self.emit_tables_ahead(loop, end, step_commits + 1)
 
     # -- epilogue -----------------------------------------------------------------
 
