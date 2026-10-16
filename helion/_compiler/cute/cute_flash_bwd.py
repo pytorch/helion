@@ -2628,7 +2628,7 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
 def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     """Enable the bwd flash search surface for the FlexAttention backward
     envelope (pins the KV tile and the Q tile to 128 rows; the list walk has
-    no persistent or 2-CTA variant)."""
+    a CLC persistent variant but no 2-CTA one)."""
     from ..backend import _flash_block_sizes_reachable
     from ..compile_environment import CompileEnvironment
     from .flex_bwd_match import match_flex_attention_bwd
@@ -2649,7 +2649,7 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=False,
-        persistent_allowed=False,
+        persistent_allowed=True,
         flex=True,
         tile_groups=fbwd_tile_group_choices(match.plan),
         fast_math=bool(env.settings.fast_math),
