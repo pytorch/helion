@@ -4173,6 +4173,24 @@ def _codegen_cute_store_tcgen05_tile(
                     f"{rec.aux_rmem}.load()\n"
                 )
                 continue
+            if tcgen05_value.output_column_major and unconditional_full_tile:
+                # Column-major broadcasts may retain a nested R2S profile while
+                # the accumulator carrier is flat. Materialize the broadcast
+                # into the carrier profile, preserving its coordinates and the
+                # original order of the epilogue's FP32 operations.
+                lines.extend(
+                    (
+                        (
+                            f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                            f"{rec.ttr_aux_grouped}"
+                            f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        ),
+                        _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        ),
+                    )
+                )
+                continue
             if rowvec_stage is None and unconditional_full_tile:
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
@@ -4438,7 +4456,8 @@ def _codegen_cute_store_tcgen05_tile(
     grouped_tma_plan = matmul_plan if grouped_tail_epilogue or segment_store else None
     grouped_tma = grouped_tma_plan.grouped if grouped_tma_plan is not None else None
     d_tma_uses_rank3_mnl_tensor = (
-        (row_union is not None and row_union.schedule is not None)
+        (tcgen05_value.output_column_major and not leading_passthrough_output)
+        or (row_union is not None and row_union.schedule is not None)
         or grouped_fixed_d_tensormap
         or (
             grouped_tma is not None

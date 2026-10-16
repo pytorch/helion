@@ -9269,23 +9269,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         k_fragment = MagicMock()
         k_fragment.low = 16
         k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-        spec = MagicMock()
-        spec._tcgen05_matmul_block_fragments.return_value = (
-            MagicMock(),
-            MagicMock(),
-            k_fragment,
-        )
-        spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
-            CuteTcgen05Config.cluster_m2_bk_is_valid
-        )
-        spec._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+        state = CuteTcgen05Config(MagicMock())
+        state.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
             static_k=128,
             max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
             allow_edge_k_tail_family=True,
         )
         env = MagicMock()
-        env.config_spec = spec
-        self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
+        env.config_spec._cute_tcgen05_config = state
+        with (
+            patch.object(
+                state,
+                "_matmul_block_fragments",
+                return_value=(MagicMock(), MagicMock(), k_fragment),
+            ),
+            patch.object(state, "_matmul_block_indices", return_value=(0, 1, 2)),
+        ):
+            self.assertEqual(state.cluster_m2_seed_bk_choices(), ())
+            self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family(

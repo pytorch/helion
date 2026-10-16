@@ -3811,6 +3811,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate,
                                 mma_candidates[0][3],
                                 allocation_graphs,
+                                allow_fp8_broadcasts=(
+                                    len(device_ir.root_ids) == 1
+                                    and env.cute_fission_plan is None
+                                ),
                                 capacity_bytes=(
                                     tcgen05_config.per_cta_smem_capacity_bytes(
                                         lhs.device
