@@ -1,0 +1,726 @@
+{
+  "schema_version": 1,
+  "policy_version": "kda-flashkda-prefill-low-2026-10-09+k7-bf16-head-l2-2026-10-09+k8-bf16-head-l2-2026-10-09+k13-state-fixed-0.003-l2-diagnostic-2026-10-12+k19-sglang-bf16-reference-2026-10-12+k7-head-l2-0.01-bf16-0.0015-fp16-20261012+k11-output-l2-0.006-state-0.005-0.016-l2-0.01-2026-10-12+k19-sglang-fused-fp32-routing-reference-2026-10-13+k19-bf16-rtol-0.008-2026-10-13+k19-fixed-row-cublas-first-projection-2026-10-13",
+  "shared": {
+    "oracle_dtype": "float64",
+    "oracle_final_rounding": false,
+    "finite_outputs": true,
+    "zero_reference_norm": "elementwise_and_structural_zero",
+    "conventional_matmul_tf32": false,
+    "calibration_target_multiplier": 2,
+    "calibration_status": "REQUIRES_WORKLOAD_CALIBRATION"
+  },
+  "kernels": {
+    "grouped_gemm_bf16": {
+      "id": "K1",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_expert"
+            ]
+          }
+        }
+      },
+      "reference_checks": {},
+      "rules": {}
+    },
+    "scaled_mm": {
+      "id": "K2",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global"
+            ]
+          }
+        }
+      },
+      "reference_checks": {},
+      "rules": {}
+    },
+    "mxfp8_dense_gemm": {
+      "id": "K3",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global"
+            ]
+          }
+        }
+      },
+      "reference_checks": {},
+      "rules": {}
+    },
+    "top_k_varlen": {
+      "id": "K4",
+      "outputs": {},
+      "reference_checks": {},
+      "rules": {
+        "comparison": "exact_values_and_indices",
+        "atol": 0,
+        "rtol": 0,
+        "order": "free",
+        "ties": "any_valid_unique_ids",
+        "padding_values": "-inf",
+        "padding_indices": -1
+      }
+    },
+    "moe_topk_softmax": {
+      "id": "K5",
+      "outputs": {
+        "output": {
+          "float32": {
+            "atol": 2e-06,
+            "rtol": 2e-05
+          }
+        }
+      },
+      "reference_checks": {},
+      "rules": {
+        "selection": "exact_fp32_probability_multiset",
+        "weight_reference": "fp64_at_returned_ids",
+        "order": "free"
+      }
+    },
+    "top_k_top_p_sampling": {
+      "id": "K6",
+      "outputs": {},
+      "reference_checks": {
+        "input_row_sum": {
+          "atol": 1e-05,
+          "rtol": 0
+        }
+      },
+      "rules": {
+        "comparison": "support_and_distribution",
+        "indices_dtype": "int32",
+        "top_k_ties": "inclusive",
+        "top_p_rule": "strictly_larger_mass_less_than_fp32_p",
+        "familywise_alpha": 1e-06,
+        "advancement_alpha": 1e-06,
+        "miss_probability": 0.05,
+        "benchmark_draws_per_row": 16,
+        "qualification_draws_per_row": 1024,
+        "qualification_rows": 32,
+        "atol": 0,
+        "rtol": 0,
+        "audit_draws": 8
+      }
+    },
+    "batch_prefill_paged_attention": {
+      "id": "K7",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "group_l2_limit": 0.01,
+            "l2_scope": [
+              "global",
+              "per_query_head"
+            ]
+          },
+          "float16": {
+            "atol": 0.003,
+            "rtol": 0.003,
+            "l2_limit": 0.001,
+            "l2_scope": [
+              "global",
+              "per_query_head"
+            ],
+            "group_l2_limit": 0.0015
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-05,
+          "rtol": 1e-05
+        }
+      },
+      "rules": {
+        "structural_zeros": "exact_input_derived",
+        "probability_rounding": "input_dtype_before_pv"
+      }
+    },
+    "batch_decode_paged_attention": {
+      "id": "K8",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "group_l2_limit": 0.006,
+            "l2_scope": [
+              "global",
+              "per_query_head"
+            ]
+          },
+          "float16": {
+            "atol": 0.003,
+            "rtol": 0.003,
+            "l2_limit": 0.001,
+            "l2_scope": [
+              "global",
+              "per_query_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-05,
+          "rtol": 1e-05
+        }
+      },
+      "rules": {
+        "structural_zeros": "exact_input_derived",
+        "probability_rounding": "input_dtype_before_pv"
+      }
+    },
+    "rms_norm": {
+      "id": "K9",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          },
+          "float16": {
+            "atol": 0.003,
+            "rtol": 0.003,
+            "l2_limit": 0.001,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          },
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 1e-05,
+            "l2_limit": 1e-05,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-05,
+          "rtol": 1e-05
+        }
+      },
+      "rules": {
+        "structural_zeros": "exact_input_derived"
+      }
+    },
+    "fused_add_rms_norm": {
+      "id": "K10",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.02,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          },
+          "float16": {
+            "atol": 0.003,
+            "rtol": 0.003,
+            "l2_limit": 0.001,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          },
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 1e-05,
+            "l2_limit": 1e-05,
+            "l2_scope": [
+              "global",
+              "per_row"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-05,
+          "rtol": 1e-05
+        }
+      },
+      "rules": {
+        "structural_zeros": "exact_input_derived",
+        "residual_comparison": "exact_fp32_add_then_input_dtype"
+      }
+    },
+    "kda_prefill": {
+      "id": "K11",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.005,
+            "rtol": 0.016,
+            "l2_limit": 0.006,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 0.005,
+            "rtol": 0.016,
+            "l2_limit": 0.01,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-08,
+          "rtol": 1e-08
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures"
+      },
+      "aliases": [
+        "kda_prefill_high"
+      ],
+      "precision": "high"
+    },
+    "kda_decode": {
+      "id": "K12",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.005,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 0.0001,
+            "l2_limit": 0.0001,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-10,
+          "rtol": 1e-09
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures"
+      },
+      "aliases": [
+        "kda_decode_high"
+      ],
+      "precision": "high"
+    },
+    "mamba2_ssd": {
+      "id": "K13",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.005,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 0.003,
+            "rtol": 0.003,
+            "l2_limit": null,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-10,
+          "rtol": 1e-09
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures"
+      }
+    },
+    "mamba2_decode": {
+      "id": "K14",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.005,
+            "rtol": 0.016,
+            "l2_limit": 0.005,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 0.0001,
+            "l2_limit": 0.0001,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-10,
+          "rtol": 1e-09
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures"
+      }
+    },
+    "cross_entropy": {
+      "id": "K15",
+      "outputs": {
+        "loss": {
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 2e-05
+          },
+          "bfloat16": {
+            "atol": 2e-05,
+            "rtol": 0.008
+          }
+        },
+        "gradient": {
+          "float32": {
+            "atol": 2e-08,
+            "rtol": 2e-05
+          },
+          "bfloat16": {
+            "atol": 2e-08,
+            "rtol": 0.008
+          }
+        }
+      },
+      "reference_checks": {
+        "loss": {
+          "atol": 2e-05,
+          "rtol": 2e-05
+        },
+        "gradient": {
+          "atol": 2e-08,
+          "rtol": 2e-05
+        }
+      },
+      "rules": {
+        "gradient_oracle_final_rounding": true,
+        "structural_zeros": "exact_ignored_or_singleton"
+      }
+    },
+    "grpo_loss": {
+      "id": "K16",
+      "outputs": {
+        "loss": {
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 0.0001
+          }
+        },
+        "kl": {
+          "float32": {
+            "atol": 1e-05,
+            "rtol": 0.0001
+          }
+        },
+        "gradient": {
+          "bfloat16": {
+            "atol": 1e-07,
+            "rtol": 0.02,
+            "l2_limit": 0.01,
+            "l2_scope": [
+              "global"
+            ]
+          }
+        },
+        "clip_fraction": {
+          "float32": {
+            "atol": 0,
+            "rtol": 0,
+            "comparison": "exact"
+          }
+        }
+      },
+      "reference_checks": {
+        "loss": {
+          "atol": 1e-12,
+          "rtol": 1e-12
+        },
+        "gradient": {
+          "atol": 1e-12,
+          "rtol": 1e-10
+        }
+      },
+      "rules": {
+        "clip_policy": "fp32-fp64-ratio-band-v1",
+        "clip_calibration_factor": 2.0,
+        "clip_fraction": "exact_permitted_fp32_count_divided_by_denominator",
+        "gradient_elementwise_oracle_final_rounding": true,
+        "gradient_l2_oracle_final_rounding": false,
+        "structural_zeros": "exact_masked_or_unused"
+      }
+    },
+    "nvfp4_quantize": {
+      "id": "K17",
+      "outputs": {},
+      "reference_checks": {},
+      "rules": {
+        "comparison": "byte_exact",
+        "atol": 0,
+        "rtol": 0,
+        "recipe": "transformer_engine_block16"
+      }
+    },
+    "mxfp8_quantize": {
+      "id": "K18",
+      "outputs": {},
+      "reference_checks": {},
+      "rules": {
+        "comparison": "byte_exact",
+        "atol": 0,
+        "rtol": 0,
+        "recipes": [
+          "flashinfer-rp",
+          "aiter-convert-even",
+          "aiter-dynamic",
+          "vllm-rp",
+          "te-rp",
+          "torchao-rceil"
+        ]
+      }
+    },
+    "moe_bf16_prerouted": {
+      "id": "K19",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.01,
+            "rtol": 0.008,
+            "l2_limit": null,
+            "l2_scope": [
+              "global",
+              "per_token"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 1e-10,
+          "rtol": 1e-10
+        }
+      },
+      "rules": {
+        "intermediate_rounding": [
+          "bf16_after_first_projection",
+          "fp32_swiglu_then_bf16",
+          "fp32_second_projection_and_route_weights",
+          "bf16_weighted_contributions",
+          "bf16_final_sum"
+        ],
+        "structural_zeros": "exact_input_derived_only"
+      },
+      "reference": {
+        "kind": "torch_bf16_moe",
+        "oracle_dtype": "bfloat16",
+        "oracle_final_rounding": true,
+        "comparison_dtype": "float64",
+        "framework": "PyTorch eager",
+        "upstream_commit": "e00930c5489053f26d86b179cee0d087f846acbb",
+        "implementation": "shared PyTorch reference; no SGLang imports",
+        "upstream_source": "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py",
+        "upstream_function": "fused_experts_impl",
+        "weighting": "FP32 down-projection accumulator times live FP32 route weights before BF16 storage",
+        "tolerance_source": "test/registered/moe/test_fused_moe.py",
+        "first_projection": "cuBLAS strided-batched BF16 GEMM for all tokens per expert; gather supplied routes after projection"
+      }
+    },
+    "moe_token_permutation": {
+      "id": "K20",
+      "outputs": {},
+      "reference_checks": {},
+      "rules": {
+        "comparison": "byte_exact",
+        "atol": 0,
+        "rtol": 0,
+        "within_expert_order": "free",
+        "inverse_indices": "exact_bijection",
+        "duplicate_slots": "distinct"
+      }
+    },
+    "kda_prefill_low": {
+      "id": "K21",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.01,
+            "rtol": 0.01,
+            "l2_limit": null,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 0.01,
+            "rtol": 0.01,
+            "l2_limit": null,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 0,
+          "rtol": 0
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures",
+        "precision_contract": "Agreement with pinned native FlashKDA output and FP32 final state; no eager substitution",
+        "tolerance_source": "FlashInfer FlashKDA peer checks: elementwise atol=rtol=0.01 for output and final state; relative L2 is diagnostic only"
+      },
+      "aliases": [],
+      "precision": "low",
+      "reference": {
+        "kind": "flashkda_prefill",
+        "oracle_dtype": "native",
+        "oracle_final_rounding": true,
+        "comparison_dtype": "float64",
+        "framework": "FlashKDA native CUDA",
+        "upstream_repository": "https://github.com/MoonshotAI/FlashKDA",
+        "upstream_commit": "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b",
+        "upstream_function": "flash_kda._fwd_raw",
+        "adapter": "Clone live FP32 initial state; native BF16 output and FP32 final state widened losslessly to FP64 for error measurement",
+        "normalization": "Native FlashKDA Q/K normalization with epsilon 1e-6",
+        "supported_contract": "CUDA bounded prefill; unsupported devices or gates require an explicit unavailable result"
+      }
+    },
+    "kda_decode_low": {
+      "id": "K22",
+      "outputs": {
+        "output": {
+          "bfloat16": {
+            "atol": 0.01,
+            "rtol": 0.01,
+            "l2_limit": 0.01,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        },
+        "state": {
+          "float32": {
+            "atol": 0.01,
+            "rtol": 0.01,
+            "l2_limit": 0.01,
+            "l2_scope": [
+              "global",
+              "per_sequence_head"
+            ]
+          }
+        }
+      },
+      "reference_checks": {
+        "default": {
+          "atol": 0,
+          "rtol": 0
+        }
+      },
+      "rules": {
+        "state_indices": "valid_source_indices",
+        "structural_zeros": "only_input_derived_contract_fixtures",
+        "precision_contract": "Upstream-style eager FP32 recurrence with BF16 state/output rounding; FP32 state storage ABI",
+        "tolerance_source": "FlashInfer eager-reference checks use atol=rtol=0.01; this suite additionally limits global and per-sequence/head relative L2 to 0.01"
+      },
+      "aliases": [],
+      "precision": "low",
+      "reference": {
+        "kind": "flashinfer_eager_decode",
+        "oracle_dtype": "float32",
+        "oracle_final_rounding": true,
+        "comparison_dtype": "float64",
+        "upstream_repository": "https://github.com/flashinfer-ai/flashinfer",
+        "upstream_commit": "4d75a33f19aaf48b44d5b1c5dbca33bc1eca5c58",
+        "upstream_file": "tests/kda/test_packed_kda_decode.py",
+        "upstream_function": "_reference_step",
+        "state_rounding": "BF16 source and updated state; output projects before the final state rounding",
+        "adapter": "Immutable indexed sources, arbitrary head counts and softplus gates; BF16 source/state and token output widened losslessly to FP64 for error measurement",
+        "normalization": "FP32 rsqrt(sum(q*q)+1e-6); normalized Q/K stay FP32"
+      }
+    }
+  }
+}
