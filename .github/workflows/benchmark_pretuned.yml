@@ -236,15 +236,25 @@ jobs:
           print(f'Device: {torch.cuda.get_device_name(0)}')
           "
 
+      - name: XPU Compute Check
+        if: inputs.alias == 'xpu'
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import torch
+
+          assert torch.xpu.is_available(), "FATAL: XPU not available"
+          print(f"Device: {torch.xpu.get_device_name(0)}")
+          PY
+
       - name: Install tritonbench
-        # The cudagraph-timed kernels (scaled_mm + fp8/quant ports) use
-        # tritonbench's _do_bench_cudagraph_with_cache_clear, which clears the L2
-        # cache each iteration (triton.testing.do_bench_cudagraph does not, so it
-        # under-reports latency for graphs that replay the same inputs). Only the
-        # do_bench component is needed, so install the package alone (--no-deps).
+        # Graph-timed kernels use tritonbench's cache-clearing device-graph timer;
+        # triton.testing.do_bench_cudagraph does not clear L2 and under-reports
+        # latency for graphs that replay the same inputs. Only the do_bench
+        # component is needed, so install the package alone (--no-deps).
         # Required (no fallback): pretuned_kernels/_bench.py errors without it, so
         # this step must succeed for cudagraph kernels to benchmark.
-        if: startsWith(inputs.image, 'nvidia')
+        if: startsWith(inputs.image, 'nvidia') || inputs.alias == 'xpu'
         run: |
           source .venv/bin/activate
           mkdir -p benchmarks/ && pushd benchmarks/
