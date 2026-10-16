@@ -8393,12 +8393,22 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # Exception: backends that set allow_wide_persistent_reduction use the
         # single-iteration looped path for register caching (in_local[] across
         # reduce+normalize passes), so preserve chunk >= size_hint for them.
-        if isinstance(normalized, int) and normalized >= self.size_hint:
-            if (
-                normalized & (normalized - 1) == 0
-                and normalized != self._full_extent_chunk()
-            ) or not self.allow_wide_persistent:
-                return None
+        # Collapse a chunk >= extent to persistent None, matching _flat_config's
+        # preservation rules: keep the explicit full-extent full-loop token, keep
+        # an exact non-power-of-two full chunk, and (FlyDSL) keep everything when
+        # the backend register-caches the single-iteration looped path.
+        if (
+            isinstance(normalized, int)
+            and normalized >= self.size_hint
+            and not self.allow_wide_persistent
+            and normalized != self._full_extent_chunk()
+            and not (
+                self.allow_non_power_of_two
+                and normalized == self.size_hint
+                and normalized & (normalized - 1) != 0
+            )
+        ):
+            return None
 
         return normalized
 
