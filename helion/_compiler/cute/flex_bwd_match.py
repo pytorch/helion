@@ -166,10 +166,19 @@ class FlexBwdPlan:
         return self.kv_seq % 128 != 0
 
     @property
+    def num_q_tiles_padded(self) -> int:
+        """128-row Q tiles the list walk can visit: every listed Q block of
+        ``q_block`` rows expands to ``q_block // 128`` tiles, so a ragged
+        last block reaches past ``ceil(q_seq / 128)`` (those tiles hold no
+        valid rows: the TMA unit zero-fills them and the stagings clamp)."""
+        q_block = self.walk.q_block
+        return -(-self.q_seq // q_block) * (q_block // 128)
+
+    @property
     def max_steps(self) -> int:
         """Upper bound of the Q-tile steps of one KV tile: every Q block of
         every q head of the group, in 128-row tiles."""
-        return self.group * self.num_q_tiles
+        return self.group * self.num_q_tiles_padded
 
 
 @dataclasses.dataclass(frozen=True)
@@ -532,7 +541,7 @@ def match_flex_attention_bwd(
     root_facts = _match_root(ctx, root)
     if root_facts is None:
         return None
-    group_loop, k_root, v_root, dv_full, dk_full = root_facts
+    group_loop, k_root, v_root, dv_full, dk_full, dk_factor = root_facts
     outers = _match_group_graph(ctx, group_loop)
     if outers is None:
         return None
@@ -545,7 +554,9 @@ def match_flex_attention_bwd(
         if body is None:
             return None
         nests.append((outer, inner, body))
-    return _assemble(ctx, root, group_loop, k_root, v_root, dv_full, dk_full, nests)
+    return _assemble(
+        ctx, root, group_loop, k_root, v_root, dv_full, dk_full, dk_factor, nests
+    )
 
 
 # -- root --------------------------------------------------------------------------
@@ -554,7 +565,14 @@ def match_flex_attention_bwd(
 def _match_root(
     ctx: _BwdCtx, root: GraphInfo
 ) -> (
-    tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, torch.fx.Node, torch.fx.Node]
+    tuple[
+        torch.fx.Node,
+        torch.fx.Node,
+        torch.fx.Node,
+        torch.fx.Node,
+        torch.fx.Node,
+        object,
+    ]
     | None
 ):
     """The root: ``k_j = key[b, hk, tile_n, :]``, ``v_j = value[...]``, two fp32
@@ -648,6 +666,7 @@ def _match_root(
     ctx.group = group
     # The accumulators are loop inputs whose results the stores consume.
     dv_full = dk_full = None
+    dk_factor: object = None
     for store in stores:
         value = store.args[2]
         index = store.args[1]
@@ -665,9 +684,11 @@ def _match_root(
             return None
         inner: object = _strip_identity(value.args[0])
         scaled = False
+        factor: object = None
         if _is_call(inner, _aten.mul.Tensor):
             assert isinstance(inner, torch.fx.Node)
             scaled = True
+            factor = inner.args[1]
             inner = _strip_identity(inner.args[0])
         phi_input = _phi_source(inner)
         if phi_input is None or phi_input not in inputs:
@@ -675,6 +696,7 @@ def _match_root(
             return None
         if scaled:
             dk_full = phi_input
+            dk_factor = factor
         else:
             dv_full = phi_input
     if dv_full is None or dk_full is None or dv_full is dk_full:
@@ -683,7 +705,7 @@ def _match_root(
     if dv_full not in fulls or dk_full not in fulls:
         ctx.decline("flex_bwd: the stored accumulators are not the root's zero tiles")
         return None
-    return loop, k_root, v_root, dv_full, dk_full
+    return loop, k_root, v_root, dv_full, dk_full, dk_factor
 
 
 def _phi_source(node: object) -> torch.fx.Node | None:
@@ -1509,11 +1531,17 @@ def _assemble(
     v_root: torch.fx.Node,
     dv_full: torch.fx.Node,
     dk_full: torch.fx.Node,
+    dk_factor: object,
     nests: list[tuple[_Outer, _Inner, _Body]],
 ) -> FlexBwdMatch | None:
     (full_outer, full_inner, full_body), (part_outer, part_inner, part_body) = nests
     if full_body.regions.mask is not None:
         ctx.decline("flex_bwd: the first (full) list body must not carry a mask")
+        return None
+    # The emitter scales dK by the softmax scale of the scores: the store's
+    # factor must be that scale (literal or host scalar), nothing else.
+    if not _same_scale(ctx, dk_factor, part_body.scale_literal, part_body.scale_symbol):
+        ctx.decline("flex_bwd: the dK store factor is not the softmax scale")
         return None
     same = (
         full_body.q_name == part_body.q_name

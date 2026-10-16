@@ -582,7 +582,10 @@ def fbwd_p_pairs_packed(
             (scale2, scale2),
             (-lse_any[2 * v], -lse_any[2 * v + 1]),
         )
-        if emu_res > 0 and (2 * v) % 16 >= 16 - emu_res:
+        # The split is by the element's position in the row (``off`` + pair),
+        # so it holds for every hook group width (a 8-lane call covers half a
+        # 16-element period).
+        if emu_res > 0 and (off + 2 * v) % 16 >= 16 - emu_res:
             a, b = ex2_emulation_deg2_2(a, b)  # pyrefly: ignore[bad-argument-type]
         elif exp2_f32:
             a = cute.arch.exp2(a)
@@ -765,10 +768,6 @@ def flash_bwd_2cta_shared_storage(
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-        # the step's dK MMA (the last reader of the dS staging) complete
-        dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-        # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
-        flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
         ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         s_read_mbar: cute.struct.MemRange[cutlass.Int64, 1]

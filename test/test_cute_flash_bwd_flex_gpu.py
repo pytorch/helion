@@ -15,6 +15,10 @@ FlexAttention semantics) within bf16 tolerance:
   a softcap score_mod with a non-identity ``score_mod_bwd`` (the Jacobian
   hook);
 * a mask leaving whole KV tiles unattended (empty step tables store zeros);
+* the non-default knobs: the CLC persistent walk, statistics through the MMAs,
+  dS^T through TMEM, the polynomial exp2 share, the per-element mask form, hook
+  group widths, register splits, the KV-fastest block order, the gathered aux
+  table staged in shared memory;
 * repeated launches give stable gradients.
 """
 
@@ -123,7 +127,11 @@ def _run(
     ref_score_mod: Callable[..., torch.Tensor] | None = None,
     repeats: int = 1,
     seed: int = 0,
+    config_overrides: dict[str, object] | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
+    """Run the example backward on the fused CuTe path with the default config
+    (``config_overrides``: knob values on top of it) and return the gradients,
+    the fp32 reference gradients and the generated code."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     dtype = torch.bfloat16
     q = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
@@ -159,6 +167,13 @@ def _run(
     )
     bound = kernel.bind(args)
     config = bound.config_spec.default_config()
+    if config_overrides:
+        import helion
+
+        fields = bound.config_spec._flat_fields()
+        for key in config_overrides:
+            assert key in fields, f"{key} is not a knob of this kernel"
+        config = helion.Config(**{**config.config, **config_overrides})
     code = bound.to_code(config)
     assert "fbwd_sSteps" in code, "the fused flex backward did not fire"
     bound.set_config(config)
@@ -271,6 +286,87 @@ def test_score_mod_table_gather() -> None:
         ref_score_mod=ref_score_mod,
     )
     assert "_flash_aux0" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # The CLC persistent walk with the statistics MMAs, dS^T through TMEM,
+        # the polynomial exp2 share, the per-element mask form, 8-lane hooks
+        # and the KV-fastest block order.
+        {
+            "cute_flash_bwd_persistent": 1,
+            "cute_flash_bwd_stats_mma": 1,
+            "cute_flash_bwd_ds_tmem": 1,
+            "cute_flash_bwd_exp2_emu": 8,
+            "cute_flash_bwd_mask_form": "element",
+            "cute_flash_bwd_hook_cols": 8,
+            "cute_flash_bwd_tile_group": 0,
+        },
+        # Non-persistent with the statistics MMAs, the packed f16x2 exp2 pair
+        # and the widest register split for the compute warps.
+        {
+            "cute_flash_bwd_stats_mma": 1,
+            "cute_flash_bwd_exp2_f32": 0,
+            "cute_flash_bwd_regs": "88/168/88",
+            "cute_flash_bwd_hook_pin": 0,
+        },
+    ],
+)
+def test_causal_non_default_knobs(overrides: dict[str, object]) -> None:
+    got, ref, code = _run(
+        b=2,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=64,
+        mask_mod=_causal,
+        config_overrides=overrides,
+    )
+    if overrides.get("cute_flash_bwd_persistent"):
+        assert "fbwd_tissued_ptr" in code
+    if overrides.get("cute_flash_bwd_ds_tmem"):
+        assert "gemm_ptx_precomputed_pv_ts(fbwd_dk_addr" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize("aux_smem", [0, 4096])
+def test_gathered_table_score_mod(aux_smem: int) -> None:
+    # graphormer-style: a per-(b, q, kv) index table selects a row of a small
+    # per-head bias table; with the budget the bias table is staged in smem.
+    index = torch.randint(0, 7, (1, 256, 256), device=DEVICE, dtype=torch.int32)
+    bias = torch.randn((2, 7), device=DEVICE, dtype=torch.float32)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        import helion.language as hl
+
+        dist = hl.load(index, [b, q_idx, kv_idx])
+        return score + hl.load(bias, [h, dist])
+
+    def ref_score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[h, index[b, q_idx, kv_idx]]
+
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=64,
+        score_mod=score_mod,
+        mask_mod=_causal,
+        ref_score_mod=ref_score_mod,
+        config_overrides={
+            "cute_flash_bwd_aux_smem": aux_smem,
+            "cute_flash_bwd_bias_fold": 0,
+            "cute_flash_bwd_hook_cols": 16,
+        },
+    )
+    assert ("flash_flex_aux_smem" in code) == (aux_smem > 0)
     _assert_close(got, ref)
 
 

@@ -40,6 +40,7 @@ from helion.runtime.kernel import Kernel
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    import pathlib
 
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
@@ -224,6 +225,11 @@ def test_causal_mask_plan_and_surface() -> None:
     assert config.config["cute_flash_bwd_exp2_emu"] == 0
     # dS^T through TMEM for the dK MMA is offered at head dim 64 (off first).
     assert config.config["cute_flash_bwd_ds_tmem"] == 0
+    # A mask without a score_mod: the mask form and the hook knobs are searched,
+    # the additive-bias fold (nothing to fold) is not.
+    fields = spec._flat_fields()
+    assert "cute_flash_bwd_mask_form" in fields and "cute_flash_bwd_hook_cols" in fields
+    assert "cute_flash_bwd_bias_fold" not in fields
     # No gathered aux table: nothing to stage, no staging knob.
     assert fbwd_aux_smem_candidates(plan) == ()
     assert "cute_flash_bwd_aux_smem" not in spec._flat_fields()
@@ -259,6 +265,7 @@ def test_additive_bias_score_mod_is_an_lse_fold() -> None:
     assert len(plan.aux_buffers) == 1 and plan.aux_buffers[0].shape == (4, 1023)
     g = additive_bias_region(plan)
     assert g is not None
+    assert "cute_flash_bwd_bias_fold" in bound.config_spec._flat_fields()
     # The fold's region is the bias alone: the score placeholder is unused.
     score_ph = next(n for n in g.graph.nodes if n.op == "placeholder")
     assert score_ph.target == "score" and not score_ph.users
@@ -337,6 +344,37 @@ def test_declines_head_dim_192() -> None:
     reasons: list[str] = []
     assert _match(_bind(_args(t, _causal)), reasons) is None
     assert any("head dims" in r for r in reasons), reasons
+
+
+def test_q_block_256_pads_the_step_table() -> None:
+    # Ragged M with 256-row Q blocks: the last block's second 128-row tile
+    # lies past M; the table and the hook bounds cover it.
+    t = _tensors(q_seq=300, kv_seq=512)
+    bound = _bind(_args(t, _causal, block_size=(256, 128)))
+    match = _match_or_fail(bound)
+    plan = match.plan
+    assert plan.walk.q_block == 256
+    assert plan.num_q_tiles == 3 and plan.num_q_tiles_padded == 4
+    assert plan.max_steps == plan.group * 4
+
+
+def test_declines_dk_store_with_another_factor(tmp_path: pathlib.Path) -> None:
+    # The emitter scales dK by the softmax scale: a store with any other
+    # factor must not match (it would silently get the wrong dK).
+    source = (EXAMPLES_DIR / "flex_attention.py").read_text()
+    old = "(dk_acc * scale)[None, None, :, :].to(dk.dtype)"
+    assert source.count(old) == 1
+    path = tmp_path / "flex_attention_dk_factor.py"
+    path.write_text(
+        source.replace(old, "(dk_acc * 2.0)[None, None, :, :].to(dk.dtype)")
+    )
+    kernel = _cute_kernel(import_path(path).helion_flex_attention_backward_kernel)
+    t = _tensors()
+    with _as_sm100():
+        bound = kernel._bind_isolated(_args(t, _causal))
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert any("dK store factor" in r for r in reasons), reasons
 
 
 def test_declines_kv_block_other_than_128() -> None:

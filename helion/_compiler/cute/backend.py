@@ -1009,7 +1009,10 @@ def _detect_flex_attention_bwd_loop(
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
     from .flex_bwd_match import match_flex_attention_bwd
+    from .flex_match import FLEX_PLAN_ENABLED
 
+    if not FLEX_PLAN_ENABLED:
+        return False
     device_ir = HostFunction.current().device_ir
     root_grid_ids = device_ir.grid_block_ids[0]
     if len(block_ids) != 1 or block_ids[0] in root_grid_ids:

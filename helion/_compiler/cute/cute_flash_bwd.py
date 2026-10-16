@@ -2632,7 +2632,10 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     from ..backend import _flash_block_sizes_reachable
     from ..compile_environment import CompileEnvironment
     from .flex_bwd_match import match_flex_attention_bwd
+    from .flex_match import FLEX_PLAN_ENABLED
 
+    if not FLEX_PLAN_ENABLED:
+        return False
     if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 3:
         return False
     env = CompileEnvironment.current()
@@ -2644,6 +2647,7 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     targets = {match.kv_block_id: 128, match.q_block_id: 128}
     if not _flash_block_sizes_reachable(env, targets):
         return False
+    from .cute_flash_bwd_flex import additive_bias_region
     from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
     from .cute_flash_bwd_flex import fbwd_tile_group_choices
 
@@ -2656,5 +2660,8 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         fast_math=bool(env.settings.fast_math),
         aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
         ds_tmem_allowed=match.plan.head_dim == 64,
+        has_mask=match.plan.mask_region is not None,
+        has_score=match.plan.score_region is not None,
+        additive_bias=additive_bias_region(match.plan) is not None,
     )
     return True
