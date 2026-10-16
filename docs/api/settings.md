@@ -93,7 +93,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    - For Pallas backend, this is initialized from the ``JAX_DEFAULT_MATMUL_PRECISION`` environment variable (defaulting to ``"default"``).
 
    Supported values depend on the backend:
-   - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
+   - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``, ``"hf32"``
    - Pallas (TPU): ``"default"``, ``"high"``, ``"highest"`` and portable Triton aliases are accepted.
 
    However, unified mappings exist so you can use any value on any backend:
@@ -393,7 +393,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
-| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
+| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``, ``"hf32"``). This variable does not apply to the Pallas backend. |
 | ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |

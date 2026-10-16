@@ -31,6 +31,13 @@ CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
+# Constructor sentinel distinguishing "not passed" from an explicit None for
+# num_warps/num_stages: None there defers the choice to the backend's driver,
+# while every other core property treats an omitted/None argument as "unset".
+# Typed as int so the parameters stay `int | None` (an `| object` union would
+# collapse to object and disable checking); identity comparison still works.
+_NUM_THREADS_UNSET = cast("int", object())
+
 
 class Config(Mapping[str, object]):
     config: dict[str, object]
@@ -77,8 +84,8 @@ class Config(Mapping[str, object]):
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
-        num_warps: int | None = None,
-        num_stages: int | None = None,
+        num_warps: int | None = _NUM_THREADS_UNSET,
+        num_stages: int | None = _NUM_THREADS_UNSET,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
@@ -273,7 +280,14 @@ class Config(Mapping[str, object]):
             "reduction_fusion": reduction_fusion,
         }
         for key, value in core_props.items():
-            if value is not None:
+            # For num_warps/num_stages an explicit None (deferral to the
+            # backend's driver) is kept in the config dict so it survives
+            # to_json/from_json round-trips through the autotune caches;
+            # _NUM_THREADS_UNSET (argument not given) falls through to the
+            # property defaults like every other core property.
+            if value is _NUM_THREADS_UNSET:
+                continue
+            if value is not None or key in ("num_warps", "num_stages"):
                 self.config[key] = value
         self.config.update(kwargs)
 
@@ -394,16 +408,18 @@ class Config(Mapping[str, object]):
         return cast("list[int | None]", self.config.get("reduction_loops", []))
 
     @property
-    def num_warps(self) -> int:
+    def num_warps(self) -> int | None:
+        """Warp count, or None to defer the choice to the backend's driver."""
         from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
-        return cast("int", self.config.get("num_warps", DEFAULT_NUM_WARPS))
+        return cast("int | None", self.config.get("num_warps", DEFAULT_NUM_WARPS))
 
     @property
-    def num_stages(self) -> int:
+    def num_stages(self) -> int | None:
+        """Pipeline depth, or None to defer the choice to the backend's driver."""
         from ..autotuner.config_spec import DEFAULT_NUM_STAGES
 
-        return cast("int", self.config.get("num_stages", DEFAULT_NUM_STAGES))
+        return cast("int | None", self.config.get("num_stages", DEFAULT_NUM_STAGES))
 
     @property
     def l2_groupings(self) -> list[int]:
