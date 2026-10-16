@@ -1059,29 +1059,34 @@ class TestAutotunerHeuristic(TestCase):
         self.assertNotEqual(execution_default, reference)
         self.assertEqual(generated_reference, reference)
 
-    def test_accuracy_baseline_uses_autotune_reference(self) -> None:
+    def test_accuracy_baseline_runs_the_execution_default(self) -> None:
+        # The autotuning reference produces the baseline only while it is what
+        # the kernel runs by default; a promoted execution default (whose
+        # arithmetic the fast candidates share) takes over as soon as it
+        # differs from the reference.
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
-        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider.args = ()
-        provider.settings = MagicMock(autotune_baseline_fn=None)
-        provider.config_spec = MagicMock()
-        provider.config_spec.autotune_reference_config.return_value = reference
-        provider.config_spec.default_config.return_value = execution_default
-        provider.kernel = MagicMock()
-        provider.kernel.env.process_group_name = None
-        provider.kernel.compile_config.return_value = lambda: "baseline"
+        for default in (reference, execution_default):
+            with self.subTest(default=default):
+                provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+                provider.args = ()
+                provider.settings = MagicMock(autotune_baseline_fn=None)
+                provider.config_spec = MagicMock()
+                provider.config_spec.autotune_reference_config.return_value = reference
+                provider.config_spec.default_config.return_value = default
+                provider.kernel = MagicMock()
+                provider.kernel.env.process_group_name = None
+                provider.kernel.compile_config.return_value = lambda: "baseline"
 
-        with patch("helion.autotuner.benchmark_provider.synchronize_device"):
-            output, mutated, post_args = provider._compute_baseline()
+                with patch("helion.autotuner.benchmark_provider.synchronize_device"):
+                    output, mutated, post_args = provider._compute_baseline()
 
-        self.assertEqual(output, "baseline")
-        self.assertEqual(mutated, [])
-        self.assertEqual(post_args, ())
-        provider.kernel.compile_config.assert_called_once_with(
-            reference, allow_print=False
-        )
-        provider.config_spec.default_config.assert_not_called()
+                self.assertEqual(output, "baseline")
+                self.assertEqual(mutated, [])
+                self.assertEqual(post_args, ())
+                provider.kernel.compile_config.assert_called_once_with(
+                    default, allow_print=False
+                )
 
     def test_should_promote_gate(self) -> None:
         # should_promote() gates a seed's PROMOTION (becoming the autotune-off

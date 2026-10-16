@@ -856,7 +856,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the conservative autotuning reference
+        - Otherwise, run the kernel with its execution default, backing off to
+          the conservative autotuning reference (see _compute_reference_baseline)
         """
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -899,23 +900,35 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         return baseline_output, mutated_arg_idxs, baseline_post_args
 
     def _compute_reference_baseline(self) -> tuple[object, Sequence[object]]:
-        """Run the autotuning reference config to produce the baseline output.
+        """Run a config to produce the accuracy baseline output.
 
         Returns the output and the (cloned) arguments it ran on.
 
-        The reference config exists only to produce reference outputs, so any
-        config that runs will do.  Hardware limits Helion cannot model -- Intel
-        per-thread scratch space, shared memory, register pressure -- can reject
-        the conservative default on a kernel whose smaller configs are fine, so
-        such failures back off to smaller block sizes instead of aborting the
-        search.  Failures a smaller config cannot fix are raised right away (see
-        _can_back_off_baseline).  Each attempt re-clones the arguments so a
-        kernel that mutates its inputs before failing cannot poison the
-        baseline.
+        The execution default goes first when it differs from the autotuning
+        reference config: a compiler heuristic that promotes it (a tensor-core
+        lowering) gives the fast candidates its arithmetic -- the accumulation
+        order of an MMA -- which the conservative reference's SIMT code does
+        not share, and a kernel whose bf16 intermediates amplify that
+        difference would otherwise fail every promoted candidate against the
+        reference.  The reference config backs the default off; hardware
+        limits Helion cannot model -- Intel per-thread scratch space, shared
+        memory, register pressure -- can reject it on a kernel whose smaller
+        configs are fine, so such failures back off to smaller block sizes
+        instead of aborting the search.  Failures a smaller config cannot fix
+        are raised right away (see _can_back_off_baseline).  Each attempt
+        re-clones the arguments so a kernel that mutates its inputs before
+        failing cannot poison the baseline.
         """
-        config = self.config_spec.autotune_reference_config()
-        failure: tuple[Exception, Config] | None = None
-        for attempt in range(_MAX_REFERENCE_BASELINE_ATTEMPTS):
+        reference = self.config_spec.autotune_reference_config()
+        execution = self.config_spec.default_config()
+        pending = [reference]
+        if execution.config != reference.config:
+            pending.insert(0, execution)
+        config = pending.pop(0)
+        role = "Execution default" if pending else "Autotuning reference config"
+        failure: tuple[Exception, Config, str] | None = None
+        shrinks = 0
+        while True:
             new_args = _clone_args(self.args, self.kernel.env.process_group_name)
             try:
                 with _searching_candidates():
@@ -923,16 +936,33 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 baseline_output = baseline_fn(*new_args)
                 synchronize_device()
             except Exception as e:
+                if pending and not match_unrecoverable_runtime_error(e):
+                    # The execution default failed: the reference config exists
+                    # for exactly this (an unrecoverable runtime error still
+                    # surfaces at once -- the device may be in a bad state).
+                    # The traceback holds this attempt's cloned args and
+                    # outputs; drop it so they are freed before the next attempt.
+                    e.__traceback__ = None
+                    self.log.warning(
+                        f"The execution default {config} failed to compute the "
+                        f"accuracy baseline ({e}); retrying with the autotuning "
+                        "reference config"
+                    )
+                    config = pending.pop(0)
+                    role = "Autotuning reference config"
+                    continue
                 if not self._can_back_off_baseline(e):
-                    # A smaller config cannot fix this; report it as is.
-                    failure = (e, config)
+                    # A smaller config cannot fix this; report it as is, with
+                    # its traceback.
+                    failure = (e, config, role)
                     break
                 # The traceback holds this attempt's cloned args and outputs;
                 # drop it so they are freed before the next attempt.
                 e.__traceback__ = None
                 if failure is None:
-                    failure = (e, config)
-                if attempt + 1 == _MAX_REFERENCE_BASELINE_ATTEMPTS:
+                    failure = (e, config, role)
+                shrinks += 1
+                if shrinks >= _MAX_REFERENCE_BASELINE_ATTEMPTS:
                     break
                 smaller = self.config_spec.shrink_block_sizes_once(config)
                 if smaller is None:
@@ -952,7 +982,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return baseline_output, new_args
 
         assert failure is not None
-        error, baseline_config = failure
+        error, baseline_config, role = failure
         decorator = self.kernel.format_kernel_decorator(baseline_config, self.settings)
         log_generated_triton_code_debug(
             self.log,
@@ -962,8 +992,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
         self.kernel.maybe_log_repro(self.log.error, self.args, baseline_config)
         raise exc.InvalidConfig(
-            "Autotuning reference config failed while computing baseline.\n"
-            f"Reference config: {decorator}\n"
+            f"{role} failed while computing baseline.\n"
+            f"{role}: {decorator}\n"
             f"{SUPPRESSED_TRITON_CODE_MSG}\n"
             "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
             "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."

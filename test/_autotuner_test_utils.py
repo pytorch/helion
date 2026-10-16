@@ -354,7 +354,7 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
         reject: Callable[[int, int], bool],
         attempted: list[int],
         error: Exception | None = None,
-    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int]:
+    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int, list[int]]:
         """A search whose baseline compiles are rejected by *reject*.
 
         ``reject`` is called with the attempted block size and the reference
@@ -363,7 +363,9 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
         per-thread scratch space.  ``_prepare()`` builds the benchmark provider
         (and with it the accuracy baseline) but does not compile the candidate
         configs, so replacing ``compile_config`` here only intercepts the
-        baseline.
+        baseline.  The last element is the block size of the execution default
+        when a compiler heuristic promotes it beyond the reference config (the
+        baseline tries it first), else empty.
         """
 
         @helion.kernel(autotune_log_level=0, autotune_benchmark_subprocess=False)
@@ -381,6 +383,8 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
         reference_block = bound.config_spec.autotune_reference_config()["block_sizes"][
             0
         ]
+        default_block = bound.config_spec.default_config()["block_sizes"][0]
+        promoted = [default_block] if default_block != reference_block else []
         original = bound.compile_config
 
         def compile_config(config: helion.Config, **kwargs: object) -> object:
@@ -401,4 +405,4 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
             ],
         )
         search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
-        return search, args, reference_block
+        return search, args, reference_block, promoted
