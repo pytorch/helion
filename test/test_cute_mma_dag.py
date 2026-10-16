@@ -11,6 +11,7 @@ coordinate model.  Runtime coverage lives in ``test_cute_mma_dag_gpu.py``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import os
 import re
@@ -37,6 +38,8 @@ from helion.exc import InvalidConfig
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
@@ -624,13 +627,9 @@ def test_non_admitted_kernels_never_see_the_knobs() -> None:
         fixed = dict(requested)
         bound.config_spec.normalize(fixed, _fix_invalid=True)
     assert "cute_mma_dag" not in fixed
-    engine = _engine()
-    t = _tensors3()
-    beta = torch.empty((16, 64), dtype=torch.float32, device=CPU_DEVICE)
-    wy = helion.kernel(
-        engine.chunk_fwd_wy_delta_helion.fn, backend="cute", static_shapes=True
-    )  # type: ignore[attr-defined]
-    other = wy.bind((t["q"], t["v"], beta, None, None, None, False, False))
+    # A recurrence with fixed fragment tiles is not mine either.
+    t = _tensors()
+    other = _bind_fn(_fixed_tiles_recurrence, (t["k"], t["v"]))
     assert other.config_spec.cute_mma_dag is None
     assert "cute_mma_dag" not in other.config_spec.default_config().config
 
@@ -667,32 +666,43 @@ def test_a_carry_read_as_an_operand_inside_the_loop_is_admitted() -> None:
     assert body.count(f"{RT}.mma_bf16(") == 32 + 32
 
 
-def test_a_carry_read_after_its_in_place_update_is_not_mine() -> None:
-    # The dot accumulates into the carry's registers in place, so a later
-    # read of the carry-in value would see the updated state: not mine.
-    @helion.kernel(backend="cute", static_shapes=True)
-    def stale_carry(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        bh, n, c, d = k.shape
-        c = hl.specialize(c)
-        out = torch.empty((bh, n, d, d), dtype=k.dtype, device=k.device)
-        out2 = torch.empty((bh, n, c, d), dtype=k.dtype, device=k.device)
-        for tile_bh, tile_d, tile_dv in hl.tile([bh, d, d], block_size=[1, None, None]):
-            idx = tile_bh.id
-            acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
-            for i in hl.grid(n):
-                out[idx, i, tile_d, tile_dv] = acc.to(out.dtype)
-                k_i = k[idx, i, :, tile_d]
-                v_i = v[idx, i, :, tile_dv]
-                new = hl.dot(k_i.transpose(-2, -1), v_i, acc=acc)
-                proj = hl.dot(k_i, acc.to(k.dtype))
-                out2[idx, i, :, tile_dv] = proj.to(out2.dtype)
-                acc = new
-        return out, out2
+def _stale_carry(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The carry is read (as an operand) after the dot that replaces it."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    out = torch.empty([BH, D, DV], dtype=k.dtype, device=k.device)
+    out2 = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i in hl.grid(N):
+            k_i = k[idx, i, :, tile_d]
+            v_i = v[idx, i, :, tile_dv]
+            new = hl.dot(k_i.transpose(-2, -1), v_i, acc=acc)
+            proj = hl.dot(k_i, acc.to(k.dtype))
+            out2[idx, i, :, tile_dv] = proj.to(out2.dtype)
+            acc = new
+        out[idx, tile_d, tile_dv] = acc.to(out.dtype)
+    return out, out2
 
+
+def test_a_carry_read_after_its_in_place_update_gets_a_fresh_slot_and_a_copy() -> None:
+    # The carry ``acc`` feeds ``proj`` after ``new`` would have overwritten it:
+    # ``new`` takes a fresh slot (slot 1) and moves into the carry's registers
+    # at the iteration end, after ``proj`` read them.
     t = _tensors()
-    bound = stale_carry.bind((t["k"], t["v"]))
-    assert bound.config_spec.cute_mma_dag is None
-    assert "cute_mma_dag" not in bound.config_spec.default_config().config
+    bound = _bind_fn(_stale_carry, (t["k"], t["v"]))
+    assert bound.config_spec.cute_mma_dag is not None
+    program = _program(bound)
+    (carry,) = program.loops[0].carries
+    new, proj = program.dots
+    assert new.acc_slot == carry.slot and new.slot != carry.slot
+    assert proj.b.frag is carry.placeholder
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    loop = _loop_and_after(body)
+    mmas = [m.start() for m in re.finditer(rf"{RT}\.mma_bf16\(", loop)]
+    copies = re.findall(r"md_c0_\d+_\d+_\d+ = md_c1_\d+_\d+_\d+", loop)
+    assert len(copies) == 32
+    assert mmas[-1] < loop.index(copies[0])
 
 
 def test_an_explicit_mode_the_planner_cannot_match_fails_closed() -> None:
@@ -1150,59 +1160,150 @@ def test_unaligned_fp32_sources_keep_the_synchronous_pair_pass() -> None:
     assert loop.count(f"{RT}.sts_b32(") == 16 + 16
 
 
-def test_other_engine_kernels_stay_untouched() -> None:
+def test_engine_kernels_pin_their_admission() -> None:
+    # Every chunked engine kernel (varlen variants aside) with the dag's
+    # verdict: the state, K-loop, delta-rule and region kernels and the kda /
+    # anchored kernels whose GPU numerics are covered are admitted; the rest
+    # decline.
+    bf16, f32 = torch.bfloat16, torch.float32
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    bhn, bh, n, c, d, dv = 16, 2, 8, 64, 64, 64
+    gc = e(bhn, c, d, dtype=f32)
+    other = {
+        "chunk_bwd_o_kda_helion": (
+            e(bhn, c, d),
+            e(bhn, c, dv),
+            e(bhn, d, dv),
+            e(bhn, c, c),
+            gc,
+            e(bhn, c, dv),
+            0.125,
+        ),
+        "chunk_bwd_state_du_kda_helion": (
+            e(bh, n, c, d),
+            e(bh, n, c, d),
+            e(bh, n, c, d, dtype=f32),
+            e(bh, n, c, dv, dtype=f32),
+            e(bh, n, d, dv, dtype=f32),
+            e(bh, d, dv, dtype=f32),
+        ),
+        "chunk_bwd_wu_kda_helion": (
+            e(bhn, c, c, dtype=f32),
+            e(bhn, c, d),
+            e(bhn, c, dv),
+            e(bhn, c, dtype=f32),
+            gc,
+            e(bhn, c, c),
+            e(bhn, c, d, dtype=f32),
+            e(bhn, c, dv, dtype=f32),
+        ),
+        "chunk_fwd_o_diag_anchored_helion": (
+            e(bhn, c, d),
+            e(bhn, c, dv),
+            gc,
+            e(bhn, d, dv),
+            e(bhn, c, c),
+            0.125,
+        ),
+        "chunk_bwd_state_dwk_kda_helion": (
+            e(bh, n, c, d),
+            e(bh, n, c, d, dtype=f32),
+            e(bh, n, d, dv),
+            e(bh, n, c, dv),
+            e(bh, n, c, dv, dtype=f32),
+            e(bh, n, d, dv, dtype=f32),
+        ),
+        "chunk_bwd_gram2_kda_helion": (
+            e(bhn, c, d),
+            e(bhn, c, d),
+            gc,
+            e(bhn, c, c, dtype=f32),
+            e(bhn, c, c, dtype=f32),
+            1.0,
+        ),
+        "chunk_fwd_A_diag_anchored_helion": (
+            e(bhn, c, d),
+            e(bhn, c, d),
+            gc,
+            0.125,
+            True,
+        ),
+        "chunk_bwd_dqkg_scalar_helion": (
+            e(bhn, c, d),
+            e(bhn, c, d),
+            e(bhn, c, dv),
+            e(bhn, c, dtype=f32),
+            e(bhn, d, dv),
+            e(bhn, c, dv),
+            e(bhn, d, dv, dtype=f32),
+            e(bhn, dtype=f32),
+            False,
+            True,
+            0.125,
+        ),
+        "chunk_cumsum_gc_helion": (gc,),
+    }
+    binders: dict[str, Callable[[], BoundKernel]] = {
+        "chunk_fwd_h_diag_fused": _bind_fwd,
+        "chunk_bwd_dh_diag_fused": _bind_bwd,
+        "chunk_fwd_o_helion": _bind_fwd_o,
+        "chunk_bwd_dqk_helion": _bind_dqk,
+        "chunk_bwd_dv_helion": _bind_dv,
+        "chunk_fwd_h_delta_helion": _bind_fwd_h_delta,
+        "chunk_bwd_dstate_delta_helion": _bind_dstate,
+        "chunk_bwd_dqkw_delta_helion": _bind_dqkw,
+        "chunk_bwd_wy_dL_delta_helion": _bind_wy_dl,
+        "chunk_bwd_dk_delta_helion": _bind_dk,
+        "chunk_fwd_wy_delta_helion": _bind_wy,
+        **{name: functools.partial(_bind, name, args) for name, args in other.items()},
+    }
+    declined = {
+        "chunk_bwd_state_dwk_kda_helion",
+        "chunk_bwd_gram2_kda_helion",
+        "chunk_fwd_A_diag_anchored_helion",
+        "chunk_bwd_dqkg_scalar_helion",
+        "chunk_cumsum_gc_helion",
+    }
+    verdicts = {}
+    for name, binder in binders.items():
+        spec = binder().config_spec
+        verdicts[name] = spec.cute_mma_dag is not None
+        assert ("cute_mma_dag" in spec.default_config().config) == verdicts[name], name
+    assert verdicts == {name: name not in declined for name in binders}
+
+
+def test_wy_is_admitted_under_tf32_only() -> None:
+    # The Neumann chain runs fp32 x fp32 dots: tf32 MMAs under the default
+    # dot precision; "ieee" keeps the exact lowering (not mine).
     engine = _engine()
     t = _tensors3()
     beta = torch.empty((16, 64), dtype=torch.float32, device=CPU_DEVICE)
-    a_inv = torch.empty((16, 64, 64), dtype=torch.float32, device=CPU_DEVICE)
-    kernels = {
-        "chunk_fwd_wy_delta_helion": (
+    for gated in (False, True):
+        args = (
             t["q"],
             t["v"],
             beta,
+            t["gcs"] if gated else None,
             None,
             None,
-            None,
+            gated,
             False,
-            False,
-        ),
-        "chunk_bwd_wy_dL_delta_helion": (
-            t["q"],
-            t["v"],
-            beta,
-            a_inv,
-            t["dh"][:, :64],
-            t["dh"][:, :64],
-            None,
-            False,
-        ),
-        # Nested tile loops / fragment reductions are not mine.
-        "chunk_bwd_dqkw_delta_helion": (
-            t["q"],
-            t["q"],
-            t["h"],
-            t["v"],
-            t["v"],
-            t["v"],
-            t["h"],
-            None,
-            None,
-            False,
-            0.125,
-        ),
-        "chunk_bwd_dk_delta_helion": (
-            t["q"],
-            a_inv,
-            t["dh"][:, :64],
-            beta,
-            t["dh"][:, :64],
-        ),
-    }
-    for name, args in kernels.items():
-        fn = getattr(engine, name).fn
-        bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
-        assert bound.config_spec.cute_mma_dag is None, name
-        assert "cute_mma_dag" not in bound.config_spec.default_config().config
+        )
+        bound = helion.kernel(
+            engine.chunk_fwd_wy_delta_helion.fn, backend="cute", static_shapes=True
+        ).bind(args)  # type: ignore[attr-defined]
+        assert bound.config_spec.cute_mma_dag is not None, gated
+        exact = helion.kernel(
+            engine.chunk_fwd_wy_delta_helion.fn,
+            backend="cute",
+            static_shapes=True,
+            dot_precision="ieee",
+        ).bind(args)  # type: ignore[attr-defined]
+        assert exact.config_spec.cute_mma_dag is None, gated
+        assert "cute_mma_dag" not in exact.config_spec.default_config().config
 
 
 # --------------------------------------------------------------------------
@@ -1529,7 +1630,8 @@ def test_the_register_budget_follows_the_live_fragments() -> None:
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
     assert facts is not None
-    assert len(facts.live_groups) == len(_program(bound).steps) + 1
+    # One live set per loop step (the epilogue has no steps of its own).
+    assert len(facts.live_groups) == len(_program(bound).steps)
     resolved = [1, 32, 128, 64]
     peak = max(
         sum(resolved[r] * resolved[c] for r, c in (facts.frags[s] for s in group))
@@ -2389,10 +2491,16 @@ def test_two_loop_dots_on_one_carry_copy_before_the_rescale() -> None:
     store = loop.index(f"{RT}.stg_b32(")
     assert copy < loop.index("cute.arch.cp_async_wait_group(") < x_mmas[0]
     assert x_mmas[-1] < store < rescale < h_mmas[0]
-    assert (
-        _bind_fn(_two_dots_carry_read_after, (t["k"], t["v"])).config_spec.cute_mma_dag
-        is None
+    # With the carry read after the rescaled dot, that dot takes a fresh
+    # slot and its result moves into the carry at the iteration end.
+    after = _bind_fn(_two_dots_carry_read_after, (t["k"], t["v"]))
+    assert after.config_spec.cute_mma_dag is not None
+    loop = _loop_and_after(
+        _kernel_body(_source(after, _config(64, 64, warps=4, stages=2)))
     )
+    copies = re.findall(r"md_c0_\d+_\d+_\d+ = md_c1_\d+_\d+_\d+", loop)
+    assert len(copies) == 32
+    assert loop.rindex(f"{RT}.mma_bf16(") < loop.index(copies[0])
 
 
 def test_an_exchange_of_an_epilogue_dot_result_follows_that_dot() -> None:
@@ -2451,8 +2559,8 @@ def test_a_cc_store_over_one_rdim_uses_positional_strides() -> None:
     bound = _bind_fn(_cc_load_operand, (t["q"], t["q"], t["v"], t["h"], a_in))
     assert bound.config_spec.cute_mma_dag is not None
     body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=2)))
-    assert f"{RT}.cp_async_16(md_t2 + md_prow" in body
-    assert "cutlass.Int64(md_prow_" in body and ") * 128 + cutlass.Int64(md_pch" in body
+    assert f"{RT}.cp_async_16(md_t2 + md_pr8 * 128" in body
+    assert "cutlass.Int64(md_pr8) * 128 + cutlass.Int64(md_pc8 * 16)" in body
 
 
 def test_operands_with_different_values_do_not_share_a_tile() -> None:
@@ -2671,3 +2779,1439 @@ def test_a_cc_carry_init_over_one_rdim_uses_positional_strides() -> None:
     loads = re.findall(r"\* (\d+) \+ cutlass\.Int64\(md_L\d_coll\) \* (\d+)", prologue)
     assert loads and set(loads) == {("128", "2")}
     assert prologue.count(f"{RT}.ldg_b32(") == 16
+
+
+# --------------------------------------------------------------------------
+# Generated code: inner tile loops and nested loops
+# --------------------------------------------------------------------------
+
+
+def _bind_dk(**shape: int) -> BoundKernel:
+    t = _tensors3(**shape)
+    bhn, c, d = t["q"].shape
+    f32 = torch.float32
+    return _bind(
+        "chunk_bwd_dk_delta_helion",
+        (
+            t["q"],
+            torch.empty((bhn, c, c), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE),
+        ),
+    )
+
+
+def _bind_dqkw(gated: bool = False, **shape: int) -> BoundKernel:
+    t = _tensors3(**shape)
+    gcs, gl = (t["gcs"], t["gl"]) if gated else (None, None)
+    return _bind(
+        "chunk_bwd_dqkw_delta_helion",
+        (t["q"], t["q"], t["h"], t["v"], t["v"], t["v"], t["h"], gcs, gl, gated, 0.125),
+    )
+
+
+def test_dk_is_admitted_with_hoisted_operands_and_a_loaded_accumulator() -> None:
+    # A loop with no carry: the two [C, C] operands are loaded (fp32 -> bf16)
+    # once per CTA, the accumulator is seeded from two fp32 tiles at the
+    # fragment coordinates and both dots accumulate into that slot.
+    bound = _bind_dk()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    assert [(b, hi) for b, _lo, hi in _block_bounds(spec)] == [(2, 128)]
+    program = _program(bound)
+    assert len(program.loops) == 1 and program.loops[0].innermost
+    assert not program.loops[0].carries and not program.simple
+    assert [axis.kind for axis in program.axes] == ["loop", "lead", "rdim"]
+    assert len(program.slots) == 1
+    (derived,) = program.derived
+    assert not derived.frags and len(derived.loads) == 2
+    assert all(dot.slot == 0 and dot.acc_slot == 0 for dot in program.dots)
+    assert all(not program.is_ring(dot, dot.a) for dot in program.dots)
+    assert all(program.is_ring(dot, dot.b) for dot in program.dots)
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    assert [tile.frame for tile in facts.tiles] == [-1, 0, -1, 0, 0]
+    assert [tile.ring for tile in facts.tiles] == [False, True, False, True, True]
+    body = _kernel_body(_source(bound, _config(32, warps=4, stages=2)))
+    prologue = body[: body.index("for md_i in cutlass.range(0, 4):")]
+    loop = _loop_and_after(body)
+    # The staged operands: cp.async, one wait, two convert passes (fp32 ->
+    # bf16 packets), a barrier, all before the ring prologue.
+    assert prologue.count("cute.arch.cp_async_wait_group(0)") == 1
+    assert prologue.count(f"{RT}.lds_v4_f32(") == 16
+    assert prologue.count(f"{RT}.sts_v2_b32(") == 16
+    assert prologue.count("cute.arch.barrier()") == 1
+    assert prologue.index(f"{RT}.sts_v2_b32(") < prologue.index("cute.arch.barrier()")
+    assert prologue.count("cute.arch.cp_async_commit_group()") == 2
+    # Two 64x64 bf16 tiles beside their 64x64 fp32 sources (48 KB) plus the
+    # ring: k (4 KB) and the two fp32 seed tiles (8 KB each) at two stages.
+    assert "alloc_smem(cutlass.Uint8, 90112, alignment=128)" in body
+    # The seed: fp32 pairs of both tiles read from the ring per register.
+    assert loop.count(f"{RT}.lds_v2_f32(") == 16
+    assert "md_c1_" not in body
+    # dL straight (ldmatrix), dL^T through the same layout with .trans; the
+    # k tile is the B operand of both dots (one ring tile).
+    assert loop.count(f"{RT}.ldmatrix_x4(md_t0") == 4
+    assert loop.count(f"{RT}.ldmatrix_x4_trans(md_t2") == 4
+    assert loop.count(f"{RT}.ldmatrix_x4_trans(md_t1") == 16
+    assert loop.count(f"{RT}.mma_bf16(") == 32
+    assert loop.count(f"{RT}.stg_b32(") == 8
+    # No fragment operand: the exchange knob has no subject.
+    assert not facts.identity_candidates
+
+
+def test_dqkw_is_admitted_as_a_three_level_nest() -> None:
+    # dattn's loop, then the tile_d loop with the DV loop nested in it.
+    bound = _bind_dqkw()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert [(b, hi) for b, _lo, hi in _block_bounds(spec)] == [
+        (1, 128),
+        (3, 128),
+        (4, 128),
+    ]
+    program = _program(bound)
+    assert [(loop.parent, loop.innermost) for loop in program.loops] == [
+        (-1, True),
+        (-1, False),
+        (1, True),
+    ]
+    assert [len(loop.carries) for loop in program.loops] == [1, 0, 3]
+    # dg_p / dg_last_dk pass through the tile_d loop untouched.
+    assert [s.identity for s in program.loops[1].small_carries] == [True, True]
+    # Slots: dattn [C, C], the three nested carries and the subtracted dot.
+    assert len(program.slots) == 5
+    # ``dW = dW - dot(...)``: the carry and the no-acc dot feed the derived
+    # value, which takes over the carry's slot.
+    (derived,) = program.derived
+    assert len(derived.frags) == 2 and derived.slot == program.loops[2].carries[0].slot
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    assert facts.loops == (
+        dag.LoopFacts(-1, True),
+        dag.LoopFacts(-1, False),
+        dag.LoopFacts(1, True),
+    )
+    # bd = 32: dattn (4096) + three [C, bd] carries + the dot (4 x 2048) are
+    # 96 registers over four warps; two warps overflow; bd = 128 overflows
+    # at eight.
+    sizes = {1: 32, 3: 32, 4: 32}
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 2) is None
+    reason = dag.mma_dag_config_reason(facts, sizes, 2, 2)
+    assert reason is not None and "192 registers" in reason
+    reason = dag.mma_dag_config_reason(facts, {1: 32, 3: 128, 4: 32}, 8, 2)
+    assert reason is not None and "144 registers" in reason
+    body = _kernel_body(_source(bound, _config(32, 32, 32, warps=4, stages=2)))
+    first = body.index("for md_i in cutlass.range(0, 4):")
+    outer = body.index("for md_i1 in cutlass.range(0, 4):")
+    inner = body.index("for md_i2 in cutlass.range(0, 4):")
+    assert first < outer < inner
+    # Sibling frames overlap: both rings start at the frame base, the outer
+    # loop's q / k tiles follow the nested ring, the exchange tile is root.
+    assert "md_t0 = md_s0 + 0" in body and "md_t2 = md_s0 + 0" in body
+    assert "md_t7 = md_s0 + 32768" in body and "md_x8 = md_s0 + 40960" in body
+    assert "alloc_smem(cutlass.Uint8, 49152, alignment=128)" in body
+    between = body[first:outer]
+    # The dattn loop releases its frame, then the masked bf16 dattn is
+    # written once into the exchange tile behind its own barrier.
+    assert between.count("cute.arch.barrier()") == 3
+    assert between.count(f"{RT}.sts_b32(md_x8") == 16
+    assert between.rindex(f"{RT}.sts_b32(md_x8") < between.rindex("cute.arch.barrier()")
+    outer_body = body[outer:inner]
+    # q and k land once per outer iteration (before the nested prologue).
+    assert outer_body.count(f"{RT}.cp_async_16(md_t7") == 2
+    assert outer_body.count(f"{RT}.cp_async_16(md_t9") == 2
+    assert outer_body.count("cute.arch.cp_async_commit_group()") == 2
+    assert outer_body.index(f"{RT}.cp_async_16(md_t7") < outer_body.index(
+        "cute.arch.cp_async_commit_group()"
+    )
+    after = body[inner:]
+    # After the nested loop: wait, barrier, the dW store, dq from the
+    # register repack of dattn, dk_as from the exchange tile transposed,
+    # and the trailing barrier that guards the single-slot q / k tiles.
+    tail = after[after.rindex("cute.arch.cp_async_wait_group(0)") :]
+    assert tail.index("cute.arch.barrier()") < tail.index(f"{RT}.stg_v2_f32(")
+    assert tail.count(f"{RT}.stg_v2_f32(") == 16
+    assert tail.count(f"{RT}.stg_b32(") == 8
+    assert "md_aw" in tail and tail.count(f"{RT}.ldmatrix_x4_trans(md_x8") == 4
+    assert tail.rstrip().endswith("cute.arch.barrier()")
+    assert tail.count(f"{RT}.mma_bf16(") == 32
+
+
+def test_dqkw_exchange_knob_sends_the_hoisted_operand_through_the_tile() -> None:
+    bound = _bind_dqkw()
+    auto = _kernel_body(_source(bound, _config(32, 32, 32, warps=4, stages=2)))
+    smem = _kernel_body(
+        _source(
+            bound, _config(32, 32, 32, warps=4, stages=2, cute_mma_dag_exchange="smem")
+        )
+    )
+    assert "md_aw" in auto and "md_aw" not in smem
+    assert len(re.findall(rf"{RT}\.ldmatrix_x4\(md_x\d+", smem)) == 4
+    assert len(re.findall(rf"{RT}\.ldmatrix_x4_trans\(md_x\d+", smem)) == 4
+    assert len(re.findall(rf"{RT}\.sts_b32\(md_x\d+", smem)) == 16
+
+
+def _bind_wy_dl(gated: bool = False, **shape: int) -> BoundKernel:
+    t = _tensors3(**shape)
+    bhn, c, d = t["q"].shape
+    dv = t["v"].shape[2]
+    f32 = torch.float32
+    return _bind(
+        "chunk_bwd_wy_dL_delta_helion",
+        (
+            t["q"],
+            t["v"],
+            torch.empty((bhn, c), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c, c), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE),
+            torch.empty((bhn, c, dv), dtype=f32, device=CPU_DEVICE),
+            t["gcs"] if gated else None,
+            gated,
+        ),
+    )
+
+
+def test_wy_dl_is_admitted_with_vector_carries_and_row_reductions() -> None:
+    # Three sequential loops: dAinv and dbeta carried from the first into
+    # the second (their own slots), chained root dots, the kk loop, then the
+    # root reduction into dbeta and its vector store.
+    bound = _bind_wy_dl()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    program = _program(bound)
+    assert [(loop.parent, loop.innermost) for loop in program.loops] == [(-1, True)] * 3
+    assert [type(step).__name__ for step in program.body] == [
+        "Loop",
+        "Loop",
+        "Dot",
+        "Dot",
+        "Loop",
+        "Store",
+        "Derived",
+        "Reduce",
+        "VecOp",
+        "VecStore",
+    ]
+    first, second, third = program.loops
+    assert second.carries[0].init_frag is first.carries[0].phi
+    assert second.carries[0].slot == first.carries[0].slot
+    assert [c.identity for c in first.vec_carries] == [False]
+    assert [c.identity for c in second.vec_carries] == [False, True]
+    assert second.vec_carries[0].init_vec is first.vec_carries[0].phi
+    assert second.vec_carries[0].slot == first.vec_carries[0].slot == 0
+    assert not third.vec_carries
+    # One vector family: the carry, the two loop reductions and the root one,
+    # following the three reduced fragments' row split.
+    assert len(program.vec_slots) == 4
+    assert all(slot.orient == "rows" for slot in program.vec_slots)
+    assert len({program.vec_frag_slots[s] for s in range(4)}) == 1
+    assert [op.slot for op in program.vec_ops] == [0, 0, 0]
+    # ``d_bv * v`` / ``d_ba * k`` take over the dot result's slot; the root
+    # ``dA * kk`` takes over dA's.
+    assert [d.slot for d in program.derived] == [1, 2, 4]
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    assert len(facts.vecs) == 4 and facts.vecs[0].frags == (1, 2, 4)
+    # Register budget: the vector words count (two per lane at four warps).
+    resolved = [32, 32, 128, 1, 64]
+    layouts, _routes, _bytes = dag.mma_dag_layout_solution(facts, resolved, 4)
+    assert dag.mma_dag_vec_regs(facts, resolved, layouts, 4) == 8
+    # The vector scratch holds one vector (a relayout) at one warp column,
+    # one per warp column otherwise.
+    assert dag.mma_dag_vec_scratch(facts, resolved, layouts, 4) == 64 * 4
+    layouts8, _routes, _bytes = dag.mma_dag_layout_solution(facts, resolved, 8)
+    assert dag.mma_dag_vec_scratch(facts, resolved, layouts8, 8) == 2 * 64 * 4
+    body = _kernel_body(_source(bound, _config(32, 32, 128, warps=4, stages=2)))
+    # The vector carry starts at zero; each of the three reductions sums the
+    # lane's registers then the quad (xor 1, 2); the final value is stored by
+    # the lanes with c == 0 (one warp column: nothing goes through scratch).
+    assert "md_r0_0_0 = cutlass.Float32(0.0)" in body
+    assert body.count(f"{RT}.lane_group_sum(") == 6
+    assert f"{RT}.sts_f32(" not in body
+    assert body.count("if md_c == 0:") == 1
+    assert body.count(f"{RT}.stg_f32(") == 2
+    # The three rings share one frame base; T^T is one staged tile (fp32 ->
+    # bf16 once per CTA) read by four dots, straight and transposed.
+    assert body.count("= md_s0 + 0\n") == 3
+    prologue = body[: body.index("for md_i in cutlass.range(")]
+    assert prologue.count(f"{RT}.sts_v2_b32(") == 8
+    eight = _kernel_body(_source(bound, _config(32, 32, 64, warps=8, stages=2)))
+    # Two warp columns: the partial rows meet in the scratch tile behind a
+    # barrier (and another before its reuse), per reduction.
+    assert "md_rv = md_s0 +" in eight
+    assert eight.count(f"{RT}.sts_f32(md_rv") == 6
+    assert eight.count(f"{RT}.lds_f32(md_rv") == 12
+    assert "if md_c == 0 and md_L" in eight
+
+
+def test_gated_dqkw_adds_scalar_reductions_and_a_two_dim_loop() -> None:
+    # Gated: dg_p accumulates two row reductions per tile_d iteration,
+    # dg_last_dk a row reduction summed into a scalar, and a 2-D tile loop
+    # over h * dS (loads only) reduces into a scalar carry.
+    bound = _bind_dqkw(gated=True)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    program = _program(bound)
+    assert [
+        (loop.parent, loop.innermost, len(loop.axes)) for loop in program.loops
+    ] == [
+        (-1, True, 1),
+        (-1, False, 1),
+        (1, True, 1),
+        (-1, True, 2),
+    ]
+    tile_d, hd_loop = program.loops[1], program.loops[3]
+    assert [c.identity for c in tile_d.vec_carries] == [False, False]
+    assert [program.vec_slots[c.slot].orient for c in tile_d.vec_carries] == [
+        "rows",
+        "scalar",
+    ]
+    assert [program.vec_slots[c.slot].orient for c in hd_loop.vec_carries] == ["scalar"]
+    # The 2-D loop's product is a fresh [bd, bdv] fragment over two tiles.
+    (derived,) = [d for d in program.derived if d.loop == hd_loop.index]
+    assert not derived.frags and len(derived.loads) == 2
+    assert [type(step).__name__ for step in program.body] == [
+        "Loop",
+        "Loop",
+        "VecStore",
+        "Loop",
+        "VecOp",
+        "VecOp",
+        "VecStore",
+    ]
+    reduces = [r.orient for r in program.reduces]
+    assert reduces == ["rows", "rows", "rows", "scalar", "rows", "scalar"]
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    assert [v.orient for v in facts.vecs].count("scalar") == 4
+    body = _kernel_body(_source(bound, _config(32, 32, 32, 32, 32, warps=4, stages=2)))
+    # The 2-D loop walks 4 x 4 tiles, the last axis fastest.
+    assert "for md_i3 in cutlass.range(0, 16):" in body
+    assert "md_a3 = md_i3 // 4 * 32" in body and "md_a4 = md_i3 % 4 * 32" in body
+    # Vector -> scalar: the octet shuffles (xor 4, 8, 16) sum the rows a warp
+    # holds, the warp rows meet in the scratch; thread 0 stores the scalar.
+    assert body.count(f"{RT}.octet_sum(") == 2
+    assert body.count("if md_tidx == 0:") == 1
+    assert body.count("if md_c == 0:") >= 1
+    assert f"{RT}.sts_f32(md_rv + md_L" in body
+
+
+def test_gated_wy_dl_relays_the_column_reduction_into_the_row_vector() -> None:
+    # ``dLL.sum(-1) - dLL.sum(-2)``: the column sums (octet shuffles over g)
+    # are written to the scratch by the lanes owning each column and read
+    # back in the row vector's layout before the subtraction.
+    bound = _bind_wy_dl(gated=True)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    program = _program(bound)
+    assert [r.orient for r in program.reduces] == [
+        "rows",
+        "rows",
+        "rows",
+        "rows",
+        "rows",
+        "cols",
+    ]
+    cols = [s for s in program.vec_slots if s.orient == "cols"]
+    assert len(cols) == 1
+    body = _kernel_body(_source(bound, _config(32, 32, 128, warps=4, stages=2)))
+    assert body.count(f"{RT}.octet_sum(") == 16
+    assert "if md_g == 0:" in body
+    assert body.count("md_rt") > 0
+    assert body.count(f"{RT}.stg_f32(") == 4
+
+
+def _bind_wy(gated: bool = False, **shape: int) -> BoundKernel:
+    t = _tensors3(**shape)
+    bhn, c, _d = t["q"].shape
+    beta = torch.empty((bhn, c), dtype=torch.float32, device=CPU_DEVICE)
+    gcs = t["gcs"] if gated else None
+    return _bind(
+        "chunk_fwd_wy_delta_helion",
+        (t["q"], t["v"], beta, gcs, None, None, gated, False),
+    )
+
+
+def test_wy_runs_the_neumann_chain_on_tf32_mmas() -> None:
+    # kk (bf16) feeds the pointwise carry inits A and T = eye + A of the
+    # static five-step loop; its dots are fp32 x fp32 (tf32) over fp32
+    # exchange tiles; the w / u loops widen the bf16 k / v tiles into fp32
+    # operand tiles for dot(T, kt).
+    bound = _bind_wy()
+    program = _program(bound)
+    assert [
+        (loop.parent, loop.innermost, len(loop.axes)) for loop in program.loops
+    ] == [
+        (-1, True, 1),
+        (-1, True, 0),
+        (-1, True, 1),
+        (-1, True, 1),
+    ]
+    chain = program.loops[1]
+    assert (chain.begin, chain.end) == (0, 5)
+    kk = program.loops[0].carries[0]
+    assert [c.init_frag is kk.phi for c in chain.carries] == [True, True]
+    assert all(c.init_value is not None and c.slot != kk.slot for c in chain.carries)
+    apow, t_dot = (dot for dot in program.dots if dot.loop == 1)
+    assert apow.acc is None and apow.slot not in {c.slot for c in chain.carries}
+    assert t_dot.acc_slot == t_dot.slot == chain.carries[1].slot
+    assert [dot.a.dtype for dot in program.dots] == [torch.bfloat16] + [
+        torch.float32
+    ] * 4
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    # fp32 fragments bind whole-K words only when the producer is the dot's
+    # own accumulator (T feeding dot(Apow, T, acc=T)); the exchange knob
+    # has a subject (the chain's shuffle routes).
+    assert [(d.a_identity, d.b_frag) for d in facts.dots] == [
+        (False, False),
+        (False, False),
+        (False, True),
+        (False, False),
+        (False, False),
+    ]
+    assert facts.identity_candidates
+    body = _kernel_body(_source(bound, _config(128, 32, 32, warps=4, stages=2)))
+    assert body.count(f"{RT}.mma_bf16(") == 64
+    # Apow and T: 8 K steps of 8 x 8 atoms each; w and u: 8 x 4 each.
+    assert body.count(f"{RT}.mma_tf32(") == 128 + 32 + 32
+    # Four warps split M: the chain's A operands (Apow, then its square) are
+    # the warp's own registers, picked per K step with lane shuffles (2 dots
+    # x 8 steps x 4 words); its B operands are scattered into transposed
+    # ([N, K]) fp32 tiles and T feeds the w / u dots through an fp32 pair
+    # tile; both are read by ldmatrix (four fp32 per 16-byte chunk), never
+    # per lane or with .trans.
+    assert body.count(f"{RT}.shfl_pick_b32(") == 64
+    assert body.count(f"{RT}.f32_bits(") == 128
+    assert body.count("md_qsl + 2") == 32 and "md_tsl" not in body
+    assert len(re.findall(rf"{RT}\.sts_v2_f32\(md_x", body)) == 16
+    assert len(re.findall(rf"{RT}\.sts_f32\(md_x", body)) == 64
+    assert len(re.findall(rf"{RT}\.ldmatrix_x4\(md_x", body)) == 64 + 16
+    assert f"{RT}.lds_b32(md_x" not in body
+    assert f"{RT}.ldmatrix_x4_trans(md_x" not in body
+    # The bf16 k / v tiles widen into transposed fp32 operand tiles.
+    assert len(re.findall(rf"{RT}\.sts_f32\(md_t", body)) == 32
+    assert f"{RT}.sts_v4_f32(" not in body
+    # dot(Apow, Apow) lands in a fresh slot and moves into Apow's carry.
+    copies = re.findall(r"md_c1_\d+_\d+_\d+ = md_c3_\d+_\d+_\d+", body)
+    assert len(copies) == 32
+    # A_inv is stored as fp32 pairs (16 per lane) between the chain and the
+    # w loop.
+    assert body.count(f"{RT}.stg_v2_f32(") == 16
+
+
+def test_cta_rich_kernels_seed_four_warps_and_pipelined_loop_tiles() -> None:
+    # The per-chunk delta kernels tile their fragments by rdims and loop
+    # tiles alone over 8192 leading CTAs: with the device facts of a B200
+    # (148 SMs, 227 KB) they seed four warps first and loop tiles of at
+    # least two trips, within two CTAs per SM of shared memory (measured
+    # at s2: dk [32] 203 us; dqkw [64, 32, 64] 575, the eight-warp /
+    # single-trip tiles 616 - 793; wy_dL [64, 64, 64] 429; wy 787).
+    def seeds(bound: BoundKernel) -> list[tuple[list[int], int, int]]:
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None
+        facts = dataclasses.replace(facts, sm_count=148, smem_capacity=232448)
+        tunable = [a.block_id for a in facts.axes if a.kind in ("root", "loop")]
+        return [
+            ([sizes[b] for b in tunable], warps, stages)
+            for sizes, warps, stages in dag.mma_dag_seed_configs(facts)
+        ]
+
+    big = {"bhn": 8192, "d": 128, "dv": 128}
+    assert seeds(_bind_dk(**big))[0] == ([32], 4, 2)
+    assert seeds(_bind_dqkw(**big))[0] == ([64, 32, 64], 4, 2)
+    assert seeds(_bind_wy_dl(**big))[0] == ([64, 64, 64], 4, 2)
+    assert seeds(_bind_wy(**big))[0] == ([64, 64, 64], 4, 4)
+    # Tiles over the register budget at four warps rank behind every
+    # four-warp seed; single-trip loops rank behind pipelined ones.
+    ranked = seeds(_bind_dqkw(**big))
+    first_eight = next(i for i, (_s, warps, _st) in enumerate(ranked) if warps == 8)
+    assert all(warps == 4 for _s, warps, _st in ranked[:first_eight])
+    assert all(all(128 // tile >= 2 for tile in sizes) for sizes, _w, _st in ranked[:4])
+    # The single-loop kernels tile a root axis: their seeds are unchanged by
+    # the rule (fwd_h_delta keeps the exchange-free four warps first,
+    # dstate its eight).
+    delta = _bind_fwd_h_delta(bh=32, dv=128).config_spec.cute_mma_dag_facts
+    assert delta is not None
+    delta = dataclasses.replace(delta, sm_count=148, smem_capacity=232448)
+    assert [(s[1], s[2]) for s in dag.mma_dag_seed_configs(delta)[:2]] == [
+        (4, 4),
+        (4, 2),
+    ]
+
+
+def test_m4_kernels_pin_their_inert_knobs_and_repair_over_budget_configs() -> None:
+    # dk has no fragment operand and no loop snapshot: both the exchange and
+    # the store knob are pinned.  dqkw reads the hoisted dattn as an A
+    # operand (the exchange knob has a subject) but snapshots nothing; a
+    # tile over the register budget at four warps repairs to eight.
+    bound = _bind_dk()
+    config = _config(
+        32, warps=4, stages=2, cute_mma_dag_exchange="smem", cute_mma_dag_store="direct"
+    ).config
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_exchange"] == "auto"
+    assert config["cute_mma_dag_store"] == "staged"
+    bound = _bind_dqkw()
+    config = _config(
+        32,
+        32,
+        32,
+        warps=4,
+        stages=2,
+        cute_mma_dag_exchange="smem",
+        cute_mma_dag_store="direct",
+    ).config
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_exchange"] == "smem"
+    assert config["cute_mma_dag_store"] == "staged"
+    over = _config(32, 64, 32, warps=4, stages=2)
+    assert (
+        bound.config_spec.backend.autotune_config_is_viable(bound.config_spec, over)
+        is False
+    )
+    with bound.env:
+        with pytest.raises(InvalidConfig, match="registers per thread"):
+            bound.config_spec.normalize(dict(over.config))
+        repaired = dict(over.config)
+        bound.config_spec.normalize(repaired, _fix_invalid=True)
+    assert repaired["cute_mma_dag_warps"] == 8
+    assert repaired["block_sizes"] == [32, 64, 32]
+    # wy: the knob surface exists only under tf32; the chain's fp32
+    # fragments take the shuffle route per iteration, so the exchange knob
+    # has a register route to switch off.
+    bound = _bind_wy()
+    config = _config(
+        128, 32, 32, warps=4, stages=2, cute_mma_dag_exchange="smem"
+    ).config
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_exchange"] == "smem"
+    body = _kernel_body(_source(bound, helion.Config(**config)))
+    assert f"{RT}.shfl_pick_b32(" not in body
+    assert len(re.findall(rf"{RT}\.sts_v2_f32\(md_x", body)) == 48
+
+
+# --------------------------------------------------------------------------
+# Probes: register takeovers across regions and through views, the barrier
+# behind a nested ring, fp32 operand tiles the passes cannot rewrite, admitted
+# shapes that could not render
+# --------------------------------------------------------------------------
+
+
+def _acc_from_outer(
+    a: torch.Tensor, b: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """A loop dot accumulates onto a fragment of the enclosing region."""
+    BH, N = k.size(0), k.size(1)
+    C, D = hl.specialize(k.size(2)), hl.specialize(k.size(3))
+    out = torch.empty([BH, N, C, D], dtype=torch.float32, device=k.device)
+    for tile_b in hl.tile(BH, block_size=1):
+        base = a[tile_b, :, :] + b[tile_b, :, :]
+        for i in hl.grid(N):
+            out[tile_b, i, :, :] = hl.dot(
+                k[tile_b, i, :, :], v[tile_b, i, :, :], acc=base
+            )
+    return out
+
+
+def _derived_from_outer(
+    a: torch.Tensor, b: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """A loop's derived value reads an earlier loop's accumulator."""
+    BH, N = k.size(0), k.size(1)
+    C, D = hl.specialize(k.size(2)), hl.specialize(k.size(3))
+    out = torch.empty([BH, N, C, D], dtype=torch.float32, device=k.device)
+    for tile_b in hl.tile(BH, block_size=1):
+        base = hl.zeros([tile_b, C, D], dtype=torch.float32)
+        for j in hl.grid(N):
+            base = hl.dot(k[tile_b, j, :, :], v[tile_b, j, :, :], acc=base)
+        for i in hl.grid(N):
+            y = hl.dot(k[tile_b, i, :, :], v[tile_b, i, :, :])
+            out[tile_b, i, :, :] = base * 2.0 + y
+    return out
+
+
+def _vec_from_outer(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """A loop's vector value reads an earlier loop's vector carry."""
+    BH, N = k.size(0), k.size(1)
+    C, D = hl.specialize(k.size(2)), hl.specialize(k.size(3))
+    out = torch.empty([BH, N, C], dtype=torch.float32, device=k.device)
+    for tile_b in hl.tile(BH, block_size=1):
+        acc = hl.zeros([tile_b, C, D], dtype=torch.float32)
+        vb = hl.zeros([tile_b, C], dtype=torch.float32)
+        for j in hl.grid(N):
+            acc = hl.dot(k[tile_b, j, :, :], v[tile_b, j, :, :], acc=acc)
+            vb = vb + acc.sum(-1)
+        for i in hl.grid(N):
+            y = hl.dot(k[tile_b, i, :, :], v[tile_b, i, :, :])
+            out[tile_b, i, :] = vb + y.sum(-1)
+    return out
+
+
+def _view_read_after_takeover(
+    q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``y = -kk`` is read after ``d1 = kk * qq`` would take kk's registers."""
+    BHN, C, D = q.size(0), hl.specialize(q.size(1)), q.size(2)
+    out1 = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    out2 = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        qq = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            kd = k[tile_bhn, :, tile_d]
+            qd = q[tile_bhn, :, tile_d]
+            kk = hl.dot(kd, kd.transpose(-2, -1), acc=kk)
+            qq = hl.dot(qd, qd.transpose(-2, -1), acc=qq)
+        y = -kk
+        d1 = kk * qq
+        out1[tile_bhn, :, :] = d1
+        out2[tile_bhn, :, :] = y * qq
+    return out1, out2
+
+
+def _reduced_view_after_takeover(
+    q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A row reduction of ``kk * 2`` after ``d1 = kk * qq``."""
+    BHN, C, D = q.size(0), hl.specialize(q.size(1)), q.size(2)
+    out1 = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    sout = torch.empty([BHN, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        qq = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            kd = k[tile_bhn, :, tile_d]
+            qd = q[tile_bhn, :, tile_d]
+            kk = hl.dot(kd, kd.transpose(-2, -1), acc=kk)
+            qq = hl.dot(qd, qd.transpose(-2, -1), acc=qq)
+        y = kk * 2.0
+        out1[tile_bhn, :, :] = kk * qq
+        sout[tile_bhn, :] = y.sum(-1)
+    return out1, sout
+
+
+def test_a_loop_never_takes_over_the_registers_of_an_enclosing_region() -> None:
+    # The next iteration reads them again: a dot accumulating onto the
+    # enclosing region's fragment, a derived value over an earlier loop's
+    # accumulator and a vector value over an earlier loop's vector each get
+    # a fresh slot (the dot copies its seed in every iteration).
+    t = _tensors()
+    a = torch.empty((2, 64, 64), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind_fn(_acc_from_outer, (a, a, t["k"], t["v"]))
+    program = _program(bound)
+    (base,) = program.derived
+    (dot,) = program.dots
+    assert base.loop == -1 and dot.loop == 0
+    assert dot.acc_slot == base.slot and dot.slot != base.slot
+    body = _kernel_body(_source(bound, _config(warps=4, stages=2)))
+    loop = _loop_and_after(body)
+    assert (
+        len(re.findall(rf"md_c{dot.slot}_\d+_\d+_\d+ = md_c{base.slot}_", loop)) == 32
+    )
+
+    bound = _bind_fn(_derived_from_outer, (a, a, t["k"], t["v"]))
+    program = _program(bound)
+    (derived,) = program.derived
+    (carry,) = program.loops[0].carries
+    assert derived.loop == 1 and carry.phi in derived.frags
+    assert derived.slot != carry.slot
+    assert derived.slot == program.dots[1].slot
+
+    bound = _bind_fn(_vec_from_outer, (t["k"], t["v"]))
+    program = _program(bound)
+    (vb,) = program.loops[0].vec_carries
+    later = [op for op in program.vec_ops if op.loop == 1]
+    (op,) = later
+    assert vb.phi in op.vecs and op.slot != vb.slot
+
+
+def test_a_takeover_sees_the_readers_of_the_fragments_views() -> None:
+    # ``y = -kk`` is evaluated where it is consumed, after ``d1``: ``d1``
+    # cannot take kk's registers (nor qq's, read by the second value);
+    # the second value, the last reader of both, takes one of them.  With
+    # a row reduction of the view instead, ``d1`` is qq's last reader and
+    # takes qq's registers, never kk's.
+    t = _tensors3()
+    bound = _bind_fn(_view_read_after_takeover, (t["q"], t["q"]))
+    program = _program(bound)
+    kk, qq = (carry.slot for carry in program.loops[0].carries)
+    d1, d2 = program.derived
+    assert d1.slot not in (kk, qq)
+    assert d2.slot in (kk, qq)
+
+    bound = _bind_fn(_reduced_view_after_takeover, (t["q"], t["q"]))
+    program = _program(bound)
+    kk, qq = (carry.slot for carry in program.loops[0].carries)
+    (d1,) = program.derived
+    (reduce,) = program.reduces
+    assert d1.slot == qq
+    assert program.frag_slots[reduce.frag] == kk
+
+
+def _nested_ring(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """A ringed loop nested in an outer tile loop that stages nothing."""
+    BHN, C, DV = x.size(0), hl.specialize(x.size(1)), hl.specialize(x.size(2))
+    D = s.size(1)
+    out = torch.empty([BHN, C, D], dtype=torch.float32, device=x.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        for tile_d in hl.tile(D):
+            acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
+            for tile_dv in hl.tile(DV):
+                xa = x[tile_bhn, :, tile_dv]
+                sb = s[tile_bhn, tile_d, tile_dv]
+                acc = hl.dot(xa, sb.transpose(-2, -1), acc=acc)
+            out[tile_bhn, :, tile_d] = acc
+    return out
+
+
+def _outer_loop_tail(body: str, outer: str, inner: str) -> str:
+    """The text of loop ``outer``'s body after its nested loop ``inner``."""
+    lines = body.split("\n")
+    start = next(i for i, line in enumerate(lines) if line.lstrip().startswith(outer))
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next(
+        (
+            i
+            for i, line in enumerate(lines[start + 1 :], start + 1)
+            if line.strip() and len(line) - len(line.lstrip()) <= indent
+        ),
+        len(lines),
+    )
+    inner_start = next(
+        i for i in range(start, end) if lines[i].lstrip().startswith(inner)
+    )
+    inner_indent = len(lines[inner_start]) - len(lines[inner_start].lstrip())
+    inner_end = next(
+        i
+        for i in range(inner_start + 1, end)
+        if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= inner_indent
+    )
+    return "\n".join(lines[inner_end:end])
+
+
+def test_an_outer_iteration_ends_with_a_barrier_behind_a_nested_ring() -> None:
+    # The next outer iteration's ring prologue rewrites slot 0 while slower
+    # warps may still read it: the outer iteration ends with a CTA barrier
+    # even though the outer loop stages no tile of its own.
+    t = _tensors3()
+    bound = _bind_fn(_nested_ring, (t["q"], t["h"]))
+    program = _program(bound)
+    outer, inner = program.loops
+    assert not outer.innermost and inner.parent == outer.index
+    plan_facts = bound.config_spec.cute_mma_dag_facts
+    assert plan_facts is not None and not plan_facts.staging_frames
+    body = _kernel_body(_source(bound, _config(32, 128, warps=4, stages=2)))
+    tail = _outer_loop_tail(body, "for md_i in", f"for md_i{inner.index} in")
+    assert "cute.arch.barrier()" in tail
+    assert f"{RT}.stg_v2_f32(" in tail
+    assert tail.rindex(f"{RT}.stg_v2_f32(") < tail.rindex("cute.arch.barrier()")
+
+
+def _tf32_inplace_b(
+    k: torch.Tensor, x: torch.Tensor, beta: torch.Tensor
+) -> torch.Tensor:
+    """B = fp32 load * beta (a row-dependent pointwise op) into a tf32 dot."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, D], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        beta_i = beta[tile_bhn, :]
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            kt = k[tile_bhn, :, tile_d]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        for tile_d in hl.tile(D):
+            xt = x[tile_bhn, :, tile_d] * beta_i[:, :, None]
+            out[tile_bhn, :, tile_d] = hl.dot(kk, xt)
+    return out
+
+
+def _tf32_inplace_a(
+    k: torch.Tensor, x: torch.Tensor, beta: torch.Tensor
+) -> torch.Tensor:
+    """A and B = fp32 load + 1 in a K loop (K along the columns)."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        acc = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            xt = x[tile_bhn, :, tile_d] + 1.0
+            acc = hl.dot(xt, xt.transpose(-2, -1), acc=acc)
+        out[tile_bhn, :, :] = acc
+    return out
+
+
+def _tf32_lanes_b(k: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """B = fp32 load as is (K = C along the tile rows: per-lane B reads)."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, D], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            kt = k[tile_bhn, :, tile_d]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        for tile_d in hl.tile(D):
+            xt = x[tile_bhn, :, tile_d]
+            out[tile_bhn, :, tile_d] = hl.dot(kk, xt)
+    return out
+
+
+def _bind_tf32(fn: object, args: tuple[object, ...]) -> BoundKernel:
+    return helion.kernel(
+        fn,  # type: ignore[arg-type]
+        backend="cute",
+        static_shapes=True,
+        dot_precision="tf32",
+    ).bind(args)
+
+
+def test_an_fp32_tile_with_a_pointwise_op_is_not_a_tf32_operand() -> None:
+    # The in-place pass rewrites 16-bit packets (eight elements, bf16
+    # unpack / pack): an fp32 source tile with a pointwise op feeding a
+    # tf32 dot declines at admission instead of being repacked as bf16.
+    # The same tile read as loaded stays admitted (per-lane fp32 B reads).
+    t = _tensors3()
+    x = torch.empty((16, 64, 128), dtype=torch.float32, device=CPU_DEVICE)
+    beta = torch.empty((16, 64), dtype=torch.float32, device=CPU_DEVICE)
+    assert (
+        _bind_tf32(_tf32_inplace_b, (t["q"], x, beta)).config_spec.cute_mma_dag is None
+    )
+    assert (
+        _bind_tf32(_tf32_inplace_a, (t["q"], x, beta)).config_spec.cute_mma_dag is None
+    )
+    bound = _bind_tf32(_tf32_lanes_b, (t["q"], x))
+    assert bound.config_spec.cute_mma_dag is not None
+    program = _program(bound)
+    (_kk_dot, dot) = program.dots
+    assert dot.b.kind == "load" and dot.b.dtype == torch.float32 and not dot.b.pointwise
+    body = _kernel_body(_source(bound, _config(32, 32, warps=4, stages=2)))
+    assert f"{RT}.mma_tf32(" in body and f"{RT}.lds_b32(" in body
+    assert f"{RT}.unpack_bf16x2(" not in body
+
+
+def _staged_aux_vec(a: torch.Tensor, g: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """A loop-invariant operand tile scaled by a per-iteration row vector."""
+    BH, C = a.size(0), hl.specialize(a.size(1))
+    N, D = k.size(1), hl.specialize(k.size(3))
+    out = torch.empty([BH, C, D], dtype=torch.float32, device=a.device)
+    for tile_b in hl.tile(BH, block_size=1):
+        T = a[tile_b, :, :].to(torch.float32)
+        acc = hl.zeros([tile_b, C, D], dtype=torch.float32)
+        for i in hl.grid(N):
+            gi = g[tile_b, i, :]
+            op = (T * gi[:, :, None]).to(torch.bfloat16)
+            acc = hl.dot(op, k[tile_b, i, :, :], acc=acc)
+        out[tile_b, :, :] = acc
+    return out
+
+
+def _staged_aux_scalar(
+    a: torch.Tensor, g: torch.Tensor, k: torch.Tensor
+) -> torch.Tensor:
+    """The same with a per-iteration scalar."""
+    BH, C = a.size(0), hl.specialize(a.size(1))
+    N, D = k.size(1), hl.specialize(k.size(3))
+    out = torch.empty([BH, C, D], dtype=torch.float32, device=a.device)
+    for tile_b in hl.tile(BH, block_size=1):
+        T = a[tile_b, :, :]
+        acc = hl.zeros([tile_b, C, D], dtype=torch.float32)
+        for i in hl.grid(N):
+            s = g[tile_b, i, 0]
+            op = (T.to(torch.float32) * s[:, None, None]).to(torch.bfloat16)
+            acc = hl.dot(op, k[tile_b, i, :, :], acc=acc)
+        out[tile_b, :, :] = acc
+    return out
+
+
+def _scalar_broadcast_store(
+    q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A scalar broadcast into a vector store."""
+    BHN, C, D = q.size(0), hl.specialize(q.size(1)), q.size(2)
+    out = torch.empty([BHN, C], dtype=torch.float32, device=q.device)
+    out2 = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            kd = k[tile_bhn, :, tile_d]
+            kk = hl.dot(kd, kd.transpose(-2, -1), acc=kk)
+        tot = kk.sum(-1).sum(-1)
+        out[tile_bhn, :] = tot[:, None].expand([tile_bhn, C])
+        out2[tile_bhn, :, :] = kk
+    return out, out2
+
+
+def test_operand_tiles_whose_aux_loads_vary_below_their_frame_decline() -> None:
+    # A loop-invariant tile is staged once per CTA; its pointwise chain
+    # reading a per-iteration vector or scalar would be evaluated once too.
+    t = _tensors()
+    a = torch.empty((2, 64, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    g = torch.empty((2, 8, 64), dtype=torch.float32, device=CPU_DEVICE)
+    for fn in (_staged_aux_vec, _staged_aux_scalar):
+        assert _bind_fn(fn, (a, g, t["k"])).config_spec.cute_mma_dag is None, fn
+
+
+def test_a_scalar_broadcast_into_a_vector_store_declines() -> None:
+    t = _tensors3()
+    bound = _bind_fn(_scalar_broadcast_store, (t["q"], t["q"]))
+    assert bound.config_spec.cute_mma_dag is None
+
+
+def test_wy_with_an_unaligned_key_keeps_the_natural_fp32_tiles() -> None:
+    # The widen pass alone scatters into the transposed tf32 B tile; a key
+    # whose rows are not 16-byte aligned takes the synchronous pass into the
+    # natural tile and the per-lane B reads (admitted, every config renders).
+    t = _tensors3()
+    bhn, c, d = t["q"].shape
+    wide = torch.empty((bhn, c, d + 8), dtype=torch.bfloat16, device=CPU_DEVICE)
+    k = wide[:, :, 4 : d + 4]
+    beta = torch.empty((bhn, c), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind(
+        "chunk_fwd_wy_delta_helion", (k, t["v"], beta, None, None, None, False, False)
+    )
+    assert bound.config_spec.cute_mma_dag is not None
+    program = _program(bound)
+
+    def transposed(program: dag.MmaDagProgram, name: str) -> list[bool]:
+        return [
+            op.transposed_tile
+            for dot in program.dots
+            for op in (dot.a, dot.b)
+            if op.load is not None
+            and op.load.name == name
+            and op.dtype == torch.float32
+        ]
+
+    # k's widened B tile stays natural; v's (aligned) is still transposed.
+    assert transposed(program, "k") == [False]
+    assert transposed(program, "v") == [True]
+    assert transposed(_program(_bind_wy()), "k") == [True]
+    for sizes, warps, stages in (((64, 64, 64), 4, 2), ((128, 32, 32), 4, 2)):
+        config = _config(*sizes, warps=warps, stages=stages)
+        assert bound.config_spec.backend.autotune_config_is_viable(
+            bound.config_spec, config
+        )
+        body = _kernel_body(_source(bound, config))
+        assert f"{RT}.mma_tf32(" in body and f"{RT}.lds_b32(" in body
+
+
+def test_wy_dl_promoted_default_at_s1_renders_on_the_dag() -> None:
+    # delta_rule at s1 (BHN 2048, D = DV = 128, bf16 beta and dvni as the
+    # pipeline passes them) on B200 facts: the first seed is a four-warp dag
+    # config in both decay modes and renders tensor-core MMAs.
+    bf16, f32 = torch.bfloat16, torch.float32
+    for gated in (False, True):
+        bound = _bind(
+            "chunk_bwd_wy_dL_delta_helion",
+            (
+                torch.empty((2048, 64, 128), dtype=bf16, device=CPU_DEVICE),
+                torch.empty((2048, 64, 128), dtype=bf16, device=CPU_DEVICE),
+                torch.empty((2048, 64), dtype=bf16, device=CPU_DEVICE),
+                torch.empty((2048, 64, 64), dtype=f32, device=CPU_DEVICE),
+                torch.empty((2048, 64, 128), dtype=f32, device=CPU_DEVICE),
+                torch.empty((2048, 64, 128), dtype=bf16, device=CPU_DEVICE),
+                torch.empty((2048, 64), dtype=f32, device=CPU_DEVICE)
+                if gated
+                else None,
+                gated,
+            ),
+        )
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None
+        facts = dataclasses.replace(facts, sm_count=148, smem_capacity=232448)
+        sizes, warps, stages = dag.mma_dag_seed_configs(facts)[0]
+        tunable = [a.block_id for a in facts.axes if a.kind in ("root", "loop")]
+        assert ([sizes[b] for b in tunable], warps, stages) == ([64, 64, 64], 4, 2)
+        body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+        assert f"{RT}.mma_bf16(" in body and SIMT_FALLBACK not in body
+
+
+# --------------------------------------------------------------------------
+# The tf32 shuffle route and conflict-free transposed fp32 tiles
+# --------------------------------------------------------------------------
+
+
+def _tf32_c_fragment(
+    rows: int, cols: int
+) -> dict[tuple[int, int, int, int], tuple[int, int]]:
+    """Element (row, col) held by ``(am, an, j)`` of each lane of a warp's
+    ``rows x cols`` fp32 fragment in the m16n8 C layout."""
+    held = {}
+    for am in range(rows // 16):
+        for an in range(cols // 8):
+            for j in range(4):
+                for lane in range(32):
+                    g, c = lane // 4, lane % 4
+                    held[(am, an, j, lane)] = (
+                        16 * am + 8 * (j // 2) + g,
+                        8 * an + 2 * c + (j % 2),
+                    )
+    return held
+
+
+def _shfl_pick(lane: list[int], flag: list[int], x: list, y: list) -> list:
+    """Model of ``shfl_pick_b32``: lane r reads ``y`` (``flag``) or ``x`` of
+    lane ``lane[r]``."""
+    return [y[lane[r]] if flag[r] else x[lane[r]] for r in range(32)]
+
+
+@pytest.mark.parametrize("shape", ("a", "b_nk", "b_kn"))
+def test_shuffle_routed_words_yield_the_tf32_fragments(shape: str) -> None:
+    # The emitter's lane terms: an A word (row g, k c) or an [N, K] B word
+    # (n g, k c) lives in lane (g, c // 2) at register parity c % 2; a
+    # [K, N] B word (k c, n g) in lane (c, g // 2) at parity g % 2.  k + 4
+    # is two lanes (A, [N, K]) or sixteen lanes ([K, N]) further.
+    g = [lane // 4 for lane in range(32)]
+    c = [lane % 4 for lane in range(32)]
+    held = _tf32_c_fragment(64, 64)
+    for st in range(8):
+        for atom in range(2):
+            if shape == "a":
+                lane = [4 * g[r] + c[r] // 2 for r in range(32)]
+                flag = [c[r] % 2 for r in range(32)]
+                regs = [[held[(atom, st, j, r)] for r in range(32)] for j in range(4)]
+                words = [
+                    _shfl_pick(lane, flag, regs[0], regs[1]),
+                    _shfl_pick(lane, flag, regs[2], regs[3]),
+                    _shfl_pick([x + 2 for x in lane], flag, regs[0], regs[1]),
+                    _shfl_pick([x + 2 for x in lane], flag, regs[2], regs[3]),
+                ]
+                expected = [
+                    [(16 * atom + g[r], 8 * st + c[r]) for r in range(32)],
+                    [(16 * atom + g[r] + 8, 8 * st + c[r]) for r in range(32)],
+                    [(16 * atom + g[r], 8 * st + c[r] + 4) for r in range(32)],
+                    [(16 * atom + g[r] + 8, 8 * st + c[r] + 4) for r in range(32)],
+                ]
+            elif shape == "b_nk":
+                # Producer [N, K]: n-atom ``atom`` is block (atom // 2, atom % 2).
+                lane = [4 * g[r] + c[r] // 2 for r in range(32)]
+                flag = [c[r] % 2 for r in range(32)]
+                am, half = atom // 2, atom % 2
+                lo = [held[(am, st, 2 * half, r)] for r in range(32)]
+                hi = [held[(am, st, 2 * half + 1, r)] for r in range(32)]
+                words = [
+                    _shfl_pick(lane, flag, lo, hi),
+                    _shfl_pick([x + 2 for x in lane], flag, lo, hi),
+                ]
+                # (n g, k c) and (n g, k c + 4) as (row, col) of the producer.
+                expected = [
+                    [(8 * atom + g[r], 8 * st + c[r]) for r in range(32)],
+                    [(8 * atom + g[r], 8 * st + c[r] + 4) for r in range(32)],
+                ]
+            else:
+                # Producer [K, N]: K rows 8 st .. of n-atom ``atom`` are block
+                # (st // 2, st % 2).
+                lane = [4 * c[r] + g[r] // 2 for r in range(32)]
+                flag = [g[r] % 2 for r in range(32)]
+                am, half = st // 2, st % 2
+                lo = [held[(am, atom, 2 * half, r)] for r in range(32)]
+                hi = [held[(am, atom, 2 * half + 1, r)] for r in range(32)]
+                words = [
+                    _shfl_pick(lane, flag, lo, hi),
+                    _shfl_pick([x + 16 for x in lane], flag, lo, hi),
+                ]
+                expected = [
+                    [(8 * st + c[r], 8 * atom + g[r]) for r in range(32)],
+                    [(8 * st + c[r] + 4, 8 * atom + g[r]) for r in range(32)],
+                ]
+            assert words == expected, (shape, st, atom)
+
+
+def test_fp32_fragments_take_the_shuffle_route_per_iteration_only() -> None:
+    kwargs = {
+        "producer": (64, 64),
+        "consumer": (64, 64),
+        "k": 64,
+        "layout_p": (4, 1),
+        "layout_c": (4, 1),
+    }
+    assert dag.frag_register_route(role="a", logical_swap=False, **kwargs) == (
+        dag.ROUTE_IDENTITY
+    )
+    assert (
+        dag.frag_register_route(role="a", logical_swap=False, elem_bytes=4, **kwargs)
+        == dag.ROUTE_SHUFFLE
+    )
+    assert (
+        dag.frag_register_route(
+            role="a", logical_swap=False, elem_bytes=4, per_iteration=False, **kwargs
+        )
+        is None
+    )
+    n_first = dict(kwargs, layout_p=(1, 4), layout_c=(1, 4))
+    assert (
+        dag.frag_register_route(role="b", logical_swap=False, elem_bytes=4, **n_first)
+        == dag.ROUTE_SHUFFLE
+    )
+    assert (
+        dag.frag_register_route(role="b", logical_swap=False, elem_bytes=4, **kwargs)
+        is None
+    )
+
+
+def test_transposed_fp32_tiles_keep_their_scatter_stores_conflict_free() -> None:
+    # A 64 x 64 fp32 tile (256-byte rows, 16 chunks): the widen pass stores
+    # the eight elements of a packet into eight rows 8 apart at one column,
+    # the exchange scatters a fragment's registers likewise.  The row
+    # swizzle alone lands every such lane group in one bank; XOR-ing the
+    # chunk by row // 8 as well spreads the warp over all 32 banks, and the
+    # eight rows of an ldmatrix (a multiple of 8 apart) keep eight chunks.
+    cpr = 16
+
+    def bank(row: int, col: int, swizzle: object) -> int:
+        chunk = swizzle(row, col // 4, cpr)  # pyrefly: ignore[not-callable]
+        return ((row * 256 + chunk * 16 + (col % 4) * 4) // 4) % 32
+
+    # Widen pass: lane -> packet (k row, chunk pch) of the bf16 source, its
+    # element e lands at (row 8 pch + e, column k) of the transposed tile.
+    for e in range(8):
+        new = {
+            bank(8 * (lane % 8) + e, lane // 8, dag.transposed_swizzled_chunk)
+            for lane in range(32)
+        }
+        old = {
+            bank(8 * (lane % 8) + e, lane // 8, dag.swizzled_chunk)
+            for lane in range(32)
+        }
+        assert len(new) == 32 and len(old) == 4
+    # Exchange scatter from the M-split C layout: register (an, j) of each
+    # lane (g, c) is element (row g + 8 (j // 2), col 8 an + 2 c + j % 2),
+    # stored transposed.
+    for an in range(8):
+        for j in range(4):
+            banks = {
+                bank(
+                    8 * an + 2 * (lane % 4) + j % 2,
+                    lane // 4 + 8 * (j // 2),
+                    dag.transposed_swizzled_chunk,
+                )
+                for lane in range(32)
+            }
+            assert len(banks) == 32, (an, j)
+    for n0 in range(0, 64, 8):
+        for chunk in range(cpr):
+            assert (
+                len(
+                    {
+                        dag.transposed_swizzled_chunk(n0 + r, chunk, cpr)
+                        for r in range(8)
+                    }
+                )
+                == 8
+            )
+
+
+def test_packet_rounds_add_immediates_to_one_lane_term() -> None:
+    # 128 threads cover 16 rows of a 128-byte-row tile per round: the
+    # thread's row, chunk and swizzled chunk are bound once in the preamble
+    # and every later round adds a constant (16 rows = 2048 bytes) to both
+    # the shared and the global address, so ptxas keeps one base register
+    # per tile instead of one per round.
+    bound = _bind_fwd()
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    preamble = body[: body.index("for md_i in")]
+    assert "md_pr8 = md_tidx // 8" in preamble
+    assert "md_pc8 = md_tidx % 8" in preamble
+    assert "md_pz8 = md_pc8 ^ md_pr8 % 8" in preamble
+    assert "md_prow" not in body and "md_pch" not in body
+    rounds = re.findall(
+        rf"{RT}\.cp_async_16\(md_t0 \+ md_pr8 \* 128( \+ \d+)? \+ md_pz8 \* 16, "
+        r"md_\w+ \+ cutlass\.Int64\(md_pr8\) \* \d+ \+ cutlass\.Int64\(md_pc8 \* 16\)( \+ \d+)?\)",
+        body,
+    )
+    assert len(rounds) == 4
+    assert {smem.strip() for smem, _g in rounds} == {"", "+ 2048", "+ 4096", "+ 6144"}
+    assert all(smem.strip() == gmem.strip() for smem, gmem in rounds)
+
+
+# --------------------------------------------------------------------------
+# A rescaled accumulator whose leaf an operand reads
+# --------------------------------------------------------------------------
+
+
+def _acc_scaled_b(k: torch.Tensor) -> torch.Tensor:
+    """A chain step accumulating into T with a pointwise acc over T, B = T."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        idx = hl.arange(C)
+        A = torch.where(idx[:, None] > idx[None, :], -kk, 0.0)
+        T = A + 1.0
+        Apow = A
+        for _ in range(3):
+            Apow = hl.dot(Apow, Apow)
+            T = hl.dot(Apow, T, acc=T * 0.5)
+        out[tile_bhn, :, :] = T
+    return out
+
+
+def _acc_scaled_a(k: torch.Tensor) -> torch.Tensor:
+    """The same with A = T."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        idx = hl.arange(C)
+        A = torch.where(idx[:, None] > idx[None, :], -kk, 0.0)
+        T = A + 1.0
+        Apow = A
+        for _ in range(3):
+            Apow = hl.dot(Apow, Apow)
+            T = hl.dot(T, Apow, acc=T * 0.5)
+        out[tile_bhn, :, :] = T
+    return out
+
+
+def _acc_scaled_b16(k: torch.Tensor) -> torch.Tensor:
+    """The 16-bit chain (identity / movmatrix routes), B = T."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        idx = hl.arange(C)
+        A = torch.where(idx[:, None] > idx[None, :], -kk, 0.0)
+        T = A + 1.0
+        Apow = A
+        for _ in range(3):
+            Apow = hl.dot(Apow.to(torch.bfloat16), Apow.to(torch.bfloat16))
+            T = hl.dot(Apow.to(torch.bfloat16), T.to(torch.bfloat16), acc=T * 0.5)
+        out[tile_bhn, :, :] = T
+    return out
+
+
+@pytest.mark.parametrize(
+    ("fn", "role"), ((_acc_scaled_b, "b"), (_acc_scaled_a, "a"), (_acc_scaled_b16, "b"))
+)
+def test_a_rescaled_acc_whose_leaf_an_operand_reads_takes_a_fresh_slot(
+    fn: object, role: str
+) -> None:
+    # ``dot(Apow, T, acc=T * 0.5)``: the acc is materialized into its slot
+    # before the MMAs (hoisted to the loop top), so an in-place accumulate
+    # would hand the B operand's exchange / words / shuffles the rescaled T.
+    # The dot takes a fresh slot (32 rescaled registers in, 32 copied back
+    # into the carry at the iteration end); the operand reads the carry.
+    t = _tensors3()
+    bound = _bind_fn(fn, (t["q"],))
+    assert bound.config_spec.cute_mma_dag is not None
+    program = _program(bound)
+    chain = program.loops[1]
+    (t_dot,) = [d for d in program.dots if d.loop == chain.index and d.acc is not None]
+    operand = t_dot.b if role == "b" else t_dot.a
+    assert operand.kind == "frag" and operand.frag is t_dot.acc_frag
+    carry = next(c for c in chain.carries if c.placeholder is t_dot.acc_frag)
+    assert t_dot.acc_slot == carry.slot and t_dot.slot != carry.slot
+    for warps in (4, 8):
+        body = _kernel_body(_source(bound, _config(64, warps=warps, stages=2)))
+        loop = body[body.index("for md_i1 in") :]
+        regs = 32 if warps == 4 else 16
+        rescales = re.findall(
+            rf"= md_c{carry.slot}_\d+_\d+_\d+ \* v_\d+$", loop, re.MULTILINE
+        )
+        copies = re.findall(
+            rf"^\s*md_c{carry.slot}_\d+_\d+_\d+ = md_c{t_dot.slot}_\d+_\d+_\d+$",
+            loop,
+            re.MULTILINE,
+        )
+        assert len(rescales) == regs == len(copies)
+        # Nothing writes the carry's registers before the copies behind the
+        # dot's last MMA: the operand reads them intact.
+        writes = [
+            m.start()
+            for m in re.finditer(
+                rf"^\s*md_c{carry.slot}_\d+_\d+_\d+ = ", loop, re.MULTILINE
+            )
+        ]
+        assert len(writes) == regs and min(writes) > loop.rindex(f"{RT}.mma_")
+
+
+def test_register_budget_prices_tf32_hoisted_words_at_eight_k_per_step() -> None:
+    # wy at eight warps splits N: dot(Apow, T, acc=T) reads its own
+    # accumulator as the [K, N] B operand, so its words are bound for the
+    # whole K extent -- 8 K per tf32 step, 16 words for K = 64 and 8
+    # columns, twice the 16-bit rate -- beside the 16 ldmatrix A words.
+    bound = _bind_wy()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    sizes = {
+        axis.block_id: 64
+        if axis.kind in ("root", "loop")
+        else (1 if axis.kind == "lead" else axis.extent)
+        for axis in facts.axes
+    }
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert all(size is not None for size in resolved)
+    assert dag.mma_dag_transient_regs(facts, resolved, 8) == 16 + 16  # pyrefly: ignore[bad-argument-type]
+    assert {d.elem_bytes for d in facts.dots} == {2, 4}
+
+
+def _hoisted_a_chain(k: torch.Tensor) -> torch.Tensor:
+    """The chain's A operand is the dot's own accumulator (a bare acc): its
+    shuffle words are bound before the MMAs."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        idx = hl.arange(C)
+        A = torch.where(idx[:, None] > idx[None, :], -kk, 0.0)
+        T = A + 1.0
+        Apow = A
+        for _ in range(3):
+            Apow = hl.dot(Apow, Apow)
+            T = hl.dot(T, Apow, acc=T)
+        out[tile_bhn, :, :] = T
+    return out
+
+
+def _nk_b_shuffle(x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """A 16-row fp32 tile times the transpose of a per-iteration fragment:
+    the B operand is the fragment read as [N, K]."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    R = hl.specialize(x.size(1))
+    out = torch.empty([BHN, 3, R, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        idx = hl.arange(C)
+        P = torch.where(idx[:, None] > idx[None, :], -kk, 0.0)
+        xr = x[tile_bhn, :, :]
+        for i in range(3):
+            P = hl.dot(P, P)
+            out[tile_bhn, i, :, :] = hl.dot(xr, P.transpose(-2, -1))
+    return out
+
+
+def test_the_hoisted_a_and_nk_b_shuffle_routes_render() -> None:
+    # Four warps split M: ``dot(T, Apow, acc=T)`` reads its own accumulator
+    # as A, so the words of all eight K steps are bound before the MMAs
+    # (32 ``md_aw`` per iteration); ``dot(xr, P^T)`` on a 16-row consumer
+    # splits N while the 64 x 64 producer splits M, the [N, K] shape of the
+    # route: B words picked from lanes ``4g + c // 2`` and two further.
+    t = _tensors3()
+    bound = _bind_fn(_hoisted_a_chain, (t["q"],))
+    program = _program(bound)
+    chain = program.loops[1]
+    (t_dot,) = [d for d in program.dots if d.loop == chain.index and d.acc is not None]
+    assert t_dot.a.frag is t_dot.acc_frag and t_dot.slot == t_dot.acc_slot
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    loop = body[body.index("for md_i1 in") :]
+    assert (
+        len(
+            re.findall(
+                r"^\s*md_aw(?:_\d+)? = .*shfl_pick_b32\(md_qsl", loop, re.MULTILINE
+            )
+        )
+        == 32
+    )
+    assert "md_tsl" not in body
+
+    x = torch.empty((16, 16, 64), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind_fn(_nk_b_shuffle, (x, t["q"]))
+    assert bound.config_spec.cute_mma_dag is not None
+    program = _program(bound)
+    (y_dot,) = [
+        d for d in program.dots if d.a.kind == "load" and d.a.dtype == torch.float32
+    ]
+    assert y_dot.b.kind == "frag" and y_dot.b.logical_swap
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    loop = body[body.index("for md_i1 in") :]
+    picks = re.findall(
+        rf"^\s*md_b_\d+_0, md_b_\d+_1 = \({RT}\.shfl_pick_b32\(md_qsl, md_qodd, .*"
+        rf"{RT}\.shfl_pick_b32\(md_qsl \+ 2, md_qodd, ",
+        loop,
+        re.MULTILINE,
+    )
+    assert len(picks) == 16 and "md_tsl" not in body
+
+
+# --------------------------------------------------------------------------
+# Loop outputs in another slot, the root rescale after a loop
+# --------------------------------------------------------------------------
+
+
+def _single_ring(a: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """One loop: A staged per iteration, B the carry read as an operand,
+    ``acc=T * 0.5`` (the dot takes a fresh slot)."""
+    BHN, N, C = a.size(0), a.size(1), hl.specialize(a.size(2))
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=a.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        T = t[tile_bhn, :, :].to(torch.float32)
+        for i in range(N):
+            T = hl.dot(a[tile_bhn, i, :, :], T.to(torch.bfloat16), acc=T * 0.5)
+        out[tile_bhn, :, :] = T
+    return out
+
+
+def _single_ring_noacc(a: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """The same without an accumulator (a fresh slot at every version)."""
+    BHN, N, C = a.size(0), a.size(1), hl.specialize(a.size(2))
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=a.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        T = t[tile_bhn, :, :].to(torch.float32)
+        for i in range(N):
+            T = hl.dot(a[tile_bhn, i, :, :], T.to(torch.bfloat16))
+        out[tile_bhn, :, :] = T
+    return out
+
+
+def _root_rescaled_carry(k: torch.Tensor) -> torch.Tensor:
+    """A root-region dot over the K loop's own carry with a rescaled acc:
+    ``dot(kk, kk, acc=kk * 0.5)``."""
+    BHN, C, D = k.size(0), hl.specialize(k.size(1)), k.size(2)
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=k.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_kk in hl.tile(D):
+            kt = k[tile_bhn, :, tile_kk]
+            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
+        T2 = hl.dot(kk.to(torch.bfloat16), kk.to(torch.bfloat16), acc=kk * 0.5)
+        out[tile_bhn, :, :] = T2
+    return out
+
+
+def test_a_root_dot_rescaling_its_loops_carry_takes_a_fresh_slot() -> None:
+    # ``dot(kk, kk, acc=kk * 0.5)`` after the K loop: both operands read
+    # the carry, so the rescaled acc goes to a fresh slot (32 registers at
+    # four warps) and the operand words are packed from the carry's
+    # registers, which nothing writes after the loop.
+    t = _tensors3()
+    bound = _bind_fn(_root_rescaled_carry, (t["q"],))
+    program = _program(bound)
+    (dot,) = [d for d in program.dots if d.loop == -1]
+    (carry,) = program.loops[0].carries
+    assert dot.a.frag is dot.b.frag is dot.acc_frag
+    assert dot.acc_slot == carry.slot == 0 and dot.slot == 1
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    loop = _loop_and_after(body)
+    after = loop[re.search(r"\n    \S", loop).start() + 1 :]
+    assert not re.search(r"^\s*md_c0_\d+_\d+_\d+ = ", after, re.MULTILINE)
+    rescales = re.findall(r"= md_c0_\d+_\d+_\d+ \* v_\d+$", after, re.MULTILINE)
+    copies = re.findall(r"^\s*md_c1_\d+_\d+_\d+ = md_v(?:_\d+)?$", after, re.MULTILINE)
+    assert len(rescales) == len(copies) == 32
+    packs = [line for line in after.splitlines() if "pack_bf16x2(" in line]
+    assert packs and all("md_c0_" in line and "md_c1_" not in line for line in packs)
+    mmas = re.findall(
+        rf"^\s*(md_c\d)_\d+_\d+_\d+, .* = {RT}\.mma_bf16\(", after, re.MULTILINE
+    )
+    assert mmas == ["md_c1"] * 32
+    assert after.index(copies[-1]) < after.index(f"{RT}.mma_bf16(")
