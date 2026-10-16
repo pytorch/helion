@@ -7,6 +7,8 @@ directly), so no ``@cute.jit`` wrapper is needed.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cutlass
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith
@@ -14,9 +16,18 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector as _vector_dialect
 import cutlass.cute as cute
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def store_u8_vec(ptr: object, vals: list) -> None:
+
+def store_u8_vec(
+    ptr: object,
+    vals: list,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
     """Store 2/4/8/16 byte lanes as one naturally aligned integer packet."""
+    store = cute.arch.store if packet_store is None else packet_store
     if len(vals) == 16:
         words = []
         for start in (0, 8):
@@ -27,17 +38,24 @@ def store_u8_vec(ptr: object, vals: list) -> None:
         packet = _vector_dialect.from_elements(
             ir.VectorType.get([2], cutlass.Uint64.mlir_type), words
         )
-        cute.arch.store(ptr, packet)
+        store(ptr, packet)
         return
     carrier = {2: cutlass.Uint16, 4: cutlass.Uint32, 8: cutlass.Uint64}[len(vals)]
     packed = carrier(0)
     for index, value in enumerate(vals):
         packed = packed | (carrier(value) << (8 * index))
     # ``Uint16 << int`` promotes to Int32: store exactly ``len(vals)`` bytes.
-    cute.arch.store(ptr, carrier(packed))
+    store(ptr, carrier(packed))
 
 
-def _store_fp8_vec(ptr: object, vals: list, dtype: type) -> None:
+def _store_fp8_vec(
+    ptr: object,
+    vals: list,
+    dtype: type,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
+    store = cute.arch.store if packet_store is None else packet_store
     source_dtype = type(vals[0])
     if source_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and all(
         type(value) is source_dtype and isinstance(value.value, ir.Value)
@@ -66,12 +84,16 @@ def _store_fp8_vec(ptr: object, vals: list, dtype: type) -> None:
             ir.VectorType.get([max(1, len(vals) // 8)], carrier.mlir_type), converted
         )
         if len(vals) == 16:
-            cute.arch.store(ptr, packed)
+            store(ptr, packed)
             return
         scalar = _vector_dialect.extract(packed, [], [0])
-        cute.arch.store(ptr, carrier(scalar))
+        store(ptr, carrier(scalar))
     else:
-        store_u8_vec(ptr, [dtype(value).bitcast(cutlass.Uint8) for value in vals])
+        store_u8_vec(
+            ptr,
+            [dtype(value).bitcast(cutlass.Uint8) for value in vals],
+            packet_store=packet_store,
+        )
 
 
 def store_fp8e4m3fn_vec(ptr: object, vals: list) -> None:

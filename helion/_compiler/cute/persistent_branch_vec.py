@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
-from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .cache_policy_loads import cache_hinted_load_helper
+from .cache_policy_loads import is_cache_policy_suffix
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1644,10 +1644,10 @@ class _BranchLocalPersistentVectorizer:
                         vector_type = (
                             f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
                         )
-                        if eviction in _CUTE_CACHE_LOAD_HELPERS:
+                        if is_cache_policy_suffix(eviction):
                             # An L2-policy marker is not a ``cute.arch.load``
-                            # kwarg: the 16-, 8- and 4-byte packets go
-                            # through the inline-PTX helper of their width.
+                            # kwarg: the packet goes through the inline-PTX
+                            # helper of its width (32 bytes: nc_l2_first only).
                             helper = cache_hinted_load_helper(
                                 eviction, width * itemsize
                             )
