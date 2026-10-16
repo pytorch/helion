@@ -1899,10 +1899,27 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
     def _axes(
         env: CompileEnvironment, device_ir: DeviceIR
     ) -> tuple[tuple[int, int, int, int], ...]:
+        """The consistent (m, n, k, factor) geometry of the placed contractions.
+
+        This is the geometry alone: it registers the proven-bounds knob and
+        the stride facts an explicit collective config relies on, whether or
+        not any site passes the structural proofs that gate the seeds.
+        """
+        return CuteCollectiveMatmulHeuristic._placements(env, device_ir)[0]
+
+    @staticmethod
+    def _placements(
+        env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[
+        tuple[tuple[int, int, int, int], ...],
+        tuple[tuple[MatmulFact, tuple[int, ...], int, int], ...],
+    ]:
+        """Geometry axes with each placed fact's root, K block and packing."""
         placements = cute_matmul_root_placements(env, device_ir)
         if not placements:
-            return ()
+            return (), ()
         axes = []
+        sites: list[tuple[MatmulFact, tuple[int, ...], int, int]] = []
         occupied: dict[int, tuple[int, ...]] = {}
         roots: dict[tuple[int, ...], tuple[int, int]] = {}
         factors: dict[int, int] = {}
@@ -1951,13 +1968,14 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 or k in factors
                 and factors[k] != factor
             ):
-                return ()
+                return (), ()
             if (m, n, k, factor) not in axes:
                 axes.append((m, n, k, factor))
+            sites.append((fact, root, k, factor))
             roots[root] = (m, n)
             occupied.update(dict.fromkeys((m, n, k), root))
             factors[k] = factor
-        return tuple(axes)
+        return tuple(axes), tuple(sites)
 
     @staticmethod
     def _gathered_candidate(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -2171,6 +2189,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
     ) -> list[Config]:
         # The collective proof imports DeviceIR, which imports the runtime
         # kernel while this registry is being initialized.
+        from ..cute.collective_matmul import fact_admits_collective_site
         from ..cute.collective_matmul import has_collective_native_seed_candidate
         from ..cute.collective_matmul import has_collective_tmem_operand_candidate
 
@@ -2180,8 +2199,21 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         # native-MMA seeds instead of measuring the requested collective.
         if spec.cute_tcgen05_search_enabled or spec.cute_flash_search_enabled:
             return []
-        axes = cls._axes(env, device_ir)
+        axes, sites = cls._placements(env, device_ir)
         if not axes:
+            return []
+        # A consistent geometry does not make a seed useful: when no placed
+        # contraction passes the lowering's structural proofs (for example a
+        # full-slice K accumulating a serial loop's carry, or operands indexed
+        # by that loop), every seed would fail at code generation. Only the
+        # seeds are withheld; ``register_facts`` keeps the geometry's knob and
+        # cache facts for explicit configs.
+        if not any(
+            fact_admits_collective_site(
+                env, device_ir, fact, root=root, k_block_id=k, k_factor=factor
+            )
+            for fact, root, k, factor in sites
+        ):
             return []
         blocks = {
             item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
@@ -2206,7 +2238,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         fragments = {
             block_id: item._fragment(spec) for block_id, item in blocks.items()
         }
-        seeded_native = has_collective_native_seed_candidate(device_ir.graphs)
+        seeded_native = has_collective_native_seed_candidate(env, device_ir)
         result = []
         for bm, bn, bk in (
             (64, 32, 64),
