@@ -1040,6 +1040,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        "cute_flash_bwd_mask_form",
+        "cute_flash_bwd_regs",
+        "cute_flash_bwd_hook_cols",
+        "cute_flash_bwd_hook_pin",
+        "cute_flash_bwd_bias_fold",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1279,6 +1284,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        "cute_flash_bwd_mask_form",
+        "cute_flash_bwd_regs",
+        "cute_flash_bwd_hook_cols",
+        "cute_flash_bwd_hook_pin",
+        "cute_flash_bwd_bias_fold",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1865,6 +1875,9 @@ class ConfigSpec:
         self.cute_flash_bwd_search_enabled: bool = False
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
+        self._cute_flash_bwd_persistent_allowed: bool = True
+        # The FlexAttention backward envelope: opens the mask-form knob.
+        self._cute_flash_bwd_flex: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
@@ -3317,6 +3330,8 @@ class ConfigSpec:
         *,
         block_size_targets: Mapping[int, int],
         two_cta_allowed: bool = False,
+        persistent_allowed: bool = True,
+        flex: bool = False,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3328,6 +3343,8 @@ class ConfigSpec:
         self.cute_flash_bwd_search_enabled = True
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
+        self._cute_flash_bwd_persistent_allowed = persistent_allowed
+        self._cute_flash_bwd_flex = flex
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -7053,11 +7070,38 @@ class ConfigSpec:
                     )
                 )
             elif self.cute_flash_bwd_search_enabled:
-                fields["cute_flash_bwd_persistent"] = EnumFragment(choices=(0, 1))
+                fields["cute_flash_bwd_persistent"] = EnumFragment(
+                    choices=(0, 1) if self._cute_flash_bwd_persistent_allowed else (0,)
+                )
                 fields["cute_flash_bwd_two_cta"] = EnumFragment(
                     choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
                 )
-                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
+                # The first choice is the default config's: the f32 exp2 pair
+                # measured 2-5% faster on the flex walks (and causal / d64 dense),
+                # the packed f16x2 pair on the dense d128 non-causal shapes.
+                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(
+                    choices=(1, 0) if self._cute_flash_bwd_flex else (0, 1)
+                )
+                if self._cute_flash_bwd_flex:
+                    # How the mask_mod predicate reaches the -inf select of
+                    # the flex backward's P pass (see flash_score_mod).
+                    fields["cute_flash_bwd_mask_form"] = EnumFragment(
+                        choices=("bitmask", "element")
+                    )
+                    from .._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
+
+                    # Register budget per warp role (reduce / compute / other).
+                    fields["cute_flash_bwd_regs"] = EnumFragment(
+                        choices=FBWD_REG_SPLITS
+                    )
+                    # Lanes per hook + exp2 group of the P pass (live-range control).
+                    fields["cute_flash_bwd_hook_cols"] = EnumFragment(
+                        choices=(32, 16, 8)
+                    )
+                    # Order the hook coordinate math after the S wait (see fbwd_pin_i32).
+                    fields["cute_flash_bwd_hook_pin"] = EnumFragment(choices=(1, 0))
+                    # Fold an additive score bias into the LSE term (see additive_bias_region).
+                    fields["cute_flash_bwd_bias_fold"] = EnumFragment(choices=(1, 0))
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path

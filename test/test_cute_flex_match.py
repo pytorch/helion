@@ -72,11 +72,17 @@ def _flex_kernel() -> Kernel:
 def _variant_kernel(
     tmp_path: pathlib.Path, name: str, *edits: tuple[str, str]
 ) -> Kernel:
-    """A textual variant of the example kernel (each edit must apply once)."""
+    """A textual variant of the example kernel (each edit must apply once).
+
+    The backward kernels further down the file repeat some of the forward
+    kernel's lines, so the edits apply to the forward part only."""
     source = (EXAMPLES_DIR / "flex_attention.py").read_text()
+    cut = source.find("\ndef _flex_attention_bwd_preprocess")
+    head, tail = (source, "") if cut < 0 else (source[:cut], source[cut:])
     for old, new in edits:
-        assert source.count(old) == 1, old
-        source = source.replace(old, new)
+        assert head.count(old) == 1, old
+        head = head.replace(old, new)
+    source = head + tail
     path = tmp_path / f"flex_attention_{name}.py"
     path.write_text(source)
     return _cute_kernel(import_path(path).helion_flex_attention_kernel)

@@ -707,6 +707,7 @@ def _fbwd_epilogue_block(
     io_dtype: str,
     dkv_wait: str,
     v_empty_expr: str,
+    gm_expr: str | None = None,
 ) -> str:
     """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> a free
     smem buffer as (128, 64) SWIZZLE_128B boxes -> one TMA store per box.
@@ -719,7 +720,7 @@ def _fbwd_epilogue_block(
     tile's K loads overlap the epilogue."""
     buf = "sV" if h == 0 else "sdS"
     tma = "_fbwd_tma_dv" if h == 0 else "_fbwd_tma_dk"
-    gm = "_fbwd_mdVt" if h == 0 else "_fbwd_mdKt"
+    gm = ("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") if gm_expr is None else gm_expr
     warp_lo = 4 if h == 0 else 8
     chunks = "".join(
         (
@@ -2402,6 +2403,12 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     df = cg.device_function
     match = df.cute_state.attention_flash_bwd_match
+    from .flex_bwd_match import FlexBwdMatch
+
+    if isinstance(match, FlexBwdMatch):
+        from .cute_flash_bwd_flex import codegen_attention_flash_bwd_flex
+
+        return codegen_attention_flash_bwd_flex(cg, match)
     if not isinstance(match, AttentionBwdMatch):
         return False
     plan: AttentionBwdPlan = match.plan
@@ -2596,7 +2603,7 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
         return False
     match = match_attention_bwd(device_ir)
     if match is None:
-        return False
+        return _detect_flex_bwd_search_surface(device_ir)
     env = CompileEnvironment.current()
     kv_block_id = device_ir.grid_block_ids[0][0]
     inner_block_id = None
@@ -2614,5 +2621,33 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=_flash_bwd_two_cta_allowed(match.plan),
+    )
+    return True
+
+
+def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
+    """Enable the bwd flash search surface for the FlexAttention backward
+    envelope (pins the KV tile and the Q tile to 128 rows; the list walk has
+    no persistent or 2-CTA variant)."""
+    from ..backend import _flash_block_sizes_reachable
+    from ..compile_environment import CompileEnvironment
+    from .flex_bwd_match import match_flex_attention_bwd
+
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 3:
+        return False
+    env = CompileEnvironment.current()
+    match = match_flex_attention_bwd(
+        device_ir.graphs, device_ir.grid_block_ids[0], env=env
+    )
+    if match is None:
+        return False
+    targets = {match.kv_block_id: 128, match.q_block_id: 128}
+    if not _flash_block_sizes_reachable(env, targets):
+        return False
+    env.config_spec.enable_cute_flash_bwd_search(
+        block_size_targets=targets,
+        two_cta_allowed=False,
+        persistent_allowed=False,
+        flex=True,
     )
     return True
