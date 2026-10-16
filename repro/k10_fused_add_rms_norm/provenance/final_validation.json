@@ -1,0 +1,26 @@
+{
+  "status": "PASS",
+  "tested_head": "e757221171adcc11513c907a9dddf02a9917b5f9",
+  "tested_tree": "674c4a3c22051592cdaec63a796d6cebad6b8f44",
+  "message_only_parent_head": "d1c57678eda3835142768dcec215038e55804ec6",
+  "source_unchanged_by_message_updates": true,
+  "default_suite": {
+    "tests_passed": 17811,
+    "subtests_passed": 3215,
+    "skipped": 10708,
+    "receipt": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main71_verify_prepare_v1/default_gpu0/completion_v1.json",
+    "sha256": "8b909cb3e86e9a2549fd309a0f04fd1a8ebc8c768cd40332cd85b6a2709ae914"
+  },
+  "cute_suite": {
+    "tests_passed": 27164,
+    "subtests_passed": 4648,
+    "skipped": 1348,
+    "receipt": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main71_verify_prepare_v1/cute_gpu1/completion_v1.json",
+    "sha256": "fbeaffd2de89c3f9fc19c7541e26dcff5e1f53a6599bee85a4a85b743fdf8f8d"
+  },
+  "standalone_records": 396,
+  "portable_records": 99,
+  "lint": "PASS",
+  "code_review": "LGTM",
+  "new_codegen_or_perf_claim_in_this_artifact": false
+}

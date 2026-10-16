@@ -1,0 +1,21 @@
+{
+  "status": "PASS_CPU_SYNTAX_EXECUTABLE_AST_TYPE_HINT_FORMAT_ONLY",
+  "all_python_files_checked": [
+    "inputs.py",
+    "validation.py",
+    "numerics.py",
+    "numerical_policy.py",
+    "fused_add_rms_norm.py",
+    "run.py"
+  ],
+  "canonical_kernel_full_AST_unchanged": true,
+  "old_frozen_source_guard_full_AST_unchanged": true,
+  "metadata_and_reference_executable_ASTs_unchanged_after_deferred_annotations": true,
+  "runtime_annotations_only_no_math_policy_changes": true,
+  "v5_native_all396_validation": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_no_land_fixed_correctness_v1/completion_v1.json",
+    "sha256": "c9183bbbf5f4b906c629c52b1591414bc5953a9891df52dfe7d16aac632ac1ee"
+  },
+  "native_targeted_bootstrap_validation": "PENDING_CASE0_9_11_99_CHECKS",
+  "old_v5_v6_or_core_fullsuite_changes": false
+}

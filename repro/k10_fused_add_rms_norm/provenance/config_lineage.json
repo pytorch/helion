@@ -1,0 +1,3799 @@
+[
+  {
+    "case_index": 0,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/stack_cute.json",
+      "sha256": "48f5c5fd16482c5d32d222327fc6b927bd0cfcf42af16806d86aaa11e02b83da"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/stack_cute.artifacts/winner.json",
+      "sha256": "6adba28c0512885ae6756af5153e453d0894c03b768c146fdede1380dd9ab93c"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "dc415e01638952c8cf9ea71551bf95eb86e4a28415b609536953894a0cb5dc1a"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_interleaved_comparison_v1.json",
+      "sha256": "ec639577eb48b6f918a85ad0b74f167e86c408671e7eb2dc7e330a3b1a23020f"
+    },
+    "Goal_row": {
+      "name": "bfloat16_1x4096",
+      "case_index": 0,
+      "ratio": 1.0,
+      "artifact": "artifacts/k10-cute-2026-10-14/case00_interleaved_comparison_v1.json",
+      "before_artifact": "artifacts/k10-cute-2026-10-14/initial_full_case00_v3/main_helion-cute_case00_full.json",
+      "before_ms": 0.002432,
+      "after_artifact": "artifacts/k10-cute-2026-10-14/initial_full_case00_v3/stack_helion-cute_case00_full.json",
+      "after_ms": 0.002144,
+      "best_baseline": "quack-tuned",
+      "verification": "PASS_3_interleaved_pairs",
+      "verified_after_ms": 0.002112,
+      "verified_best_baseline_ms": 0.002112
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "fa477ac121fe0eaa8807b99b32bbc3838f48b2831b580d9aad51b5119c649248"
+    },
+    "current_inner_config_exact_match": true,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/stack_cute.json",
+      "sha256": "48f5c5fd16482c5d32d222327fc6b927bd0cfcf42af16806d86aaa11e02b83da"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          1,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8192,
+        "sha256": "c907b78cba182f61076684bf8fcb3f15bac485ad91b923005f39e20f8d790063"
+      },
+      "residual_storage": {
+        "shape": [
+          1,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8192,
+        "sha256": "3c1d4b6425705d45bd39f7d17f8fa5d24e8969f2ab6570a6d8d15cd536d109a2"
+      },
+      "weight": {
+        "shape": [
+          4096
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8192,
+        "sha256": "04589014cd463f8f244042a0c8964166862de638363a660033199d9051d82072"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b",
+    "evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "313af501e44dfce0b146f0fc25bf43006fed0559f50f1fe9af97de0b9ffc531c"
+    },
+    "paired_acceptance": "ACCEPTED_PAIRED",
+    "Root_application": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_goal_application_v1.json",
+      "sha256": "044e330f19dd682f9a319498cf0d66dbd8d3b3dce0ab7dd3306aca72522756fb"
+    },
+    "proposed_update": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_balanced_qualification_v1/proposed_update_v1.json",
+      "sha256": "000782b4c81894e5bd992c9233294b3c78b60c59659a71e65811255965c7f8d1"
+    },
+    "initial_qualification": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/initial_qualification_v1.json",
+      "sha256": "6557d364ede61e8a858adb24d7058c58a0f8a8709ae0cde75da7b964e8f390b5"
+    },
+    "source_equivalence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main_rebase_code_capture_case00_latest_v1/comparison_v1.json",
+      "sha256": "fcc931a3c41facb79216f44dae44427c334b723a3e45ffa495209f8ecbb158e4"
+    },
+    "Root_authorized_inner_config_installation": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_library_config_v1/receipt_v1.json",
+      "sha256": "dfa6a485790411c374acfc7226eee1870b10168c4ba69480bb9d81e4de14f106"
+    }
+  },
+  {
+    "case_index": 1,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.json",
+      "sha256": "5ed7f504f9b14c1e4cb4125052741332fbfc253ad5ec85410a3ac39c91bace23"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.artifacts/winner.json",
+      "sha256": "60aa0ef8b2ed6865cca7b4bbf873b64acf2ef1060973ad177f31cba716701a78"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.artifacts/generated_cute.py",
+      "sha256": "1a5ef08a72816c222ebff4df5d0a02f133f82c0be83010c1dfa23f82c4d3267c"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_results_v1/performance_qualification_v2.json",
+      "sha256": "2e7e1123ea7b545c08ada9c248e449f480df8899663b9e571a8178e58cdae652"
+    },
+    "Goal_row": {
+      "name": "bfloat16_16x7168",
+      "case_index": 1,
+      "ratio": 1.0394736842105263,
+      "artifact": "artifacts/k10-cute-2026-10-14/case01_private_retained_results_v1/performance_qualification_v2.json",
+      "artifact_sha256": "2e7e1123ea7b545c08ada9c248e449f480df8899663b9e571a8178e58cdae652",
+      "artifact_classification": "local_private_input_cold_full_balanced_verified",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "artifacts/k10-cute-2026-10-14/case01_rebased_revalidation_v1/02_main_e73_full.json",
+      "before_sha256": "a6090685e49cdb85b5428ea0422f9fee00ccc531b5428f89e90218ee8f0f8396",
+      "before_ms": 0.002432,
+      "before_gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143",
+      "after_artifact": "artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.json",
+      "after_sha256": "5ed7f504f9b14c1e4cb4125052741332fbfc253ad5ec85410a3ac39c91bace23",
+      "after_ms": 0.002432,
+      "after_gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143",
+      "verified_before_ms": 0.002432,
+      "verified_main_ms": 0.002432,
+      "verified_after_ms": 0.002432,
+      "verified_best_baseline_ms": 0.002528,
+      "best_baseline": "quack-tuned",
+      "best_baseline_ms": 0.002528,
+      "best_known_baseline": "quack-tuned",
+      "best_known_baseline_ms": 0.002528,
+      "best_baseline_complete": true,
+      "source_manifest": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/private_retained_args_v1_manifest.json",
+        "sha256": "7481af97acc263378fc22baa9216488b2b004928bd9090a9fecf834480e4228b"
+      },
+      "main_source_manifest": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/main_e73f_v1_manifest.json",
+        "sha256": "fc9de5dc754baac537e3d86add0d380c8f4a9ed78e0fad2fcf3dc8e511920ca1"
+      },
+      "peer_review": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/private_retained_case01_qualifier_stage_review_v1/review_v1.json",
+        "sha256": "51456eaa6b7e3e14a025bfca4dca1c813a8f6867f7cf2b846b0f12d91e8cbd2f"
+      },
+      "completion": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_results_v1/completion.json",
+        "sha256": "02898832f723f1b8e0f54b9915d7e9b2e380025d0d1ad20615a5b88ef4d62c3c"
+      },
+      "performance_qualification": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_results_v1/performance_qualification_v2.json",
+        "sha256": "2e7e1123ea7b545c08ada9c248e449f480df8899663b9e571a8178e58cdae652"
+      },
+      "precision_l2_limit": 0.005,
+      "normalize_rounded_residual": false,
+      "benchmark_interface": "frozen library .fn; backend FULL and fixed verification",
+      "public_library_timing_validated": false
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.json",
+      "sha256": "5ed7f504f9b14c1e4cb4125052741332fbfc253ad5ec85410a3ac39c91bace23"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          16,
+          7168
+        ],
+        "stride": [
+          7168,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 229376,
+        "sha256": "196078791f56db5d0d25d1497859b71c234d1d3cda3ae5654c64d8af4fce0b77"
+      },
+      "residual_storage": {
+        "shape": [
+          16,
+          7168
+        ],
+        "stride": [
+          7168,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 229376,
+        "sha256": "bc282a80d13448184fa4e98116b92716fae021125faa658009add1ed063e3571"
+      },
+      "weight": {
+        "shape": [
+          7168
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 14336,
+        "sha256": "b86312d63461c88bfead16f3c72f6f59cfd4ba821f18ca57496b74b192918803"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 2,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_full_v1/01_private_retained_full.json",
+      "sha256": "5968bb246965cf3f25f650d21e1a9e216020dac8ec3cfc7db56e5b45ad88ee6c"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_full_v1/01_private_retained_full.artifacts/winner.json",
+      "sha256": "6173d203ac2fbeb3e3aee29508ceb6598ba4c4b7906fae50c1f97b885b3db3f4"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_full_v1/01_private_retained_full.artifacts/generated_cute.py",
+      "sha256": "d3272a6ba4a7188a34c2dd50fd566fb956eec43525a720ad51cc25345908623b"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_qualification_v1/comparison_v1.json",
+      "sha256": "eccdca4b1a00883ff3676226b58e7bbc75027ab4cd56db2297cbefdb818b4692"
+    },
+    "Goal_row": {
+      "name": "bfloat16_128x8192",
+      "case_index": 2,
+      "ratio": 1.1264367816091954,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "eccdca4b1a00883ff3676226b58e7bbc75027ab4cd56db2297cbefdb818b4692",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_latest_main_full_v1/01_latest_main_full.json",
+      "before_sha256": "21ec3e0ace8d3791e1e250db704ec0e9f26d3ca6ee515a225ee3d19538868eee",
+      "before_ms": 0.003456,
+      "after_ms": 0.002784,
+      "best_baseline_ms": 0.003136,
+      "verified_before_ms": 0.003456,
+      "verified_after_ms": 0.002784,
+      "verified_best_baseline_ms": 0.003136,
+      "best_baseline": "torch-compile",
+      "gpu_uuid": "GPU-7910a120-6368-4db1-a571-d4ce1b1e02a4",
+      "terminal_peer_review": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/private_retained_balanced_native_review_v1/review_v1.json",
+        "sha256": "908e8e6c5001568b121d58e0e784a85bd0ad6790a563d8c4e00a67dc44f9d6bb"
+      }
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_full_v1/01_private_retained_full.json",
+      "sha256": "5968bb246965cf3f25f650d21e1a9e216020dac8ec3cfc7db56e5b45ad88ee6c"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          128,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 2097152,
+        "sha256": "b23bd7f7a85965e13c3f7649acb60e2c6b3f29d52fdaf38299ee6a61e0afb9c6"
+      },
+      "residual_storage": {
+        "shape": [
+          128,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 2097152,
+        "sha256": "b94f8725fc6e46c71ad76eda8e64c4c16c93310d0fd580d259dca53f58be198e"
+      },
+      "weight": {
+        "shape": [
+          8192
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 16384,
+        "sha256": "11eed7765a03a27ae2598e4bf8a6985561281a08e2a97336b51851b06887efac"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 3,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_retry_v1/stack_cute.json",
+      "sha256": "42b9c816b6a28aeed01682ea1352b2722dc5cf6fd89c27ff6840e1d141777049"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_retry_v1/stack_cute.artifacts/winner.json",
+      "sha256": "ad6428c03b1e40cd2e4414ef5d1b24bdf7b11efb127b138539d3889980dfa25d"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_retry_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "b3bda8ce31ff03212fd86996a4181dc98b5fc5081995b87bddc717598b867144"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "cbebb9b18181ad1b5376da66958059909c5d35aeb5dcf576464d51fd36e31a15"
+    },
+    "Goal_row": {
+      "name": "bfloat16_1024x4096",
+      "case_index": 3,
+      "ratio": 1.0445103857566767,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_balanced_qualification_v1/comparison_v1.json",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_initial_v1/main_cute.json",
+      "before_ms": 0.005696,
+      "before_sha256": "fed850316bb5707cb7b33048ef8796f791b81a1dac3ccfceb67d6bf254ad7890",
+      "artifact_sha256": "cbebb9b18181ad1b5376da66958059909c5d35aeb5dcf576464d51fd36e31a15",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "after_ms": 0.005391999999999999,
+      "best_baseline_ms": 0.005632,
+      "verified_before_ms": 0.005728,
+      "verified_after_ms": 0.005391999999999999,
+      "verified_best_baseline_ms": 0.005632,
+      "best_baseline": "helion-triton",
+      "gpu_uuid": "GPU-7910a120-6368-4db1-a571-d4ce1b1e02a4",
+      "terminal_peer_review": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_balanced_native_peer_v1/review_v1.json",
+        "sha256": "a55dfe3d61c4ee706e8a9f2a0f946d1a8fb105cf33b8825c2d1fba0779b77722"
+      }
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_retry_v1/stack_cute.json",
+      "sha256": "42b9c816b6a28aeed01682ea1352b2722dc5cf6fd89c27ff6840e1d141777049"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          1024,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8388608,
+        "sha256": "fe1c8f20161fb20ef7aca6c10592eb5f2007a0a503f910f253730febad9f6d2f"
+      },
+      "residual_storage": {
+        "shape": [
+          1024,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8388608,
+        "sha256": "20cf0c1589ea6dccea2268f368a5d8ec06aba355daa19e7cb851b6e3b66ac089"
+      },
+      "weight": {
+        "shape": [
+          4096
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 8192,
+        "sha256": "88b2c9ea6af7ea1ead05e648ea3de75ec29dfb33c1976156b7dfffa16e9bc46a"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 4,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/stack_cute.json",
+      "sha256": "7b9c1f75fb892f03b5fc9414acb52bf7e0c0fa076b716dfd785facccbea23453"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/stack_cute.artifacts/winner.json",
+      "sha256": "f2a7a1a135ea242d787a5eba942fb6032b8b8696f94cc29b6309488c629d556e"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/stack_cute.artifacts/generated_cute.py",
+      "sha256": "054a9adca31d4615884bf05a4f369f081022d336780cb604d271ed400fde505a"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_balanced_qualification_v2/comparison_v1.json",
+      "sha256": "dbd88980e209ced375ac0ea168583b61f59cc1899f956566d4db8314a986c229"
+    },
+    "Goal_row": {
+      "name": "bfloat16_4096x5120",
+      "case_index": 4,
+      "ratio": 1.0403121184371185,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_balanced_qualification_v2/comparison_v1.json",
+      "artifact_sha256": "dbd88980e209ced375ac0ea168583b61f59cc1899f956566d4db8314a986c229",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/main_cute.json",
+      "before_sha256": "ebacdf6ffe086be20982a7543d91f3681a25f0ba0b9f927b655fd7540c56b63a",
+      "before_ms": 0.026528,
+      "after_ms": 0.026208,
+      "best_baseline_ms": 0.0272645,
+      "verified_before_ms": 0.0264965,
+      "verified_after_ms": 0.026208,
+      "verified_best_baseline_ms": 0.0272645,
+      "best_baseline": "helion-triton",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/stack_cute.json",
+      "sha256": "7b9c1f75fb892f03b5fc9414acb52bf7e0c0fa076b716dfd785facccbea23453"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          4096,
+          5120
+        ],
+        "stride": [
+          5120,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 41943040,
+        "sha256": "11af81ae62e8f23ac7220a9ff70314040666acd9983662eebd87e751cc272f3b"
+      },
+      "residual_storage": {
+        "shape": [
+          4096,
+          5120
+        ],
+        "stride": [
+          5120,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 41943040,
+        "sha256": "cf93455460bd3a93daacdc7e231da95f2d3e91880758b41c4afaa0417ae5e068"
+      },
+      "weight": {
+        "shape": [
+          5120
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 10240,
+        "sha256": "707396e2f71ef86265dd791387180c61a7557a25e980a896438ad5fde277d7a6"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 5,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "d0a47a1eb5cc4c282c2f7fa421e25b4f07817c563526c36458b7f073ce7bdb5a"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/stack_cute.artifacts/winner.json",
+      "sha256": "fab3193dd2e9218bba0807d6cb4ed50d672c82e04f685a3dcc3ee37616bfd7a0"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "0c7939057a3660fb78672a6cea882299255d867c7282722acc9207db0de51eb2"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "23be7444ac25a460c0b144ea3778608bd6b3198674dcdfe0faee62a8aa068b09"
+    },
+    "Goal_row": {
+      "name": "bfloat16_16384x8192",
+      "case_index": 5,
+      "ratio": 0.9928185313115938,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_balanced_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "23be7444ac25a460c0b144ea3778608bd6b3198674dcdfe0faee62a8aa068b09",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/main_cute.json",
+      "before_sha256": "9a34ec409a7353c55d9fbca512ed4b2c33b82baa360a359051d76e001d212b09",
+      "before_ms": 0.154017,
+      "after_ms": 0.153729,
+      "best_baseline_ms": 0.152625,
+      "verified_before_ms": 0.154401,
+      "verified_after_ms": 0.153729,
+      "verified_best_baseline_ms": 0.152625,
+      "best_baseline": "quack-tuned",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.005,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "d0a47a1eb5cc4c282c2f7fa421e25b4f07817c563526c36458b7f073ce7bdb5a"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          16384,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 268435456,
+        "sha256": "76d11c9a336199e401abd69ec096d05b41b882b2fa2ec4351606dd7df5128fe5"
+      },
+      "residual_storage": {
+        "shape": [
+          16384,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 268435456,
+        "sha256": "4f1b7d4b3b06b549c89c778533ca965da769c9168821b6eff075a3b7cac77c20"
+      },
+      "weight": {
+        "shape": [
+          8192
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.bfloat16",
+        "storage_bytes": 16384,
+        "sha256": "1955d1bb16cd2e8f1149be53d7c3ce735b379d0113f88703549eadc701623584"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 6,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "a3d727603c9293b57ceb0368600c6a84e37b2f93fa885cc8eaa6dc91a0d60586"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/stack_cute.artifacts/winner.json",
+      "sha256": "819bf8883760a5f2f887e05d51ee27050a3ebab0a9caa323719d1e039b0215a6"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "29be09f27f8cf42d8b1e6171845531c0ba4504661e9205fff4b00f9b780af4f5"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "1c78105ffdd66e12626208cdc9889a30ecf0be0f0da56f27fae8ba87ddc7c620"
+    },
+    "Goal_row": {
+      "name": "float16_1x4096",
+      "case_index": 6,
+      "ratio": 1.0819672131147542,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_balanced_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "1c78105ffdd66e12626208cdc9889a30ecf0be0f0da56f27fae8ba87ddc7c620",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/main_cute.json",
+      "before_sha256": "fb07efcd36e9702c42d6eb4d370201d1ff724e05c263d5d405b1eac2daec01da",
+      "before_ms": 0.002144,
+      "after_ms": 0.001952,
+      "best_baseline_ms": 0.002112,
+      "verified_before_ms": 0.002112,
+      "verified_after_ms": 0.001952,
+      "verified_best_baseline_ms": 0.002112,
+      "best_baseline": "quack-tuned",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "a3d727603c9293b57ceb0368600c6a84e37b2f93fa885cc8eaa6dc91a0d60586"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          1,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8192,
+        "sha256": "f0bb60f864ad87364917eec973a8ff98cc4e0b9a9f1e3ef37afd1a97101e3e4e"
+      },
+      "residual_storage": {
+        "shape": [
+          1,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8192,
+        "sha256": "1033856c15f99bb2a5476310d6c361ba37045214ed8a2741c7b37e77d0d09eaa"
+      },
+      "weight": {
+        "shape": [
+          4096
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8192,
+        "sha256": "515d47dba40838f45d4043218fced8f43d537febc9ca882de874685d0ccb7802"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 7,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.json",
+      "sha256": "d1c6c8dd67a910138d298b57769e81824ccc2e69a1fde558f07b316609e38b81"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.artifacts/winner.json",
+      "sha256": "1edd5018eada2c36435fba4f41225a0bcf3cc1528406e50788c1b75d97ac600c"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.artifacts/generated_cute.py",
+      "sha256": "968afae5b09397a40ee200c5237ec61b4a156b584fcccf8d89abeca8d215cff6"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "0a0837cd83563fc16020e740d00d0682e299eb94ade3083cc5491c4515989e23"
+    },
+    "Goal_row": {
+      "name": "float16_16x7168",
+      "case_index": 7,
+      "ratio": 1.0540540540540542,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_balanced_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "0a0837cd83563fc16020e740d00d0682e299eb94ade3083cc5491c4515989e23",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.json",
+      "before_sha256": "d1c6c8dd67a910138d298b57769e81824ccc2e69a1fde558f07b316609e38b81",
+      "before_ms": 0.002368,
+      "after_ms": 0.002368,
+      "best_baseline_ms": 0.002496,
+      "verified_before_ms": 0.002368,
+      "verified_after_ms": 0.002368,
+      "verified_best_baseline_ms": 0.002496,
+      "best_baseline": "helion-triton",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.json",
+      "sha256": "d1c6c8dd67a910138d298b57769e81824ccc2e69a1fde558f07b316609e38b81"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          16,
+          7168
+        ],
+        "stride": [
+          7168,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 229376,
+        "sha256": "a9b8c8c0fa3e0973fe2028b863fe5b8df0a97cc4fed461e0d3759916cb68c808"
+      },
+      "residual_storage": {
+        "shape": [
+          16,
+          7168
+        ],
+        "stride": [
+          7168,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 229376,
+        "sha256": "fa18b9c93d36322e37d7a372ad96f5976bbd05fb5c68ce4031f3ee44f3e6c177"
+      },
+      "weight": {
+        "shape": [
+          7168
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 14336,
+        "sha256": "ddd2a5720321ea555e6dec722332a04461e443c0b97519faa7899fc4e1c2d127"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 8,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.json",
+      "sha256": "4c7c1cfe8044aadecdd72f02c641bf3c70e299c28b755fd9caead76ce4cdcaa5"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.artifacts/winner.json",
+      "sha256": "52d6f583f50d55917786b98dd5214d6cbb1bf99e4ae216d02360165a1418030f"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.artifacts/generated_cute.py",
+      "sha256": "7eb245a6db139476584b0b0acc62c7131ac242966926f4fdad9d56328a13fb67"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_pinned_torch_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "e42505b4ee78c1fbc60e3fa22d4cdf54855b2e4ad57c2b453ce2b0937cfa1b1b"
+    },
+    "Goal_row": {
+      "name": "float16_128x8192",
+      "case_index": 8,
+      "ratio": 1.1470588235294117,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_pinned_torch_balanced_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "e42505b4ee78c1fbc60e3fa22d4cdf54855b2e4ad57c2b453ce2b0937cfa1b1b",
+      "artifact_classification": "local_forward_reverse_verified_main_transfer_and_offered_native_torch_config",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.json",
+      "before_sha256": "4c7c1cfe8044aadecdd72f02c641bf3c70e299c28b755fd9caead76ce4cdcaa5",
+      "before_ms": 0.00272,
+      "after_ms": 0.00272,
+      "best_baseline_ms": 0.00312,
+      "verified_before_ms": 0.00272,
+      "verified_after_ms": 0.00272,
+      "verified_best_baseline_ms": 0.00312,
+      "best_baseline": "torch-compile",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.json",
+      "sha256": "4c7c1cfe8044aadecdd72f02c641bf3c70e299c28b755fd9caead76ce4cdcaa5"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          128,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 2097152,
+        "sha256": "896ca5658bed3afde38293833aadde326948a927911e7a1bcd6ce2354aabd795"
+      },
+      "residual_storage": {
+        "shape": [
+          128,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 2097152,
+        "sha256": "63541209c0abd5052352bc6850ac8efde7176f2e01401bef4dd16c0a8a9bcfe6"
+      },
+      "weight": {
+        "shape": [
+          8192
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 16384,
+        "sha256": "eddeb8a11a3a767b65e3b945ee1b5484353fc0085d1f5a7e4cefe0cfcb4de032"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 9,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "13a4a2f45d127d89e8b8a497cd582e212108a83bfc98de2935c4613b14c96478"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/stack_cute.artifacts/winner.json",
+      "sha256": "276d7b0c388e45f9e8418fc52f750324ba8e9711879ea52a67411653f72557a8"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "bdaecdb13e80282ef23df6aad7d76f8ca6760902b2391288692b11cdd9cdc2f5"
+    },
+    "Goal_evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "416928bd69c62f6c3f878c2e2f51a86099c446eaff1370969741d7fb8d581b81"
+    },
+    "Goal_row": {
+      "name": "float16_1024x4096",
+      "case_index": 9,
+      "ratio": 1.0495875788452207,
+      "artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_balanced_qualification_v1/comparison_v1.json",
+      "artifact_sha256": "416928bd69c62f6c3f878c2e2f51a86099c446eaff1370969741d7fb8d581b81",
+      "artifact_classification": "local_forward_reverse_ground_truth_fixed_cold_full_winners",
+      "verification": "PASS_2_balanced_pairs",
+      "before_artifact": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/main_cute.json",
+      "before_sha256": "376c2549d404e37c087a5b3b169eb145d763c484dea68733034888cbe0d2cc4c",
+      "before_ms": 0.005376,
+      "after_ms": 0.0051525,
+      "best_baseline_ms": 0.005408,
+      "verified_before_ms": 0.005408,
+      "verified_after_ms": 0.0051525,
+      "verified_best_baseline_ms": 0.005408,
+      "best_baseline": "helion-triton",
+      "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "f5fe380fae3e09336a4d4d76db31631cc25485f0e07934a3028a06f955826954"
+    },
+    "current_inner_config_exact_match": true,
+    "case0_historical_table_note": null,
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false,
+        "residual_rounding": "exact input-dtype rounding of FP32 sum"
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "13a4a2f45d127d89e8b8a497cd582e212108a83bfc98de2935c4613b14c96478"
+    },
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          1024,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8388608,
+        "sha256": "72ee95d6cb4903adcd8f1203f3aa9868e613f2597c4af43303656950826582f2"
+      },
+      "residual_storage": {
+        "shape": [
+          1024,
+          4096
+        ],
+        "stride": [
+          4096,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8388608,
+        "sha256": "4bdc2a05a48866ffc8db941f5a8db6bbbc1cae8d1768496942a19b464d01f716"
+      },
+      "weight": {
+        "shape": [
+          4096
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 8192,
+        "sha256": "0d172bbaea96eb8d4e69cccca30c1da13c100cc1ec189600d612ccfe97128ac6"
+      }
+    },
+    "original_software_sha256": "6aea8397c3c2d0196ef6385d3209df930683b05f17aa84c63ed8627f799dc64b"
+  },
+  {
+    "case_index": 10,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "fbd4bd50a74d277ae61b4962901e01bd3f503deb34e12e243c4f6d1e84d3eddf"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_gpu0_private_retained_initial_v1/stack_cute.artifacts/winner.json",
+      "sha256": "2160595bbabc8689a85630e094fb015e650e6754874bb58f9738915ca1f0f122"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "3a0284503c731dc3cc1e352810e406f93bc8842177fdf03b517320bf329d53e5"
+    },
+    "evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_balanced_qualification_v3/comparison_v1.json",
+      "sha256": "4b72724c71bf5849ac9aa0bd4b71560906515357321528562e8208f3957079ef"
+    },
+    "paired_acceptance": "ACCEPTED_PAIRED",
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "fbd4bd50a74d277ae61b4962901e01bd3f503deb34e12e243c4f6d1e84d3eddf"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "e0422595025614021e5d28ebbbc887e8d104398fc7b8104512ab6e9f2ae0d536"
+    },
+    "current_inner_config_exact_match": true,
+    "current_table_note": "Accepted INNER exact config",
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          4096,
+          5120
+        ],
+        "stride": [
+          5120,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 41943040,
+        "sha256": "e53ac216b14859698a73a24d9624b8f51eec54ad5c78968c91eeeca6e34c882d"
+      },
+      "residual_storage": {
+        "shape": [
+          4096,
+          5120
+        ],
+        "stride": [
+          5120,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 41943040,
+        "sha256": "3686f9001ac2249eaf87e67ba9f94fa0eab89ba21d1266f4faddd68f82d59e11"
+      },
+      "weight": {
+        "shape": [
+          5120
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 10240,
+        "sha256": "26894f625cf7d20375ecde42db9f2e946054d4f70fd9159fad6eab3312ef4485"
+      }
+    }
+  },
+  {
+    "case_index": 11,
+    "selected_FULL_origin": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "d960e3df7a6f68bf85d188609c00a34e02d2b03c1e99dbeada474e1baf40e21b"
+    },
+    "winner": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_gpu0_private_retained_initial_v1/stack_cute.artifacts/winner.json",
+      "sha256": "df52ca9535c473e911cb14d021387a84780ab6ad0e4f26766c7900367a52670b"
+    },
+    "generated_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+      "sha256": "8fd963289e8a58dbc7785e113f9b14c1e04ebe7dd2d9b6353e23491742be936b"
+    },
+    "evidence": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_balanced_qualification_v1/comparison_v1.json",
+      "sha256": "5c3b43ded510c24b612531147096e71ce3312d123cf674f3a0a9db9cdb769f2f"
+    },
+    "paired_acceptance": "ACCEPTED_PAIRED",
+    "original_all33_records": [
+      {
+        "path": ".correctness_eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.x.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.residual.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.eager[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.graph[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_changed_inputs.weight.restored_graph[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_restored_graph_inputs[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[0]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[1]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      },
+      {
+        "path": ".correctness_after_timing[2]",
+        "status": "PASS",
+        "l2_limit": 0.001,
+        "normalize_rounded_residual": false
+      }
+    ],
+    "raw_native_accuracy_source": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_gpu0_private_retained_initial_v1/stack_cute.json",
+      "sha256": "d960e3df7a6f68bf85d188609c00a34e02d2b03c1e99dbeada474e1baf40e21b"
+    },
+    "current_inner_table": {
+      "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+      "sha256": "ce73b3ad07dd1098f20ae0725b6e41cf030194aadffbdac4660bcb3edc6ce245"
+    },
+    "current_inner_config_exact_match": true,
+    "current_table_note": "Root-authorized exact INNER config11 installed after paired acceptance",
+    "original_input_sources": {
+      "x_storage": {
+        "shape": [
+          16384,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 268435456,
+        "sha256": "0417469687b5d5109cb60081ec80957c6c8e588c306e314b8c7ba7ef5299750b"
+      },
+      "residual_storage": {
+        "shape": [
+          16384,
+          8192
+        ],
+        "stride": [
+          8192,
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 268435456,
+        "sha256": "3685d65f5bfdbeb9ef2b735c2940e25eb119b2a8fb632882f84ab63d3eb880e8"
+      },
+      "weight": {
+        "shape": [
+          8192
+        ],
+        "stride": [
+          1
+        ],
+        "dtype": "torch.float16",
+        "storage_bytes": 16384,
+        "sha256": "db812bdac447efe943720ae97b449a06612835fafe5dfd949e87e506e5c16e1a"
+      }
+    },
+    "initial_qualification": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_initial_qualification_v1/initial_qualification_v1.json",
+      "sha256": "95619d2011824aac08d1dc33d8795f774de6f12d7fb2f441b6f54d25107d0d97"
+    },
+    "Root_application": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_goal_application_v1.json",
+      "sha256": "16897289eff12cd2ce3df32a6c4a9dfbd9167b318ba60a3c0f19d22e68b9a0e0"
+    },
+    "proposed_update": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_balanced_qualification_v1/proposed_update_v1.json",
+      "sha256": "615c830059d904513c363eb4ccd79d7c7428e5cda5a856945943e5318c85c27a"
+    },
+    "verified_performance": {
+      "current_us": 153.89700000000002,
+      "best_baseline": "quack-tuned",
+      "baseline_us": 152.545,
+      "ratio": 0.9912149034744016,
+      "description": "CuTe0.89%slower than QuACK, within1% parity; no gain claim"
+    },
+    "Root_authorized_inner_config_installation": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_library_config_v1/receipt_v1.json",
+      "sha256": "5625b2590a1a646b0eb3e55891e446c2ee04e605b9aad096f28eee71c188d5b8"
+    }
+  }
+]

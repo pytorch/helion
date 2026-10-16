@@ -1,0 +1,336 @@
+{
+  "accepted_goal_cases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "current_source_cases": 12,
+  "historical_case0_refresh_pending": false,
+  "pending_cases": [],
+  "standalone_native_validation": "PENDING_ROOT_FINAL_NATIVE_STAGE",
+  "cases": [
+    {
+      "case_index": 0,
+      "name": "bfloat16_1x4096",
+      "shape": {
+        "m": 1,
+        "n": 4096,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "7b215d3d693f5011f3941cc087533b0511752fe744070715c5d54fe3b5be7089",
+      "config": "configs/case00_bfloat16_1x4096.json",
+      "original_winner": "provenance/case00.winner.json",
+      "selected_origin": "Latest actual-e757 genuine FULL winner6adba; Root-accepted forward/reverse pairs",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_full_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "dc415e01638952c8cf9ea71551bf95eb86e4a28415b609536953894a0cb5dc1a"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "ROOT_ACCEPTED_MAIN71_E757",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Exact latest0 program/all7 helpers on both actual main71 and reviewed e757; config-only compatibility",
+      "paired_acceptance": "ACCEPTED_PAIRED"
+    },
+    {
+      "case_index": 1,
+      "name": "bfloat16_16x7168",
+      "shape": {
+        "m": 16,
+        "n": 7168,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "a244f6fa1ad53339242d6f09a9c5512cfe38b0262b9735b5ac4e9573e3b9cc14",
+      "config": "configs/case01_bfloat16_16x7168.json",
+      "original_winner": "provenance/case01.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case01_private_retained_revalidation_v1/02_private_retained_stack_full.artifacts/generated_cute.py",
+        "sha256": "1a5ef08a72816c222ebff4df5d0a02f133f82c0be83010c1dfa23f82c4d3267c"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 2,
+      "name": "bfloat16_128x8192",
+      "shape": {
+        "m": 128,
+        "n": 8192,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "0f1e925ee9fe95a4508e02169ae5fd606bbfc5dde6001b7749462b1b033fbbe7",
+      "config": "configs/case02_bfloat16_128x8192.json",
+      "original_winner": "provenance/case02.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case02_private_retained_full_v1/01_private_retained_full.artifacts/generated_cute.py",
+        "sha256": "d3272a6ba4a7188a34c2dd50fd566fb956eec43525a720ad51cc25345908623b"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 3,
+      "name": "bfloat16_1024x4096",
+      "shape": {
+        "m": 1024,
+        "n": 4096,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "994789347de10962bec44c1f62ca315abb2719d90c155fbf402a33933561f66c",
+      "config": "configs/case03_bfloat16_1024x4096.json",
+      "original_winner": "provenance/case03.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case03_private_retained_retry_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "b3bda8ce31ff03212fd86996a4181dc98b5fc5081995b87bddc717598b867144"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 4,
+      "name": "bfloat16_4096x5120",
+      "shape": {
+        "m": 4096,
+        "n": 5120,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "6adf14e4777a09e9e6de55bb0b6cb51c9a4690c74c78db3e9224180dd0838b24",
+      "config": "configs/case04_bfloat16_4096x5120.json",
+      "original_winner": "provenance/case04.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case04_gpu0_private_retained_retry_v2/stack_cute.artifacts/generated_cute.py",
+        "sha256": "054a9adca31d4615884bf05a4f369f081022d336780cb604d271ed400fde505a"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 5,
+      "name": "bfloat16_16384x8192",
+      "shape": {
+        "m": 16384,
+        "n": 8192,
+        "dtype": "bfloat16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "3bdc6308b4eb2124f5cf90b5165b4896559e18204f3cf017305680cae5cf7452",
+      "config": "configs/case05_bfloat16_16384x8192.json",
+      "original_winner": "provenance/case05.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case05_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "0c7939057a3660fb78672a6cea882299255d867c7282722acc9207db0de51eb2"
+      },
+      "precision_l2_limit": 0.005,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 6,
+      "name": "float16_1x4096",
+      "shape": {
+        "m": 1,
+        "n": 4096,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "0eda36740541a1cac91537c9b4a37417f067319f235c3154735d1a393cb6b9a5",
+      "config": "configs/case06_float16_1x4096.json",
+      "original_winner": "provenance/case06.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case06_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "29be09f27f8cf42d8b1e6171845531c0ba4504661e9205fff4b00f9b780af4f5"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 7,
+      "name": "float16_16x7168",
+      "shape": {
+        "m": 16,
+        "n": 7168,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "ab6c8a61f5d32344780e92ad95767d67cad0af5e5ce8b58b99865a54cfe55bd2",
+      "config": "configs/case07_float16_16x7168.json",
+      "original_winner": "provenance/case07.winner.json",
+      "selected_origin": "Main FULL winner transferred and verified on current; private FULL original selection archived",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_gpu0_private_retained_initial_v1/main_cute.artifacts/generated_cute.py",
+        "sha256": "968afae5b09397a40ee200c5237ec61b4a156b584fcccf8d89abeca8d215cff6"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 8,
+      "name": "float16_128x8192",
+      "shape": {
+        "m": 128,
+        "n": 8192,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "ed9080059e46f4aa714bd1ec9ed5d788ef0c450767ab4ac859de445d843d7723",
+      "config": "configs/case08_float16_128x8192.json",
+      "original_winner": "provenance/case08.winner.json",
+      "selected_origin": "Main FULL winner transferred and verified on current; private FULL original selection archived",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_gpu0_private_retained_initial_v1/main_cute.artifacts/generated_cute.py",
+        "sha256": "7eb245a6db139476584b0b0acc62c7131ac242966926f4fdad9d56328a13fb67"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; original saved-source proof linked"
+    },
+    {
+      "case_index": 9,
+      "name": "float16_1024x4096",
+      "shape": {
+        "m": 1024,
+        "n": 4096,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "9703335aa883a925a485325e015ee86ff680fe26fc898fec9a5b9a2dd2ebbfe2",
+      "config": "configs/case09_float16_1024x4096.json",
+      "original_winner": "provenance/case09.winner.json",
+      "selected_origin": "Accepted private FULL winner",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "bdaecdb13e80282ef23df6aad7d76f8ca6760902b2391288692b11cdd9cdc2f5"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "latest_source_case0_refresh": "not case0",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Reviewed AP/PURE stack needed for native BDA program"
+    },
+    {
+      "case_index": 10,
+      "name": "float16_4096x5120",
+      "shape": {
+        "m": 4096,
+        "n": 5120,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "68c3784a3b3bd14564e8766147c6eb9f8eafb3369c5e05c80a0cb8068eaa4ce6",
+      "config": "configs/case10_float16_4096x5120.json",
+      "original_winner": "provenance/case10.winner.json",
+      "selected_origin": "Private FULL winner; ACCEPTED_PAIRED",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case10_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "3a0284503c731dc3cc1e352810e406f93bc8842177fdf03b517320bf329d53e5"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "paired_acceptance": "ACCEPTED_PAIRED",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; main/current/native helper equivalence proof linked"
+    },
+    {
+      "case_index": 11,
+      "name": "float16_16384x8192",
+      "shape": {
+        "m": 16384,
+        "n": 8192,
+        "dtype": "float16",
+        "row_padding": 0,
+        "distribution": "normal",
+        "normalize_rounded_residual": false
+      },
+      "input_seed": 0,
+      "input_sha256": "c3161b48c5e139374e2894442f10d99b949385371859d940031065702c597f2e",
+      "config": "configs/case11_float16_16384x8192.json",
+      "original_winner": "provenance/case11.winner.json",
+      "selected_origin": "Accepted private FULL winner; paired Root acceptance",
+      "accepted_generated_source": {
+        "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_gpu0_private_retained_initial_v1/stack_cute.artifacts/generated_cute.py",
+        "sha256": "8fd963289e8a58dbc7785e113f9b14c1e04ebe7dd2d9b6353e23491742be936b"
+      },
+      "precision_l2_limit": 0.001,
+      "Goal_verification": "PASS_2_balanced_pairs",
+      "paired_acceptance": "ACCEPTED_PAIRED",
+      "standalone_native_validation": "PENDING_FINAL_PHASE",
+      "backend_requirement": "Preferred reviewed e757 source; main/current/native helper equivalence proof linked"
+    }
+  ],
+  "initial_only_cases": []
+}

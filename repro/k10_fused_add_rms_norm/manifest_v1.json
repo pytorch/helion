@@ -1,0 +1,81 @@
+{
+  "status": "FINAL_VALIDATED_NO_LAND_ARTIFACT",
+  "preferred_core": {
+    "runtime": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/final_main_rebase_71f_v1",
+    "manifest": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/final_main_rebase_71f_v1_manifest.json",
+      "sha256": "29facea674606245e722b9d86713c22eadeb8f91f7df1c8133d9d14c07c62ee7"
+    },
+    "commit": "e757221171adcc11513c907a9dddf02a9917b5f9"
+  },
+  "baseline_main": {
+    "runtime": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/main_71f_v1",
+    "manifest": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/main_71f_v1_manifest.json",
+      "sha256": "d1bfab137d717ff9400d828482a24eecc89e85352e8ca9270961f1e685940e11"
+    },
+    "commit": "71f69c5f212ac97feb6a1fe6fbff42711f567190"
+  },
+  "accepted_goal_configs": 12,
+  "historical_case0_latestrefreshpending": false,
+  "initial_only_configs": [],
+  "all_config_count": 12,
+  "standalone_native_execution": "PASS_396_ORIGINAL_AND_99_PORTABLE_CHECKS",
+  "Root_commit_after_all_final_checks": true,
+  "GPU_Source_Goal_commits_pushchanges": false,
+  "all12_inner_table_snapshot": {
+    "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+    "sha256": "fa477ac121fe0eaa8807b99b32bbc3838f48b2831b580d9aad51b5119c649248"
+  },
+  "portable_mode": "UNVERIFIED_PORTABLE",
+  "frozen_source_verification": "optional --verify-frozen-source",
+  "prior_v6_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v6/manifest_v1.json",
+    "sha256": "58c7669b06924b1390c597e199d08be29642509dad309049682da3af18518df1"
+  },
+  "cpu_validation": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v7/cpu_validation.json",
+    "sha256": "7ce05a839b3fddeeb9f97bbf8200db0641fab4bece8cb17ec05e1f41345bd733"
+  },
+  "files": {
+    "inputs.py": "5f6e884b9f4ac87c294d419a46130345ac89906b7bf19dcbd5425f742c9e4683",
+    "validation.py": "8f2f6918b6f6ab15d0a73de0c49f56a8bcb85f24a46ef6cadd382caac6f16083",
+    "numerics.py": "4c0b1905e70000c56899f9bc37e60c09085b78cb1b80ed3dac6f56aa3843d94f",
+    "numerical_policy.py": "d03bf39ea41980098ca118ea4f6d732cd70d1535106929607d924ac075204e5f",
+    "numerical_policy.json": "db055365c7f11543d8362e4961facaa0715fe63fec86f2b36b277a030c7790b9",
+    "fused_add_rms_norm.py": "373ad15214c823726f7a0dcf126c41f0d85785aa11cc0ab329feaebc17617221",
+    "cases.json": "967569e408cbacfead2aaaf345382924854837a76863ba7e7fb5f8682918ed20",
+    "run.py": "50d2111f917fa48c377ee952c9f5c85089eeffd7565c87551d1100a5a833571d",
+    "README.md": "48d2d5fdc5907849a67bdde66bda3e932a95b04a66e751100bbf053cd4b9e7a0",
+    "cpu_validation.json": "7ce05a839b3fddeeb9f97bbf8200db0641fab4bece8cb17ec05e1f41345bd733",
+    "configs/case00_bfloat16_1x4096.json": "5b0a99663675e3db4c786566f56761a03ad6c656f99149823aeef1370da85658",
+    "configs/case01_bfloat16_16x7168.json": "e1a71381fb377190e25ec0d3e246a5c0a6d13339a207b1d7b4aecc8af00bd24b",
+    "configs/case02_bfloat16_128x8192.json": "b370d81328bdf80df040f2c426b5ebe64a1a6c1e5b9951e52735afca5ebc1525",
+    "configs/case03_bfloat16_1024x4096.json": "cbbd5b86a570ac41fffe04a5bcfbcb201ce9b0cde1ef6dabf0b9148d9c98be43",
+    "configs/case04_bfloat16_4096x5120.json": "684211e881dd5eef277e78a89685f9dbbdfe70513ae021a58cbc203dc898bdf5",
+    "configs/case05_bfloat16_16384x8192.json": "7334ee456cfd6f943a021fc1905f0dbcb9aff37d93d4653c47f060efeb97c3ff",
+    "configs/case06_float16_1x4096.json": "5b0a99663675e3db4c786566f56761a03ad6c656f99149823aeef1370da85658",
+    "configs/case07_float16_16x7168.json": "147eedfa8259cf388f544b1039c8bb50cec58ea7e642e4fa9542269e6f0c5619",
+    "configs/case08_float16_128x8192.json": "9925aedcc6d4d82006ea9c22af8b5797fb3797bd8567fec76d59008b8696be13",
+    "configs/case09_float16_1024x4096.json": "395e940f4b0feee187bf9deda8030994ec1793d1d979c48f40cab4bf3599a1db",
+    "configs/case10_float16_4096x5120.json": "a572025a49b3c9880b13a492cfcc43b282a9f58820d928eeefd8954941b03e42",
+    "configs/case11_float16_16384x8192.json": "cff584570ee1c9e235aefcc5313d7b0e207cd0ef7c91a25ad7f409269dbf14f7",
+    "provenance/goal_snapshot.json": "bc3b6c12e2f6aecb8ef9474ad5f69b126656c166041d1ac3316194e131e3819c",
+    "provenance/case00.winner.json": "6adba28c0512885ae6756af5153e453d0894c03b768c146fdede1380dd9ab93c",
+    "provenance/case01.winner.json": "60aa0ef8b2ed6865cca7b4bbf873b64acf2ef1060973ad177f31cba716701a78",
+    "provenance/case02.winner.json": "6173d203ac2fbeb3e3aee29508ceb6598ba4c4b7906fae50c1f97b885b3db3f4",
+    "provenance/case03.winner.json": "ad6428c03b1e40cd2e4414ef5d1b24bdf7b11efb127b138539d3889980dfa25d",
+    "provenance/case04.winner.json": "f2a7a1a135ea242d787a5eba942fb6032b8b8696f94cc29b6309488c629d556e",
+    "provenance/case05.winner.json": "fab3193dd2e9218bba0807d6cb4ed50d672c82e04f685a3dcc3ee37616bfd7a0",
+    "provenance/case06.winner.json": "819bf8883760a5f2f887e05d51ee27050a3ebab0a9caa323719d1e039b0215a6",
+    "provenance/case07.winner.json": "1edd5018eada2c36435fba4f41225a0bcf3cc1528406e50788c1b75d97ac600c",
+    "provenance/case08.winner.json": "52d6f583f50d55917786b98dd5214d6cbb1bf99e4ae216d02360165a1418030f",
+    "provenance/case09.winner.json": "276d7b0c388e45f9e8418fc52f750324ba8e9711879ea52a67411653f72557a8",
+    "provenance/config_lineage.json": "38ab1ac12d7f1056a3151534ec25671fcb6caadf24d0bcd4c606ab80ff436d84",
+    "provenance/source_pins.json": "b39ff4d873b285c5c4c737bd8015d7a4330c2775f1ef43367560c9441844e4dc",
+    "provenance/case10.winner.json": "2160595bbabc8689a85630e094fb015e650e6754874bb58f9738915ca1f0f122",
+    "provenance/case11.winner.json": "df52ca9535c473e911cb14d021387a84780ab6ad0e4f26766c7900367a52670b",
+    "provenance/final_validation.json": "41f70135fc5894117dc4c988be83ddad11d808a54e8680a37c89a92fd54483fd"
+  },
+  "artifact_bytes": 271203
+}

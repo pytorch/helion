@@ -1,0 +1,108 @@
+{
+  "preferred_core": {
+    "runtime": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/final_main_rebase_71f_v1",
+    "manifest": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/final_main_rebase_71f_v1_manifest.json",
+      "sha256": "29facea674606245e722b9d86713c22eadeb8f91f7df1c8133d9d14c07c62ee7"
+    },
+    "commit": "e757221171adcc11513c907a9dddf02a9917b5f9"
+  },
+  "baseline_main": {
+    "runtime": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/main_71f_v1",
+    "manifest": {
+      "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/main_71f_v1_manifest.json",
+      "sha256": "d1bfab137d717ff9400d828482a24eecc89e85352e8ca9270961f1e685940e11"
+    },
+    "commit": "71f69c5f212ac97feb6a1fe6fbff42711f567190"
+  },
+  "canonical_function": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/library/helion_kernel_library/_kernels/fused_add_rms_norm/fused_add_rms_norm.py",
+    "sha256": "9912dabf747abaf9ddbe7699c1178839b9357265ad95befcc657745532c74668"
+  },
+  "public_function_AST_reference": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/library_k10_public_aot_prepare_v1/library/helion_kernel_library/_kernels/fused_add_rms_norm/fused_add_rms_norm.py",
+    "sha256": "02bfcf00533eefd3904dcda939e886d506829a62d5a0795c8d99b6c900829e52"
+  },
+  "case9_compiler_source_proof": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main_rebase_code_capture_case09_v1/comparison_v1.json",
+    "sha256": "2d747b32ca416e8fd65e7e8e8d5c3b49cc158b4871cb5c9c726fda5e2ef7fc1a"
+  },
+  "case9_same_config_native_diagnostic": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case09_same_config_gpu1_diagnostic_v1/comparison_v1.json",
+    "sha256": "458b6d1fa476e180434c46b23768ab101ebb669a8f3fc9b63b2cb893d11b0b53"
+  },
+  "case7_transfer": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case07_main_winner_codegen_equivalence_v1/equivalence_v1.json",
+    "sha256": "02c1aa3b4536923d635116fa184ed2b42cfe8fe5047d930621da18a7faea2a00"
+  },
+  "case8_transfer": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case08_main_winner_codegen_equivalence_v1/equivalence_v1.json",
+    "sha256": "ef7fe5b607ff027bbc721ecbded9dca1db8e14fbe168bfe494b9070e4b0f39be"
+  },
+  "old_v1_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v1/manifest_v1.json",
+    "sha256": "055983b1969f862a060a80fe74bc37d4e1ef8321f763a101c8bb32657f58327d"
+  },
+  "previous_v2_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v2/manifest_v1.json",
+    "sha256": "7991e4fc3dfe468383330cad5b4777ad747ff9f1b90e2fc8610c187b07427788"
+  },
+  "case10_actual_main71_proof": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/library_k10_public_case10_main71_capture_v1/comparison_v1.json",
+    "sha256": "472d785d5436267afc180a5d07f1a56d67ecef07c809423943d346977f922397"
+  },
+  "case10_rebased_source_proof": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main_rebase_code_capture_case10_v1/comparison_v1.json",
+    "sha256": "5ab60e64c49666ae33a4d107c9375863e54f9afd4ff147bf120ad722990ef3bb"
+  },
+  "case11_actual_main71_rebased_source_proof": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main_rebase_code_capture_case11_v1/comparison_v1.json",
+    "sha256": "5332277343d4350f2f9585e75f0e4885b5dc338b46c4fd5093ee0876a9ad8a31"
+  },
+  "previous_v3_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v3/manifest_v1.json",
+    "sha256": "9053bc081e2632eb47ac01d1f32ca2fa4a6aa32e484ded3c79510d726ae2c521"
+  },
+  "case11_balanced_qualification": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_balanced_qualification_v1/comparison_v1.json",
+    "sha256": "5c3b43ded510c24b612531147096e71ce3312d123cf674f3a0a9db9cdb769f2f"
+  },
+  "case11_Root_application": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case11_goal_application_v1.json",
+    "sha256": "16897289eff12cd2ce3df32a6c4a9dfbd9167b318ba60a3c0f19d22e68b9a0e0"
+  },
+  "previous_v4_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v4/manifest_v1.json",
+    "sha256": "973dd039aeec98ffc38ba9a1a6df047051f7fe85c95a8347114af53c134b2e4c"
+  },
+  "case0_latest_program_and_helper_equivalence": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_main_rebase_code_capture_case00_latest_v1/comparison_v1.json",
+    "sha256": "fcc931a3c41facb79216f44dae44427c334b723a3e45ffa495209f8ecbb158e4"
+  },
+  "case0_latest_balanced_qualification": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_latest_main71_balanced_qualification_v1/comparison_v1.json",
+    "sha256": "313af501e44dfce0b146f0fc25bf43006fed0559f50f1fe9af97de0b9ffc531c"
+  },
+  "case0_latest_Root_application": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/case00_goal_application_v1.json",
+    "sha256": "044e330f19dd682f9a319498cf0d66dbd8d3b3dce0ab7dd3306aca72522756fb"
+  },
+  "all12_exact_inner_table_snapshot": {
+    "path": "/home/shangdiy/helion-kernel-library/helion_kernel_library/configs/fused_add_rms_norm/nvidia_sm103_cute.json",
+    "sha256": "fa477ac121fe0eaa8807b99b32bbc3838f48b2831b580d9aad51b5119c649248"
+  },
+  "previous_v5_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v5/manifest_v1.json",
+    "sha256": "42df86a44d7ea82e2d432b8428812e28c4f2f101d7f7b49a00d83be5b684fbe0"
+  },
+  "v5_native_all396_validation": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/final_no_land_fixed_correctness_v1/completion_v1.json",
+    "sha256": "c9183bbbf5f4b906c629c52b1591414bc5953a9891df52dfe7d16aac632ac1ee"
+  },
+  "portable_source_identity": "UNVERIFIED_PORTABLE unless --verify-frozen-source explicitly selects a reviewed manifest",
+  "previous_v6_manifest": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/no_land_k10_repro_prepare_v6/manifest_v1.json",
+    "sha256": "58c7669b06924b1390c597e199d08be29642509dad309049682da3af18518df1"
+  },
+  "v7_lint_only_changes": "Formatting/import order/deferred annotations; executable function bodies and canonical kernel AST unchanged"
+}

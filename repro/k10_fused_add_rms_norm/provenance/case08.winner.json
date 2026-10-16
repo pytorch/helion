@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "impl": "helion-cute",
+  "case_index": 8,
+  "shape": {
+    "m": 128,
+    "n": 8192,
+    "dtype": "float16",
+    "row_padding": 0,
+    "distribution": "normal",
+    "normalize_rounded_residual": false
+  },
+  "gpu_uuid": "GPU-1ced79bd-fbd0-93b7-c1dd-fc83511e7143",
+  "autotune_seed": 176600,
+  "config": {
+    "block_sizes": [
+      1
+    ],
+    "num_threads": [
+      1,
+      512
+    ],
+    "reduction_loops": [
+      8192
+    ],
+    "load_eviction_policies": [
+      "l1_l2_last",
+      "l2_last",
+      "l1_l2_last",
+      "l1_l2_last",
+      "l1_l2_last",
+      "l1_l2_last",
+      "l1_l2_last",
+      "l1_l2_last"
+    ],
+    "cute_independent_reduction": false,
+    "cute_replicated_reduction": true,
+    "cute_vector_packet_unroll": false,
+    "cute_vloop_sink": false,
+    "cute_lane_unroll": 1,
+    "cute_pdl": true,
+    "cute_vector_widths": [
+      8,
+      1
+    ],
+    "cute_lane_layouts": [
+      "strided",
+      "blocked"
+    ],
+    "cute_reduction_reloads": [
+      "register_prefetch"
+    ],
+    "cute_cluster_warp_online": false,
+    "cute_register_row": false,
+    "cute_register_row_tensor_copy": false,
+    "cute_scalar_epilogue": false,
+    "cute_scalar_epilogue_keep_inputs": false,
+    "cute_scalar_epilogue_owner_fold": false,
+    "cute_warp_fp32_redux": false,
+    "cute_cluster_n": 1,
+    "cute_min_blocks_per_mp": 1
+  },
+  "cute_structural_policy": {
+    "schema": "helion.cute.structural_policy",
+    "version": 1,
+    "settings": {
+      "cute_region_fission": true,
+      "cute_full_slice_matmul_tiling": true,
+      "cute_segmented_matmul_tiling": true,
+      "cute_flatten_nested_reductions": true,
+      "cute_materialize_transformed_operands": true
+    }
+  },
+  "kernel_source": {
+    "path": "/home/shangdiy/helion-k10-cute-20261014/artifacts/k10-cute-2026-10-14/sources/library/helion_kernel_library/_kernels/fused_add_rms_norm/fused_add_rms_norm.py",
+    "sha256": "9912dabf747abaf9ddbe7699c1178839b9357265ad95befcc657745532c74668"
+  }
+}

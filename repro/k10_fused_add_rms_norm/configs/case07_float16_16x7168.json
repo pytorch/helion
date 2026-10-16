@@ -1,0 +1,48 @@
+{
+  "block_sizes": [
+    1
+  ],
+  "num_threads": [
+    1,
+    512
+  ],
+  "reduction_loops": [
+    8192
+  ],
+  "load_eviction_policies": [
+    "l2_last",
+    "l2_last",
+    "l2_last",
+    "l2_last",
+    "",
+    "l2_last",
+    "l2_last",
+    "l2_last"
+  ],
+  "cute_independent_reduction": false,
+  "cute_replicated_reduction": true,
+  "cute_vector_packet_unroll": false,
+  "cute_vloop_sink": false,
+  "cute_lane_unroll": 1,
+  "cute_pdl": true,
+  "cute_vector_widths": [
+    8,
+    1
+  ],
+  "cute_lane_layouts": [
+    "strided",
+    "blocked"
+  ],
+  "cute_reduction_reloads": [
+    "register_prefetch"
+  ],
+  "cute_cluster_warp_online": false,
+  "cute_register_row": false,
+  "cute_register_row_tensor_copy": false,
+  "cute_scalar_epilogue": false,
+  "cute_scalar_epilogue_keep_inputs": false,
+  "cute_scalar_epilogue_owner_fold": false,
+  "cute_warp_fp32_redux": false,
+  "cute_cluster_n": 1,
+  "cute_min_blocks_per_mp": 1
+}
