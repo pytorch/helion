@@ -159,8 +159,10 @@ def default_launcher(
     triton_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    num_warps: int,
-    num_stages: int,
+    # Optional on purpose: ``None`` defers the choice to the triton driver's
+    # own default (the keyword is then not forwarded to ``triton_kernel.run``).
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     _remote_copy_signal_dst: torch.Tensor | None = None,
     _remote_copy_signal_slots_per_program: int = 0,
     _remote_copy_process_group_name: str | None = None,
@@ -256,11 +258,14 @@ def default_launcher(
     run_kwargs: dict = {
         "grid": grid,
         "warmup": False,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "launch_cooperative_grid": launch_cooperative_grid,
-        **kwargs,
     }
+    # ``None`` leaves the warp/stage choice to the triton driver's default.
+    if num_warps is not None:
+        run_kwargs["num_warps"] = num_warps
+    if num_stages is not None:
+        run_kwargs["num_stages"] = num_stages
+    run_kwargs["launch_cooperative_grid"] = launch_cooperative_grid
+    run_kwargs.update(kwargs)
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
     if _minimum_resident_programs:
@@ -525,7 +530,7 @@ def _validate_resident_program_capacity(
     compiled_kernel: object,
     args: tuple[object, ...],
     *,
-    num_warps: int,
+    num_warps: int | None,
     required_programs: int,
 ) -> None:
     """Reject a polling schedule whose required CTA cohort cannot be resident."""
@@ -534,6 +539,14 @@ def _validate_resident_program_capacity(
     tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
     if tensor is None or tensor.device.type != "cuda":
         raise RuntimeError("cross-loop residency checks require a CUDA tensor")
+
+    if num_warps is None:
+        # The prefix lets the runtime wrapper convert this to InvalidConfig,
+        # like the capacity error below.
+        raise RuntimeError(
+            "Cross-loop scheduling requires an explicit num_warps "
+            "(num_warps=None defers to the driver and has no residency answer)"
+        )
 
     if compiled_kernel is None:
         raise RuntimeError("unable to compile cross-loop scheduled kernel")

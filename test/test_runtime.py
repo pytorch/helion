@@ -95,6 +95,30 @@ class TestTritonLauncher(unittest.TestCase):
             required_programs=7,
         )
 
+    def test_none_num_warps_and_stages_are_omitted_from_run(self) -> None:
+        # Backends that defer num_warps/num_stages to the triton driver pass
+        # None; the launcher must omit the keys (not forward None) so triton
+        # applies its own defaults.
+        calls: list[dict[str, object]] = []
+
+        class FakeJITFunction:
+            def run(self, *args: object, **kwargs: object) -> object:
+                calls.append(kwargs)
+                return "launched"
+
+        result = triton_default_launcher(
+            FakeJITFunction(),
+            (8,),
+            object(),
+            num_warps=None,
+            num_stages=None,
+        )
+
+        self.assertEqual(result, "launched")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("num_warps", calls[0])
+        self.assertNotIn("num_stages", calls[0])
+
     def test_cross_loop_occupancy_failure_is_an_invalid_config(self) -> None:
         with (
             patch(
