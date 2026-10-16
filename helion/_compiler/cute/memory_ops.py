@@ -164,6 +164,31 @@ def _persistent_vec_alignment_matrix_signature(
     return tuple(_persistent_vec_alignment_signature((value,)) for value in values)
 
 
+def _persistent_vec_alignment_prepared_guard(
+    source_extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+    expected: Hashable,
+) -> Callable[[Sequence[object]], bool]:
+    """Prepared-call predicate for ``_persistent_vec_alignment_matrix_signature``.
+
+    The prepared argument guard pins each source's type, dtype, shape and
+    stride, which fixes every signature component except the base pointer
+    residue; a source whose signature is ``None`` stays a non-tensor.
+    """
+    namespace: dict[str, object] = {}
+    checks: list[str] = []
+    for index, (extract, signature) in enumerate(
+        zip(source_extractors, cast("tuple[object, ...]", expected), strict=True)
+    ):
+        if signature is None:
+            continue
+        residue = cast("tuple[int, object, object]", signature)[0]
+        namespace[f"extract_{index}"] = extract
+        checks.append(
+            f"extract_{index}(args).data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}"
+        )
+    return eval(f"lambda args: {' and '.join(checks) or 'True'}", namespace)
+
+
 def register_persistent_vec_alignment_specializations(
     env: CompileEnvironment,
 ) -> None:
@@ -196,6 +221,7 @@ def register_persistent_vec_alignment_specializations(
             ),
             classifier=_persistent_vec_alignment_matrix_signature,
             reusable_tensor_properties=frozenset(("data_ptr",)),
+            prepared_guard_factory=_persistent_vec_alignment_prepared_guard,
         ),
     )
 
@@ -482,6 +508,46 @@ def _tensor_storage_disjoint_matrix_signature(
     return tuple(result)
 
 
+def _tensor_storage_disjoint_prepared_guard(
+    source_extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+    expected: Hashable,
+) -> Callable[[Sequence[object]], bool]:
+    """Prepared-call predicate for ``_tensor_storage_disjoint_matrix_signature``.
+
+    Source types and devices are pinned by the prepared argument guard, so a
+    pair's entry can only change through the storage spans themselves.  Each
+    span is read once and every pair is re-evaluated against its pinned
+    entry.  A pair the classifier proved disjoint through differing devices
+    may be rejected here (the spans are compared regardless), which only
+    costs a fallback to the full dispatch path.
+    """
+    namespace: dict[str, object] = {}
+    lines = ["def guard(args):"]
+    for index, extract in enumerate(source_extractors):
+        namespace[f"extract_{index}"] = extract
+        lines.extend(
+            (
+                f"    storage_{index} = extract_{index}(args).untyped_storage()",
+                f"    start_{index} = storage_{index}.data_ptr()",
+                f"    end_{index} = start_{index} + storage_{index}.nbytes()",
+            )
+        )
+    conditions: list[str] = []
+    for (left, right), disjoint in zip(
+        itertools.combinations(range(len(source_extractors)), 2),
+        cast("tuple[bool, ...]", expected),
+        strict=True,
+    ):
+        predicate = (
+            f"(start_{left} == end_{left} or start_{right} == end_{right}"
+            f" or end_{left} <= start_{right} or end_{right} <= start_{left})"
+        )
+        conditions.append(predicate if disjoint else f"not {predicate}")
+    lines.append(f"    return {' and '.join(conditions) or 'True'}")
+    exec("\n".join(lines), namespace)
+    return cast("Callable[[Sequence[object]], bool]", namespace["guard"])
+
+
 def _tensor_alias_sources(env: CompileEnvironment) -> tuple[Source, ...]:
     sources: list[Source] = []
     # Enumerate direct host tensor arguments by their argument names rather
@@ -526,6 +592,7 @@ def register_cute_tensor_alias_specializations(env: CompileEnvironment) -> None:
             ),
             classifier=_tensor_storage_disjoint_matrix_signature,
             reusable_tensor_properties=frozenset(("storage_span",)),
+            prepared_guard_factory=_tensor_storage_disjoint_prepared_guard,
         ),
     )
 
