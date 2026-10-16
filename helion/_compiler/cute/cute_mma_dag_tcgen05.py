@@ -1389,6 +1389,26 @@ class _Tcgen05Emitter(_Emitter):
         self.iter_vars = {}
         self.deferred = []
         self._defined_tiles = set()
+        # The warp emitter's loop state its ``bind`` / raw-ring helpers
+        # consult: this mode's single loop is ``define_iteration_bases``'s
+        # ``in_loop`` form and hoists its side loads through ``prefetched``.
+        self.values = {}
+        self.raw_stages = {}
+        self.hoists = []
+        self.name_depth = {}
+        self.overlaid_keys = set()
+        self.overlaid_tiles = set()
+        # This mode renders its passes element by element.
+        self.pairs = False
+        self.packable_memo = {}
+        self.redirect = None
+        self.scope_path = []
+        self.scope_count = 0
+        self.lane_bases = {}
+        # This mode spells every address out (its own addressing is TMA).
+        self.fold_addresses = False
+        self.early_prologues = {}
+        self.early_issued = set()
         self.evaluator: _Evaluator = _PassEvaluator(self)
         self.es = self.program.elem_bytes
         self.kind = "bf16" if self.program.dtype == torch.bfloat16 else "f16"
@@ -1988,8 +2008,10 @@ class _Tcgen05Emitter(_Emitter):
         side loads whose coordinates are fixed per thread (the thread's
         fragment row, a static column of its half-row).  Programs without
         a loop-invariant vector access skip the dry run (their renders are
-        untouched).  Loads of a tensor the program stores stay in the
-        epilogue (hoisted, they would run ahead of the store they follow);
+        untouched).  Loads of a storage the program stores stay in the
+        epilogue (hoisted, they would run ahead of the store they follow;
+        the matcher declines such programs -- the check is defense in
+        depth);
         the row and static sites come first, the half-row's column sites
         all together or not at all (see ``TCGEN05_EPILOGUE_PREFETCH_COLS``)."""
         program = self.program

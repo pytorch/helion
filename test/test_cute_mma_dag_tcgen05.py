@@ -1114,24 +1114,15 @@ def test_the_program_order_loop_prefetches_the_epilogue_row_after_the_loop() -> 
     assert re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE) == ["md_ex0"]
 
 
-def test_epilogue_prefetch_skips_a_tensor_the_program_stores() -> None:
-    # ``g[b] = T; out[b] = T * exp2(g[b, 0, :])``: the decay row is a row
-    # of a tensor the epilogue stores first.  Hoisted ahead of the loop the
-    # load would run before that store; it stays in the epilogue, behind
-    # the store's drain and barrier (``_gen_epi`` reads the same row from
-    # a tensor the program only loads and hoists it, above).
+def test_a_program_that_loads_a_tensor_it_stores_is_not_mine_either() -> None:
+    # ``g[b] = T; out[b] = T * exp2(g[b, 0, :])``: the decay row is a row of
+    # a tensor the epilogue stores first.  The lowering used to keep the
+    # load in the epilogue behind the store's drain; now the matcher
+    # declines any program whose load shares storage with a store (both
+    # modes, one rule), so no dag knob is offered at all.
     bound = _bind_fn(_gen_epi_stored, _epi_inputs(stored=True))
-    program = _program(bound)
-    assert [store.region for store in program.stores] == ["epilogue", "epilogue"]
-    body = _kernel_body(_source(bound, _config(warps=4, stages=2)))
-    assert "md_ex" not in body
-    assert body.count(f"{WARP_RT}.ldg_f32(") == 1
-    epilogue = body.rsplit(f"{RT}.mbar_wait(md_accb, ", 1)[1]
-    (load,) = re.findall(
-        rf"{WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
-        epilogue,
-    )
-    _assert_in_order(epilogue, [f"{WARP_RT}.stg_v4_b32(", "cute.arch.barrier()", load])
+    assert bound.config_spec.cute_mma_dag is None
+    assert bound.config_spec.cute_mma_dag_facts is None
 
 
 # --------------------------------------------------------------------------

@@ -742,6 +742,47 @@ def test_region_tree_kernels_match_the_triton_backend(
             assert torch.equal(lhs, rhs), index
 
 
+@pytest.mark.parametrize("warps,stages", [(4, 2), (8, 1)])
+def test_side_loads_varying_with_a_nested_loop_match_the_triton_backend(
+    warps: int, stages: int
+) -> None:
+    # Probes: a vector varying with the inner loop of a nest (never hoisted
+    # ahead of the outer one) and one varying with the outer loop (hoisted
+    # ahead of the inner one only).  (The read-modify-write probes decline the
+    # lowering now: a program that loads and stores one storage is not mine.)
+    kernels = _probe_kernels()
+    g = torch.Generator(device=DEVICE).manual_seed(11)
+    do = _randn(g, 4, 64, 128, dtype=torch.bfloat16)
+    h = _randn(g, 4, 128, 128, dtype=torch.bfloat16)
+    gate = _randn(g, 4, 128, dtype=torch.float32)
+    for fn in (kernels._inner_varying_gate, kernels._inner_varying_row_gate):
+        _source, out = _run_cute(fn, (do, h, gate), _config([64, 64], warps, stages))
+        ref = _run_triton(fn, (do, h, gate), [64, 64])
+        assert torch.equal(out[0], ref[0]), fn.__name__
+
+
+@pytest.mark.parametrize("mode", range(5))
+def test_packed_pairs_match_the_triton_backend(mode: int) -> None:
+    # The packed f32x2 pairs round each lane as the scalar op does: the three
+    # packable epilogue shapes of the probe are bit-identical to Triton.  The
+    # FMA refusal (through views) keeps every fusable product scalar, where
+    # the cute lowering fuses the product and Triton >= 3.9 rounds it first:
+    # those two shapes agree to one fp32 rounding of the product.
+    fn = _probe_kernels()._pack_probe
+    g = torch.Generator(device=DEVICE).manual_seed(13)
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=13)
+    sr = _randn(g, 2, 64, dtype=torch.float32)
+    sc = _randn(g, 2, 64, dtype=torch.float32)
+    s2 = _randn(g, 2, 64, dtype=torch.float32)
+    args = (t["k"], t["v"], sr, sc, s2, mode)
+    _source, out = _run_cute(fn, args, _config([64, 64], 4, 2))
+    ref = _run_triton(fn, args, [64, 64])
+    if mode in (2, 4):
+        torch.testing.assert_close(out[0], ref[0], atol=1e-4, rtol=1e-5)
+    else:
+        assert torch.equal(out[0], ref[0])
+
+
 def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
     # A source whose base is 8-byte aligned cannot be staged with 16-byte
     # cp.async packets: the operand goes through the cooperative pass of
@@ -1272,3 +1313,29 @@ def test_a_root_dot_rescaling_its_loops_carry_matches_the_triton_backend(
     _source, out = _run_cute(fn, args, _config([64], warps, 2))
     for lhs, rhs in zip(out, _run_triton(fn, args, [64]), strict=True):
         assert torch.equal(lhs, rhs)
+
+
+@pytest.mark.parametrize("n", (0, 3))
+def test_a_zero_trip_outer_loop_matches_the_triton_backend(n: int) -> None:
+    # The nested ring's first prologue, peeled ahead of the outer ``for``, read
+    # iteration 0's tiles of empty tensors when the outer grid loop had no
+    # iterations (an illegal address).  A static zero trip count issues
+    # nothing; a dynamic one (an int argument) guards the peel.
+    kernels = _probe_kernels()
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    a = _randn(g, 2, n, 64, 128, dtype=torch.bfloat16)
+    b = _randn(g, 2, n, 128, 64, dtype=torch.bfloat16)
+    source, out = _run_cute(kernels._grid_nest, (a, b), _config([64, 32], 4, 3))
+    assert f"cutlass.range(0, {n})" in source
+    ref = _run_triton(kernels._grid_nest, (a, b), [64, 32])
+    _assert_close(out, ref)
+    if n:
+        eager = 2.0 * (a.float() @ b.float())
+        torch.testing.assert_close(out[0], eager, atol=1e-2, rtol=1e-2)
+    a3 = _randn(g, 2, 3, 64, 128, dtype=torch.bfloat16)
+    b3 = _randn(g, 2, 3, 128, 64, dtype=torch.bfloat16)
+    args = (a3, b3, n)
+    source, out = _run_cute(kernels._grid_nest_steps, args, _config([64, 32], 4, 3))
+    assert "if 0 < n:" in source
+    ref = _run_triton(kernels._grid_nest_steps, args, [64, 32])
+    _assert_close(out, ref)
