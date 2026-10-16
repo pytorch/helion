@@ -2477,6 +2477,10 @@ class LoopedReductionStrategy(ReductionStrategy):
             if static_numel
             else numel_int // cl
         )
+        # Cluster rank-relative begin/end expressions use cutlass.Int32.
+        # A logical extent can fit while the padded final slice overflows.
+        if static_numel and slice_len * cl > 2**31 - 1:
+            return
         self._cute_rolled_cluster_n = cl
         self._cute_rolled_cluster_slice_len = slice_len
         self.fn.cute_state.simt_cluster_n = cl
