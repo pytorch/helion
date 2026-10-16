@@ -37,7 +37,10 @@ import torch
 
 from .attention_plan import AttentionScorePlan
 from .attention_plan import FlexRegion
+from .flash_score_mod import FlexAuxSmem
 from .flash_score_mod import FlexHookCode
+from .flash_score_mod import flex_aux_smem_candidates
+from .flash_score_mod import flex_aux_smem_layout
 from .flash_score_mod import render_flex_hook
 
 if TYPE_CHECKING:
@@ -87,6 +90,19 @@ def flex_bwd_hook_plan(
         scale_arg=plan.scale_arg,
         scale_peeled=True,
     )
+
+
+def fbwd_aux_smem_candidates(plan: FlexBwdPlan) -> tuple[int, ...]:
+    """Padded byte sizes of the aux tables worth staging in shared memory
+    (``flex_aux_smem_candidates`` over the backward's hook plan): the tables
+    some load indexes with a data-dependent value (the backward's per-element
+    gathers are latency chains behind the table loads)."""
+    return flex_aux_smem_candidates(flex_bwd_hook_plan(plan))
+
+
+def fbwd_aux_smem_layout(plan: FlexBwdPlan, budget: int) -> list[FlexAuxSmem]:
+    """The staged tables of ``cute_flash_bwd_aux_smem`` with their offsets."""
+    return flex_aux_smem_layout(flex_bwd_hook_plan(plan), budget)
 
 
 def additive_bias_region(plan: FlexBwdPlan) -> FlexRegion | None:
@@ -153,13 +169,15 @@ def _render_hooks(
     mask_form: str,
     hook_cols: int = 32,
     bias: FlexRegion | None = None,
+    aux_smem_budget: int = 0,
 ) -> tuple[
     list[FlexHookCode], FlexHookCode | None, FlexHookCode | None, FlexHookCode | None
 ]:
     """The unmasked hook, the masked hook and the Jacobian hook (each None when
     the plan has no region for it). With ``bias`` (the folded additive score
     bias) the unmasked hook renders ``g`` into ``fbwd_gfrag`` and the masked
-    hook carries the mask only."""
+    hook carries the mask only. ``aux_smem_budget`` (bytes) selects the aux
+    tables the hooks read from their shared-memory copy (``fbwd_aux_smem_layout``)."""
     has_score = plan.score_region is not None and bias is None
     has_mask = plan.mask_region is not None
     has_grad = plan.grad_region is not None
@@ -189,6 +207,7 @@ def _render_hooks(
             plan.num_q_tiles * 128,
         ),
         "mask_form": mask_form,
+        "aux_smem_budget": aux_smem_budget,
     }
     hooks: list[FlexHookCode] = []
     plain = masked = jac = None
@@ -637,6 +656,9 @@ class _SmemPlan:
     aug_stages: int
     lse_in_mma: bool
     delta_in_mma: bool
+    # Bytes of the flex hook's staged aux tables (``fbwd_aux_smem_layout``;
+    # 0 = the gathers read global memory).
+    aux_bytes: int = 0
 
     @property
     def stage_lse(self) -> bool:
@@ -654,6 +676,7 @@ def _fit_smem_budget(
     raw_score: bool,
     device: torch.device,
     persistent: bool = False,
+    aux_smem: int = 0,
 ) -> _SmemPlan:
     """Fit the storage into the per-CTA SMEM capacity.
 
@@ -667,7 +690,10 @@ def _fit_smem_budget(
     cost one Q-ring stage of 4 KB each plus 8 KB of constants; when they do
     not fit, the dO ring gives up stages down to 2, then the mode is dropped.
     ``persistent`` sizes the step table for its double buffer (two tables
-    plus the two length words).
+    plus the two length words). ``aux_smem`` (knob ``cute_flash_bwd_aux_smem``,
+    bytes) stages the hook's gathered aux tables in shared memory
+    (``fbwd_aux_smem_layout``); the region is dropped first when the storage
+    does not fit.
     """
     import cutlass
 
@@ -684,22 +710,43 @@ def _fit_smem_budget(
 
     steps = max(plan.max_steps, 1)
     table_entries = 2 * steps + 2 if persistent else steps
+    aux_total = sum(
+        entry.padded_bytes for entry in fbwd_aux_smem_layout(plan, aux_smem)
+    )
 
-    def size(do_stage: int, dq_boxes: int, aug: int, lse: bool, delta: bool) -> int:
+    def size(
+        do_stage: int, dq_boxes: int, aug: int, lse: bool, delta: bool, aux: int
+    ) -> int:
         return flash_bwd_shared_storage(
-            d, q_stage, do_stage, 1, dtype, table_entries, dq_boxes, aug, lse, delta
+            d,
+            q_stage,
+            do_stage,
+            1,
+            dtype,
+            table_entries,
+            dq_boxes,
+            aug,
+            lse,
+            delta,
+            flex_aux_bytes=aux,
         ).size_in_bytes()
 
-    if stats_mma:
-        lse_in_mma = not raw_score
-        for do_stage in range(do_stage_max, max(min(do_stage_max, 2) - 1, 0), -1):
-            for dq_boxes in (8, 4):
-                if size(do_stage, dq_boxes, q_stage, not lse_in_mma, False) <= capacity:
-                    return _SmemPlan(
-                        q_stage, do_stage, dq_boxes, q_stage, lse_in_mma, True
-                    )
-    dq_boxes = 8 if size(do_stage_max, 8, 0, True, True) <= capacity else 4
-    return _SmemPlan(q_stage, do_stage_max, dq_boxes, 0, False, False)
+    for aux in sorted({aux_total, 0}, reverse=True):
+        if stats_mma:
+            lse_in_mma = not raw_score
+            for do_stage in range(do_stage_max, max(min(do_stage_max, 2) - 1, 0), -1):
+                for dq_boxes in (8, 4):
+                    if (
+                        size(do_stage, dq_boxes, q_stage, not lse_in_mma, False, aux)
+                        <= capacity
+                    ):
+                        return _SmemPlan(
+                            q_stage, do_stage, dq_boxes, q_stage, lse_in_mma, True, aux
+                        )
+        for dq_boxes in (8, 4):
+            if size(do_stage_max, dq_boxes, 0, True, True, aux) <= capacity:
+                return _SmemPlan(q_stage, do_stage_max, dq_boxes, 0, False, False, aux)
+    return _SmemPlan(q_stage, do_stage_max, 4, 0, False, False, 0)
 
 
 # dQ fp32 working set (bytes) one batch-head group of CTAs may keep hot in L2:
@@ -862,6 +909,18 @@ def emit_flash_bwd_flex_device_body(
     assert (smem.q_stage, smem.do_stage) == (q_stage, do_stage)
     dq_boxes = smem.dq_boxes
     bias = additive_bias_region(plan) if bias_fold else None
+    # The staged aux tables: the budget the fitter kept (its layout is the
+    # renderer's) and the CTA-wide fill before the setup sync.
+    aux_layout = fbwd_aux_smem_layout(plan, smem.aux_bytes) if smem.aux_bytes else []
+    assert sum(entry.padded_bytes for entry in aux_layout) == smem.aux_bytes
+    aux_fill = ""
+    if aux_layout:
+        from .cute_flash import _flash_flex_aux_smem_fill
+
+        aux_fill = "".join(
+            f"    {line}\n"
+            for line in _flash_flex_aux_smem_fill(flex_bwd_hook_plan(plan), aux_layout)
+        )
     _hooks, plain, masked, jac = _render_hooks(
         plan,
         device_function=device_function,
@@ -869,6 +928,7 @@ def emit_flash_bwd_flex_device_body(
         mask_form=mask_form,
         hook_cols=hook_cols,
         bias=bias,
+        aux_smem_budget=smem.aux_bytes,
     )
     regs_reduce, regs_compute, regs_other = _reg_split(reg_split)
     binding_lines = "".join(f"    {line}\n" for line in bindings)
@@ -1408,7 +1468,7 @@ def emit_flash_bwd_flex_device_body(
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_v)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_do)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_dq)
-    _fbwd_storage_cls = _helion_flash_rt.flash_bwd_shared_storage({d}, {q_stage}, {do_stage}, {kv_stage}, {io_dtype}, {table_entries}, {dq_boxes}, {smem.aug_stages}, {smem.stage_lse}, {smem.stage_delta})
+    _fbwd_storage_cls = _helion_flash_rt.flash_bwd_shared_storage({d}, {q_stage}, {do_stage}, {kv_stage}, {io_dtype}, {table_entries}, {dq_boxes}, {smem.aug_stages}, {smem.stage_lse}, {smem.stage_delta}, {smem.aux_bytes})
     smem = cutlass_utils_flash.SmemAllocator()
     storage = smem.allocate(_fbwd_storage_cls)
     fbwd_sSteps = storage.sSteps.get_tensor(cute.make_layout({table_entries}))
@@ -1456,7 +1516,7 @@ def emit_flash_bwd_flex_device_body(
     fbwd_v_prod, fbwd_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages={kv_stage}, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.v_mbar_ptr.data_ptr(), defer_sync=True).make_participants()
     # One fence + sync for every mbarrier above (the pipelines are created
     # ``defer_sync``); the step-table fill below ends in the second sync.
-{clc_setup}    cute.arch.mbarrier_init_fence()
+{clc_setup}{aux_fill}    cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
     fbwd_sst = _fbwd_ss_mma.get_slice(0)
     gK = cute.flat_divide(_fbwd_mKt, cute.select((128, 128, {d}), mode=[0, 2]))
@@ -1631,12 +1691,20 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     raw_score = (
         plan.score_region is not None and bias_region is None
     ) or plan.grad_region is not None
+    from .cute_flash import flash_flex_aux_smem_canonical
+
+    aux_smem_cfg = df.config.config.get("cute_flash_bwd_aux_smem", 0)
+    aux_smem = flash_flex_aux_smem_canonical(
+        aux_smem_cfg if isinstance(aux_smem_cfg, int) else 0,
+        fbwd_aux_smem_candidates(plan),
+    )
     smem = _fit_smem_budget(
         plan,
         stats_mma=stats_mma,
         raw_score=raw_score,
         device=env.device,
         persistent=persistent,
+        aux_smem=aux_smem,
     )
     q_stage, do_stage, dq_boxes = smem.q_stage, smem.do_stage, smem.dq_boxes
 

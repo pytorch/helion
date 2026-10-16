@@ -26,7 +26,9 @@ from test._cute_aux import _cpu_codegen
 
 from helion._compiler.cute import flex_match
 from helion._compiler.cute.backend import _attention_config_envelope_ok
+from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
 from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
+from helion._compiler.cute.cute_flash_bwd_flex import fbwd_aux_smem_candidates
 from helion._compiler.cute.flex_bwd_match import FlexBwdMatch
 from helion._compiler.cute.flex_bwd_match import match_flex_attention_bwd
 from helion._testing import EXAMPLES_DIR
@@ -220,6 +222,9 @@ def test_causal_mask_plan_and_surface() -> None:
     # The polynomial exp2 share is offered (the example runs fast_math) but
     # starts at 0 (every element on MUFU).
     assert config.config["cute_flash_bwd_exp2_emu"] == 0
+    # No gathered aux table: nothing to stage, no staging knob.
+    assert fbwd_aux_smem_candidates(plan) == ()
+    assert "cute_flash_bwd_aux_smem" not in spec._flat_fields()
     # The fused body owns its epilogue: the store-split knob is not searched
     # (its graph rewrite would defeat the matcher) and its envelope rejects it.
     assert "epilogue_subtile" not in spec._flat_fields()
@@ -254,6 +259,38 @@ def test_additive_bias_score_mod_is_an_lse_fold() -> None:
     score_ph = next(n for n in g.graph.nodes if n.op == "placeholder")
     assert score_ph.target == "score" and not score_ph.users
     assert g.output.target is hl.load
+
+
+def test_gathered_table_stages_in_smem() -> None:
+    # graphormer-style: a per-(b, q, kv) index table selects a row of a small
+    # per-head bias table (a data-dependent gather behind an affine load).
+    index = torch.randint(0, 7, (2, 512, 512), dtype=torch.int32)
+    bias = torch.randn(4, 7, dtype=torch.float32)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        dist = hl.load(index, [b, q_idx, kv_idx])
+        return score + hl.load(bias, [h, dist])
+
+    t = _tensors()
+    bound = _bind(_args(t, _causal, score_mod))
+    match = _match_or_fail(bound)
+    plan = match.plan
+    # Only the gathered table is a candidate (its 28 floats + the sentinel,
+    # 16-byte rounded); the affine index table stays in global memory.
+    assert fbwd_aux_smem_candidates(plan) == (128,)
+    spec = bound.config_spec
+    assert spec._flat_fields()["cute_flash_bwd_aux_smem"].choices == (0, 4096)
+    assert spec.default_config().config["cute_flash_bwd_aux_smem"] == 0
+    # The fitter keeps the staged region when it fits (and drops it first).
+    staged = _fit_smem_budget(
+        plan, stats_mma=False, raw_score=False, device=_CPU, aux_smem=4096
+    )
+    assert staged.aux_bytes == 128
+    plain = _fit_smem_budget(plan, stats_mma=False, raw_score=False, device=_CPU)
+    assert plain.aux_bytes == 0 and (plain.q_stage, plain.do_stage) == (
+        staged.q_stage,
+        staged.do_stage,
+    )
 
 
 def test_softcap_jacobian_region() -> None:
