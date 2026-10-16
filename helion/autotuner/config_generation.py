@@ -2435,7 +2435,9 @@ class ConfigGeneration:
         seen: set[Config] = set()
         for i, config in enumerate(user_seed_configs):
             try:
-                flat, normalized = self.canonicalize_flat(self.flatten(config))
+                flat, normalized = self.canonicalize_flat(
+                    self.flatten(self._normalize_seed_per_loop_lists(config))
+                )
             except (
                 InvalidConfig,
                 ValueError,
@@ -2451,6 +2453,30 @@ class ConfigGeneration:
             seen.add(normalized)
             result.append((flat, normalized))
         return result
+
+    def _normalize_seed_per_loop_lists(self, config: Config) -> Config:
+        """Fit a seed's per-loop lists to this spec, as ``ConfigSpec.normalize`` does.
+
+        Seeds can come from a heuristic file written on another GPU or by an
+        older Helion, where a per-loop list such as ``range_num_stages`` has
+        fewer (often zero) entries.  ``flatten`` requires exact lengths, so
+        missing entries are filled with defaults and lists that cannot fit
+        raise ``InvalidConfig`` with the reason.
+        """
+        from ..runtime.config import Config
+
+        values = dict(config.config)
+        flat_fields = self._flat_fields()
+        for key, (_indices, is_sequence) in self._key_to_flat_indices.items():
+            if not is_sequence or key not in values:
+                continue
+            field = flat_fields[key]
+            assert isinstance(field, BlockIdSequence)
+            value = values[key]
+            if not isinstance(value, list) or len(value) != len(field):
+                # Only loop_orders holds nested lists, as in ConfigSpec.normalize.
+                values[key] = field._normalize(key, value, flatten=key != "loop_orders")
+        return Config.from_dict(values)
 
     def random_flat(self) -> FlatConfig:
         """

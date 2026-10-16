@@ -2042,6 +2042,43 @@ class TestAutotuneSeedConfigs(TestCase):
             "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
         )
 
+    @onlyBackends("triton")
+    def test_initial_population_keeps_seed_with_short_per_loop_lists(self) -> None:
+        # Like a pretuned heuristic file written for a GPU or Helion version where
+        # this kernel's loop had no range_num_stages entries.
+        seed_config = helion.Config(
+            block_sizes=[16, 64], num_warps=8, range_num_stages=[]
+        )
+
+        @helion.kernel(autotune_log_level=0, autotune_seed_configs=[seed_config])
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(x.size(1)):
+                    acc += x[tile_m, tile_n].sum(-1)
+                out[tile_m] = acc
+            return out
+
+        args = (torch.randn([128, 256], device=DEVICE),)
+        bound = row_sum.bind(args)
+        if not bound.config_spec.range_num_stages:
+            self.skipTest("range_num_stages is not tunable on this device")
+        search = PatternSearch(bound, args, initial_population=3)
+        search.log = Mock()
+
+        configs = self._population_configs(search)
+
+        self.assertFalse(
+            any("Failed to transfer" in str(call) for call in search.log.call_args_list)
+        )
+        self.assertTrue(
+            any(
+                config.block_sizes == [16, 64] and config.num_warps == 8
+                for config in configs
+            )
+        )
+
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @onlyBackends(["triton", "cute"])
