@@ -5113,9 +5113,9 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
     )
     program = dataclasses.replace(plan.program, loops=(outer, dependent))
     assert dataclasses.replace(plan, program=program).early_prologues() == {}
-    # A symbol that is no host value varies, whatever its origin -- one
-    # minted in device code (``int or int`` on a loop index) as much as a
-    # loop index; a host argument (the int trip count) does not.
+    # A symbol that is no host value varies, whatever its origin -- one minted
+    # in device code (``int or int`` on a loop index) as much as a loop index;
+    # a host argument (the int trip count) does not.
     a, b = _nest_tensors(3)
     bound = _bind_fn(_grid_nest_steps, (a, b, 3))
     host = bound.host_function
@@ -5135,3 +5135,104 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
         assert not matcher.bound_varies(
             shape_env.create_symintnode(host_symbol + 1, hint=4)
         )
+
+
+def _seed_knobs(config: helion.Config) -> tuple[list[int], str, int, int, str]:
+    c = config.config
+    return (
+        c["block_sizes"],
+        c["cute_mma_dag"],
+        c["cute_mma_dag_warps"],
+        c["cute_mma_dag_stages"],
+        c.get("cute_mma_dag_exchange", "auto"),
+    )
+
+
+def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
+    # The cold autotune of the gated delta rule at s1 (seed 31337) left the
+    # ranked ladder for: dqkw at three stages, wy_dL at the full kk tile
+    # with the shared-memory exchange, dk at the 32 tile with two warps and
+    # one stage.  Those neighbours of the top warp seed follow the ladder
+    # (the first seed stays), each measured against the default; see
+    # ``mma_dag_seed_variants``.
+    bf16 = torch.bfloat16
+    # Gated dqkw's dattn is a hoisted root exchange: the streaming class
+    # leads with the four tensor-memory seeds, then the warp ladder.
+    dqkw = _bind_dqkw(True, bhn=2048, d=128, dv=128).config_spec
+    seeds = [_seed_knobs(c) for c in dqkw.compiler_seed_configs]
+    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
+    top = ([64, 32, 64, 64, 64], "warp", 4, 2, "auto")
+    assert seeds[4] == top
+    assert seeds[12:17] == [
+        ([64, 32, 64, 64, 64], "warp", 4, 3, "auto"),
+        ([64, 32, 64, 64, 64], "warp", 4, 3, "smem"),
+        ([64, 32, 64, 64, 64], "warp", 4, 2, "smem"),
+        # Of the two K loops of extent 128 only the dattn loop keeps two
+        # CTAs per SM at its full extent (the nested DV loop's ring would
+        # take 148 KB); the gated [D, DV] tile contracts nothing.
+        ([128, 32, 64, 64, 64], "warp", 4, 2, "auto"),
+        ([128, 32, 64, 64, 64], "warp", 4, 2, "smem"),
+    ]
+    assert seeds[17:] == []
+    # The flat streaming programs (wy_dL, dk) lead with the four
+    # tensor-memory seeds; the warp ladder and its neighbours follow.
+    wy_dl = _bind_wy_dl(True, bf16, bf16, bhn=2048, d=128, dv=128).config_spec
+    seeds = [_seed_knobs(c) for c in wy_dl.compiler_seed_configs]
+    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
+    assert seeds[4] == ([64, 64, 64], "warp", 4, 2, "auto")
+    assert seeds[12:17] == [
+        ([64, 64, 64], "warp", 4, 3, "auto"),
+        ([64, 64, 64], "warp", 4, 3, "smem"),
+        ([64, 64, 64], "warp", 4, 2, "smem"),
+        # The kk loop at its full extent keeps three CTAs per SM; the DV
+        # loop at 128 would drop to two.
+        ([64, 64, 128], "warp", 4, 2, "auto"),
+        ([64, 64, 128], "warp", 4, 2, "smem"),
+    ]
+    dk = _bind_dk(bhn=2048, d=128, dv=128).config_spec
+    seeds = [_seed_knobs(c) for c in dk.compiler_seed_configs]
+    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
+    assert seeds[4] == ([64], "warp", 4, 2, "auto")
+    assert seeds[12:14] == [
+        ([64], "warp", 4, 1, "auto"),
+        ([32], "warp", 2, 1, "auto"),
+    ]
+    # No root tile, no CTA-rich grid: the ladder alone (fwd_o tiles its
+    # root; the state kernels run a CTA per head).
+    fwd_o = _bind_fwd_o(True, bhn=2048, d=128, dv=128).config_spec
+    assert all(_seed_knobs(c)[4] == "auto" for c in fwd_o.compiler_seed_configs)
+    assert all(
+        _seed_knobs(c)[3] in dag.MMA_DAG_SEED_STAGES
+        for c in fwd_o.compiler_seed_configs
+        if _seed_knobs(c)[1] == "warp"
+    )
+    facts = fwd_o.cute_mma_dag_facts
+    assert facts is not None
+    assert dag.mma_dag_seed_variants(facts, dag.mma_dag_seed_configs(facts)) == []
+    fwd = _bind_fwd().config_spec
+    facts = fwd.cute_mma_dag_facts
+    assert facts is not None
+    assert dag.mma_dag_seed_variants(facts, dag.mma_dag_seed_configs(facts)) == []
+
+
+@pytest.mark.parametrize("kernel", ("dqkw", "wy_dL", "dk"), ids=("dqkw", "wy_dL", "dk"))
+def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
+    bf16 = torch.bfloat16
+    bound = {
+        "dqkw": lambda: _bind_dqkw(True, bhn=2048, d=128, dv=128),
+        "wy_dL": lambda: _bind_wy_dl(True, bf16, bf16, bhn=2048, d=128, dv=128),
+        "dk": lambda: _bind_dk(bhn=2048, d=128, dv=128),
+    }[kernel]()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    ladder = dag.mma_dag_seed_configs(facts)[: CuteMmaDagHeuristic.SEED_TILES]
+    variants = dag.mma_dag_seed_variants(facts, ladder)
+    assert variants
+    warp = [c for c in spec.compiler_seed_configs if c.config["cute_mma_dag"] == "warp"]
+    assert len(warp) == len(ladder) + len(variants)
+    for config in warp[len(ladder) :]:
+        with bound.env:
+            normalized = spec.normalized_config(config)
+        assert normalized.config["cute_mma_dag"] == "warp"
+        assert f"{RT}.mma_bf16(" in _kernel_body(_source(bound, normalized))

@@ -87,6 +87,7 @@ from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
 from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_K_STEP
+from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
 from .cute_mma_dag import MMA_DAG_TCGEN05
@@ -98,6 +99,7 @@ from .cute_mma_dag import ROUTE_INPLACE
 from .cute_mma_dag import ROUTE_SYNC
 from .cute_mma_dag import Access
 from .cute_mma_dag import Axis
+from .cute_mma_dag import AxisFacts
 from .cute_mma_dag import CuteMmaDagFacts
 from .cute_mma_dag import Derived
 from .cute_mma_dag import Dot
@@ -107,6 +109,7 @@ from .cute_mma_dag import Operand
 from .cute_mma_dag import Store
 from .cute_mma_dag import _decline
 from .cute_mma_dag import _storage
+from .cute_mma_dag import mma_dag_ctas_per_sm
 from .cute_mma_dag import staged_store_reason
 from .cute_mma_dag_codegen import _RUNTIME
 from .cute_mma_dag_codegen import Coords
@@ -170,6 +173,19 @@ TCGEN05_MAX_TABLE_REGS = 96
 TCGEN05_EPILOGUE_PREFETCH_COLS = 32
 # One swizzle atom row: the widest swizzle (SW128) spans 128 bytes.
 ATOM_MAX_BYTES = 128
+# Region programs rank their seeds by innermost-loop iterations per resident
+# CTA: every iteration is a commit round trip the CTA waits through, and up
+# to three resident CTAs overlap their chains (beyond three the SM is busy
+# already).  B200, device us at s2 / s1: dk [64] s2 (2 iterations at two
+# per SM) 150 / 49 against [32] s2 (4 at three) 152 / 51; wy_dL [64, 32, 128]
+# s3 (7 at three) 261 / 78 against [32, 32, 128] s3 (9 at three) 289 / 80 and
+# [64, 64, 128] s2 (5 at two) 333 / 92; gated dqkw [128, 32, 32, 64, 128] s3
+# (19 at two) 690 / 186 against [128, 32, 16, 64, 128] s2 (35 at three) 717 /
+# 193.
+TCGEN05_REGION_SEED_CTAS = 3
+# ... and up to four for a program with a chain loop (a loop without a tile
+# axis), whose commit round trips only the co-resident CTAs overlap.
+TCGEN05_CHAIN_SEED_CTAS = 4
 SLAB_ALIGNMENT = 1024
 TMA_MAX_RANK = 5
 # Tensor maps the launcher passes to one kernel.
@@ -239,6 +255,20 @@ class Tcgen05ExchangeFacts:
 
 
 @dataclasses.dataclass(frozen=True)
+class RegisterCarryFacts:
+    """A loop carry that may live in the epilogue warps' registers instead
+    of tensor memory (``cute_mma_dag_tcgen05_regions.register_carries``):
+    its slot and, per derived value of its loop that does not read it, the
+    column axes live while that value is evaluated (its inputs' rows, its
+    own and this carry's).  The carry is resident at a config when every
+    such live set fits the derived-value register budget
+    (``resident_slots``); otherwise it keeps its tensor-memory columns."""
+
+    slot: int
+    live: tuple[tuple[int, ...], ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class Tcgen05Facts:
     tiles: tuple[Tcgen05TileFacts, ...]
     exchanges: tuple[Tcgen05ExchangeFacts, ...]
@@ -257,13 +287,31 @@ class Tcgen05Facts:
     regions: bool = False
     items: tuple[Tcgen05SmemItem, ...] = ()
     tmem_slots: tuple[int, ...] = ()
+    # Region programs: the carries that live in registers at the configs
+    # whose register budget admits them (``resident_slots``).
+    register_carries: tuple[RegisterCarryFacts, ...] = ()
     # Slot pairs that may not share TMEM columns beyond the live groups (a
-    # carry and the slot its seed reads, a dot and the accumulator it copies).
+    # dot and the accumulator it copies, the batch reorder's pairs).
     tmem_conflicts: tuple[tuple[int, int], ...] = ()
+    # (output slot, carry slot) of the loop outputs computed in another
+    # slot: the output takes the carry's columns when the two never
+    # conflict, and the end-of-iteration copy vanishes.
+    tmem_aliases: tuple[tuple[int, int], ...] = ()
+    # Region programs: operand tiles rewritten by a per-packet pass (a
+    # dtype conversion or a pointwise chain) -- the work that spreads over
+    # every warp; the rest of the render runs on the four epilogue warps.
+    pass_tiles: int = 0
     # Some dot runs on fp32 (tf32) operands.
     tf32: bool = False
     ring_loops: int = 0
     staged_regions: int = 0
+    # Derived values' tile inputs that may ride a loop ring (the
+    # ``cute_mma_dag_loads`` knob has a subject).
+    aux_items: int = 0
+    # Region programs: the live groups with the region emitter's exchange
+    # points (a root fragment's exchange tile is written once ahead of the
+    # loop reading it), for the TMEM layout; None: the planner's.
+    live_groups: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,6 +327,10 @@ class Tcgen05SmemItem:
     cols: int
     elem_bytes: int
     copies: int
+    # Root items live within one root segment (the k-th run of root steps
+    # between the loops; 0 is the prologue for a raw tile settled there)
+    # overlay the loop frames, which are dead then (-1: live across loops).
+    segment: int = -1
 
 
 def _tma_dims(access: Access) -> tuple[int, ...]:
@@ -447,6 +499,20 @@ def tcgen05_tmem_cols(total: int) -> int:
     return cols
 
 
+def resident_slots(tc: Tcgen05Facts, resolved: Sequence[int]) -> tuple[int, ...]:
+    """The register carries (``Tcgen05Facts.register_carries``) resident at
+    the resolved block sizes: every derived value of the carry's loop keeps
+    its live rows plus the carry's within the register budget."""
+    return tuple(
+        carry.slot
+        for carry in tc.register_carries
+        if all(
+            sum(resolved[axis] for axis in live) <= TCGEN05_MAX_DERIVED_COLS
+            for live in carry.live
+        )
+    )
+
+
 def tcgen05_slot_columns(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> int:
     tc = facts.tcgen05
     if tc is not None and tc.regions:
@@ -593,6 +659,51 @@ def tcgen05_config_reason(
     return None
 
 
+def region_warps_matter(facts: CuteMmaDagFacts, sizes: Mapping[int, int]) -> bool:
+    """Whether a region program's render changes with the warp count at the
+    tile ``sizes``: only the per-packet work spreads over every warp -- the
+    operand passes (``Tcgen05Facts.pass_tiles``) and the packet drains of
+    staging tiles whose rows are not one swizzle atom (the others store by
+    TMA from one thread); exchanges, derived values, reductions and stores'
+    stage-ins run on the four epilogue warps."""
+    tc = facts.tcgen05
+    assert tc is not None
+    if tc.pass_tiles:
+        return True
+    for item in tc.items:
+        if item.kind != "staging":
+            continue
+        cols = facts.block_size(item.cols, sizes)
+        if cols is None or cols * item.elem_bytes not in (16, 32, 64, 128):
+            return True
+    return False
+
+
+def region_iterations(
+    facts: CuteMmaDagFacts,
+    tunable: Sequence[tuple[int, AxisFacts]],
+    choice: Sequence[int],
+) -> int:
+    """Innermost-loop iterations per CTA of a region program at the tile
+    ``choice`` of the ``tunable`` axes: for every innermost loop the product
+    of the trip counts of the loops enclosing it (a loop without a tile
+    axis counts one)."""
+    trips: dict[int, int] = {}
+    for (_index, axis), tile in zip(tunable, choice, strict=True):
+        if axis.kind == AXIS_LOOP and axis.loop >= 0:
+            trips[axis.loop] = trips.get(axis.loop, 1) * (axis.extent // tile)
+    total = 0
+    for index, loop in enumerate(facts.loops):
+        if not loop.innermost:
+            continue
+        count = 1
+        while index >= 0:
+            count *= trips.get(index, 1)
+            index = facts.loops[index].parent
+        total += count
+    return total
+
+
 def _ladder_for(facts: CuteMmaDagFacts, index: int) -> tuple[int, ...]:
     """The seed ladder of tunable axis ``index``: fragment rows take the
     {64, 128} M ladder, everything else the N ladder."""
@@ -707,6 +818,12 @@ def tcgen05_seed_configs(
     # the narrowest tile (dstate at s2: [32] 441 us vs [64] 557 vs [16],
     # two waves, 767; at s1 [64] 76 vs [32] 118).
     chain = bool(tc.derived_cols)
+    # A region program's loop without a tile axis (``hl.grid`` / a fixed
+    # step: no ring; its dots run on fragments and staged tiles).
+    loop_axes = {axis.loop for axis in facts.axes if axis.kind == AXIS_LOOP}
+    chain_loop = tc.regions and any(
+        index not in loop_axes for index in range(len(facts.loops))
+    )
     fallback = False
     for choice in _seed_choices(ladders):
         if choice is None:
@@ -720,11 +837,14 @@ def tcgen05_seed_configs(
             fallback = True
             continue
         sizes: dict[int, int] = dict(fixed)
+        # The deepest ring any loop fills (a region program's loops each
+        # own a ring of ``stages`` slots; a one-trip loop beside a four-trip
+        # one does not cap the depth).
         trip = 0
         for (_index, axis), tile in zip(tunable, choice, strict=True):
             sizes[axis.block_id] = tile
             if axis.kind == AXIS_LOOP:
-                trip = axis.extent // tile
+                trip = max(trip, axis.extent // tile)
         stage_choices: tuple[int, ...] = TCGEN05_SEED_STAGES
         if trip:
             stage_choices = tuple(
@@ -739,6 +859,14 @@ def tcgen05_seed_configs(
                 mma_dag_config_reason(facts, sizes, warps, stages, MMA_DAG_TCGEN05)
                 is not None
             ):
+                continue
+            if (
+                tc.regions
+                and warps > TCGEN05_DEFAULT_WARPS
+                and not region_warps_matter(facts, sizes)
+            ):
+                # The extra warps would idle: the render is the four-warp one
+                # (state_du_kda [16] rendered identically at four and eight).
                 continue
             ctas = facts.grid_blocks
             root_area = 1
@@ -760,29 +888,47 @@ def tcgen05_seed_configs(
                 not facts.smem_capacity or 2 * smem <= facts.smem_capacity
             ) and 2 * tmem <= TCGEN05_MAX_TMEM_COLS
             fits_wave = not facts.sm_count or ctas <= facts.sm_count or two_per_sm
-            if chain:
-                waves = -(-ctas // facts.sm_count) if facts.sm_count else 1
-                rank = (-waves, -root_area, stages, -warps)
-            elif tc.regions:
-                # Region programs (loops over tile axes, no root tile): a
-                # ring that pipelines (every loop at least two trips) before
-                # the largest tiles (wy at s2: [64, 64, 64] s2 512 us against
-                # [128, 128, 128] s1 623).
-                trips = [
-                    axis.extent // tile
-                    for (_index, axis), tile in zip(tunable, choice, strict=True)
-                    if axis.kind == AXIS_LOOP
-                ]
+            if tc.regions:
+                # Region programs (many small CTAs, a few iterations each):
+                # two CTAs per SM of shared memory and TMEM first (one CTA
+                # leaves the SM idle through every commit round trip: wy_dL
+                # at s2 [64, 32, 16] s2 677 us against [32, 32, 32] s2 403;
+                # dk [64] s3 at one per SM 241 against s2 at two 150), a ring
+                # that pipelines (two stages: [32, 32, 128] s1 443 against s2
+                # 392), then the fewest innermost-loop iterations per
+                # resident CTA (``TCGEN05_REGION_SEED_CTAS``) -- every
+                # iteration is at least one commit round trip, overlapped by
+                # the CTAs sharing the SM (dqkw at s2: [32, 32, 32] s2 662 us
+                # with 20 against [64, 16, 16] 1311 with 66; wy_dL [32, 32,
+                # 128] s2 392 with 9 against [16, 16, 16] 488 with 24) -- the
+                # stage depth, the loop area and the warp count.  A program
+                # with a chain loop -- a loop without a tile axis, whose
+                # iterations are MMA commit round trips with no ring to
+                # overlap them (wy's Neumann doubling) -- ranks by the CTAs
+                # per SM up to four ahead of the ring depth: only the
+                # co-resident CTAs overlap the chain (wy at s2: [128, 32, 32]
+                # s2 at four per SM 332 us against [128, 64, 64] s2 at three
+                # 407 and [128, 64, 64] s1 at four 373; wy_dL measured four
+                # no better than three).
+                per_sm = mma_dag_ctas_per_sm(smem, facts.smem_capacity, tmem)
+                cap = (
+                    TCGEN05_CHAIN_SEED_CTAS if chain_loop else TCGEN05_REGION_SEED_CTAS
+                )
+                resident = max(min(per_sm, cap), 1)
+                # Iterations per resident CTA, exact in twelfths (the lcm of
+                # one to four residents).
                 rank = (
                     int(ctas >= 128),
-                    int(fits_wave),
-                    int(min(trips, default=2) >= 2),
-                    root_area,
-                    -root_perimeter,
-                    loop_area,
+                    min(per_sm, cap) if chain_loop else int(per_sm >= 2),
+                    int(stages >= 2),
+                    -(region_iterations(facts, tunable, choice) * 12) // resident,
                     stages,
+                    loop_area,
                     -warps,
                 )
+            elif chain:
+                waves = -(-ctas // facts.sm_count) if facts.sm_count else 1
+                rank = (-waves, -root_area, stages, -warps)
             else:
                 rank = (
                     int(ctas >= 128),
@@ -910,6 +1056,46 @@ class Tcgen05Tile:
 
 
 @dataclasses.dataclass(frozen=True)
+class AuxTile:
+    """A 2-D tile a derived value reads at the fragment coordinates (region
+    programs), fetched by TMA into the derived value's loop ring beside the
+    operand tiles -- the swizzled UMMA layout, so each epilogue thread reads
+    its row's 16-byte chunks conflict-free -- instead of per-element global
+    loads in fragment layout (lane = row: one sector per lane per load)."""
+
+    key: tuple[object, ...]
+    tag: str
+    access: Access
+    frame: int
+    rows: int
+    cols: int
+    elem_bytes: int
+    atom_bytes: int
+    swizzle: str
+    slabs: int
+    # Byte offset within the ring slot.
+    offset: int
+    # None: the tile is a ring operand's (the same load as loaded), brought
+    # in by that operand's TMA and, when ``rewritten``, rewritten in place
+    # by its pass after the aux reads.
+    tma: TmaSpec | None
+    raw_tma: TmaSpec | None = None
+    ring: bool = True
+    rewritten: bool = False
+    # The owning operand tile's key when the aux reads share one (a staged
+    # or hoisted owner is waited by its region's barrier before the reads).
+    owner_key: tuple[object, ...] | None = None
+
+    @property
+    def chunks_per_atom(self) -> int:
+        return self.atom_bytes // 16
+
+    @property
+    def slab_bytes(self) -> int:
+        return self.rows * self.atom_bytes
+
+
+@dataclasses.dataclass(frozen=True)
 class SlotGeometry:
     rows: int
     cols: int
@@ -957,10 +1143,16 @@ class Tcgen05Plan:
         default_factory=dict
     )
     staged_tx: dict[int, int] = dataclasses.field(default_factory=dict)
+    # Region programs: the derived values' tile inputs riding each loop's
+    # ring (``ring_tx`` counts their bytes).
+    aux_tiles: dict[int, tuple[AuxTile, ...]] = dataclasses.field(default_factory=dict)
     scratch_offset: int = -1
     # The fragment slots holding tensor-memory columns (the others stay in
     # registers).
     tmem_slots: tuple[int, ...] = ()
+    # The loop carries living in the epilogue registers at this config
+    # (``resident_slots``): never loaded from or stored to tensor memory.
+    register_carries: tuple[int, ...] = ()
     # Loop stores whose staging tile goes to global memory by TMA (store
     # access node -> its tensor map), one bulk group per issue point.
     store_tma: dict[Node, TmaSpec] = dataclasses.field(default_factory=dict)
@@ -989,6 +1181,7 @@ def plan_tcgen05(
     stages: int,
     store_mode: str,
     pass_warps: bool = False,
+    loads_mode: str = MMA_DAG_LOADS_TMA,
 ) -> Tcgen05Plan:
     """The tcgen05 plan for the resolved ``sizes`` (the config passed
     :func:`tcgen05_config_reason`)."""
@@ -999,7 +1192,7 @@ def plan_tcgen05(
         from .cute_mma_dag_tcgen05_regions import plan_tcgen05_regions
 
         return plan_tcgen05_regions(
-            program, facts, sizes, routes, warps, stages, store_mode
+            program, facts, sizes, routes, warps, stages, store_mode, loads_mode
         )
     tma: list[TmaSpec] = []
 
@@ -2771,15 +2964,20 @@ class _Tcgen05Emitter(_Emitter):
         inputs into registers at the iteration top (they land while the
         carry is read and the first batch runs)."""
         for access in step.loads:
-            paired = self.pairs_aligned(access, 1)
-            for col in range(0, self.local_cols(step.slot), 2):
-                address = self.derived_pair_address(step, access, col)
-                if paired and access.dtype != torch.float32:
-                    word = self.bind("md_u", f"{_RUNTIME}.ldg_b32({address})")
-                    self.derived_words[(access.node, col)] = (word,)
-                else:
-                    lo, hi = self.pair_load(address, access.dtype, paired)
-                    self.derived_words[(access.node, col)] = (lo, hi)
+            self.emit_derived_access_prefetch(step, access)
+
+    def emit_derived_access_prefetch(self, step: Derived, access: Access) -> None:
+        """The pair loads of one 2-D tile input of ``step`` (this thread's
+        row at the fragment coordinates, straight from global memory)."""
+        paired = self.pairs_aligned(access, 1)
+        for col in range(0, self.local_cols(step.slot), 2):
+            address = self.derived_pair_address(step, access, col)
+            if paired and access.dtype != torch.float32:
+                word = self.bind("md_u", f"{_RUNTIME}.ldg_b32({address})")
+                self.derived_words[(access.node, col)] = (word,)
+            else:
+                lo, hi = self.pair_load(address, access.dtype, paired)
+                self.derived_words[(access.node, col)] = (lo, hi)
 
     def emit_derived_line_prefetch(self, loop_value: str) -> None:
         """``prefetch.global.L2`` of the rows the derived values' tile inputs

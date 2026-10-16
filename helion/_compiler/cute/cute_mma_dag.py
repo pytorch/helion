@@ -143,6 +143,22 @@ MMA_DAG_PASS_WARP_STAGES = 3
 # beyond the SM count) lose a CTA per SM to the pass seed's ring depth
 # (318 -> 430, 186 -> 289) and stay with the autotuner.
 MMA_DAG_PASS_WARP_PACKETS = 8
+MMA_DAG_LOADS_KEY = "cute_mma_dag_loads"
+MMA_DAG_LOADS_TMA = "tma"
+MMA_DAG_LOADS_LANE = "lane"
+# The tensor-memory region programs' derived values read 2-D tiles at the
+# fragment coordinates (a fresh accumulator's seed, a reduction's operand):
+# ``tma`` fetches them into the loop ring beside the operand tiles (one
+# 16-byte shared load per chunk; the tiles that do not fit the shared memory
+# stay lane loads), ``lane`` keeps every lane's global pair loads (one sector
+# per lane per load) and the shared memory for occupancy.  Inert elsewhere.
+MMA_DAG_LOADS_CHOICES: tuple[str, ...] = (MMA_DAG_LOADS_TMA, MMA_DAG_LOADS_LANE)
+# The driver reserves this much shared memory per resident CTA: an SM's
+# ``capacity + reserved`` bytes hold ``(capacity + reserved) // (smem +
+# reserved)`` CTAs of ``smem`` bytes (B200: 233472 B per SM, 232448 per CTA).
+MMA_DAG_SMEM_CTA_RESERVED = 1024
+# Tensor memory columns of one SM (the tcgen05 mode's second occupancy limit).
+MMA_DAG_TMEM_COLUMNS = 512
 MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_KEY,
     MMA_DAG_WARPS_KEY,
@@ -150,6 +166,7 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_STORE_KEY,
     MMA_DAG_EXCHANGE_KEY,
     MMA_DAG_PASS_WARPS_KEY,
+    MMA_DAG_LOADS_KEY,
 )
 # Live fp32 fragment words per thread the carry may occupy.
 MMA_DAG_MAX_FRAG_REGS = 128
@@ -1009,6 +1026,9 @@ class AxisFacts:
     block_id: int
     kind: str
     extent: int
+    # The device loop (index into ``CuteMmaDagFacts.loops``) a loop axis
+    # tiles (-1 otherwise).
+    loop: int = -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1069,8 +1089,13 @@ class VecFacts:
 class FragEdgeFacts:
     """A fragment operand of a dot: the producer and consumer slots, whether
     the logical operand is the producer's registers transposed, the K axis
-    index, the element size, the exchange-tile sharing key and the region
-    (loop edges are exchanged every iteration)."""
+    index, the element size, the exchange-tile sharing key, the region
+    (loop edges are exchanged every iteration), whether the consumer dot
+    runs inside a device loop, and whether such an operand is a hoisted
+    root exchange: a fragment defined at the root and read by a loop's dot
+    has one value for every iteration, so the region emitter writes its
+    tile once ahead of the loop (``hoisted_exchange_loop``) -- an epilogue
+    edge feeding a tensor-core operand in every iteration."""
 
     role: str
     logical_swap: bool
@@ -1080,6 +1105,8 @@ class FragEdgeFacts:
     elem_bytes: int
     key: int
     region: str
+    in_loop: bool = False
+    hoisted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2093,6 +2120,26 @@ def mma_dag_seed_warps(bm: int, bn: int) -> int:
     return 1
 
 
+def mma_dag_ctas_per_sm(
+    smem: int, smem_capacity: int, tmem_cols: int = 0, limit: int = 32
+) -> int:
+    """The CTAs one SM holds at ``smem`` bytes of shared memory each (0 or
+    an unknown capacity: ``limit``) and, for the tcgen05 mode, ``tmem_cols``
+    tensor-memory columns each -- the occupancy prediction the seeds rank
+    by (the register count is ptxas's and follows this occupancy: it sizes
+    registers to what the static shared memory allows)."""
+    ctas = limit
+    if smem_capacity:
+        ctas = min(
+            ctas,
+            (smem_capacity + MMA_DAG_SMEM_CTA_RESERVED)
+            // (smem + MMA_DAG_SMEM_CTA_RESERVED),
+        )
+    if tmem_cols:
+        ctas = min(ctas, MMA_DAG_TMEM_COLUMNS // tmem_cols)
+    return ctas
+
+
 def mma_dag_seed_configs(
     facts: CuteMmaDagFacts,
 ) -> list[tuple[dict[int, int], int, int]]:
@@ -2121,11 +2168,7 @@ def mma_dag_seed_configs(
         [tile for tile in MMA_DAG_TILE_LADDER if axis.extent % tile == 0]
         for axis in tunable
     ]
-    cta_rich = (
-        facts.sm_count > 0
-        and facts.grid_blocks >= 2 * facts.sm_count
-        and not any(axis.kind == AXIS_ROOT for axis in facts.axes)
-    )
+    cta_rich = _cta_rich(facts)
     ranked: list[tuple[tuple[int, ...], tuple[dict[int, int], int, int]]] = []
     for choice in itertools.product(*ladders):
         sizes: dict[int, int] = dict(fixed)
@@ -2194,14 +2237,11 @@ def mma_dag_seed_configs(
             for stages in MMA_DAG_SEED_STAGES:
                 if mma_dag_config_reason(facts, sizes, warps, stages) is not None:
                     continue
-                smem = mma_dag_smem_estimate(facts, resolved_sizes, stages, warps)
                 # Shared memory for two CTAs per SM counts once the grid has
                 # more CTAs than SMs (bdv 16 at s2: 256 CTAs, two stages 342
                 # us against 444 at three); otherwise the deeper ring wins.
                 two_per_sm = int(
-                    (facts.sm_count > 0 and ctas <= facts.sm_count)
-                    or not facts.smem_capacity
-                    or 2 * smem <= facts.smem_capacity
+                    _seed_two_per_sm(facts, ctas, resolved_sizes, warps, stages)
                 )
                 # Among equal root areas the squarer tile stages fewer
                 # operand rows.
@@ -2219,6 +2259,149 @@ def mma_dag_seed_configs(
                 ranked.append((rank, (sizes, warps, stages)))
     ranked.sort(key=operator.itemgetter(0), reverse=True)
     return [seed for _rank, seed in ranked]
+
+
+def _cta_rich(facts: CuteMmaDagFacts) -> bool:
+    """A grid of leading tiles far beyond the SM count with no root tile
+    (the per-chunk delta kernels): parallelism comes from co-resident CTAs."""
+    return (
+        facts.sm_count > 0
+        and facts.grid_blocks >= 2 * facts.sm_count
+        and not any(axis.kind == AXIS_ROOT for axis in facts.axes)
+    )
+
+
+def _seed_ctas(facts: CuteMmaDagFacts, sizes: Mapping[int, int]) -> int:
+    ctas = facts.grid_blocks
+    for axis in facts.axes:
+        if axis.kind == AXIS_ROOT:
+            ctas *= axis.extent // sizes[axis.block_id]
+    return ctas
+
+
+def _seed_two_per_sm(
+    facts: CuteMmaDagFacts,
+    ctas: int,
+    resolved: Sequence[int],
+    warps: int,
+    stages: int,
+) -> bool:
+    """Whether the config's shared memory leaves room for two CTAs per SM
+    (moot for a grid within the SM count or an unknown capacity)."""
+    return (facts.sm_count > 0 and ctas <= facts.sm_count) or mma_dag_ctas_per_sm(
+        mma_dag_smem_estimate(facts, resolved, stages, warps), facts.smem_capacity
+    ) >= 2
+
+
+def mma_dag_seed_variants(
+    facts: CuteMmaDagFacts,
+    ranked: Sequence[tuple[dict[int, int], int, int]],
+) -> list[tuple[dict[int, int], int, int, str]]:
+    """Measured neighbours of the top warp seed of a CTA-rich program,
+    ``(sizes, warps, stages, exchange)``, to follow the ranked seeds
+    ``ranked`` (the first seed stays).  The cold autotune of the gated delta
+    rule at s1 left the ranked ladder for each of them; measured against the
+    default at s1 / s2 (B200, us):
+
+    - the ring one step deeper while two CTAs per SM still fit (the ladder
+      walks 8 / 4 / 2: dqkw 193 -> 182 / 757 -> 713, wy_dL 117 -> 117 /
+      446 -> 437), and the same with every fragment operand exchanged
+      through shared memory (dqkw 182 / 704);
+    - the fragment operands exchanged through shared memory where the
+      automatic routes keep some in registers (dqkw 192 / 742), for 16-bit
+      operands: the fp32 tiles of a tf32 chain cost wy 139 -> 155;
+    - a loop axis a dot contracts over at its full extent -- one trip -- when
+      that is a ladder tile and the shared memory keeps its CTAs per SM
+      (wy_dL [64, 64, 128] 115 / 442; dqkw [128, 32, 64, 64, 64] 192 / 753;
+      the nested K loop of dqkw at 128 halves the CTAs and runs 258), with
+      its shared-memory exchange twin (wy_dL 110 / 414, dqkw 189 / 723);
+    - a single-loop program with the ring at one stage (dk [64] 52 -> 49 /
+      161 -> 156) and at the 32 tile with two warps and one stage, the most
+      co-resident CTAs (dk 47 / 149); a multi-loop program loses the
+      overlap (dqkw 205, wy_dL 126).
+    """
+    if not ranked or not _cta_rich(facts):
+        return []
+    sizes, warps, stages = ranked[0]
+    seen = {
+        (tuple(sorted(s.items())), w, st, MMA_DAG_EXCHANGE_AUTO) for s, w, st in ranked
+    }
+    variants: list[tuple[dict[int, int], int, int, str]] = []
+
+    def resolve(candidate: Mapping[int, int]) -> list[int] | None:
+        resolved = [facts.block_size(i, candidate) for i in range(len(facts.axes))]
+        if any(size is None for size in resolved):
+            return None
+        return cast("list[int]", resolved)
+
+    def ctas_per_sm(candidate: Mapping[int, int], w: int, st: int) -> int:
+        resolved = resolve(candidate)
+        if resolved is None or not facts.smem_capacity:
+            return 0
+        return facts.smem_capacity // max(
+            1, mma_dag_smem_estimate(facts, resolved, st, w)
+        )
+
+    def exchanges(candidate: Mapping[int, int], w: int) -> bool:
+        """Whether forcing the shared-memory exchange changes the routes
+        (of 16-bit fragment operands)."""
+        resolved = resolve(candidate)
+        return bool(
+            facts.edges
+            and all(dot.elem_bytes == 2 for dot in facts.dots)
+            and resolved is not None
+            and any(
+                route in REGISTER_ROUTES
+                for route in mma_dag_layout_solution(facts, resolved, w)[1]
+            )
+        )
+
+    def add(candidate: Mapping[int, int], w: int, st: int, exchange: str) -> None:
+        key = (tuple(sorted(candidate.items())), w, st, exchange)
+        if key in seen or mma_dag_config_reason(facts, candidate, w, st) is not None:
+            return
+        seen.add(key)
+        variants.append((dict(candidate), w, st, exchange))
+
+    def add_with_twin(candidate: Mapping[int, int], w: int, st: int) -> None:
+        add(candidate, w, st, MMA_DAG_EXCHANGE_AUTO)
+        if exchanges(candidate, w):
+            add(candidate, w, st, MMA_DAG_EXCHANGE_SMEM)
+
+    resolved = resolve(sizes)
+    if resolved is None:
+        return []
+    ctas = _seed_ctas(facts, sizes)
+    deeper = next((s for s in MMA_DAG_STAGE_CHOICES if s > stages), None)
+    if deeper is not None and _seed_two_per_sm(facts, ctas, resolved, warps, deeper):
+        add_with_twin(sizes, warps, deeper)
+    if exchanges(sizes, warps):
+        add(sizes, warps, stages, MMA_DAG_EXCHANGE_SMEM)
+    occupancy = ctas_per_sm(sizes, warps, stages)
+    for index in facts.k_axes:
+        axis = facts.axes[index]
+        if (
+            axis.kind == AXIS_LOOP
+            and axis.extent in MMA_DAG_TILE_LADDER
+            and sizes.get(axis.block_id, axis.extent) < axis.extent
+        ):
+            full = {**sizes, axis.block_id: axis.extent}
+            if ctas_per_sm(full, warps, stages) >= occupancy:
+                add_with_twin(full, warps, stages)
+    if len(facts.loops) == 1:
+        if stages > 1:
+            add(sizes, warps, 1, MMA_DAG_EXCHANGE_AUTO)
+        small = {
+            axis.block_id: 32
+            if axis.kind == AXIS_LOOP and axis.extent % 32 == 0
+            else size
+            for axis in facts.axes
+            for size in [sizes.get(axis.block_id)]
+            if size is not None
+        }
+        if 2 in MMA_DAG_WARP_CHOICES:
+            add({**sizes, **small}, 2, 1, MMA_DAG_EXCHANGE_AUTO)
+    return variants
 
 
 # ---------------------------------------------------------------------------
@@ -4515,7 +4698,9 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     from .cute_mma_dag_tcgen05 import tcgen05_facts
 
     return CuteMmaDagFacts(
-        axes=tuple(AxisFacts(a.block_id, a.kind, a.extent) for a in program.axes),
+        axes=tuple(
+            AxisFacts(a.block_id, a.kind, a.extent, a.loop) for a in program.axes
+        ),
         frags=tuple((rows.index, cols.index) for rows, cols in program.slots),
         tiles=tuple(tiles),
         staging=staging,
@@ -4762,6 +4947,8 @@ def mma_dag_frag_edges(program: MmaDagProgram) -> tuple[FragEdgeFacts, ...]:
                     region="loop"
                     if program.operand_frame(dot, operand) >= 0
                     else "epilogue",
+                    in_loop=dot.loop >= 0,
+                    hoisted=dot.loop >= 0 and program.operand_frame(dot, operand) == -1,
                 )
             )
     return tuple(edges)
@@ -4868,6 +5055,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     store_mode = get(MMA_DAG_STORE_KEY, MMA_DAG_STORE_STAGED)
     exchange_mode = get(MMA_DAG_EXCHANGE_KEY, MMA_DAG_EXCHANGE_AUTO)
     pass_warps = get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_OFF)
+    loads_mode = get(MMA_DAG_LOADS_KEY, MMA_DAG_LOADS_TMA)
     facts = mma_dag_facts(program)
     reason = mma_dag_config_reason(
         facts, sizes_by_block, warps, stages, cast("str", mode)
@@ -4885,6 +5073,10 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
         raise _decline(
             f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
+        )
+    if loads_mode not in MMA_DAG_LOADS_CHOICES:
+        raise _decline(
+            f"{MMA_DAG_LOADS_KEY} {loads_mode!r} must be one of {MMA_DAG_LOADS_CHOICES}"
         )
     assert type(warps) is int and type(stages) is int
     if pass_warps == MMA_DAG_PASS_WARPS_ON:
@@ -4949,6 +5141,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             stages,
             cast("str", store_mode),
             pass_warps == MMA_DAG_PASS_WARPS_ON,
+            cast("str", loads_mode),
         )
         return MmaDagPlan(
             program=program,
@@ -4992,6 +5185,10 @@ __all__ = [
     "MMA_DAG_EXCHANGE_KEY",
     "MMA_DAG_KEY",
     "MMA_DAG_KEYS",
+    "MMA_DAG_LOADS_CHOICES",
+    "MMA_DAG_LOADS_KEY",
+    "MMA_DAG_LOADS_LANE",
+    "MMA_DAG_LOADS_TMA",
     "MMA_DAG_MODES",
     "MMA_DAG_OFF",
     "MMA_DAG_PASS_WARPS_CHOICES",
@@ -5000,6 +5197,7 @@ __all__ = [
     "MMA_DAG_PASS_WARPS_ON",
     "MMA_DAG_PASS_WARP_STAGES",
     "MMA_DAG_SEED_STAGES",
+    "MMA_DAG_SMEM_CTA_RESERVED",
     "MMA_DAG_STAGES_KEY",
     "MMA_DAG_STAGE_CHOICES",
     "MMA_DAG_STORE_CHOICES",
@@ -5007,6 +5205,7 @@ __all__ = [
     "MMA_DAG_STORE_KEY",
     "MMA_DAG_STORE_STAGED",
     "MMA_DAG_TCGEN05",
+    "MMA_DAG_TMEM_COLUMNS",
     "MMA_DAG_WARP",
     "MMA_DAG_WARPS_KEY",
     "MMA_DAG_WARP_CHOICES",
@@ -5039,6 +5238,7 @@ __all__ = [
     "ldmatrix_lane_address",
     "match_mma_dag",
     "mma_dag_config_reason",
+    "mma_dag_ctas_per_sm",
     "mma_dag_facts",
     "mma_dag_frag_edges",
     "mma_dag_frag_regs",

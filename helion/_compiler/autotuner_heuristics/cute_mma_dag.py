@@ -8,7 +8,12 @@ from typing import cast
 
 from ...runtime.config import Config
 from ..compile_environment import CompileEnvironment
+from ..cute.cute_mma_dag import AXIS_ROOT
+from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
+from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
+from ..cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from ..cute.cute_mma_dag import MMA_DAG_LOADS_TMA
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
@@ -26,6 +31,7 @@ from ..cute.cute_mma_dag import mma_dag_config_reason
 from ..cute.cute_mma_dag import mma_dag_pass_warps_lead
 from ..cute.cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute.cute_mma_dag import mma_dag_seed_configs
+from ..cute.cute_mma_dag import mma_dag_seed_variants
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -125,29 +131,42 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         # default is the first seed), then the warp-mode ladder.  Their
         # snapshots always go through the staging tile: the direct fp32
         # pair stores from the TMEM rows measured 397 us against 176 on
-        # bwd_dh at s2.  The region programs (many small CTAs, a few
-        # iterations each) keep the warp mode first: their
-        # tensor-memory chain of commit waits runs behind it (dk at s2: 295
-        # vs 156 us, dqkw 675 vs 525, wy_dL 598 vs 400).
+        # bwd_dh at s2.  Region programs (many small CTAs, a few iterations
+        # each) lead with tensor memory only in the measured classes: wy's
+        # tf32 chain (332 vs 513 us at s2 at four CTAs per SM) and the
+        # streaming programs -- loops, every loop dot over loaded tiles or a
+        # root fragment exchanged once ahead of the loop, no root tile --
+        # whose per-CTA work is a TMA ring into TMEM accumulators and
+        # vectors (dk at s2 148 vs 165 us, s1 48 vs 53, s0 21 vs 24; wy_dL
+        # 301 vs 404, 87 vs 110, 38 vs 46; gated wy_dL 435 vs 474; gated
+        # dqkw, whose dattn is hoisted ahead of the tile_d loop, 695 vs 730
+        # at s2 and 187 vs 200 at s1 -- plain dqkw 572 vs 558 and 153 vs
+        # 147, the warp seeds behind for the search).  A fragment operand
+        # exchanged every iteration (a state recurrence's carry: state_du_kda
+        # 278 vs 130; bwd_o_kda's per-iteration operand 127 vs 95) or a root
+        # tile (fwd_o_anch 47 vs 35) keeps the warp mode first: the
+        # tensor-memory chain of commit waits runs behind it there.
         tensor_memory = [
-            (MMA_DAG_TCGEN05, seed)
+            (MMA_DAG_TCGEN05, seed, MMA_DAG_EXCHANGE_AUTO)
             for seed in tcgen05_seed_configs(facts)[: cls.SEED_TCGEN05]
         ]
-        warp = [
-            (MMA_DAG_WARP, seed)
-            for seed in mma_dag_seed_configs(facts)[: cls.SEED_TILES]
+        ladder = mma_dag_seed_configs(facts)[: cls.SEED_TILES]
+        warp = [(MMA_DAG_WARP, seed, MMA_DAG_EXCHANGE_AUTO) for seed in ladder]
+        # Measured neighbours of the top warp seed (CTA-rich programs; see
+        # ``mma_dag_seed_variants``) follow the ladder: the first seed stays.
+        warp += [
+            (MMA_DAG_WARP, (sizes, warps, stages), exchange)
+            for sizes, warps, stages, exchange in mma_dag_seed_variants(facts, ladder)
         ]
-        # Except wy's tf32 chain: its tcgen05 lowering runs 512 vs 677 us at
-        # s2 (two CTAs per SM, the chain's exchanges through smem).
-        regions = (
-            facts.tcgen05 is not None
-            and facts.tcgen05.regions
-            and not facts.tcgen05.tf32
+        tensor_memory_first = facts.tcgen05 is not None and (
+            not facts.tcgen05.regions
+            or facts.tcgen05.tf32
+            or cls.streaming_regions(facts)
         )
         ranked = [
-            (mode, seed, MMA_DAG_PASS_WARPS_OFF)
-            for mode, seed in (
-                warp + tensor_memory if regions else tensor_memory + warp
+            (mode, seed, exchange, MMA_DAG_PASS_WARPS_OFF)
+            for mode, seed, exchange in (
+                tensor_memory + warp if tensor_memory_first else warp + tensor_memory
             )
         ]
         # Loop operand passes off the chain: the first tensor-memory seed
@@ -174,28 +193,48 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 lead = mma_dag_pass_warps_lead(facts, resolved)
                 ranked.insert(
                     0 if lead else 1,
-                    (MMA_DAG_TCGEN05, (sizes, eight, stages), MMA_DAG_PASS_WARPS_ON),
+                    (
+                        MMA_DAG_TCGEN05,
+                        (sizes, eight, stages),
+                        MMA_DAG_EXCHANGE_AUTO,
+                        MMA_DAG_PASS_WARPS_ON,
+                    ),
                 )
-        for mode, (sizes, warps, stages), pass_warps in ranked:
+        for mode, (sizes, warps, stages), exchange, pass_warps in ranked:
             block_sizes = list(default_sizes)
             for block_id, size in sizes.items():
                 if block_id in block_ids:
                     block_sizes[spec.block_sizes.block_id_to_index(block_id)] = size
-            seeds.append(
-                Config.from_dict(
-                    {
-                        "block_sizes": block_sizes,
-                        MMA_DAG_KEY: mode,
-                        MMA_DAG_WARPS_KEY: warps,
-                        MMA_DAG_STAGES_KEY: stages,
-                        MMA_DAG_STORE_KEY: (
-                            MMA_DAG_STORE_STAGED if mode == MMA_DAG_TCGEN05 else store
-                        ),
-                        MMA_DAG_PASS_WARPS_KEY: pass_warps,
-                    }
-                )
-            )
+            config: dict[str, object] = {
+                "block_sizes": block_sizes,
+                MMA_DAG_KEY: mode,
+                MMA_DAG_WARPS_KEY: warps,
+                MMA_DAG_STAGES_KEY: stages,
+                MMA_DAG_STORE_KEY: (
+                    MMA_DAG_STORE_STAGED if mode == MMA_DAG_TCGEN05 else store
+                ),
+                MMA_DAG_PASS_WARPS_KEY: pass_warps,
+                MMA_DAG_LOADS_KEY: MMA_DAG_LOADS_TMA,
+            }
+            if exchange != MMA_DAG_EXCHANGE_AUTO:
+                config[MMA_DAG_EXCHANGE_KEY] = exchange
+            seeds.append(Config.from_dict(config))
         return seeds or None
+
+    @classmethod
+    def streaming_regions(cls, facts: CuteMmaDagFacts) -> bool:
+        """A streaming region program: loops, no root tile axis, and every
+        fragment operand of a dot inside a loop a hoisted root exchange
+        (its tile written once ahead of the loop) -- the loops' work is a
+        TMA ring into tensor-memory accumulators and vectors, nested or
+        not.  A fragment exchanged every iteration (a state recurrence's
+        carry, bwd_o_kda's per-iteration operand) or a root tile keeps the
+        warp mode first."""
+        return (
+            bool(facts.loops)
+            and all(not edge.in_loop or edge.hoisted for edge in facts.edges)
+            and all(axis.kind != AXIS_ROOT for axis in facts.axes)
+        )
 
     @classmethod
     def get_seed_config(
