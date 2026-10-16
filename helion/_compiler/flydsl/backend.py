@@ -284,7 +284,9 @@ class FlyDSLBackend(Backend):
             # Small-N sub-warp regime: THREADS_PER_ROW<64 packs multiple rows
             # per block; the per-row reduction runs over a sub-group of that many
             # lanes. Default 64 = one full wavefront per row (unchanged).
-            _tpr = int(config.config.get("flydsl_threads_per_row", 0) or 0)
+            _tpr = int(
+                config.config.get("flydsl_threads_per_row", 0) or 0  # pyrefly: ignore[bad-argument-type]
+            )
             return _tpr if _tpr > 0 else 64
         _vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
         _v = config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1
@@ -700,7 +702,9 @@ class FlyDSLBackend(Backend):
             _cr = bool(_cand.config.get("constexpr_range", False))
             # Preserve the small-N sub-warp knob; without it bm>1 defaults to 64
             # threads/row and num_threads=64*bm can exceed the 1024 block limit.
-            _tp = int(_cand.config.get("flydsl_threads_per_row", 0) or 0)
+            _tp = int(
+                _cand.config.get("flydsl_threads_per_row", 0) or 0  # pyrefly: ignore[bad-argument-type]
+            )
             for _cm in (2,):  # non-temporal load (bypass L1)
                 for _wpe in (0, 2, 4):
                     _add(_bs, _rl, _v, cr=_cr, cm=_cm, wpe=_wpe, tpr=_tp)
@@ -791,7 +795,8 @@ class FlyDSLBackend(Backend):
         # Threads per row: 64 = one full wavefront (default); <64 = small-N
         # sub-warp regime (set from flydsl_threads_per_row below).
         self._flydsl_threads_per_row: int = (
-            int(config.config.get("flydsl_threads_per_row", 0) or 0) or 64
+            int(config.config.get("flydsl_threads_per_row", 0) or 0)  # pyrefly: ignore[bad-argument-type]
+            or 64
         )
         # Cache modifier for buffer loads: 0=cached (default), 2=non-temporal.
         self._flydsl_load_cache_modifier: int = int(
