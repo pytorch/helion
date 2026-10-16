@@ -49,7 +49,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
+DotPrecision = Literal["tf32", "tf32x3", "hf32", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -677,6 +677,10 @@ class Settings(_Settings):
     # Not a dataclass field: public serialization, equality and existing cache
     # fingerprints continue to contain only the effective setting values.
     _cute_structural_origins: CuteStructuralOrigins
+    # Not a dataclass field: True when the backend was chosen explicitly — a
+    # Settings/kernel kwarg or HELION_BACKEND — as opposed to resolved from
+    # the default. Device routing must not override an explicit choice.
+    _backend_explicit: bool
 
     __slots__ = {
         "backend": (
@@ -692,7 +696,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'; 'hf32' is only honored by triton drivers that accept it). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
         "cute_rng_stream": (
             "CuTe RNG policy: auto (CuTe default) uses philox4 for explicit hl.rand "
             "and preserves other RNG operations. philox4 maps logical offset i "
@@ -980,8 +984,15 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
+        backend_explicit = "backend" in settings
         if "backend" not in settings:
             settings["backend"] = _get_backend()
+            # _get_backend above already resolved HELION_BACKEND; record that
+            # fact here instead of re-reading the env var at each consumer
+            # (the device-routing gate), so one construction-time snapshot
+            # decides whether routing may swap the implicit default. A blank
+            # value falls back like _get_backend does and stays implicit.
+            backend_explicit = bool(os.environ.get("HELION_BACKEND", "").strip())
         if "cute_rng_stream" not in settings:
             settings["cute_rng_stream"] = _env_get_literal(
                 "HELION_CUTE_RNG_STREAM",
@@ -1004,6 +1015,7 @@ class Settings(_Settings):
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
         self._cute_structural_origins = CuteStructuralOrigins(**origins)
+        self._backend_explicit = backend_explicit
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
@@ -1022,6 +1034,11 @@ class Settings(_Settings):
 
     def __setattr__(self, name: str, value: object) -> None:
         super().__setattr__(name, value)
+        if name == "backend" and "_backend_explicit" in self.__dict__:
+            # Direct assignment is an explicit user choice (the initial
+            # dataclass write precede creation of the flag; copy() fixes up
+            # the replace()-based path separately).
+            self._backend_explicit = True
         if (
             name in CUTE_STRUCTURAL_SETTINGS
             and "_cute_structural_origins" in self.__dict__
@@ -1048,6 +1065,11 @@ class Settings(_Settings):
             self._cute_structural_origins = CuteStructuralOrigins().with_explicit(
                 *CUTE_STRUCTURAL_SETTINGS
             )
+        if "_backend_explicit" not in self.__dict__:
+            # Same rationale: an older serialized Settings round-tripped only
+            # the effective backend value, so treat it as an explicit choice
+            # and leave device routing alone for it.
+            self._backend_explicit = True
 
     def copy(self, **overrides: object) -> Settings:
         """Copy values and origins, marking supplied structural overrides explicit.
@@ -1061,6 +1083,10 @@ class Settings(_Settings):
         result._cute_structural_origins = self._cute_structural_origins.with_explicit(
             *(name for name in CUTE_STRUCTURAL_SETTINGS if name in overrides)
         )
+        # dataclasses.replace re-runs __init__ with every field and would mark
+        # the backend explicit even when it was resolved from the default;
+        # only a copy() override of "backend" is a user choice.
+        result._backend_explicit = self._backend_explicit or "backend" in overrides
         return result
 
     @property
