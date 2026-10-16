@@ -52,6 +52,14 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+# (source projections, expected classifier result) -> predicate over call args
+PreparedGuardFactory = typing.Callable[
+    [
+        typing.Sequence[typing.Callable[[typing.Sequence[object]], typing.Hashable]],
+        typing.Hashable,
+    ],
+    typing.Callable[[typing.Sequence[object]], bool],
+]
 # CUDA TMA limits each box dimension to 256 elements. Other descriptor
 # backends have their own legality checks and must not inherit this cap.
 CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
@@ -113,7 +121,13 @@ class RuntimeInputSpecialization:
     ``reusable_tensor_properties`` is an optional promise that the classifier's
     result depends only on the named storage properties (plus tensor metadata
     already covered by eager dispatch guards), never on tensor contents.  It
-    lets repeated calls with the exact same tensors reuse a prevalidated result.
+    lets code generation consume the result recorded in the bound kernel key.
+    ``prepared_guard_factory`` optionally builds, from the source projections
+    and an expected classifier result, a cheaper predicate over the raw call
+    arguments that holds exactly when the classifier would produce that result
+    again.  The prepared eager call evaluates it only after pinning every
+    argument's type, dtype, shape, stride and device, so the predicate needs to
+    read just the facts those pins leave open (pointers and storage spans).
     Runtime cache state is deliberately excluded from descriptor equality.
     """
 
@@ -125,6 +139,9 @@ class RuntimeInputSpecialization:
     reusable_tensor_properties: frozenset[
         typing.Literal["data_ptr", "storage_span"]
     ] = frozenset()
+    prepared_guard_factory: PreparedGuardFactory | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -541,6 +558,10 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # Input sizes code generation relied on being equal (a block store
+        # bounded by its tensor covering the tile's loop) only at this
+        # binding's values; like a guard, each keys the bound kernel.
+        self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
         self.tunable_symbols: set[sympy.Symbol] = set()
@@ -2052,8 +2073,12 @@ class CompileEnvironment:
         return result is sympy.true
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
-        if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
-            return (int(a) % b) == 0
+        a = self.specialize_expr(_to_sympy(a))
+        b_expr = self.specialize_expr(_to_sympy(b))
+        if isinstance(a, (int, sympy.Integer)) and isinstance(
+            b_expr, (int, sympy.Integer)
+        ):
+            return (int(a) % int(b_expr)) == 0
         return False
 
     def specialized_multiple(self, value: object, divisor: int) -> bool:

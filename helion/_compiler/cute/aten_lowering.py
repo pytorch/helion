@@ -22,6 +22,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..aten_lowering import Lowering
 from ..aten_lowering import LoweringContext
 from ..aten_lowering import _argreduce_schema
 from ..aten_lowering import _env_arg
@@ -1160,6 +1161,15 @@ def _cute_iota_expr(
         return _wrap_iota_coord_expr(ctx, rolled, start, step, dtype)
 
     env = CompileEnvironment.current()
+    if isinstance(length_arg, int) and length_arg == 1:
+        # A one-element range (``hl.arange(1)``, the literal broadcast
+        # coordinate of a unit tile such as the flex example's batch / head
+        # vectors) has no element coordinate in the SIMT lowering: a size-1
+        # dim is a scalar, so the range is its ``start``.
+        expr = "{start}"
+        if dtype != torch.int32:
+            expr = f"{env.backend.dtype_str(dtype)}({expr})"
+        return expr_from_string(expr, start=ctx.to_ast(start))
     length_hint: int | None = None
     if isinstance(length_arg, (int, torch.SymInt)):
         length_hint = _resolve_tile_extent(length_arg, env, cg.device_function.config)
@@ -1672,6 +1682,7 @@ def _topk_args(node: Node) -> tuple[int, int, bool]:
 @topk_lowering.register_codegen("cute")
 def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
     from ...language import memory_ops
+    from .memory_ops import _cute_topk_cast_input
 
     k, _, largest = _topk_args(node)
     input_node = node.args[0]
@@ -1684,18 +1695,70 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
         raise exc.BackendUnsupported("cute", "torch.topk input")
     # Output ``j`` is held on the lane at position ``j`` of the sorted input
     # dim, which only a store addresses (``_cute_topk_store_index_exprs``);
-    # any other consumer would read it on the output dim's own lanes.
-    for output in node.users:
+    # dtype conversions retain that lane. Other consumers would read it on
+    # the output dim's own lanes.
+    pending = list(node.users)
+    visited: set[Node] = set()
+    while pending:
+        output = pending.pop()
+        if output in visited:
+            continue
+        visited.add(output)
         for user in output.users:
-            if user.target is not memory_ops.store or user.args[2] is not output:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "torch.topk output that feeds anything but a store: its "
-                    "elements are held on the lanes of the sorted input dim",
-                )
+            if user.target is memory_ops.store and user.args[2] is output:
+                continue
+            if _cute_topk_cast_input(user) is output:
+                pending.append(user)
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                "torch.topk output that feeds anything but a store: its "
+                "elements are held on the lanes of the sorted input dim",
+            )
+    if k == 1 and CompileEnvironment.current().known_equal(input_tensor.shape[-1], 1):
+        # A singleton keeps its original masked load and has index zero. Its
+        # size-one axis has no block owner or sorting coordinates to publish.
+        return load.expr, expr_from_string("cutlass.Int64(0)")
     result = _emit_cute_rank_sort(
         ctx, node, load, input_tensor, descending=largest, k=k
     )
     node.meta["cute_topk_lane_expr"] = node.meta["cute_sort_axis"].position
     node.meta["cute_topk_k"] = k
     return result
+
+
+class NumericExtremumLowering(Lowering):
+    """Lower numeric extrema that choose the non-NaN operand when available."""
+
+    def codegen(self, ctx: LoweringContext, node: Node) -> ast.AST:
+        backend = CompileEnvironment.current().backend
+        dtype = node.meta["val"].dtype
+        operands = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert all(isinstance(arg, ast.AST) for arg in operands)
+        left, right = (
+            backend.cast_ast(cast("ast.AST", arg), dtype) for arg in operands
+        )
+        operation = "min" if node.target is torch.ops.aten.fmin.default else "max"
+        if dtype == torch.float32:
+            cg = cast("GenerateAST", ctx.cg)
+            module = "helion.runtime.cute.register_tensor"
+            name = "_cute_numeric_extremum"
+            if not any(
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == module
+                and any(alias.name == name for alias in statement.names)
+                for statement in cg.module_statements
+            ):
+                cg.module_statements.append(
+                    ast.ImportFrom(module=module, names=[ast.alias(name=name)], level=0)
+                )
+            return expr_from_string(
+                f"{name}({{left}}, {{right}}, minimum={operation == 'min'})",
+                left=left,
+                right=right,
+            )
+        return expr_from_string(
+            f"cute.math.{operation}({{left}}, {{right}}, propagate_nan=False)",
+            left=left,
+            right=right,
+        )

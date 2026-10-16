@@ -73,6 +73,7 @@ def _resolve(
     *,
     num_kv: int = 8,
     causal: bool = False,
+    fast_math: bool = False,
 ) -> cute_flash.FlashAttentionConfig:
     return cute_flash.resolve_flash_config(
         head_dim,
@@ -83,6 +84,7 @@ def _resolve(
         is_causal=causal,
         standard_dense_output=not causal,
         standard_causal_output=causal,
+        fast_math=fast_math,
     )
 
 
@@ -92,8 +94,9 @@ def _source(
     values: dict[str, object],
     *,
     causal: bool = False,
+    fast_math: bool = False,
 ) -> str:
-    config = _resolve(head_dim, dtype, values, causal=causal)
+    config = _resolve(head_dim, dtype, values, causal=causal, fast_math=fast_math)
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
         head_dim=head_dim,
@@ -430,6 +433,7 @@ def test_widened_transport_does_not_change_existing_defaults(
 
 
 def test_short_reverse_packet_keeps_conservative_protocol() -> None:
+    # The degree-1 packet is offered under fast_math only.
     source = _source(
         64,
         torch.float16,
@@ -438,6 +442,7 @@ def test_short_reverse_packet_keeps_conservative_protocol() -> None:
             cute_flash_exp2_packet="deg1_8x2_corr10",
             cute_flash_e2e_schedule="8/2",
         ),
+        fast_math=True,
     )
     assert source.count("flash_s_corr_prod_phase = cutlass.Int32(0)") == 2
     assert "flash_s_corr_prod_phase = cutlass.Int32(1)" not in source

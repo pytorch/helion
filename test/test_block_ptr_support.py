@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler import indexing_strategy
 from helion._compiler.indexing_strategy import BlockPtrIndexingStrategy
 from helion._compiler.indexing_strategy import IndexingStrategy
 from helion._compiler.indexing_strategy import PointerIndexingStrategy
@@ -95,7 +96,14 @@ class TestBlockPtrFallback(TestCase):
             self.assertIsInstance(
                 IndexingStrategy.select("block_ptr"), BlockPtrIndexingStrategy
             )
-        with patch.object(_compat, "_supports_block_ptr", lambda: False):
+        # The fallback warns once per process through the compile environment,
+        # which this test does not enter: start from "already warned" so the
+        # result does not depend on whether an earlier test on this worker
+        # took the fallback.
+        with (
+            patch.object(indexing_strategy, "_warned_block_ptr_fallback", True),
+            patch.object(_compat, "_supports_block_ptr", lambda: False),
+        ):
             self.assertIsInstance(
                 IndexingStrategy.select("block_ptr"), PointerIndexingStrategy
             )
@@ -103,7 +111,12 @@ class TestBlockPtrFallback(TestCase):
     def test_block_ptr_config_lowers_as_pointer_without_support(self) -> None:
         x = torch.randn(64, 64, device=DEVICE)
         y = torch.randn(64, 64, device=DEVICE)
-        with patch.object(_compat, "_supports_block_ptr", lambda: False):
+        # Take the warning path, then restore the once-per-process flag so
+        # later tests on this worker start from the same state.
+        with (
+            patch.object(indexing_strategy, "_warned_block_ptr_fallback", False),
+            patch.object(_compat, "_supports_block_ptr", lambda: False),
+        ):
             code, out = code_and_output(
                 _add, (x, y), block_sizes=[32, 32], indexing="block_ptr"
             )

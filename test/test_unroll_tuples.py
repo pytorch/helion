@@ -967,6 +967,11 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @skipIfMTIA(
         "Triton-MTIA: register-cache layernorm (G=8) needs >14 circular buffers; see T280008478"
     )
+    # MI350X CI intermittently returns wrong values for a few rows of this
+    # two-pass layernorm (up to ~900 elements off by up to 0.26) while
+    # every CUDA job passes; test_examples.py::test_softmax_bwd has the
+    # full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
@@ -996,6 +1001,11 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @skipIfMTIA(
         "Triton-MTIA: no-cache layernorm (G=8, 2*G loads) exceeds the 14 circular-buffer limit; see T280008478"
     )
+    # MI350X CI intermittently returns wrong values for a few rows of this
+    # two-pass layernorm (up to ~900 elements off by up to 0.26) while
+    # every CUDA job passes; test_examples.py::test_softmax_bwd has the
+    # full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_list_no_cache_layernorm(self):
         """Test two-pass layernorm without register cache (re-gathers in pass 2)."""
         M, D, G = 1024 * 1024, 32, 8

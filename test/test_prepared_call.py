@@ -97,6 +97,28 @@ def _make_scale() -> helion.Kernel:
     return scale
 
 
+def _double(t: torch.Tensor) -> torch.Tensor:
+    return t * 2
+
+
+def _triple(t: torch.Tensor) -> torch.Tensor:
+    return t * 3
+
+
+def _make_apply() -> helion.Kernel:
+    @helion.kernel(
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64]),
+    )
+    def apply(x: torch.Tensor, fn: Callable[..., torch.Tensor]) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = fn(x[tile])
+        return out
+
+    return apply
+
+
 def _tensor_size(values: Sequence[object]) -> int:
     value = values[0]
     assert isinstance(value, torch.Tensor)
@@ -161,6 +183,72 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first.data_ptr(), second.data_ptr())
         torch.testing.assert_close(first, x + 1)
         torch.testing.assert_close(second, other + 1)
+
+    def test_callable_argument_uses_prepared_call(self) -> None:
+        """Callable arguments (score-modifier style hooks) key by code object,
+        so repeat calls skip ``bind()``; a different function re-dispatches."""
+        apply = _make_apply()
+        x = torch.randn(64, device=DEVICE)
+        first = apply(x, _double)
+        self.assertIsNotNone(apply._prepared_call)  # type: ignore[attr-defined]
+
+        other = torch.randn_like(x)
+        with (
+            patch.object(
+                apply,
+                "_fast_dispatch_key_and_guards",
+                side_effect=AssertionError("prepared call rebuilt its dispatch key"),
+            ),
+            patch.object(
+                apply,
+                "bind",
+                side_effect=AssertionError("prepared call rebound the kernel"),
+            ),
+        ):
+            second = apply(other, _double)
+        torch.testing.assert_close(first, x * 2)
+        torch.testing.assert_close(second, other * 2)
+
+        with patch.object(
+            apply,
+            "_fast_dispatch_key_and_guards",
+            wraps=apply._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
+        ) as fast_key:
+            third = apply(x, _triple)
+        fast_key.assert_called()
+        torch.testing.assert_close(third, x * 3)
+        # Alternating functions dispatch through the cache without rebinding.
+        with patch.object(
+            apply,
+            "bind",
+            side_effect=AssertionError("cached specialization rebound the kernel"),
+        ):
+            torch.testing.assert_close(apply(x, _double), x * 2)
+            torch.testing.assert_close(apply(x, _triple), x * 3)
+
+    def test_bound_callable_argument_uses_direct_prepared_call(self) -> None:
+        apply = _make_apply()
+        x = torch.randn(64, device=DEVICE)
+        args = (x, _double)
+        bound = apply.bind(args)
+        bound(*args)
+        bound(*args)
+        if bound.kernel._has_specialization_extras:  # type: ignore[attr-defined]
+            # Backends without runtime specialization extras never rebind
+            # from ``BoundKernel.__call__`` and need no monomorphic guard.
+            self.assertIsNotNone(bound._direct_prepared_call)
+        with patch.object(
+            apply,
+            "bind",
+            side_effect=AssertionError("direct prepared call rebound the kernel"),
+        ):
+            torch.testing.assert_close(bound(*args), x * 2)
+        if bound.kernel._has_specialization_extras:  # type: ignore[attr-defined]
+            # A different callable leaves the monomorphic path and rebinds.
+            with patch.object(apply, "bind", wraps=apply.bind) as bind:
+                out = bound(x, _triple)
+            bind.assert_called()
+            torch.testing.assert_close(out, x * 3)
 
     def test_tensor_metadata_changes_use_dispatch(self) -> None:
         add_one = _make_add_one()

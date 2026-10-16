@@ -9,6 +9,7 @@ Unknown effects, aliased stores, and non-unit lane mappings are left intact.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import dataclasses
 import math
 import re
@@ -56,6 +57,9 @@ _CASTS = frozenset(
     )
 )
 _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
+_COMPARISON_CALLS = frozenset(
+    f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
+)
 _PURE = frozenset(
     f"cute.math.{name}"
     for name in (
@@ -93,6 +97,63 @@ class _Access:
 
 class _Decline(Exception):
     pass
+
+
+def _loaded_vector_register_reads(body: list[ast.stmt]) -> frozenset[str]:
+    """Recognize extracts from immutable, already loaded MLIR vectors.
+
+    These reads retain their lane order. The vector's global load remains at
+    its original location; only a later disjoint output store can be packed.
+    A rebound or mutated binding cannot establish this register value.
+    """
+    tree = ast.Module(body=body, type_ignores=[])
+    writes = Counter(
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    )
+    mutations = {
+        name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Subscript, ast.Attribute))
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for name in _binding_write_roots(node)
+    }
+    vectors: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and writes[node.targets[0].id] == 1
+            and node.targets[0].id not in mutations
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "cute.arch.load"
+            and len(node.value.args) == 2
+            and not node.value.keywords
+        ):
+            continue
+        vector_type = node.value.args[1]
+        if (
+            isinstance(vector_type, ast.Call)
+            and ast.unparse(vector_type.func) == "ir.VectorType.get"
+            and len(vector_type.args) == 2
+            and not vector_type.keywords
+            and isinstance(vector_type.args[0], ast.List)
+            and len(vector_type.args[0].elts) == 1
+            and isinstance(vector_type.args[0].elts[0], ast.Constant)
+            and type(vector_type.args[0].elts[0].value) is int
+            and vector_type.args[0].elts[0].value > 0
+        ):
+            vectors.add(node.targets[0].id)
+    return frozenset(
+        ast.dump(node, include_attributes=False)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in vectors
+    )
 
 
 def _pure_boolean_guard(
@@ -141,6 +202,12 @@ def _pure_boolean_guard(
                 for part in value.values
             )
         if isinstance(value, ast.Call):
+            if ast.unparse(value.func) in _COMPARISON_CALLS:
+                return (
+                    len(value.args) == 2
+                    and not value.keywords
+                    and all(scalar(argument) for argument in value.args)
+                )
             return (
                 ast.unparse(value.func) in _CASTS
                 and len(value.args) == 1
@@ -186,7 +253,7 @@ def _pure_boolean_guard(
         )
     return (
         isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "cutlass.Boolean"
+        and ast.unparse(node.func) in _COMPARISON_CALLS | {"cutlass.Boolean"}
         and scalar(node)
     )
 
@@ -1166,6 +1233,8 @@ def vectorize_affine_tile_lanes(
             torch.float16,
             torch.bfloat16,
             torch.float32,
+            torch.int32,
+            torch.uint32,
         ):
             continue
         tensor = arg.fake_value
@@ -1265,7 +1334,7 @@ def vectorize_affine_tile_lanes(
             if renames.get(name, name) not in renamed_writes
         ),
         private_accesses=private_accesses,
-        register_accesses=register_accesses,
+        register_accesses=register_accesses | _loaded_vector_register_reads(body),
     )
     return ast.fix_missing_locations(
         ast.Module(body=vectorizer.body(body), type_ignores=[])

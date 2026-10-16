@@ -702,7 +702,8 @@ class Settings(_Settings):
             "Override with HELION_CUTE_RNG_STREAM."
         ),
         "fast_math": (
-            "If True, enable fast math approximations (Helion-level and Inductor-level). "
+            "If True, enable fast math approximations (Helion-level, including the CuTe "
+            "flash-attention polynomial exp2 packets, and Inductor-level). "
             "May reduce numerical precision and change NaN/Inf behavior. "
             "Set HELION_FAST_MATH=1 to enable."
         ),
@@ -766,7 +767,14 @@ class Settings(_Settings):
             "vice versa. Default 1 (current single-trial behavior). Set "
             "HELION_AUTOTUNE_BEST_OF_K=N to override."
         ),
-        "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
+        "autotune_accuracy_check": (
+            "If True, validate candidate configs against the baseline kernel output "
+            "before accepting them during autotuning. Unless autotune_baseline_fn is "
+            "set, the baseline is the output of the config the kernel runs by default "
+            "(a compiler-promoted default when there is one, else the conservative "
+            "autotuning reference, which is also the fallback when the promoted "
+            "default fails to compile or run)."
+        ),
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",

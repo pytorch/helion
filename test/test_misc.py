@@ -1784,6 +1784,30 @@ class TestMisc(RefEagerTestBase, TestCase):
                         self.assertLess(mismatched, 0.05)
 
     @skipIfNotCUDA()
+    def test_gelu_half_subnormal_rounds_like_eager(self):
+        # Odd fp16 subnormals cannot represent x / 2 exactly. GELU must keep
+        # that prefactor in fp32 and round only its completed result.
+        @helion.kernel(autotune_effort="none")
+        def gelu_then_mul(
+            x: torch.Tensor, w: torch.Tensor, approximate: str
+        ) -> torch.Tensor:
+            out = torch.empty([2, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                g = torch.nn.functional.gelu(x[tile], approximate=approximate)
+                out[0, tile] = g
+                out[1, tile] = g * w[tile]
+            return out
+
+        x = (torch.arange(-2048, 2048, device=DEVICE).float() * 2**-24).half()
+        w = torch.full_like(x, 1.5)
+        for approximate in ("tanh", "none"):
+            with self.subTest(approximate=approximate):
+                _, result = code_and_output(gelu_then_mul, (x, w, approximate))
+                gelu = torch.nn.functional.gelu(x, approximate=approximate)
+                expected = torch.stack([gelu, gelu * w])
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
     @onlyBackends(["triton", "cute"])
     def test_device_symint_local_not_lifted_as_host_arg(self):

@@ -48,6 +48,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import release_private_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import capture_output
@@ -472,6 +473,11 @@ class BenchmarkResult(NamedTuple):
     per_shape_statuses: tuple[str, ...] = ()
 
 
+# Private per-finalist argument copies are only taken when they leave most of
+# the device memory untouched (the worker holds the originals as well).
+_PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION = 0.5
+
+
 class IsolatedBenchmarkFailure(NamedTuple):
     """A conclusive failure while rechecking an already-validated function.
 
@@ -850,7 +856,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the conservative autotuning reference
+        - Otherwise, run the kernel with its execution default, backing off to
+          the conservative autotuning reference (see _compute_reference_baseline)
         """
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
@@ -893,23 +900,35 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         return baseline_output, mutated_arg_idxs, baseline_post_args
 
     def _compute_reference_baseline(self) -> tuple[object, Sequence[object]]:
-        """Run the autotuning reference config to produce the baseline output.
+        """Run a config to produce the accuracy baseline output.
 
         Returns the output and the (cloned) arguments it ran on.
 
-        The reference config exists only to produce reference outputs, so any
-        config that runs will do.  Hardware limits Helion cannot model -- Intel
-        per-thread scratch space, shared memory, register pressure -- can reject
-        the conservative default on a kernel whose smaller configs are fine, so
-        such failures back off to smaller block sizes instead of aborting the
-        search.  Failures a smaller config cannot fix are raised right away (see
-        _can_back_off_baseline).  Each attempt re-clones the arguments so a
-        kernel that mutates its inputs before failing cannot poison the
-        baseline.
+        The execution default goes first when it differs from the autotuning
+        reference config: a compiler heuristic that promotes it (a tensor-core
+        lowering) gives the fast candidates its arithmetic -- the accumulation
+        order of an MMA -- which the conservative reference's SIMT code does
+        not share, and a kernel whose bf16 intermediates amplify that
+        difference would otherwise fail every promoted candidate against the
+        reference.  The reference config backs the default off; hardware
+        limits Helion cannot model -- Intel per-thread scratch space, shared
+        memory, register pressure -- can reject it on a kernel whose smaller
+        configs are fine, so such failures back off to smaller block sizes
+        instead of aborting the search.  Failures a smaller config cannot fix
+        are raised right away (see _can_back_off_baseline).  Each attempt
+        re-clones the arguments so a kernel that mutates its inputs before
+        failing cannot poison the baseline.
         """
-        config = self.config_spec.autotune_reference_config()
-        failure: tuple[Exception, Config] | None = None
-        for attempt in range(_MAX_REFERENCE_BASELINE_ATTEMPTS):
+        reference = self.config_spec.autotune_reference_config()
+        execution = self.config_spec.default_config()
+        pending = [reference]
+        if execution.config != reference.config:
+            pending.insert(0, execution)
+        config = pending.pop(0)
+        role = "Execution default" if pending else "Autotuning reference config"
+        failure: tuple[Exception, Config, str] | None = None
+        shrinks = 0
+        while True:
             new_args = _clone_args(self.args, self.kernel.env.process_group_name)
             try:
                 with _searching_candidates():
@@ -917,16 +936,33 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 baseline_output = baseline_fn(*new_args)
                 synchronize_device()
             except Exception as e:
+                if pending and not match_unrecoverable_runtime_error(e):
+                    # The execution default failed: the reference config exists
+                    # for exactly this (an unrecoverable runtime error still
+                    # surfaces at once -- the device may be in a bad state).
+                    # The traceback holds this attempt's cloned args and
+                    # outputs; drop it so they are freed before the next attempt.
+                    e.__traceback__ = None
+                    self.log.warning(
+                        f"The execution default {config} failed to compute the "
+                        f"accuracy baseline ({e}); retrying with the autotuning "
+                        "reference config"
+                    )
+                    config = pending.pop(0)
+                    role = "Autotuning reference config"
+                    continue
                 if not self._can_back_off_baseline(e):
-                    # A smaller config cannot fix this; report it as is.
-                    failure = (e, config)
+                    # A smaller config cannot fix this; report it as is, with
+                    # its traceback.
+                    failure = (e, config, role)
                     break
                 # The traceback holds this attempt's cloned args and outputs;
                 # drop it so they are freed before the next attempt.
                 e.__traceback__ = None
                 if failure is None:
-                    failure = (e, config)
-                if attempt + 1 == _MAX_REFERENCE_BASELINE_ATTEMPTS:
+                    failure = (e, config, role)
+                shrinks += 1
+                if shrinks >= _MAX_REFERENCE_BASELINE_ATTEMPTS:
                     break
                 smaller = self.config_spec.shrink_block_sizes_once(config)
                 if smaller is None:
@@ -946,7 +982,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return baseline_output, new_args
 
         assert failure is not None
-        error, baseline_config = failure
+        error, baseline_config, role = failure
         decorator = self.kernel.format_kernel_decorator(baseline_config, self.settings)
         log_generated_triton_code_debug(
             self.log,
@@ -956,8 +992,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
         self.kernel.maybe_log_repro(self.log.error, self.args, baseline_config)
         raise exc.InvalidConfig(
-            "Autotuning reference config failed while computing baseline.\n"
-            f"Reference config: {decorator}\n"
+            f"{role} failed while computing baseline.\n"
+            f"{role}: {decorator}\n"
             f"{SUPPRESSED_TRITON_CODE_MSG}\n"
             "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
             "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
@@ -2150,6 +2186,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         warmup: int,
         rep: int,
         fixed_repetitions: int | None = None,
+        args_slot: int | None = None,
+        timeout: float | None = None,
     ) -> float | None:
         if self._precompile_args_path is None or self._subprocess_wrapper_unloadable:
             return None
@@ -2169,14 +2207,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
             probe_long_kernel=self._probe_long_kernel(),
             fixed_repetitions=fixed_repetitions,
+            args_slot=args_slot,
         )
+        if timeout is None:
+            timeout = float(self.settings.autotune_benchmark_timeout)
         try:
-            return float(
-                self._benchmark_worker.run(
-                    job,
-                    timeout=float(self.settings.autotune_benchmark_timeout),
-                )
-            )
+            return float(self._benchmark_worker.run(job, timeout=timeout))
         except CompiledFunctionLoadError as error:
             self._disable_unloadable_benchmark_worker(error)
             return None
@@ -2198,6 +2234,68 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             f"falling back in-process: {error}"
         )
 
+    def steady_window_benchmark_available(self) -> bool:
+        """Whether finalists can be timed in the killable benchmark worker."""
+        return (
+            self._subprocess_benchmark_enabled()
+            and self.settings.autotune_benchmark_fn is None
+        )
+
+    def private_argument_copies_affordable(self, count: int) -> bool:
+        """Whether ``count`` private copies of the kernel arguments fit on the
+        device next to the originals (CUDA tensors only; other devices share)."""
+        tensors = [
+            leaf
+            for leaf in tree_flatten(self.args)[0]
+            if isinstance(leaf, torch.Tensor) and leaf.device.type != "cpu"
+        ]
+        if not tensors:
+            return True
+        if not all(tensor.is_cuda for tensor in tensors):
+            return False
+        total_bytes = 0
+        seen_storages: set[int] = set()
+        for tensor in tensors:
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen_storages:
+                continue
+            seen_storages.add(storage.data_ptr())
+            total_bytes += storage.nbytes()
+        free_bytes, _total = torch.cuda.mem_get_info(tensors[0].device)
+        return (
+            count * total_bytes <= _PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION * free_bytes
+        )
+
+    def release_private_argument_copies(self) -> None:
+        """Free the finalists' private argument copies held by the worker.
+
+        Best-effort: the selection that used the copies is complete, so a
+        release that fails is logged and left for the worker's next job. A
+        worker that times out or dies on the release is killed (the copies
+        die with it) and respawns on that job; a job that raises in the
+        worker (a sticky CUDA error from a finalist's kernel, surfaced by
+        the cache release as a ``RuntimeError``) has dropped the copies
+        from the cache before the error, and ``BenchmarkWorker.run`` kills
+        the worker when the error is unrecoverable. Only those two kinds
+        are logged (the ``BenchmarkSubprocessError`` family and
+        ``RuntimeError``); a worker that survived its kill still raises
+        ``BenchmarkWorkerUnkillable`` and any other error propagates.
+        """
+        if self._benchmark_worker is None or not self._benchmark_worker.alive():
+            return
+        try:
+            self._benchmark_worker.run(
+                release_private_kernel_args,
+                timeout=float(self.settings.autotune_benchmark_timeout),
+            )
+        except BenchmarkWorkerUnkillable:
+            raise
+        except (RuntimeError, BenchmarkSubprocessError) as error:
+            self.log.warning(
+                "Releasing the final selection's private argument copies failed; "
+                f"the benchmark worker's next job proceeds without them: {error!r}"
+            )
+
     def benchmark_isolated(
         self,
         fns: list[Callable[..., object]],
@@ -2206,14 +2304,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rep: int,
         desc: str = "Benchmarking",
         fresh_process: bool = False,
+        args_slots: Sequence[int | None] | None = None,
+        timeout: float | None = None,
     ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
         if self.settings.autotune_benchmark_fn is not None:
             return None
+        if args_slots is None:
+            args_slots = [None] * len(fns)
 
         timings: list[IsolatedBenchmarkTiming] = []
-        for index, fn in enumerate(fns):
+        for index, (fn, args_slot) in enumerate(zip(fns, args_slots, strict=True)):
             if fresh_process and self._benchmark_worker is not None:
                 self._shutdown_isolated_worker(index - 1 if index else None)
             try:
@@ -2222,6 +2324,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         cast("CompiledConfig", fn),
                         warmup=warmup,
                         rep=rep,
+                        args_slot=args_slot,
+                        timeout=timeout,
                     )
                 except BenchmarkWorkerUnkillable as error:
                     # the worker that could not be reaped ran this candidate

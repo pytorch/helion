@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import PreparedGuardFactory
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
@@ -237,7 +238,74 @@ def _nested_fast_dispatch_key(
         except TypeError:
             return None
         return (value_type, tuple(entries)), has_tensor
+    if value_type is types.FunctionType and not specialize_numeric:
+        return _function_fast_dispatch_key(cast("types.FunctionType", value))
+    if value_type is types.BuiltinFunctionType:
+        # ``_specialization_extractors`` keys builtins by identity.
+        return (value_type, value), False
     return None
+
+
+def _function_fast_dispatch_key(
+    fn: types.FunctionType,
+) -> tuple[Hashable, bool] | None:
+    """Refine ``_function_key``: the code object, every closure cell's key and
+    every default value's key.
+
+    Callable arguments (score-modifier style hooks) are common in attention
+    kernels; keying them by code object keeps repeat calls on the prepared
+    fast path even when the caller rebuilds the function object per call.
+    Closure cells are re-read on every call because ``nonlocal`` rebinding can
+    change their contents without changing the function object.  Default
+    values are baked into the compiled kernel when the lifted function is
+    traced (``lift_closures`` passes ``__defaults__`` through), so they key by
+    value like constexpr arguments; a default the constexpr rules cannot key
+    (a tensor, a function) keeps the slow path.  Module globals the function
+    reads are not part of the key: like the kernel's own globals they are read
+    from the module when the kernel runs and specialized once, on the first
+    call's values.
+    """
+    closure = fn.__closure__
+    defaults = _function_defaults_fast_dispatch_key(fn)
+    if defaults is None:
+        return None
+    if not closure and not defaults:
+        return (types.FunctionType, fn.__code__), False
+    cells: list[Hashable] = []
+    has_tensor = False
+    for cell in closure or ():
+        nested = _nested_fast_dispatch_key(cell.cell_contents)
+        if nested is None:
+            return None
+        cell_key, cell_has_tensor = nested
+        cells.append(cell_key)
+        has_tensor = has_tensor or cell_has_tensor
+    if not defaults:
+        return (types.FunctionType, fn.__code__, tuple(cells)), has_tensor
+    return (types.FunctionType, fn.__code__, tuple(cells), defaults), has_tensor
+
+
+def _function_defaults_fast_dispatch_key(fn: types.FunctionType) -> Hashable | None:
+    """Value keys of ``fn``'s positional and keyword-only defaults (``()`` when
+    it has none; ``None`` when a default has no constexpr key)."""
+    defaults = fn.__defaults__ or ()
+    kwdefaults = fn.__kwdefaults__ or {}
+    if not defaults and not kwdefaults:
+        return ()
+    positional: list[Hashable] = []
+    for value in defaults:
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        positional.append(nested[0])
+    keyword: list[tuple[str, Hashable]] = []
+    for name, value in kwdefaults.items():
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        keyword.append((name, nested[0]))
+    keyword.sort()
+    return (tuple(positional), tuple(keyword))
 
 
 _TensorMetadataPathStep = (
@@ -423,6 +491,7 @@ class _RuntimeInputSpecializationExtractor:
     classifier: Callable[[Sequence[object]], Hashable]
     reusable_tensor_properties: frozenset[str]
     specialization_key: str | None = None
+    prepared_guard_factory: PreparedGuardFactory | None = None
 
     def source_values(self, args: Sequence[object]) -> tuple[object, ...]:
         return tuple(extract(args) for extract in self.source_extractors)
@@ -435,101 +504,50 @@ def _partition_prepared_extra_guards(
     args: tuple[object, ...],
     extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
 ) -> tuple[
-    Callable[[tuple[object, ...]], bool] | None,
     tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
-    tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+    tuple[Callable[[Sequence[object]], bool], ...],
 ]:
-    """Split guards into always-check and exact-tensor reusable projections.
+    """Split guards into always-check classifiers and prepared fact guards.
 
-    Tensor shape/stride/dtype/device facts are already checked by the prepared
-    argument guard.  A runtime classifier may additionally opt in to reuse
-    when its exact source tensors still have the same pointer/storage facts.
-    Classifiers that depend on tensor contents (or arbitrary Python state)
-    remain in the always-check set.
+    Tensor type/shape/stride/dtype/device facts are already checked by the
+    prepared argument guard.  A runtime input specialization may supply a
+    ``prepared_guard_factory`` that turns its expected result into a direct
+    check of the pointer/storage facts those pins leave open, so repeat calls
+    with fresh output tensors never re-run the full classifier.  Classifiers
+    without one (tensor contents, arbitrary Python state) remain in the
+    always-check set, as does any factory guard that rejects the very
+    arguments it was prepared from.
     """
     always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    reusable: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    # One source projection is enough for duplicate tensor objects: the
-    # prepared argument guard independently preserves the input alias topology.
-    tensor_entries: dict[
-        int,
-        tuple[
-            Callable[[Sequence[object]], Hashable],
-            torch.Tensor,
-            set[str],
-        ],
-    ] = {}
+    fact_guards: list[Callable[[Sequence[object]], bool]] = []
     for extractor, expected in extra_guards:
         if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
             continue
-        if (
-            not isinstance(extractor, _RuntimeInputSpecializationExtractor)
-            or not extractor.reusable_tensor_properties
-            or not extractor.reusable_tensor_properties <= {"data_ptr", "storage_span"}
-        ):
+        guard = (
+            _build_prepared_fact_guard(extractor, expected, args)
+            if isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            else None
+        )
+        if guard is None:
             always_check.append((extractor, expected))
-            continue
-        try:
-            source_values = extractor.source_values(args)
-        except Exception:
-            always_check.append((extractor, expected))
-            continue
-        if not source_values or any(
-            type(value) not in (torch.Tensor, torch.nn.Parameter)
-            for value in source_values
-        ):
-            always_check.append((extractor, expected))
-            continue
-        reusable.append((extractor, expected))
-        for source_extractor, value in zip(
-            extractor.source_extractors, source_values, strict=True
-        ):
-            assert isinstance(value, torch.Tensor)
-            entry = tensor_entries.get(id(value))
-            if entry is None:
-                tensor_entries[id(value)] = (
-                    source_extractor,
-                    value,
-                    set(extractor.reusable_tensor_properties),
-                )
-            else:
-                entry[2].update(extractor.reusable_tensor_properties)
+        else:
+            fact_guards.append(guard)
+    return tuple(always_check), tuple(fact_guards)
 
-    if not reusable:
-        return None, tuple(always_check), ()
 
-    namespace: dict[str, object] = {}
-    checks: list[str] = []
+def _build_prepared_fact_guard(
+    extractor: _RuntimeInputSpecializationExtractor,
+    expected: Hashable,
+    args: tuple[object, ...],
+) -> Callable[[Sequence[object]], bool] | None:
+    factory = extractor.prepared_guard_factory
+    if factory is None:
+        return None
     try:
-        for index, (extractor, tensor, properties) in enumerate(
-            tensor_entries.values()
-        ):
-            namespace[f"extract_{index}"] = extractor
-            namespace[f"ref_{index}"] = weakref.ref(tensor)
-            value_name = f"value_{index}"
-            item_checks = [
-                f"(({value_name} := extract_{index}(args)) is ref_{index}())"
-            ]
-            if "data_ptr" in properties:
-                namespace[f"data_ptr_{index}"] = int(tensor.data_ptr())
-                item_checks.append(f"{value_name}.data_ptr() == data_ptr_{index}")
-            if "storage_span" in properties:
-                storage = tensor.untyped_storage()
-                namespace[f"storage_ptr_{index}"] = int(storage.data_ptr())
-                namespace[f"storage_nbytes_{index}"] = storage.nbytes()
-                storage_name = f"storage_{index}"
-                item_checks.extend(
-                    (
-                        f"(({storage_name} := {value_name}.untyped_storage()).data_ptr() == storage_ptr_{index})",
-                        f"{storage_name}.nbytes() == storage_nbytes_{index}",
-                    )
-                )
-            checks.append(f"({' and '.join(item_checks)})")
-        reuse_guard = eval(f"lambda args: {' and '.join(checks)}", namespace)
+        guard = factory(extractor.source_extractors, expected)
+        return guard if guard(args) else None
     except Exception:
-        always_check.extend(reusable)
-        return None, tuple(always_check), ()
-    return reuse_guard, tuple(always_check), tuple(reusable)
+        return None
 
 
 def _make_prepared_arg_guard(
@@ -637,6 +655,38 @@ def _make_prepared_arg_guard(
             else:
                 namespace[f"value_{token}"] = inner
                 checks.append(f"{prefix}.value == value_{token}")
+        elif value_type is types.FunctionType and annotation is not ConstExpr:
+            # Mirror ``_function_key``: the code object identifies the
+            # function, every closure cell is guarded like an argument of its
+            # own type (cells are re-read because ``nonlocal`` can rebind them
+            # without replacing the function object), and every default value
+            # like a constexpr argument (defaults are baked into the traced
+            # kernel).  Module globals the function reads are not guarded, as
+            # the kernel's own globals are not.
+            function = cast("types.FunctionType", value)
+            namespace[f"code_{token}"] = function.__code__
+            checks.append(f"{prefix}.__code__ is code_{token}")
+            for cell_index, cell in enumerate(function.__closure__ or ()):
+                append_checks(
+                    cell.cell_contents,
+                    f"{prefix}.__closure__[{cell_index}].cell_contents",
+                )
+            if _function_defaults_fast_dispatch_key(function) is None:
+                raise TypeError("callable default without a constexpr key")
+            defaults = function.__defaults__ or ()
+            checks.append(f"len({prefix}.__defaults__ or ()) == {len(defaults)}")
+            for default_index, default in enumerate(defaults):
+                append_checks(
+                    default, f"{prefix}.__defaults__[{default_index}]", ConstExpr
+                )
+            kwdefaults = function.__kwdefaults__ or {}
+            checks.append(f"len({prefix}.__kwdefaults__ or {{}}) == {len(kwdefaults)}")
+            for name, default in kwdefaults.items():
+                checks.append(f"{name!r} in {prefix}.__kwdefaults__")
+                append_checks(default, f"{prefix}.__kwdefaults__[{name!r}]", ConstExpr)
+        elif value_type is types.BuiltinFunctionType:
+            namespace[f"value_{token}"] = value
+            checks.append(f"{prefix} is value_{token}")
         else:
             raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
 
@@ -657,12 +707,11 @@ class _PreparedCall:
     __slots__ = (
         "_dist_initialized",
         "_extra_guards",
+        "_fact_guards",
         "_is_distributed",
         "_matches_args",
         "_reset_generation",
-        "_reusable_extra_guards",
         "_specialization_generation",
-        "_tensor_storage_reuse_guard",
         "bound",
     )
 
@@ -680,11 +729,9 @@ class _PreparedCall:
         self._matches_args = _make_prepared_arg_guard(bound.kernel, args)
         self._dist_initialized = dist_initialized
         self._is_distributed = is_distributed
-        (
-            self._tensor_storage_reuse_guard,
-            self._extra_guards,
-            self._reusable_extra_guards,
-        ) = _partition_prepared_extra_guards(args, extra_guards)
+        self._extra_guards, self._fact_guards = _partition_prepared_extra_guards(
+            args, extra_guards
+        )
         self._specialization_generation = bound.kernel._specialization_generation
         self._reset_generation = bound.kernel._reset_generation
         self.bound = bound
@@ -745,12 +792,9 @@ class _PreparedCall:
             for extractor, expected in self._extra_guards:
                 if extractor(args) != expected:
                     return False
-            if self._tensor_storage_reuse_guard is None or not (
-                self._tensor_storage_reuse_guard(args)
-            ):
-                for extractor, expected in self._reusable_extra_guards:
-                    if extractor(args) != expected:
-                        return False
+            for guard in self._fact_guards:
+                if not guard(args):
+                    return False
             return (
                 self._reset_generation == kernel._reset_generation
                 and self._specialization_generation == kernel._specialization_generation
@@ -969,6 +1013,10 @@ class Kernel(Generic[_R]):
         # Cache the number of parameters to avoid accessing self.signature.parameters
         # during torch.compile tracing.
         self._num_params: int = len(self.signature.parameters)
+        self._normalize_args_plans: dict[
+            tuple[int, tuple[str, ...]],
+            tuple[tuple[object, ...], tuple[int, ...]] | None,
+        ] = {}
 
         # Expose function attributes for compatibility with torch.library.custom_op
         # These are set as instance attributes to allow the Kernel to be used
@@ -1390,7 +1438,13 @@ class Kernel(Generic[_R]):
                 key.append(None)
             elif t is torch.dtype or t is torch.device:
                 key.append(a)
-            elif t is tuple or t is list or t is dict:
+            elif (
+                t is tuple
+                or t is list
+                or t is dict
+                or t is types.FunctionType
+                or t is types.BuiltinFunctionType
+            ):
                 nested = _nested_fast_dispatch_key(
                     a,
                     specialize_numeric=annotation is ConstExpr,
@@ -1782,9 +1836,57 @@ class Kernel(Generic[_R]):
         Returns:
             tuple[object, ...]: A tuple of normalized positional arguments.
         """
-        bound_args = self.signature.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        return tuple(bound_args.args)
+        key = (len(args), tuple(kwargs))
+        plans = self._normalize_args_plans
+        if torch.compiler.is_compiling():
+            # Dynamo would guard on the plan cache's contents and replay the
+            # write, recompiling once per call shape; trace inspect instead.
+            plan = None
+        elif key in plans:
+            plan = plans[key]
+        else:
+            plan = plans[key] = self._plan_normalize_args(*key)
+        if plan is None:
+            # Calls that ``inspect`` must reject (or that need its binding
+            # rules) raise its errors.
+            bound_args = self.signature.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            return tuple(bound_args.args)
+        defaults, positions = plan
+        normalized = [*args, *defaults[len(args) :]]
+        for position, value in zip(positions, kwargs.values(), strict=True):
+            normalized[position] = value
+        return tuple(normalized)
+
+    def _plan_normalize_args(
+        self, positional_count: int, keyword_names: tuple[str, ...]
+    ) -> tuple[tuple[object, ...], tuple[int, ...]] | None:
+        """Defaults template and keyword slots for one call shape, if bindable.
+
+        ``inspect.Signature.bind`` costs ~10us per call; a call shape (count of
+        positional arguments plus the keyword names) that binds cleanly to a
+        positional-or-keyword-only signature can be replayed from this plan.
+        """
+        parameters = list(self.signature.parameters.values())
+        if positional_count > len(parameters) or any(
+            parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        ):
+            return None
+        names = [parameter.name for parameter in parameters]
+        positions: list[int] = []
+        for name in keyword_names:
+            if name not in names or names.index(name) < positional_count:
+                return None
+            positions.append(names.index(name))
+        defaults = tuple(parameter.default for parameter in parameters)
+        if any(
+            default is inspect.Parameter.empty
+            for index, default in enumerate(defaults)
+            if index >= positional_count and index not in positions
+        ):
+            return None
+        return defaults, tuple(positions)
 
     def autotune(
         self,
@@ -3396,6 +3498,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     specialization.classifier,
                     frozenset(specialization.reusable_tensor_properties),
                     key,
+                    specialization.prepared_guard_factory,
                 )
             )
         return extractors
@@ -3471,6 +3574,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             for symbol, expr in shape_env.replacements.items()
             if expr != symbol
         ]
+        relations.extend(
+            (symbol, expr, True) for symbol, expr in self.env.keyed_size_equalities
+        )
         relations.extend(
             (lhs, rhs, False)
             # Binding records ``!= 1`` for any size it saw >= 2 without code
@@ -4170,13 +4276,125 @@ def _number_key(fn: Kernel, n: float | bool) -> object:
     return type(n)
 
 
-def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
-    if obj.__closure__:
-        closures = [
-            fn._specialization_key(cell.cell_contents) for cell in obj.__closure__
-        ]
-        return (obj.__code__, *closures)
-    return obj.__code__
+def _function_key(
+    fn: Kernel, obj: types.FunctionType, *, baked: bool = False
+) -> object:
+    """Specialization key of a callable argument: its code object, the key of
+    every closure cell and the key of every default.
+
+    A cell of the argument itself is a runtime input of the compiled kernel
+    (``lift_closures`` lifts it, so it is read on each call) and keys like an
+    argument of its type. Defaults are baked into the kernel when the lifted
+    function is traced, so they key like constexprs through ``_constant_key``,
+    and so does everything reachable from a default: with ``baked`` the
+    function is itself a default (``lift_closures`` passes ``__defaults__``
+    through raw, so a default function is traced with its own cells, which
+    are never lifted) and its cells key by value too. Module globals the
+    function reads are not part of the key: like the kernel's own globals
+    they are read from the module when the kernel runs and specialized once,
+    on the first call's values."""
+    cells = obj.__closure__ or ()
+    defaults = obj.__defaults__ or ()
+    kwdefaults = obj.__kwdefaults__ or {}
+    if not cells and not defaults and not kwdefaults:
+        return obj.__code__
+    if baked:
+        closures = tuple(_constant_key(fn, cell.cell_contents) for cell in cells)
+    else:
+        closures = tuple(fn._specialization_key(cell.cell_contents) for cell in cells)
+    return (
+        obj.__code__,
+        closures,
+        tuple(_constant_key(fn, value) for value in defaults),
+        tuple(
+            sorted(
+                (name, _constant_key(fn, value)) for name, value in kwdefaults.items()
+            )
+        ),
+    )
+
+
+class _IdentityKey:
+    """Hashable stand-in for a baked-in value that cannot key by its own
+    equality (a tensor or a container holding one, whose ``==`` is not a
+    bool; an unhashable object): equal only to a key of the same object. It
+    keeps the object alive, so its identity cannot pass to another object
+    while a cache holds the key."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _IdentityKey and other.value is self.value
+
+    def __repr__(self) -> str:
+        return f"_IdentityKey({self.value!r})"
+
+
+def _constant_key(fn: Kernel, value: object) -> Hashable:
+    """Key of a value baked into the compiled kernel: by value through the
+    constexpr rules (numbers, strings, dtypes, containers of them), a
+    function through ``_function_key`` with its cells baked too (a lambda
+    default rebuilt per call keys like one passed as an argument), any other
+    hashable value with no tensor inside by its own equality (a frozenset,
+    a namedtuple, an enum member, a frozen dataclass, a bound method), else
+    by identity (a tensor or a container holding one, an unhashable
+    object).
+
+    Equality here is Python's: a frozenset, namedtuple or frozen dataclass
+    holding ``1``, ``1.0`` or ``True`` (or ``0.0`` and ``-0.0``) shares one
+    specialization although the baked constant differs (``1.0`` casts an
+    int32 input through float32), the same merge a constexpr argument
+    holding that container makes. Only a default that is itself a function
+    is read through ``_function_key``: a function inside a container
+    default keys by identity with the container, so its cells are not
+    re-read (a ``nonlocal`` rebind reuses the old kernel) and a lambda
+    rebuilt per call inside a tuple is a new specialization each call."""
+    if type(value) is types.FunctionType:
+        return cast("Hashable", _function_key(fn, value, baked=True))
+    nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+    if nested is not None:
+        return nested[0]
+    try:
+        hash(value)
+    except TypeError:
+        return _IdentityKey(value)
+    if _contains_tensor(value, set()):
+        return _IdentityKey(value)
+    return (type(value), cast("Hashable", value))
+
+
+def _contains_tensor(value: object, visited: set[int]) -> bool:
+    """Whether a ``torch.Tensor`` is reachable from ``value`` through tuples,
+    lists, sets, frozensets, dict keys and values, dataclass fields or a
+    bound method's ``__self__``. ``visited`` holds the ids of the objects
+    already walked (every object reachable from ``value`` stays alive for
+    the walk), so a cycle such as a dataclass holding itself ends."""
+    if isinstance(value, torch.Tensor):
+        return True
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_tensor(item, visited) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_tensor(key, visited) or _contains_tensor(item, visited)
+            for key, item in value.items()
+        )
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _contains_tensor(getattr(value, field.name), visited)
+            for field in dataclasses.fields(value)
+        )
+    if isinstance(value, types.MethodType):
+        return _contains_tensor(value.__self__, visited)
+    return False
 
 
 def _cute_grouped_layout_has_m_tail(

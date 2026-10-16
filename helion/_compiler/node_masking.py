@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -21,6 +22,8 @@ from ..language._tracing_ops import _if
 from ..language._tracing_ops import _mask_to
 from ..language._tracing_ops import _phi
 from ..language._tracing_ops import is_for_loop_target
+from ..language.creation_ops import full
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from .inductor_lowering import InductorLowering
@@ -86,7 +89,8 @@ def apply_masking(
     """Analyze the node and apply masking."""
     for user in node.users:
         if user.op == "call_function" and user.target == _mask_to:
-            if user.args[1] == other:
+            # A mask made for a later consumer is not defined at this one.
+            if user.args[1] == other and user < base_node:
                 assert user.args[0] is node
                 return user  # reuse existing mask_to node
     from .inductor_lowering import APIFuncLowering
@@ -166,10 +170,61 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
                 input_node
             ):
                 continue
-            node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
-                input_node
-            )
-            graph.erase_node(node)
+        else:
+            for user in _dots_zeroed_by_partner(node, masked_value1):
+                user.replace_input_with(node, input_node)
+            if node.users:
+                continue
+        node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
+            input_node
+        )
+        graph.erase_node(node)
+
+
+def _dots_zeroed_by_partner(
+    mask: torch.fx.Node, masked_value: float | bool | None
+) -> list[torch.fx.Node]:
+    """The ``hl.dot`` users taking ``mask`` as a matrix whose partner is
+    already 0 past the K tile, so their padded lanes' products are 0 without it.
+
+    That fails only for a lane holding inf or NaN.  A known one (a constant
+    fill) keeps the mask; an unknown value (such as attention's probabilities,
+    multiplied by loaded values) is taken to be finite, as every ``hl.dot``
+    operand was before they were masked, which keeps such matmuls' graphs
+    unchanged.
+    """
+    from ..language.matmul_ops import dot_operand_indices
+
+    if mask.args[1] != 0 or (
+        isinstance(masked_value, float) and not math.isfinite(masked_value)
+    ):
+        return []
+    # A Pallas load whose mask was deferred to this one has stale lanes.
+    source = mask.args[0]
+    while isinstance(source, torch.fx.Node) and source.target in _RELAYOUT_TARGETS:
+        source = source.args[0]
+    if (
+        not isinstance(source, torch.fx.Node)
+        or "pallas_deferred_mask_block_ids" in source.meta
+    ):
+        return []
+    dots = []
+    for user in mask.users:
+        indices = dot_operand_indices(user)
+        if indices is None:
+            continue
+        lhs, rhs = (user.args[i] for i in indices)
+        if mask is lhs:
+            partner = rhs
+        elif mask is rhs:
+            partner = lhs
+        else:
+            continue
+        if isinstance(partner, torch.fx.Node) and partner.target is _mask_to:
+            partner = partner.args[0]
+        if isinstance(partner, torch.fx.Node) and cached_masked_value(partner) == 0:
+            dots.append(user)
+    return dots
 
 
 def cached_masked_value(
@@ -267,7 +322,6 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
     """
     from ..language.memory_ops import load as load_op
     from .aten_lowering import passthrough_masked_value
-    from .compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
 
@@ -440,9 +494,27 @@ def getitem_masked_value(
 
 
 class MaskedValueAnalysisInductor(ValueRangeAnalysis):
-    def __init__(self, input_name_lookup: dict[str, ValueRangesAny]) -> None:
+    def __init__(
+        self, input_name_lookup: dict[str, ValueRangesAny], *, strict_float: bool
+    ) -> None:
         super().__init__()
         self.input_name_lookup = input_name_lookup
+        self.strict_float = strict_float
+
+    def mul(
+        self, a: ValueRangesAny | float, b: ValueRangesAny | float
+    ) -> ValueRangesAny:
+        a_range: ValueRangesAny = ValueRanges.wrap(a)
+        b_range: ValueRangesAny = ValueRanges.wrap(b)
+        # Inductor takes 0 * anything to be 0, but a float 0 times inf or NaN
+        # is NaN (fast math assumes those away), so a factor that may not be
+        # finite leaves the product unknown.
+        if self.strict_float and not all(
+            bound.is_finite
+            for bound in (a_range.lower, a_range.upper, b_range.lower, b_range.upper)
+        ):
+            return ValueRanges.unknown()
+        return super().mul(a_range, b_range)
 
     def load(self, name: str, index: sympy.Expr) -> ValueRangesAny:
         return self.input_name_lookup[name]
@@ -461,9 +533,11 @@ def inductor_masked_value(
     If the masked value of X is 0, then `X + 1` will be masked to 1.
     """
 
+    pointwise = not isinstance(lowering.buffer.data, Reduction)
+
     def visit(n: torch.fx.Node) -> torch.fx.Node:
         val = cached_masked_value(n)
-        if val is None:
+        if val is None or (pointwise and broadcasts_onto_masked_lanes(n, node)):
             input_ranges.append(ValueRanges.unknown())
         else:
             input_ranges.append(ValueRanges(val, val))
@@ -471,9 +545,16 @@ def inductor_masked_value(
 
     input_ranges: list[ValueRangesAny] = []
     map_arg((node.args, node.kwargs), visit)
+    val = node.meta.get("val")
+    strict_float = (
+        isinstance(val, torch.Tensor)
+        and val.dtype.is_floating_point
+        and not CompileEnvironment.current().settings.fast_math
+    )
     with V.set_ops_handler(
         MaskedValueAnalysisInductor(
             dict(zip(lowering.input_names, input_ranges, strict=True)),
+            strict_float=strict_float,
         )
     ):
         result = call_inner_fn(lowering.buffer.data)
@@ -484,6 +565,30 @@ def inductor_masked_value(
             if isinstance(val, (float, sympy.Float)):
                 return float(val)
         return None
+
+
+def broadcasts_onto_masked_lanes(
+    input_node: torch.fx.Node, node: torch.fx.Node
+) -> bool:
+    """Whether ``node`` broadcasts ``input_node`` along a dim that is not 1,
+    and so may be masked.  The lanes past that dim's extent then hold the
+    input's real values rather than its masked value, unless it is a
+    constant fill."""
+    if input_node.target is full:
+        return False
+    input_val = input_node.meta.get("val")
+    output_val = node.meta.get("val")
+    if not isinstance(input_val, torch.Tensor) or not isinstance(
+        output_val, torch.Tensor
+    ):
+        return False
+    env = CompileEnvironment.current()
+    pad = output_val.ndim - input_val.ndim
+    return any(
+        not env.known_equal(size, 1)
+        and (dim < pad or env.known_equal(input_val.size(dim - pad), 1))
+        for dim, size in enumerate(output_val.size())
+    )
 
 
 def call_inner_fn(loops: Loops) -> ValueRangesAny:

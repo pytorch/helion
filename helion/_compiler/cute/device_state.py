@@ -32,17 +32,22 @@ if TYPE_CHECKING:
     from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_mma_dag import MmaDagPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_bwd_match import FlexBwdMatch
+    from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
+    from .radix_selection import RadixSelectionPlan
     from .register_producers import RegisterProducerRequest
+    from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -50,6 +55,7 @@ if TYPE_CHECKING:
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+    from .topk import CuteTopKPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -822,6 +828,9 @@ class CuteDeviceFunctionState:
         # Its CTA shape is authoritative because the direct lowering replaces
         # the ordinary lane topology.
         self.direct_affine_plan: DirectAffinePlan | None = None
+        self.topk_plan: CuteTopKPlan | None = None
+        self.radix_selection_plan: RadixSelectionPlan | None = None
+        self.register_region_plan: RegisterRegionPlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
         self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None
@@ -857,6 +866,12 @@ class CuteDeviceFunctionState:
         # ``.notes/spikes/fa_tcgen05_spike.py``.
         self.attention_flash_block_ids: list[int] | None = None
         self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Set by the flex-envelope matcher (``flex_match.py``): the
+        # whole-graph-set match, probed once per device function. Every
+        # device loop of the two BlockMask list walks answers ``mma_mode``
+        # from it, and the flash codegen reads its operands from it.
+        self.attention_flex_match: FlexMatch | None = None
+        self.attention_flex_probed: bool = False
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
@@ -872,13 +887,22 @@ class CuteDeviceFunctionState:
         self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
+        # whole-graph-set match, probed once per device function.
+        self.attention_flex_bwd_match: FlexBwdMatch | None = None
+        self.attention_flex_bwd_probed: bool = False
         # Set by the register-MMA GEMM detector (``cute_matmul_family=
         # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
         # its tile; the dedicated codegen emits the whole device body and
         # the launch runs ``32 * warps`` threads per CTA.
         self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
+        # the matched serial MMA state recurrence and its tile / warp /
+        # stage selection; the dedicated codegen owns the matched root and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.mma_dag_plan: MmaDagPlan | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

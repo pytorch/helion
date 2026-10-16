@@ -19,8 +19,8 @@ CUDA_DEVICE = "cuda"
 @pytest.mark.parametrize("startup", [False, True])
 @pytest.mark.parametrize("partial", [False, True], ids=["full", "partial_g31"])
 def test_ordinary_paired_profile_cuda(startup: bool, partial: bool) -> None:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("paired tcgen05 profile requires a Blackwell CUDA device")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("paired tcgen05 profile requires an SM100 CUDA device")
     m, n, k = (640 if partial else 768), 256, 512
     offsets = [17, 17, 49, 113, 113] + [617] * 27 if partial else [0, m]
     generator = torch.Generator(device=CUDA_DEVICE).manual_seed(73453)
