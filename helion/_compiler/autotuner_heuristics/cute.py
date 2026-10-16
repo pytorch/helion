@@ -14,6 +14,7 @@ from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
 
+from ..._utils import prev_power_of_2
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
@@ -3423,17 +3424,14 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
-    """Companion seed: chunk = max(max_threads, size_hint/2) so the inner
-    reduction loop has very few outer iterations and lane_extent absorbs
-    the bulk of the work.
+    """Seed a power-of-two chunk within half the extent and the backend limit.
 
-    For large N this lattice (1-2 outer iters, large lane_extent) tends to
+    For large N this lattice (few outer iters, large lane_extent) tends to
     schedule better than the narrow-chunk lattice (many outer iters,
     lane_extent=1) on B200 — the SASS is dominated by per-iter scheduling
     bubbles in the narrow case, while the wide case lets the compiler
     overlap the load/compute/store traffic across the unrolled lane
-    iterations. Only applies when size_hint > max_threads (otherwise the
-    narrow heuristic already gives the same lattice).
+    iterations. Only applies when the rounded chunk exceeds max_threads.
     """
 
     name = "cute_reduction_wide_chunk"
@@ -3446,7 +3444,14 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
-        return rl_spec.size_hint > 2 * max_threads
+        return (
+            prev_power_of_2(
+                min(
+                    rl_spec.size_hint // 2, spec.max_reduction_loop or rl_spec.size_hint
+                )
+            )
+            > max_threads
+        )
 
     @classmethod
     def get_seed_config(
@@ -3456,12 +3461,9 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        # Halve the size_hint until it fits in the reduction_loop chunk
-        # spec's [low, high] range; the autotuner explores power-of-2
-        # chunks so we keep this seed PoT.
-        chunk = size_hint // 2
-        if chunk < max_threads:
-            chunk = max_threads
+        chunk = prev_power_of_2(
+            min(size_hint // 2, spec.max_reduction_loop or size_hint)
+        )
         seed: dict[str, Any] = {
             "block_sizes": [1],
             "num_threads": _seq_config_list(spec.num_threads, {}),
@@ -3517,9 +3519,9 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
         if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
             rows_per_cta = 1
-        chunk = min(size_hint // 2, 65536)
+        chunk = min(prev_power_of_2(size_hint // 2), 65536)
         chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
-        if chunk >= size_hint or chunk < 2:
+        if chunk >= size_hint:
             return None
         rdim_id = rl_spec.block_id
         tile_id = spec.block_sizes[0].block_id
