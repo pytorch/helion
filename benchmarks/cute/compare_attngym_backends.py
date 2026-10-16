@@ -241,13 +241,16 @@ def _skipped(
 
 
 def _make_flex_inputs(
-    variant: agv.Variant, device: torch.device, seed: int = 0
+    variant: agv.Variant,
+    device: torch.device,
+    seed: int = 0,
+    block_size: int | tuple[int, int] = 128,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], object, object]:
     q, k, v = agv.make_qkv(variant, device, seed=seed)
     score_mod, mask_mod = variant.make_mods(device)
     block_mask = None
     if mask_mod is not None:
-        block_mask = agv.build_block_mask(variant, mask_mod, device)
+        block_mask = agv.build_block_mask(variant, mask_mod, device, block_size)
     return (q, k, v), score_mod, block_mask
 
 
@@ -255,8 +258,10 @@ def _benchmark_flex(args: argparse.Namespace, variant: agv.Variant) -> dict[str,
     from torch.nn.attention.flex_attention import flex_attention
 
     device = torch.device("cuda")
-    (q, k, v), score_mod, block_mask = _make_flex_inputs(variant, device, args.seed)
     backend = "FLASH" if args.impl == "flex-cute" else "TRITON"
+    (q, k, v), score_mod, block_mask = _make_flex_inputs(
+        variant, device, args.seed, (256, 128) if backend == "FLASH" else 128
+    )
     notes = [f"FlexAttention BACKEND={backend}"]
     if args.impl == "flex-cute":
         import compare_attention_backends as cab  # pyrefly: ignore [missing-import]

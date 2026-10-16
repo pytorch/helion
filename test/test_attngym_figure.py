@@ -212,6 +212,28 @@ class TestAttentionGymFigure(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertEqual(_visible_keys(mask, query, 8), keys)
 
+    def test_block_diffusion_visibility_across_noised_and_clean_blocks(self):
+        # Three two-token blocks in each half: noised [0, 6), clean [6, 12).
+        # Explicit key sets cover both halves and earlier/same/later blocks.
+        mask = _mask("block-diffusion", 12, 12, {"block_size": 2})
+        expected = (
+            {0, 1},
+            {0, 1},
+            {2, 3, 6, 7},
+            {2, 3, 6, 7},
+            {4, 5, 6, 7, 8, 9},
+            {4, 5, 6, 7, 8, 9},
+            {6, 7},
+            {6, 7},
+            {6, 7, 8, 9},
+            {6, 7, 8, 9},
+            {6, 7, 8, 9, 10, 11},
+            {6, 7, 8, 9, 10, 11},
+        )
+        for query, keys in enumerate(expected):
+            with self.subTest(query=query):
+                self.assertEqual(_visible_keys(mask, query, 12), keys)
+
     def test_sta2d_uses_tile_major_order_and_even_window_borders(self):
         mask = _mask(
             "sta2d", 24, 24, {"canvas": [4, 6], "kernel": [4, 4], "tile": [2, 2]}

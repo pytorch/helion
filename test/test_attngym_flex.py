@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from test._cute_aux import _cpu_codegen
 
 import helion
+from helion._compiler import backend as compiler_backend
 from helion._compiler.cute import flex_match
 
 pytest.importorskip("cutlass")
@@ -143,6 +144,34 @@ def test_batch_and_head_dependent_tables_match_flash() -> None:
         bound = kernel._bind_isolated(args)
     assert bound.config_spec.cute_flash_search_enabled
     assert args[4].shape[:2] == (2, 4)
+
+
+@pytest.mark.parametrize("name", ("noop", "causal"))
+def test_dense_and_causal_cases_use_the_regular_flash_surface(name: str) -> None:
+    device = torch.device("cpu")
+    case = attngym_figure.CASES[f"{name}.s2048"]
+    q, k, v = agv.make_qkv(case, device)
+    kernel, args = attngym_flex.kernel_call_args(case, q, k, v, device)
+    # The examples module may already have been imported on the default backend.
+    kernel = helion.Kernel(kernel.fn, settings=kernel.settings.copy(backend="cute"))
+    with (
+        _cpu_codegen(),
+        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
+        patch(
+            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
+        ),
+    ):
+        bound = kernel._bind_isolated(args)
+        host = bound.host_function
+        assert host is not None
+        with bound.env:
+            surface = compiler_backend.detect_flash_search_surface(host.device_ir)
+    assert surface is not None
+    assert surface.standard_dense_output is (name == "noop")
+    assert surface.standard_causal_output is (name == "causal")
+    assert surface.is_causal is (name == "causal")
+    assert not surface.has_list_walk
+    assert bound.config_spec.cute_flash_search_enabled
 
 
 @pytest.mark.parametrize(

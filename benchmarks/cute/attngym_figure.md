@@ -101,6 +101,8 @@ FlexAttention Triton, FlexAttention Triton with max autotuning,
 FlexAttention CuTe/FLASH, and Helion CuTe. Unsupported native operations are
 recorded as SKIP; compilation/runtime errors and numerical failures remain
 separate outcomes. No SDPA backend fallback is permitted.
+FlexAttention CuTe uses 256-by-128 BlockMask tiles, as required by its FA4
+forward kernel; the other masked paths use 128-by-128 tiles.
 cuDNN receives dense bias in the input dtype (BF16). Each row is centered by
 its finite maximum before conversion; a row constant cancels in softmax and
 centering preserves the influential differences in large positional biases.
@@ -110,7 +112,9 @@ excluded from the comparison.
 
 The output contract is forward attention only. Helion and FA4 omit LSE writes;
 the installed FlexAttention implementation may still calculate its internal
-LSE. Q/K and P/V use FP32 accumulation with BF16 dot operands. Reference softmax
+LSE. Helion's `noop` and `causal` cases reuse the regular output-only kernels
+from `examples/attention.py`; the other variants use the FlexAttention kernel.
+Q/K and P/V use FP32 accumulation with BF16 dot operands. Reference softmax
 runs in FP32; checks use atol=0.05 and rtol=0.02, including finiteness, shape,
 and dtype. Fully masked rows produce zero. All implementations receive the
 same input seed and fixed mask/bias parameters.

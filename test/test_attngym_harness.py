@@ -18,6 +18,7 @@ from benchmarks.cute import compare_attngym_backends as harness
 from benchmarks.cute.attngym_report import aggregate
 import pytest
 import torch
+from torch.nn.attention.flex_attention import BlockMask
 
 
 @pytest.fixture
@@ -125,6 +126,38 @@ def test_input_seed_changes_inputs_and_is_reproducible():
     changed = harness._make_flex_inputs(variant, torch.device("cpu"), seed=38)[0]
     assert all(starmap(torch.equal, zip(first, repeated, strict=True)))
     assert all(not torch.equal(a, b) for a, b in zip(first, changed, strict=True))
+
+
+@pytest.mark.parametrize("block_size", (None, (256, 128)))
+def test_flex_input_helper_forwards_sparse_block_size(
+    block_size, monkeypatch: pytest.MonkeyPatch
+):
+    variant = replace(_small_case("causal"), m=512, n=512)
+    device = torch.device("cpu")
+    captured = []
+    original_builder = harness.agv.build_block_mask
+
+    def build_block_mask(case, mask_mod, device, block_size=128):
+        captured.append(block_size)
+        return original_builder(case, mask_mod, device, block_size)
+
+    # Exercise the real BlockMask builder eagerly on CPU.
+    monkeypatch.setattr(torch, "compile", lambda fn: fn)
+    monkeypatch.setattr(harness.agv, "build_block_mask", build_block_mask)
+    if block_size is None:
+        inputs, score_mod, block_mask = harness._make_flex_inputs(variant, device)
+        expected = (128, 128)
+    else:
+        inputs, score_mod, block_mask = harness._make_flex_inputs(
+            variant, device, block_size=block_size
+        )
+        expected = block_size
+    assert captured == [128 if block_size is None else block_size]
+    assert score_mod is None
+    assert isinstance(block_mask, BlockMask)
+    assert expected == block_mask.BLOCK_SIZE
+    assert block_mask.kv_num_blocks.shape[-1] == variant.m // expected[0]
+    assert all(tensor.device == device for tensor in inputs)
 
 
 @pytest.mark.parametrize(
@@ -530,8 +563,9 @@ def test_flex_backend_is_explicit_and_compile_shapes_are_static(
     qkv = _cpu_qkv(variant)
     captured = {}
 
-    def make_inputs(case, device, seed):
+    def make_inputs(case, device, seed, block_size=128):
         captured["seed"] = seed
+        captured["block_size"] = block_size
         return qkv, None, None
 
     def fake_compile(fn, **options):
@@ -556,6 +590,7 @@ def test_flex_backend_is_explicit_and_compile_shapes_are_static(
     monkeypatch.setattr(harness, "_run_impl", run_impl)
     harness._benchmark_flex(args, variant)
     assert captured["seed"] == 37
+    assert captured["block_size"] == ((256, 128) if impl == "flex-cute" else 128)
     assert captured["compile"]["dynamic"] is False
     assert captured["compile"]["fullgraph"] is True
     assert captured["compile"]["mode"] == (

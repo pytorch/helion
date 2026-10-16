@@ -1,9 +1,9 @@
-"""Output-only FlexAttention kernel for attention-gym benchmark cases.
+"""Output-only attention kernels for attention-gym benchmark cases.
 
-This keeps the BlockMask walk from ``examples/flex_attention.py`` so the CuTe
-backend can use its fused FlexAttention implementation. The value dimension
-may differ from the query/key dimension, and BlockMask tables may vary over
-batch and query heads.
+Plain dense and causal cases use ``examples/attention.py``. Other cases keep
+the BlockMask walk from ``examples/flex_attention.py`` for fused FlexAttention.
+The value dimension may differ from the query/key dimension, and BlockMask
+tables may vary over batch and query heads.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import os
 from typing import Callable
 
 from benchmarks.cute import attngym_variants as agv
+from examples.attention import attention_output
+from examples.attention import causal_attention_output
 import torch
 from torch.nn.attention.flex_attention import _identity
 from torch.nn.attention.flex_attention import noop_mask
@@ -184,6 +186,11 @@ def kernel_call_args(
     device: torch.device,
 ) -> tuple[helion.Kernel[torch.Tensor], tuple[object, ...]]:
     from benchmarks.cute import attngym_figure
+
+    if variant.name == "noop":
+        return attention_output, (q, k, v)
+    if variant.name == "causal":
+        return causal_attention_output, (q, k, v)
 
     _, torch_mask = variant.make_mods(device)
     score_mod, mask_mod = attngym_figure.helion_mods(variant, device)

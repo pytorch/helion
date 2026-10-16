@@ -159,7 +159,7 @@ def make_block_diffusion(seq_len: int, block_size: int) -> MaskMod:
         kv_noised = kv_idx < seq_len
         q_block = (q_idx % seq_len) // block_size
         kv_block = (kv_idx % seq_len) // block_size
-        block_diagonal = (q_block == kv_block) & (q_noised == kv_noised)
+        block_diagonal = (q_block == kv_block) & (q_noised ^ ~kv_noised)
         offset_block_causal = (q_block > kv_block) & q_noised & ~kv_noised
         block_causal = (q_block >= kv_block) & ~q_noised & ~kv_noised
         return block_diagonal | offset_block_causal | block_causal
