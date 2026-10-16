@@ -165,7 +165,6 @@ def _render_hooks(
     plan: FlexBwdPlan,
     *,
     device_function: DeviceFunction,
-    exp2_f32: bool,
     mask_form: str,
     hook_cols: int = 32,
     bias: FlexRegion | None = None,
@@ -177,7 +176,10 @@ def _render_hooks(
     the plan has no region for it). With ``bias`` (the folded additive score
     bias) the unmasked hook renders ``g`` into ``fbwd_gfrag`` and the masked
     hook carries the mask only. ``aux_smem_budget`` (bytes) selects the aux
-    tables the hooks read from their shared-memory copy (``fbwd_aux_smem_layout``)."""
+    tables the hooks read from their shared-memory copy: the fill's set
+    (``fbwd_aux_smem_layout`` over the whole plan), passed to every hook so
+    a sub-plan's own candidate list never names a pointer the fill did not
+    bind."""
     has_score = plan.score_region is not None and bias is None
     has_mask = plan.mask_region is not None
     has_grad = plan.grad_region is not None
@@ -204,10 +206,13 @@ def _render_hooks(
             plan.batch,
             plan.heads,
             plan.num_kv_tiles * 128,
-            plan.num_q_tiles * 128,
+            plan.num_q_tiles_padded * 128,
         ),
         "mask_form": mask_form,
         "aux_smem_budget": aux_smem_budget,
+        "aux_smem_staged": frozenset(
+            entry.aux_index for entry in fbwd_aux_smem_layout(plan, aux_smem_budget)
+        ),
     }
     hooks: list[FlexHookCode] = []
     plain = masked = jac = None
@@ -708,8 +713,9 @@ def _fit_smem_budget(
     device: torch.device,
     persistent: bool = False,
     aux_smem: int = 0,
-) -> _SmemPlan:
-    """Fit the storage into the per-CTA SMEM capacity.
+) -> _SmemPlan | None:
+    """Fit the storage into the per-CTA SMEM capacity (None: nothing fits,
+    the caller declines the fused path).
 
     Q / dO rings: 2 / 1 stages at head dim 128, 4 / 4 at 64 (FA4's). The dQ
     drain ring is 8 boxes (2 per reduce warp) unless the step table overflows
@@ -777,7 +783,7 @@ def _fit_smem_budget(
         for dq_boxes in (8, 4):
             if size(do_stage_max, dq_boxes, 0, True, True, aux) <= capacity:
                 return _SmemPlan(q_stage, do_stage_max, dq_boxes, 0, False, False, aux)
-    return _SmemPlan(q_stage, do_stage_max, 4, 0, False, False, 0)
+    return None
 
 
 # dQ fp32 working set (bytes) one batch-head group of CTAs may keep hot in L2:
@@ -956,7 +962,6 @@ def emit_flash_bwd_flex_device_body(
     _hooks, plain, masked, jac = _render_hooks(
         plan,
         device_function=device_function,
-        exp2_f32=exp2_f32,
         mask_form=mask_form,
         hook_cols=hook_cols,
         bias=bias,
@@ -1021,7 +1026,9 @@ def emit_flash_bwd_flex_device_body(
         ind = " " * indent
         inner = ind + "    "
         lines = []
-        if kind == "cons":
+        if kind in ("cons", "mma"):
+            # Every reader of the tile's table buffer (the 12 consumer warps
+            # and the MMA warp, which reads its length word) releases it.
             lines += [
                 f"{inner}cute.arch.sync_warp()\n",
                 f"{inner}with cute.arch.elect_one():\n",
@@ -1267,8 +1274,8 @@ def emit_flash_bwd_flex_device_body(
         flex_mbar_init = (
             "        cute.arch.mbarrier_init(fbwd_tfull_ptr, 1)\n"
             "        cute.arch.mbarrier_init(fbwd_tfull_ptr + 1, 1)\n"
-            "        cute.arch.mbarrier_init(fbwd_tempty_ptr, 12)\n"
-            "        cute.arch.mbarrier_init(fbwd_tempty_ptr + 1, 12)\n"
+            "        cute.arch.mbarrier_init(fbwd_tempty_ptr, 13)\n"
+            "        cute.arch.mbarrier_init(fbwd_tempty_ptr + 1, 13)\n"
             "        cute.arch.mbarrier_init(fbwd_sdsfree_ptr, 1)\n"
             "        cute.arch.mbarrier_init(fbwd_tissued_ptr, 1)\n"
         )
@@ -1730,7 +1737,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     mask_form = str(df.config.config.get("cute_flash_bwd_mask_form", "bitmask"))
     reg_split = df.config.config.get("cute_flash_bwd_regs")
     hook_cols_cfg = df.config.config.get("cute_flash_bwd_hook_cols", 32)
-    hook_cols = hook_cols_cfg if isinstance(hook_cols_cfg, int) else 32
+    hook_cols = hook_cols_cfg if hook_cols_cfg in (8, 16, 32) else 32
     hook_pin = bool(df.config.config.get("cute_flash_bwd_hook_pin", 1))
     bias_fold = bool(df.config.config.get("cute_flash_bwd_bias_fold", 1))
     tile_group_cfg = df.config.config.get("cute_flash_bwd_tile_group", 0)
@@ -1767,6 +1774,10 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         persistent=persistent,
         aux_smem=aux_smem,
     )
+    if smem is None:
+        # Even the smallest storage (a 128K-token walk's step table, say)
+        # exceeds the SM's shared memory: leave the kernel to the generic path.
+        return False
     q_stage, do_stage, dq_boxes = smem.q_stage, smem.do_stage, smem.dq_boxes
 
     emit_flash_module_statements(cg)

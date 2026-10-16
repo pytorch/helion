@@ -1885,6 +1885,9 @@ class ConfigSpec:
         self.cute_flash_bwd_search_enabled: bool = False
         self._cute_flash_bwd_aux_smem_candidates: tuple[int, ...] = ()
         self._cute_flash_bwd_ds_tmem_allowed: bool = False
+        self._cute_flash_bwd_has_mask: bool = True
+        self._cute_flash_bwd_has_hook: bool = True
+        self._cute_flash_bwd_additive_bias: bool = True
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self._cute_flash_bwd_persistent_allowed: bool = True
@@ -3350,6 +3353,9 @@ class ConfigSpec:
         fast_math: bool = False,
         aux_smem_candidates: Sequence[int] = (),
         ds_tmem_allowed: bool = False,
+        has_mask: bool = True,
+        has_score: bool = True,
+        additive_bias: bool = True,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3367,6 +3373,11 @@ class ConfigSpec:
         self._cute_flash_bwd_fast_math = fast_math
         self._cute_flash_bwd_aux_smem_candidates = tuple(aux_smem_candidates)
         self._cute_flash_bwd_ds_tmem_allowed = ds_tmem_allowed
+        # Which hook knobs have an effect: the mask form needs a mask region,
+        # the hook group width / pin a hook at all, the fold an additive bias.
+        self._cute_flash_bwd_has_mask = has_mask
+        self._cute_flash_bwd_has_hook = has_mask or has_score
+        self._cute_flash_bwd_additive_bias = additive_bias
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -7105,25 +7116,30 @@ class ConfigSpec:
                     choices=(1, 0) if self._cute_flash_bwd_flex else (0, 1)
                 )
                 if self._cute_flash_bwd_flex:
-                    # How the mask_mod predicate reaches the -inf select of
-                    # the flex backward's P pass (see flash_score_mod).
-                    fields["cute_flash_bwd_mask_form"] = EnumFragment(
-                        choices=("bitmask", "element")
-                    )
+                    if self._cute_flash_bwd_has_mask:
+                        # How the mask_mod predicate reaches the -inf select of
+                        # the flex backward's P pass (see flash_score_mod).
+                        fields["cute_flash_bwd_mask_form"] = EnumFragment(
+                            choices=("bitmask", "element")
+                        )
                     from .._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
 
                     # Register budget per warp role (reduce / compute / other).
                     fields["cute_flash_bwd_regs"] = EnumFragment(
                         choices=FBWD_REG_SPLITS
                     )
-                    # Lanes per hook + exp2 group of the P pass (live-range control).
-                    fields["cute_flash_bwd_hook_cols"] = EnumFragment(
-                        choices=(32, 16, 8)
-                    )
-                    # Order the hook coordinate math after the S wait (see fbwd_pin_i32).
-                    fields["cute_flash_bwd_hook_pin"] = EnumFragment(choices=(1, 0))
-                    # Fold an additive score bias into the LSE term (see additive_bias_region).
-                    fields["cute_flash_bwd_bias_fold"] = EnumFragment(choices=(1, 0))
+                    if self._cute_flash_bwd_has_hook:
+                        # Lanes per hook + exp2 group of the P pass (live-range control).
+                        fields["cute_flash_bwd_hook_cols"] = EnumFragment(
+                            choices=(32, 16, 8)
+                        )
+                        # Order the hook coordinate math after the S wait (see fbwd_pin_i32).
+                        fields["cute_flash_bwd_hook_pin"] = EnumFragment(choices=(1, 0))
+                    if self._cute_flash_bwd_additive_bias:
+                        # Fold an additive score bias into the LSE term (see additive_bias_region).
+                        fields["cute_flash_bwd_bias_fold"] = EnumFragment(
+                            choices=(1, 0)
+                        )
                     # Block-index -> (batch-head, KV tile) walk: heaviest-first
                     # inside L2-sized batch-head groups (see fbwd_tile_group_choices).
                     fields["cute_flash_bwd_tile_group"] = EnumFragment(
