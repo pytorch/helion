@@ -3922,6 +3922,33 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    @skipIfPallasInterpret(
+        "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
+    )
+    def test_pallas_device_micros_waits_for_torch_launched_kernel(self) -> None:
+        from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[256, 1024]),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(32768, 4096, device=DEVICE)  # 512 MiB per operand
+        y = torch.randn(32768, 4096, device=DEVICE)
+        micros = _pallas_device_micros_for_fn(
+            lambda: add(x, y), n_calls=100, n_warmup=5
+        )
+        self.assertTrue(
+            math.isfinite(micros) and micros > 0,
+            f"device µs must be finite for a torch-launched kernel; got {micros!r}",
+        )
+
     def test_wall_clock_benches_time_failed_executions_as_inf(self) -> None:
         from unittest.mock import patch
 
