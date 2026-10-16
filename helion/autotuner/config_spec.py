@@ -1067,6 +1067,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "flydsl_load_cache_modifier",
         "flydsl_waves_per_eu",
         "flydsl_cr_max_tiles",
+        "flydsl_threads_per_row",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_reduction_schedule",
@@ -1216,6 +1217,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "flydsl_maxnreg",
         # FlyDSL: max tiles to unroll with constexpr_range (0 = default 16).
         "flydsl_cr_max_tiles",
+        # FlyDSL: small-N sub-warp threads-per-row (0=standard 64/row).
+        "flydsl_threads_per_row",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_reduction_schedule",
@@ -5802,6 +5805,13 @@ class ConfigSpec:
                                 and new_loops[i] > 32
                             )
                         )
+                        # Wide-persistent candidates (chunk >= N) bypass the
+                        # max_loop cap — the backend handles oversized chunks
+                        # as single-pass register-cached reductions.
+                        and not (
+                            spec.allow_wide_persistent
+                            and new_loops[i] >= spec.size_hint
+                        )
                     ):
                         new_loops[i] = min(
                             new_loops[i] if max_loop is None else max_loop,
@@ -8335,7 +8345,15 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # For wide-persistent configs (FlyDSL chunk=N single-pass), allow
         # non-power-of-two chunk values so non-POT N can be offered as a
         # persistent single-iteration candidate.
-        if self.allow_wide_persistent and isinstance(value, int) and value > 0:
+        # For wide-persistent configs (FlyDSL chunk=N single-pass), allow
+        # non-power-of-two chunk values so non-POT N can be offered as a
+        # persistent single-iteration candidate.
+        if (
+            self.allow_wide_persistent
+            and isinstance(value, int)
+            and value > 0
+            and value >= self.size_hint
+        ):
             normalized: int | None = value
         elif (
             self.allow_non_power_of_two
@@ -8376,6 +8394,9 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # single-iteration looped path for register caching (in_local[] across
         # reduce+normalize passes), so preserve chunk >= size_hint for them.
         if isinstance(normalized, int) and normalized >= self.size_hint:
+            # Exception: backends that set allow_wide_persistent_reduction use the
+            # single-iteration looped path for register caching (in_local[] across
+            # reduce+normalize passes), so preserve chunk >= size_hint for them.
             if (
                 (normalized & (normalized - 1) == 0 
                 and normalized != self._full_extent_chunk())        

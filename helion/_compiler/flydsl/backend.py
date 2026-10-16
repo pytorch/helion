@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import ClassVar
 from typing import Sequence
 from typing import cast
@@ -130,6 +131,11 @@ class FlyDSLBackend(Backend):
             # Max tiles to unroll with constexpr_range (0 = default 16).
             # Autotune tries (8, 16, 32) to find the right unroll depth.
             "flydsl_cr_max_tiles",
+            # Small-N sub-warp regime: threads per row (power-of-2 divisor of 64).
+            # 0 = standard one full wavefront (64) per row.  When set with bm>1,
+            # packs multiple short rows per block at <64 threads/row, reducing
+            # each row with a sub-group shuffle_xor of width=THREADS_PER_ROW.
+            "flydsl_threads_per_row",
         }
     )
 
@@ -190,6 +196,16 @@ class FlyDSLBackend(Backend):
     @property
     def default_launcher_name(self) -> str:
         return "_default_flydsl_launcher"
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from ...autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from ...autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
 
     def max_reduction_threads(self) -> int | None:
         return 64
@@ -265,7 +281,11 @@ class FlyDSLBackend(Backend):
         # from this override recomputing the count from the chunk.)
         _bm = int(config.block_sizes[0]) if config.block_sizes else 1
         if _bm != 1:
-            return 64
+            # Small-N sub-warp regime: THREADS_PER_ROW<64 packs multiple rows
+            # per block; the per-row reduction runs over a sub-group of that many
+            # lanes. Default 64 = one full wavefront per row (unchanged).
+            _tpr = int(config.config.get("flydsl_threads_per_row", 0) or 0)
+            return _tpr if _tpr > 0 else 64
         _vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
         _v = config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1
         return _looped_tc(block_size, int(_v))
@@ -332,8 +352,8 @@ class FlyDSLBackend(Backend):
             "arith": "from flydsl.expr import arith",
             "rocdl": "from flydsl.expr import rocdl",
             "gpu": "from flydsl.expr import gpu",
-            "full": "from flydsl.expr.vector import full",
-            "ReductionOp": "from flydsl.expr.vector import ReductionOp",
+            "full": "from flydsl.expr.typing import full",
+            "ReductionOp": "from flydsl.expr.typing import ReductionOp",
             "const_expr": "from flydsl.expr import const_expr",
             "helion": "import helion",
             "hl": "import helion.language as hl",
@@ -488,10 +508,19 @@ class FlyDSLBackend(Backend):
             wpe: int = 0,
             mnr: int = 0,
             budget: int = 0,
+            tpr: int = 0,
         ) -> None:
             # Safety: for user-tiled reductions all column dims must be multiples
             # of 256 (one warp-pass = 64 lanes x 4 elems). Reject bad configs.
             if user_tiled and any(b % 256 != 0 for b in bs[1:]):
+                return
+            # Safety: a reduction chunk LARGER than the whole extent (e.g. small-N
+            # where the 64*V doubling starts above N) over-reads the per-row buffer
+            # on its single tile and faults the GPU (buffer-descriptor OOB / SIGABRT
+            # for N=128, chunk=256). chunk == extent is fine (exact single tile).
+            # The tail-overshoot slack check below only covers a chunk that fits the
+            # extent but whose LAST tile overshoots -- not a whole chunk past it.
+            if rl is not None and rl_numel is not None and rl > rl_numel:
                 return
             # Safety: reject a looped chunk whose last pass OOBs the divided
             # buffer (hardware buffer instructions fault on true OOB). The bound
@@ -536,7 +565,7 @@ class FlyDSLBackend(Backend):
                     _SAFE_OOB_BYTES = 1536
                     if _oob_bytes > _SAFE_OOB_BYTES:
                         return
-            key = (tuple(bs), rl, v, cr, cm, wpe, mnr, budget)
+            key = (tuple(bs), rl, v, cr, cm, wpe, mnr, budget, tpr)
             if key in seen:
                 return
             seen.add(key)
@@ -555,6 +584,8 @@ class FlyDSLBackend(Backend):
                 kw["flydsl_maxnreg"] = mnr
             if budget:
                 kw["flydsl_cr_max_tiles"] = budget
+            if tpr:
+                kw["flydsl_threads_per_row"] = tpr
             candidates.append(Config(**kw))
 
         # Tile count for the first reduction dim, to decide constexpr eligibility.
@@ -637,6 +668,23 @@ class FlyDSLBackend(Backend):
                                     _add(bs, c, None, cr=True, budget=_mt)
                                     break
 
+        # Small-N sub-warp regime: pack BLOCK_M rows/block at THREADS_PER_ROW<64
+        # lanes/row (matches the ref _build_rmsnorm_large_m_small_n geometry).
+        # Only worthwhile when the reduction extent N is small enough that a full
+        # 64-lane wavefront per row wastes lanes: TPR = min(64, 1024//BLOCK_M) < 64
+        # (i.e. N <= 512). Uses a vectorized 128-bit load per thread (V=BLOCK_N//TPR,
+        # capped at the dtype width) + a sub-group shuffle_xor reduction.
+        if isinstance(rl_numel, int) and 0 < rl_numel <= 512:
+            _bn = 1 << (rl_numel - 1).bit_length()  # next pow2 of N
+            _blm = max(min(16384 // _bn, 32), 8)  # rows/block in [8, 32]
+            _tpr = min(64, 1024 // _blm)  # threads/row (power-of-2 <=64)
+            if _tpr < 64:
+                _vc = min(max(_v_choices), _bn // _tpr)
+                if _vc >= 1:
+                    _bs_c = list(block_sizes)
+                    _bs_c[0] = _blm
+                    _add(_bs_c, _tpr * _vc, _vc, tpr=_tpr)
+
         # Extend candidates with cache-modifier, waves_per_eu, and maxnreg variants.
         # Take each candidate already in the list and cross it with the hardware
         # knobs so the autotuner benchmarks default vs non-temporal loads,
@@ -650,14 +698,17 @@ class FlyDSLBackend(Backend):
             _vw = _cand.config.get("cute_vector_widths") or [None]
             _v = int(_vw[0]) if _vw and _vw[0] is not None else None  # pyrefly: ignore[bad-index]
             _cr = bool(_cand.config.get("constexpr_range", False))
+            # Preserve the small-N sub-warp knob; without it bm>1 defaults to 64
+            # threads/row and num_threads=64*bm can exceed the 1024 block limit.
+            _tp = int(_cand.config.get("flydsl_threads_per_row", 0) or 0)
             for _cm in (2,):  # non-temporal load (bypass L1)
                 for _wpe in (0, 2, 4):
-                    _add(_bs, _rl, _v, cr=_cr, cm=_cm, wpe=_wpe)
+                    _add(_bs, _rl, _v, cr=_cr, cm=_cm, wpe=_wpe, tpr=_tp)
             for _wpe in (2, 4):  # default cache modifier + varied occupancy
-                _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=_wpe)
+                _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=_wpe, tpr=_tp)
             for _mnr in (64, 96, 128):  # VGPR caps — force higher occupancy
-                _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=0, mnr=_mnr)
-                _add(_bs, _rl, _v, cr=_cr, cm=2, wpe=0, mnr=_mnr)
+                _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=0, mnr=_mnr, tpr=_tp)
+                _add(_bs, _rl, _v, cr=_cr, cm=2, wpe=0, mnr=_mnr, tpr=_tp)
 
         if not candidates:
             return default
@@ -737,6 +788,11 @@ class FlyDSLBackend(Backend):
         self._flydsl_use_constexpr_range = False  # set below for small-N
         self._flydsl_constexpr_chunk: int | None = None
         self._flydsl_cr_numel: int = 0  # static N for full-tile elision
+        # Threads per row: 64 = one full wavefront (default); <64 = small-N
+        # sub-warp regime (set from flydsl_threads_per_row below).
+        self._flydsl_threads_per_row: int = (
+            int(config.config.get("flydsl_threads_per_row", 0) or 0) or 64
+        )
         # Cache modifier for buffer loads: 0=cached (default), 2=non-temporal.
         self._flydsl_load_cache_modifier: int = int(
             config.config.get("flydsl_load_cache_modifier", 0) or 0  # pyrefly: ignore[bad-argument-type]
@@ -776,7 +832,11 @@ class FlyDSLBackend(Backend):
         _tc = self._flydsl_looped_thread_count(config, bm)
         W = _tc // 64 if _tc is not None else 1
         self._flydsl_warps_per_row = W
-        self._flydsl_num_threads = 64 * W if W > 1 else 64 * bm
+        # W>1 (bm==1): W wavefronts cooperate on one row -> 64*W. Else bm rows,
+        # each owned by THREADS_PER_ROW lanes (64 by default; <64 small-N) -> bm*TPR.
+        self._flydsl_num_threads = (
+            64 * W if W > 1 else bm * self._flydsl_threads_per_row
+        )
 
         # Hybrid range strategy: use range_constexpr (unrolled, enables in_local[]
         # register caching across two passes) when the tile count is small enough
@@ -790,11 +850,16 @@ class FlyDSLBackend(Backend):
             rl = cast("list[int]", config.config.get("reduction_loops", None) or [])
             chunk = int(rl[0]) if rl and rl[0] is not None else 0
             rl_data = _env.config_spec.reduction_loops
-            if chunk > 0 and len(rl_data):
+            if len(rl_data):
                 _numel = rl_data[0].size_hint  # static N from the ReductionLoopSpec
                 # Fall back to scf.for if numel is dynamic (can't compute tile count).
-                if isinstance(_numel, int):
-                    tile_count = (_numel + chunk - 1) // chunk
+                if isinstance(_numel, int) and _numel > 0:
+                    # Persistent config: reduction_loops absent or None means chunk=N,
+                    # tile_count=1 — always within the constexpr threshold.
+                    _chunk = chunk if chunk > 0 else _numel
+                    tile_count = (_numel + _chunk - 1) // _chunk
+                    if chunk == 0:
+                        chunk = _numel
                     _threshold = _cr_tile_threshold(
                         int(config.config.get("flydsl_cr_max_tiles", 0) or 0)  # pyrefly: ignore[bad-argument-type]
                     )
@@ -858,11 +923,12 @@ class FlyDSLBackend(Backend):
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        # Row (grid) tile -> warps: warp w = thread_idx.x // 64 owns its row.
-        # Always dim x (flat block), regardless of the axis Helion assigns.
+        # Row (grid) tile -> groups: row r = offset + thread_idx.x // TPR, where
+        # TPR = threads per row (64 = one wavefront/row, default; <64 small-N
+        # packs multiple rows per block). Always dim x (flat block).
         if block_size_var == "1":
             return offset_var
-        return f"({offset_var}) + fx.thread_idx.x // 64"
+        return f"({offset_var}) + fx.thread_idx.x // {self._flydsl_threads_per_row}"
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
@@ -918,8 +984,8 @@ class FlyDSLBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        # Lane mask (flat block, dim x): one warp (64 lanes) per row.
-        return f"fx.thread_idx.x % 64 < ({block_size_var})"
+        # Lane mask (flat block, dim x): TPR lanes per row (64 default; <64 small-N).
+        return f"fx.thread_idx.x % {self._flydsl_threads_per_row} < ({block_size_var})"
 
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
@@ -938,9 +1004,9 @@ class FlyDSLBackend(Backend):
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        # Lane index for the column (``:``) mapping: one warp per row -> lane =
-        # thread_idx.x % 64.
-        return "fx.thread_idx.x % 64"
+        # Lane index for the column (``:``) mapping: TPR lanes per row -> lane =
+        # thread_idx.x % TPR (64 default; <64 small-N sub-warp).
+        return f"fx.thread_idx.x % {self._flydsl_threads_per_row}"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return "fx.Int32(0)"
@@ -1141,14 +1207,21 @@ class FlyDSLBackend(Backend):
         # emitted as a range_constexpr loop (that register-caching path lands in
         # PR4). The warp helpers are needed by BOTH regimes: W=1 uses them
         # directly; the W>1 block reduce calls them for the intra-warp step.
+        # Reduce over THREADS_PER_ROW lanes (64 = full wavefront, default; <64 =
+        # small-N sub-group). Fold count = log2(TPR); shuffle width = TPR. For
+        # a power-of-2 TPR, log2(TPR) == TPR.bit_length() - 1. TPR=64 -> 6 steps,
+        # widths 64, textually identical to before.
+        _tpr = self._flydsl_threads_per_row
+        _steps = _tpr.bit_length() - 1
+
         def _fold(step_op: str) -> str:
             return "\n".join(
-                f"    w = {step_op.format(off=64 >> (s + 1))}" for s in range(6)
+                f"    w = {step_op.format(off=_tpr >> (s + 1))}" for s in range(_steps)
             )
 
-        _wmax_body = _fold("w.maximumf(w.shuffle_xor({off}, 64))")
+        _wmax_body = _fold(f"w.maximumf(w.shuffle_xor({{off}}, {_tpr}))")
         _wsum_body = _fold(
-            "w.addf(w.shuffle_xor({off}, 64), fastmath=arith.FastMathFlags.fast)"
+            f"w.addf(w.shuffle_xor({{off}}, {_tpr}), fastmath=arith.FastMathFlags.fast)"
         )
         stmts: list[ast.AST] = [
             statement_from_string(h)

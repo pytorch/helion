@@ -49,6 +49,22 @@ def rms_norm_fwd(
 
 
 @helion.kernel(backend="flydsl")
+def rms_norm_fwd_no_invrms(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        x_squared = x_tile * x_tile
+        mean_x_squared = torch.mean(x_squared, dim=-1)
+        inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
+        normalized = x_tile * inv_rms_tile[:, None]
+        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="flydsl")
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty_like(x)
