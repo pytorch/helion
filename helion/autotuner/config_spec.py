@@ -8268,6 +8268,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
         self.allow_full_extent = allow_full_extent
+        # When True, _normalize preserves chunk >= size_hint instead of
+        # collapsing to None.  Set by backends that use the single-iteration
+        # looped path for register caching (allow_wide_persistent_reduction).
+        self.allow_wide_persistent = allow_wide_persistent
 
     def _full_extent_chunk(self) -> int | None:
         # A padded single iteration can preserve vector packets where an exact
@@ -8276,10 +8280,6 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if self.allow_full_extent and self.size_hint >= 8:
             return next_power_of_2(self.size_hint)
         return None
-        # When True, _normalize preserves chunk >= size_hint instead of
-        # collapsing to None.  Set by backends that use the single-iteration
-        # looped path for register caching (allow_wide_persistent_reduction).
-        self.allow_wide_persistent = allow_wide_persistent
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -8394,14 +8394,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # single-iteration looped path for register caching (in_local[] across
         # reduce+normalize passes), so preserve chunk >= size_hint for them.
         if isinstance(normalized, int) and normalized >= self.size_hint:
-            # Exception: backends that set allow_wide_persistent_reduction use the
-            # single-iteration looped path for register caching (in_local[] across
-            # reduce+normalize passes), so preserve chunk >= size_hint for them.
             if (
-                (normalized & (normalized - 1) == 0 
-                and normalized != self._full_extent_chunk())        
-                or not self.allow_wide_persistent
-            ):
+                normalized & (normalized - 1) == 0
+                and normalized != self._full_extent_chunk()
+            ) or not self.allow_wide_persistent:
                 return None
 
         return normalized
