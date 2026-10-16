@@ -2655,5 +2655,6 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         tile_groups=fbwd_tile_group_choices(match.plan),
         fast_math=bool(env.settings.fast_math),
         aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
+        ds_tmem_allowed=match.plan.head_dim == 64,
     )
     return True
