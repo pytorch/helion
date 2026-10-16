@@ -19,6 +19,7 @@ from test._autotuner_test_utils import basic_kernels
 import helion
 from helion import _compat
 from helion import exc
+from helion._compiler.backend import TritonBackend
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
 from helion._testing import DEVICE
@@ -41,6 +42,10 @@ from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import RangeNumStagesSpec
+from helion.autotuner.config_spec import RangeWarpSpecializeSpec
 import helion.language as hl
 from helion.language import loops
 
@@ -664,6 +669,62 @@ class TestConfigValuePriors(TestCase):
             self.assertRaisesRegex(exc.InvalidConfig, "invalid default"),
         ):
             gen.random_population(1)
+
+
+class TestUserSeedPerLoopLists(TestCase):
+    """User seeds can come from a heuristic file written on another GPU or by
+    an older Helion, so their per-loop lists may not match the live spec."""
+
+    def _config_gen(self) -> ConfigGeneration:
+        spec = ConfigSpec(backend=TritonBackend())
+        for block_id in (0, 1):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=1024))
+            spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
+            spec.range_warp_specialize.append(RangeWarpSpecializeSpec([block_id]))
+        return spec.create_config_generation()
+
+    def test_full_length_seed_transfers_as_before(self) -> None:
+        gen = self._config_gen()
+        seed = helion.Config(
+            block_sizes=[64, 32],
+            range_num_stages=[2, 3],
+            range_warp_specializes=[None, True],
+        )
+        messages: list[str] = []
+
+        pairs = gen.user_seed_flat_config_pairs([seed], messages.append)
+
+        self.assertEqual(messages, [])
+        self.assertEqual(pairs, [gen.canonicalize_flat(gen.flatten(seed))])
+
+    def test_short_per_loop_lists_are_filled_with_defaults(self) -> None:
+        gen = self._config_gen()
+        seed = helion.Config(
+            block_sizes=[64, 32], range_num_stages=[], range_warp_specializes=[True]
+        )
+        padded = helion.Config(
+            block_sizes=[64, 32],
+            range_num_stages=[0, 0],
+            range_warp_specializes=[True, None],
+        )
+        messages: list[str] = []
+
+        pairs = gen.user_seed_flat_config_pairs([seed], messages.append)
+
+        self.assertEqual(messages, [])
+        self.assertEqual(pairs, [gen.canonicalize_flat(gen.flatten(padded))])
+
+    def test_too_long_per_loop_list_is_rejected_with_reason(self) -> None:
+        gen = self._config_gen()
+        seed = helion.Config(block_sizes=[64, 32], range_num_stages=[2, 3, 4])
+        messages: list[str] = []
+
+        pairs = gen.user_seed_flat_config_pairs([seed], messages.append)
+
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Failed to transfer autotune seed config 1", messages[0])
+        self.assertIn("Too many values for config['range_num_stages']", messages[0])
 
 
 if __name__ == "__main__":
