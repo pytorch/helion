@@ -336,6 +336,9 @@ class DeviceFunction:
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
         self.wrapper_only_params: list[str] = []
+        # Optional parameter annotations of wrapper-only params (e.g. TMA
+        # descriptors passed as ``cutlass.GridConstant[...]``).
+        self.wrapper_only_param_annotations: dict[str, str] = {}
         self._tensor_properties: dict[tuple[object, ...], TensorPropertyArg] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
@@ -1276,7 +1279,10 @@ class DeviceFunction:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         wrapper_only_params.extend(self.triton_persistent_state_args)
-        args.extend(create_arg(name) for name in wrapper_only_params)
+        args.extend(
+            create_arg(name, self.wrapper_only_param_annotations.get(name))
+            for name in wrapper_only_params
+        )
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))

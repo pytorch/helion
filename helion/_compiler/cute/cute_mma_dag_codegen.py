@@ -64,6 +64,7 @@ from ..compile_environment import CompileEnvironment
 from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
+from .cute_mma_dag import MMA_DAG_TCGEN05
 from .cute_mma_dag import REGISTER_ROUTES
 from .cute_mma_dag import ROUTE_CONVERT
 from .cute_mma_dag import ROUTE_DIRECT
@@ -113,6 +114,11 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.program.root_graph_id:
         return False
+    if plan.compute == MMA_DAG_TCGEN05:
+        from .cute_mma_dag_tcgen05 import codegen_mma_dag_tcgen05
+
+        codegen_mma_dag_tcgen05(cg, plan)
+        return True
     emit_mma_dag_module_statements(cg)
     source = _Emitter(cg, plan).render()
     for statement in ast.parse(textwrap.dedent(source)).body:

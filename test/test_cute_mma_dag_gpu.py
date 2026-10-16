@@ -529,28 +529,41 @@ def test_the_promoted_defaults_run_on_tensor_cores() -> None:
     t = _inputs(bh=2, n=8, d=128, dv=128, dtype=torch.bfloat16)
     t3 = _inputs3(bhn=6, d=128, dv=128, dtype=torch.bfloat16)
     t4 = _inputs4(bh=2, n=8, d=128, dv=128, dtype=torch.bfloat16)
-    for kernel, args in (
-        ("fwd", _fwd_args(t, "vanilla", False)),
-        ("fwd_o", _fwd_o_args(t3, "vanilla")),
-        ("dqk", _dqk_args(t3, "vanilla")),
-        ("dv", _dv_args(t3, "vanilla")),
-        ("fwd_h_delta", _fwd_h_delta_args(t4, False)),
-        ("fwd_h_delta", _fwd_h_delta_args(t4, True)),
-        ("dstate", _dstate_args(t4, False)),
-        ("dstate", _dstate_args(t4, True)),
+    # Every admitted program lands on tensor memory (the warp mode stays
+    # one knob value away); the delta kernels keep the warp mode.
+    for kernel, mode, args in (
+        ("fwd", "tcgen05", _fwd_args(t, "vanilla", False)),
+        ("fwd_o", "tcgen05", _fwd_o_args(t3, "vanilla")),
+        ("dqk", "tcgen05", _dqk_args(t3, "vanilla")),
+        ("dv", "tcgen05", _dv_args(t3, "vanilla")),
+        ("fwd_h_delta", "warp", _fwd_h_delta_args(t4, False)),
+        ("fwd_h_delta", "warp", _fwd_h_delta_args(t4, True)),
+        ("dstate", "warp", _dstate_args(t4, False)),
+        ("dstate", "warp", _dstate_args(t4, True)),
     ):
         fn = _kernel_fn(kernel)
         bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
         config = bound.config_spec.default_config()
-        assert config.config["cute_mma_dag"] == "warp", kernel
+        assert config.config["cute_mma_dag"] == mode, kernel
         source = bound.to_code(config)
-        assert f"{RT}.mma_bf16(" in source
+        if mode == "warp":
+            assert f"{RT}.mma_bf16(" in source
+        else:
+            assert "_helion_mma_dag_tc.prims.tcgen05_mma(" in source
         out = _tensors(bound.compile_config(config)(*args))
         _assert_close(
             out,
             _run_triton(fn, args, config.config["block_sizes"]),
             scaled=kernel in ("fwd_h_delta", "dstate"),
         )
+        if mode == "warp":
+            continue
+        # (its tiles may need more warps there: normalize repairs them).
+        warp = dict(config.config, cute_mma_dag="warp")
+        with bound.env:
+            bound.config_spec.normalize(warp, _fix_invalid=True)
+        assert warp["cute_mma_dag"] == "warp"
+        assert f"{RT}.mma_bf16(" in bound.to_code(helion.Config(**warp))
 
 
 def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:

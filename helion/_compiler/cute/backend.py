@@ -15,6 +15,7 @@ import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
+from typing import cast
 
 import sympy
 import torch
@@ -1593,8 +1594,15 @@ class CuteBackend(Backend):
         }
         if config_spec is not None and config_spec.cute_mma_dag is not None:
             # The warp-MMA recurrence owner is admitted: keep the random half
-            # of the population mostly in-family.
-            priors["cute_mma_dag"] = weighted_choice({"warp": 4.0, "off": 1.0})
+            # of the population mostly in-family (tensor-memory mode first
+            # where the kernel admits it).
+            facts = config_spec.cute_mma_dag_facts
+            if facts is not None and facts.tcgen05 is not None:
+                priors["cute_mma_dag"] = weighted_choice(
+                    {"tcgen05": 4.0, "warp": 2.0, "off": 1.0}
+                )
+            else:
+                priors["cute_mma_dag"] = weighted_choice({"warp": 4.0, "off": 1.0})
         return priors
 
     def autotune_config_is_viable(
@@ -1604,25 +1612,30 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
         from .cute_mma_dag import MMA_DAG_KEY
+        from .cute_mma_dag import MMA_DAG_TCGEN05
         from .cute_mma_dag import MMA_DAG_WARP
         from .cute_mma_dag import mma_dag_config_reason
 
         facts = config_spec.cute_mma_dag_facts
-        if facts is None or config.config.get(MMA_DAG_KEY) != MMA_DAG_WARP:
+        mode = config.config.get(MMA_DAG_KEY)
+        if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
             return True
         # Pre-screen the register / shared-memory budget of the warp-MMA
         # dataflow owner (``normalize`` repairs or refuses the same configs).
         block_sizes = config.config.get("block_sizes")
         if not isinstance(block_sizes, list):
             return True
-        sizes: dict[int, object] = {}
+        # Fixed blocks (a lead tile of one row) have no config slot: the
+        # facts resolve them without a lookup.
         tunable = config_spec.block_sizes.valid_block_ids()
+        sizes: dict[int, object] = {}
         for axis in facts.axes:
             if axis.kind not in (AXIS_ROOT, AXIS_LOOP, AXIS_LEAD):
                 continue
-            if axis.kind == AXIS_LEAD and axis.block_id not in tunable:
-                # A lead fixed to one row by the kernel (``block_size=1``).
-                sizes[axis.block_id] = 1
+            if axis.block_id not in tunable:
+                if axis.kind == AXIS_LEAD:
+                    # A lead fixed to one row by the kernel (``block_size=1``).
+                    sizes[axis.block_id] = 1
                 continue
             try:
                 sizes[axis.block_id] = block_sizes[
@@ -1636,6 +1649,7 @@ class CuteBackend(Backend):
                 sizes,
                 config.config.get("cute_mma_dag_warps"),
                 config.config.get("cute_mma_dag_stages"),
+                cast("str", mode),
             )
             is None
         )

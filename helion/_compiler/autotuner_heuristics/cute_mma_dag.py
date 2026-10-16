@@ -12,6 +12,7 @@ from ..cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_DIRECT
 from ..cute.cute_mma_dag import MMA_DAG_STORE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_STAGED
+from ..cute.cute_mma_dag import MMA_DAG_TCGEN05
 from ..cute.cute_mma_dag import MMA_DAG_WARP
 from ..cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute.cute_mma_dag import CuteMmaDagFacts
@@ -47,6 +48,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
     PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
     SEED_TILES = 8
+    SEED_TCGEN05 = 4
 
     @classmethod
     def _facts(
@@ -95,6 +97,8 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         facts = spec.cute_mma_dag_facts
         if facts is None or spec.cute_mma_dag is None:
             return None
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
+
         block_ids = spec.block_sizes.valid_block_ids()
         default_sizes = spec.default_config().config.get("block_sizes", [])
         assert isinstance(default_sizes, list)
@@ -108,7 +112,17 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             if any(elem_bytes == 4 for _rows, _cols, elem_bytes in facts.staging)
             else MMA_DAG_STORE_STAGED
         )
-        for sizes, warps, stages in mma_dag_seed_configs(facts)[: cls.SEED_TILES]:
+        # Tensor-memory seeds lead where the kernel admits them (the promoted
+        # default is the first seed), then the warp-mode ladder.
+        ranked = [
+            (MMA_DAG_TCGEN05, seed)
+            for seed in tcgen05_seed_configs(facts)[: cls.SEED_TCGEN05]
+        ]
+        ranked.extend(
+            (MMA_DAG_WARP, seed)
+            for seed in mma_dag_seed_configs(facts)[: cls.SEED_TILES]
+        )
+        for mode, (sizes, warps, stages) in ranked:
             block_sizes = list(default_sizes)
             for block_id, size in sizes.items():
                 if block_id in block_ids:
@@ -117,7 +131,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 Config.from_dict(
                     {
                         "block_sizes": block_sizes,
-                        MMA_DAG_KEY: MMA_DAG_WARP,
+                        MMA_DAG_KEY: mode,
                         MMA_DAG_WARPS_KEY: warps,
                         MMA_DAG_STAGES_KEY: stages,
                         MMA_DAG_STORE_KEY: store,

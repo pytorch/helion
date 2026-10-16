@@ -734,6 +734,49 @@ def _append_cute_wrapper_plan(
         )
         return
 
+    if kind == "helion_mma_dag_tma":
+        # cute_mma_dag tcgen05 mode: one tiled TMA descriptor per operand,
+        # built here over the wrapper's tensor views and passed to the kernel
+        # as grid constants after the ordinary arguments.  The launch keeps
+        # the generic flat grid.
+        count = plan_int("tma_count")
+        if count <= 0 or count > 8:
+            raise exc.BackendUnsupported("cute", "invalid mma_dag tensor-map count")
+        tma_params: list[str] = []
+        for index in range(count):
+            param = plan.get(f"tma{index}_param")
+            dims = plan.get(f"tma{index}_dims")
+            box = plan.get(f"tma{index}_box")
+            swizzle = plan.get(f"tma{index}_swizzle")
+            tensor_idx = plan_int(f"tma{index}_idx")
+            if (
+                not isinstance(param, str)
+                or not isinstance(dims, (list, tuple))
+                or not isinstance(box, (list, tuple))
+                or len(dims) != len(box)
+                or not 1 <= len(dims) <= 5
+                or not all(type(d) is int and d >= 0 for d in dims)
+                or len(set(dims)) != len(dims)
+                or not all(type(b) is int and 1 <= b <= 256 for b in box)
+                or swizzle not in ("none", "s32b", "s64b", "s128b")
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "invalid mma_dag tensor-map wrapper plan"
+                )
+            if schema_key is not None and (
+                _cute_schema_pointer_alignment(schema_key[tensor_idx]) % 16
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "mma_dag tensor maps require 16-byte-aligned bases"
+                )
+            body.append(
+                f"    {param} = _helion_mma_dag_tensor_map(arg{tensor_idx}, "
+                f"{tuple(dims)!r}, {tuple(box)!r}, {swizzle!r})"
+            )
+            tma_params.append(param)
+        call_args.extend(tma_params)
+        return
+
     if kind == "helion_warp_mma_gemm":
         # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
         # plain tensor arguments, no host-side descriptors.
@@ -2733,6 +2776,10 @@ def _create_cute_wrapper(
         from ..._compiler.cute.gathered_mma_runtime import make_tma_arguments
 
         namespace["_helion_make_gathered_tma"] = make_tma_arguments
+    if any(plan.get("kind") == "helion_mma_dag_tma" for plan in wrapper_plans):
+        from ..._compiler.cute._mma_dag_tcgen05_runtime import make_tensor_map
+
+        namespace["_helion_mma_dag_tensor_map"] = make_tensor_map
     if block_scaled_plans:
         from ..._compiler.cute.block_scaled_prepare import make_block_scaled_entry
 

@@ -91,6 +91,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_TCGEN05
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
@@ -3093,7 +3094,10 @@ class ConfigSpec:
         targets, the promoted default) selects ``warp``.
         """
         self.cute_mma_dag_facts = facts
-        self.cute_mma_dag = EnumFragment(choices=MMA_DAG_MODES)
+        modes = MMA_DAG_MODES
+        if facts.tcgen05 is not None:
+            modes = (*modes, MMA_DAG_TCGEN05)
+        self.cute_mma_dag = EnumFragment(choices=modes)
         self.cute_mma_dag_warps = EnumFragment(
             choices=(
                 MMA_DAG_DEFAULT_WARPS,
@@ -3159,11 +3163,17 @@ class ConfigSpec:
             block_id: block_sizes[index] for block_id, index in indices.items()
         }
         warps, stages = config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY]
-        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages)
+        mode = cast("str", config[MMA_DAG_KEY])
+        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
         if reason is not None:
             if not fix_invalid:
-                raise InvalidConfig(f"{MMA_DAG_KEY}={MMA_DAG_WARP!r}: {reason}")
-            repaired = mma_dag_repair(facts, sizes_by_block, warps, stages)
+                raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
+            repaired = mma_dag_repair(facts, sizes_by_block, warps, stages, mode)
+            if repaired is None and mode == MMA_DAG_TCGEN05:
+                # No tcgen05 geometry near the request: the warp mode runs
+                # the same program.
+                config[MMA_DAG_KEY] = MMA_DAG_WARP
+                repaired = mma_dag_repair(facts, sizes_by_block, warps, stages)
             if repaired is None:
                 config[MMA_DAG_KEY] = MMA_DAG_OFF
                 config[MMA_DAG_WARPS_KEY] = MMA_DAG_DEFAULT_WARPS

@@ -432,6 +432,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "helion_flash_bwd",
                     "gathered_mma_tma",
                     "block_scaled_mma",
+                    "helion_mma_dag_tma",
                 }
                 for plan in self.cute_wrapper_plans
             )
@@ -3029,6 +3030,8 @@ def _generate_ast(
                         "epi_aux1_name",
                         "epi_aux2_name",
                         "epi_aux3_name",
+                        # cute_mma_dag tcgen05 tensor maps (one per operand).
+                        *(f"tma{index}_name" for index in range(8)),
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))
