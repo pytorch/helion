@@ -984,18 +984,7 @@ def _detect_attention_bwd_mma_loop(
     root_block_id = device_ir.grid_block_ids[0][0]
     if len(block_ids) != 1 or block_ids[0] == root_block_id:
         return False
-    if config.pid_type != "flat":
-        return False
-    if any(grouping != 1 for grouping in config.l2_groupings):
-        return False
-    if any(order != [*range(len(order))] for order in config.loop_orders):
-        return False
-    if any(thread_count != 0 for thread_count in config.num_threads):
-        return False
-    cute_vector_widths = config.config.get("cute_vector_widths", [])
-    if isinstance(cute_vector_widths, list) and any(
-        width != 1 for width in cute_vector_widths
-    ):
+    if not _attention_config_envelope_ok(config):
         return False
     bm = env.block_sizes[block_ids[0]].from_config(config)
     bn = env.block_sizes[root_block_id].from_config(config)
@@ -1056,8 +1045,11 @@ def _detect_flex_attention_bwd_loop(
 def _attention_config_envelope_ok(config: Config) -> bool:
     """The fused flash bodies emit their own program mapping and own the
     whole CTA: only the flat pid with no reordering, no L2 grouping, no
-    explicit thread counts and no lane vectors is valid."""
+    explicit thread counts, no lane vectors and no epilogue subtiling (the
+    store split rewrites the graphs the matchers read) is valid."""
     if config.pid_type != "flat":
+        return False
+    if config.config.get("epilogue_subtile"):
         return False
     if any(grouping != 1 for grouping in config.l2_groupings):
         return False

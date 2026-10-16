@@ -25,6 +25,7 @@ pytest.importorskip("cutlass.cute")
 from test._cute_aux import _cpu_codegen
 
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.backend import _attention_config_envelope_ok
 from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
 from helion._compiler.cute.flex_bwd_match import FlexBwdMatch
 from helion._compiler.cute.flex_bwd_match import match_flex_attention_bwd
@@ -219,6 +220,12 @@ def test_causal_mask_plan_and_surface() -> None:
     # The polynomial exp2 share is offered (the example runs fast_math) but
     # starts at 0 (every element on MUFU).
     assert config.config["cute_flash_bwd_exp2_emu"] == 0
+    # The fused body owns its epilogue: the store-split knob is not searched
+    # (its graph rewrite would defeat the matcher) and its envelope rejects it.
+    assert "epilogue_subtile" not in spec._flat_fields()
+    subtiled = spec.default_config()
+    subtiled.config["epilogue_subtile"] = 2
+    assert not _attention_config_envelope_ok(subtiled)
 
 
 def test_runtime_scale_and_grouped_heads() -> None:
