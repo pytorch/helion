@@ -26,6 +26,30 @@ if TYPE_CHECKING:
 #: K is unaffected, verified up to 512.
 _MAX_MPP_TILE_EXTENT = 128
 
+#: (accumulator dtype, output dtype) pairs that take the mixed-dtype store
+#: path (masked per-element convert-and-store loop, see
+#: ``_metal_mpp_scalar_store``) instead of the ``_coop.store`` fast path,
+#: beyond the trivial acc == out case.  Each pair needs on-device proof that
+#: the loop conversion is a single round-to-nearest cast matching the
+#: epilogue ``static_cast`` semantics (half -> float is exact, so the
+#: epilogue cast plus the store narrowing compose into one cast).  Extend
+#: only with a passing mixed-dtype device test.
+_MPP_MIXED_ACC_OUT_DTYPES: frozenset[tuple[torch.dtype, torch.dtype]] = frozenset(
+    {(torch.float32, torch.float16)}
+)
+
+
+def _is_mixed_acc_out_store(
+    acc_dtype: torch.dtype | None, out_dtype: torch.dtype | None
+) -> bool:
+    """Whether (acc, out) takes the mixed-dtype scalar store path."""
+    return (
+        acc_dtype is not None
+        and out_dtype is not None
+        and acc_dtype != out_dtype
+        and (acc_dtype, out_dtype) in _MPP_MIXED_ACC_OUT_DTYPES
+    )
+
 
 @dataclasses.dataclass(frozen=True)
 class _MPPOperandLayout:
@@ -312,13 +336,19 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         assert self.out_dtype is not None
         from ..backend import MetalBackend
 
-        # 4. Store the cooperative tensor to HBM.
+        # 4. Store the cooperative tensor to HBM.  Mixed acc/out pairs cannot
+        # use the cooperative store (it requires matching dtypes), so they
+        # take a masked per-element convert-and-store loop instead.
         out_name = codegen.device_function.tensor_arg(self.out_tensor).name
         codegen.device_function.placeholder_args.add(out_name)
         out_dtype = MetalBackend._get_dtype_to_metal()[self.out_dtype]
+        if _is_mixed_acc_out_store(self.acc_dtype, self.out_dtype):
+            store_marker = "_metal_mpp_scalar_store"
+        else:
+            store_marker = "_metal_mpp_coop_store"
         codegen.add_statement(
             statement_from_string(
-                f'_metal_mpp_coop_store({setup_var}, "{out_name}", "{out_dtype}")'
+                f'{store_marker}({setup_var}, "{out_name}", "{out_dtype}")'
             )
         )
         if emit_store_barrier and self.needs_store_barrier:
@@ -409,11 +439,27 @@ class MPPGraphInfo(NodeArgsGraphInfo):
                 f"unsupported accumulator dtype for MPP matmul: {acc_dtype}",
             )
         assert acc_dtype is not None
-        if self.out_dtype is not None and acc_dtype != self.out_dtype:
+        if (
+            self.out_dtype is not None
+            and acc_dtype != self.out_dtype
+            and not _is_mixed_acc_out_store(acc_dtype, self.out_dtype)
+        ):
             raise exc.BackendUnsupported(
                 "metal",
                 "MPP cooperative store requires accumulator dtype to match output "
                 f"dtype; got accumulator {acc_dtype} and output {self.out_dtype}",
+            )
+        if (
+            _is_mixed_acc_out_store(acc_dtype, self.out_dtype)
+            and self.bias_tensor is not None
+            and self.bias_tensor.dtype != acc_dtype
+        ):
+            # The bias preload (coop.load) also requires matching dtypes, so a
+            # mixed store with a foreign-dtype bias cannot compile.
+            raise exc.BackendUnsupported(
+                "metal",
+                "MPP mixed accumulator/output dtype with bias dtype "
+                f"{self.bias_tensor.dtype}; bias must match the accumulator",
             )
         assert self.lhs_tensor.ndim == 2 and self.rhs_tensor.ndim == 2
         assert self.lhs_tensor.dtype == self.rhs_tensor.dtype
