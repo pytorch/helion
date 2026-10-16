@@ -1951,6 +1951,11 @@ class ConfigSpec:
     def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
             return False
+        # Subtiled stores are forced onto tensor descriptors below; a
+        # clamp-masked-offset backend cannot guarantee masked accesses there,
+        # so it does not get the epilogue-subtile search space at all.
+        if self.backend.clamp_masked_pointer_offsets():
+            return False
         return supports_tensor_descriptor()
 
     def fix_epilogue_subtile_store_indexing(self, config: dict[str, object]) -> None:
@@ -1958,6 +1963,8 @@ class ConfigSpec:
         if (
             not self.epilogue_subtile_candidate_enabled
             or "epilogue_subtile" not in config
+            # Clamp-masked-offset backends keep pointer stores (see above).
+            or self.backend.clamp_masked_pointer_offsets()
         ):
             return
         indexing = config.get("indexing")
@@ -2016,6 +2023,12 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # Clamp-masked-offset backends only guarantee masked accesses on the
+        # pointer strategy; restrict the search space here so the flag's
+        # contract holds by construction instead of relying on backend
+        # authors to also override the other capability hooks.
+        if self.backend.clamp_masked_pointer_offsets():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -2024,6 +2037,8 @@ class ConfigSpec:
 
     def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if self.backend.clamp_masked_pointer_offsets():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
@@ -5892,6 +5907,23 @@ class ConfigSpec:
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
+        if not self.backend.supports_num_threads_deferral():
+            # Reject a deferred None uniformly at the config boundary; autotune
+            # generation passes _fix_invalid and gets the default instead.
+            for name, default in (
+                ("num_warps", DEFAULT_NUM_WARPS),
+                ("num_stages", self._default_num_stages()),
+            ):
+                if self.supports_config_key(name) and config.get(name) is None:
+                    if _fix_invalid:
+                        config[name] = default
+                    else:
+                        raise InvalidConfig(
+                            f"the {self.backend_name!r} backend requires an "
+                            f"explicit {name} ({name}=None deferral is only "
+                            "supported by backends that defer to the triton "
+                            "driver)"
+                        )
         if self.supports_config_key("host_tensor_descriptors"):
             value = config.setdefault("host_tensor_descriptors", False)
             if type(value) is not bool:
@@ -5932,6 +5964,25 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if self.backend.clamp_masked_pointer_offsets():
+            # The search space is already restricted to "pointer"
+            # (valid_indexing_types); this closes the gap for configs spelled
+            # out by hand, so the flag's contract holds for them too.
+            for name in ("indexing", "atomic_indexing"):
+                values = config.get(name)
+                if not values:
+                    continue
+                items = values if isinstance(values, list) else [values]
+                if all(item == "pointer" for item in items):
+                    continue
+                if _fix_invalid:
+                    config[name] = ["pointer"] * len(items)
+                else:
+                    raise InvalidConfig(
+                        f"{name}={values!r}: the {self.backend_name!r} backend "
+                        "requires the pointer indexing strategy "
+                        "(clamp_masked_pointer_offsets)"
+                    )
         if config.get("host_tensor_descriptors"):
             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
             uses_tensor_descriptor = any(

@@ -188,9 +188,15 @@ def _parse_statement(template: str) -> ast.stmt:
     return statement
 
 
-def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
+def statements_from_string(template: str, **placeholders: ast.AST) -> list[ast.stmt]:
     """
-    Create an AST statement from a template string with placeholders.
+    Create a list of AST statements from a template string with placeholders.
+
+    Parses a *block* of statements (e.g. a ``for`` loop with its indented
+    body, or several statements) and returns the list of statements.
+
+    Deliberate API surface for out-of-tree backend code generators emitting
+    multi-statement blocks; in-tree codegen uses ``statement_from_string``.
 
     Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
     This supports two common patterns:
@@ -233,7 +239,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     modified_template = re.sub(pattern, make_unique, template)
 
     # Parse the modified template into an AST
-    statement = _parse_statement(modified_template)
+    statements = ast.parse(modified_template).body
 
     # Second pass: Recursively walk the AST and replace __placeholder_N__ identifiers
     # with the actual AST nodes provided by the user
@@ -263,7 +269,18 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
         )
 
     # Apply the second pass transformation to replace all placeholders
-    return _replace(statement)
+    return [_replace(statement) for statement in statements]
+
+
+def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
+    """
+    Create a single AST statement from a template string with placeholders.
+
+    Like :func:`statements_from_string` but for exactly one statement; see
+    that function for the {placeholder} syntax and f-string escaping rules.
+    """
+    (statement,) = statements_from_string(template, **placeholders)
+    return statement
 
 
 def expr_from_string(template: str, **placeholders: ast.AST) -> ast.AST:

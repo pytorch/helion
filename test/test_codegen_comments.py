@@ -2,10 +2,32 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from helion._compiler.ast_extension import create
+from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.ast_extension import statements_from_string
 from helion._compiler.ast_extension import unparse
 from helion._compiler.source_location import SourceLocation
+
+
+def test_statements_from_string_parses_statement_blocks() -> None:
+    stmts = statements_from_string("x = 1\ny = x + 1\nif y:\n    z = 2")
+    assert isinstance(stmts[0], ast.Assign)
+    assert isinstance(stmts[1], ast.Assign)
+    assert isinstance(stmts[2], ast.If)
+
+    # Placeholders are replaced in every statement of the block.
+    placeholder = expr_from_string("q")
+    stmts = statements_from_string("a = {v}\nb = a", v=placeholder)
+    assert isinstance(stmts[0].value, ast.Name)
+    assert stmts[0].value.id == "q"
+
+    # The single-statement variant enforces its exactly-one contract:
+    # a two-statement block does not unpack.
+    with pytest.raises(ValueError):
+        statement_from_string("x = 1\ny = 2")
 
 
 def test_unparse_inserts_source_location_comments(tmp_path) -> None:
