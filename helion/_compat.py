@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Protocol
 from typing import cast
 
 from packaging import version
@@ -640,6 +641,127 @@ def _supports_maxnreg() -> bool:
         and torch.version.xpu is None
         and torch.cuda.is_available()
     )
+
+
+class _BenchmarkCacheDriver(Protocol):
+    """Structural type of a triton driver with the L2-flush primitives."""
+
+    def clear_cache(self, cache: object) -> None: ...
+
+    def get_empty_cache_for_benchmark(self) -> object: ...
+
+
+# Most-recent (driver, device, buffer) slot, not a cache. The driver is
+# identity-compared (test doubles may be unhashable); the buffer is
+# reallocated on device change (get_empty_cache_for_benchmark() allocates on
+# the current device). Unsynchronized by design — assumes one benchmarking
+# writer per process; a second writer could free the buffer while a captured
+# flush-only CUDA graph still references it.
+_flush_cache_state: list[tuple[object, object, object]] = []
+
+
+def _current_flush_device(driver: object) -> object:
+    # Prefer the driver's own notion of the current device: it tracks
+    # non-CUDA accelerators too, while torch's CUDA query is unavailable on
+    # CUDA-less machines and would collapse the per-(driver, device) keying
+    # to a single slot.
+    get_current_device = getattr(driver, "get_current_device", None)
+    if get_current_device is not None:
+        return get_current_device()
+    return torch.cuda.current_device() if torch.cuda.is_available() else None
+
+
+def _driver_flush_cache(driver: object) -> object:
+    """Allocate the flush buffer once per (driver, device), not per iteration.
+
+    ``get_empty_cache_for_benchmark()`` allocates a large buffer on the current
+    device; allocating it on every call would pay the first allocation inside
+    a timed estimate loop, and a single buffer shared across devices would
+    flush the wrong one. The buffer stays alive until the slot is reassigned;
+    switching drivers or devices reallocates (see ``_flush_cache_state``).
+    """
+    device = _current_flush_device(driver)
+    if (
+        not _flush_cache_state
+        or _flush_cache_state[0][0] is not driver
+        or _flush_cache_state[0][1] != device
+    ):
+        # The runtime driver object (triton's LazyProxy or a test double)
+        # forwards attribute access; the Protocol is the structural contract.
+        cache_driver = cast("_BenchmarkCacheDriver", driver)
+        _flush_cache_state[:] = [
+            (driver, device, cache_driver.get_empty_cache_for_benchmark())
+        ]
+    return _flush_cache_state[0][2]
+
+
+def make_cache_clearer(driver: object) -> Callable[[], None] | None:
+    """Bind an L2-flush callable to ``driver``, or return None without the primitives.
+
+    This is the single driver-capability probe for the L2 flush: both
+    ``safe_clear_cache()`` and the autotuner's benchmark paths go through it,
+    so a driver is judged by one contract. The flush buffer is allocated
+    eagerly (at binding time, before any timed loop) through the shared
+    per-(driver, device) slot, so the first flush never pays the allocation
+    inside a timed window and all callers share one buffer.
+    """
+    if not hasattr(driver, "clear_cache") or not hasattr(
+        driver, "get_empty_cache_for_benchmark"
+    ):
+        return None
+    _driver_flush_cache(driver)
+
+    def clear() -> None:
+        cast("_BenchmarkCacheDriver", driver).clear_cache(_driver_flush_cache(driver))
+
+    return clear
+
+
+def active_cache_clearer() -> Callable[[], None] | None:
+    """Resolve the active Triton driver and bind a cache clearer to it.
+
+    The single driver-resolution gate for the L2 flush: an environment whose
+    active driver cannot be resolved at all (no Triton, CPU-only, or several
+    competing accelerators) yields None, as does a driver without the flush
+    primitives — so both the event benches (via safe_clear_cache) and the
+    generic wall-clock benches flush on one capability contract.
+    """
+    try:
+        from triton import runtime
+
+        driver = runtime.driver.active
+        # driver.active is triton's LazyProxy: the resolution that raises
+        # RuntimeError (no active driver, or several competing ones) happens
+        # on the first attribute access, so the capability probes below — not
+        # the attribute read above — are where an unresolvable driver fails.
+        resolvable = hasattr(driver, "clear_cache") and hasattr(
+            driver, "get_empty_cache_for_benchmark"
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        # Triton missing, or its driver cannot be resolved: benchmarking
+        # proceeds without the L2 flush.
+        return None
+    if not resolvable:
+        return None
+    # The eager buffer allocation stays outside the gate: an OOM raised while
+    # binding the flush buffer is a real failure and must propagate.
+    return make_cache_clearer(driver)
+
+
+def safe_clear_cache() -> None:
+    """Clear the benchmark cache when the active Triton driver supports it.
+
+    The CUDA driver exposes ``clear_cache``/``get_empty_cache_for_benchmark``
+    for L2 flushes between timed runs; out-of-tree Triton drivers for other
+    targets may not. A driver without the primitive — or an environment whose
+    active driver cannot be resolved at all (CPU-only, or several competing
+    accelerators) — makes this a silent no-op, so timing simply measures a
+    warmer L2. Failures of the flush itself (e.g. an OOM allocating the flush
+    buffer) are not hidden; they propagate to the caller.
+    """
+    clearer = active_cache_clearer()
+    if clearer is not None:
+        clearer()
 
 
 def fp8_block_ptr_padding_broken() -> bool:
