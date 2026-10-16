@@ -67,6 +67,8 @@ from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .merge_reduction_dims import chain_reduction_dims
+from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
@@ -166,6 +168,13 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    for op in (
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.mean.dim,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+    ):
+        decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
 
 
@@ -3450,6 +3459,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        merged_rdims = merge_reduction_dims(device_ir.graphs)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions
@@ -3564,6 +3574,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
+        if merged_rdims and CompileEnvironment.current().backend.name == "cute":
+            # Merged dims can leave their per-dim rdims unused.  Stop treating
+            # them as reductions, or CuTe would give each a reduction strategy
+            # (claiming a thread axis) and tuning slots, and its seed
+            # heuristics would count them.
+            # Only rdims nothing uses are demoted: a later slice of the same
+            # extent would come from a subscript that kept the rdim in use.
+            from .cute.active_blocks import unused_block_ids
+
+            for block_id in unused_block_ids(device_ir.graphs, merged_rdims):
+                CompileEnvironment.current().block_sizes[block_id].reduction = False
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
