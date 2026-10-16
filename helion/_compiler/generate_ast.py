@@ -3031,7 +3031,7 @@ def _generate_ast(
                         "epi_aux2_name",
                         "epi_aux3_name",
                         # cute_mma_dag tcgen05 tensor maps (one per operand).
-                        *(f"tma{index}_name" for index in range(8)),
+                        *(f"tma{index}_name" for index in range(16)),
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))

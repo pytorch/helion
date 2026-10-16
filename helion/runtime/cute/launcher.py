@@ -740,7 +740,7 @@ def _append_cute_wrapper_plan(
         # as grid constants after the ordinary arguments.  The launch keeps
         # the generic flat grid.
         count = plan_int("tma_count")
-        if count <= 0 or count > 8:
+        if count <= 0 or count > 16:
             raise exc.BackendUnsupported("cute", "invalid mma_dag tensor-map count")
         tma_params: list[str] = []
         for index in range(count):

@@ -1345,7 +1345,7 @@ def test_delta_state_kernels_are_admitted_with_their_axes() -> None:
     assert spec.block_sizes.block_id_lookup(1).min_size == 1
     with bound.env, pytest.raises(InvalidConfig, match="cute_mma_dag"):
         spec.normalize(dict(_config(4, warps=4, stages=2).config))
-    assert spec.default_config().config["cute_mma_dag"] == "warp"
+    assert spec.default_config().config["cute_mma_dag"] == "tcgen05"
     dstate = _bind_dstate().config_spec.cute_mma_dag_facts
     assert dstate is not None
     assert [(a.kind, a.extent) for a in dstate.axes] == [
@@ -1376,7 +1376,7 @@ def test_delta_state_kernels_are_admitted_when_d_equals_c() -> None:
             ("root", 64),
             ("rdim", 64),
         ]
-        assert bound.config_spec.default_config().config["cute_mma_dag"] == "warp"
+        assert bound.config_spec.default_config().config["cute_mma_dag"] == "tcgen05"
     bound = _bind_fwd_h_delta(d=64, dv=64)
     program = _program(bound)
     dot1 = program.steps[1]
@@ -1691,7 +1691,12 @@ def test_delta_seeds_prefer_exchange_free_warps_then_the_budget_warps() -> None:
     assert facts_gated is not None and facts_gated.loop_passes == 1
     seeds = [(s[0][1], s[1], s[2]) for s in dag.mma_dag_seed_configs(facts_gated)]
     assert seeds[:4] == [(32, 8, 4), (32, 8, 2), (32, 4, 4), (32, 4, 2)]
-    assert gated.config_spec.default_config().config["cute_mma_dag_warps"] == 8
+    first_warp = next(
+        c.config
+        for c in gated.config_spec.compiler_seed_configs
+        if c.config["cute_mma_dag"] == "warp"
+    )
+    assert first_warp["cute_mma_dag_warps"] == 8
     # The route-aware shared-memory estimate: at bdv 128 both B operands
     # come from registers at eight warps, so no exchange tile is charged
     # and two stages fit (the tiles alone would not).
@@ -1709,24 +1714,35 @@ def test_delta_seeds_prefer_exchange_free_warps_then_the_budget_warps() -> None:
     seeds = [(s[0][1], s[1], s[2]) for s in dag.mma_dag_seed_configs(facts)]
     assert seeds[0] == (32, 8, 2)
     assert all(warps == 8 for _bdv, warps, _stages in seeds)
+    # dstate's promoted default is the tensor-memory mode; the first warp
+    # seed carries the budget warps.
     default = dstate.config_spec.default_config().config
-    assert default["block_sizes"] == [32] and default["cute_mma_dag_warps"] == 8
+    assert default["block_sizes"] == [32] and default["cute_mma_dag"] == "tcgen05"
+    first_warp = next(
+        c.config
+        for c in dstate.config_spec.compiler_seed_configs
+        if c.config["cute_mma_dag"] == "warp"
+    )
+    assert first_warp["block_sizes"] == [32] and first_warp["cute_mma_dag_warps"] == 8
 
 
 def test_fp32_snapshots_seed_the_direct_store_path() -> None:
     # bwd_dh snapshots the fp32 carry: 8-byte pairs either way, so the
     # direct pair stores skip the staging round trip; fwd_h's bf16
     # snapshot keeps the 16-byte packets of the staging tile.
+    # The tensor-memory default stages its snapshots (the TMEM rows are
+    # packed into the staging tile either way).
     bwd = _bind_bwd().config_spec
-    assert bwd.default_config().config["cute_mma_dag_store"] == "direct"
-    assert all(
-        c.config["cute_mma_dag_store"] == "direct"
+    assert bwd.default_config().config["cute_mma_dag_store"] == "staged"
+    warp_seeds = [
+        c.config
         for c in bwd.compiler_seed_configs
         if c.config.get("cute_mma_dag") == "warp"
-    )
+    ]
+    assert warp_seeds and all(c["cute_mma_dag_store"] == "direct" for c in warp_seeds)
     fwd = _bind_fwd().config_spec
     assert fwd.default_config().config["cute_mma_dag_store"] == "staged"
-    body = _kernel_body(_source(_bind_bwd(), bwd.default_config()))
+    body = _kernel_body(_source(_bind_bwd(), helion.Config(**warp_seeds[0])))
     assert f"{RT}.stg_v2_f32(" in body and f"{RT}.stg_v4_b32(" not in body
 
 
@@ -2818,7 +2834,7 @@ def test_dk_is_admitted_with_hoisted_operands_and_a_loaded_accumulator() -> None
     bound = _bind_dk()
     spec = bound.config_spec
     assert spec.cute_mma_dag is not None
-    assert spec.cute_mma_dag.choices == ("off", "warp")
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
     assert [(b, hi) for b, _lo, hi in _block_bounds(spec)] == [(2, 128)]
     program = _program(bound)
     assert len(program.loops) == 1 and program.loops[0].innermost
@@ -2831,7 +2847,8 @@ def test_dk_is_admitted_with_hoisted_operands_and_a_loaded_accumulator() -> None
     assert all(not program.is_ring(dot, dot.a) for dot in program.dots)
     assert all(program.is_ring(dot, dot.b) for dot in program.dots)
     facts = spec.cute_mma_dag_facts
-    assert facts is not None and facts.tcgen05 is None
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions
     assert [tile.frame for tile in facts.tiles] == [-1, 0, -1, 0, 0]
     assert [tile.ring for tile in facts.tiles] == [False, True, False, True, True]
     body = _kernel_body(_source(bound, _config(32, warps=4, stages=2)))
@@ -2888,7 +2905,8 @@ def test_dqkw_is_admitted_as_a_three_level_nest() -> None:
     (derived,) = program.derived
     assert len(derived.frags) == 2 and derived.slot == program.loops[2].carries[0].slot
     facts = spec.cute_mma_dag_facts
-    assert facts is not None and facts.tcgen05 is None
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions
     assert facts.loops == (
         dag.LoopFacts(-1, True),
         dag.LoopFacts(-1, False),
@@ -3013,7 +3031,8 @@ def test_wy_dl_is_admitted_with_vector_carries_and_row_reductions() -> None:
     # ``dA * kk`` takes over dA's.
     assert [d.slot for d in program.derived] == [1, 2, 4]
     facts = spec.cute_mma_dag_facts
-    assert facts is not None and facts.tcgen05 is None
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions
     assert len(facts.vecs) == 4 and facts.vecs[0].frags == (1, 2, 4)
     # Register budget: the vector words count (two per lane at four warps).
     resolved = [32, 32, 128, 1, 64]
@@ -3085,7 +3104,8 @@ def test_gated_dqkw_adds_scalar_reductions_and_a_two_dim_loop() -> None:
     reduces = [r.orient for r in program.reduces]
     assert reduces == ["rows", "rows", "rows", "scalar", "rows", "scalar"]
     facts = spec.cute_mma_dag_facts
-    assert facts is not None and facts.tcgen05 is None
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions
     assert [v.orient for v in facts.vecs].count("scalar") == 4
     body = _kernel_body(_source(bound, _config(32, 32, 32, 32, 32, warps=4, stages=2)))
     # The 2-D loop walks 4 x 4 tiles, the last axis fastest.
@@ -3162,7 +3182,8 @@ def test_wy_runs_the_neumann_chain_on_tf32_mmas() -> None:
         torch.float32
     ] * 4
     facts = bound.config_spec.cute_mma_dag_facts
-    assert facts is not None and facts.tcgen05 is None
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions and facts.tcgen05.tf32
     # fp32 fragments bind whole-K words only when the producer is the dot's
     # own accumulator (T feeding dot(Apow, T, acc=T)); the exchange knob
     # has a subject (the chain's shuffle routes).
@@ -4174,6 +4195,18 @@ def _single_ring_noacc(a: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _single_ring_bare(a: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Control: the bare acc accumulates in place."""
+    BHN, N, C = a.size(0), a.size(1), hl.specialize(a.size(2))
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=a.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        T = t[tile_bhn, :, :].to(torch.float32)
+        for i in range(N):
+            T = hl.dot(a[tile_bhn, i, :, :], T.to(torch.bfloat16), acc=T)
+        out[tile_bhn, :, :] = T
+    return out
+
+
 def _root_rescaled_carry(k: torch.Tensor) -> torch.Tensor:
     """A root-region dot over the K loop's own carry with a rescaled acc:
     ``dot(kk, kk, acc=kk * 0.5)``."""
@@ -4186,6 +4219,35 @@ def _root_rescaled_carry(k: torch.Tensor) -> torch.Tensor:
             kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
         T2 = hl.dot(kk.to(torch.bfloat16), kk.to(torch.bfloat16), acc=kk * 0.5)
         out[tile_bhn, :, :] = T2
+    return out
+
+
+def _gen_epi(a: torch.Tensor, t: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """A program-order loop (the carry is the B operand) and an epilogue
+    reading a decay row."""
+    BHN, N, C = a.size(0), a.size(1), hl.specialize(a.size(2))
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=a.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        T = t[tile_bhn, :, :].to(torch.float32)
+        for i in range(N):
+            T = hl.dot(a[tile_bhn, i, :, :], T.to(torch.bfloat16), acc=T)
+        gv = g[tile_bhn, :]
+        out[tile_bhn, :, :] = T * torch.exp2(gv)[:, :, None]
+    return out
+
+
+def _gen_epi_stored(a: torch.Tensor, t: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """``_gen_epi`` whose decay row is a row of a tensor the epilogue stores
+    first."""
+    BHN, N, C = a.size(0), a.size(1), hl.specialize(a.size(2))
+    out = torch.empty([BHN, C, C], dtype=torch.float32, device=a.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        T = t[tile_bhn, :, :].to(torch.float32)
+        for i in range(N):
+            T = hl.dot(a[tile_bhn, i, :, :], T.to(torch.bfloat16), acc=T)
+        g[tile_bhn, :, :] = T
+        gv = g[tile_bhn, 0, :]
+        out[tile_bhn, :, :] = T * torch.exp2(gv)[:, :, None]
     return out
 
 

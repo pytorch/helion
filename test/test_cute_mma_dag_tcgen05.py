@@ -8,29 +8,56 @@ and fixture this file reuses.  Runtime coverage lives in
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import os
 import re
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
+from test.test_cute_mma_dag import _bind
 from test.test_cute_mma_dag import _bind_bwd
+from test.test_cute_mma_dag import _bind_dk
 from test.test_cute_mma_dag import _bind_dqk
+from test.test_cute_mma_dag import _bind_dqkw
+from test.test_cute_mma_dag import _bind_dstate
 from test.test_cute_mma_dag import _bind_dv
+from test.test_cute_mma_dag import _bind_fn
 from test.test_cute_mma_dag import _bind_fwd
+from test.test_cute_mma_dag import _bind_fwd_h_delta
 from test.test_cute_mma_dag import _bind_fwd_o
+from test.test_cute_mma_dag import _bind_wy
+from test.test_cute_mma_dag import _bind_wy_dl
+from test.test_cute_mma_dag import _gen_epi
+from test.test_cute_mma_dag import _gen_epi_stored
 from test.test_cute_mma_dag import _kernel_body
+from test.test_cute_mma_dag import _program
+from test.test_cute_mma_dag import _root_rescaled_carry
+from test.test_cute_mma_dag import _single_ring
+from test.test_cute_mma_dag import _single_ring_bare
+from test.test_cute_mma_dag import _single_ring_noacc
 from test.test_cute_mma_dag import _source
+from test.test_cute_mma_dag import _tensors
+from test.test_cute_mma_dag import _tensors3
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 
 import helion
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute import cute_mma_dag_tcgen05 as tc
+from helion._compiler.cute import cute_mma_dag_tcgen05_regions as regions
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Sequence
+
+    from helion.runtime.kernel import BoundKernel
 
 pytestmark = [
     skipUnlessBackends(["cute"]),
@@ -181,18 +208,70 @@ def test_k_loop_config_reasons() -> None:
     assert reason is not None and "no swizzled UMMA layout" in reason
 
 
-def test_chained_loop_accumulators_stay_on_the_warp_mode() -> None:
-    # The loop issues an iteration's dots together: a dot accumulating onto
-    # an earlier loop dot's result needs the warp mode's program-order body.
-    from test.test_cute_mma_dag import _bind_fn
-    from test.test_cute_mma_dag import _tensors
+def test_chained_loop_accumulators_split_the_iteration_into_batches() -> None:
+    # ``x = dot(acc=h); x_all[...] = x; h = dot(acc=h * 0.5)``: x copies the
+    # carry into its own slot before the first batch, its store and the
+    # rescale of the carry wait for that batch's commit, the second batch
+    # commits to acc_ready.
+    from test.test_cute_mma_dag import _loop_chain
     from test.test_cute_mma_dag import _two_dots_same_carry
 
     t = _tensors()
-    spec = _bind_fn(_two_dots_same_carry, (t["k"], t["v"])).config_spec
+    bound = _bind_fn(_two_dots_same_carry, (t["k"], t["v"]))
+    spec = bound.config_spec
     assert spec.cute_mma_dag is not None
-    assert spec.cute_mma_dag.choices == ("off", "warp")
-    assert spec.default_config().config["cute_mma_dag"] == "warp"
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    loop = _loop(body)
+    assert loop.count(f"{P}.tcgen05_commit(md_stepb") == 1
+    assert loop.count(f"{P}.tcgen05_commit(md_accb") == 1
+    _assert_in_order(
+        loop,
+        [
+            f"{P}.tcgen05_ld(",
+            f"{P}.tcgen05_st(",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_stepb",
+            f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)",
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(md_srow",
+            f"{P}.tcgen05_st(",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_accb",
+            f"{WARP_RT}.stg_v4_b32(",
+        ],
+    )
+    # Without the store (``h = dot(acc=dot(acc=h) * 0.5)``, x in the carry's
+    # slot) the rescale still sits between the two batches: the simple loop
+    # would rescale the carry before both dots.
+    bound = _bind_fn(_loop_chain, (t["k"], t["v"]))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.general_loop
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    loop = _loop(body)
+    assert f"{P}.mbarrier_init(md_stepb, 1)" in body
+    assert loop.count(f"{P}.tcgen05_commit(md_stepb") == 1
+    assert loop.count(f"{P}.tcgen05_commit(md_accb") == 1
+    assert loop.count(f"{P}.tcgen05_st(") == 1 and "md_tmem + 0" in loop
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_accb, md_parity ^ 1)",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_stepb",
+            f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)",
+            f"{P}.tcgen05_ld(",
+            f"{P}.tcgen05_st(",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_accb",
+        ],
+    )
+    assert loop.count(f"{P}.tcgen05_mma(") == 4 + 4
 
 
 def _facts() -> dag.CuteMmaDagFacts:
@@ -248,7 +327,7 @@ def test_geometry_helpers() -> None:
         256,
     ]
     facts = _facts()
-    assert facts.tcgen05 is not None
+    assert facts.tcgen05 is not None and not facts.tcgen05.general_loop
     # 64 x 64 bf16 operand tiles: two 8 KB slabs per stage.
     assert tc.tcgen05_stage_bytes(facts.tcgen05, [1, 64, 64, 64]) == 16384
     assert tc.tcgen05_stage_bytes(facts.tcgen05, [1, 128, 128, 64]) == 32768
@@ -446,7 +525,7 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     assert "if md_i + 1 < 8:" in loop[:refill]
     assert loop.count(f"{WARP_RT}.ldg_f32(") == 3
     # 512 packets over 256 threads, plus the staging packets.
-    assert loop.count(f"{WARP_RT}.sts_v4_b32(") == 2 + 8
+    assert loop.count(f"{WARP_RT}.sts_v4_b32(") == 2 + 4
     # The leaves stay fp32 and the pack rounds once: no per-element casts
     # (the per-row decay keeps its own rounding, once per packet).
     assert loop[wait:fence].count("cutlass.BFloat16(") <= 2
@@ -473,7 +552,7 @@ def test_renders_the_reversed_scaled_backward_with_fp32_stores() -> None:
     assert "cutlass.Int32(7 + -1 * (md_i + 3))" in loop
     assert "cutlass.Int64(7 + -1 * md_i)" in loop
     # fp32 snapshots: 16 packets per row into a 16 KB staging buffer.
-    assert loop.count(f"{RT}.sts_v4_f32(") == 16
+    assert loop.count(f"{RT}.sts_v4_f32(") == 8
     assert "md_s0 + 65536 + md_parity * 16384" in loop
     assert loop.count(f"{WARP_RT}.stg_v4_b32(") == 8
     # q * scale is an in-place rewrite of the landed tile (two packets per
@@ -540,7 +619,6 @@ def test_renders_the_k_loop_epilogue_through_an_exchange_tile() -> None:
         f"{RT}.mbar_wait(md_efull, 0)",
         "if md_epi:",
         f"{P}.tcgen05_ld(",
-        "if md_rowok:",
         f"{WARP_RT}.sts_v4_b32(md_s0 + 131072 + md_row64 * 128",
         "cute.arch.fence_proxy(kind='async.shared', space='cta')",
         f"{P}.tcgen05_fence({P}.Tcgen05Fence.BEFORE_THREAD_SYNC)",
@@ -557,8 +635,9 @@ def test_renders_the_k_loop_epilogue_through_an_exchange_tile() -> None:
         f"{P}.tcgen05_dealloc(md_acc0, 256,",
     ]
     _assert_in_order(epilogue, order)
+    # Every lane holds half a row (16x32bx2): four packets per thread.
     exchange = epilogue[: epilogue.index("cute.arch.fence_proxy(")]
-    assert exchange.count(f"{WARP_RT}.sts_v4_b32(") == 8
+    assert exchange.count(f"{WARP_RT}.sts_v4_b32(") == 4
     assert epilogue.count(f"{P}.tcgen05_mma(") == 4
     assert "md_idesc2, True)" in epilogue
     assert epilogue.count(f"{P}.tcgen05_commit(md_eacc") == 1
@@ -567,6 +646,49 @@ def test_renders_the_k_loop_epilogue_through_an_exchange_tile() -> None:
     assert epilogue.count(f"{WARP_RT}.stg_v4_b32(") == 8
     assert "cutlass.BFloat16(" not in epilogue
     assert f"{P}.tcgen05_st(" not in epilogue
+
+
+def test_gated_epilogue_side_loads_go_out_under_the_last_mmas() -> None:
+    # fwd_o with decay: the exchange's ``exp2((gc_i - gc_j) * RCP_LN2)`` and
+    # the o_cross rescale's ``exp2(gc_i * RCP_LN2)`` read the chunk's decay
+    # row per element.  The thread's row value and its 32 half-row column
+    # values take one register each, defined ahead of the loop and loaded
+    # in the last iteration between the MMA issue and the accumulator wait
+    # (the drain after a one-trip loop is immediate: loads issued there
+    # stall the epilogue's first subtraction for a memory round trip); the
+    # epilogue issues no global load of its own and the exchange and the
+    # rescale share the row register.
+    body = _kernel_body(
+        _source(_bind_fwd_o(True), _config(1, 128, 128, warps=4, stages=1))
+    )
+    prologue, rest = body.split("for md_i in cutlass.range(0, 1):", 1)
+    loop, epilogue = rest.split(f"{RT}.mbar_wait(md_accb, 1 - 0 - 1 & 1)", 1)
+    assert [line.strip() for line in prologue.splitlines() if "md_ex" in line] == [
+        f"md_ex{i} = cutlass.Float32(0.0)" for i in range(33)
+    ]
+    issue, wait = loop.split(f"{RT}.mbar_wait(md_accb, md_parity)", 1)
+    assert f"{P}.tcgen05_commit(md_accb" in issue and "md_ex" not in wait
+    guarded = issue.split("if md_i + 1 == 1:", 1)[1]
+    loads = [line.strip() for line in guarded.splitlines() if line.strip()]
+    assert len(loads) == 33
+    assert re.fullmatch(
+        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
+        loads[0],
+    )
+    assert re.fullmatch(
+        rf"md_ex1 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_cb1 \+ 0\) \* 4\)",
+        loads[1],
+    )
+    assert loads[32].startswith("md_ex32 = ") and "(md_cb1 + 31) * 4)" in loads[32]
+    assert "ldg_" not in epilogue
+    reads = collections.Counter(re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE))
+    assert reads["md_ex0"] == 2
+    assert all(reads[f"md_ex{i}"] == 1 for i in range(1, 33))
+    # Without decay the epilogue reads no vector: nothing is hoisted.
+    plain = _kernel_body(
+        _source(_bind_fwd_o(), _config(1, 128, 128, warps=4, stages=1))
+    )
+    assert "md_ex" not in plain and "ldg_" not in plain
 
 
 def test_renders_the_transposed_and_shared_exchange_tiles() -> None:
@@ -610,10 +732,10 @@ def test_renders_the_transposed_and_shared_exchange_tiles() -> None:
     # The exchange tile is written once (eight packets per row) before the
     # first dot; the two stores stage eight packets each.
     first_mma = epilogue.index(f"{P}.tcgen05_mma(")
-    assert epilogue[:first_mma].count(f"{WARP_RT}.sts_v4_b32(") == 8
+    assert epilogue[:first_mma].count(f"{WARP_RT}.sts_v4_b32(") == 4
     second_dot = epilogue.index("md_idesc4")
     assert epilogue[first_mma:second_dot].count(f"{WARP_RT}.sts_v4_b32(") == 0
-    assert epilogue.count(f"{WARP_RT}.sts_v4_b32(") == 8 + 2 * 8
+    assert epilogue.count(f"{WARP_RT}.sts_v4_b32(") == 4 + 2 * 4
     assert epilogue.count(f"{P}.tcgen05_mma(") == 8
     assert epilogue.count(f"{P}.tcgen05_commit(md_eacc") == 1
     # The gated accumulators are rescaled in TMEM before the issue (one
@@ -625,6 +747,208 @@ def test_renders_the_transposed_and_shared_exchange_tiles() -> None:
     assert epilogue.count(f"{WARP_RT}.stg_v4_b32(") == 2 * 4
 
 
+def test_delta_state_kernels_admit_the_mode_with_loop_exchanges() -> None:
+    # fwd_h_delta: the carry feeds the first dot and the derived value the
+    # second, both through exchange tiles rewritten every iteration; the
+    # derived value holds one row of its input (the dot) and its own.
+    facts = _bind_fwd_h_delta().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    tc_facts = facts.tcgen05
+    assert [(x.slot, x.region) for x in tc_facts.exchanges] == [
+        (0, "loop"),
+        (1, "loop"),
+    ]
+    assert [t.region for t in tc_facts.tiles] == ["loop", "loop"]
+    assert tc_facts.derived_cols == ((1, 1),)
+    assert tc_facts.loop_stores == ((0, 2), (1, 2))
+    assert tc_facts.general_loop
+    # dstate: attn, the carry and dvni as loop operands; two derived values
+    # (the dvni sum in the gated form, the carry update).
+    facts = _bind_dstate(gated=True).config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert [x.slot for x in facts.tcgen05.exchanges] == [1, 0, 2]
+    assert len(facts.tcgen05.derived_cols) == 2
+    # Both admit the mode and seed it first (its snapshots staged), then
+    # the warp ladder.
+    for bind in (
+        _bind_fwd_h_delta,
+        lambda: _bind_fwd_h_delta(gated=True),
+        _bind_dstate,
+        lambda: _bind_dstate(gated=True),
+    ):
+        spec = bind().config_spec
+        assert spec.cute_mma_dag is not None
+        assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+        first = spec.compiler_seed_configs[0].config
+        assert first["cute_mma_dag"] == "tcgen05"
+        assert first["cute_mma_dag_store"] == "staged"
+        assert spec.default_config().config["cute_mma_dag"] == "tcgen05"
+        modes = [c.config["cute_mma_dag"] for c in spec.compiler_seed_configs]
+        assert "tcgen05" in modes and "warp" in modes
+    # A derived value over wide rows is refused: fwd_h_delta at bdv 128
+    # holds two 128-column rows per thread.
+    facts = _bind_fwd_h_delta().config_spec.cute_mma_dag_facts
+    assert facts is not None
+    reason = tc.tcgen05_config_reason(facts, [1, 128, 128, 64], 4, 1)
+    assert reason is not None and "derived value holds" in reason
+
+
+def test_renders_the_delta_loop_in_program_order() -> None:
+    body = _kernel_body(_source(_bind_fwd_h_delta(), _config(32, warps=4, stages=4)))
+    prologue, rest = body.split("for md_i in cutlass.range(", 1)
+    loop, epilogue = rest.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)
+    # One intermediate commit per iteration (dot1 -> vnew -> dot2).
+    assert f"{P}.mbarrier_init(md_stepb, 1)" in prologue
+    assert loop.count(f"{P}.tcgen05_commit(md_stepb") == 1
+    assert loop.count(f"{P}.tcgen05_commit(md_accb") == 1
+    assert f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)" in loop
+    assert loop.count("cute.arch.barrier()") == 2
+    # Block 0: the carry snapshot and the carry's exchange tile (bf16 pack
+    # of the 128-row carry into the fixed region, MN-major B of dot1);
+    # block 1: the derived value from the dot result and the u pairs, its
+    # body store, the exchange of its cast for dot2, and the TMEM write.
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_accb, md_parity ^ 1)",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(",
+            "if md_epi:",
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(md_srow",
+            f"{WARP_RT}.sts_v4_b32(md_s0 + 131072 + md_row128 * 64",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            "if md_warp == 0:",
+            f"{RT}.mbar_wait(md_full + md_stage, md_round)",
+            f"{P}.Tcgen05SmemDesc.build(md_s0 + 131072, leading_byte_offset=8192",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_stepb",
+            f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)",
+            "if md_epi:",
+            f"{P}.tcgen05_ld(",
+            "md_dr_0 = cutlass.Array(cutlass.Float32, 16, alignment=16)",
+            f"{WARP_RT}.unpack_bf16x2(md_u",
+            f"{WARP_RT}.sts_v4_b32(md_srow_1",
+            f"{WARP_RT}.sts_v4_b32(md_s0 + 139264 + md_row64 * 64",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            f"{P}.Tcgen05SmemDesc.build(md_s0 + 139264, leading_byte_offset=4096",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_accb",
+            f"{WARP_RT}.lds_v4_b32(",
+            f"{WARP_RT}.stg_v4_b32(",
+        ],
+    )
+    # The v_new rows go through a staging tile drained behind dot2's
+    # barrier (two packets per thread), the snapshot through its own (four).
+    assert loop.count(f"{WARP_RT}.stg_b32(") == 0
+    assert loop.count(f"{WARP_RT}.stg_v4_b32(") == 4 + 2
+    # dot1: w K-major A, the carry MN-major B into slot 1 from zero; dot2:
+    # k^T MN-major A, vnew MN-major B accumulating into the carry.
+    assert "n_dim=32, m_dim=64, a_major=0, b_major=1" in prologue
+    assert "n_dim=32, m_dim=128, a_major=1, b_major=1" in prologue
+    assert "md_idesc0, False)" in loop and "md_idesc1, True)" in loop
+    # The derived value is read only in its block: no tensor-memory write;
+    # the exchange packs the derived arrays; the u pairs are loaded at the
+    # iteration top, before the acc wait.
+    assert loop.count(f"{P}.tcgen05_st(") == 0 and loop.count(f"{P}.tcgen05_ld(") == 2
+    assert "= md_dr_0[0]" in loop and "= md_dr_0[15]" in loop
+    assert loop.index(f"{WARP_RT}.ldg_b32(") < loop.index(
+        f"{RT}.mbar_wait(md_accb, md_parity ^ 1)"
+    )
+    assert loop.count(f"{WARP_RT}.ldg_b32(") == 8
+    # dstate: four blocks (attn | dv_i + dv_i_1 | dS + dot_4 | dS - dot_4),
+    # two step commits, the trailing derived value after the acc wait.
+    body = _kernel_body(_source(_bind_dstate(), _config(32, warps=4, stages=2)))
+    loop = body.split("for md_i in cutlass.range(", 1)[1].split(
+        f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1
+    )[0]
+    assert loop.count(f"{P}.tcgen05_commit(md_stepb") == 2
+    assert loop.count("cute.arch.barrier()") == 3
+    assert f"{RT}.mbar_wait(md_stepb, md_i * 2 + 0 & 1)" in loop
+    assert f"{RT}.mbar_wait(md_stepb, md_i * 2 + 1 & 1)" in loop
+    assert loop.count(f"{RT}.mbar_wait(md_accb, md_parity)") == 1
+    assert loop.index(f"{RT}.mbar_wait(md_accb, md_parity)") > loop.rindex(
+        f"{P}.tcgen05_commit(md_accb"
+    )
+    # attn: q and k K-major; the transposed attn (k rows, q rows) is read
+    # straight as the K-major A of dv_i with do_i MN-major; dv_i_1
+    # accumulates onto it in the same batch.
+    assert re.search(r"md_idesc0 = .*n_dim=64, m_dim=64, a_major=0, b_major=0", body)
+    assert re.search(r"md_idesc1 = .*n_dim=32, m_dim=64, a_major=0, b_major=1", body)
+    # attn K = 128, dv_i K = 64, dv_i_1 K = 128, dS K = 64, dot_4 K = 64.
+    assert loop.count(f"{P}.tcgen05_mma(") == 8 + 4 + 8 + 4 + 4
+
+
+def _store_first(
+    k: torch.Tensor, v: torch.Tensor, u: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A body store in the first block of a single-batch iteration."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    d_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
+    h_all = torch.empty([BH, D, DV], dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            d = h_acc - u[idx, i_t, tile_d, tile_dv].float()
+            d_all[idx, i_t, tile_d, tile_dv] = d.to(d_all.dtype)
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        h_all[idx, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+    return d_all, h_all
+
+
+def test_body_stores_of_the_first_block_are_double_buffered() -> None:
+    # The body store's staging buffer is written before the iteration's only
+    # barrier and drained after the batch issue; only the acc wait separates
+    # that drain from the next iteration's stage-in, so the buffer alternates
+    # by parity like the snapshots (two 8 KB buffers after the 32 KB ring).
+    t = _tensors()
+    u = torch.empty((2, 8, 64, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_store_first, (t["k"], t["v"], u))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.general_loop
+    # The derived value (slot 1) is the stored one.
+    assert facts.tcgen05.loop_stores == ((1, 2),)
+    # Ring, two staging buffers, the epilogue staging tile (the plan folds
+    # it into the ring), the barriers with the step barrier, the TMEM slot.
+    assert tc.tcgen05_smem_bytes(facts, [1, 64, 64, 64, 64], 2, True) == (
+        2 * 16384 + 2 * 64 * 64 * 2 + 64 * 64 * 2 + 8 * (2 + 3 + 1) + 16
+    )
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    assert "alloc_smem(cutlass.Uint8, 49152, alignment=1024)" in body
+    assert f"{P}.mbarrier_init(md_stepb, 1)" in body
+    prologue, rest = body.split("for md_i in cutlass.range(", 1)
+    loop, epilogue = rest.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)
+    assert loop.count("cute.arch.barrier()") == 1
+    assert loop.count(f"{P}.tcgen05_commit(") == 1
+    assert "md_srow = md_s0 + 32768 + md_parity * 8192 + md_row64 * 128" in loop
+    assert loop.count(f"{WARP_RT}.lds_v4_b32(md_s0 + 32768 + md_parity * 8192 + ") == 4
+    assert (
+        loop.count(f"{WARP_RT}.stg_v4_b32(") == 4 and f"{WARP_RT}.stg_b32(" not in loop
+    )
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_accb, md_parity ^ 1)",
+            "if md_epi:",
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(md_srow + ",
+            "cute.arch.barrier()",
+            "if md_warp == 0:",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_accb",
+            f"{WARP_RT}.lds_v4_b32(md_s0 + 32768 + md_parity * 8192 + ",
+            f"{WARP_RT}.stg_v4_b32(",
+        ],
+    )
+    # The epilogue store reuses the ring.
+    assert "md_srow_1 = md_s0 + 0 + md_row64 * 128" in epilogue
+
+
 def test_direct_stores_skip_the_staging_tile() -> None:
     body = _kernel_body(
         _source(
@@ -633,7 +957,7 @@ def test_direct_stores_skip_the_staging_tile() -> None:
     )
     loop = _loop(body)
     assert f"{WARP_RT}.stg_v4_b32(" not in loop and f"{WARP_RT}.lds_v4_b32(" not in loop
-    assert loop.count(f"{WARP_RT}.stg_b32(") == 32
+    assert loop.count(f"{WARP_RT}.stg_b32(") == 16
     assert "alloc_smem(cutlass.Uint8, 32768, alignment=1024)" in body
 
 
@@ -661,3 +985,1170 @@ def test_unaligned_sources_take_the_synchronous_pass() -> None:
     assert loop.index("cute.arch.fence_proxy(") < loop.index("cute.arch.barrier()")
     # Only warp 0 waits the (one) TMA operand's full barrier.
     assert loop.count(f"{RT}.mbar_wait(md_full") == 1
+
+
+# --------------------------------------------------------------------------
+# Loop outputs in another slot, the epilogue prefetch's bounds
+# --------------------------------------------------------------------------
+
+
+def _ring_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    bf16 = torch.bfloat16
+    return (
+        torch.empty((16, 4, 64, 64), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((16, 64, 64), dtype=bf16, device=CPU_DEVICE),
+    )
+
+
+@pytest.mark.parametrize("fn", (_single_ring, _single_ring_noacc))
+def test_a_loop_output_in_another_slot_declines_the_mode(fn: object) -> None:
+    # ``T = dot(a_i, T, acc=T * 0.5)`` (the fresh slot of the rescaled-acc
+    # fix) and ``T = dot(a_i, T)``: the loop output lives in slot 1 while
+    # the carry is slot 0.  The warp emitter copies it back at the
+    # iteration end; TMEM has no such copy, so the next iteration's
+    # exchange and the epilogue store would read the initial T.  The mode
+    # declines the program (the knob never offers it); the bare acc
+    # accumulates in place and keeps it.
+    args = _ring_inputs()
+    bound = _bind_fn(fn, args)
+    program = _program(bound)
+    (carry,) = program.carries
+    assert program.frag_slots[program.resolve(carry.output)] == 1 != carry.slot
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    with bound.env, bound.host_function:
+        assert tc.tcgen05_facts(program) is None
+    with bound.env, pytest.raises(InvalidConfig, match="cute_mma_dag must be one of"):
+        spec.normalize(_config(warps=4, stages=2).config)
+    bare = _bind_fn(_single_ring_bare, args).config_spec
+    assert bare.cute_mma_dag is not None
+    assert bare.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+
+
+def test_a_root_dot_rescaling_its_loops_carry_takes_a_fresh_tmem_slot() -> None:
+    # ``dot(kk, kk, acc=kk * 0.5)`` after the K loop: the exchange tiles
+    # read the carry (column 0), the rescaled acc is stored into slot 1
+    # (column 64), the MMAs accumulate there and the store reads it back.
+    bound = _bind_fn(_root_rescaled_carry, (_tensors3()["q"],))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    assert "md_acc1 = cutlass.inttoptr(md_tmem + 64, " in body
+    epilogue = body.rsplit(f"{RT}.mbar_wait(md_accb, ", 1)[1]
+    tmem = r"cutlass\.inttoptr\(md_warp % 4 \* 32 << 16 \| md_tmem \+ (\d+), "
+    assert re.findall(rf"tcgen05_ld\('16x32bx2', {tmem}", epilogue) == ["0", "64"]
+    assert re.findall(rf"tcgen05_st\('16x32bx2', {tmem}", epilogue) == ["64"]
+    mmas = re.findall(
+        rf"{re.escape(P)}\.tcgen05_mma\({re.escape(P)}\.Tcgen05MMAKind\.F16, "
+        rf"{re.escape(P)}\.CTAGroup\.CTA_1, (md_acc\d), ",
+        epilogue,
+    )
+    assert mmas == ["md_acc1"] * 4
+    assert epilogue.count(f"{WARP_RT}.sts_v4_b32(") == 8
+
+
+def test_epilogue_prefetch_keeps_the_rows_and_a_half_row_of_columns() -> None:
+    # Gated fwd_o at c = 128 (tcgen05 takes blocks 32 / 64): the attention
+    # exchange is a 128-row fragment whose thread holds all 128 columns of
+    # its row, so the column sites would carry 128 registers through the
+    # loop (defined ahead of it, assigned in its last iteration).  Only the
+    # row site goes out ahead of the drain; the 128 column loads stay in
+    # the epilogue.  At c = 64 the half-row's 32 columns ride along (33
+    # registers, ``test_gated_epilogue_side_loads_go_out_under_the_last_mmas``).
+    assert tc.TCGEN05_EPILOGUE_PREFETCH_COLS == 32
+    body = _kernel_body(
+        _source(_bind_fwd_o(True, c=128), _config(1, 64, 64, warps=4, stages=2))
+    )
+    prologue, rest = body.split("for md_i in cutlass.range(0, 2):", 1)
+    assert [line.strip() for line in prologue.splitlines() if "md_ex" in line] == [
+        "md_ex0 = cutlass.Float32(0.0)"
+    ]
+    loop, epilogue = rest.rsplit(f"{RT}.mbar_wait(md_accb, ", 1)
+    guarded = loop.split("if md_i + 1 == 2:", 1)[1]
+    loads = [line.strip() for line in guarded.splitlines() if line.strip()]
+    assert len(loads) == 1 and "md_ex1" not in body
+    assert re.fullmatch(
+        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row128\) \* 4\)",
+        loads[0],
+    )
+    assert epilogue.count(f"{WARP_RT}.ldg_f32(") == 128
+    columns = re.findall(
+        rf"{WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\((\d+)\) \* 4\)", epilogue
+    )
+    assert columns == [str(j) for j in range(1, 128)]
+    reads = collections.Counter(re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE))
+    assert reads == {"md_ex0": 2}
+
+
+def _epi_inputs(stored: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    a, t = _ring_inputs()
+    shape = (16, 64, 64) if stored else (16, 64)
+    return a, t, torch.empty(shape, dtype=torch.float32, device=CPU_DEVICE)
+
+
+def test_the_program_order_loop_prefetches_the_epilogue_row_after_the_loop() -> None:
+    # ``_gen_epi``: the carry is the B operand, so the loop body is emitted
+    # in program order and has no last-iteration slot between the MMA issue
+    # and the acc wait; the decay row goes out after the loop, ahead of the
+    # drain (its register still defined before the loop), and the epilogue
+    # issues no global load.
+    bound = _bind_fn(_gen_epi, _epi_inputs(stored=False))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.general_loop
+    body = _kernel_body(_source(bound, _config(warps=4, stages=2)))
+    prologue, rest = body.split("for md_i in cutlass.range(0, 4):", 1)
+    assert [line.strip() for line in prologue.splitlines() if "md_ex" in line] == [
+        "md_ex0 = cutlass.Float32(0.0)"
+    ]
+    loop, epilogue = rest.split(f"{RT}.mbar_wait(md_accb, 4 - 0 - 1 & 1)", 1)
+    assert "md_ex" not in loop.rstrip().rsplit("\n", 1)[0]
+    assert re.fullmatch(
+        rf"    md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
+        loop.rstrip().rsplit("\n", 1)[1],
+    )
+    assert "ldg_" not in epilogue
+    assert re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE) == ["md_ex0"]
+
+
+def test_epilogue_prefetch_skips_a_tensor_the_program_stores() -> None:
+    # ``g[b] = T; out[b] = T * exp2(g[b, 0, :])``: the decay row is a row
+    # of a tensor the epilogue stores first.  Hoisted ahead of the loop the
+    # load would run before that store; it stays in the epilogue, behind
+    # the store's drain and barrier (``_gen_epi`` reads the same row from
+    # a tensor the program only loads and hoists it, above).
+    bound = _bind_fn(_gen_epi_stored, _epi_inputs(stored=True))
+    program = _program(bound)
+    assert [store.region for store in program.stores] == ["epilogue", "epilogue"]
+    body = _kernel_body(_source(bound, _config(warps=4, stages=2)))
+    assert "md_ex" not in body
+    assert body.count(f"{WARP_RT}.ldg_f32(") == 1
+    epilogue = body.rsplit(f"{RT}.mbar_wait(md_accb, ", 1)[1]
+    (load,) = re.findall(
+        rf"{WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
+        epilogue,
+    )
+    _assert_in_order(epilogue, [f"{WARP_RT}.stg_v4_b32(", "cute.arch.barrier()", load])
+
+
+# --------------------------------------------------------------------------
+# Region programs
+# --------------------------------------------------------------------------
+
+
+def _split_loop(body: str, var: str) -> tuple[str, str]:
+    """``(before, loop and after)`` at the first ``for var in`` line."""
+    index = body.index(f"for {var} in cutlass.range(")
+    return body[:index], body[index:]
+
+
+def test_region_programs_admit_the_mode_behind_the_warp_seeds() -> None:
+    # dk, dqkw and wy_dL (both decay modes) admit the tensor-memory mode
+    # through the region renderer; the warp mode stays the default and the
+    # first seed, a tensor-memory seed follows.
+    for bind in (
+        _bind_dk,
+        _bind_dqkw,
+        lambda: _bind_dqkw(gated=True),
+        _bind_wy_dl,
+        lambda: _bind_wy_dl(gated=True),
+    ):
+        spec = bind().config_spec
+        assert spec.cute_mma_dag is not None
+        assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None and facts.tcgen05 is not None
+        assert facts.tcgen05.regions
+        assert spec.default_config().config["cute_mma_dag"] == "warp"
+        modes = [c.config["cute_mma_dag"] for c in spec.compiler_seed_configs]
+        assert modes[0] == "warp" and "tcgen05" in modes
+    # dk: both orientations of dL (plain casts of one load) share a hoisted
+    # tile (fp32 source -> a raw tile beside it), k rides loop 0's ring,
+    # the store stages through two buffers in loop 0's frame; one slot
+    # lives in TMEM.
+    facts = _bind_dk().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    items = facts.tcgen05.items
+    assert [(i.kind, i.frame, i.copies) for i in items] == [
+        ("tile", -1, 1),
+        ("raw", -1, 1),
+        ("tile", 0, 0),
+        ("staging", 0, 2),
+    ]
+    assert facts.tcgen05.tmem_slots == (0,)
+    assert facts.tcgen05.ring_loops == 1 and facts.tcgen05.staged_regions == 1
+    # Block ids of dk: loop bd 2, lead 0, rdim C 1 -> axis indices 0..2.
+    resolved = [64, 1, 64]
+    layout = regions.region_layout(items, facts.loops, resolved, 2)
+    assert layout.ring_base == {0: 0} and layout.ring_bytes == {0: 8192}
+    # Loop 0's frame first (the ring, the two staging buffers), then the
+    # root's hoisted tile with its raw tile.
+    assert layout.offsets == (32768, 40960, 0, 16384)
+    assert layout.total == 57344
+    assert tc.tcgen05_smem_bytes(facts, resolved, 2, True) == 57344 + 8 * 4 + 16
+    assert tc.tcgen05_slot_columns(facts, resolved) == 64
+    # wy_dL: the vector scratch (four warps of 128 entries) sits in the
+    # root frame; a derived value over the dot result cannot hold two
+    # 128-column rows; dqkw's five slots exceed the TMEM at bd = 128.
+    facts = _bind_wy_dl(gated=True).config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    scratch = [i for i in facts.tcgen05.items if i.kind == "scratch"]
+    assert scratch == [tc.Tcgen05SmemItem("scratch", -1, -1, -1, 4, 4)]
+    facts = _bind_wy_dl().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    reason = dag.mma_dag_config_reason(
+        facts, {0: 1, 2: 128, 3: 64, 4: 64}, 4, 2, "tcgen05"
+    )
+    assert reason is not None and "derived value holds 256" in reason
+    facts = _bind_dqkw().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.tmem_slots == (0, 1, 2, 3, 4)
+    reason = dag.mma_dag_config_reason(
+        facts, {0: 1, 1: 64, 3: 128, 4: 64}, 4, 2, "tcgen05"
+    )
+    assert reason is not None and "576 TMEM columns" in reason
+    assert (
+        dag.mma_dag_config_reason(facts, {0: 1, 1: 64, 3: 64, 4: 64}, 4, 2, "tcgen05")
+        is None
+    )
+
+
+def test_renders_dk_with_hoisted_tiles_and_a_seeded_accumulator() -> None:
+    body = _kernel_body(_source(_bind_dk(), _config(64, warps=4, stages=2)))
+    prologue, loop = _split_loop(body, "md_i")
+    # One commit barrier, loop 0's ring (two slots), the root's staged
+    # tiles' barrier; the running counters.
+    assert "md_cb = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)" in prologue
+    assert "md_full0 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in prologue
+    assert "md_sfr = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)" in prologue
+    assert (
+        "md_cn = cutlass.Int32(0)" in prologue
+        and "md_rk0 = cutlass.Int32(0)" in prologue
+    )
+    # The hoisted dL tile lands by TMA (raw fp32) while the ring prologue
+    # issues the first iteration's k tile, converts into the bf16 UMMA
+    # tile (eight packets per thread) behind one wait, then a barrier.
+    _assert_in_order(
+        prologue,
+        [
+            f"{P}.mbarrier_arrive_expect_tx(md_sfr, 16384)",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(md_smem + (0 + 40960)",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + md_rk0 % 2, 8192)",
+            f"{RT}.mbar_wait(md_sfr, 0)",
+            f"{RT}.lds_v4_f32(md_s0 + 40960",
+            f"{WARP_RT}.sts_v2_b32(md_s0 + 32768",
+            "cute.arch.barrier()",
+        ],
+    )
+    assert prologue.count(f"{RT}.lds_v4_f32(") == 8
+    assert prologue.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 2
+    # Per iteration: the slot / phase / parity from the counter, the refill
+    # one iteration ahead, the seed (two fp32 tiles at the fragment
+    # coordinates) stored to TMEM, both dots in one batch (the ring wait by
+    # warp 0), one commit, the wait, the staged store, the counter.
+    _assert_in_order(
+        loop,
+        [
+            "md_st0 = md_rk0 % 2",
+            "md_rd0 = md_rk0 // 2 & 1",
+            "md_pt0 = md_rk0 % 2",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 1) % 2, 8192)",
+            "if md_epi:",
+            "md_dr_0 = cutlass.Array(cutlass.Float32, 32, alignment=16)",
+            f"{P}.tcgen05_st(",
+            "cute.arch.barrier()",
+            "if md_warp == 0:",
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_cb",
+            "md_cn = md_cn + 1",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+            f"{P}.tcgen05_ld(",
+            "md_srow = md_s0 + 16384 + md_pt0 * 8192 + md_row64 * 128",
+            f"{WARP_RT}.sts_v4_b32(",
+            "cute.arch.barrier()",
+            f"{WARP_RT}.lds_v4_b32(md_s0 + 16384 + md_pt0 * 8192",
+            f"{WARP_RT}.stg_v4_b32(",
+            "md_rk0 = md_rk0 + 1",
+        ],
+    )
+    assert loop.count(f"{P}.tcgen05_mma(") == 8
+    assert loop.count(f"{P}.tcgen05_commit(") == 1
+    assert loop.count(f"{P}.tcgen05_st(") == 1 and loop.count(f"{P}.tcgen05_ld(") == 1
+    # dL as A: K-major straight, MN-major transposed; k is MN-major B.
+    assert "n_dim=64, m_dim=64, a_major=0, b_major=1" in prologue
+    assert "n_dim=64, m_dim=64, a_major=1, b_major=1" in prologue
+    assert "alloc_smem(cutlass.Uint8, 57344, alignment=1024)" in body
+
+
+def test_renders_wy_dl_sequential_loops_and_vector_carries() -> None:
+    body = _kernel_body(_source(_bind_wy_dl(), _config(64, 64, 64, warps=4, stages=2)))
+    # Three rings, no staged region (A_inv's tile is hoisted by the
+    # synchronous pass... through TMA: the root barrier), four vector
+    # registers.
+    assert body.count("cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)") == 3
+    for slot in range(4):
+        assert f"md_vv{slot} = cutlass.Float32(0.0)" in body
+    first, rest = _split_loop(body, "md_i")
+    loop0, rest = _split_loop(rest, "md_i1")
+    loop1, rest = _split_loop(rest, "md_i2")
+    # Loop 1 continues dAinv in place (no seed), its vector carry copies
+    # nothing (same slot); kk's loop seeds zeros.
+    assert loop0.count(f"{P}.tcgen05_st(") == 0
+    assert "md_seed" in first and "md_seed" not in loop0
+    assert loop1.count("md_seed") > 0
+    # Row sums: the thread's local columns, then the other half.
+    assert loop0.count("cute.arch.shuffle_sync_bfly(") == 1
+    assert loop1.count("cute.arch.shuffle_sync_bfly(") == 1
+    assert rest.count("cute.arch.shuffle_sync_bfly(") == 1
+    assert "barrier_id=1" not in body
+    # The root chain after loop 1: dAinv's exchange tile feeds dot
+    # (MN-major B), dot's exchange tile feeds dot_1 (K-major A) after its
+    # own commit wait, kk's loop seeds zeros; after that loop the dL store,
+    # the row sums (one half-row shuffle) and the vector store (the lanes
+    # owning a row), then the staged store drains.
+    root = loop1[loop1.index("md_rk1 = md_rk1 + 1") :]
+    _assert_in_order(
+        root,
+        [
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_cb",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_cb",
+            "md_seed",
+        ],
+    )
+    after = rest[rest.index("md_rk2 = md_rk2 + 1") :]
+    _assert_in_order(
+        after,
+        [
+            f"{P}.tcgen05_ld(",
+            "cute.arch.shuffle_sync_bfly(",
+            "if md_lane < 16:",
+            f"{WARP_RT}.stg_f32(",
+            "cute.arch.barrier()",
+            f"{WARP_RT}.stg_v4_b32(",
+        ],
+    )
+
+
+def test_renders_gated_wy_dl_column_sums_through_the_scratch() -> None:
+    body = _kernel_body(
+        _source(_bind_wy_dl(gated=True), _config(64, 64, 64, warps=4, stages=2))
+    )
+    _first, rest = _split_loop(body, "md_i2")
+    # dLL.sum(-2): the 16 rows of each warp by shuffles per local column,
+    # the four epilogue warps through the scratch (their own barrier),
+    # read back at the thread's row.
+    assert rest.count(f"{WARP_RT}.lane_group_sum(") == 32
+    assert rest.count("cute.arch.barrier(barrier_id=1, number_of_threads=128)") == 2
+    assert rest.count(f"{WARP_RT}.sts_f32(") == 32
+    assert rest.count(f"{WARP_RT}.lds_f32(") == 4
+    assert "if md_lane % 16 == 0:" in rest
+    assert "alloc_smem(cutlass.Uint8, 149504, alignment=1024)" in body
+
+
+def test_renders_dqkw_nested_loops_with_staged_tiles() -> None:
+    body = _kernel_body(_source(_bind_dqkw(), _config(64, 64, 64, warps=4, stages=2)))
+    # Rings for loop 0 and the nested loop 2, a staged region for loop 1
+    # (k_d and q_d once per outer iteration).
+    assert "md_full0 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in body
+    assert "md_full2 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in body
+    assert "md_sf1 = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)" in body
+    assert "md_full1" not in body
+    _first, rest = _split_loop(body, "md_i1")
+    outer, inner = _split_loop(rest, "md_i2")
+    # The outer iteration: its parity, the staged tiles' TMA, the three
+    # zero seeds of the inner carries, the inner ring prologue.
+    _assert_in_order(
+        outer,
+        [
+            "md_pt1 = md_rk1 % 2",
+            f"{P}.mbarrier_arrive_expect_tx(md_sf1,",
+            "md_seed",
+            f"{P}.mbarrier_arrive_expect_tx(md_full2 + md_rk2 % 2,",
+        ],
+    )
+    assert outer.count(f"{P}.tcgen05_st(") == 3
+    # The inner iteration: the no-acc dot, its commit, the subtraction
+    # (ld both, store dW), the two accumulating dots in a second batch.
+    # The inner iteration: the no-acc dot and the two accumulating dots in
+    # one batch (the subtraction reads the first's result, so it follows
+    # the commit: ld both, store dW).
+    inner_body = inner[: inner.index("md_rk2 = md_rk2 + 1")]
+    assert inner_body.count(f"{P}.tcgen05_commit(md_cb") == 1
+    assert inner_body.count(f"{P}.tcgen05_mma(") == 12
+    assert inner_body.count(f"{P}.tcgen05_st(") == 1
+    assert inner_body.index(f"{P}.tcgen05_st(") > inner_body.index(
+        f"{P}.tcgen05_commit(md_cb"
+    )
+    # After the inner loop: the staged tiles are waited, dW is stored, dq
+    # and dk_as accumulate onto the carries in one batch with dattn's
+    # exchange tile (both orientations from one tile), then their stores.
+    after = inner[inner.index("md_rk2 = md_rk2 + 1") :]
+    assert f"{RT}.mbar_wait(md_sf1, md_rk1 & 1)" in after
+    assert after.count(f"{P}.tcgen05_commit(md_cb") == 1
+    # dW_out fp32 (eight packets per thread), dq_out bf16 (four), dk_as_out
+    # fp32 (eight).
+    assert after.count(f"{WARP_RT}.stg_v4_b32(") == 8 + 4 + 8
+    assert "md_rk1 = md_rk1 + 1" in after
+    assert "md_idesc3 = " in body
+    assert "n_dim=64, m_dim=64, a_major=0, b_major=1" in body
+    assert "n_dim=64, m_dim=64, a_major=1, b_major=1" in body
+
+
+def test_declines_mn_major_tf32_source_tiles() -> None:
+    # chunk_fwd_o_diag_anchored over fp32 inputs (the GLA example): the
+    # ``h[bhn, tile_d, tile_dv]`` B operand is an fp32 source read with K
+    # along its rows, so its tile would be MN-major tf32 -- declined at
+    # admission (the warp mode keeps the kernel), not at plan time.
+    f32 = torch.float32
+    bhn, c, d, dv = 16, 64, 128, 128
+    q = torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE)
+    v = torch.empty((bhn, c, dv), dtype=f32, device=CPU_DEVICE)
+    gc = torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE)
+    h = torch.empty((bhn, d, dv), dtype=f32, device=CPU_DEVICE)
+    a = torch.empty((bhn, c, c), dtype=f32, device=CPU_DEVICE)
+    bound = _bind("chunk_fwd_o_diag_anchored_helion", (q, v, gc, h, a, 0.125))
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    with bound.env, bound.host_function:
+        program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
+        assert program is not None
+        assert regions.region_program_reason(program) == (
+            "ht: an MN-major tf32 operand"
+        )
+
+
+def test_wy_admits_the_tf32_chain_and_seeds_it_first() -> None:
+    # chunk_fwd_wy_delta: a bf16 dot (kk), the five-step tf32 Neumann chain
+    # with carries seeded from a pointwise value over kk (Apow in a fresh
+    # slot each step, copied back) and the tf32 w / u dots over widened
+    # bf16 tiles.  fp32 operands are admitted (tf32 kind) and, unlike the
+    # 16-bit region programs, the tensor-memory seed comes first.
+    for gated in (False, True):
+        spec = _bind_wy(gated=gated).config_spec
+        assert spec.cute_mma_dag is not None
+        assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None and facts.tcgen05 is not None
+        assert facts.tcgen05.regions and facts.tcgen05.tf32
+        assert spec.default_config().config["cute_mma_dag"] == "tcgen05"
+        modes = [c.config["cute_mma_dag"] for c in spec.compiler_seed_configs]
+        assert modes[0] == "tcgen05" and "warp" in modes
+    facts = _bind_wy().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    tc_facts = facts.tcgen05
+    # The chain loop's frame holds Apow straight (K-major) and transposed
+    # (its own tile), the squared Apow straight and T transposed; T's
+    # natural tile feeds the w and u loops from the root frame; the kt / vt
+    # operands widen bf16 raw tiles into transposed fp32 tiles in their
+    # rings.
+    exchanges = [
+        (i.frame, i.elem_bytes) for i in tc_facts.items if i.kind == "exchange"
+    ]
+    assert exchanges == [(1, 4), (1, 4), (1, 4), (1, 4), (-1, 4)]
+    assert [(i.frame, i.elem_bytes) for i in tc_facts.items if i.kind == "raw"] == [
+        (2, 2),
+        (3, 2),
+    ]
+    # TMEM: the fresh Apow slot and the w / u results share kk's columns
+    # (never live together), 192 of the 384 a flat layout would take.
+    resolved = [64, 64, 64, 1, 64]
+    columns, total = regions.region_tmem_layout(facts, resolved)
+    assert columns == {0: 0, 1: 64, 2: 128, 3: 0, 4: 0, 5: 0} and total == 192
+
+
+def test_renders_the_wy_chain_with_tf32_mmas() -> None:
+    body = _kernel_body(_source(_bind_wy(), _config(64, 64, 64, warps=4, stages=2)))
+    assert "alloc_smem(cutlass.Uint8, 98304, alignment=1024)" in body
+    assert f"{P}.tcgen05_alloc(md_tslot, 256," in body
+    for slot in (3, 4, 5):
+        assert f"md_acc{slot} = cutlass.inttoptr(md_tmem + 0," in body
+    assert body.count(f"{P}.Tcgen05MMAKind.F16") == 4
+    assert body.count(f"{P}.Tcgen05MMAKind.TF32") == 4 * 8
+    assert body.count("a_dtype=cutlass.Float32, b_dtype=cutlass.Float32") == 4
+    assert "a_dtype=cutlass.BFloat16, b_dtype=cutlass.BFloat16" in body
+    first, rest = _split_loop(body, "md_i")
+    kk_loop, rest = _split_loop(rest, "md_i1")
+    chain, rest = _split_loop(rest, "md_i2")
+    w_loop, u_loop = _split_loop(rest, "md_i3")
+    assert "for md_i1 in cutlass.range(0, 5):" in chain
+    # The chain's carries are seeded from kk's row: both arrays evaluate the
+    # pointwise seed before the loop; each step runs two tf32 batches
+    # (Apow = Apow @ Apow, then T += Apow @ T) with the transposed B tiles
+    # scattered (one store per element) and copies Apow back to its slot.
+    init = kk_loop[kk_loop.index("md_rk0 = md_rk0 + 1") :]
+    assert init.count(f"{P}.tcgen05_st(") == 2 and "md_seed" in init
+    assert chain.count(f"{P}.tcgen05_commit(md_cb") == 2
+    assert chain.count(f"{WARP_RT}.sts_f32(") == 2 * 32
+    assert chain.count(f"{P}.tcgen05_st(") == 1
+    _assert_in_order(
+        chain,
+        [
+            f"{P}.tcgen05_ld(",
+            f"{RT}.sts_v4_f32(",
+            f"{WARP_RT}.sts_f32(",
+            "cute.arch.barrier()",
+            f"{P}.Tcgen05MMAKind.TF32",
+            f"{P}.tcgen05_commit(md_cb",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+            f"{P}.tcgen05_ld(",
+            f"{RT}.sts_v4_f32(",
+            f"{WARP_RT}.sts_f32(",
+            "cute.arch.barrier()",
+            f"{P}.Tcgen05MMAKind.TF32",
+            f"{P}.tcgen05_commit(md_cb",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+            f"{P}.tcgen05_ld(",
+            f"{P}.tcgen05_st(",
+        ],
+    )
+    # w: the bf16 k tile lands raw by TMA, the widen pass scatters beta * k
+    # into the transposed fp32 tile (four raw packets per thread), T's
+    # natural tile is the K-major A, eight tf32 MMAs, the bf16 result stages
+    # out.
+    assert w_loop.count(f"{WARP_RT}.lds_v4_b32(") == 8
+    assert w_loop.count(f"{WARP_RT}.unpack_bf16x2(") == 16
+    assert w_loop.count(f"{WARP_RT}.sts_f32(") == 32
+    assert w_loop.count(f"{P}.Tcgen05MMAKind.TF32") == 8
+    assert w_loop.count(f"{WARP_RT}.stg_v4_b32(") == 4
+    assert u_loop.count(f"{P}.Tcgen05MMAKind.TF32") == 8
+
+
+# --------------------------------------------------------------------------
+# Region programs: the kda / anchored kernels
+# --------------------------------------------------------------------------
+
+
+def _cpu(*shape: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+
+def _bind_bwd_o_kda(bhn: int = 16, d: int = 64, dv: int = 64) -> BoundKernel:
+    c, f32 = 64, torch.float32
+    return _bind(
+        "chunk_bwd_o_kda_helion",
+        (
+            _cpu(bhn, c, d),
+            _cpu(bhn, c, dv),
+            _cpu(bhn, d, dv),
+            _cpu(bhn, c, c),
+            _cpu(bhn, c, d, dtype=f32),
+            _cpu(bhn, c, dv),
+            0.125,
+        ),
+    )
+
+
+def _bind_state_du_kda(
+    bh: int = 2, n: int = 8, d: int = 64, dv: int = 64
+) -> BoundKernel:
+    c, f32 = 64, torch.float32
+    return _bind(
+        "chunk_bwd_state_du_kda_helion",
+        (
+            _cpu(bh, n, c, d),
+            _cpu(bh, n, c, d),
+            _cpu(bh, n, c, d, dtype=f32),
+            _cpu(bh, n, c, dv, dtype=f32),
+            _cpu(bh, n, d, dv, dtype=f32),
+            _cpu(bh, d, dv, dtype=f32),
+        ),
+    )
+
+
+def _bind_fwd_o_anch(bhn: int = 16, d: int = 64, dv: int = 64) -> BoundKernel:
+    c, f32 = 64, torch.float32
+    return _bind(
+        "chunk_fwd_o_diag_anchored_helion",
+        (
+            _cpu(bhn, c, d),
+            _cpu(bhn, c, dv),
+            _cpu(bhn, c, d, dtype=f32),
+            _cpu(bhn, d, dv),
+            _cpu(bhn, c, c),
+            0.125,
+        ),
+    )
+
+
+_REGION_BINDERS: dict[str, Callable[[], BoundKernel]] = {
+    "dk": _bind_dk,
+    "dqkw": _bind_dqkw,
+    "dqkw_gated": lambda: _bind_dqkw(gated=True),
+    "wy_dL": _bind_wy_dl,
+    "wy_dL_gated": lambda: _bind_wy_dl(gated=True),
+    "wy": _bind_wy,
+    "wy_gated": lambda: _bind_wy(gated=True),
+    "bwd_o_kda": _bind_bwd_o_kda,
+    "state_du_kda": _bind_state_du_kda,
+    "fwd_o_anch": _bind_fwd_o_anch,
+    "probe_h1": lambda: _bind_h1(),
+    "probe_h3": lambda: _bind_h3(),
+    "probe_h4": lambda: _bind_h4(),
+}
+
+
+def _match(bound: BoundKernel) -> dag.MmaDagProgram:
+    with bound.env, bound.host_function:
+        program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
+    assert program is not None
+    return program
+
+
+def _commits_while_one_is_outstanding(body: str) -> list[int]:
+    """Abstract interpretation of the kernel body's commit / wait order
+    (loops run 0..n times, branches are taken): the line numbers of
+    ``tcgen05_commit(md_cb`` issued while a commit is still outstanding
+    -- the single barrier's parity tells one phase apart."""
+    root: list[object] = []
+    stack: list[tuple[int, list[object]]] = [(-1, root)]
+    for number, line in enumerate(body.split("\n")):
+        text = line.strip()
+        if not text:
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        current = stack[-1][1]
+        if text.startswith("for ") and text.endswith(":"):
+            children: list[object] = []
+            current.append(("loop", number, children))
+            stack.append((indent, children))
+        elif "tcgen05_commit(md_cb" in text:
+            current.append(("commit", number))
+        elif "mbar_wait(md_cb" in text:
+            current.append(("wait", number))
+        elif text.startswith(("if ", "elif ", "else", "with ")) and text.endswith(":"):
+            stack.append((indent, current))
+    errors: set[int] = set()
+
+    def run(nodes: list[object], outstanding: int) -> int:
+        for node in nodes:
+            kind = node[0]  # type: ignore[index]
+            if kind == "commit":
+                if outstanding:
+                    errors.add(node[1])  # type: ignore[index]
+                outstanding = min(outstanding + 1, 2)
+            elif kind == "wait":
+                outstanding = 0
+            else:
+                worst = state = outstanding
+                for _trip in range(4):
+                    state = run(node[2], state)  # type: ignore[index]
+                    worst = max(worst, state)
+                    state = max(state, outstanding)
+                outstanding = worst
+        return outstanding
+
+    run(root, 0)
+    return sorted(errors)
+
+
+def _after_loop(body: str, var: str) -> str:
+    """The body from the first line after the ``for var in`` loop (the
+    next line at the loop's indentation or less)."""
+    lines = body.split("\n")
+    start = next(
+        i for i, line in enumerate(lines) if f"for {var} in cutlass.range(" in line
+    )
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next(
+        i
+        for i, line in enumerate(lines[start + 1 :], start + 1)
+        if line.strip() and len(line) - len(line.lstrip()) <= indent
+    )
+    return "\n".join(lines[end:])
+
+
+def _tmem_columns(body: str) -> dict[int, int]:
+    return {
+        int(slot): int(column)
+        for slot, column in re.findall(
+            r"md_acc(\d+) = cutlass\.inttoptr\(md_tmem \+ (\d+),", body
+        )
+    }
+
+
+def _resolved_axes(
+    program: dag.MmaDagProgram, bound: BoundKernel, block_sizes: list[int]
+) -> list[int]:
+    by_block = {
+        spec.block_id: size
+        for spec, size in zip(bound.config_spec.block_sizes, block_sizes, strict=True)
+    }
+    return [
+        by_block.get(axis.block_id, axis.extent if isinstance(axis.extent, int) else 0)
+        for axis in program.axes
+    ]
+
+
+@pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
+def test_region_programs_keep_one_commit_in_flight_and_disjoint_live_slots(
+    kernel: str,
+) -> None:
+    # Three rules over every region program the examples admit
+    # (the kda and anchored kernels included), at its tensor-memory seeds:
+    # a tile-only derived value that a dot reads, a loop carries or another
+    # region reads holds its own tensor-memory columns (``derived_crosses``;
+    # the rest stay in registers, so the renderer never loads or stores
+    # them -- it asserts); slots live together never share columns; and no
+    # batch commits while the previous commit is outstanding (a dots-only
+    # batch behind a loop used to).
+    bound = _REGION_BINDERS[kernel]()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    tc_facts = facts.tcgen05
+    assert tc_facts.regions
+    program = _match(bound)
+    for derived in program.derived:
+        assert (derived.slot in tc_facts.tmem_slots) == (
+            bool(derived.frags) or regions.derived_crosses(program, derived)
+        )
+    for dot in program.dots:
+        for operand in (dot.a, dot.b):
+            if operand.frag is not None:
+                assert program.frag_slots[operand.frag] in tc_facts.tmem_slots
+    seeds = [
+        config
+        for config in spec.compiler_seed_configs
+        if config.config["cute_mma_dag"] == "tcgen05"
+    ]
+    assert seeds
+    for seed in seeds[:2]:
+        with bound.env:
+            normalized = spec.normalized_config(seed)
+        body = _kernel_body(bound.to_code(normalized))
+        assert _commits_while_one_is_outstanding(body) == []
+        _assert_live_slots_disjoint(
+            bound, program, body, normalized.config["block_sizes"]
+        )
+        columns = _tmem_columns(body)
+        resolved = _resolved_axes(program, bound, normalized.config["block_sizes"])
+        groups = [*facts.live_groups, *tc_facts.tmem_conflicts]
+        for group in groups:
+            for a in group:
+                for b in group:
+                    if a < b and a in tc_facts.tmem_slots and b in tc_facts.tmem_slots:
+                        wa = tc._align(
+                            resolved[facts.frags[a][1]], tc.TCGEN05_SLOT_ALIGN
+                        )
+                        wb = tc._align(
+                            resolved[facts.frags[b][1]], tc.TCGEN05_SLOT_ALIGN
+                        )
+                        assert (
+                            columns[a] + wa <= columns[b]
+                            or columns[b] + wb <= columns[a]
+                        ), (kernel, a, b, columns)
+
+
+def _probe_h1(
+    q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor, do: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A root carry (dattn) read only by an inner loop's dot, and a fresh
+    dot (z) of the enclosing loop after it."""
+    BHN = q.size(0)
+    C = hl.specialize(q.size(1))
+    D = q.size(2)
+    DV = hl.specialize(do.size(2))
+    out_a = torch.empty([BHN, C, DV], dtype=torch.float32, device=q.device)
+    out_b = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        dattn = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_dv in hl.tile(DV):
+            dattn = hl.dot(
+                do[tile_bhn, :, tile_dv],
+                v_new[tile_bhn, :, tile_dv].transpose(-2, -1),
+                acc=dattn,
+            )
+        dattn = dattn.to(torch.bfloat16)
+        for tile_d in hl.tile(D):
+            for tile_dv in hl.tile(DV):
+                y = hl.dot(dattn, v_new[tile_bhn, :, tile_dv])
+                out_a[tile_bhn, :, tile_dv] = y
+            z = hl.dot(q[tile_bhn, :, tile_d], k[tile_bhn, :, tile_d].transpose(-2, -1))
+            out_b[tile_bhn, :, :] = z
+    return out_a, out_b
+
+
+def _probe_h3(
+    do: torch.Tensor, h: torch.Tensor, g: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A tile-only derived value computed before a nested dot loop and
+    reduced after it, in the same loop."""
+    BHN = do.size(0)
+    C = hl.specialize(do.size(1))
+    DV = hl.specialize(do.size(2))
+    D = h.size(1)
+    dq_out = torch.empty([BHN, C, D], dtype=torch.float32, device=do.device)
+    hd_out = torch.empty([BHN], dtype=torch.float32, device=do.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        hd = hl.zeros([tile_bhn], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            ht2 = h[tile_bhn, tile_d, :].to(torch.float32) * g[tile_bhn, tile_d, :]
+            dq = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
+            for tile_dv in hl.tile(DV):
+                dq = hl.dot(
+                    do[tile_bhn, :, tile_dv],
+                    h[tile_bhn, tile_d, tile_dv].transpose(-2, -1),
+                    acc=dq,
+                )
+            dq_out[tile_bhn, :, tile_d] = dq
+            hd = hd + ht2.sum(-1).sum(-1)
+        hd_out[tile_bhn] = hd
+    return dq_out, hd_out
+
+
+def _probe_h4(
+    a32: torch.Tensor, b32: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A tf32 dot ahead of a bf16 dot whose operand is rewritten in
+    place."""
+    BHN = a32.size(0)
+    C = hl.specialize(a32.size(1))
+    DV = a32.size(2)
+    D = q.size(2)
+    out_x = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    out_y = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        x = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_dv in hl.tile(DV):
+            x = hl.dot(
+                a32[tile_bhn, :, tile_dv],
+                b32[tile_bhn, :, tile_dv].transpose(-2, -1),
+                acc=x,
+            )
+        out_x[tile_bhn, :, :] = x
+        y = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            qs = (q[tile_bhn, :, tile_d].to(torch.float32) * 2.0).to(torch.bfloat16)
+            y = hl.dot(qs, k[tile_bhn, :, tile_d].transpose(-2, -1), acc=y)
+        out_y[tile_bhn, :, :] = y
+    return out_x, out_y
+
+
+def _bind_probe(
+    fn: object, *shapes: tuple[tuple[int, ...], torch.dtype]
+) -> BoundKernel:
+    return _bind_fn(fn, tuple(_cpu(*shape, dtype=dtype) for shape, dtype in shapes))
+
+
+def _bind_h1(bhn: int = 16, d: int = 128, dv: int = 64) -> BoundKernel:
+    bf16, c = torch.bfloat16, 64
+    return _bind_probe(
+        _probe_h1,
+        ((bhn, c, d), bf16),
+        ((bhn, c, d), bf16),
+        ((bhn, c, dv), bf16),
+        ((bhn, c, dv), bf16),
+    )
+
+
+def _bind_h3(bhn: int = 16, d: int = 128, dv: int = 64) -> BoundKernel:
+    bf16, f32, c = torch.bfloat16, torch.float32, 64
+    return _bind_probe(
+        _probe_h3, ((bhn, c, dv), bf16), ((bhn, d, dv), bf16), ((bhn, d, dv), f32)
+    )
+
+
+def _bind_h4(bhn: int = 16, d: int = 128, dv: int = 64) -> BoundKernel:
+    bf16, f32, c = torch.bfloat16, torch.float32, 64
+    return _bind_probe(
+        _probe_h4,
+        ((bhn, c, dv), f32),
+        ((bhn, c, dv), f32),
+        ((bhn, c, d), bf16),
+        ((bhn, c, d), bf16),
+    )
+
+
+def _unrolled_live_pairs(program: dag.MmaDagProgram) -> set[tuple[int, int]]:
+    """Slot pairs live together in an execution with every loop run twice
+    (an independent, loop-aware liveness).  A dot / derived result is live
+    from each of its definitions to the last read before the next one (a
+    value redefined by every iteration is not live across iterations); a
+    carry is live from its loop's entry (where it reads the slot seeding
+    it) over the whole loop and on to its phi's last reader.  A step reads
+    its inputs before it writes its result, so a definition at another
+    slot's last read does not overlap it."""
+    flat: list[dag.Step] = []
+    spans: dict[int, tuple[int, int]] = {}
+
+    def walk(steps: Sequence[dag.Step]) -> None:
+        for step in steps:
+            if isinstance(step, dag.Loop):
+                start = len(flat)
+                for _trip in range(2):
+                    walk(step.steps)
+                spans[step.index] = (start, len(flat))
+            else:
+                flat.append(step)
+
+    walk(program.body)
+    carries: dict[int, int] = {}
+    for loop in program.loops:
+        for carry in loop.carries:
+            carries[carry.slot] = loop.index
+    # (slot, first, last, defined) intervals.
+    intervals: list[tuple[int, int, int, bool]] = []
+    open_at: dict[int, int] = {}
+    last_use: dict[int, int] = {}
+
+    def use(slot: int, index: int) -> None:
+        if slot in carries:
+            last_use[slot] = max(last_use.get(slot, index), index)
+            return
+        if slot not in open_at:
+            open_at[slot] = index
+        last_use[slot] = index
+
+    def define(slot: int, index: int) -> None:
+        if slot in carries:
+            return
+        if slot in open_at:
+            intervals.append((slot, open_at[slot], last_use[slot], True))
+        open_at[slot] = index
+        last_use[slot] = index
+
+    seeds: dict[int, int] = {}
+    for loop in program.loops:
+        start, _end = spans[loop.index]
+        for carry in loop.carries:
+            if carry.init_frag is not None:
+                seeds[start] = program.frag_slots[program.resolve(carry.init_frag)]
+    for index, step in enumerate(flat):
+        if index in seeds:
+            use(seeds[index], index)
+        if isinstance(step, dag.Dot):
+            for operand in (step.a, step.b):
+                if operand.frag is not None:
+                    use(program.frag_slots[program.resolve(operand.frag)], index)
+            if step.acc_slot is not None:
+                use(step.acc_slot, index)
+            define(step.slot, index)
+        elif isinstance(step, dag.Derived):
+            for frag in step.frags:
+                use(program.frag_slots[frag], index)
+            define(step.slot, index)
+        elif isinstance(step, (dag.Store, dag.Reduce)) and step.frag is not None:
+            use(program.frag_slots[step.frag], index)
+    for slot, start in open_at.items():
+        intervals.append((slot, start, last_use[slot], True))
+    for slot, loop in carries.items():
+        start, end = spans[loop]
+        intervals.append((slot, start, max(end, last_use.get(slot, end)), False))
+
+    def overlap(a: tuple[int, int, int, bool], b: tuple[int, int, int, bool]) -> bool:
+        _sa, fa, la, da = a
+        _sb, fb, lb, db = b
+        if fa > lb or fb > la:
+            return False
+        if fa == lb and da:
+            return False
+        return not (fb == la and db)
+
+    pairs: set[tuple[int, int]] = set()
+    for a in intervals:
+        for b in intervals:
+            if a[0] < b[0] and overlap(a, b):
+                pairs.add((a[0], b[0]))
+    return pairs
+
+
+def _assert_live_slots_disjoint(
+    bound: BoundKernel, program: dag.MmaDagProgram, body: str, block_sizes: list[int]
+) -> None:
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    columns = _tmem_columns(body)
+    resolved = _resolved_axes(program, bound, block_sizes)
+    for a, b in _unrolled_live_pairs(program):
+        if a in facts.tcgen05.tmem_slots and b in facts.tcgen05.tmem_slots:
+            wa = tc._align(resolved[facts.frags[a][1]], tc.TCGEN05_SLOT_ALIGN)
+            wb = tc._align(resolved[facts.frags[b][1]], tc.TCGEN05_SLOT_ALIGN)
+            assert columns[a] + wa <= columns[b] or columns[b] + wb <= columns[a], (
+                a,
+                b,
+                columns,
+            )
+
+
+def test_values_read_inside_a_nested_loop_stay_live_across_it() -> None:
+    # dattn (the root carry, cast for the inner loop's dot) is read by every
+    # iteration of the tile_d loop, but the planner's linear liveness ended it
+    # at that read, so z (a fresh dot of the tile_d loop after the inner loop)
+    # shared its columns -- from the second tile_d iteration on, the inner loop
+    # read z as dattn.  The outermost loop containing a read but not the
+    # definition now holds the value live: dattn conflicts with everything that
+    # loop touches.
+    bound = _bind_h1()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    program = _match(bound)
+    (dattn,) = [
+        carry.slot
+        for loop in program.loops
+        if loop.parent < 0
+        for carry in loop.carries
+    ]
+    (z,) = [
+        dot.slot
+        for dot in program.dots
+        if dot.loop >= 0
+        and program.loops[dot.loop].parent < 0
+        and dot.a.kind == "load"
+        and dot.acc_slot is None
+        and dot.loop != 0
+    ]
+    assert (min(dattn, z), max(dattn, z)) in facts.tcgen05.tmem_conflicts
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    columns = _tmem_columns(body)
+    assert columns[dattn] != columns[z]
+    _assert_live_slots_disjoint(bound, program, body, [64, 64, 64])
+
+
+def test_mixed_dtype_passes_use_each_tiles_dtype() -> None:
+    # With a tf32 dot first, the program-wide kind picked unpack_f16x2 for the
+    # bf16 tile rewritten in place, and the exchange packs defaulted to the
+    # program dtype.  The passes now use the tile's own dtype.
+    bound = _bind_h4()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.tf32
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    assert f"{WARP_RT}.unpack_bf16x2(" in body
+    assert f"{WARP_RT}.unpack_f16x2(" not in body
+    assert f"{WARP_RT}.pack_bf16x2(" in body and f"{WARP_RT}.pack_f16x2(" not in body
+    assert f"{P}.Tcgen05MMAKind.TF32" in body and f"{P}.Tcgen05MMAKind.F16" in body
+
+
+def test_a_derived_value_read_behind_a_nested_loop_crosses_segments() -> None:
+    # ht2 is computed before the inner dot loop and reduced after it, in the
+    # same tile_d loop; the blocks are built per segment, so its registers do
+    # not reach the reduction -- the value takes tensor-memory columns (the
+    # render used to hit the emit_ld assertion).
+    bound = _bind_h3()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    program = _match(bound)
+    (ht2,) = [step for step in program.derived if not step.frags]
+    assert regions.derived_crosses(program, ht2)
+    assert ht2.slot in facts.tcgen05.tmem_slots
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    assert body.count(f"{P}.tcgen05_st(") >= 1
+    _assert_live_slots_disjoint(bound, program, body, [64, 64])
+
+
+def test_region_programs_own_the_carry_slot_rule() -> None:
+    # The single-loop emitter declines a loop output computed in another
+    # slot (no TMEM carry copy); the region renderer
+    # copies the output into the carry's slot (wy's Apow), so region
+    # programs dispatch before that rule.
+    spec = _bind_wy().config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    program = _match(_bind_wy())
+    assert any(
+        program.frag_slots[program.resolve(carry.output)] != carry.slot
+        for loop in program.loops
+        for carry in loop.carries
+    )
+
+
+def test_tile_only_derived_operands_take_tensor_memory_slots() -> None:
+    # bwd_o_kda's ``qg = (q * exp2(gc)).to(bf16)`` is a derived value over
+    # tiles alone that the inner loop's dot reads as an operand (through the
+    # exchange tile) -- it needs its own columns: at the first seed it took
+    # dqg's, and the inner loop read dqg as qg.  Its columns are now shared
+    # only with dA (the first loop's carry, dead by then).
+    bound = _bind_bwd_o_kda()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    program = _match(bound)
+    (dh_dot,) = [dot for dot in program.dots if dot.a.frag is not None]
+    assert dh_dot.a.frag is not None
+    qg = program.frag_slots[dh_dot.a.frag]
+    (derived,) = [step for step in program.derived if step.slot == qg]
+    assert not derived.frags and regions.derived_crosses(program, derived)
+    assert qg in facts.tcgen05.tmem_slots
+    (dqg,) = [
+        carry.slot
+        for loop in program.loops
+        if loop.parent >= 0
+        for carry in loop.carries
+    ]
+    (da,) = [
+        carry.slot
+        for loop in program.loops
+        if loop.parent < 0
+        for carry in loop.carries
+    ]
+    body = _kernel_body(_source(bound, _config(64, 64, 16, warps=4, stages=4)))
+    columns = _tmem_columns(body)
+    assert columns[qg] == columns[da] == 0
+    assert columns[dqg] == 64 and columns[dh_dot.slot] == 128
+    assert f"{P}.tcgen05_alloc(md_tslot, 256," in body
+    # state_du_kda's ``k_scaled`` and the anchored output's ``qg`` likewise.
+    for bind in (_bind_state_du_kda, _bind_fwd_o_anch):
+        bound = bind()
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.tcgen05 is not None
+        program = _match(bound)
+        operands = {
+            program.frag_slots[operand.frag]
+            for dot in program.dots
+            for operand in (dot.a, dot.b)
+            if operand.frag is not None
+        }
+        tile_only = {step.slot for step in program.derived if not step.frags}
+        assert operands & tile_only
+        assert (operands & tile_only) <= set(facts.tcgen05.tmem_slots)
+
+
+def test_a_dots_only_batch_waits_for_the_previous_commit() -> None:
+    # The anchored output's ``o_intra = dot(A, v)`` follows the ``o_cross``
+    # loop as a batch without epilogue work ahead of it; it used to commit
+    # while the loop's last commit was outstanding, and the parity wait passed
+    # on the stale phase.
+    bound = _bind_fwd_o_anch()
+    body = _kernel_body(_source(bound, _config(1, 16, 16, warps=4, stages=4)))
+    assert _commits_while_one_is_outstanding(body) == []
+    epilogue = _after_loop(body, "md_i")
+    assert epilogue.count(f"{P}.tcgen05_commit(md_cb") == 1
+    _assert_in_order(
+        epilogue,
+        [
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_cb",
+            "md_cn = md_cn + 1",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+        ],
+    )
+
+
+def test_the_outer_loop_staging_waits_for_the_sibling_loop() -> None:
+    # dqkw's tile_d loop stages k / q tiles into a frame that overlaps the
+    # dattn loop's ring; the first iteration's TMA used to be issued while the
+    # dattn loop's last batch could still be reading it.
+    bound = _bind_dqkw()
+    body = _kernel_body(_source(bound, _config(64, 64, 16, warps=4, stages=2)))
+    assert _commits_while_one_is_outstanding(body) == []
+    _before, outer = _split_loop(body, "md_i1")
+    head = outer[: outer.index(f"{P}.mbarrier_arrive_expect_tx(md_sf1, ")]
+    assert head.startswith("for md_i1 in cutlass.range(0, 2):")
+    assert f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)" in head
+    assert f"{P}.tcgen05_commit(" not in head
+    assert "cp_async_bulk_tensor" not in head
