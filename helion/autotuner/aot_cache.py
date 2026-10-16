@@ -62,6 +62,7 @@ from .aot_structural_policy import policy_path
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
+from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 
@@ -714,10 +715,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
             shape_features = self._extract_shape_features()
 
             # Hash inputs, run kernel, hash inputs again and outputs
-            input_hashes = self._compute_tensor_hashes()
+            probe_args = self.args
+            if self.autotuner.benchmark_provider.mutated_arg_indices:
+                probe_args = _clone_args(
+                    self.args,
+                    self.kernel.env.process_group_name,
+                    idx_to_clone=self.autotuner.benchmark_provider.mutated_arg_indices,
+                )
+            else:
+                probe_args = self.args
+            input_hashes = self._compute_tensor_hashes(probe_args)
             fn = self.kernel.compile_config(config)
-            outputs = fn(*self.args)
-            input_after_hashes = self._compute_tensor_hashes()
+            outputs = fn(*probe_args)
+            input_after_hashes = self._compute_tensor_hashes(probe_args)
             if outputs is None:
                 outputs = ()
             elif not isinstance(outputs, (tuple, list)):
