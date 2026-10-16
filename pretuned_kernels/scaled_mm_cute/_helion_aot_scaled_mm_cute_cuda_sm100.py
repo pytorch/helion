@@ -1,5 +1,5 @@
 """
-Auto-generated heuristic for kernels: scale_mm_cute, scale_mm_cute_skinny_m, scale_mm_cute_swap_ab
+Auto-generated heuristic for kernels: scaled_mm_cute, scaled_mm_cute_skinny_m, scaled_mm_cute_swap_ab
 Backend: explicit per-shape table (exact (M, K, N) -> tuned config)
 
 RowWise-scaled FP8 GEMM pretuned on NVIDIA B200 (sm100) for the Helion CuTe
@@ -60,14 +60,14 @@ def _select(keys, mkn):
     return best_i
 
 
-# === Kernel: scale_mm_cute_skinny_m ===
-# Tuned (M, K, N) shapes, parallel to _CONFIGS_scale_mm_cute_skinny_m.
-_KEYS_scale_mm_cute_skinny_m = [
+# === Kernel: scaled_mm_cute_skinny_m ===
+# Tuned (M, K, N) shapes, parallel to _CONFIGS_scaled_mm_cute_skinny_m.
+_KEYS_scaled_mm_cute_skinny_m = [
     (1, 4096, 4096),
     (1, 4096, 256),
 ]
 
-_CONFIGS_scale_mm_cute_skinny_m = [
+_CONFIGS_scaled_mm_cute_skinny_m = [
     # (M, K, N) = (1, 4096, 4096)
     {'block_sizes': [1, 512], 'num_threads': [0, 32], 'cute_vector_widths': [1, 8]},
     # (M, K, N) = (1, 4096, 256)
@@ -75,17 +75,17 @@ _CONFIGS_scale_mm_cute_skinny_m = [
 ]
 
 
-def key_scale_mm_cute_skinny_m(*args) -> int:
+def key_scaled_mm_cute_skinny_m(*args) -> int:
     """Config index for the given args (also the cache key)."""
-    return _select(_KEYS_scale_mm_cute_skinny_m, _mkn(args))
+    return _select(_KEYS_scaled_mm_cute_skinny_m, _mkn(args))
 
 
-def autotune_scale_mm_cute_skinny_m(*args) -> dict:
+def autotune_scaled_mm_cute_skinny_m(*args) -> dict:
     """Config dict for the given args."""
-    return _CONFIGS_scale_mm_cute_skinny_m[key_scale_mm_cute_skinny_m(*args)]
+    return _CONFIGS_scaled_mm_cute_skinny_m[key_scaled_mm_cute_skinny_m(*args)]
 
 
-# === Kernel: scale_mm_cute_swap_ab ===
+# === Kernel: scaled_mm_cute_swap_ab ===
 _SMALL_M_SWAP_KEYS = [
     (m, k, n)
     for m in (2, 8, 16, 32)
@@ -187,24 +187,24 @@ _M64_SWAP_CONFIGS = {
     },
 }
 
-_KEYS_scale_mm_cute_swap_ab = [*_SMALL_M_SWAP_KEYS, *_M64_SWAP_CONFIGS]
+_KEYS_scaled_mm_cute_swap_ab = [*_SMALL_M_SWAP_KEYS, *_M64_SWAP_CONFIGS]
 
-_CONFIGS_scale_mm_cute_swap_ab = [
+_CONFIGS_scaled_mm_cute_swap_ab = [
     _small_m_swap_config(*key) for key in _SMALL_M_SWAP_KEYS
 ] + list(_M64_SWAP_CONFIGS.values())
 
 
-def key_scale_mm_cute_swap_ab(*args) -> int:
-    return _select(_KEYS_scale_mm_cute_swap_ab, _mkn(args))
+def key_scaled_mm_cute_swap_ab(*args) -> int:
+    return _select(_KEYS_scaled_mm_cute_swap_ab, _mkn(args))
 
 
-def autotune_scale_mm_cute_swap_ab(*args) -> dict:
-    return _CONFIGS_scale_mm_cute_swap_ab[key_scale_mm_cute_swap_ab(*args)]
+def autotune_scaled_mm_cute_swap_ab(*args) -> dict:
+    return _CONFIGS_scaled_mm_cute_swap_ab[key_scaled_mm_cute_swap_ab(*args)]
 
 
-# === Kernel: scale_mm_cute ===
-# Tuned (M, K, N) shapes, parallel to _CONFIGS_scale_mm_cute.
-_KEYS_scale_mm_cute = [
+# === Kernel: scaled_mm_cute ===
+# Tuned (M, K, N) shapes, parallel to _CONFIGS_scaled_mm_cute.
+_KEYS_scaled_mm_cute = [
     (4096, 4096, 4096),
     (512, 2048, 4096),
     (512, 2048, 2048),
@@ -222,7 +222,7 @@ _KEYS_scale_mm_cute = [
     (64, 25600, 5120),
 ]
 
-_CONFIGS_scale_mm_cute = [
+_CONFIGS_scaled_mm_cute = [
     # (M, K, N) = (4096, 4096, 4096)
     {'block_sizes': [256, 256, 128], 'l2_groupings': [4], 'indexing': ['pointer', 'pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 8, 'tcgen05_strategy': 'role_local_monolithic', 'tcgen05_layout_strategy': 'default', 'tcgen05_warp_spec_mma_warps': 1, 'tcgen05_warp_spec_ab_load_warps': 1, 'tcgen05_warp_spec_epi_load_warps': 0, 'tcgen05_warp_spec_scheduler_warps': 0, 'tcgen05_warp_spec_c_input_warps': 0, 'tcgen05_warp_spec_store_warps': 0, 'tcgen05_warp_spec_register_decrease': 120, 'tcgen05_warp_spec_register_increase': 256, 'cute_vector_widths': [1, 1, 1], 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_layout_overrides_epi_tile_m': None, 'tcgen05_layout_overrides_epi_tile_n': None, 'tcgen05_layout_overrides_smem_swizzle_a': None, 'tcgen05_layout_overrides_smem_swizzle_b': None, 'tcgen05_layout_overrides_d_store_box_n': None},
     # (M, K, N) = (512, 2048, 4096) -- four-CTA specialization with broadcast
@@ -279,11 +279,11 @@ _CONFIGS_scale_mm_cute = [
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_aux_load_placement': 'pre_acc_wait'},
 ]
 
-def key_scale_mm_cute(*args) -> int:
+def key_scaled_mm_cute(*args) -> int:
     """Config index for the given args (also the cache key)."""
-    return _select(_KEYS_scale_mm_cute, _mkn(args))
+    return _select(_KEYS_scaled_mm_cute, _mkn(args))
 
 
-def autotune_scale_mm_cute(*args) -> dict:
+def autotune_scaled_mm_cute(*args) -> dict:
     """Config dict for the given args."""
-    return _CONFIGS_scale_mm_cute[key_scale_mm_cute(*args)]
+    return _CONFIGS_scaled_mm_cute[key_scaled_mm_cute(*args)]

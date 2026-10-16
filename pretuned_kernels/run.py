@@ -44,7 +44,7 @@ KERNELS = [
     "layer_norm",
     "softmax",
     "scaled_mm",
-    "scale_mm_cute",
+    "scaled_mm_cute",
     "nvfp4_gemv",
     "nvfp4_gemv_cute",
     # B200 tcgen05 register-fragment epilogues.
@@ -73,7 +73,7 @@ KERNELS = [
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200", "sm103": "gb300"}
 
 
 def _kernel_directory(name: str) -> Path:
