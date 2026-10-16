@@ -194,6 +194,10 @@ class _EquivalentSource(ast.NodeTransformer):
         return node
 
 
+# The bundle replays below each start a fresh Python process that imports torch
+# and Helion and compiles the kernel again: 20-33s alone on a B200, past the 60s
+# CI default once eight xdist workers share the runner's CPUs.
+@pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
 def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
@@ -226,6 +230,7 @@ def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
     _replay_bundle(bundle, tmp_path)
 
 
+@pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
 @pytest.mark.parametrize("scale", [2.0, math.inf, -math.inf, math.nan])
@@ -260,6 +265,7 @@ def test_dlpack_and_nonfinite_bundle_inputs(scale: float, tmp_path: Path) -> Non
     _replay_bundle(bundle, tmp_path)
 
 
+@pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
 @pytest.mark.parametrize("backend", ["cute", "triton"])
@@ -363,6 +369,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
             )
 
 
+@pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
 def test_numerical_reference_preserves_original_mutation_and_aliases(

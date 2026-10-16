@@ -363,6 +363,22 @@ jobs:
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
+          if [[ "${{ matrix.alias }}" == *mi350x* ]]; then
+            # The MI350X runner pods share their node's eight GPUs, and the
+            # container options pin every job to GPU 0: up to four test jobs
+            # ran on one GPU (OOMs with "0 bytes free", stalls) while the
+            # rest sat idle. Pick the least-used GPU as the tests start; the
+            # jitter keeps jobs that get here together from picking the same.
+            sleep $((RANDOM % 30))
+            GPU=$(python scripts/select_rocm_gpu.py) || { echo "::warning::GPU selection failed, staying on GPU 0"; GPU=0; }
+            export ROCR_VISIBLE_DEVICES=$GPU
+            rocminfo | grep -m1 "Uuid:.*GPU-" || true
+            # Inductor shuts its Triton-compile subprocess pool down after
+            # 60s idle, and the first compile after the test_autotune_* block
+            # waited on a pool that never answered until the per-test timeout
+            # killed the worker. Compile in the test process instead.
+            export TORCHINDUCTOR_COMPILE_THREADS=1
+          fi
           TIMEOUT=60
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
             TIMEOUT=300

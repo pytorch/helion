@@ -1114,18 +1114,26 @@ def test_packet_store_beside_the_previous_elements_read_matches_reference(
 ) -> None:
     # One packet of four per thread: vector lane 0 reads the previous
     # thread's element 3, which that thread's flush stores; the barrier
-    # between the read and the flush orders the threads.
+    # between the read and the flush orders the threads.  Each tile is its
+    # own CTA, and nothing orders two CTAs: the first element of every later
+    # tile may read the previous tile's element before or after its store.
     run = _compiled(
         _read_previous_then_store,
         tuple(_small_integers(shape) for _ in range(3)),
         **_ONE_PACKET_PER_THREAD_CONFIG,
     )
+    block = _ONE_PACKET_PER_THREAD_CONFIG["block_sizes"][0]
+    tile_begins = torch.arange(block, shape[0], block, device=CUDA_DEVICE)
     for _ in range(_RUNS):
         x = _small_integers(shape)
         v = _small_integers(shape)
         y = torch.full(shape, -7.0, device=CUDA_DEVICE)
         expected_y = torch.cat([torch.zeros_like(x[:1]), x[:-1]])
         run(x, v, y)  # pyrefly: ignore [not-callable]
+        stored = v[tile_begins - 1]
+        expected_y[tile_begins] = torch.where(
+            y[tile_begins] == stored, stored, expected_y[tile_begins]
+        )
         torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 

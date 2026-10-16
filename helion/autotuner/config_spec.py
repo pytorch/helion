@@ -76,6 +76,33 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cute_mma_dag import AXIS_LEAD
+from .._compiler.cute.cute_mma_dag import AXIS_LOOP
+from .._compiler.cute.cute_mma_dag import AXIS_ROOT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
+from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_TCGEN05
+from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
+from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
+from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
+from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
@@ -1019,6 +1046,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
+        *MMA_DAG_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1137,6 +1165,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
+        *MMA_DAG_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1639,6 +1668,19 @@ class ConfigSpec:
         self.cute_gdn_recurrence_token_group_choices_by_tile: dict[
             tuple[int, int, int], tuple[int, ...]
         ] = {}
+        # Enabled only when the warp-MMA state recurrence owner
+        # (``cute_mma_dag``) admits the kernel: the mode, its warp count and
+        # its operand stage depth.  ``cute_mma_dag_facts`` carries the
+        # geometry ``normalize`` validates a tile / warp / stage choice
+        # against without the graphs.
+        self.cute_mma_dag: EnumFragment | None = None
+        self.cute_mma_dag_warps: EnumFragment | None = None
+        self.cute_mma_dag_stages: EnumFragment | None = None
+        self.cute_mma_dag_store: EnumFragment | None = None
+        self.cute_mma_dag_exchange: EnumFragment | None = None
+        self.cute_mma_dag_pass_warps: EnumFragment | None = None
+        self.cute_mma_dag_loads: EnumFragment | None = None
+        self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
@@ -3052,6 +3094,167 @@ class ConfigSpec:
         self.cute_gdn_recurrence_token_groups = EnumFragment(
             choices=tuple(group_choices)
         )
+
+    def enable_cute_mma_dag_search(self, facts: CuteMmaDagFacts) -> None:
+        """Expose the warp-MMA recurrence mode, warp count and stage depth.
+
+        ``off`` leads the mode domain so a config that leaves the knob out
+        keeps the ordinary lowering; the seed heuristic (and, on validated
+        targets, the promoted default) selects ``warp``.
+        """
+        self.cute_mma_dag_facts = facts
+        modes = MMA_DAG_MODES
+        if facts.tcgen05 is not None:
+            modes = (*modes, MMA_DAG_TCGEN05)
+        self.cute_mma_dag = EnumFragment(choices=modes)
+        self.cute_mma_dag_warps = EnumFragment(
+            choices=(
+                MMA_DAG_DEFAULT_WARPS,
+                *(w for w in MMA_DAG_WARP_CHOICES if w != MMA_DAG_DEFAULT_WARPS),
+            )
+        )
+        self.cute_mma_dag_stages = EnumFragment(
+            choices=(
+                MMA_DAG_DEFAULT_STAGES,
+                *(s for s in MMA_DAG_STAGE_CHOICES if s != MMA_DAG_DEFAULT_STAGES),
+            )
+        )
+        self.cute_mma_dag_store = EnumFragment(choices=MMA_DAG_STORE_CHOICES)
+        self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
+        self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
+        self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
+
+    def _normalize_cute_mma_dag(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Validate the warp-MMA dataflow knobs against the selected tiles
+        and pin the knobs the replaced body ignores to one identity."""
+        from .._compiler.cute.cute_mma_dag import mma_dag_config_reason
+        from .._compiler.cute.cute_mma_dag import mma_dag_repair
+
+        facts = self.cute_mma_dag_facts
+        assert facts is not None
+        for key, fragment in (
+            (MMA_DAG_KEY, self.cute_mma_dag),
+            (MMA_DAG_WARPS_KEY, self.cute_mma_dag_warps),
+            (MMA_DAG_STAGES_KEY, self.cute_mma_dag_stages),
+            (MMA_DAG_STORE_KEY, self.cute_mma_dag_store),
+            (MMA_DAG_EXCHANGE_KEY, self.cute_mma_dag_exchange),
+            (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
+            (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
+        ):
+            assert fragment is not None
+            value = config.setdefault(key, fragment.default())
+            if value not in fragment.choices or type(value) is bool:
+                if fix_invalid:
+                    config[key] = fragment.default()
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {fragment.choices!r}, got {value!r}"
+                    )
+        if config[MMA_DAG_KEY] == MMA_DAG_OFF:
+            # The warp count, stage depth and data routes are inert without
+            # the mode.
+            config[MMA_DAG_WARPS_KEY] = MMA_DAG_DEFAULT_WARPS
+            config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
+            config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+            config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+            return
+        block_sizes = config.get("block_sizes")
+        assert isinstance(block_sizes, list)
+        indices = {
+            axis.block_id: self.block_sizes.block_id_to_index(axis.block_id)
+            for axis in facts.axes
+            if axis.kind in (AXIS_ROOT, AXIS_LOOP, AXIS_LEAD)
+            and axis.block_id in self.block_sizes.valid_block_ids()
+        }
+        # Leading root tiles are batch coordinates: one row per CTA.
+        for axis in facts.axes:
+            if axis.kind == AXIS_LEAD and axis.block_id in indices:
+                block_sizes[indices[axis.block_id]] = 1
+        sizes_by_block = {
+            block_id: block_sizes[index] for block_id, index in indices.items()
+        }
+        warps, stages = config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY]
+        mode = cast("str", config[MMA_DAG_KEY])
+        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
+            repaired = mma_dag_repair(facts, sizes_by_block, warps, stages, mode)
+            if repaired is None and mode == MMA_DAG_TCGEN05:
+                # No tcgen05 geometry near the request: the warp mode runs
+                # the same program.
+                config[MMA_DAG_KEY] = MMA_DAG_WARP
+                repaired = mma_dag_repair(facts, sizes_by_block, warps, stages)
+            if repaired is None:
+                config[MMA_DAG_KEY] = MMA_DAG_OFF
+                config[MMA_DAG_WARPS_KEY] = MMA_DAG_DEFAULT_WARPS
+                config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
+                config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+                config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
+                config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+                config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+                return
+            new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
+            for block_id, index in indices.items():
+                block_sizes[index] = new_sizes[block_id]
+        # Knobs without a subject are inert: no fragment read straight as an
+        # A operand (only the shared tile can feed a transposed one), no loop
+        # snapshot to stage.
+        if not facts.identity_candidates:
+            config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
+        if not facts.staging:
+            config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
+            mma_dag_pass_warps_reason(
+                facts,
+                cast("int", config[MMA_DAG_WARPS_KEY]),
+                cast("int", config[MMA_DAG_STAGES_KEY]),
+                cast("str", config[MMA_DAG_KEY]),
+            )
+            is not None
+        ):
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+        # The loads route has a subject only in the tensor-memory region
+        # programs whose derived values read tiles.
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 or not (
+            facts.tcgen05 is not None and facts.tcgen05.aux_items
+        ):
+            config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+        # Inert knobs: the body is replaced, so equal kernels share one
+        # autotune identity (the occupancy hint stays searchable).
+        config["pid_type"] = "flat"
+        if "loop_orders" in config:
+            config["loop_orders"] = [item._fill_missing() for item in self.loop_orders]
+        if "l2_groupings" in config:
+            config["l2_groupings"] = [1 for _ in self.l2_groupings]
+        for key, default in (
+            ("num_threads", 0),
+            ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
+            ("cute_reduction_reloads", "auto"),
+            ("load_eviction_policies", ""),
+            ("reduction_loops", None),
+            ("flatten_loops", False),
+        ):
+            value = config.get(key)
+            if isinstance(value, list):
+                config[key] = [default for _ in value]
+        for key in ("cute_collective_mma", "cute_register_chain"):
+            if key in config:
+                config[key] = False
+        for key, field in self._flat_fields().items():
+            if (
+                key.startswith(
+                    ("cute_fragment_", "cute_collective_", "cute_gathered_mma_")
+                )
+                or key == "cute_proven_bounds"
+            ) and key in config:
+                if isinstance(field, ConfigSpecFragment):
+                    config[key] = field.default()
 
     def _cute_gdn_recurrence_tile_of(self, config: dict[str, object]) -> int | None:
         """The dstate tile ``config`` selects, or ``None`` when the gdn knobs
@@ -5068,6 +5271,20 @@ class ConfigSpec:
                         "chunk-recurrence kernels"
                     )
 
+        for dag_key in MMA_DAG_KEYS:
+            if (
+                dag_key in config
+                and self.cute_mma_dag is None
+                and self.supports_config_key(dag_key)
+            ):
+                if _fix_invalid:
+                    config.pop(dag_key)
+                else:
+                    raise InvalidConfig(
+                        f"{dag_key} is available only for matched warp-MMA state "
+                        "recurrence kernels"
+                    )
+
         if (
             CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
             and self.cute_chunk_prepare_schedule is None
@@ -5884,6 +6101,8 @@ class ConfigSpec:
                         f"{gdn_tile_group_choices!r} for the selected dstate "
                         f"tile and epilogue warps, got {gdn_groups!r}"
                     )
+        if self.cute_mma_dag is not None:
+            self._normalize_cute_mma_dag(config, fix_invalid=_fix_invalid)
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
             prepare_schedule = config.setdefault(
@@ -7213,6 +7432,20 @@ class ConfigSpec:
                 )
             if self.cute_gdn_recurrence_mma_m is not None:
                 fields[CUTE_GDN_RECURRENCE_MMA_M_KEY] = self.cute_gdn_recurrence_mma_m
+            if self.cute_mma_dag is not None:
+                fields[MMA_DAG_KEY] = self.cute_mma_dag
+                assert self.cute_mma_dag_warps is not None
+                assert self.cute_mma_dag_stages is not None
+                assert self.cute_mma_dag_store is not None
+                assert self.cute_mma_dag_exchange is not None
+                assert self.cute_mma_dag_pass_warps is not None
+                assert self.cute_mma_dag_loads is not None
+                fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
+                fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
+                fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
+                fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
+                fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
+                fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule

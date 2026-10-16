@@ -304,6 +304,7 @@ from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
+from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
@@ -1058,29 +1059,34 @@ class TestAutotunerHeuristic(TestCase):
         self.assertNotEqual(execution_default, reference)
         self.assertEqual(generated_reference, reference)
 
-    def test_accuracy_baseline_uses_autotune_reference(self) -> None:
+    def test_accuracy_baseline_runs_the_execution_default(self) -> None:
+        # The autotuning reference produces the baseline only while it is what
+        # the kernel runs by default; a promoted execution default (whose
+        # arithmetic the fast candidates share) takes over as soon as it
+        # differs from the reference.
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
-        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider.args = ()
-        provider.settings = MagicMock(autotune_baseline_fn=None)
-        provider.config_spec = MagicMock()
-        provider.config_spec.autotune_reference_config.return_value = reference
-        provider.config_spec.default_config.return_value = execution_default
-        provider.kernel = MagicMock()
-        provider.kernel.env.process_group_name = None
-        provider.kernel.compile_config.return_value = lambda: "baseline"
+        for default in (reference, execution_default):
+            with self.subTest(default=default):
+                provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+                provider.args = ()
+                provider.settings = MagicMock(autotune_baseline_fn=None)
+                provider.config_spec = MagicMock()
+                provider.config_spec.autotune_reference_config.return_value = reference
+                provider.config_spec.default_config.return_value = default
+                provider.kernel = MagicMock()
+                provider.kernel.env.process_group_name = None
+                provider.kernel.compile_config.return_value = lambda: "baseline"
 
-        with patch("helion.autotuner.benchmark_provider.synchronize_device"):
-            output, mutated, post_args = provider._compute_baseline()
+                with patch("helion.autotuner.benchmark_provider.synchronize_device"):
+                    output, mutated, post_args = provider._compute_baseline()
 
-        self.assertEqual(output, "baseline")
-        self.assertEqual(mutated, [])
-        self.assertEqual(post_args, ())
-        provider.kernel.compile_config.assert_called_once_with(
-            reference, allow_print=False
-        )
-        provider.config_spec.default_config.assert_not_called()
+                self.assertEqual(output, "baseline")
+                self.assertEqual(mutated, [])
+                self.assertEqual(post_args, ())
+                provider.kernel.compile_config.assert_called_once_with(
+                    default, allow_print=False
+                )
 
     def test_should_promote_gate(self) -> None:
         # should_promote() gates a seed's PROMOTION (becoming the autotune-off
@@ -5340,6 +5346,40 @@ class TestTritonReductionHeuristicUnit(TestCase):
         self.assertEqual(seed.config["reduction_loops"], [None])
         self.assertEqual(seed.config["num_warps"], 8)
         self.assertEqual(seed.config["num_stages"], 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_lone_row_axis_packs_rows_until_the_grid_would_starve(self) -> None:
+        @helion.kernel(backend="triton")
+        def softmax(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                exp = torch.exp(row - torch.amax(row, dim=-1, keepdim=True))
+                out[tile_m, :] = exp / torch.sum(exp, dim=-1, keepdim=True)
+            return out
+
+        def row_block(bound: BoundKernel, num_sm: int) -> int:
+            with (
+                patch(
+                    "helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE
+                ),
+                patch("helion.runtime.get_num_sm", return_value=num_sm),
+            ):
+                seed = TritonReductionHeuristic.get_seed_config(
+                    bound.env, bound.host_function.device_ir
+                )
+            return seed.config["block_sizes"][0]
+
+        def bind(m: int, n: int) -> BoundKernel:
+            return softmax.bind((torch.empty(m, n, device=DEVICE, dtype=HALF_DTYPE),))
+
+        wide_m = bind(4096, 1024)
+        self.assertEqual(row_block(wide_m, 114), 4)
+        self.assertEqual(row_block(wide_m, 132), 2)
+        self.assertEqual(row_block(bind(512, 1024), 114), 1)
+        self.assertEqual(row_block(bind(4096, 8192), 114), 1)
 
     def test_user_tile_seed_respects_register_block_size_cap(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())

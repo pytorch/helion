@@ -4876,6 +4876,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             state.single_token_rank1_plan,
             state.split_single_token_rank1_plan,
             state.fixed_token_rank1_plan,
+            state.mma_dag_plan,
             state.attention_flash_block_ids,
             state.attention_flash_bwd_block_ids,
         )

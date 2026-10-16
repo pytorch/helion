@@ -211,26 +211,6 @@ def _clone_opaque_statements_with_loop_segments(
     return cloned
 
 
-def _extract_case_bodies(
-    owner: ForEachProgramID,
-    base_body: list[ast.stmt],
-) -> list[list[ast.stmt]]:
-    if len(owner.cases) == 1:
-        return [base_body]
-    assert len(base_body) >= 2
-    node = base_body[1]
-    result: list[list[ast.stmt]] = []
-    while isinstance(node, ast.If):
-        result.append(node.body)
-        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            node = node.orelse[0]
-            continue
-        result.append(node.orelse)
-        break
-    assert len(result) == len(owner.cases)
-    return result
-
-
 def _case_pid_info(case: ProgramIDs) -> list[PIDInfo]:
     if isinstance(case, L2GroupingProgramIDs):
         assert case.parent_strategy is not None
@@ -1209,7 +1189,9 @@ def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
 
 
 # Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
-_DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
+_DRY_PASS_PURE_MODULES = frozenset(
+    {"tl", "triton_helpers", "helion_triton_helpers", "tl_math", "libdevice"}
+)
 # Inductor helpers that only compute; the others load, spin, or publish.
 _DRY_PASS_PURE_HELPERS = frozenset(
     {
@@ -1219,6 +1201,8 @@ _DRY_PASS_PURE_HELPERS = frozenset(
         *("welford", "welford_reduce", "welford_combine"),
     }
 )
+# Helion's own Triton helpers that only reduce; ``triton_wait_signal`` spins.
+_DRY_PASS_PURE_HELION_HELPERS = frozenset({"max_propagate_nan", "min_propagate_nan"})
 # Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
 _DRY_PASS_PURE_METHODS = frozenset(
     {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
@@ -1238,6 +1222,8 @@ def _dry_pass_call_kind(call: ast.Call, helpers: frozenset[str]) -> str:
         return "pure" if func.attr in _DRY_PASS_PURE_METHODS else "skipped"
     if func.value.id == "triton_helpers":
         return "pure" if func.attr in _DRY_PASS_PURE_HELPERS else "skipped"
+    if func.value.id == "helion_triton_helpers":
+        return "pure" if func.attr in _DRY_PASS_PURE_HELION_HELPERS else "skipped"
     if func.value.id != "tl":
         return "pure"
     if func.attr == "inline_asm_elementwise":
@@ -1434,15 +1420,7 @@ def emit_cross_loop_schedule(
     )
     worker = typed_program_id(0)
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
-    base_body = cast(
-        "list[ast.stmt]",
-        owner._prepare_persistent_body(
-            device_function.body,
-            device_function,
-            strategy.virtual_pid_var,
-        ),
-    )
-    case_bodies = _extract_case_bodies(owner, base_body)
+    case_bodies = cast("list[list[ast.stmt]]", owner.case_bodies)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
     target_device_capability = (
         CompileEnvironment.current().config_spec.target_device_capability
@@ -2013,7 +1991,10 @@ def emit_cross_loop_schedule(
         inner_counts = [axis_counts[block_id] for block_id in axis_order[:-1]]
         if (
             root in scheduled_task_roots
-            or root in root_counters_by_producer
+            or any(
+                plan.continuation_consumer is not None
+                for plan, _producer in root_counters_by_producer.get(root, ())
+            )
             or root in nested_producer_roots
             or root in nested_loop_counters_by_consumer
             or isinstance(owner.cases[root], L2GroupingProgramIDs)
@@ -2614,6 +2595,7 @@ def emit_cross_loop_schedule(
     def emit_readiness_arrival_for_key(
         plan: ReadinessCounterPlan,
         readiness_key: str,
+        sem: str = "release",
     ) -> list[ast.stmt]:
         continuation_consumer = plan.continuation_consumer
         if continuation_consumer is None:
@@ -2622,12 +2604,12 @@ def emit_cross_loop_schedule(
                 return [
                     statement_from_string(
                         f"tl.atomic_xchg({counter}, {epoch_var}, "
-                        "sem='release', scope='gpu')"
+                        f"sem='{sem}', scope='gpu')"
                     )
                 ]
             return [
                 statement_from_string(
-                    f"tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
+                    f"tl.atomic_add({counter}, 1, sem='{sem}', scope='gpu')"
                 ),
             ]
 
@@ -2733,6 +2715,7 @@ def emit_cross_loop_schedule(
         plan: ReadinessCounterPlan,
         readiness_producer: ReadinessProducer,
         producer_coordinates: dict[int, str],
+        sem: str = "release",
     ) -> list[ast.stmt]:
         publication = readiness_producer.incidence.keys_by_item
         if publication is None:
@@ -2742,7 +2725,7 @@ def emit_cross_loop_schedule(
             producer_coordinates,
             trusted_single_valued=True,
         )
-        publications = emit_readiness_arrival_for_key(plan, readiness_key)
+        publications = emit_readiness_arrival_for_key(plan, readiness_key, sem)
         if membership == "True":
             return publications
         return [
@@ -2892,6 +2875,7 @@ def emit_cross_loop_schedule(
                 raise AssertionError("body PID ABI is not total")
             body.append(statement_from_string(f"{pid_task} = {pid_task_expression}"))
             scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
+        readiness_tokens: list[str] = []
         for (
             incoming_readiness_counter,
             incoming_consumer,
@@ -2902,19 +2886,42 @@ def emit_cross_loop_schedule(
                 incoming_consumer.keys_by_consumer,
                 scheduled_coordinates,
             )
-            wait = _wait_for_counter(
-                device_function=device_function,
-                counter=readiness_counter(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
-                target=readiness_target(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
-                prefix="tile_dependency_readiness_wait",
-            )
-            if not incoming_consumer.keys_by_consumer.is_total_function():
+            counter = readiness_counter(incoming_readiness_counter, readiness_key)
+            target = readiness_target(incoming_readiness_counter, readiness_key)
+            total = incoming_consumer.keys_by_consumer.is_total_function()
+            if any(device_function.config.range_warp_specializes):
+                # Triton's warp specialization rejects a while loop in a task
+                # loop: spin in one asm block and gate the task PID on its token.
+                token = device_function.new_var(
+                    "tile_dependency_readiness_token", dce=False
+                )
+                fence = (
+                    "fence.proxy.async.global; "
+                    if device_function.uses_async_proxy_global
+                    else ""
+                )
+                wait = [
+                    statement_from_string(
+                        f"{token} = tl.inline_asm_elementwise("
+                        "asm='{ .reg .pred p; .reg .b32 v; READY_WAIT: "
+                        "ld.acquire.gpu.global.u32 v, [$1]; setp.ne.u32 p, v, $2; "
+                        "@p bra READY_WAIT; bar.warp.sync 0xffffffff; "
+                        f"{fence}mov.u32 $0, 0; }}', constraints='=r,l,r', "
+                        f"args=[{counter}, tl.cast({target}, tl.uint32)], "
+                        "dtype=tl.int32, is_pure=False, pack=1)"
+                    )
+                ]
+                readiness_tokens.append(token)
+                if not total:
+                    body.append(statement_from_string(f"{token} = 0"))
+            else:
+                wait = _wait_for_counter(
+                    device_function=device_function,
+                    counter=counter,
+                    target=target,
+                    prefix="tile_dependency_readiness_wait",
+                )
+            if not total:
                 body.append(
                     create(
                         ast.If,
@@ -2928,6 +2935,10 @@ def emit_cross_loop_schedule(
         peer_counter_spins, peer_tokens = peer_counter_waits(
             root, scheduled_coordinates
         )
+        if readiness_tokens:
+            scheduled_logical_pid = " + ".join(
+                [scheduled_logical_pid, *readiness_tokens]
+            )
         if peer_tokens:
             # Zero tokens make every PID-derived address depend on the spins.
             has_task_scheduling = True
@@ -3093,12 +3104,17 @@ def emit_cross_loop_schedule(
 
     def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
         scatter_root = None if peer is None else peer.scatter_roots.get(root)
-        if scatter_root is None and not any(
-            plan.producers[0].producer_root == root for plan in peer_counter_plans
+        local_counters = root_counters_by_producer.get(root, ())
+        if (
+            scatter_root is None
+            and not local_counters
+            and not any(
+                plan.producers[0].producer_root == root for plan in peer_counter_plans
+            )
         ):
             return []
         # Guard-skipped tasks still count once per launch for keyed peers and
-        # mark their scatter done words.
+        # local readiness counters, and mark their scatter done words.
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = (
             segment_begin + static_pipeline_plan.execution_orders[root].task_count
@@ -3112,6 +3128,13 @@ def emit_cross_loop_schedule(
         )
         coordinates = execution_coordinates(root, f"({skipped}) - {segment_begin}")
         body = peer_counter_publications(root, coordinates, "relaxed")
+        # A skipped task writes nothing, so its arrivals need no release.
+        for plan, readiness_producer in local_counters:
+            body.extend(
+                emit_readiness_arrivals_from_producer(
+                    plan, readiness_producer, coordinates, "relaxed"
+                )
+            )
         if scatter_root is not None:
             assert peer is not None
             body.append(

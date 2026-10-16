@@ -15,6 +15,7 @@ import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
+from typing import cast
 
 import sympy
 import torch
@@ -1591,7 +1592,67 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
+        if config_spec is not None and config_spec.cute_mma_dag is not None:
+            # The warp-MMA recurrence owner is admitted: keep the random half
+            # of the population mostly in-family (tensor-memory mode first
+            # where the kernel admits it).
+            facts = config_spec.cute_mma_dag_facts
+            if facts is not None and facts.tcgen05 is not None:
+                priors["cute_mma_dag"] = weighted_choice(
+                    {"tcgen05": 4.0, "warp": 2.0, "off": 1.0}
+                )
+            else:
+                priors["cute_mma_dag"] = weighted_choice({"warp": 4.0, "off": 1.0})
         return priors
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        from .cute_mma_dag import AXIS_LEAD
+        from .cute_mma_dag import AXIS_LOOP
+        from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_KEY
+        from .cute_mma_dag import MMA_DAG_TCGEN05
+        from .cute_mma_dag import MMA_DAG_WARP
+        from .cute_mma_dag import mma_dag_config_reason
+
+        facts = config_spec.cute_mma_dag_facts
+        mode = config.config.get(MMA_DAG_KEY)
+        if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
+            return True
+        # Pre-screen the register / shared-memory budget of the warp-MMA
+        # dataflow owner (``normalize`` repairs or refuses the same configs).
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return True
+        # Fixed blocks (a lead tile of one row) have no config slot: the
+        # facts resolve them without a lookup.
+        tunable = config_spec.block_sizes.valid_block_ids()
+        sizes: dict[int, object] = {}
+        for axis in facts.axes:
+            if axis.kind not in (AXIS_ROOT, AXIS_LOOP, AXIS_LEAD):
+                continue
+            if axis.block_id not in tunable:
+                if axis.kind == AXIS_LEAD:
+                    # A lead fixed to one row by the kernel (``block_size=1``).
+                    sizes[axis.block_id] = 1
+                continue
+            try:
+                sizes[axis.block_id] = block_sizes[
+                    config_spec.block_sizes.block_id_to_index(axis.block_id)
+                ]
+            except (KeyError, IndexError):
+                return True
+        return (
+            mma_dag_config_reason(
+                facts,
+                sizes,
+                config.config.get("cute_mma_dag_warps"),
+                config.config.get("cute_mma_dag_stages"),
+                cast("str", mode),
+            )
+            is None
+        )
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
@@ -1663,6 +1724,7 @@ class CuteBackend(Backend):
         from .block_scaled_mma import plan_block_scaled
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
+        from .cute_mma_dag import plan_mma_dag
         from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .gdn_recurrence import plan_gdn_recurrence
@@ -1732,6 +1794,9 @@ class CuteBackend(Backend):
             return
         plan_gdn_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.gdn_recurrence_plan is not None:
+            return
+        device_function.cute_state.mma_dag_plan = plan_mma_dag(graphs, config)
+        if device_function.cute_state.mma_dag_plan is not None:
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
@@ -1905,6 +1970,13 @@ class CuteBackend(Backend):
                 "cute_topk_coarse_keys",
                 "cute_topk_key_recovery",
             )
+            or key == "cute_mma_dag"
+            or key == "cute_mma_dag_warps"
+            or key == "cute_mma_dag_stages"
+            or key == "cute_mma_dag_store"
+            or key == "cute_mma_dag_exchange"
+            or key == "cute_mma_dag_pass_warps"
+            or key == "cute_mma_dag_loads"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )

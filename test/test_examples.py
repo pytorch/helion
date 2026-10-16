@@ -1603,6 +1603,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Regression test: large batch, small dim."""
         self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
 
+    # MI350X CI intermittently returns wrong values for a few rows of
+    # this reduce-then-normalize kernel (tens to hundreds of elements off
+    # by up to 0.35, different rows on each failure) while every CUDA job
+    # passes; the two-pass softmax backward and the looped layernorms in
+    # test_autodiff.py and test_unroll_tuples.py fail the same way.  Seen
+    # since 2026-10-11 on one triton-rocm build; not reproduced outside CI.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
