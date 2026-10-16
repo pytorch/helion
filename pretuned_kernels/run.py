@@ -51,6 +51,8 @@ KERNELS = [
     "projection_rotary",
     "interleaved_swiglu",
     "cross_entropy",
+    # Exact output-only attention recipes for GB300 (sm103), not B200.
+    "attention",
     # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
     "silu_mul_fp8",
     "dynamic_per_token_scaled_fp8_quant",
