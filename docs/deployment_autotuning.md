@@ -20,6 +20,86 @@ runs on the same machine can reuse prior configs.  For more on
 caching see {py:class}`~helion.autotuner.local_cache.LocalAutotuneCache`
 and {py:class}`~helion.autotuner.local_cache.StrictLocalAutotuneCache`.
 
+### Generated Triton source cache
+
+For Triton kernels, opt in to caching the selected configuration's
+generated source with `generated_code_cache=True` or
+`HELION_GENERATED_CODE_CACHE=1`.
+
+With the default `@helion.kernel` and no `config=`, the default adaptive
+autotuner selects the config, and the cache only skips source generation:
+every process still runs frontend compilation (`KernelCompiler.compile`) so
+that `LocalAutotuneCache` stays authoritative when a tuning result is deleted
+or replaced. Skipping the frontend as well requires a single explicit config,
+a custom config selector or `autotune_effort="none"` (`configs=[a, b]` still
+compiles the frontend to choose between them):
+
+```python
+@helion.kernel(
+    config=helion.Config(block_sizes=[64]),
+    generated_code_cache=True,
+)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+Entries live under `HELION_CACHE_DIR/generated_code` (or the default Helion
+cache directory). A binding entry records the selected config, its generated
+source and the specialization guards the frontend recorded, such as
+`hl.specialize()` values and tensor descriptor layout classes. A later process
+with the same kernel, supported Python dependencies, input signature, hardware
+(device name, compute capability and SM count), compilation settings and
+library versions evaluates those guards before compiling. Inputs they accept
+load the saved source without `KernelCompiler.compile` or source generation,
+so a `static_shapes=False` binding serves shapes the earlier process never
+saw, as one binding does with the cache disabled; `static_shapes=True` keys
+exact sizes and strides. A new guard value, such as another `hl.specialize()`
+value, compiles normally and saves another binding. Triton's binary cache
+remains independent; a source hit can still require Triton's first binary
+compilation.
+
+Direct calls (`my_kernel(x)`) use the loaded source through a lightweight
+runner that eager dispatch caches like an ordinary binding. `my_kernel.bind(x)`
+returns an ordinary binding and runs frontend compilation if the process only
+has a runner, as do requests the runner cannot serve, such as another config
+or frontend IR. Function dependencies are fingerprinted during disk lookup, not
+on each kernel launch.
+
+Bindings keep the ordinary frontend path, and no binding entry is saved, when:
+
+- the kernel is distributed, uses a tensor-descriptor config or has runtime
+  input specializations;
+- a dynamic-shape compilation (`static_shapes=False`) guarded on input sizes
+  in a form the cache cannot save. Guards that compare an input size or stride
+  with a constant or with another one, such as a size-1 dimension, are saved
+  with the binding. After any other guard, no binding of that signature is
+  saved in the process, and runners it already loaded keep serving their
+  inputs;
+- a Python dependency cannot be fingerprinted;
+- `force_autotune`, printing code or repro callers, reference mode or
+  TorchDynamo tracing is active;
+- native-source handoff (`autotune_handoff=True`) is requested, so cache hits
+  cannot skip the handoff, or the PyTorch build lacks Helion's `torch.compile`
+  integration, so legacy graph capture reuses ordinary compiled launchers.
+
+Those paths can still reuse generated source after frontend compilation.
+Custom config selectors still run. Autotuning candidates are not written to
+this cache; `set_config` persists only the chosen config, including a winner
+already compiled during autotuning.
+
+Cache controls:
+
+- `HELION_SKIP_CACHE=1` skips reads and writes.
+- `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES` (read once per process;
+  default 1 GiB; `0` prevents new writes) bounds the JSON entries. Eviction is
+  least recently used, and entries larger than the budget are not persisted.
+- Remove the `generated_code` directory to clear the cache.
+
+Entries are checksummed and published atomically under a writers' lock.
+Missing, corrupt, evicted or unreadable entries are misses: Helion compiles
+normally and rewrites the entry. Failed writes log a warning and leave the
+compiled kernel usable.
+
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.
 

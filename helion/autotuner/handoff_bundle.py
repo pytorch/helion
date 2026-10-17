@@ -284,6 +284,7 @@ def build_handoff(
     The resulting bundle contains no BoundKernel or search object.
     """
     # Runtime imports avoid the kernel -> autotuner package import cycle.
+    from ..runtime.cached_kernel import _CachedBoundKernel
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import OutputCodeOptions
     from .base_cache import AutotuneCacheBase
@@ -295,6 +296,17 @@ def build_handoff(
     cases = multi.cases if multi else ((search.kernel, tuple(search.args)),)
     if timing is not None and timing not in ("cuda_graph", "cuda_event", "wall_clock"):
         raise ValueError(f"Unsupported handoff timing mode: {timing}")
+    # Explicit handoff can retain the disk runner passed to a search even after
+    # frontend access materialized its delegate. Export the ordinary binding.
+    cases = tuple(
+        (
+            bound._materialize(tuple(args))
+            if isinstance(bound, _CachedBoundKernel)
+            else bound,
+            args,
+        )
+        for bound, args in cases
+    )
     for bound, _ in cases:
         if not isinstance(bound, BoundKernel):
             raise TypeError(

@@ -1462,7 +1462,9 @@ class TestAutotunerHeuristic(TestCase):
             current_num_sm = 148
             get_num_sm_calls = get_num_sm_mock.call_count
             with (
-                patch.object(sensitive, "bind", wraps=sensitive.bind) as bind,
+                patch.object(
+                    sensitive, "_dispatch_bind", wraps=sensitive._dispatch_bind
+                ) as bind,
                 patch(
                     "helion.runtime.kernel._find_device",
                     wraps=runtime_find_device,
@@ -1479,7 +1481,7 @@ class TestAutotunerHeuristic(TestCase):
             first._compiler_seed_device_resolver = MagicMock(
                 return_value=different_device
             )
-            with patch.object(sensitive, "bind", return_value=second) as bind:
+            with patch.object(sensitive, "_dispatch_bind", return_value=second) as bind:
                 self.assertIs(first(x), x)
             bind.assert_called_once_with((x,))
             self.assertEqual(get_num_sm_mock.call_count, get_num_sm_calls + 1)
@@ -1490,7 +1492,9 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=same_num_sm_device
             )
             same_num_sm_calls = get_num_sm_mock.call_count
-            with patch.object(sensitive, "bind", wraps=sensitive.bind) as bind:
+            with patch.object(
+                sensitive, "_dispatch_bind", wraps=sensitive._dispatch_bind
+            ) as bind:
                 self.assertIs(first(x), x)
                 calls_after_new_device = get_num_sm_mock.call_count
                 self.assertIs(first(x), x)
