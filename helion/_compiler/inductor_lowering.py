@@ -1243,6 +1243,24 @@ class ReductionLowering(InductorLowering):
         return result
 
 
+def reduction_block_id(node: torch.fx.Node) -> int | None:
+    """Return the block reduced by a native or single-axis custom reduction."""
+    from ..language.reduce_ops import _reduce
+
+    lowering = node.meta.get("lowering")
+    if isinstance(lowering, ReductionLowering):
+        return lowering.block_index
+    if node.target is not _reduce or node.args[2] is None:
+        return None
+    inputs, dim = node.args[1:3]
+    source = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+    assert isinstance(source, torch.fx.Node)
+    value = source.meta["val"]
+    assert isinstance(value, torch.Tensor)
+    assert isinstance(dim, int)
+    return CompileEnvironment.current().get_block_id(value.size(dim))
+
+
 class APIFuncLowering(Lowering):
     def __init__(self, api_func: object) -> None:
         super().__init__()

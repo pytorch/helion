@@ -1139,7 +1139,8 @@ class GraphAnalysis:
         resolve_placeholder: Callable[[torch.fx.Node], torch.fx.Node],
     ) -> GraphAnalysis:
         from ..language import memory_ops
-        from .inductor_lowering import ReductionLowering
+        from ..language.reduce_ops import _reduce
+        from .inductor_lowering import reduction_block_id
 
         graph = graph_info.graph
         nodes = tuple(graph.nodes)
@@ -1151,6 +1152,7 @@ class GraphAnalysis:
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
+        custom_reduction_steps: list[tuple[LiveTile, ...]] = []
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
         operand_positions = matmul_operand_positions()
         promoted_lhs_nodes: set[torch.fx.Node] = set()
@@ -1191,14 +1193,24 @@ class GraphAnalysis:
             if node.op == "call_function" and node.target in dot_targets:
                 dot_nodes.append(node)
 
-            lowering = node.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
-                block_id = getattr(lowering, "block_index", None)
-                if isinstance(block_id, int):
-                    reduction_axis_by_node_id[id(node)] = block_id
-                    if block_id not in seen_reductions:
-                        seen_reductions.add(block_id)
-                        reduction_occurrences.append(block_id)
+            block_id = reduction_block_id(node)
+            if block_id is not None:
+                reduction_axis_by_node_id[id(node)] = block_id
+                if block_id not in seen_reductions:
+                    seen_reductions.add(block_id)
+                    reduction_occurrences.append(block_id)
+                if node.target is _reduce:
+                    inputs = node.args[1]
+                    sources = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                    # Each payload needs its own carry, even when inputs alias.
+                    custom_reduction_steps.append(
+                        tuple(
+                            tile_details[source]._replace(
+                                kind="carry", promoted_lhs=False
+                            )
+                            for source in sources
+                        )
+                    )
 
             if node.op != "call_function":
                 continue
@@ -1230,6 +1242,9 @@ class GraphAnalysis:
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)
+        # shortcut: carries are a separate liveness bound until loop layouts
+        # describe their overlap with loaded inputs.
+        live_tile_steps.extend(custom_reduction_steps)
 
         def peak_role_tiles(
             details: dict[torch.fx.Node, LiveTile],

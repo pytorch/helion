@@ -5186,13 +5186,17 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         return _primary_descriptor_selected(env) is not None
 
     @classmethod
-    def get_seed_config(
+    def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
+    ) -> list[Config]:
+        """Seed custom reductions with a persistent baseline and a liveness proposal.
+
+        The persistent baseline remains the default when autotuning is disabled.
+        """
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
         if pd is None:
-            return None
+            return []
         kf = spec.reduction_kernel_fact
         assert kf is not None
         alloc = cls.size_reduction_tiles_liveness(env, spec, pd)
@@ -5237,7 +5241,20 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             if evict is not None:
                 seed["load_eviction_policies"] = evict
 
-        return _materialize_config(seed, config_spec=spec)
+        config = _materialize_config(seed, config_spec=spec)
+        if not spec.has_custom_reduction_loops:
+            return [config]
+
+        persistent = dict(config.config)
+        persistent["reduction_loops"] = [None] * len(spec.reduction_loops)
+        persistent["block_sizes"] = [
+            cls._block_floor(block) if block.block_id in spec.grid_block_ids else value
+            for block, value in zip(spec.block_sizes, config.block_sizes, strict=True)
+        ]
+        width = max(loop.size_hint for loop in spec.reduction_loops)
+        persistent["num_warps"] = cls._num_warps_for_reduction_width(width)
+        baseline = _materialize_config(persistent, config_spec=spec)
+        return dedupe_configs([baseline, config])
 
 
 # Hardware the tuned reduction seeds own; the narrow fallback yields to these targets.
@@ -5248,13 +5265,17 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
     other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
     supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
-    upstream seed, so it stays unclaimed on non-sm90/sm100. Not promoted (the un-tuned baseline
-    should not override the compiler default). This is the verbatim pre-sm100 behavior, now its own
-    class rather than an off-target branch inside the sm90 heuristic.
+    upstream seed, so it stays unclaimed on non-sm90/sm100. Native seeds remain unpromoted;
+    custom reductions keep the persistent seed as their untuned default. This retains the
+    pre-sm100 native behavior rather than changing the fallback for existing reductions.
     """
 
     name = "triton_reduction_narrow"
     backend = "triton"
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        return env.config_spec.has_custom_reduction_loops
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -5272,7 +5293,7 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         seed: dict[str, Any] = {
-            "block_sizes": [1],
+            "block_sizes": [1] * len(spec.block_sizes),
             "reduction_loops": [None],
         }
         # Emit 'last' only where the backend supports it; backends that restrict

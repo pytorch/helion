@@ -688,6 +688,7 @@ class ReductionDescriptor(NamedTuple):
       feeding it.
     - ``fixed_tile_size_hint``: fixed per-iteration width for ``FIXED_TILE``; ``None`` otherwise.
     - ``row_reread`` / ``reread_eviction_index``: per-reduction memory-op signals.
+    - ``is_custom``: whether this occurrence includes a user-defined combine.
     """
 
     category: ReductionCategory
@@ -698,6 +699,7 @@ class ReductionDescriptor(NamedTuple):
     row_reread: bool = False
     reread_eviction_index: int | None = None
     fixed_tile_size_hint: int | None = None
+    is_custom: bool = False
 
 
 class ReductionKernelFact(NamedTuple):
@@ -6849,6 +6851,16 @@ class ConfigSpec:
                 config,
                 overrides,
             )
+
+    @property
+    def has_custom_reduction_loops(self) -> bool:
+        """Whether a custom reduction has an available loop-size coordinate."""
+        fact = self.reduction_kernel_fact
+        rolled_ids = self.reduction_loops.valid_block_ids()
+        return fact is not None and any(
+            reduction.is_custom and reduction.block_id in rolled_ids
+            for reduction in fact.reductions
+        )
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())

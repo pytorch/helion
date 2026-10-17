@@ -1044,7 +1044,7 @@ class DeviceIR:
         (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
         its taken side runs, and it is walked without extending the path.
         """
-        from .inductor_lowering import ReductionLowering
+        from .inductor_lowering import reduction_block_id
 
         result: dict[int, list[list[tuple[int, int]]]] = {}
 
@@ -1055,13 +1055,11 @@ class DeviceIR:
             for node in graph.nodes:
                 if node.op != "call_function":
                     continue
-                lowering = node.meta.get("lowering")
-                if isinstance(lowering, ReductionLowering) and isinstance(
-                    lowering.block_index, int
-                ):
-                    result.setdefault(lowering.block_index, [])
-                    if path not in result[lowering.block_index]:
-                        result[lowering.block_index].append(list(path))
+                block_id = reduction_block_id(node)
+                if block_id is not None:
+                    result.setdefault(block_id, [])
+                    if path not in result[block_id]:
+                        result[block_id].append(list(path))
                 if node.target is _tracing_ops._if and len(node.args) >= 3:
                     live_graph_id = fn.constexpr_taken_graph_id(node)
                     if live_graph_id is not None:
@@ -1163,7 +1161,6 @@ class DeviceIR:
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
             return
-        from .inductor_lowering import ReductionLowering
 
         num_original_graphs = len(self.graphs)
 
@@ -1218,11 +1215,7 @@ class DeviceIR:
                 if reduction_info.used_rdim:
                     used_graphs.add(graph_id)
                     reduction_count = sum(
-                        1
-                        for n in graph_info.graph.nodes
-                        if n.op == "call_function"
-                        and isinstance(n.meta.get("lowering"), ReductionLowering)
-                        and n.meta["lowering"].block_index == rdim.block_id
+                        roller.is_reduction(n) for n in graph_info.graph.nodes
                     )
                     if reduction_count >= 2 and env.config_spec.supports_config_key(
                         "reduction_fusion"
@@ -1465,6 +1458,8 @@ class DeviceIR:
 
         The reduction seed resolves every candidate against the full live-step timeline.
         """
+        from ..language.reduce_ops import _reduce
+
         env = CompileEnvironment.current()
         spec = env.config_spec
         grid_ids = {b for bids in self.grid_block_ids for b in bids}
@@ -1495,6 +1490,12 @@ class DeviceIR:
                     row_reread=per["row_reread"],
                     reread_eviction_index=per["reread_eviction_index"],
                     fixed_tile_size_hint=fixed_tile_size_hint,
+                    is_custom=any(
+                        node.target is _reduce
+                        and analysis.by_id[gid].reduction_axis_by_node_id.get(id(node))
+                        == bid
+                        for node in self.graphs[gid].graph.nodes
+                    ),
                 )
             )
 
