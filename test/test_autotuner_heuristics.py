@@ -273,6 +273,7 @@ from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
+from helion._testing import code_and_output
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
@@ -11295,6 +11296,26 @@ class TestTritonReductionHeuristic(TestCase):
     - kl_div wide (rnumel=131072): the user-tiled path resolves the complete live
       timeline and caps R_BLOCK instead of going full-N, with M at floor 1.
     """
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Checks the promoted compiler reduction seed")
+    def test_narrow_custom_grid_reduction_default(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def reduce_grid(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.grid(x.size(0)):
+                total, _ = hl.reduce(_custom_pair_sum, (x[row, :], x[row, :]), dim=0)
+                out[row] = total
+            return out
+
+        x = torch.randn(3, 200, device=DEVICE)
+        with patch("helion._hardware.get_hardware_info", return_value=A100_HARDWARE):
+            bound = reduce_grid.bind((x,))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.block_sizes, [])
+            self.assertEqual(config.reduction_loops, [None])
+            _, output = code_and_output(reduce_grid, (x,))
+        torch.testing.assert_close(output, x.sum(dim=1))
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Checks compiler reduction facts and seeds")

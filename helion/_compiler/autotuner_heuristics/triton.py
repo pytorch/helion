@@ -5277,7 +5277,7 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         seed: dict[str, Any] = {
-            "block_sizes": [1],
+            "block_sizes": [1] * len(spec.block_sizes),
             "reduction_loops": [None],
         }
         # Emit 'last' only where the backend supports it; backends that restrict
