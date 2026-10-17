@@ -84,6 +84,12 @@ jobs:
           echo "Detected ROCm image"
           rocminfo || echo "rocminfo not found"
 
+      - name: Run Intel XPU command
+        if: inputs.runtime-version == 'xpu'
+        run: |
+          echo "Detected Intel XPU image"
+          xpu-smi discovery || echo "xpu-smi not found"
+
       - name: Setup toolchain
         run: |
           set -x
@@ -146,6 +152,29 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
+      - name: XPU Compute Check
+        if: inputs.runtime-version == 'xpu'
+        run: |
+          source .venv/bin/activate
+          # Workaround: the pyzes PyPI package breaks torch.xpu device discovery.
+          uv pip uninstall pyzes
+          python -c "
+          import torch
+
+          assert torch.xpu.is_available(), 'FATAL: XPU not available'
+          n = torch.xpu.device_count()
+          assert n > 0, 'FATAL: No XPU devices found'
+          print(f'XPU devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('xpu', i)
+              a = torch.randn(256, 256, device=dev)
+              (a @ a).sum().item()
+              print(f'  Device {i} ({torch.xpu.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
       - name: Install TritonBench Requirements
         if: inputs.suite == 'tritonbench'
         run: |
@@ -202,6 +231,12 @@ jobs:
           echo "$TEST_REPORTS_DIR"
 
           KERNEL_LIST="${{ inputs.kernels }}"
+          # CUDA graphs are CUDA/ROCm-only; XPU also needs the device selected
+          # explicitly since tritonbench defaults to cuda.
+          DEVICE_ARGS=(--cudagraph)
+          if [[ "${{ inputs.runtime-version }}" == "xpu" ]]; then
+            DEVICE_ARGS=(--device xpu)
+          fi
           for kernel in ${KERNEL_LIST//,/ }; do
             echo "=========================================="
             echo "Running benchmark for kernel: $kernel"
@@ -240,7 +275,7 @@ jobs:
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                "${DEVICE_ARGS[@]}" \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
