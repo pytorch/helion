@@ -37,6 +37,7 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
@@ -278,6 +279,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
@@ -11673,6 +11675,35 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["block_sizes"][apply_idx], expected_apply_block)
             # H100 and B200 share the candidate and warp policy.
             self.assertEqual(seed["num_warps"], 8)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+@skipIfRefEager("asserts generated CuTe source, which ref eager does not emit")
+def test_cute_dynamic_reduction_seeds_vector_memory(dtype: torch.dtype) -> None:
+    @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+    def softmax(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for rows in hl.tile(x.size(0)):
+            out[rows, :] = torch.softmax(x[rows, :].float(), dim=-1).to(x.dtype)
+        return out
+
+    with _mock_cuda_unavailable():
+        x = torch.empty(64, 4096, dtype=dtype)
+        bound = softmax.bind((x,))
+        assert bound.host_function is not None
+        spec = bound.config_spec
+        seed = CuteRolledRowLadderHeuristic.get_seed_config(
+            bound.env, bound.host_function.device_ir
+        )
+        assert seed is not None
+        generation = ConfigGeneration(spec)
+        _, seed = generation.canonicalize_flat(generation.flatten(seed))
+        assert seed in [config for _, config in generation.seed_flat_config_pairs()]
+        reduction_id = spec.reduction_loops[0].block_id
+        vector_index = spec.cute_vector_widths.block_id_to_index(reduction_id)
+        assert seed.config["cute_vector_widths"][vector_index] == 16 // dtype.itemsize
+        assert "cute.arch.load(" in bound.to_code(seed)
 
 
 def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

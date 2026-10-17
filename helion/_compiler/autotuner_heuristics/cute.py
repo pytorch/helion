@@ -699,8 +699,6 @@ class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
 def _cute_seed_vec_width(
     env: CompileEnvironment,
     rl_spec: ReductionLoopSpec,
-    max_threads: int,
-    size_hint: int,
     device_ir: DeviceIR,
 ) -> int:
     """Pick a default vector width for the cute_vector_widths seed.
@@ -719,29 +717,13 @@ def _cute_seed_vec_width(
     spec = env.config_spec
     if not spec.cute_vector_widths.valid_block_ids():
         return 1
-    if size_hint < max_threads:
+    if rl_spec.size_hint < (spec.max_reduction_threads or 1024):
         # Reduction extent barely fits in one wide chunk; vec wouldn't
         # remove enough loop iters to matter.
         return 1
     return _cute_tile_seed_vec_width_for_dtype(
-        _cute_seed_reduction_dtype(rl_spec, device_ir)
+        _cute_tile_inner_block_dtype(env, device_ir, rl_spec.block_id)
     )
-
-
-def _cute_seed_reduction_dtype(
-    rl_spec: ReductionLoopSpec, device_ir: DeviceIR
-) -> torch.dtype | None:
-    """Find the dtype of the reduction-source tensor by walking nodes that
-    have a fake-tensor value matching the reduction extent."""
-    rdim_size = rl_spec.size_hint
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            val = node.meta.get("val")
-            if isinstance(val, torch.Tensor) and val.ndim >= 1:
-                last = val.shape[-1]
-                if isinstance(last, int) and last == rdim_size:
-                    return val.dtype
-    return None
 
 
 class CuteReductionTileHeuristic(AutotunerHeuristic):
@@ -789,7 +771,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": reduction_loops,
         }
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if vec > 1:
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
@@ -825,7 +807,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         ):
             return None
         vec = _cute_tile_seed_vec_width_for_dtype(
-            _cute_seed_reduction_dtype(rl_spec, device_ir)
+            _cute_tile_inner_block_dtype(env, device_ir, rl_spec.block_id)
         )
         if vec <= 1 or extent % vec:
             return None
@@ -993,10 +975,7 @@ def _cute_tile_inner_block_dtype(
     env: CompileEnvironment, device_ir: DeviceIR, block_id: int
 ) -> torch.dtype | None:
     """Walk the device graphs to find the dtype of any tensor whose
-    LAST dim corresponds to ``block_id``'s tile.  Used to seed the per-
-    block vec width when the kernel has no rolled reduction (e.g.
-    softmax_two_pass — its two ``hl.tile`` loops over the reduction
-    axis don't go through the ``ReductionLoopSpec`` path)."""
+    LAST dim corresponds to ``block_id``'s tile."""
     bs = env.block_sizes[block_id]
     if env.is_jagged_tile(block_id):
         # Jagged lengths have no static numel. Their tile symbol still
@@ -1014,16 +993,14 @@ def _cute_tile_inner_block_dtype(
                     return val.dtype
         return None
     block_numel = bs.numel
-    try:
-        block_numel_int = int(block_numel)
-    except (TypeError, ValueError):
-        return None
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             val = node.meta.get("val")
             if isinstance(val, torch.Tensor) and val.ndim >= 1:
                 last = val.shape[-1]
-                if isinstance(last, int) and last == block_numel_int:
+                if isinstance(last, torch.SymInt):
+                    last = _symint_sympy_expr(last)
+                if last == block_numel:
                     return val.dtype
     return None
 
@@ -3467,7 +3444,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
             "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": [chunk],
         }
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if vec > 1:
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
@@ -3501,9 +3478,8 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
-        max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if size_hint <= 2048:
             threads_per_row = 32
         elif size_hint <= 8192:
@@ -3578,9 +3554,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         size_hint = rl_spec.size_hint
-        vec = _cute_seed_vec_width(
-            env, rl_spec, spec.max_reduction_threads or 1024, size_hint, device_ir
-        )
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         # Power of two only: the cute_cluster_n EnumFragment enumerates
         # {1,2,4,8,16}, and an off-surface value would one-hot encode as
         # all zeros in the search surrogate.
@@ -3668,7 +3642,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         if extent < 16384:
             return []
         vec = _cute_tile_seed_vec_width_for_dtype(
-            _cute_seed_reduction_dtype(reduction, device_ir)
+            _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
         )
         if vec <= 1 or extent % vec:
             return []
