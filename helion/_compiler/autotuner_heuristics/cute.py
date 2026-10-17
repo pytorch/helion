@@ -999,7 +999,9 @@ def _cute_tile_row_blocks(
     paths = tile_loop_paths(device_ir, device_ir.graphs)
     if len(paths) != 1 or not paths[0][0]:
         return None
-    axes = tuple(bid for level in paths[0] for bid in level)
+    axes = tuple(
+        bid for level in paths[0] for bid in level if bid in blocks.valid_block_ids()
+    )
     if len(axes) != 2 or set(axes) != set(blocks.valid_block_ids()):
         return None
     return axes[0], axes[1]

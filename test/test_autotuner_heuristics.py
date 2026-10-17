@@ -11795,7 +11795,7 @@ def test_cute_row_hints_follow_loop_axes_not_registration_order(reversed_registr
             out[r] = acc
         return out
 
-    args = (torch.randn(16, 2048, device="cuda"), reversed_registration)
+    args = (torch.randn(16, 2048, device=DEVICE), reversed_registration)
     bound = helion.kernel(rowsum, backend="cute", static_shapes=True).bind(args)
     outer, inner = (1, 0) if reversed_registration else (0, 1)
     spec = bound.config_spec
