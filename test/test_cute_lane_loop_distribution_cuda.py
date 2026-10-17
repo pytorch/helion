@@ -1125,6 +1125,7 @@ def test_packet_store_beside_the_previous_elements_read_matches_reference(
         v = _small_integers(shape)
         y = torch.full(shape, -7.0, device=CUDA_DEVICE)
         expected_y = torch.cat([torch.zeros_like(x[:1]), x[:-1]])
+        expected_y[:: _ONE_PACKET_PER_THREAD_CONFIG["block_sizes"][0]] = 0
         run(x, v, y)  # pyrefly: ignore [not-callable]
         torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
         torch.testing.assert_close(x, v, rtol=0, atol=0)
