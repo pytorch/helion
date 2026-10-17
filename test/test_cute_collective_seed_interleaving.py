@@ -14,6 +14,8 @@ from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
+from test.test_cute_collective_warp_tf32 import _seeded_fp32
+from test.test_cute_gathered_mma_codegen import _bound as _gathered_bound
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
@@ -91,7 +93,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
 
 def _initial_population(
     bound: BoundKernel,
-    args: tuple[torch.Tensor, torch.Tensor],
+    args: tuple[object, ...],
     *,
     seeds: list[helion.Config] | None = None,
     count: int | None = None,
@@ -276,7 +278,7 @@ def _fixed_chunk_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         (matmul_split_k, False),
     ],
 )
-def test_no_config_owned_k_chunk_preserves_initial_population(
+def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
     kernel: helion.Kernel, static_shapes: bool
 ) -> None:
     args = (
@@ -291,10 +293,60 @@ def test_no_config_owned_k_chunk_preserves_initial_population(
     )
     bound = _cpu_bind(variant, args)
     legacy_seeds = _legacy_registered_seeds(bound)
-    assert legacy_seeds == bound.config_spec.compiler_seed_configs
-    assert _initial_population(bound, args, seeds=legacy_seeds) == _initial_population(
-        bound, args
+    seeds = bound.config_spec.compiler_seed_configs
+    assert len(legacy_seeds) == len(seeds)
+    assert set(legacy_seeds) == set(seeds)
+    assert legacy_seeds[0] == seeds[0]
+    population = _initial_population(bound, args, count=30)
+    legacy_population = _initial_population(bound, args, seeds=legacy_seeds, count=30)
+    assert {seed.get("cute_collective_copy") for seed in population} >= {
+        "scalar",
+        "async",
+        "async_cached",
+    }
+    for key in ("cute_collective_recipe", "cute_collective_epilogue"):
+        assert {seed.get(key, "scalar") for seed in legacy_population} == {"scalar"}
+        assert {seed.get(key, "scalar") for seed in population} >= {
+            "scalar",
+            "vector",
+            "vector_unrolled",
+        }
+    assert {seed.get("cute_collective_stages", 1) for seed in population} >= {1, 2, 4}
+    assert any(seed.get("cute_proven_bounds") for seed in population)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_nonzero_accumulator_reaches_native_seed_schedules(dtype: torch.dtype) -> None:
+    args = (
+        torch.empty((128, 512), dtype=dtype),
+        torch.empty((512, 256), dtype=dtype),
+        torch.empty((128, 256), dtype=torch.float32),
     )
+    bound = _cpu_bind(_seeded_fp32, args)
+    legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
+    assert not any(seed.get("cute_collective_tmem_seed") for seed in legacy)
+    population = _initial_population(bound, args)
+    native = [
+        seed for seed in population if seed.get("cute_collective_compute") == "tcgen05"
+    ]
+    assert not any(
+        seed.get("cute_collective_tmem_a")
+        for seed in bound.config_spec.compiler_seed_configs
+    )
+    for key in ("cute_collective_native_seeded", "cute_collective_tmem_seed"):
+        assert {seed.get(key, False) for seed in native} == {False, True}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gathered_schedules_preserve_the_existing_seed_order(
+    dtype: torch.dtype,
+) -> None:
+    bound = _gathered_bound((1024, 512, 512, 8), dtype, False)
+    assert any(
+        seed.get("cute_collective_compute") == "tma_gather"
+        for seed in bound.config_spec.compiler_seed_configs
+    )
+    assert bound.config_spec.compiler_seed_configs == _legacy_registered_seeds(bound)
 
 
 def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:

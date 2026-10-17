@@ -2146,11 +2146,14 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         packet_schedules = any(
             seed.get("cute_collective_operand_packets", False) for seed in seeds
         )
-        if (
-            not parameters
-            and not tmem_operand_schedules
-            and not register_recipe_schedules
-            and not packet_schedules
+        ordinary = not (
+            parameters
+            or tmem_operand_schedules
+            or register_recipe_schedules
+            or packet_schedules
+        )
+        if ordinary and any(
+            seed.get("cute_collective_compute") == "tma_gather" for seed in seeds
         ):
             return seeds
         default = spec._base_default_config()
@@ -2162,7 +2165,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 seed.get("cute_collective_stages", 1),
                 *(seed.get(parameter, default[parameter]) for parameter in parameters),
             )
-            if tmem_operand_schedules:
+            if ordinary or tmem_operand_schedules:
                 key += (
                     seed.get("cute_collective_native_seeded", False),
                     seed.get("cute_collective_recipe", "scalar"),
