@@ -3642,7 +3642,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         if extent < 16384:
             return []
         vec = _cute_tile_seed_vec_width_for_dtype(
-            _cute_seed_reduction_dtype(reduction, device_ir)
+            _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
         )
         if vec <= 1 or extent % vec:
             return []
