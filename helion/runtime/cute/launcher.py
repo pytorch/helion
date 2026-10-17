@@ -1458,8 +1458,24 @@ def _append_cute_wrapper_plan(
         majmn = "cute.nvgpu.OperandMajorMode.MN"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
         sel = "cute.select"
-        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
-        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        # The FlexAttention backward walks per-(batch, head) sequences: the
+        # maps are (seq, D, B*H) so a ragged M / N is zero-filled on load and
+        # clipped on store by the TMA unit; the dense path keeps the flat
+        # (rows, D) view (its sequences are multiples of 128).
+        flex_seq_q = plan_optional_int("flex_seq_q")
+        if flex_seq_q is not None:
+            bh_q = plan_int("flex_bh_q")
+            seq_k = plan_int("flex_seq_k")
+            bh_k = plan_int("flex_bh_k")
+            q_sdb = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
+            k_sdb = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+            dq2_layout = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
+            dkv_layout = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+        else:
+            q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+            k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+            dq2_layout = f"cute.make_layout(({tq}, {hd}), stride=({hd}, 1))"
+            dkv_layout = f"cute.make_layout(({tk}, {hd}), stride=({hd}, 1))"
         fbwd_lines = [
             f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
             f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
@@ -1488,15 +1504,23 @@ def _append_cute_wrapper_plan(
             f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
-            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
-            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 8)",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, {dq2_layout})",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), {plan_optional_int('flex_dq_boxes') or 8})",
             "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
-            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
-            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {dkv_layout})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {dkv_layout})",
             f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {epi_stages})",
             "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
             "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         ]
+        aug_stages = plan_optional_int("flex_aug_stages") or 0
+        if aug_stages:
+            # The flex walk's statistics slices: one (128 x 16) B-operand
+            # slice per Q stage and the (128 x 16) A-operand constant slice.
+            fbwd_lines += [
+                f"_fbwd_augl = {bw}.make_smem_layout_b(_fbwd_ss_mma, (128, 128, 16), {dtype}, {aug_stages})",
+                f"_fbwd_kaugl = {bw}.make_smem_layout_a(_fbwd_ss_mma, (128, 128, 16), {dtype}, 1)",
+            ]
         body.extend(f"    {line}" for line in fbwd_lines)
         call_args.extend(
             [
@@ -1537,6 +1561,8 @@ def _append_cute_wrapper_plan(
                 "_fbwd_mdKt",
             ]
         )
+        if aug_stages:
+            call_args.extend(["_fbwd_augl", "_fbwd_kaugl"])
         return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")

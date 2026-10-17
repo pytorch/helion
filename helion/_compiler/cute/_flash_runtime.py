@@ -370,6 +370,12 @@ def flash_bwd_shared_storage(
     do_stage: int,
     kv_stage: int = 1,
     dtype: object = cutlass.Float16,
+    steps: int = 0,
+    dq_boxes: int = 8,
+    aug_stages: int = 0,
+    stage_lse: bool = True,
+    stage_delta: bool = True,
+    flex_aux_bytes: int = 0,
 ) -> type:
     """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
 
@@ -380,10 +386,85 @@ def flash_bwd_shared_storage(
     over the same bytes); sdQaccum stages the row-major fp32 dQ tile for the
     ``cp.reduce.async.bulk`` global add. sLSE/sDelta are parity-double-buffered
     per-warpgroup column stagings of the base-2 LSE and delta row vectors.
+    ``steps`` > 0 (the FlexAttention list walk) adds the per-CTA step table:
+    one packed int32 per Q-tile step (``q tile | q head << 16 | masked << 24``)
+    every warp role reads instead of walking the BlockMask lists itself.
+    ``dq_boxes`` is the dQ drain staging ring: 8 (32 x 32) fp32 boxes = a
+    2-deep ring per reduce warp; 4 = one box per warp (the flex list walk's
+    choice when the step table would push the storage past the SM100 budget).
+    ``aug_stages`` > 0 adds the statistics-through-the-MMA tiles of the flex
+    walk (see ``cute_flash_bwd_flex``): one (128 x 16) B-operand slice per Q
+    stage holding the bf16 split of the per-row LSE / delta terms and the two
+    constant (128 x 16) A-operand slices (-1 columns) K / V are extended
+    with, plus one full barrier per stage. ``stage_lse`` / ``stage_delta``
+    keep the sLSE / sDelta register-path stagings (dropped when the term
+    rides the MMA). ``flex_aux_bytes`` > 0 adds the flex hook's staged aux
+    tables (``sFlexAux``, see ``flex_aux_smem_layout``), declared before the
+    1024-aligned tiles so a small region lives in the alignment padding.
     """
+    steps_entries = max(steps, 1)
+    assert dq_boxes in (4, 8), dq_boxes
+    lse_entries = 2 * 128 if stage_lse else 1
+    delta_entries = 2 * 128 if stage_delta else 1
+    flex_aux_words = max(flex_aux_bytes // 4, 1)
+    if aug_stages > 0:
+
+        @cute.struct
+        class SharedStorageAug:
+            sSteps: cute.struct.MemRange[cutlass.Int32, steps_entries]
+            q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
+            do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
+            k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            aug_full_mbar: cute.struct.MemRange[cutlass.Int64, aug_stages]
+            s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            ds_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
+            flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
+            tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_holding_buf: cutlass.Int32
+            mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+            clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
+            sLSE: cute.struct.MemRange[cutlass.Float32, lse_entries]
+            sDelta: cute.struct.MemRange[cutlass.Float32, delta_entries]
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
+            ]
+            sdO: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            ]
+            sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
+            sdQaccum: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, dq_boxes * 1024], 1024
+            ]
+            sAug: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * 16 * aug_stages], 1024
+            ]
+            sKaug: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 16], 1024]
+            sVaug: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 16], 1024]
+
+        return SharedStorageAug
 
     @cute.struct
     class SharedStorage:
+        sSteps: cute.struct.MemRange[cutlass.Int32, steps_entries]
         q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
         do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
         k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
@@ -397,6 +478,10 @@ def flash_bwd_shared_storage(
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # the step's dK MMA (the last reader of the dS staging) complete
+        dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
+        flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         # MMA operand start addresses, re-read with ld.volatile per iteration
@@ -404,8 +489,12 @@ def flash_bwd_shared_storage(
         # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
         clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
-        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
-        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sLSE: cute.struct.MemRange[cutlass.Float32, lse_entries]
+        sDelta: cute.struct.MemRange[cutlass.Float32, delta_entries]
+        # The flex hook's staged aux tables (see the forward's sFlexAux).
+        sFlexAux: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+        ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
@@ -425,7 +514,9 @@ def flash_bwd_shared_storage(
         # and stores a 32-column chunk as 8 x 16B; the swizzle keeps the 8
         # lanes of a quarter-warp in distinct 16B bank groups, and one
         # cp.reduce.async.bulk.tensor per box adds it into row-major dQ.
-        sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8192], 1024]
+        sdQaccum: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, dq_boxes * 1024], 1024
+        ]
 
     return SharedStorage
 
@@ -466,6 +557,7 @@ def fbwd_p_pairs_packed(
     mask_lim: object = None,
     col_base: int = 0,
     exp2_f32: bool = False,
+    emu_res: int = 0,
 ) -> None:
     """In-place P = exp2(s * scale2 - lse[col]) over one chunk, packed pairs.
 
@@ -478,6 +570,9 @@ def fbwd_p_pairs_packed(
     otherwise one packed ex2.approx.f16x2 serves the pair. The f32 path is
     ~2-5% faster where the compute warps are latency-bound (causal / d64),
     the f16x2 one where the MUFU pipe is the limit (d128 non-causal).
+    ``emu_res`` (knob ``cute_flash_bwd_exp2_emu``, fast_math only) sends that
+    many of every 16 elements to the degree-2 polynomial exp2 on the FMA pipe
+    (the forward's ``e2e`` split) when the MUFU pipe bounds the P pass.
     """
     frg_any = cast("Any", frg)
     lse_any = cast("Any", lse_frg)
@@ -487,7 +582,12 @@ def fbwd_p_pairs_packed(
             (scale2, scale2),
             (-lse_any[2 * v], -lse_any[2 * v + 1]),
         )
-        if exp2_f32:
+        # The split is by the element's position in the row (``off`` + pair),
+        # so it holds for every hook group width (a 8-lane call covers half a
+        # 16-element period).
+        if emu_res > 0 and (off + 2 * v) % 16 >= 16 - emu_res:
+            a, b = ex2_emulation_deg2_2(a, b)  # pyrefly: ignore[bad-argument-type]
+        elif exp2_f32:
             a = cute.arch.exp2(a)
             b = cute.arch.exp2(b)
         else:
@@ -499,6 +599,115 @@ def fbwd_p_pairs_packed(
             b = Float32(cutlass.select_(kb, b, Float32(0.0)))
         frg_any[off + 2 * v] = a
         frg_any[off + 2 * v + 1] = b
+
+
+@dsl_user_op
+def fbwd_pin_i32(
+    value: cutlass.Int32,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """``value`` through a volatile ``mov.b32``: an optimization barrier.
+
+    ptxas computes everything that depends only on the step's Q tile (the
+    score_mod / mask_mod hooks' coordinate terms, one per lane) as early as
+    possible -- ahead of the ``s_full`` wait -- and spills the 64 results
+    per thread to local memory. A volatile asm keeps its order with the
+    volatile mbarrier wait, so deriving the hook's tile coordinate from this
+    copy keeps the per-lane terms after the wait, interleaved with the exp2
+    pass that consumes them.
+    """
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [value.ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def fbwd_lse_fold(lse_frg: cute.Tensor, bias_frg: cute.Tensor, factor: Float32) -> None:
+    """In-place ``lse[i] += factor * bias[i]`` over a chunk, packed pairs: an
+    additive score bias ``g`` folded into the exp2 base LSE term
+    (``exp2(c (s + g) - lse) == exp2(c s - (lse - c g))``, ``factor = -c``)."""
+    lse_any = cast("Any", lse_frg)
+    bias_any = cast("Any", bias_frg)
+    n = cute.size(lse_frg)
+    for v in range(n // 2):
+        a, b = cute.arch.fma_packed_f32x2(
+            (bias_any[2 * v], bias_any[2 * v + 1]),
+            (factor, factor),
+            (lse_any[2 * v], lse_any[2 * v + 1]),
+        )
+        lse_any[2 * v] = a
+        lse_any[2 * v + 1] = b
+
+
+def fbwd_lse_to_log2(lse_frg: cute.Tensor, factor: Float32) -> None:
+    """In-place ``lse = where(lse == -inf, 0, lse) * factor`` over a staged LSE
+    fragment: the forward's natural-log row statistic in the exp2 base, with a
+    row that saw no key (``-inf``) mapped to 0 so ``s - lse`` stays finite (its
+    P is 0 anyway: every score of such a row is masked)."""
+    lse_any = cast("Any", lse_frg)
+    n = cute.size(lse_frg)
+    for i in range(n):
+        value = Float32(lse_any[i])
+        finite = cutlass.Boolean(value != -Float32.inf)
+        lse_any[i] = Float32(cutlass.select_(finite, value, Float32(0.0))) * factor
+
+
+def fbwd_lse_scalar_to_log2(lse: Float32, log2c: Float32) -> Float32:
+    """A natural-log LSE scalar to the exp2 base; ``-inf`` (no visible key) -> 0."""
+    return Float32(cutlass.select_(lse == -Float32.inf, Float32(0.0), lse * log2c))
+
+
+def fbwd_aug_row_fill(
+    row: cute.Tensor, lse_term: Float32, delta: Float32, with_lse: bool
+) -> None:
+    """Fill one 16-column row of the statistics MMA slice (bf16).
+
+    Columns 0-2 carry the 3-way bf16 split of ``lse_term`` (``lse2 / c``, the
+    exp2-base LSE in score units; exact to ~2^-24 relative since three 8-bit
+    mantissas cover an fp32's 24), columns 8-10 the split of ``delta``; the
+    rest are zero. Paired with the -1 columns of the K / V slices the S and
+    dP MMAs then produce ``S - lse2 / c`` and ``dP - delta`` directly.
+    """
+    row_any = cast("Any", row)
+    dtype = row.element_type
+    for j in range(16):
+        row_any[j] = dtype(0.0)
+    for base, value, on in ((0, lse_term, with_lse), (8, delta, True)):
+        if not on:
+            continue
+        rem = value
+        for j in range(3):
+            part = dtype(rem)
+            row_any[base + j] = part
+            rem = rem - Float32(part)
+
+
+def fbwd_mul_pairs_packed(
+    dst_frg: cute.Tensor,
+    src_frg: cute.Tensor,
+    src_off: int,
+    cnt: int,
+) -> None:
+    """In-place ``dst[i] *= src[src_off + i]`` over one chunk, packed pairs
+    (the ``score_mod_bwd`` Jacobian applied to dS)."""
+    dst_any = cast("Any", dst_frg)
+    src_any = cast("Any", src_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.mul_packed_f32x2(
+            (dst_any[2 * v], dst_any[2 * v + 1]),
+            (src_any[src_off + 2 * v], src_any[src_off + 2 * v + 1]),
+        )
+        dst_any[2 * v] = a
+        dst_any[2 * v + 1] = b
 
 
 def fbwd_ds_pairs_packed(

@@ -2488,6 +2488,7 @@ def render_flex_hook(
     prefetch_regs: int = 0,
     coalesce: int = 0,
     coop_slots: int = 1,
+    aux_smem_staged: frozenset[int] | None = None,
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
 
@@ -2500,6 +2501,9 @@ def render_flex_hook(
     shared-memory copy (``flex_aux_smem_layout``: the data-dependent-gather
     candidates in plan order while the padded total fits); their loads read
     the ``_flash_aux{i}_smem`` pointers the emitter binds and fills.
+    ``aux_smem_staged`` names that set directly (an emitter rendering several
+    hooks from sub-plans of one fill passes the fill's set, so no hook reads
+    a pointer the fill did not bind).
 
     ``prefetch_regs`` (32-bit registers per thread) selects the per-chunk
     table loads (vector / run groups, windows) issued ahead and how many
@@ -2562,8 +2566,12 @@ def render_flex_hook(
         row_coord_expr=row_coord_expr,
         device_function=device_function,
     )
-    emitter.staged = frozenset(
-        entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
+    emitter.staged = (
+        aux_smem_staged
+        if aux_smem_staged is not None
+        else frozenset(
+            entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
+        )
     )
     # The natural lane counts are powers of two dividing the chunk: the
     # largest covers every run in whole vectors.

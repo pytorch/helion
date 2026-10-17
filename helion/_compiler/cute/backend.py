@@ -977,23 +977,14 @@ def _detect_attention_bwd_mma_loop(
     if not env.config_spec.cute_flash_bwd_search_enabled:
         return False
     device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) == 1 and len(device_ir.grid_block_ids[0]) == 3:
+        return _detect_flex_attention_bwd_loop(fn, block_ids, config=config)
     if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
         return False
     root_block_id = device_ir.grid_block_ids[0][0]
     if len(block_ids) != 1 or block_ids[0] == root_block_id:
         return False
-    if config.pid_type != "flat":
-        return False
-    if any(grouping != 1 for grouping in config.l2_groupings):
-        return False
-    if any(order != [*range(len(order))] for order in config.loop_orders):
-        return False
-    if any(thread_count != 0 for thread_count in config.num_threads):
-        return False
-    cute_vector_widths = config.config.get("cute_vector_widths", [])
-    if isinstance(cute_vector_widths, list) and any(
-        width != 1 for width in cute_vector_widths
-    ):
+    if not _attention_config_envelope_ok(config):
         return False
     bm = env.block_sizes[block_ids[0]].from_config(config)
     bn = env.block_sizes[root_block_id].from_config(config)
@@ -1006,11 +997,62 @@ def _detect_attention_bwd_mma_loop(
     return True
 
 
+def _detect_flex_attention_bwd_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """The FlexAttention backward envelope: every device loop of the q-head
+    loop and the two Q-block list walks answers ``mma_mode`` from one
+    whole-graph-set match, probed once per device function."""
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .flex_bwd_match import match_flex_attention_bwd
+    from .flex_match import FLEX_PLAN_ENABLED
+
+    if not FLEX_PLAN_ENABLED:
+        return False
+    device_ir = HostFunction.current().device_ir
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(block_ids) != 1 or block_ids[0] in root_grid_ids:
+        return False
+    if not _attention_config_envelope_ok(config):
+        return False
+    env = CompileEnvironment.current()
+    state = fn.cute_state
+    if not state.attention_flex_bwd_probed:
+        state.attention_flex_bwd_probed = True
+        state.attention_flex_bwd_match = match_flex_attention_bwd(
+            fn.codegen.codegen_graphs, root_grid_ids, env=env
+        )
+    match = state.attention_flex_bwd_match
+    if match is None or block_ids[0] not in match.loop_block_ids:
+        return False
+    if (
+        env.block_sizes[match.q_block_id].from_config(config) != 128
+        or env.block_sizes[match.kv_block_id].from_config(config) != 128
+    ):
+        return False
+    if any(
+        env.block_sizes[block_id].from_config(config) != 1
+        for block_id in (match.b_block_id, match.hk_block_id)
+    ):
+        return False
+    state.attention_flash_bwd_match = match
+    if state.attention_flash_bwd_block_ids is None:
+        state.attention_flash_bwd_block_ids = list(match.loop_block_ids)
+    return True
+
+
 def _attention_config_envelope_ok(config: Config) -> bool:
     """The fused flash bodies emit their own program mapping and own the
     whole CTA: only the flat pid with no reordering, no L2 grouping, no
-    explicit thread counts and no lane vectors is valid."""
+    explicit thread counts, no lane vectors and no epilogue subtiling (the
+    store split rewrites the graphs the matchers read) is valid."""
     if config.pid_type != "flat":
+        return False
+    if config.config.get("epilogue_subtile"):
         return False
     if any(grouping != 1 for grouping in config.l2_groupings):
         return False
@@ -4337,9 +4379,11 @@ class CuteBackend(Backend):
                     config=config,
                 ):
                     # Fused tcgen05 attention BACKWARD: the dedicated bwd
-                    # codegen emits the whole device body.
+                    # codegen emits the whole device body. The flex envelope
+                    # records every loop it owns up front; keep that list.
                     mma_mode = True
-                    fn.cute_state.attention_flash_bwd_block_ids = list(block_ids)
+                    if fn.cute_state.attention_flash_bwd_block_ids is None:
+                        fn.cute_state.attention_flash_bwd_block_ids = list(block_ids)
                 else:
                     mma_mode = _detect_specialized_mma_loop(
                         fn,

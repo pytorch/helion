@@ -11384,8 +11384,10 @@ class TestTritonReductionHeuristic(TestCase):
         from examples.kl_div import kl_div_forward
 
         m, n = 4096, 131072
-        log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
-        p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        # Binding only inspects tensor metadata. Keep the wide, contiguous shape
+        # without allocating several GiB of inputs or computing their values.
+        log_q = torch.empty([m, n], device="meta")  # @ignore-device-lint
+        p = torch.empty_like(log_q)
         args = (log_q, p)
         heuristic = TritonReductionHeuristic
 
@@ -11395,9 +11397,12 @@ class TestTritonReductionHeuristic(TestCase):
         # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
         kernel = helion.kernel(kl_div_forward.fn, backend="triton")
 
-        # Force a tuned target so the liveness allocator is exercised on any runner.
+        # Pin the Hopper target and SM count: meta inputs have no physical device.
         # The narrow fallback on other hardware covers only standard reductions.
-        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
             bound = kernel.bind(args)
 
             # The complete timeline captures the carried [M, R] state directly.
