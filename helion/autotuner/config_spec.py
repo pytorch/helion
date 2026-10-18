@@ -1611,6 +1611,9 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # All independent vetoes, including callers without a diagnostic reason.
+        # A backend may restore a restriction it owns only if no other veto exists.
+        self.disallowed_pid_type_causes: dict[str, set[str | None]] = {}
         # (feature, reason) pairs for every non-pid_type search-space restriction
         # (currently the tcgen05 narrowing applied per matmul), for search-space
         # logging. De-duplicated; ordered by first occurrence.
@@ -2085,6 +2088,7 @@ class ConfigSpec:
         """
 
         newly_disabled = pid_type in self.allowed_pid_types
+        self.disallowed_pid_type_causes.setdefault(pid_type, set()).add(reason)
         if newly_disabled and reason is not None:
             self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
@@ -8093,7 +8097,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.dim_max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
-        self.max_size: int = self.dim_max_size
+        self._max_size: int = self.dim_max_size
+        self._max_size_revision: int = 0
         # A search surface may pin the default (non-autotuned) block size while
         # widening the autotuner's range (see ``_fragment``).
         self.default_size: int | None = None
@@ -8133,6 +8138,22 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
             self.max_size = self.min_size
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @max_size.setter
+    def max_size(self, value: int) -> None:
+        # Record even an equal assignment: an independent consumer or explicit
+        # user bound may impose the same ceiling as an earlier compiler cap.
+        self._max_size = value
+        self._max_size_revision += 1
+
+    @property
+    def max_size_revision(self) -> int:
+        """Mutation token for a compiler-owned ceiling that may later widen."""
+        return self._max_size_revision
 
     def update_max(self, value: int) -> None:
         clamped = max(value, 1)

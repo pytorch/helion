@@ -923,7 +923,10 @@ def enable_cute_tcgen05_search(
             floor = plan.min_search_n
             min_size = min(WARP_MMA_MIN_BN, floor) if warp_mma_admitted else floor
         env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-        env.block_sizes[block_idx].update_max_block(max_size)
+        if axis_name == "k":
+            spec._cute_tcgen05_config.cap_k_search(env.block_sizes[block_idx], max_size)
+        else:
+            env.block_sizes[block_idx].update_max_block(max_size)
         if min_size < floor:
             # The widened floor must not move the default (non-autotuned)
             # block: the default config stays the tcgen05 tile it was, and the

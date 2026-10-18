@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING
 from unittest import SkipTest
 from unittest.mock import patch
 
+import torch
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
+from torch.utils._pytree import tree_leaves
+
 from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from helion._utils import triton_is_available
 
@@ -76,3 +83,74 @@ def _forbid_native_compile() -> Iterator[list[MagicMock]]:
                 for target in ("cutlass.cute.compile", "cutlass.compile")
             )
         yield mocks
+
+
+@contextmanager
+def _forbid_cuda_work() -> Iterator[None]:
+    """Guard this test even when an earlier test initialized the CUDA context."""
+    initialized = torch.cuda.is_initialized()
+    with ExitStack() as stack:
+        stack.enter_context(_RejectNativeCuda())
+        guards = stack.enter_context(_forbid_native_compile())
+        guards.extend(
+            stack.enter_context(
+                patch(target, side_effect=AssertionError("CUDA work forbidden"))
+            )
+            for target in (
+                "torch.cuda._lazy_init",
+                "torch.cuda.init",
+                "torch.cuda.synchronize",
+                "torch.cuda.current_stream",
+                "torch.cuda.default_stream",
+                "torch.cuda.Stream",
+                "torch.cuda.Event",
+                "torch.cuda.CUDAGraph",
+            )
+        )
+        yield
+        for guard in guards:
+            guard.assert_not_called()
+        assert torch.cuda.is_initialized() == initialized
+
+
+class _RejectNativeCuda(TorchDispatchMode):
+    """Stop direct ATen dispatch before it can reach a live CUDA context."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = {} if kwargs is None else kwargs
+        inputs = tree_leaves((args, kwargs))
+        fake_modes = [
+            mode
+            for mode in _get_current_dispatch_mode_stack()
+            if isinstance(mode, FakeTensorMode)
+        ]
+        for value in inputs:
+            if isinstance(value, FakeTensor) and value.fake_mode not in fake_modes:
+                fake_modes.append(value.fake_mode)
+        for value in inputs:
+            if (
+                isinstance(value, torch.device)
+                and value.type == "cuda"
+                and not fake_modes
+            ):
+                raise AssertionError("CUDA device forbidden by dispatch guard")
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, FakeTensor)
+                and value.device.type == "cuda"
+            ):
+                raise AssertionError("CUDA tensor forbidden by dispatch guard")
+        # Fake metadata operations need an installed mode or a typed fake input;
+        # native fallback must not escape while this dispatch guard is popped.
+        with ExitStack() as stack:
+            for mode in fake_modes:
+                stack.enter_context(patch.object(mode, "allow_fallback_kernels", False))
+            result = func(*args, **kwargs)
+        for value in tree_leaves(result):
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, FakeTensor)
+                and value.device.type == "cuda"
+            ):
+                raise AssertionError("CUDA result forbidden by dispatch guard")
+        return result
