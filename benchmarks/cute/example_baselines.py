@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import importlib
 import inspect
+from pathlib import Path
 import statistics
 import sys
 import time
@@ -16,6 +17,12 @@ from typing import Callable
 
 if TYPE_CHECKING:
     import torch
+
+# The repository root's quack/ checkout directory has no __init__.py. With the
+# root on sys.path it shadows the installed package as a namespace package, and
+# quack's JIT cache then fails on quack.__file__. Like the dedicated
+# comparisons, import quack from the checkout itself when it exists.
+QUACK_PATH = Path(__file__).resolve().parents[2] / "quack"
 
 
 def _event_ms(fn: Callable) -> float:
@@ -108,6 +115,8 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
     import torch
     import torch.nn.functional as F
 
+    if QUACK_PATH.is_dir() and str(QUACK_PATH) not in sys.path:
+        sys.path.insert(0, str(QUACK_PATH))
     baseline = next(iter(case.baselines.values()))
     result: dict[str, Callable] = {
         name: (lambda fn=fn: fn) for name, fn in case.baselines.items()
@@ -470,7 +479,18 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
             from helion._testing import HALF_DTYPE
 
-            return lambda a, b: gemm(a, b, out_dtype=HALF_DTYPE)
+            def call(
+                a: torch.Tensor,
+                b: torch.Tensor,
+                scale_a: torch.Tensor | None = None,
+                scale_b: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                # The second case passes tensor-wise scales: alpha folds them
+                # into quack's epilogue.
+                alpha = 1.0 if scale_a is None or scale_b is None else scale_a * scale_b
+                return gemm(a, b, alpha=alpha, out_dtype=HALF_DTYPE)
+
+            return call
 
         result["quack"] = quack_fp8_gemm
     if module == "gather_gemv":
@@ -635,6 +655,29 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
         result["quack.grouped_mm"] = lambda: grouped_jagged(True)
         result["aten.grouped_mm"] = lambda: grouped_jagged(False)
+        # FP32 _grouped_mm copies offsets to the host, which CUDA graphs reject.
+        # A padded batched GEMM is a capture-safe ATen formulation.
+        offsets = case.args[0]
+        longest = int((offsets[1:] - offsets[:-1]).max())
+
+        def padded_bmm(
+            offsets: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            rows = torch.repeat_interleave(
+                torch.arange(weights.shape[0], device=x.device),
+                offsets[1:] - offsets[:-1],
+                output_size=x.shape[0],
+            )
+            cols = torch.arange(x.shape[0], device=x.device) - offsets[rows]
+            padded = x.new_zeros(weights.shape[0], longest, x.shape[1])
+            padded[rows, cols] = x
+            return torch.baddbmm(bias[:, None, :], padded, weights)[rows, cols]
+
+        result["aten.padded_bmm"] = lambda: padded_bmm
+        result["compile.padded_bmm"] = lambda: torch.compile(padded_bmm, fullgraph=True)
     if module in {
         "jagged_sum",
         "jagged_mean",
