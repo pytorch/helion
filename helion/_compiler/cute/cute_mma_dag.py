@@ -153,6 +153,15 @@ MMA_DAG_LOADS_LANE = "lane"
 # stay lane loads), ``lane`` keeps every lane's global pair loads (one sector
 # per lane per load) and the shared memory for occupancy.  Inert elsewhere.
 MMA_DAG_LOADS_CHOICES: tuple[str, ...] = (MMA_DAG_LOADS_TMA, MMA_DAG_LOADS_LANE)
+MMA_DAG_PERSISTENT_KEY = "cute_mma_dag_persistent"
+# The tcgen05 mode's launch: 0 runs one root tile per CTA over the flat grid;
+# ``k`` launches ``k`` CTAs per SM that loop over the tiles (the generic
+# ``persistent_interleaved`` program ids), so the barrier / tensor-memory
+# setup is paid once per CTA and a CTA's next tile follows its epilogue
+# without a relaunch (b8 h80 mamba2 chunk state, 4 CTAs per SM: 159 -> 147
+# us).  ``k`` should match the occupancy the shared and tensor memory allow:
+# a CTA that is not resident waits for a whole resident CTA's tile loop.
+MMA_DAG_PERSISTENT_CHOICES: tuple[int, ...] = (0, 1, 2, 3, 4)
 # The driver reserves this much shared memory per resident CTA: an SM's
 # ``capacity + reserved`` bytes hold ``(capacity + reserved) // (smem +
 # reserved)`` CTAs of ``smem`` bytes (B200: 233472 B per SM, 232448 per CTA).
@@ -167,6 +176,7 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_EXCHANGE_KEY,
     MMA_DAG_PASS_WARPS_KEY,
     MMA_DAG_LOADS_KEY,
+    MMA_DAG_PERSISTENT_KEY,
 )
 # Live fp32 fragment words per thread the carry may occupy.
 MMA_DAG_MAX_FRAG_REGS = 128
@@ -1246,6 +1256,8 @@ class MmaDagPlan:
     # ``warp`` (mma.sync, this module's emitter) or ``tcgen05``.
     compute: str = MMA_DAG_WARP
     tcgen05: Tcgen05Plan | None = None
+    # CTAs per SM of a persistent tcgen05 launch (0: one tile per CTA).
+    persistent: int = 0
 
     @property
     def threads(self) -> int:
@@ -5253,7 +5265,23 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         reason = mma_dag_pass_warps_reason(facts, warps, stages, cast("str", mode))
         if reason:
             raise _decline(f"{MMA_DAG_PASS_WARPS_KEY}: {reason}")
-    if get("pid_type", "flat") != "flat":
+    persistent = get(MMA_DAG_PERSISTENT_KEY, 0)
+    if persistent not in MMA_DAG_PERSISTENT_CHOICES or type(persistent) is not int:
+        raise _decline(
+            f"{MMA_DAG_PERSISTENT_KEY} {persistent!r} must be one of {MMA_DAG_PERSISTENT_CHOICES}"
+        )
+    if persistent:
+        if mode != MMA_DAG_TCGEN05:
+            raise _decline(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
+        if (
+            get("pid_type", "flat") != "persistent_interleaved"
+            or get("num_sm_multiplier", 1) != persistent
+        ):
+            raise _decline(
+                f"{MMA_DAG_PERSISTENT_KEY}={persistent} launches "
+                f"persistent_interleaved program ids, {persistent} per SM"
+            )
+    elif get("pid_type", "flat") != "flat":
         raise _decline("the lowering needs the flat program-id grid")
     sizes = tuple(
         cast("int", facts.block_size(axis.index, sizes_by_block))
@@ -5312,7 +5340,12 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             cast("str", store_mode),
             pass_warps == MMA_DAG_PASS_WARPS_ON,
             cast("str", loads_mode),
+            persistent=bool(persistent),
         )
+        if persistent and tc.regions:
+            raise _decline(
+                f"{MMA_DAG_PERSISTENT_KEY}: the region programs launch one tile per CTA"
+            )
         return MmaDagPlan(
             program=program,
             sizes=sizes,
@@ -5323,6 +5356,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             exchange_mode=cast("str", exchange_mode),
             compute=MMA_DAG_TCGEN05,
             tcgen05=tc,
+            persistent=cast("int", persistent),
         )
     plan = MmaDagPlan(
         program=program,

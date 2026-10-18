@@ -384,17 +384,30 @@ def test_k_loop_stage_depth_warps_and_store_path_are_pure_data_movement() -> Non
 
 
 @pytest.mark.parametrize(
-    "config",
+    ("config", "chunk"),
     (
-        None,
-        _config([64, 128, 128], warps=4, stages=2),
-        _config([64, 64, 64], warps=4, stages=1),
-        _config([64, 128, 64], warps=8, stages=4),
+        (None, 256),
+        (_config([64, 128, 128], warps=4, stages=2), 256),
+        (_config([64, 64, 64], warps=4, stages=1), 256),
+        (_config([64, 128, 64], warps=8, stages=4), 256),
+        # Persistent launches: every CTA loops over several tiles with an
+        # even, a one-trip and a four-trip K loop.
+        (_config([64, 128, 128], warps=4, stages=1, cute_mma_dag_persistent=4), 256),
+        (_config([64, 128, 128], warps=4, stages=1, cute_mma_dag_persistent=1), 128),
+        (_config([64, 64, 64], warps=4, stages=2, cute_mma_dag_persistent=2), 256),
     ),
-    ids=["default", "64x128x128w4s2", "64x64x64w4s1", "64x128x64w8s4"],
+    ids=[
+        "default",
+        "64x128x128w4s2",
+        "64x64x64w4s1",
+        "64x128x64w8s4",
+        "persistent4",
+        "persistent1-trip1",
+        "persistent2-trip4",
+    ],
 )
 def test_the_chunk_state_example_matches_the_reference(
-    config: helion.Config | None,
+    config: helion.Config | None, chunk: int
 ) -> None:
     # examples/mamba2_chunk_state.py: the chunk offset of the x / B tiles and
     # the leading tiles' begins as coordinates (4 heads per group).
@@ -402,7 +415,7 @@ def test_the_chunk_state_example_matches_the_reference(
     from examples.mamba2_chunk_state import ref_chunk_state
 
     torch.manual_seed(0)
-    batch, seqlen, nheads, ngroups, chunk = 2, 1024, 8, 2, 256
+    batch, seqlen, nheads, ngroups = 2, 1024, 8, 2
     nchunks = seqlen // chunk
     x = torch.randn(batch, seqlen, nheads, 64, device=DEVICE, dtype=torch.bfloat16)
     B = torch.randn(batch, seqlen, ngroups, 128, device=DEVICE, dtype=torch.bfloat16)

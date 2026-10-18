@@ -1289,6 +1289,70 @@ def test_loop_invariant_scalar_side_loads_go_out_ahead_of_the_loop() -> None:
     assert f"{WARP_RT}.ldg_bf16_as_f32(md_base_" not in body[loop:]
 
 
+def test_the_persistent_launch_loops_over_tiles_around_one_setup() -> None:
+    # cute_mma_dag_persistent=k: the generic persistent_interleaved program
+    # ids at k CTAs per SM; the barriers and tensor memory are set up once
+    # ahead of the tile loop, re-armed at the end of every tile, and the
+    # tensor memory is freed once after it.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_persistent is not None
+    config = _config(64, 64, 128, warps=4, stages=1, cute_mma_dag_persistent=4)
+    with bound.env:
+        normalized = spec.normalized_config(config).config
+    assert normalized["pid_type"] == "persistent_interleaved"
+    assert normalized["num_sm_multiplier"] == 4
+    body = _kernel_body(bound.to_code(helion.Config(**normalized)))
+    loop = body.index("for virtual_pid in range(")
+    assert body.index(f"{P}.tcgen05_alloc(") < loop
+    assert body.index(f"{P}.tcgen05_relinquish_alloc_permit(") < loop
+    assert body.count(f"{P}.tcgen05_alloc(") == 1
+    tile = body[loop : body.index(f"{P}.tcgen05_dealloc(")]
+    assert "pid_0 = virtual_pid %" in tile
+    # Cross-tile prefetch: the ring's phases run on from the CTA's
+    # iteration count, only its first tile issues its own ring prologue, and
+    # each tile issues the next tile's slot right after its drain -- the x
+    # box, clear of the epilogue staging tile at the ring's end -- and the B
+    # box behind the epilogue's staging reads (one K step per tile here).
+    assert body.index("md_ib = cutlass.Int32(0)") < loop
+    assert "md_stage = (md_ib + md_i) % 1" in tile
+    first = tile.index("if md_ib == 0:")
+    assert first < tile.index(f"{P}.cp_async_bulk_tensor_shared_cta_global(")
+    drain = tile.index(f"{RT}.mbar_wait(md_accb, 1 - 0 - 1 & 1)")
+    staging = tile.index("md_srow = md_s0 + 24576 + ")
+    early = tile[drain:staging]
+    assert "md_npid = virtual_pid + _NUM_SM * 4" in early
+    assert early.count(f"{P}.mbarrier_arrive_expect_tx(md_full + (") == 1
+    assert early.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert "* 32768 + 0), md_tma0" in early
+    late = tile[tile.rindex("_helion_mma_dag.stg_v4_b32(") :]
+    assert late.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert "* 32768 + 16384), md_tma1" in late
+    # The other barriers are re-armed per tile, the ring's are not.
+    assert f"{P}.mbarrier_init(md_accb, 1)" in late
+    assert f"{P}.mbarrier_init(md_full" not in tile
+    assert "md_ib = md_ib + (1 - 0)" in late
+    # The dealloc follows the loop, once.
+    assert body.count(f"{P}.tcgen05_dealloc(") == 1
+    # The warp mode has no persistent launch: the knob is repaired to 0.
+    warp = helion.Config(
+        block_sizes=[64, 64, 64],
+        cute_mma_dag="warp",
+        cute_mma_dag_warps=4,
+        cute_mma_dag_stages=2,
+        cute_mma_dag_persistent=4,
+    )
+    with bound.env:
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_persistent"):
+            spec.normalize(dict(warp.config))
+        fixed = dict(warp.config)
+        spec.normalize(fixed, _fix_invalid=True)
+    assert fixed["cute_mma_dag_persistent"] == 0
+    assert fixed.get("pid_type", "flat") == "flat" and "num_sm_multiplier" not in fixed
+
+
 def test_an_offset_tile_that_can_leave_the_tensor_is_not_mine() -> None:
     # seqlen 500: the last chunk's tile reads rows 384..511 of a 500-row x,
     # which the masked scalar lowering zero-fills.
