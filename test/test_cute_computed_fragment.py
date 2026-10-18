@@ -120,6 +120,36 @@ def test_fragment_parallel_carry_aliases_and_lazy_updates(steps):
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
+def _fragment_computed_slice_start(
+    x: torch.Tensor, bias: torch.Tensor, groups: hl.constexpr
+):
+    rows = hl.specialize(x.size(1))
+    out = torch.empty(
+        (x.size(0), rows, x.size(2)), device=x.device, dtype=torch.float32
+    )
+    for tile_r, tile_d in hl.tile([x.size(0), x.size(2)], block_size=[1, None]):
+        index = hl.arange(rows)
+        ltri = (index[:, None] >= index[None, :]).to(torch.float32)
+        head = tile_r.begin // groups
+        # The slice lowers to prims.iota(1, start=head): its start is a
+        # device-computed scalar node.
+        value = x[tile_r.begin, :, tile_d].float() + bias[head : head + 1, tile_d]
+        out[tile_r.begin, :, tile_d] = hl.dot(ltri, value)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_fragment_computed_slice_start():
+    x = torch.randn((6, 16, 8), device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn((2, 8), device=DEVICE)
+    expected = torch.tril(torch.ones(16, 16, device=DEVICE)) @ (
+        x.float() + bias.repeat_interleave(3, dim=0)[:, None, :]
+    )
+    actual = _fragment_computed_slice_start(x, bias, 3)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
 def _fragment_half_carry_dot(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -7594,3 +7624,60 @@ def test_warp_producer_regions_cooperative_publication_declines(mutation):
         _warp_prefix_cooperative_source(x, y, enabled=True)
     assert checked == [True]
     assert _warp_prefix_cooperative_source(x, y, enabled=False) == before
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _grid_row_online_logsumexp(x: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty([batches, rows], dtype=torch.float32, device=x.device)
+    for tile_b, tile_r in hl.tile([batches, rows]):
+        maximum = hl.full([tile_b, tile_r], float("-inf"), dtype=torch.float32)
+        total = hl.zeros([tile_b, tile_r], dtype=torch.float32)
+        for tile_c in hl.tile(columns):
+            values = x[tile_b, tile_r, tile_c].to(torch.float32)
+            next_maximum = torch.maximum(maximum, torch.amax(values, dim=-1))
+            total = total * torch.exp(maximum - next_maximum) + torch.sum(
+                torch.exp(values - next_maximum[:, :, None]), dim=-1
+            )
+            maximum = next_maximum
+        out[tile_b, tile_r] = maximum + torch.log(total)
+    return out
+
+
+def _grid_row_config(bound, block_sizes):
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"][:] = block_sizes
+    return config
+
+
+def test_grid_row_loop_carries_keep_native_path():
+    # Online-softmax state over a 2-D grid tile is one element per grid
+    # coordinate, not a resident matrix: several rows per CTA must keep the
+    # ordinary lowering instead of the shared-memory fragment owner.
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(_grid_row_online_logsumexp, (torch.ones(4, 16, 256),))
+        assert not bound.config_spec.cute_fragment_thread_root_ids
+        source = bound.to_code(_grid_row_config(bound, [1, 2, 64]))
+    assert "fragment_smem" not in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("block_sizes", [[1, 1, 64], [1, 2, 64], [2, 4, 32]])
+def test_grid_row_loop_carries_native_values(block_sizes):
+    x = torch.randn(3, 10, 200, device=DEVICE, dtype=torch.bfloat16)
+    code, out = code_and_output(
+        _grid_row_online_logsumexp, (x,), block_sizes=block_sizes
+    )
+    assert "fragment_smem" not in code
+    torch.testing.assert_close(
+        out, torch.logsumexp(x.float(), dim=-1), rtol=1e-4, atol=1e-4
+    )
