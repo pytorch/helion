@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
@@ -37,10 +38,18 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteResidentMultiRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteResidentRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteResidentRowWideClusterHeuristic,
+)
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
 from helion._compiler.autotuner_heuristics.cute import (
     _bounded_grouped_worklist_seed_families,
 )
@@ -276,8 +285,10 @@ from helion._testing import TestCase
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
@@ -11763,24 +11774,25 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("reversed_registration", [False, True])
-def test_cute_row_hints_follow_loop_axes_not_registration_order(reversed_registration):
-    pytest.importorskip("cutlass.cute")
-    from helion._compiler.autotuner_heuristics.cute import CuteResidentMultiRowHeuristic
-    from helion._compiler.autotuner_heuristics.cute import CuteResidentRowHeuristic
-    from helion._compiler.autotuner_heuristics.cute import (
-        CuteResidentRowWideClusterHeuristic,
-    )
-    from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
-    from helion._compiler.autotuner_heuristics.cute import (
-        CuteTileVecWarpPerRowHeuristic,
-    )
-    from helion._compiler.autotuner_heuristics.cute import (
-        CuteTileVecWarpReduceHeuristic,
-    )
+_CUTE_ROW_HEURISTICS = (
+    CuteTileVecHeuristic,
+    CuteTileVecWarpReduceHeuristic,
+    CuteTileVecWarpPerRowHeuristic,
+    CuteResidentRowHeuristic,
+    CuteResidentRowWideClusterHeuristic,
+    CuteResidentMultiRowHeuristic,
+)
 
-    def rowsum(x, reverse: hl.constexpr):
+
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_follow_loop_axes_not_registration_order(
+    reversed_registration: bool,
+) -> None:
+    pytest.importorskip("cutlass.cute")
+
+    def rowsum(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
         if reverse:
             columns = hl.register_block_size(x.size(1))
             rows = hl.register_block_size(x.size(0))
@@ -11799,15 +11811,9 @@ def test_cute_row_hints_follow_loop_axes_not_registration_order(reversed_registr
     bound = helion.kernel(rowsum, backend="cute", static_shapes=True).bind(args)
     outer, inner = (1, 0) if reversed_registration else (0, 1)
     spec = bound.config_spec
-    for heuristic in [
-        CuteTileVecHeuristic,
-        CuteTileVecWarpReduceHeuristic,
-        CuteTileVecWarpPerRowHeuristic,
-        CuteResidentRowHeuristic,
-        CuteResidentRowWideClusterHeuristic,
-        CuteResidentMultiRowHeuristic,
-    ]:
+    for heuristic in _CUTE_ROW_HEURISTICS:
         with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
             seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
         assert seed is not None, heuristic.name
         assert spec.block_sizes.config_get(seed.block_sizes, inner) > 1
@@ -11825,3 +11831,44 @@ def test_cute_row_hints_follow_loop_axes_not_registration_order(reversed_registr
             torch.testing.assert_close(
                 fn(*args), args[0].sum(dim=1), atol=1e-3, rtol=1e-3
             )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_preserve_fixed_leading_axis(
+    reversed_registration: bool,
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def copy(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+        if reverse:
+            columns = hl.register_block_size(x.size(2))
+            rows = hl.register_block_size(x.size(1))
+        else:
+            rows = hl.register_block_size(x.size(1))
+            columns = hl.register_block_size(x.size(2))
+        out = torch.empty_like(x)
+        for batch, row, col in hl.tile(x.shape, block_size=[1, rows, columns]):
+            out[batch, row, col] = x[batch, row, col]
+        return out
+
+    with _mock_cuda_unavailable(), patch_cute_mma_support():
+        bound = _cpu_bind(copy, (torch.empty(2, 16, 2048), reversed_registration))
+    row, col = (1, 0) if reversed_registration else (0, 1)
+    spec = bound.config_spec
+    assert len(spec.block_sizes) == 2
+    assert len(bound.host_function.device_ir.grid_block_ids[0]) == 3
+    for heuristic in _CUTE_ROW_HEURISTICS:
+        with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None, heuristic.name
+        assert spec.block_sizes.config_get(seed.block_sizes, row) <= 4
+        assert spec.block_sizes.config_get(seed.block_sizes, col) > 1
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], col)
+            > 1
+        )
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
+            == 1
+        )

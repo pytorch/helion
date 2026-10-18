@@ -989,20 +989,17 @@ def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     return 1
 
 
-def _cute_tile_row_blocks(
-    env: CompileEnvironment, device_ir: DeviceIR
-) -> tuple[int, int] | None:
+def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
     """Find row/inner axes in loop order, independent of registration order."""
     blocks = env.config_spec.block_sizes
     if len(blocks) != 2:
         return None
-    paths = tile_loop_paths(device_ir, device_ir.graphs)
+    paths = env.config_spec.cute_tile_loop_paths
     if len(paths) != 1 or not paths[0][0]:
         return None
-    axes = tuple(
-        bid for level in paths[0] for bid in level if bid in blocks.valid_block_ids()
-    )
-    if len(axes) != 2 or set(axes) != set(blocks.valid_block_ids()):
+    block_ids = blocks.valid_block_ids()
+    axes = tuple(bid for level in paths[0] for bid in level if bid in block_ids)
+    if len(axes) != 2 or set(axes) != set(block_ids):
         return None
     return axes[0], axes[1]
 
@@ -1514,7 +1511,7 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
             return False
         # The inner tile block must have a vec slot registered
         # (added by ``register_rollable_reductions`` for cute tile blocks).
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return False
         inner_block_id = blocks[1]
@@ -1529,7 +1526,7 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -1820,7 +1817,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return False
         inner_block_id = blocks[1]
@@ -1843,7 +1840,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -2792,7 +2789,7 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         inner_block_id = blocks[1]
@@ -2843,7 +2840,7 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n = plan
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -2928,7 +2925,7 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n, max_per_thread = plan
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -2993,7 +2990,7 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         inner_block_id = blocks[1]
@@ -3033,7 +3030,7 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             return None
         n, vec = plan
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -3106,7 +3103,7 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return False
         outer_block_id, inner_block_id = blocks
@@ -3129,7 +3126,7 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env, device_ir)
+        blocks = _cute_tile_row_blocks(env)
         if blocks is None:
             return None
         outer_block_id, inner_block_id = blocks
@@ -6642,10 +6639,10 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
     faster kernel than with heuristics disabled, with ~25% fewer wasted
     compile failures.
 
-    Seeds ``block_sizes=[1, 256]``, ``num_threads=[0, 32]``,
-    ``cute_vector_widths=[4, 8]`` in mathematical axis order, filtering M/N/K
-    to the two tunable axes (the autotune-winning N/K config for
-    M=1, K=4096, N=4096).
+    Of the two tunable axes in M/N/K order, the first gets block size 1,
+    automatic threads (0), and vector width 4; the second gets block size
+    256, 32 threads, and vector width 8. This is the autotune-winning N/K
+    config for M=1, K=4096, N=4096.
     """
 
     name = "cute_fp8_gemm_skinny_m"
@@ -6679,7 +6676,6 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
         return (
             fact.static_m is not None
             and fact.static_m <= 16
-            and len(spec.block_sizes) == 2
             and len(axes) == 2
             and set(axes) == set(block_ids)
         )
