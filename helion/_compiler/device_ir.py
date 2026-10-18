@@ -3558,6 +3558,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     for node in graph.nodes:
                         node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
 
+            env = CompileEnvironment.current()
+            if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
+                from ..language.barrier import BARRIER_PID_TYPE_REASON
+                from .cute.ordered_phases import ordered_phases_supported
+
+                spec = env.config_spec
+                if len(device_ir.phases) > 1 and ordered_phases_supported(
+                    func, device_ir
+                ):
+                    # The single persistent launch shares one thread block
+                    # across phases (and cannot host the tcgen05 pipeline).
+                    # Ordered per-phase launches tune each phase alone; the
+                    # persistent launch stays the default.
+                    spec.allowed_pid_types = (
+                        *(p for p in spec.allowed_pid_types if p != "flat"),
+                        "flat",
+                    )
+                else:
+                    spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)
+
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
