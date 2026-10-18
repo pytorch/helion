@@ -17,7 +17,10 @@ The matched Helion source shape (see ``benchmarks/cute/attnbwd_kernels.py``
   ``dQ = dS^T @ K`` — plus the softmax recompute
   ``P = exp2(S^T * qk_scale2 - lse2[None, :])`` (lse2 = base-2 LSE row
   vector), ``dS = (P * (dP^T - delta[None, :])).to(io)``, and an
-  ``hl.atomic_add(dq_fp32, [tile_m, :], dQ * out_scale)``.
+  ``hl.atomic_add(dq_fp32, [tile_m, :], dQ * dq_scale)``; the root stores
+  ``dK * dk_scale``. Each scale is a host scalar or a Python number, and may
+  be omitted (1): e.g. examples/attention.py pre-scales K by
+  ``sm_scale * log2(e)`` and rescales dQ by ``ln(2)``.
 - Causal variants mask ``S^T`` with
   ``where(q_pos[None, :] >= kv_pos[:, None], s, -inf)`` where
   ``q_pos = tile_index(tile_m) % m_dim`` / ``kv_pos = tile_index(tile_n) %
@@ -69,8 +72,9 @@ class AttentionBwdPlan:
     mm_dim: int  # query rows per KV group (group * m_dim)
     n_dim: int  # KV rows per group
     total_kv_rows: int
-    qk_scale_expr: str  # sympy expr (host symbols) for the exp2-domain scale
-    out_scale_expr: str  # sympy expr for the dK/dQ output scale
+    qk_scale_expr: str  # host expression (or literal) for the exp2-domain scale
+    out_scale_expr: str  # host expression (or literal) for the dQ output scale
+    dk_scale_expr: str  # host expression (or literal) for the dK output scale
 
     @property
     def group(self) -> int:
@@ -96,11 +100,13 @@ class AttentionBwdMatch:
     dq_name: str
     dk_name: str
     dv_name: str
-    # Sympy expressions (host symbols) for the two runtime scales, captured
-    # from the traced SymFloat metadata so symbol identity is preserved for
-    # ``DeviceFunction.sympy_expr`` rendering at codegen time.
-    qk_scale_sym: sympy.Expr | None = None
-    out_scale_sym: sympy.Expr | None = None
+    # The runtime scales (exp2 domain, dQ, dK): sympy expressions (host
+    # symbols) captured from the traced SymFloat metadata so symbol identity is
+    # preserved for ``DeviceFunction.sympy_expr`` rendering at codegen time, or
+    # Python floats for constants in the graph (an omitted scale is 1.0).
+    qk_scale_sym: sympy.Expr | float | None = None
+    out_scale_sym: sympy.Expr | float | None = None
+    dk_scale_sym: sympy.Expr | float | None = None
 
 
 def _node_target_name(node: torch.fx.Node) -> str:
@@ -152,6 +158,30 @@ def _symnode_sympy(node: object) -> sympy.Expr | None:
     val = node.meta.get("val")
     node_attr = getattr(val, "node", None)
     return getattr(node_attr, "expr", None)
+
+
+def _scale_operand(node: object) -> tuple[sympy.Expr | float, str] | None:
+    """A runtime scale operand: a traced host SymFloat (its sympy expression and
+    host expression text) or a Python number baked into the graph."""
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        return float(node), repr(float(node))
+    text = _symnode_expr(node)
+    sym = _symnode_sympy(node)
+    if text is None or sym is None:
+        return None
+    return sym, text
+
+
+def _split_scale(
+    node: object,
+) -> tuple[object, tuple[sympy.Expr | float, str]] | None:
+    """``mul(x, scale)`` -> (x, scale operand); any other node is ``x * 1``."""
+    if isinstance(node, torch.fx.Node) and node.target is torch.ops.aten.mul.Tensor:
+        scale = _scale_operand(node.args[1])
+        if scale is None:
+            return None
+        return node.args[0], scale
+    return node, (1.0, "1.0")
 
 
 def _through_new_var(node: object) -> object:
@@ -319,7 +349,7 @@ def _match_bwd_inner_graph(
     q_name, _ = q_load
     do_name, _ = do_load
 
-    # Softmax recompute chain: p_t = exp2(mul(score, scale_sym) - lse[None, :]).
+    # Softmax recompute chain: p_t = exp2(score * qk_scale - lse[None, :]).
     p_t = None
     for node in graph.nodes:
         if node.op == "call_function" and node.target is torch.ops.aten.exp2.default:
@@ -333,17 +363,11 @@ def _match_bwd_inner_graph(
         and sub_node.target is torch.ops.aten.sub.Tensor
     ):
         return None
-    mul_node, lse_bcast = sub_node.args
-    if not (
-        isinstance(mul_node, torch.fx.Node)
-        and mul_node.target is torch.ops.aten.mul.Tensor
-    ):
+    scaled_score, lse_bcast = sub_node.args
+    split = _split_scale(scaled_score)
+    if split is None:
         return None
-    score_node, scale_sym = mul_node.args
-    qk_scale_expr = _symnode_expr(scale_sym)
-    if qk_scale_expr is None:
-        return None
-    qk_scale_sympy = _symnode_sympy(scale_sym)
+    score_node, (qk_scale_sympy, qk_scale_expr) = split
     causal = False
     m_dim = n_dim = None
     if isinstance(score_node, torch.fx.Node) and score_node is not qk_dot:
@@ -435,17 +459,10 @@ def _match_bwd_inner_graph(
         isinstance(index, (list, tuple)) and len(index) == 2 and index[1] == slice(None)
     ):
         return None
-    value = atomic_node.args[2]
-    if not (
-        isinstance(value, torch.fx.Node)
-        and value.target is torch.ops.aten.mul.Tensor
-        and value.args[0] is dq_dot
-    ):
+    split = _split_scale(atomic_node.args[2])
+    if split is None or split[0] is not dq_dot:
         return None
-    out_scale_expr = _symnode_expr(value.args[1])
-    if out_scale_expr is None:
-        return None
-    out_scale_sympy = _symnode_sympy(value.args[1])
+    out_scale_sympy, out_scale_expr = split[1]
 
     # head_dim from the dv dot output metadata.
     dv_val = dv_dot.meta.get("val")
@@ -567,8 +584,9 @@ def _match_bwd_root_graph(
     else:
         return None
 
-    # dv / dk stores: store(dv, [kv_block, :], convert(phi0)) and
-    # store(dk, [kv_block, :], convert(phi1 * out_scale)).
+    # dv / dk stores: store(dv, [kv_block, :], convert(phi(dv_acc))) and
+    # store(dk, [kv_block, :], convert(phi(dk_acc) * dk_scale)). The emitted
+    # epilogue scales dK only, so each store must read its own accumulator.
     store_nodes = [
         node
         for node in graph.nodes
@@ -577,6 +595,7 @@ def _match_bwd_root_graph(
     if len(store_nodes) != 2:
         return None
     dv_name = dk_name = None
+    dk_scale = None
     for store_node in store_nodes:
         base = store_node.args[0]
         if not (isinstance(base, torch.fx.Node) and base.target is _host_tensor):
@@ -587,18 +606,22 @@ def _match_bwd_root_graph(
             and value.target is torch.ops.prims.convert_element_type.default
         ):
             return None
-        inner = value.args[0]
-        if isinstance(inner, torch.fx.Node) and inner.target is _phi:
+        split = _split_scale(value.args[0])
+        if split is None:
+            return None
+        phi, scale = split
+        if not (isinstance(phi, torch.fx.Node) and phi.target is _phi):
+            return None
+        if phi.args[0] is dv_full and scale[0] == 1.0:
             dv_name = base.args[0]
-        elif (
-            isinstance(inner, torch.fx.Node)
-            and inner.target is torch.ops.aten.mul.Tensor
-            and _symnode_expr(inner.args[1]) is not None
-        ):
+        elif phi.args[0] is dk_full:
             dk_name = base.args[0]
+            dk_scale = scale
         else:
             return None
-    if not (isinstance(dv_name, str) and isinstance(dk_name, str)):
+    if not (
+        isinstance(dv_name, str) and isinstance(dk_name, str) and dk_scale is not None
+    ):
         return None
 
     inner_causal = bool(inner_facts["causal"])
@@ -620,6 +643,8 @@ def _match_bwd_root_graph(
         "dv_name": dv_name,
         "mm_dim": mm_dim,
         "n_dim": n_dim,
+        "dk_scale_sym": dk_scale[0],
+        "dk_scale_expr": dk_scale[1],
     }
 
 
@@ -679,6 +704,7 @@ def match_attention_bwd(device_ir: DeviceIR) -> AttentionBwdMatch | None:
         total_kv_rows=total_kv_rows,
         qk_scale_expr=typing.cast("str", inner_facts["qk_scale_expr"]),
         out_scale_expr=typing.cast("str", inner_facts["out_scale_expr"]),
+        dk_scale_expr=typing.cast("str", root_facts["dk_scale_expr"]),
     )
     return AttentionBwdMatch(
         plan=plan,
@@ -691,8 +717,9 @@ def match_attention_bwd(device_ir: DeviceIR) -> AttentionBwdMatch | None:
         dq_name=typing.cast("str", inner_facts["dq_name"]),
         dk_name=typing.cast("str", root_facts["dk_name"]),
         dv_name=typing.cast("str", root_facts["dv_name"]),
-        qk_scale_sym=typing.cast("sympy.Expr | None", inner_facts["qk_scale_sym"]),
-        out_scale_sym=typing.cast("sympy.Expr | None", inner_facts["out_scale_sym"]),
+        qk_scale_sym=typing.cast("sympy.Expr | float", inner_facts["qk_scale_sym"]),
+        out_scale_sym=typing.cast("sympy.Expr | float", inner_facts["out_scale_sym"]),
+        dk_scale_sym=typing.cast("sympy.Expr | float", root_facts["dk_scale_sym"]),
     )
 
 
@@ -795,7 +822,7 @@ def _flash_bwd_wg_compute_block(
     plan: AttentionBwdPlan,
     io_dtype: str,
     scale2_expr: str,
-    out_scale_expr: str,
+    dk_scale_expr: str,
     n_tiles: int,
     m_mod_tiles: int,
     steps_expr: str,
@@ -849,7 +876,7 @@ def _flash_bwd_wg_compute_block(
         epi_off=str(256 if h == 0 else "FBWD_DK_OFF"),
         epi_scale=(
             "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
-            + out_scale_expr
+            + dk_scale_expr
             + "))"
             if h == 1
             else "pass"
@@ -1151,6 +1178,7 @@ def emit_flash_bwd_device_body(
     io_dtype: str,
     scale2_expr: str,
     out_scale_expr: str,
+    dk_scale_expr: str,
     q_stage: int,
     do_stage: int,
     kv_stage: int = 1,
@@ -1263,7 +1291,7 @@ def emit_flash_bwd_device_body(
             plan=plan,
             io_dtype=io_dtype,
             scale2_expr=scale2_expr,
-            out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             n_tiles=n_tiles,
             m_mod_tiles=m_mod_tiles,
             steps_expr=steps_expr,
@@ -1677,7 +1705,7 @@ def _flash_bwd_2cta_wg_compute_block(
     plan: AttentionBwdPlan,
     io_dtype: str,
     scale2_expr: str,
-    out_scale_expr: str,
+    dk_scale_expr: str,
     m_mod_tiles: int,
     steps_expr: str,
     exp2_f32: bool = False,
@@ -1695,7 +1723,7 @@ def _flash_bwd_2cta_wg_compute_block(
     )
     epi_scale = (
         "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
-        + out_scale_expr
+        + dk_scale_expr
         + "))"
         if h == 1
         else "pass"
@@ -1890,6 +1918,7 @@ def emit_flash_bwd_2cta_device_body(
     io_dtype: str,
     scale2_expr: str,
     out_scale_expr: str,
+    dk_scale_expr: str,
     persistent: bool = False,
     total_pairs: int = 0,
     exp2_f32: bool = False,
@@ -1907,7 +1936,7 @@ def emit_flash_bwd_2cta_device_body(
             plan=plan,
             io_dtype=io_dtype,
             scale2_expr=scale2_expr,
-            out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             m_mod_tiles=m_mod_tiles,
             steps_expr="fbwd_steps",
             exp2_f32=exp2_f32,
@@ -2478,10 +2507,20 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     ):
         return False
 
-    if match.qk_scale_sym is None or match.out_scale_sym is None:
+    qk_scale, dq_scale, dk_scale = (
+        match.qk_scale_sym,
+        match.out_scale_sym,
+        match.dk_scale_sym,
+    )
+    if qk_scale is None or dq_scale is None or dk_scale is None:
         return False
-    scale2_expr = df.sympy_expr(match.qk_scale_sym)  # pyrefly: ignore [bad-argument-type]
-    out_scale_expr = df.sympy_expr(match.out_scale_sym)  # pyrefly: ignore [bad-argument-type]
+
+    def render(scale: sympy.Expr | float) -> str:
+        return repr(scale) if isinstance(scale, float) else df.sympy_expr(scale)
+
+    scale2_expr = render(qk_scale)
+    out_scale_expr = render(dq_scale)
+    dk_scale_expr = render(dk_scale)
 
     env = CompileEnvironment.current()
     io_dtype_str = env.backend.dtype_str(plan.io_dtype)
@@ -2557,6 +2596,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             io_dtype=io_dtype_str,
             scale2_expr=scale2_expr,
             out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             persistent=persistent,
             total_pairs=plan.total_kv_rows // 256,
             exp2_f32=exp2_f32,
@@ -2567,6 +2607,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             io_dtype=io_dtype_str,
             scale2_expr=scale2_expr,
             out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             q_stage=q_stage,
             do_stage=do_stage,
             kv_stage=kv_stage,

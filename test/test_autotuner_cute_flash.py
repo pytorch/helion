@@ -3448,6 +3448,100 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertEqual(len(unrestricted), 1)
         self.assertEqual(unrestricted[0]["family"], "fa4_clc")
 
+    def test_lfbo_flash_qualification_skips_family_without_a_measured_member(self):
+        """A family whose every member fails has no family probe start; the
+        remaining families and the unrestricted path still probe."""
+        families = ("fa4", "fa4_2cta", "ws_overlap", "fa4_clc", "fa4_tma_4d")
+        failing = "fa4_tma_4d"
+
+        def member(family: str, wait_hint: int) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda: None,
+                perfs=[],
+                flat_values=[family, wait_hint],
+                config=helion.Config(
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family=family,
+                    cute_flash_exp2_packet="1x1",
+                    cute_flash_wait_hint=wait_hint,
+                ),
+                status="ok",
+            )
+
+        perfs = dict(zip(families, (1.0, 1.1, 1.2, 4.0, 5.0), strict=True))
+        initial = [member(family, index) for index, family in enumerate(families)]
+        leaves = [flash_structural_leaf_from_config(m.config.config) for m in initial]
+        assert all(leaf is not None for leaf in leaves)
+        next_hint = iter(range(100, 1000))
+
+        def measure(item: PopulationMember) -> None:
+            family = item.config.config["cute_flash_pipeline_family"]
+            if family == failing:
+                item.status = "error"
+                item.perfs = [math.inf]
+            else:
+                item.perfs = [perfs[family]]
+
+        for item in initial:
+            measure(item)
+
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.config_spec = _cute_flash_test_config_spec()
+        search.copies = 14
+        search._flash_promoted_path_limit = 14
+        search._flash_family_probe_path_limit = 6
+        search.num_neighbors = 300
+        search.num_neighbors_cap = -1
+        search.max_generations = 20
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search.population = list(initial)
+        search.initial_population = len(search.population)
+        search.train_x = []
+        search.train_y = []
+        search._train_members = []
+        search.polish_rounds = 0
+        search.train_configs = []
+        search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
+        search.config_gen = SimpleNamespace(
+            encode_config=lambda flat: flat,
+            flash_structural_leaf_catalog=lambda: leaves,
+            flash_low_confound_schedule_anchor_configs=list,
+            flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
+            flash_clc_lane_catalog=dict,
+            flash_exact_effective_search_space_configs=lambda _limit: None,
+        )
+        search.set_generation = Mock()
+        search._budgeted_range = lambda *args: range(*args)
+        search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
+        search.rebenchmark_population = Mock()
+        search._fit_surrogate = Mock()
+
+        def search_path(_index, current, _visited, _constraints, **kwargs):
+            leaf = kwargs.get("required_leaf")
+            family = (
+                current.config.config["cute_flash_pipeline_family"]
+                if leaf is None
+                else leaf.pipeline_family
+            )
+            return iter(((current, member(family, next(next_hint))),))
+
+        def benchmark(members, *, desc):
+            for item in members:
+                measure(item)
+
+        search._pruned_pattern_search_from = search_path
+        search.benchmark_population = benchmark
+
+        search._run_flash_structural_qualification({item.config for item in initial})
+        metrics = search._autotune_metrics.search_phase_metrics
+        self.assertTrue(metrics["family_probe_required"])
+        self.assertEqual(metrics["family_probe_path_limit"], 6)
+        probed = [path["family"] for path in metrics["family_probe_paths"]]
+        self.assertEqual(len(probed), 5)
+        self.assertNotIn(failing, probed)
+
     def test_lfbo_flash_qualification_finishes_round_before_budget_stops_next(self):
         def member(perf: float | None, wait_hint: int) -> PopulationMember:
             return PopulationMember(
