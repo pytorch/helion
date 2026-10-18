@@ -22,11 +22,18 @@ def _require_cute_codegen() -> None:
         raise SkipTest(reason)
 
 
+def _codegen_skip_reason(backend: str) -> str | None:
+    """Report why ``backend`` cannot generate source, without raising."""
+    if backend == "cute":
+        return _cute_backend_requirement_error()
+    if backend in ("triton", "tileir") and not triton_is_available():
+        return "Triton is required for source generation"
+    return None
+
+
 def _cpu_bind(kernel, args):
-    if kernel.settings.backend == "cute":
-        _require_cute_codegen()
-    elif kernel.settings.backend in ("triton", "tileir") and not triton_is_available():
-        raise SkipTest("Triton is required for source generation")
+    if reason := _codegen_skip_reason(kernel.settings.backend):
+        raise SkipTest(reason)
     with ExitStack() as stack:
         for name, value in (
             ("helion.runtime.kernel.target_device_capability", (10, 0)),
