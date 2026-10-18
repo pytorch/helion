@@ -172,13 +172,15 @@ def test_non_pipelined_consumer_binds_try_token_before_wait() -> None:
 
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 @skipUnlessBackends(["cute"])
-def test_m_major_lhs_matmul_binds_try_token_in_non_pipelined_kloop(
+def test_m_major_lhs_matmul_binds_try_token_before_every_wait(
     transpose_rhs: bool,
 ) -> None:
-    # An M-major (stride(-2) == 1) fp16 A disables A-TMA while B stays
-    # TMA-eligible, which selects the non-pipelined mixed K loop. The
-    # generated kernel used to reference the consumer try token there
-    # without ever assigning it (NameError at DSL compile time).
+    # An M-major (stride(-2) == 1) fp16 A once disabled A-TMA while B stayed
+    # TMA-eligible, selecting the non-pipelined mixed K loop, whose kernel
+    # referenced the consumer try token without ever assigning it (NameError
+    # at DSL compile time; the loop's builder keeps its unit tests above).
+    # A plain 2-D GEMM now stages the M-major A through TMA too: the
+    # pipelined loop seeds the token and binds it ahead of every wait.
     kernel = helion.kernel(
         matmul_custom_key.fn,
         backend="cute",
@@ -195,8 +197,9 @@ def test_m_major_lhs_matmul_binds_try_token_in_non_pipelined_kloop(
     bound = kernel._bind_isolated((lhs, rhs))
     source = bound.to_code(helion.Config(block_sizes=[128, 16, 16]))
     assert "cute.gemm(" in source
+    assert "tma_atom_a" in source and "sA_mma[" not in source
     # The pipelined branch is the one that seeds the token with Boolean(0).
-    assert "tcgen05_ab_consumer_try_token = cutlass.Boolean(0)" not in source
+    assert "tcgen05_ab_consumer_try_token = cutlass.Boolean(0)" in source
     wait = (
         "tcgen05_ab_pipeline.consumer_wait("
         "tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)"

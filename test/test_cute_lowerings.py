@@ -20406,6 +20406,34 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             code,
         )
 
+    def test_aux_producer_warp_requires_the_persistent_role_local_program(
+        self,
+    ) -> None:
+        """A flat-pid (non-persistent) launch has no role-local whiles, so
+        nothing produces the aux ring the epilogue consumer-waits on: the
+        kernel hung (seen autotuning the matmul example's addmm). The config
+        is refused instead; the persistent launch still emits the producer."""
+        kernel = self._residual_kernel()
+        args = self._square_args(3)
+        flat = helion.Config(
+            **{
+                **self._canonical_c_input_config().config,
+                "block_sizes": [128, 256, 128],
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 1,
+                "tcgen05_persistence_model": "non_persistent",
+            }
+        )
+        with patch_cute_mma_support():
+            bound = kernel.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "requires a persistent tcgen05 pid_type"
+            ):
+                bound.to_triton_code(flat)
+            code = bound.to_triton_code(self._canonical_c_input_config())
+        self.assertIn("tcgen05_aux_pipeline.producer_commit", code)
+
     def test_aux_pipeline_ab_stages_3_with_c_input_rejected(self) -> None:
         """SMEM-budget rejection pin for ``tcgen05_ab_stages=3`` +
         productive C-input warp
