@@ -34,7 +34,6 @@ from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
-from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
@@ -71,6 +70,8 @@ from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
+from .cache_policy_loads import _CUTE_NC_L2_FIRST_SUFFIX
+from .cache_policy_loads import is_cache_policy_suffix
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index
@@ -916,7 +917,7 @@ def _cute_vector_load_expr(
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
         # carrier form the L2 helper produces; drop the hint here.
         eviction_suffix = ""
@@ -6044,6 +6045,36 @@ def reject_reads_of_collective_placeholders(state: CodegenState, what: str) -> N
             )
 
 
+def _cute_load_source_is_readonly(state: CodegenState) -> bool:
+    """Whether no write in the kernel can alias this load's source.
+
+    ``nc_l2_first`` reads through the noncoherent cache path, so every store
+    and atomic must be proven disjoint from the source
+    (``host_load_is_readonly``).  Inline assembly outside the scalar
+    arithmetic envelope could hide a store and declines the hint as well.
+    """
+    from ...language.inline_asm_ops import inline_asm_elementwise
+    from .cutedsl_compat import readonly_packet_load_supported
+    from .pure_lane_packets import is_pure_scalar_assembly
+    from .register_loads import host_load_is_readonly
+
+    env = CompileEnvironment.current()
+    graphs = state.codegen.codegen_graphs
+    return (
+        state.fx_node is not None
+        and readonly_packet_load_supported(
+            env.config_spec.target_device_capability, torch.version.cuda
+        )
+        and host_load_is_readonly(state.fx_node, env, graphs)
+        and not any(
+            node.target is inline_asm_elementwise
+            and not is_pure_scalar_assembly(node.args[0], node.args[1], node.args[4])
+            for graph in graphs
+            for node in graph.graph.nodes
+        )
+    )
+
+
 def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     """Whether a collective matmul makes this load a placeholder.
 
@@ -6288,6 +6319,9 @@ def _(state: CodegenState) -> object:
                 )
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
+            elif policy == "nc_l2_first":
+                if _cute_load_source_is_readonly(state):
+                    eviction_suffix = _CUTE_NC_L2_FIRST_SUFFIX
             elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):
                 # Inline-PTX L2 hints apply only to aligned 16-byte packets.
                 eviction_suffix = f"__{policy}__"

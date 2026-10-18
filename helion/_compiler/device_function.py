@@ -2084,6 +2084,26 @@ class DeviceFunction:
             # Keep ordinary load/effect recognition intact through all memory
             # scheduling, including the late published/register-producer cuts.
             definition.body = lower_scalar_policy_loads(definition.body)
+            from .cute.packet_store_policy import lower_packet_store_policy
+
+            variable_renames = {
+                name: aliases[0] for name, aliases in self._variable_renames.items()
+            }
+            definition.body = lower_packet_store_policy(
+                definition.body,
+                policy=self.config.cute_store_policy,
+                # Shared and register pointers are not global store targets.
+                global_tensor_names=frozenset(
+                    variable_renames.get(argument.name, argument.name)
+                    for argument in param_args
+                    if isinstance(argument, TensorArg)
+                    and not isinstance(argument, TensorDescriptorArg)
+                ),
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                cuda_version=torch.version.cuda,
+            )
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"

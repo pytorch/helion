@@ -7657,6 +7657,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_vloop_sink",
                 "cute_lane_unroll",
                 "cute_pdl",
+                "cute_store_policy",
                 "load_eviction_policies",
             },
         )
@@ -7696,6 +7697,7 @@ class TestCuteAutotuner(TestCase):
                     "cute_vloop_sink",
                     "cute_lane_unroll",
                     "cute_pdl",
+                    "cute_store_policy",
                     "load_eviction_policies",
                 },
             )
