@@ -93,6 +93,8 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
@@ -1707,6 +1709,9 @@ class ConfigSpec:
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
+        # The tcgen05 mode's persistent launch (CTAs per SM); None where the
+        # mode or its one-tile-per-CTA region programs leave it no subject.
+        self.cute_mma_dag_persistent: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
@@ -3161,6 +3166,10 @@ class ConfigSpec:
         self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
         self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
+        if facts.tcgen05 is not None and not facts.tcgen05.regions:
+            self.cute_mma_dag_persistent = EnumFragment(
+                choices=MMA_DAG_PERSISTENT_CHOICES
+            )
 
     def _normalize_cute_mma_dag(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -3190,6 +3199,19 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"{key} must be one of {fragment.choices!r}, got {value!r}"
                     )
+        persistent_fragment = self.cute_mma_dag_persistent
+        persistent = config.setdefault(MMA_DAG_PERSISTENT_KEY, 0)
+        allowed = (0,) if persistent_fragment is None else persistent_fragment.choices
+        if persistent not in allowed or type(persistent) is not int:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PERSISTENT_KEY} must be one of {allowed!r}, got {persistent!r}"
+                )
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 and config[MMA_DAG_PERSISTENT_KEY]:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
+            config[MMA_DAG_PERSISTENT_KEY] = 0
         if config[MMA_DAG_KEY] == MMA_DAG_OFF:
             # The warp count, stage depth and data routes are inert without
             # the mode.
@@ -3199,6 +3221,7 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+            config[MMA_DAG_PERSISTENT_KEY] = 0
             return
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
@@ -3235,6 +3258,7 @@ class ConfigSpec:
                 config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+                config[MMA_DAG_PERSISTENT_KEY] = 0
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
             for block_id, index in indices.items():
@@ -3263,8 +3287,19 @@ class ConfigSpec:
         ):
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
         # Inert knobs: the body is replaced, so equal kernels share one
-        # autotune identity (the occupancy hint stays searchable).
-        config["pid_type"] = "flat"
+        # autotune identity (the occupancy hint stays searchable).  The
+        # persistent tcgen05 launch is the generic persistent_interleaved
+        # program ids at its CTAs per SM.
+        if (
+            config.get(MMA_DAG_KEY) == MMA_DAG_TCGEN05
+            and config[MMA_DAG_PERSISTENT_KEY]
+        ):
+            config["pid_type"] = "persistent_interleaved"
+            config["num_sm_multiplier"] = config[MMA_DAG_PERSISTENT_KEY]
+        else:
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+            config["pid_type"] = "flat"
+            config.pop("num_sm_multiplier", None)
         if "loop_orders" in config:
             config["loop_orders"] = [item._fill_missing() for item in self.loop_orders]
         if "l2_groupings" in config:
@@ -6563,6 +6598,9 @@ class ConfigSpec:
                 # ``Config.pid_type`` falls back to ``flat`` for a missing key,
                 # so a persistent choice is not an implicit default.
                 preserve_keys = {*preserve_keys, "pid_type"}
+            if config.get(MMA_DAG_PERSISTENT_KEY):
+                # The persistent dag launch's program ids (set by its knob).
+                preserve_keys = {*preserve_keys, "pid_type", "num_sm_multiplier"}
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
@@ -7593,6 +7631,8 @@ class ConfigSpec:
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
+                if self.cute_mma_dag_persistent is not None:
+                    fields[MMA_DAG_PERSISTENT_KEY] = self.cute_mma_dag_persistent
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
