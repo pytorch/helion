@@ -4,12 +4,22 @@ from __future__ import annotations
 import operator
 
 import cutlass
-from cutlass.base_dsl.enums import Arch
 import cutlass.cute as cute
-from cutlass.experimental import primitives as prims
 
 from .cluster_helpers import store_shared_remote_f32
 from .cluster_helpers import store_shared_remote_f32x2
+
+try:
+    from cutlass.base_dsl.enums import Arch
+except ImportError:
+    from cutlass.base_dsl.arch import Arch
+
+try:
+    from cutlass.experimental import primitives as prims
+except ImportError:
+    prims = None
+
+_REDUX_SYNC_AVAILABLE = prims is not None
 
 
 @cute.jit
@@ -63,7 +73,8 @@ def _warp_reduce_max_native_fp32(
 ) -> cute.Numeric:
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     if cutlass.const_expr(
-        type(value) is cutlass.Float32
+        _REDUX_SYNC_AVAILABLE
+        and type(value) is cutlass.Float32
         and threads_in_group == 32
         and arch.is_family_of(Arch.sm_100f)
     ):
@@ -79,7 +90,8 @@ def _warp_reduce_min_native_fp32(
 ) -> cute.Numeric:
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     if cutlass.const_expr(
-        type(value) is cutlass.Float32
+        _REDUX_SYNC_AVAILABLE
+        and type(value) is cutlass.Float32
         and threads_in_group == 32
         and arch.is_family_of(Arch.sm_100f)
     ):
