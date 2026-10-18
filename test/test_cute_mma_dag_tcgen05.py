@@ -592,7 +592,10 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     fence = loop.index("cute.arch.fence_proxy(kind='async.shared', space='cta')")
     acc = loop.index(f"{RT}.mbar_wait(md_accb, md_parity ^ 1)")
     assert acc < wait < lds < fence < loop.index("cute.arch.barrier()")
-    assert loop[wait:fence].count("exp2(") == 2
+    # The two packets of a thread read their row's decay from the lane that
+    # evaluated it (one exp2 per lane, one shuffle per packet).
+    assert loop[wait:fence].count("exp2(") == 1
+    assert loop[wait:fence].count("cute.arch.shuffle_sync(") == 2
     # The decay scalar and the two K-vector rows of this thread come from
     # registers loaded one iteration ahead (after the MMA issue, guarded by
     # the trip count); the pass itself issues no global loads.
@@ -602,10 +605,11 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     assert loop.index(f"{P}.tcgen05_commit(") < refill
     assert "if md_i + 1 < 8:" in loop[:refill]
     # Once per branch of the split iteration (the epilogue warps' after the
-    # MMA issue, the store warps' after the barrier): three per thread.
+    # MMA issue, the store warps' after the barrier): the decay scalar and
+    # the lane's K-vector row, two per thread.
     epi, store = loop.split("else:", 1)
-    assert epi.count(f"{WARP_RT}.ldg_f32(") == 3
-    assert store.count(f"{WARP_RT}.ldg_f32(") == 3
+    assert epi.count(f"{WARP_RT}.ldg_f32(") == 2
+    assert store.count(f"{WARP_RT}.ldg_f32(") == 2
     # 512 packets over 256 threads, plus the staging packets.
     assert loop.count(f"{WARP_RT}.sts_v4_b32(") == 2 + 4
     # The leaves stay fp32 and the pack rounds once: no per-element casts
@@ -647,11 +651,13 @@ def test_renders_the_reversed_scaled_backward_with_fp32_stores() -> None:
         _kernel_body(_source(_bind_bwd("scalar"), _config(64, 64, warps=4, stages=4)))
     )
     pass_body = scalar[: scalar.index("cute.arch.fence_proxy(")]
-    # Four packets per thread over 128 threads: one exp2 each of a row value
-    # loaded one iteration ahead (four rows plus the decay scalar).
-    assert pass_body.count("exp2(") == 4 and "md_pch * 8" not in pass_body
+    # Four packets per thread over 128 threads: each lane evaluates one row's
+    # exp2 of a row value loaded one iteration ahead, the packets shuffle it.
+    assert pass_body.count("exp2(") == 1 and "md_pch * 8" not in pass_body
+    assert pass_body.count("cute.arch.shuffle_sync(") == 4
     assert pass_body.count(f"{WARP_RT}.ldg_f32(") == 0
-    assert scalar.count("md_ax4 = ") == 1 and "md_ax5" not in scalar
+    # One prefetched row per lane plus the decay scalar.
+    assert scalar.count("md_ax1 = ") == 1 and "md_ax2" not in scalar
 
 
 def test_narrow_tiles_use_the_narrow_swizzles() -> None:
@@ -1006,10 +1012,11 @@ def test_body_stores_of_the_first_block_are_double_buffered() -> None:
     assert facts.tcgen05.general_loop
     # The derived value (slot 1) is the stored one.
     assert facts.tcgen05.loop_stores == ((1, 2),)
-    # Ring, two staging buffers, the epilogue staging tile (the plan folds
-    # it into the ring), the barriers with the step barrier, the TMEM slot.
+    # Ring, two staging buffers (the epilogue staging tile folds into the
+    # drained ring, as the plan lays it out), the barriers with the step
+    # barrier, the TMEM slot.
     assert tc.tcgen05_smem_bytes(facts, [1, 64, 64, 64, 64], 2, True) == (
-        2 * 16384 + 2 * 64 * 64 * 2 + 64 * 64 * 2 + 8 * (2 + 3 + 1) + 16
+        2 * 16384 + 2 * 64 * 64 * 2 + 8 * (2 + 3 + 1) + 16
     )
     body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
     assert "alloc_smem(cutlass.Uint8, 49152, alignment=1024)" in body
@@ -1266,6 +1273,20 @@ def test_chunk_offset_tiles_and_lead_tile_begins_are_admitted() -> None:
         )
     )
     assert re.search(r"md_base = x\.iterator\.toint\(\) .*128 \* tile_offset_", warp)
+
+
+def test_loop_invariant_scalar_side_loads_go_out_ahead_of_the_loop() -> None:
+    # dA_cumsum[b, h, c, chunk - 1] feeds every iteration's in-place pass:
+    # one load ahead of the K loop, not one behind each iteration's TMA wait.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=1)))
+    loop = body.index("for md_i in cutlass.range(")
+    scalar = re.findall(rf"md_sl\w* = {WARP_RT}\.ldg_bf16_as_f32\(md_base_\d+\)", body)
+    assert len(scalar) == 1, body
+    assert body.index(scalar[0]) < loop
+    assert f"{WARP_RT}.ldg_bf16_as_f32(md_base_" not in body[loop:]
 
 
 def test_an_offset_tile_that_can_leave_the_tensor_is_not_mine() -> None:
@@ -3644,11 +3665,11 @@ def test_gated_dstate_computes_its_decay_tables_one_iteration_ahead() -> None:
     assert "if md_i + 2 < 8:" in segments[3]
     assert segments[3].index("if md_i + 2 < 8:") > segments[3].rindex("md_tb1_")
     # The exchange multiplies by the registers and evaluates no exp2 (the
-    # two in its segment are the dog pass's row factors, run there since
-    # the pass moved under the first batch).
+    # one in its segment is the dog pass's row factor, one row per lane,
+    # run there since the pass moved under the first batch).
     assert re.search(r"\* md_tb0_0\b", segments[1])
     assert re.search(r"\* md_tb0_31\b", segments[1])
-    assert segments[1].count("exp2(") == 2
+    assert segments[1].count("exp2(") == 1
     assert segments[1].index("exp2(") < segments[1].index(f"{RT}.mbar_wait(md_stepb")
     # 33 entries, plus the dS rescale's scalar in block 2.
     assert sum(s.count("exp2(") for s in segments[2:]) == 33 + 1

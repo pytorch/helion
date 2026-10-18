@@ -108,6 +108,7 @@ from .cute_mma_dag import MmaDagProgram
 from .cute_mma_dag import Operand
 from .cute_mma_dag import Store
 from .cute_mma_dag import _decline
+from .cute_mma_dag import _is_call
 from .cute_mma_dag import _storage
 from .cute_mma_dag import mma_dag_ctas_per_sm
 from .cute_mma_dag import staged_store_reason
@@ -116,6 +117,7 @@ from .cute_mma_dag_codegen import Coords
 from .cute_mma_dag_codegen import _broadcast
 from .cute_mma_dag_codegen import _Emitter
 from .cute_mma_dag_codegen import _Evaluator
+from .cute_mma_dag_codegen import _Hoist
 from .cute_mma_dag_codegen import _shape
 from .cute_mma_dag_codegen import emit_mma_dag_module_statements
 from .cute_mma_dag_codegen import mma_dag_alias_plan
@@ -545,10 +547,12 @@ def _tile_bytes(tile: Tcgen05TileFacts, resolved: Sequence[int]) -> int:
 
 
 def tcgen05_fixed_bytes(
-    facts: CuteMmaDagFacts, resolved: Sequence[int], staged: bool
+    facts: CuteMmaDagFacts, resolved: Sequence[int], staged: bool, ring_bytes: int
 ) -> int:
     """Shared memory beside the ring: the epilogue operand tiles, the
-    exchange tiles, the loop staging buffers and the epilogue staging tile."""
+    exchange tiles, the loop staging buffers and the epilogue staging tile
+    (which ``plan_tcgen05`` overlays on the drained ring when it fits in
+    ``ring_bytes``)."""
     tc = facts.tcgen05
     assert tc is not None
     total = sum(
@@ -569,6 +573,8 @@ def tcgen05_fixed_bytes(
     for slot, es in tc.epilogue_stores:
         rows, cols = facts.frags[slot]
         epilogue_staging = max(epilogue_staging, resolved[rows] * resolved[cols] * es)
+    if epilogue_staging <= ring_bytes:
+        return total
     return total + epilogue_staging
 
 
@@ -582,7 +588,7 @@ def tcgen05_smem_bytes(
 
         return region_smem_bytes(facts, resolved, stages)
     total = stages * tcgen05_stage_bytes(tc, resolved)
-    total += tcgen05_fixed_bytes(facts, resolved, staged)
+    total += tcgen05_fixed_bytes(facts, resolved, staged, total)
     # Barriers (the program-order loop adds its step barrier) and the TMEM
     # slot.
     return total + 8 * (stages + 3 + int(tc.general_loop)) + 16
@@ -1600,6 +1606,25 @@ class _PassEvaluator(_Evaluator):
             register = em.table_regs.get((node, coords))
             if register is not None:
                 return register
+        lane_value = em.row_lanes.get(node)
+        if lane_value is not None:
+            # A row-only value of the pass at a packet round's row: the lane
+            # holding that row computed it once (``emit_row_lanes``).
+            for coord in coords:
+                found = em.round_of.get(coord)
+                if found is None:
+                    continue
+                key = (node, coords)
+                cached = self._lookup(key)
+                if cached is not None:
+                    return cached
+                first, cpr = found
+                result = em.bind(
+                    "md_v",
+                    f"cute.arch.shuffle_sync({lane_value}, {first} + md_lane // {cpr})",
+                )
+                self.scopes[-1][key] = result
+                return result
         return super().evaluate(node, coords)
 
     def _load(self, node: Node, coords: Coords) -> str:
@@ -1732,8 +1757,17 @@ class _Tcgen05Emitter(_Emitter):
         # ``in_loop`` form and hoists its side loads through ``prefetched``.
         self.values = {}
         self.raw_stages = {}
+        # The in-place pass being rendered: its row-only values, one row per
+        # lane (node -> register), and the packet rounds' row names -> the
+        # first lane holding their rows and the chunks per row.
+        self.row_lanes: dict[Node, str] = {}
+        self.round_of: dict[str, tuple[int, int]] = {}
         self.hoists = []
         self.name_depth = {}
+        self.stored_storages = {
+            _storage(store.access)
+            for store in (*self.program.stores, *self.program.vec_stores)
+        }
         self.overlaid_keys = set()
         self.overlaid_tiles = set()
         # This mode renders its passes element by element.
@@ -2241,11 +2275,116 @@ class _Tcgen05Emitter(_Emitter):
             self.emit(f"{_RUNTIME}.sts_v4_b32({address}, {', '.join(packed)})")
 
         cpr = tile.chunks_per_row
-        self.emit_pipelined_pass(
-            self.packet_rounds(tile.rows * cpr, threads, idx_base, cpr, tile.tag),
-            packet_load,
-            rewrite,
+        rounds = self.packet_rounds(tile.rows * cpr, threads, idx_base, cpr, tile.tag)
+        self.emit_row_lanes(tile, value, rounds, idx_base, threads)
+        self.emit_pipelined_pass(rounds, packet_load, rewrite)
+        self.row_lanes, self.round_of = {}, {}
+
+    def row_only_roots(
+        self, tile: Tcgen05Tile, value: Node
+    ) -> list[tuple[Node, int, int]]:
+        """The maximal sub-values of the pass value ``value`` that vary only
+        with the shared tile's row (a decay of the K position: loads of side
+        vectors along that axis and uniform scalars, never the tile itself):
+        ``(node, row dim, rank)``."""
+        from ...language import memory_ops
+
+        operand = tile.operand
+        source = operand.load.node if operand.load is not None else None
+        probe = self.tile_coords(operand, "md_probe_row", "md_probe_col")
+        if source is None or "md_probe_row" not in probe:
+            return []
+        row_block = self.env.resolve_block_id(
+            _shape(operand.value)[probe.index("md_probe_row")]
         )
+        if row_block is None:
+            return []
+        row_block = self.env.canonical_block_id(row_block)
+        free: dict[Node, tuple[bool, bool]] = {}
+
+        def facts(node: Node) -> tuple[bool, bool]:
+            """(free of the tile, reads a side load)."""
+            if node not in free:
+                if node is source:
+                    free[node] = (False, True)
+                else:
+                    inputs = [facts(n) for n in node.all_input_nodes]
+                    free[node] = (
+                        all(f for f, _ in inputs),
+                        _is_call(node, memory_ops.load) or any(r for _, r in inputs),
+                    )
+            return free[node]
+
+        roots: list[tuple[Node, int, int]] = []
+        seen: set[Node] = set()
+
+        def visit(node: Node) -> None:
+            if node in seen or node.op != "call_function":
+                return
+            seen.add(node)
+            val = node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                shape = _shape(node)
+                dims = [
+                    i
+                    for i, size in enumerate(shape)
+                    if not (isinstance(size, int) and size == 1)
+                ]
+                if len(dims) == 1 and all(facts(node)):
+                    block = self.env.resolve_block_id(shape[dims[0]])
+                    if (
+                        block is not None
+                        and self.env.canonical_block_id(block) == row_block
+                    ):
+                        roots.append((node, dims[0], len(shape)))
+                        return
+            for inp in node.all_input_nodes:
+                visit(inp)
+
+        visit(value)
+        return roots
+
+    def emit_row_lanes(
+        self,
+        tile: Tcgen05Tile,
+        value: Node,
+        rounds: Sequence[tuple[str, str, str | None]],
+        idx_base: str,
+        threads: int,
+    ) -> None:
+        """Evaluate the pass value's row-only sub-values once per row: a
+        warp's packet round ``j`` covers ``32 / cpr`` consecutive rows, so
+        with at most 32 rows over all its rounds lane ``l`` computes the row
+        of round ``l // (32 / cpr)``, slot ``l % (32 / cpr)`` (its side
+        loads prefetched like the packets'), and every packet reads it with
+        one shuffle.  Same values (the same expression at the same row),
+        ``cpr`` times fewer side loads and transcendentals."""
+        cpr = tile.chunks_per_row
+        count = len(rounds)
+        if (
+            threads % 32
+            or 32 % cpr
+            or any(guard is not None for _prow, _pch, guard in rounds)
+        ):
+            return
+        per = 32 // cpr
+        if count * per > 32:
+            return
+        roots = self.row_only_roots(tile, value)
+        if not roots:
+            return
+        name = f"md_lr_{tile.tag}"
+        expr = (
+            f"(md_lane // {per}) % {count} * {threads // cpr} "
+            f"+ ({idx_base}) // 32 * {32 // cpr} + md_lane % {per}"
+        )
+        self.emit(f"{name} = {expr}")
+        self.row_exprs[name] = (f"({expr})", None)
+        for node, dim, rank in roots:
+            coords = tuple(name if d == dim else "0" for d in range(rank))
+            self.row_lanes[node] = self.evaluator.evaluate(node, coords)
+        for rep, (prow, _pch, _guard) in enumerate(rounds):
+            self.round_of[prow] = (rep * per, cpr)
 
     def emit_convert_pass(  # type: ignore[override]
         self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int
@@ -3502,11 +3641,24 @@ class _Tcgen05Emitter(_Emitter):
                     self.emit_iteration(begin, end)
             self.sync = "cute.arch.barrier()"
         else:
+            # Loop-invariant per-thread side loads (a scalar read by a pass)
+            # go out once ahead of the loop instead of behind every
+            # iteration's TMA wait.
+            loop_axis = program.loop_axis
+            self.hoists.append(
+                _Hoist(
+                    len(self.lines),
+                    self.indent,
+                    len(self.values),
+                    loop_axis.loop if loop_axis is not None else 0,
+                )
+            )
             with self.nest(f"for {self.loop_var} in cutlass.range({begin}, {end}):"):
                 if general:
                     self.emit_general_iteration(begin, end)
                 else:
                     self.emit_iteration(begin, end)
+            self.hoists.pop()
         self.table_lookup = False
         if self.epilogue_sites and not self.epilogue_sites_in_loop:
             self.define_iteration_bases(in_loop=False)
