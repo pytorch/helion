@@ -20,6 +20,7 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
+from examples.attention import attention_relu_output
 import pytest
 import torch
 
@@ -889,6 +890,35 @@ def test_output_only_body_matches_the_fa4_body_and_sdpa(
     assert (out_alt.float() - out_fa4.float()).abs().max().item() <= 2 * 2.0**-7
     assert (out_alt.float() - out_ref.float()).abs().max().item() < 1e-2
     assert torch.equal(run(config), out_alt)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_output_relu_epilogue_matches_the_fa4_body_and_sdpa() -> None:
+    """The output ReLU of ``attention_relu_output`` is applied by the
+    correction warps (it used to be dropped: the plain attention output)."""
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(2, 16, 768, 128, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    out_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v).relu()
+
+    def run(cfg: dict[str, object]) -> torch.Tensor:
+        kernel = helion.kernel(
+            attention_relu_output.fn,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config.from_dict(cfg),
+        )
+        out = cast("Any", kernel)(q, k, v)
+        torch.cuda.synchronize()
+        return out
+
+    out_alt = run(_ALT)
+    out_fa4 = run({**_ALT, FAMILY_KEY: "fa4"})
+    assert (out_alt.float() - out_fa4.float()).abs().max().item() <= 2 * 2.0**-7
+    assert (out_alt.float() - out_ref.float()).abs().max().item() < 1e-2
 
 
 @skipIfNotCUDA()

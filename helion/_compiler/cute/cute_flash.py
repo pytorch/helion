@@ -23585,6 +23585,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 e2e_freq=alt_exp2.e2e_freq,
                 e2e_res=alt_exp2.e2e_res,
                 kv_group=kv_group,
+                relu_output=_flash_output_relu_enabled(output_epilogue),
             )
         )
     elif cfg.topology == "fa4":
