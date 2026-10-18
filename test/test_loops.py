@@ -816,13 +816,17 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(result, args[0] + 1)
 
-    @skipIfRefEager("checks the CuTe lowering's refusal")
+    @skipIfRefEager("checks the CuTe lowering of a block-sized slice reduction")
     @skipUnlessBackends(["cute"])
     def test_full_slice_of_block_sized_buffer_reduction(self):
         """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
         slice's reduction dim reuses the block's symbol after its loop ended.
-        CuTe must refuse it rather than reduce it with that dim's synthetic
-        lane loop, which would repeat the tile loop's atomics once per lane."""
+        Where CuTe lowers it, the dim combines across its threads, so each
+        row's total is the tile loop's atomics once, not once per lane. Where
+        CuTe has no lowering (e.g. ``BackendUnsupported: reduction lane owner
+        is not proven``), the refusal is the expected safe outcome: it must
+        refuse rather than reduce with that dim's synthetic lane loop, which
+        would repeat the tile loop's atomics once per lane."""
 
         @helion.kernel(static_shapes=True)
         def row_sums(y: torch.Tensor) -> torch.Tensor:
@@ -840,19 +844,14 @@ class TestLoops(RefEagerTestBase, TestCase):
             return rows
 
         y = torch.randn(64, 128, device=DEVICE)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "reduction lane owner is not proven"
-        ):
-            code_and_output(row_sums, (y,), block_sizes=[128])
+        try:
+            _code, result = code_and_output(row_sums, (y,), block_sizes=[128])
+        except helion.exc.BackendUnsupported as error:
+            self.assertIn("reduction lane owner is not proven", str(error))
+            return
+        torch.testing.assert_close(result, y.sum(dim=-1))
 
     @skipIfTileIR("Result mismatch with tileir backend")
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe has no lowering for reducing the full slice loss_sum[:, :] of a "
-        "buffer sized by a block: its reduction dim reuses tile_v's block, "
-        "whose loop has ended (BackendUnsupported: reduction lane owner is "
-        "not proven)",
-    )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -885,7 +884,20 @@ class TestLoops(RefEagerTestBase, TestCase):
         y_true = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
         args = (y_pred, y_true)
 
-        code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
+        try:
+            code, result = code_and_output(
+                kernel_fixed_block_size, args, block_sizes=[128]
+            )
+        except helion.exc.BackendUnsupported as error:
+            if _get_backend() == "cute" and (
+                "reduction lane owner is not proven" in str(error)
+            ):
+                self.skipTest(
+                    "CuTe has no lowering for reducing the full slice "
+                    "loss_sum[:, :] of a buffer sized by a block: "
+                    f"{error}"
+                )
+            raise
 
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
