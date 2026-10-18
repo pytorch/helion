@@ -2741,11 +2741,17 @@ class CuteNestedRowHeuristic(AutotunerHeuristic):
     A coalesced outer feature axis can own the threads while an inner
     jagged axis accumulates serially. Configuring each sibling independently
     makes this layout difficult to discover through individual mutations.
+
+    The primary seed is also the autotune-off default. The generic default
+    threads only the root tile, so one thread walks every feature and jagged
+    element of its row serially: 7.4 ms against 0.059 ms for this seed on
+    256 rows of up to 256 x 128 fp32 elements (B200).
     """
 
     name = "cute_nested_row"
     backend = "cute"
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    promote_seed_to_default = True
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
