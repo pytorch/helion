@@ -24,6 +24,8 @@ from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .fuse_two_pass_loads import _tensor_roots_may_alias
 from .fuse_two_pass_loads import _trip_count_for
+from .proven_loop_bounds import _Context
+from .proven_loop_bounds import _Proof
 
 # A conservative *cache* policy, in 32-bit register slots, not an occupancy
 # guarantee. Include all explicit retained fragments, not just this input.
@@ -47,6 +49,14 @@ _COLLECTIVES = {
     "cute.arch.warp_reduction_sum",
     "_cute_grouped_reduce_shared_two_stage",
     "_cute_grouped_reduce_shared",
+    "_cute_grouped_reduce_cluster",
+}
+_PREAMBLE_SYNC = {
+    "cute.arch.griddepcontrol_wait",
+    "cute.arch.mbarrier_init",
+    "cute.arch.mbarrier_init_fence",
+    "cute.arch.cluster_arrive_relaxed",
+    "cute.arch.cluster_wait",
 }
 _PURE = _CASTS | {
     "range",
@@ -238,6 +248,8 @@ def _effects_safe(
     tensors: set[str],
     source: frozenset[str],
     disjoint: set[frozenset[str]],
+    *,
+    allow_preamble_sync: bool = False,
 ) -> bool:
     for statement in region:
         for node in ast.walk(statement):
@@ -272,6 +284,7 @@ def _effects_safe(
                 in _PURE
                 | _COLLECTIVES
                 | _CUTE_CACHE_LOAD_HELPER_NAMES
+                | (_PREAMBLE_SYNC if allow_preamble_sync else set())
                 | {
                     "cute.arch.load",
                     "cute.make_rmem_tensor",
@@ -348,25 +361,82 @@ def _packet(
     return name, call, width, dtype, roots
 
 
+def _index_context(
+    statements: list[ast.stmt], stop: int, constants: dict[str, int], proof: _Proof
+) -> _Context:
+    """Read-only integer value snapshots before the producer sweep.
+
+    The loop-bound prover supplies architectural coordinate ranges and rejects
+    signed-index overflow. Analyze assignments in source order so a copied
+    scalar keeps its old value after the original name is rebound. Do not run
+    its AST rewriter: the global tail masks must remain unchanged.
+    """
+    context = _Context()
+    for name, integer in constants.items():
+        value = proof.value(ast.Constant(value=integer), context)
+        if value is not None:
+            context.values[name] = value
+    for statement in statements[:stop]:
+        target = _assignment(statement)
+        value = (
+            proof.value(cast("ast.Assign", statement).value, context)
+            if target is not None
+            else None
+        )
+        for name in _assigned(statement):
+            context.values.pop(name, None)
+        if target is not None and value is not None:
+            context.values[target] = value
+    return context
+
+
 def _domain(
-    loop: ast.For, constants: dict[str, int]
+    loop: ast.For,
+    constants: dict[str, int],
+    *,
+    proof: _Proof | None = None,
+    context: _Context | None = None,
 ) -> tuple[ast.expr, ast.expr, tuple[str, str] | None] | None:
     bounds = _range_bounds(loop.iter)
     if bounds is None or not isinstance(loop.target, ast.Name) or loop.orelse:
         return None
     values = [_static_int(x, constants) for x in bounds]
-    if any(x is None for x in values):
-        return None
-    start, stop, step = cast("list[int]", values)
-    if (
-        not (
-            0 <= start < stop <= 2**31 - 1
-            and 0 < step <= 2**31 - 1
-            and start + step <= 2**31 - 1
-        )
-        or _trip_count_for(*bounds, constants) != 1
-    ):
-        return None
+    if all(value is not None for value in values):
+        start, stop, step = cast("list[int]", values)
+        if (
+            not (
+                0 <= start < stop <= 2**31 - 1
+                and 0 < step <= 2**31 - 1
+                and start + step <= 2**31 - 1
+            )
+            or _trip_count_for(*bounds, constants) != 1
+        ):
+            return None
+    else:
+        if proof is None or context is None:
+            return None
+        # The same rank-relative span/cache-index proof used by the load fuser,
+        # with immutable value snapshots and nonnegative Int32 intervals. A
+        # dynamic base is legal only when end-start is one exact constant step;
+        # a size hint or a runtime length cannot prove the single cache slot.
+        if not all(_index_expression(bound, set()) for bound in bounds):
+            return None
+        evaluated = [proof.value(bound, context) for bound in bounds]
+        if any(value is None for value in evaluated):
+            return None
+        start_value, stop_value, step_value = evaluated
+        assert start_value is not None and stop_value is not None
+        assert step_value is not None
+        span = stop_value.form.add(start_value.form, -1)
+        if (
+            span is None
+            or span.terms
+            or span.constant <= 0
+            or step_value.low != step_value.high
+            or span.constant != step_value.low
+            or start_value.high + step_value.low > 2**31 - 1
+        ):
+            return None
     children = [s for s in loop.body if isinstance(s, ast.For)]
     lane = None
     if children:
@@ -455,8 +525,10 @@ def prefetch_reduction_packets(
             or reload_modes.get(block_id) != "register_prefetch"
         ):
             continue
-        domain = _domain(first, constexpr_values)
-        other = _domain(last, constexpr_values)
+        proof = _Proof(thread_block_dims)
+        context = _index_context(body, first_index, constexpr_values, proof)
+        domain = _domain(first, constexpr_values, proof=proof, context=context)
+        other = _domain(last, constexpr_values, proof=proof, context=context)
         if domain is None or other is None or domain[2] != other[2]:
             continue
         first_ctx = helper._resolve_load_container(first, domain[0], domain[1], 1)
@@ -470,6 +542,13 @@ def prefetch_reduction_packets(
             continue
         region = body[first_index : last_index + 1]
         region_ast = ast.Module(body=region, type_ignores=[])
+        first_bounds = _range_bounds(first.iter)
+        assert first_bounds is not None
+        bound_names = set().union(*(_names(bound) for bound in first_bounds))
+        if bound_names & _assigned(region_ast):
+            # Identical syntax must retain identical values on both sweeps.
+            # Otherwise the prefetched packet would belong to another slice.
+            continue
         available = (
             argument_names
             | set(constexpr_values)
@@ -503,6 +582,20 @@ def prefetch_reduction_packets(
             if used_slots + slots * width > _CACHE_SLOTS or not _effects_safe(
                 region, private, lists, tensors, roots, proven_disjoint_tensor_pairs
             ):
+                continue
+            if not _effects_safe(
+                body,
+                private,
+                lists,
+                tensors,
+                roots,
+                proven_disjoint_tensor_pairs,
+                allow_preamble_sync=True,
+            ):
+                # A prefix write by another CTA thread may become visible only
+                # at the crossed collective. The consumer source must be read-
+                # only across the entire kernel, not just between these loops.
+                # Unknown calls/stores and shadow aliases remain conservative.
                 continue
             order = _LexicalMemoryOrder(body, tensors, proven_disjoint_tensor_pairs)
             if order.has_aliasing_store_between(
