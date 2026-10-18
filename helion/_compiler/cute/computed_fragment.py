@@ -4035,7 +4035,8 @@ class FragmentCompiler:
                 ]
             return result
         if target is torch.ops.prims.iota.default:
-            start, step = node.kwargs.get("start", 0), node.kwargs.get("step", 1)
+            start = _resolve(node.kwargs.get("start", 0), values)
+            step = _resolve(node.kwargs.get("step", 1), values)
             return Fragment(
                 shape,
                 fake.dtype,
@@ -4329,6 +4330,21 @@ def computed_fragment_supported(
             return int(expr) > 0
         return all(env.get_block_id(symbol) is not None for symbol in expr.free_symbols)
 
+    grid_block_ids = {*env.config_spec.grid_block_ids}
+
+    def resident_state(value: object) -> bool:
+        # Per-row state such as an online-softmax max over ``hl.tile([B, L])``
+        # has one element per grid coordinate, like a 1-D carry: the ordinary
+        # lowering already owns each element. Only carries with a non-grid axis
+        # are resident matrices that need independent coordinates.
+        return (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 1
+            and not all(
+                env.resolve_block_id(size) in grid_block_ids for size in value.shape
+            )
+        )
+
     carried: set[Node] = set()
     captures: dict[Node, Node] = {}
     parents = control_flow_parent_entries(graphs)
@@ -4346,8 +4362,7 @@ def computed_fragment_supported(
         )
         if _tracing_ops.is_for_loop_target(node.target):
             for slot in _loop_carry_slots(node).values():
-                value = placeholders[slot].meta.get("val")
-                if isinstance(value, torch.Tensor) and value.ndim > 1:
+                if resident_state(placeholders[slot].meta.get("val")):
                     carried.add(placeholders[slot])
 
     def reads_carry(node: Node) -> bool:
