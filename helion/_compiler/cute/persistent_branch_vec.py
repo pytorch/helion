@@ -11,6 +11,7 @@ branch-local indices dominate it.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import math
 import re
 from typing import TYPE_CHECKING
@@ -32,6 +33,18 @@ _DTYPE_INFO = {
     "cutlass.Float32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
     "cutlass.Int32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
     "cutlass.Uint32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
+}
+# FP8 stores collect unconverted lanes; their flush helper converts the whole
+# packet at once.  FP8 loads keep their scalar path.
+_STORE_DTYPE_INFO = {
+    **_DTYPE_INFO,
+    "cutlass.Float8E4M3FN": ("cutlass.Uint8", 1, "_cute_store_fp8e4m3fn_vec"),
+    "cutlass.Float8E5M2": ("cutlass.Uint8", 1, "_cute_store_fp8e5m2_vec"),
+}
+# Element bytes of each generated ``NAME(pointer, values)`` packet flush; the
+# lane passes treat exactly these helpers as one store of ``values``.
+PACKET_STORE_BYTES = {
+    helper: itemsize for _carrier, itemsize, helper in _STORE_DTYPE_INFO.values()
 }
 
 
@@ -414,8 +427,7 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
 
 # Widest element count one 16-byte flush helper can write.
 _VECTOR_FLUSH_MAX_WIDTH = {
-    "_cute_store_u16_vec": 8,
-    "_cute_store_u32_vec": 4,
+    **{helper: 16 // itemsize for helper, itemsize in PACKET_STORE_BYTES.items()},
     "_cute_store_u16x8_l2_evict_last": 8,
     "_cute_store_u32x4_l2_evict_last": 4,
 }
@@ -452,8 +464,8 @@ def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
     hoisted ``cute.arch.load(PTR, ir.VectorType.get([V], ...))`` packet load
     and its L2-policy helper forms (``V`` elements), a scalar-typed
     ``cute.arch.load(PTR, cutlass.Float32, ...)`` (one element) and the
-    ``_cute_store_u16_vec`` / ``_cute_store_u32_vec`` flush of a V-loop's
-    values.  The flush's element count is not visible in the call, so it
+    packet flush (``PACKET_STORE_BYTES``) of a V-loop's values.  The
+    flush's element count is not visible in the call, so it
     reports the widest fragment its helper can write.  Anything else returns
     ``None``: atomics, unknown helpers, and byte-packed loads through a word
     carrier (``cute.arch.load(PTR, cutlass.Uint64)`` reads as many elements
@@ -1168,6 +1180,8 @@ def _uniform_guard(
             # Prove the complete contiguous fragment is live by checking both
             # endpoints outside the loop.  The candidate's earlier unit-affine
             # proof makes this sufficient for generated tensor-bound compares.
+            # User masks (an FP8 packet store's ``extra_mask``) lower to
+            # ``operator`` calls, so a lane-dependent one is rejected above.
             endpoints = (
                 _expand(term, definitions, lane_var, ast.Constant(value=0)),
                 _expand(
@@ -1317,12 +1331,13 @@ class _BranchLocalPersistentVectorizer:
         proven_disjoint_tensor_pairs: set[frozenset[str]],
         proven_tensor_stride_values: Mapping[tuple[str, int], int],
     ) -> None:
-        self.used_names = {
+        self.name_counts = Counter(
             node.id
             for stmt in body
             for node in ast.walk(stmt)
             if isinstance(node, ast.Name)
-        }
+        )
+        self.used_names = set(self.name_counts)
         self.counter = 0
         self.proven_disjoint_tensor_pairs = proven_disjoint_tensor_pairs
         self.proven_tensor_stride_values = proven_tensor_stride_values
@@ -1669,7 +1684,9 @@ class _BranchLocalPersistentVectorizer:
                 marker_block = _literal(store_marker.args[0], int)
                 marker_width = _literal(store_marker.args[1], int)
                 dtype = _literal(store_marker.args[2], str)
-                dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                dtype_info = (
+                    _STORE_DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                )
                 mask_arg = store_marker.args[5]
                 mask = (
                     None
@@ -1706,6 +1723,24 @@ class _BranchLocalPersistentVectorizer:
                     )
                 ):
                     carrier, _itemsize, store_helper = dtype_info
+                    lane_value = _clone_expr(store_marker.args[4])
+                    if carrier == "cutlass.Uint8":
+                        assert isinstance(dtype, str)
+                        fp8_source = self._fp8_lane_value(
+                            lane_value, dtype, rewritten_body
+                        )
+                        if fp8_source is None:
+                            rewritten_body.extend(self._restore_store(store_marker))
+                            continue
+                        lane_value = fp8_source
+                    else:
+                        lane_value = ast.Call(
+                            func=ast.Attribute(
+                                value=lane_value, attr="bitcast", ctx=ast.Load()
+                            ),
+                            args=[ast.parse(carrier, mode="eval").body],
+                            keywords=[],
+                        )
                     values_name = self._fresh("_persistent_branch_store_values")
                     before.append(
                         ast.Assign(
@@ -1720,19 +1755,7 @@ class _BranchLocalPersistentVectorizer:
                                 attr="append",
                                 ctx=ast.Load(),
                             ),
-                            args=[
-                                ast.Call(
-                                    func=ast.Attribute(
-                                        value=_clone_expr(store_marker.args[4]),
-                                        attr="bitcast",
-                                        ctx=ast.Load(),
-                                    ),
-                                    args=[
-                                        ast.parse(carrier, mode="eval").body,
-                                    ],
-                                    keywords=[],
-                                )
-                            ],
+                            args=[lane_value],
                             keywords=[],
                         )
                     )
@@ -1761,6 +1784,43 @@ class _BranchLocalPersistentVectorizer:
 
         loop.body = self.transform_body(rewritten_body)
         return before, loop, after
+
+    def _fp8_lane_value(
+        self, value: ast.expr, dtype: str, loop_body: list[ast.stmt]
+    ) -> ast.expr | None:
+        """The input of the store's FP8 cast; the flush helper converts it.
+
+        When that input is a single-use ``name = <dtype>(x)`` of this loop,
+        collect ``x`` instead so FP32/FP16/BF16 lanes reach the vector
+        conversion; ``name = x`` keeps the value from the assignment's position.
+        Returns ``None`` for a value that is not an FP8 cast, which keeps the
+        scalar stores.  ``memory_ops`` wraps every FP8 store value in the cast,
+        so a copied E4M3FN value (a raw ``Uint8`` load) still reaches the
+        helper, which converts it the way the scalar store does.
+        """
+        if not (
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func) == dtype
+            and len(value.args) == 1
+            and not value.keywords
+        ):
+            return None
+        (value,) = value.args
+        if isinstance(value, ast.Name) and self.name_counts[value.id] == 2:
+            for stmt in loop_body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == value.id
+                    and isinstance(stmt.value, ast.Call)
+                    and ast.unparse(stmt.value.func) == dtype
+                    and len(stmt.value.args) == 1
+                    and not stmt.value.keywords
+                ):
+                    stmt.value = stmt.value.args[0]
+                    break
+        return value
 
     def transform_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
         result: list[ast.stmt] = []
