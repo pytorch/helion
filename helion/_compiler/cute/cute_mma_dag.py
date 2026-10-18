@@ -193,6 +193,9 @@ def _operand_dtypes() -> tuple[torch.dtype, ...]:
 
 # Scalar / vector side loads (decays, masks, scales) the per-lane loads read.
 _AUX_DTYPES: tuple[torch.dtype, ...] = (torch.float32, torch.float16, torch.bfloat16)
+# Side values of at most one tile dim may also be int32 (window bounds a
+# mask compares against).
+_SIDE_DTYPES: tuple[torch.dtype, ...] = (*_AUX_DTYPES, torch.int32)
 _STORE_DTYPES: tuple[torch.dtype, ...] = (
     torch.bfloat16,
     torch.float16,
@@ -389,13 +392,17 @@ class Subscript:
     (``root`` / ``loop`` / ``lead`` tiles and ``:`` rdims) or a uniform
     integer expression ``expr`` over grid loop indices and the leading tile
     ids (``loops`` lists the loops whose index occurs in it;
-    ``loop_dependent`` says there is at least one)."""
+    ``loop_dependent`` says there is at least one).  An ``axis`` subscript
+    may carry a loop-invariant uniform ``offset`` over the leading tile ids
+    (``x[tile_k.index + tile_c.begin * C]``): the tile's elements sit at
+    ``offset`` plus the axis position, proven in bounds by the matcher."""
 
     kind: str  # "axis" | "scalar"
     axis: Axis | None = None
     expr: sympy.Expr | None = None
     loop_dependent: bool = False
     loops: tuple[int, ...] = ()
+    offset: sympy.Expr | None = None
 
     @property
     def loop_set(self) -> frozenset[int]:
@@ -801,6 +808,8 @@ class MmaDagProgram:
     # Vector slot -> the fragment slots whose warp split it follows (the
     # component of carries / ops / reductions it belongs to).
     vec_frag_slots: dict[int, tuple[int, ...]] = dataclasses.field(default_factory=dict)
+    # ``tile.index`` values (``tile.index[None, :]``) -> their root axis.
+    tile_index_loads: dict[Node, Axis] = dataclasses.field(default_factory=dict)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -2431,6 +2440,61 @@ def _is_call(node: object, target: object) -> bool:
     )
 
 
+def rounded_dot_dtype(node: object) -> torch.dtype | None:
+    """The 16-bit dtype of a ``torch.matmul`` of two 16-bit tiles
+    (``aten.mm``): a dot whose fp32 product is rounded once to the operands'
+    dtype -- its fragment holds the fp32 product and every reader evaluates
+    the rounded value.  None for anything else."""
+    if not _is_call(node, torch.ops.aten.mm.default):
+        return None
+    assert isinstance(node, torch.fx.Node)
+    if len(node.args) != 2 or node.kwargs:
+        return None
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or val.dtype not in _OPERAND_DTYPES:
+        return None
+    for arg in node.args:
+        arg_val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
+        if not isinstance(arg_val, torch.Tensor) or arg_val.dtype != val.dtype:
+            return None
+    return val.dtype
+
+
+def _is_dot(node: object) -> bool:
+    """An ``hl.dot`` or a rounded 16-bit ``aten.mm`` (``rounded_dot_dtype``)."""
+    from ...language.matmul_ops import dot
+
+    return _is_call(node, dot) or rounded_dot_dtype(node) is not None
+
+
+def _dot_acc(node: Node) -> object:
+    """The accumulator argument of a dot (``aten.mm`` has none)."""
+    return node.args[2] if rounded_dot_dtype(node) is None else None
+
+
+def _tile_index_position(node: Node) -> int | None:
+    """``tile.index`` broadcast by ``None`` subscripts (``tile.index[None, :]``
+    is a ``load`` of the ``tile_index`` value): the position of its one tile
+    dim, None for any other node."""
+    from ...language import memory_ops
+    from ...language import tile_ops
+
+    if not _is_call(node, memory_ops.load) or len(node.args) < 4:
+        return None
+    source, indices = node.args[0], node.args[1]
+    if (
+        not _is_call(source, tile_ops.tile_index)
+        or node.args[2] is not None
+        or node.args[3] is not None
+        or not isinstance(indices, (list, tuple))
+    ):
+        return None
+    positions = [i for i, index in enumerate(indices) if index is not None]
+    if len(positions) != 1 or indices[positions[0]] != slice(None):
+        return None
+    return positions[0]
+
+
 def _tile_signature(access: Access) -> tuple[object, ...] | None:
     """What makes two loads of a region the same tile: the tensor, its
     dtype and strides, and whole-tile subscripts of the same axes (loads
@@ -2441,7 +2505,10 @@ def _tile_signature(access: Access) -> tuple[object, ...] | None:
         access.name,
         access.dtype,
         access.strides,
-        tuple(cast("Axis", subscript.axis).block_id for subscript in access.subscripts),
+        tuple(
+            (cast("Axis", subscript.axis).block_id, subscript.offset)
+            for subscript in access.subscripts
+        ),
     )
 
 
@@ -2663,6 +2730,8 @@ class _Matcher:
         # them) and the fragment slots reduced into each.
         self.vec_parent: list[int] = []
         self.vec_frags: dict[int, list[int]] = {}
+        # ``tile.index`` values (``_tile_index_position``) -> their root axis.
+        self.tile_index_loads: dict[Node, Axis] = {}
 
     # -- axes ------------------------------------------------------------------
 
@@ -2726,8 +2795,10 @@ class _Matcher:
         return isinstance(node, torch.fx.Node) and self.resolve(node) in self.frag_slots
 
     def is_tile_id(self, subscript: object) -> bool:
-        """A ``tile.id`` symbol: a scalar coordinate, not a tile."""
+        """A ``tile.id`` symbol (or the ``tile.begin`` of a leading tile,
+        whose block size is one): a scalar coordinate, not a tile."""
         from ..host_function import HostFunction
+        from ..variable_origin import TileBeginOrigin
         from ..variable_origin import TileIdOrigin
 
         if not isinstance(subscript, torch.fx.Node):
@@ -2737,15 +2808,34 @@ class _Matcher:
             return False
         expr = val._sympy_()
         info = HostFunction.current().expr_to_origin.get(expr)
-        return info is not None and isinstance(info.origin, TileIdOrigin)
+        if info is None:
+            return False
+        if isinstance(info.origin, TileIdOrigin):
+            return True
+        return isinstance(info.origin, TileBeginOrigin) and self.is_lead_block(
+            info.origin.block_id
+        )
+
+    def is_lead_block(self, block_id: int) -> bool:
+        axis = self.axes.get(self.canonical(block_id))
+        return axis is not None and axis.kind == AXIS_LEAD
+
+    def lead_coordinate(self, origin: object) -> bool:
+        """Whether a symbol of ``origin`` is a leading tile's coordinate (its
+        id, or its begin: lead tiles have block size one); ``_NotMine`` for
+        the id or begin of any other tile."""
+        from ..variable_origin import TileBeginOrigin
+        from ..variable_origin import TileIdOrigin
+
+        if not isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
+            return False
+        if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
+            raise _NotMine
+        return True
 
     def uniform_expr(self, subscript: object) -> tuple[sympy.Expr, tuple[int, ...]]:
         """A uniform integer subscript and the grid loops whose index occurs
         in it."""
-        from ..host_function import HostFunction
-        from ..variable_origin import GridOrigin
-        from ..variable_origin import TensorSizeOrigin
-        from ..variable_origin import TileIdOrigin
 
         if isinstance(subscript, bool):
             raise _NotMine
@@ -2758,7 +2848,14 @@ class _Matcher:
             return sympy.Integer(val), ()
         if not isinstance(val, torch.SymInt):
             raise _NotMine
-        expr = val._sympy_()
+        return self.uniform_sym(val._sympy_())
+
+    def uniform_sym(self, expr: object) -> tuple[sympy.Expr, tuple[int, ...]]:
+        """``uniform_expr`` of a sympy integer expression."""
+        from ..host_function import HostFunction
+        from ..variable_origin import GridOrigin
+        from ..variable_origin import TensorSizeOrigin
+
         if not isinstance(expr, sympy.Expr):
             raise _NotMine
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -2777,12 +2874,61 @@ class _Matcher:
                     raise _NotMine
                 if loop not in loops:
                     loops.append(loop)
-            elif isinstance(origin, TileIdOrigin):
-                if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
-                    raise _NotMine
+            elif self.lead_coordinate(origin):
+                pass
             elif not isinstance(origin, TensorSizeOrigin):
                 raise _NotMine
         return expr, tuple(sorted(loops))
+
+    def tile_offset(
+        self, offset: object, axis: Axis, extent: int | None, stride: int, itemsize: int
+    ) -> sympy.Expr:
+        """The uniform offset of an ``axis`` subscript ``tile.index + offset``
+        (``_NotMine`` unless it is a nonnegative affine form of the leading
+        tile coordinates that keeps every tile of ``axis`` inside the
+        ``extent``-long tensor dim, so the access needs no mask, and keeps
+        16-byte alignment of the dim's byte offsets)."""
+        from ..host_function import HostFunction
+        from ..variable_origin import GridOrigin
+
+        if isinstance(offset, torch.SymInt):
+            offset = offset._sympy_()
+        elif isinstance(offset, int) and not isinstance(offset, bool):
+            offset = sympy.Integer(offset)
+        expr, loops = self.uniform_sym(offset)
+        if loops or extent is None:
+            raise _NotMine
+        expr_to_origin = HostFunction.current().expr_to_origin
+        symbols = sorted(expr.free_symbols, key=str)
+        highest: dict[sympy.Symbol, int] = {}
+        for symbol in symbols:
+            info = expr_to_origin.get(cast("sympy.Symbol", symbol))
+            assert info is not None
+            origin = info.origin
+            if not self.lead_coordinate(origin):
+                raise _NotMine
+            assert isinstance(origin, GridOrigin)
+            highest[cast("sympy.Symbol", symbol)] = (
+                self.axis_of_block(origin.block_id).extent - 1
+            )
+        try:
+            poly = sympy.Poly(expr, *symbols) if symbols else None
+        except sympy.PolynomialError:
+            raise _NotMine from None
+        coefficients = (
+            [sympy.Integer(expr)] if poly is None else [*poly.coeffs(), poly.TC()]
+        )
+        if poly is not None and poly.total_degree() > 1:
+            raise _NotMine
+        for coefficient in coefficients:
+            if not coefficient.is_integer or coefficient < 0:
+                raise _NotMine
+            if int(coefficient) * stride * itemsize % 16:
+                raise _NotMine
+        largest = int(expr.xreplace(highest))
+        if largest + axis.extent > extent:
+            raise _NotMine
+        return expr
 
     def bound_varies(self, val: torch.SymInt) -> bool:
         """Whether a grid loop bound varies within the kernel: any symbol
@@ -2793,6 +2939,7 @@ class _Matcher:
         with the host's symbols, and an enclosing loop evaluates a nested
         loop's bounds ahead of its iteration (the early ring prologue)."""
         from ..host_function import HostFunction
+        from ..variable_origin import TileBeginOrigin
         from ..variable_origin import TileIdOrigin
 
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -2801,7 +2948,7 @@ class _Matcher:
             if info is None:
                 return True
             origin = info.origin
-            if isinstance(origin, TileIdOrigin):
+            if isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
                 if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
                     return True
             elif not origin.is_host():
@@ -2872,16 +3019,21 @@ class _Matcher:
             )
             tile_blocks = [*self.root_block_ids, *self.loop_blocks]
             if tile is not None and self.canonical(tile.block_id) in tile_blocks:
-                if not self.env.known_equal(tile.offset, 0) or not value_sizes:
+                if not value_sizes:
                     raise _NotMine
                 axis = self.axis_of_block(tile.block_id)
                 size = value_sizes.pop(0)
                 size_block = self.env.resolve_block_id(size)
                 if size_block is None or self.canonical(size_block) != axis.block_id:
                     raise _NotMine
-                if extent is None or extent != axis.extent:
+                offset = None
+                if not self.env.known_equal(tile.offset, 0):
+                    offset = self.tile_offset(
+                        tile.offset, axis, extent, strides[dim], fake.dtype.itemsize
+                    )
+                elif extent is None or extent != axis.extent:
                     raise _NotMine
-                subscripts.append(Subscript("axis", axis))
+                subscripts.append(Subscript("axis", axis, offset=offset))
                 dims.append(axis)
                 dim_strides.append(strides[dim])
                 continue
@@ -2992,9 +3144,25 @@ class _Matcher:
             self.shape_axes(node)
             self.aux_dag(cast("Node", node.args[0]), aux, seen)
             return
+        position = _tile_index_position(node)
+        if position is not None:
+            # A root tile's global indices: the CTA's base plus the
+            # coordinate (``hl.arange`` relabels the same way).
+            axis = self.shape_axes(node)[position]
+            val = node.meta.get("val")
+            if (
+                axis is None
+                or axis.kind != AXIS_ROOT
+                or self.shape_axes(cast("Node", node.args[0])) != (axis,)
+                or not isinstance(val, torch.Tensor)
+                or val.dtype != torch.int32
+            ):
+                raise _NotMine
+            self.tile_index_loads[node] = axis
+            return
         if _is_call(node, memory_ops.load):
             access = self.access(node)
-            if len(access.tile_dims) > 1 or access.dtype not in _AUX_DTYPES:
+            if len(access.tile_dims) > 1 or access.dtype not in _SIDE_DTYPES:
                 raise _NotMine
             aux.append(access)
             return
@@ -3370,14 +3538,13 @@ class _Matcher:
         product transposed makes those reads straight)."""
         from ...language import _tracing_ops
         from ...language import view_ops
-        from ...language.matmul_ops import dot
 
         parities: list[bool] = []
 
         def visit(current: Node, parity: bool) -> bool:
             for user in self.users_of(current):
-                if _is_call(user, dot):
-                    if user.args[2] is current or current not in user.args[:2]:
+                if _is_dot(user):
+                    if _dot_acc(user) is current or current not in user.args[:2]:
                         return False
                     parities.append(parity)
                 elif _is_swap_permute(user):
@@ -3468,7 +3635,6 @@ class _Matcher:
     def _match(self) -> MmaDagProgram:
         from ...language import _tracing_ops
         from ...language import memory_ops
-        from ...language.matmul_ops import dot
         from ..device_ir import ForLoopGraphInfo
         from ..device_ir import ReductionLoopGraphInfo
         from ..device_ir import RootGraphInfo
@@ -3504,7 +3670,7 @@ class _Matcher:
             raise _NotMine
         for graph in graphs:
             for node in graph.graph.nodes:
-                if _is_call(node, dot) and (
+                if _is_dot(node) and (
                     analyze_cute_mma_node(node, graphs=graphs) is not None
                 ):
                     raise _NotMine
@@ -3546,17 +3712,16 @@ class _Matcher:
 
         # The dots tell which root blocks tile fragments; the rest are leads.
         dot_nodes = [
-            node
-            for graph in graphs
-            for node in graph.graph.nodes
-            if _is_call(node, dot)
+            node for graph in graphs for node in graph.graph.nodes if _is_dot(node)
         ]
         if not dot_nodes:
             raise _NotMine
         tiled_blocks: set[int] = set()
         for node in dot_nodes:
             val = node.meta.get("val")
-            if not isinstance(val, torch.Tensor) or val.dtype != torch.float32:
+            if not isinstance(val, torch.Tensor) or (
+                val.dtype != torch.float32 and rounded_dot_dtype(node) is None
+            ):
                 raise _NotMine
             for size in val.shape[-2:]:
                 block_id = self.env.resolve_block_id(size)
@@ -3643,6 +3808,7 @@ class _Matcher:
             vec_ops=tuple(self.vec_ops),
             vec_stores=tuple(self.vec_stores),
             vec_frag_slots=vec_frag_slots,
+            tile_index_loads=dict(self.tile_index_loads),
             acc_loads=self.acc_loads,
             store_aux_loads=tuple(store_aux),
             epilogue_order=tuple(
@@ -3674,12 +3840,11 @@ class _Matcher:
         other node must feed one of the steps."""
         from ...language import _tracing_ops
         from ...language import memory_ops
-        from ...language.matmul_ops import dot
 
         steps: list[Step] = []
         loaded: dict[tuple[object, ...], Node] = {}
         for node in graph.graph.nodes:
-            if _is_call(node, memory_ops.load):
+            if _is_call(node, memory_ops.load) and _tile_index_position(node) is None:
                 access = self.access(node)
                 signature = _tile_signature(access)
                 if signature is None:
@@ -3694,7 +3859,7 @@ class _Matcher:
             step: Step
             if _is_call(node, _tracing_ops._for_loop):
                 step = self._loop(node, loop)
-            elif _is_call(node, dot):
+            elif _is_dot(node):
                 step = self._dot(node, loop)
                 self.dots.append(step)
             elif _is_call(node, memory_ops.store):
@@ -4309,7 +4474,12 @@ class _Matcher:
 
     def _dot(self, node: Node, loop: int) -> Dot:
         region = "loop" if loop >= 0 else "epilogue"
-        if len(node.args) not in (3, 4) or (
+        if rounded_dot_dtype(node) is not None:
+            # The evaluator rounds the fragment where a pointwise reader
+            # evaluates it; no reader takes its registers as they are.
+            if not all(_is_pointwise(user) for user in self.users_of(node)):
+                raise _NotMine
+        elif len(node.args) not in (3, 4) or (
             len(node.args) == 4 and node.args[3] not in (None, torch.float32)
         ):
             raise _NotMine
@@ -4331,7 +4501,7 @@ class _Matcher:
         # A loop axis sizes the dot only inside that loop (or a nested one).
         if not all(self.encloses(loop, axis) for axis in (rows, cols, k)):
             raise _NotMine
-        acc = node.args[2]
+        acc = _dot_acc(node)
         # The orientation rule: a no-acc dot read only transposed is emitted
         # transposed (the FX B source feeds A and vice versa), so the reads
         # are straight and an ``hl.arange`` mask relabels by coordinates.

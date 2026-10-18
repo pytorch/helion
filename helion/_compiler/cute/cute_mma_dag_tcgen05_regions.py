@@ -2339,6 +2339,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     value = f"({offset}) * {self.plan.size(axis)}"
                 else:
                     value = self.axis_base(axis)
+                if subscript.offset is not None:
+                    value = f"{value} + {self.uniform(subscript.offset, {})}"
             if position == spec.slab_dim and slab:
                 value = f"{value} + {slab * spec.slab_elems}"
             coords.append(f"cutlass.Int32({value})")

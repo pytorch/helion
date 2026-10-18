@@ -1579,3 +1579,42 @@ def test_the_raw_launch_record_follows_the_fastpaths_grid() -> None:
     assert rows_written(None) == [True, True]
     assert fastpath.raw_grid == (2,)
     assert rows_written(None) == [True, True]
+
+
+def _head_sum_args(
+    *, m: int = 256, h: int = 4, n: int = 512, d: int = 128, seed: int = 11
+) -> tuple[torch.Tensor, ...]:
+    """Integer bf16 queries / keys (every fp32 partial sum exact, scores up
+    to ~1500 so their bf16 rounding is exercised) and quarter-step weights:
+    any accumulation order and contraction gives the same bits."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    def ints(*shape: int, low: int, high: int) -> torch.Tensor:
+        return torch.randint(low, high, shape, device=DEVICE, generator=g)
+
+    ks = ints(m, low=0, high=n // 2).to(torch.int32)
+    return (
+        ints(m, h, d, low=-8, high=9).to(torch.bfloat16),
+        ints(n, d, low=-8, high=9).to(torch.bfloat16),
+        ints(m, h, low=-8, high=9).to(torch.float32) / 4,
+        ks,
+        ks + ints(m, low=0, high=n // 2).to(torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages"), (([64, 128], 4, 2), ([32, 64], 2, 3))
+)
+def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
+    block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # The sparse-attention indexer's logits: a bf16 ``torch.matmul`` per
+    # head read rounded, and a window mask of ``tile_n.index`` against
+    # int32 bounds.  Bit-equal to Triton over eight launches.
+    fn = _probe_kernels()._head_sum_logits
+    args = _head_sum_args()
+    source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    assert f"{RT}.ldg_s32(" in source
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out[0], ref)
