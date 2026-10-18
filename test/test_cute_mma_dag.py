@@ -2066,22 +2066,27 @@ def test_contractions_the_tensor_core_families_claim_are_not_mine() -> None:
         (torch.float32, True),
         (torch.bfloat16, True),
         (torch.float64, False),
-        (torch.int32, False),
+        (torch.int32, True),
     ),
 )
-def test_side_loads_need_a_floating_dtype_the_lane_loads_read(
+def test_side_loads_need_a_dtype_the_lane_loads_read(
     dtype: torch.dtype, admitted: bool
 ) -> None:
-    # The per-lane scalar / vector loads read f32 / f16 / bf16; anything else
-    # (here a float64 or int32 decay) is not mine rather than a mistyped 16-bit
-    # load.
+    # The per-lane scalar / vector loads read f32 / f16 / bf16 (widened to
+    # fp32) and int32 (window bounds; the ``.float()`` converts the loaded
+    # integer); anything else (here a float64 decay) is not mine rather than
+    # a mistyped load.
     t = _tensors()
     s = torch.empty((2, 8), dtype=dtype, device=CPU_DEVICE)
     bound = _bind_fn(_scalar_decay_recurrence, (t["k"], t["v"], s))
     assert (bound.config_spec.cute_mma_dag is not None) is admitted
     if admitted:
         body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
-        load = "ldg_f32" if dtype == torch.float32 else "ldg_bf16_as_f32"
+        load = {
+            torch.float32: "ldg_f32",
+            torch.bfloat16: "ldg_bf16_as_f32",
+            torch.int32: "ldg_s32",
+        }[dtype]
         assert f"{RT}.{load}(" in _loop_and_after(body)
 
 
@@ -5360,3 +5365,92 @@ def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
             normalized = spec.normalized_config(config)
         assert normalized.config["cute_mma_dag"] == "warp"
         assert f"{RT}.mma_bf16(" in _kernel_body(_source(bound, normalized))
+
+
+# --------------------------------------------------------------------------
+# torch.matmul dots and tile.index masks
+# --------------------------------------------------------------------------
+
+
+def _head_sum_logits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+) -> torch.Tensor:
+    """The sparse-attention indexer's logits: a ``torch.matmul`` per head
+    (a bf16 score), relu, a per-row weight, summed over the heads and masked
+    to the row's window by ``tile.index``."""
+    M, H, N = q.size(0), hl.specialize(q.size(1)), k.size(0)
+    hl.specialize(q.size(2))
+    out = torch.empty([M, N], dtype=torch.float32, device=q.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        kt = k[tile_n, :]
+        for h in hl.grid(H):
+            score = torch.matmul(q[tile_m, h, :], kt.transpose(0, 1)).to(torch.float32)
+            acc = acc + torch.relu(score) * w[tile_m, h][:, None]
+        in_window = (tile_n.index[None, :] >= ks[tile_m][:, None]) & (
+            tile_n.index[None, :] < ke[tile_m][:, None]
+        )
+        out[tile_m, tile_n] = torch.where(in_window, acc, float("-inf"))
+    return out
+
+
+def _head_scores_stored(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Control: each head's bf16 ``torch.matmul`` stored as it is (the
+    store would read the unrounded fragment)."""
+    M, H, N = q.size(0), hl.specialize(q.size(1)), k.size(0)
+    hl.specialize(q.size(2))
+    out = torch.empty([M, H, N], dtype=q.dtype, device=q.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        kt = k[tile_n, :]
+        for h in hl.grid(H):
+            out[tile_m, h, tile_n] = torch.matmul(q[tile_m, h, :], kt.transpose(0, 1))
+    return out
+
+
+def _head_sum_inputs(m: int = 256, h: int = 4, n: int = 512, d: int = 128) -> tuple:
+    return (
+        torch.empty((m, h, d), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((n, d), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((m, h), dtype=torch.float32, device=CPU_DEVICE),
+        torch.empty((m,), dtype=torch.int32, device=CPU_DEVICE),
+        torch.empty((m,), dtype=torch.int32, device=CPU_DEVICE),
+    )
+
+
+def test_a_16_bit_matmul_is_a_dot_rounded_where_it_is_read() -> None:
+    # ``torch.matmul`` of two bf16 tiles is ``aten.mm`` with a bf16 result:
+    # the fragment holds the fp32 product and its one reader (the
+    # ``.to(torch.float32)``) reads it rounded to bf16, as the SIMT lowering
+    # rounds it.  The window mask compares ``tile_n.index`` (the CTA's base
+    # plus the column) with int32 bounds loaded per row.
+    bound = _bind_fn(_head_sum_logits, _head_sum_inputs())
+    program = _program(bound)
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.mm.default
+    assert dag.rounded_dot_dtype(dot.node) is torch.bfloat16
+    assert len(program.tile_index_loads) == 2
+    body = _kernel_body(_source(bound, _config(64, 128, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_bf16(" in body
+    slot = dot.slot
+    rounds = re.findall(rf"= cutlass\.BFloat16\(md_c{slot}_\d+_\d+_\d\)", body)
+    assert len(rounds) == len(set(rounds)) == dag.mma_dag_frag_regs(64, 128, 4)
+    assert f"{RT}.ldg_s32(" in body
+    (column_base,) = (
+        axis for axis in program.axes if axis.block_id == dot.cols.block_id
+    )
+    assert f"cutlass.Int32(md_a{column_base.index} + " in body
+
+
+def test_a_16_bit_matmul_read_as_it_is_stays_simt() -> None:
+    # A store takes the fragment's registers as they are: the unrounded
+    # fp32 product, so the program is not the owner's.
+    q, k = _head_sum_inputs()[:2]
+    bound = _bind_fn(_head_scores_stored, (q, k))
+    with bound.env, bound.host_function:
+        assert dag.match_mma_dag(bound.host_function.device_ir.graphs) is None
+    assert bound.config_spec.cute_mma_dag is None

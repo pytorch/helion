@@ -25,6 +25,7 @@ from test.test_cute_mma_dag_gpu import _dv_args
 from test.test_cute_mma_dag_gpu import _fwd_args
 from test.test_cute_mma_dag_gpu import _fwd_h_delta_args
 from test.test_cute_mma_dag_gpu import _fwd_o_args
+from test.test_cute_mma_dag_gpu import _head_sum_args
 from test.test_cute_mma_dag_gpu import _inputs
 from test.test_cute_mma_dag_gpu import _inputs3
 from test.test_cute_mma_dag_gpu import _inputs4
@@ -380,6 +381,44 @@ def test_k_loop_stage_depth_warps_and_store_path_are_pure_data_movement() -> Non
         )
     assert pinned.config["cute_mma_dag_store"] == "staged"
     assert "_helion_mma_dag.stg_v4_b32(" in bound.to_code(pinned)
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        None,
+        _config([64, 128, 128], warps=4, stages=2),
+        _config([64, 64, 64], warps=4, stages=1),
+        _config([64, 128, 64], warps=8, stages=4),
+    ),
+    ids=["default", "64x128x128w4s2", "64x64x64w4s1", "64x128x64w8s4"],
+)
+def test_the_chunk_state_example_matches_the_reference(
+    config: helion.Config | None,
+) -> None:
+    # examples/mamba2_chunk_state.py: the chunk offset of the x / B tiles and
+    # the leading tiles' begins as coordinates (4 heads per group).
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+    from examples.mamba2_chunk_state import ref_chunk_state
+
+    torch.manual_seed(0)
+    batch, seqlen, nheads, ngroups, chunk = 2, 1024, 8, 2, 256
+    nchunks = seqlen // chunk
+    x = torch.randn(batch, seqlen, nheads, 64, device=DEVICE, dtype=torch.bfloat16)
+    B = torch.randn(batch, seqlen, ngroups, 128, device=DEVICE, dtype=torch.bfloat16)
+    dt = torch.rand(batch, nheads, nchunks, chunk, device=DEVICE, dtype=torch.bfloat16)
+    dA = -torch.rand_like(dt).cumsum(-1)
+    args = (B, x, dt, dA)
+    fn = helion_mamba2_chunk_state_kernel.fn
+    if config is None:
+        bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+        config = bound.config_spec.default_config()
+        assert config.config["cute_mma_dag"] == "tcgen05"
+        out = bound.compile_config(config)(*args)
+    else:
+        _source, (out,) = _run_cute(fn, args, config)
+    ref = ref_chunk_state(B.float(), x.float(), dt.float(), dA.float())
+    torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=1e-2)
 
 
 def test_the_k_loop_defaults_run_on_tensor_memory() -> None:
@@ -1396,3 +1435,18 @@ def test_the_chains_squared_carry_takes_its_own_columns(
     source, out = _run_cute(fn, args, _config(block_sizes, warps, stages, **extra))
     assert f"{RT}.prims.tcgen05_alloc(md_tslot, 128," in source
     _assert_region_outputs("wy", out, _run_triton(fn, args, block_sizes))
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages"), (([128, 64], 4, 4), ([128, 32], 8, 2))
+)
+def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
+    block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # The sparse-attention indexer's logits in tensor memory: each head's
+    # bf16 score read rounded from TMEM, masked by ``tile_n.index``.
+    fn = _probe_kernels()._head_sum_logits
+    args = _head_sum_args()
+    _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.equal(out[0], ref)
