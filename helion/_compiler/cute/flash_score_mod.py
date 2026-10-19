@@ -1085,9 +1085,14 @@ class _HookEmitter:
         chunk_cols: int,
         row_coord_expr: str,
         device_function: DeviceFunction,
+        stage_expr: str | None = None,
     ) -> None:
         self.plan = plan
         self.stage = stage
+        # The stage as a device expression where the hook addresses the
+        # stage's warpgroup (the cooperative staging ring): the digit, or
+        # the shared softmax region's warp-uniform ``flash_stage``.
+        self.stage_expr = str(stage) if stage_expr is None else stage_expr
         self.score_tensor = score_tensor
         self.coord_tensor = coord_tensor
         self.m_tile_expr = m_tile_expr
@@ -1235,9 +1240,14 @@ class _HookEmitter:
             # stage's warpgroup holds warps ``4 stage .. 4 stage + 3`` of the
             # eight softmax warps.
             assert self.coop_warp_bytes
+            warp_base = (
+                f"cutlass.Int32({self.stage * 4})"
+                if self.stage_expr == str(self.stage)
+                else f"cutlass.Int32({self.stage_expr}) * cutlass.Int32(4)"
+            )
             self.emit(
                 _ITEM,
-                f"{var} = _flash_flex_coop_smem + (cutlass.Int32({self.stage * 4}) + "
+                f"{var} = _flash_flex_coop_smem + ({warp_base} + "
                 f"cutlass.Int32({self.row_coord_expr}) // cutlass.Int32(32)) * "
                 f"cutlass.Int32({self.coop_slots * self.coop_warp_bytes})",
             )
@@ -2489,6 +2499,7 @@ def render_flex_hook(
     coalesce: int = 0,
     coop_slots: int = 1,
     aux_smem_staged: frozenset[int] | None = None,
+    stage_expr: str | None = None,
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
 
@@ -2565,6 +2576,7 @@ def render_flex_hook(
         chunk_cols=chunk_cols,
         row_coord_expr=row_coord_expr,
         device_function=device_function,
+        stage_expr=stage_expr,
     )
     emitter.staged = (
         aux_smem_staged

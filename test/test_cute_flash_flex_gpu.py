@@ -196,13 +196,19 @@ def _assert_close_to_reference(
 
 
 def _qkv(
-    batch: int, heads: int, q_seq: int, kv_seq: int, *, kv_heads: int | None = None
+    batch: int,
+    heads: int,
+    q_seq: int,
+    kv_seq: int,
+    *,
+    kv_heads: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
     kv_heads = heads if kv_heads is None else kv_heads
-    q = torch.randn(batch, heads, q_seq, 64, dtype=torch.bfloat16, device=DEVICE)
-    k = torch.randn(batch, kv_heads, kv_seq, 64, dtype=torch.bfloat16, device=DEVICE)
-    v = torch.randn(batch, kv_heads, kv_seq, 64, dtype=torch.bfloat16, device=DEVICE)
+    q = torch.randn(batch, heads, q_seq, 64, dtype=dtype, device=DEVICE)
+    k = torch.randn(batch, kv_heads, kv_seq, 64, dtype=dtype, device=DEVICE)
+    v = torch.randn(batch, kv_heads, kv_seq, 64, dtype=dtype, device=DEVICE)
     return q, k, v
 
 
@@ -731,6 +737,261 @@ def test_item_words_are_bitwise_the_device_list_walk() -> None:
         assert torch.equal(lse, lse_ref), persistent
 
 
+def _half(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    # Every row sees the first half of the keys: equal counts (the identity
+    # item order), full tiles only, not every tile.
+    return kv_idx < 1024
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_host_flags_skip_the_table_loads_bitwise() -> None:
+    """The tables' host flags (``flex_item_flags``, a runtime scalar): the
+    all-full bit binds the words as constants without loading them and the
+    identity-order bit decodes the persistent item without the item table;
+    both give the output and LSE of the table path (inference-tensor
+    copies of the tables, which rebuild per call with the flags 0), on the
+    persistent loop and the plain grid."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    for mask_mod, expect in (
+        (noop_mask, FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER),
+        (_half, FLEX_FLAG_IDENTITY_ORDER),
+    ):
+        block_mask = create_block_mask(
+            mask_mod, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+        )
+        args = _flex_args(q, k, v, _identity, block_mask)
+        tables = args[4:8]
+        geometry = {
+            "q_block": 128,
+            "batch": batch,
+            "heads": heads,
+            "num_pairs": seq // 256,
+            "num_kv": seq // 128,
+        }
+        assert flex_item_flags(*tables, **geometry) == expect
+        with torch.inference_mode():
+            plain_tables = tuple(table.clone() for table in tables)
+        assert flex_item_flags(*plain_tables, **geometry) == 0
+        plain_args = (*args[:4], *plain_tables, *args[8:])
+        for persistent in (False, True):
+            fn, resolved = _compile_flex(
+                args,
+                {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent},
+                expect_in_code="if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):",
+            )
+            assert resolved.flex_item_words
+            out_ref, lse_ref = fn(*plain_args)
+            torch.cuda.synchronize()
+            out, lse = fn(*args)
+            torch.cuda.synchronize()
+            assert torch.equal(out, out_ref), (mask_mod.__name__, persistent)
+            assert torch.equal(lse, lse_ref), (mask_mod.__name__, persistent)
+            ref_out, ref_lse = _reference(q, k, v, None, block_mask)
+            _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
+def _plain_table_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The same arguments with inference-tensor copies of the four tables:
+    the uncached table path, host flags 0."""
+    with torch.inference_mode():
+        plain_tables = tuple(table.clone() for table in args[4:8])
+    return (*args[:4], *plain_tables, *args[8:])
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("q_seq", "block_rows", "persistent"),
+    [(2048 + 128, 128, False), (2048 + 128, 128, True), (2048, 256, False)],
+    ids=["odd_rows_grid", "odd_rows_persistent", "q_block_256"],
+)
+def test_host_flags_all_full_constants_on_odd_rows_and_256_row_tables(
+    q_seq: int, block_rows: int, persistent: bool
+) -> None:
+    """The all-full constants where the device's word is not the plain full
+    word of both stages: an odd row count (the last pair's missing
+    second-stage row is the ``select_`` zero word) and 256-row BlockMask
+    tables (one row, one word pair per item); bitwise the table path."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, kv_seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        noop_mask,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(block_rows, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    geometry = {
+        "q_block": block_rows,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": -(-q_seq // 256),
+        "num_kv": kv_seq // 128,
+    }
+    assert (
+        flex_item_flags(*args[4:8], **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    full_word = (1 << (kv_seq // 128)) - 1
+    rows = -(-q_seq // block_rows)
+    if block_rows == 256:
+        expect = f"flash_flex_f0_0 = cutlass.Int32({full_word})"
+    else:
+        expect = (
+            f"flash_flex_f1_0 = cutlass.Int32(cutlass.select_(flash_m_tile1 < {rows}, "
+            f"cutlass.Int32({full_word}), cutlass.Int32(0)))"
+        )
+    fn, resolved = _compile_flex(
+        args,
+        {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent},
+        expect_in_code=expect,
+    )
+    assert resolved.flex_item_words
+    out_ref, lse_ref = fn(*_plain_table_args(args))
+    torch.cuda.synchronize()
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    ref_out, ref_lse = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_host_flags_follow_table_rewrites_and_graph_replay() -> None:
+    """The flags live in the per-BlockMask cache behind the tables' version
+    counters: rewriting a full mask's tables in place into a banded mask's
+    flips them 3 -> 0 and the same compiled kernel (built with the band's
+    mask hook, which full tiles never run) follows, bitwise the band's own
+    tables; a CUDA-graph capture of the flags-3 mask rebuilds the tables in
+    the graph with the flags 0 and replays the eager result bitwise."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    full = create_block_mask(
+        noop_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    band = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, full, mask_mod=_band)
+    band_args = _flex_args(q, k, v, _identity, band)
+    tables, band_tables = args[4:8], band_args[4:8]
+    assert all(a.shape == b.shape for a, b in zip(tables, band_tables, strict=True))
+    geometry = {
+        "q_block": 128,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": seq // 256,
+        "num_kv": seq // 128,
+    }
+    fn, _ = _compile_flex(args, PAIR_DESC)
+    assert (
+        flex_item_flags(*tables, **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    out_full, lse_full = fn(*args)
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(q, k, v, None, full)
+    _assert_close_to_reference(out_full, lse_full, ref_out, ref_lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = fn(*args)
+    for _ in range(2):
+        graph_out.fill_(0)
+        graph_lse.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, out_full)
+        assert torch.equal(graph_lse, lse_full)
+    # The in-place rewrite bumps the version counters: the flags follow.
+    for table, source in zip(tables, band_tables, strict=True):
+        table.copy_(source)
+    assert flex_item_flags(*tables, **geometry) == 0
+    out_band, lse_band = fn(*args)
+    torch.cuda.synchronize()
+    band_ref_out, band_ref_lse = _reference(q, k, v, None, band)
+    _assert_close_to_reference(out_band, lse_band, band_ref_out, band_ref_lse)
+    out_own, lse_own = fn(*band_args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_band, out_own)
+    assert torch.equal(lse_band, lse_own)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", ["gqa", "kv_split"])
+def test_host_flags_with_grouped_queries_and_the_split_walk(case: str) -> None:
+    """Grouped-query heads (two KV heads for four query heads) and the
+    split-KV grid (``cute_flash_kv_split`` 2: two CTAs per pair item, the
+    words guarded by the all-full bit on both) with the all-full flags:
+    bitwise the table path, close to torch."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    kv_heads = 2 if case == "gqa" else None
+    q, k, v = _qkv(batch, heads, seq, seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        noop_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, enable_gqa=kv_heads is not None)
+    geometry = {
+        "q_block": 128,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": seq // 256,
+        "num_kv": seq // 128,
+    }
+    assert (
+        flex_item_flags(*args[4:8], **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    overrides: dict[str, object] = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    if case == "kv_split":
+        overrides[cute_flash.FLASH_KV_SPLIT_KEY] = 2
+    fn, resolved = _compile_flex(
+        args,
+        overrides,
+        expect_in_code="_flash_flex_hflags = cutlass.Int32(flash_flex_host_flags)",
+    )
+    assert resolved.flex_item_words
+    if case == "kv_split":
+        assert resolved.kv_split == 2
+    out_ref, lse_ref = fn(*_plain_table_args(args))
+    torch.cuda.synchronize()
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    ref_out, ref_lse = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads is not None
+    )
+    _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
 RESIDENT_REP32: dict[str, object] = {
     **PAIR_DESC,
     cute_flash.FLASH_S_LOAD_REP_KEY: 32,
@@ -811,8 +1072,8 @@ def test_resident_pass2_is_bitwise_the_reload_pass2(
         {**base, cute_flash.FLASH_S_RESIDENT_KEY: True},
         expect_in_code={
             "rep32": "fa4_disc_exp_convert_store_resident_rep32((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
-            "rep16_split": "fa4_disc_exp_convert_store_resident_rep16((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
-            "rep32_split": "fa4_disc_exp_convert_store_resident_rep32_split((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
+            "rep16_split": "fa4_disc_resident_chunk16(flash_res_frg0, ",
+            "rep32_split": "fa4_disc_resident_pair32(flash_p_sum, flash_res_frg0, flash_res_frg1, ",
         }[store],
     )
     assert resolved.s_resident
@@ -1291,3 +1552,207 @@ def test_keep_word_mask_form_is_bitwise_the_element_form(
     assert torch.equal(lse, results["element"][1])
     out_ref, lse_ref = _reference(q, k, v, None, block_mask)
     _assert_close_to_reference(out, lse, out_ref, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("persistent", "seq"),
+    [(False, 2048), (True, 2048), (False, 16384), (True, 16384)],
+    ids=["grid_words", "persistent_words", "grid_cursor", "persistent_cursor"],
+)
+def test_shared_softmax_region_is_bitwise_the_per_stage_regions(
+    persistent: bool, seq: int
+) -> None:
+    """``cute_flash_softmax_region="shared"``: one softmax region for both
+    query stages (the stage a warp-uniform runtime value) gives the same
+    output and LSE as the two per-stage regions with the same exp cadence,
+    on a mask-only walk with partial, full and absent tiles, over the
+    register words (2K) and the host words table's cursor (16K), on the
+    grid and the persistent walks. (One CTA per pair: the split-KV walk
+    the small 2K grid defaults to keeps the per-stage regions.)"""
+    batch, heads = (2, 4) if seq == 2048 else (1, 2)
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    base = {
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/6",
+        cute_flash.FLASH_E2E_OFFSET0_KEY: 3,
+        cute_flash.FLASH_E2E_OFFSET_KEY: 3,
+    }
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.softmax_region == "per_stage"
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        expect_in_code="flash_stage = cute.arch.make_warp_uniform(warp_idx // 4)",
+    )
+    assert resolved.softmax_region == "shared"
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+def _score_table_mod(table: torch.Tensor) -> Callable[..., Any]:
+    """A per-(row, column) score bias ``table[q, kv]`` (a row-strided table
+    load in the score hook: a coalescible run, so the hook runs on every
+    tile and stages through the per-warp cooperative ring)."""
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(table, [q_idx, kv_idx]).to(torch.float32)
+
+    return score_mod
+
+
+def _keep_table_masks(
+    keep: torch.Tensor,
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """A causal mask gated by a per-(row, column) table ``keep[q, kv]`` (a
+    row-strided table load in the mask hook: the coalescible run the
+    staging ring serves, and the prefetch's per-chunk table load): the
+    Helion form for the kernel and the eager form for the BlockMask."""
+
+    def helion_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (hl.load(keep, [q_idx, kv_idx]) != 0)
+
+    def torch_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (keep[q_idx, kv_idx] != 0)
+
+    return helion_mask, torch_mask
+
+
+_SHARED_COVERAGE: dict[str, dict[str, object]] = {
+    # The shapes and bodies the shared region must match per stage on.
+    "ragged": {"seq": 1920},
+    "fp16": {"dtype": torch.float16},
+    "gqa": {"kv_heads": 2},
+    "rep32_store": {
+        "overrides": {
+            cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+            cute_flash.FLASH_P_STORE_REP_KEY: 32,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        }
+    },
+    "mixed_store": {
+        "overrides": {
+            cute_flash.FLASH_P_STORE_REP_KEY: 32,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        }
+    },
+    "resident": {
+        "overrides": {**RESIDENT_REP32, cute_flash.FLASH_S_RESIDENT_KEY: True}
+    },
+    "coalesced_mask": {
+        "table_mask": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+        },
+        "expect": ("flex_coalesce", 64),
+    },
+    "prefetched_mask": {
+        "table_mask": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 32,
+        },
+        "expect": ("flex_prefetch", 32),
+    },
+    "coalesced_score": {
+        "score_table": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+        },
+        "expect": ("flex_coalesce", 64),
+    },
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", sorted(_SHARED_COVERAGE), ids=sorted(_SHARED_COVERAGE))
+def test_shared_softmax_region_coverage_is_bitwise_the_per_stage_regions(
+    case: str,
+) -> None:
+    """The shared softmax region matches the per-stage regions bitwise on a
+    ragged query length (the live-rows guard), fp16, grouped-query heads,
+    the Rep32 and the mixed Rep32/Rep16 P stores, the resident PASS2, and
+    the table-gated mask whose hook stages its rows through the per-warp
+    cooperative ring (``cute_flash_flex_coalesce``: the ring is addressed by
+    the runtime stage) or prefetches them (``cute_flash_flex_prefetch``),
+    and a score region (a coalesced score table: the hook on every tile)."""
+    spec = _SHARED_COVERAGE[case]
+    batch, heads = 2, 4
+    seq = int(spec.get("seq", 2048))
+    kv_heads = spec.get("kv_heads")
+    q, k, v = _qkv(
+        batch,
+        heads,
+        seq,
+        seq,
+        kv_heads=kv_heads,  # pyrefly: ignore[bad-argument-type]
+        dtype=spec.get("dtype", torch.bfloat16),  # pyrefly: ignore[bad-argument-type]
+    )
+    if spec.get("table_mask"):
+        torch.manual_seed(1)
+        keep = (torch.rand(seq, seq, device=DEVICE) < 0.7).to(torch.int32)
+        helion_mask, torch_mask = _keep_table_masks(keep)
+    else:
+        helion_mask = torch_mask = _band
+    score_mod: Callable[..., Any] = _identity
+    if spec.get("score_table"):
+        torch.manual_seed(2)
+        score_mod = _score_table_mod(
+            torch.randn(seq, seq, dtype=torch.bfloat16, device=DEVICE)
+        )
+    block_mask = create_block_mask(
+        torch_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        score_mod,
+        block_mask,
+        mask_mod=helion_mask,
+        enable_gqa=kv_heads is not None,
+    )
+    base = {
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_E2E_OFFSET0_KEY: 3,
+        cute_flash.FLASH_E2E_OFFSET_KEY: 3,
+        **spec.get("overrides", {}),  # pyrefly: ignore[bad-argument-type]
+    }
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.softmax_region == "per_stage"
+    expect = spec.get("expect")
+    if expect is not None:
+        name, value = expect  # pyrefly: ignore[bad-assignment]
+        assert getattr(resolved, name) == value, (name, getattr(resolved, name))
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        expect_in_code="flash_stage = cute.arch.make_warp_uniform(warp_idx // 4)",
+    )
+    assert resolved.softmax_region == "shared"
+    if expect is not None:
+        name, value = expect  # pyrefly: ignore[bad-assignment]
+        assert getattr(resolved, name) == value
+    if case == "coalesced_mask":
+        assert resolved.flex_coalesce_slots  # the staging ring is in use
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
