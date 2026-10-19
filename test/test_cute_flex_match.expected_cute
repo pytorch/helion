@@ -658,16 +658,20 @@ _helion_helion_flex_attention_kernel._helion_cute_wrapper_plans = [{'kind': 'hel
 def helion_flex_attention_kernel(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, score_mod: Callable, block_mask_kv_num_blocks: torch.Tensor, block_mask_kv_indices: torch.Tensor, block_mask_full_kv_num_blocks: torch.Tensor | None, block_mask_full_kv_indices: torch.Tensor | None, block_mask_mask_mod: Callable, block_mask_m: int, block_mask_n: int, scale: float, enable_gqa: bool=False, *, _launcher=_default_cute_launcher):
     B, H, M, D = query.size()
     D = 64
-    assert key.size() == value.size()
+    Dv = 64
     Bk, Hk, N, Dk = key.size()
     assert Bk == B
     assert Dk == D
+    assert value.size()[:3] == key.size()[:3]
     if enable_gqa:
         assert H % Hk == 0
     else:
         assert Hk == H
     table_batch, table_heads, _ = block_mask_kv_num_blocks.size()
-    out = torch.empty_like(query)
+    if Dv == D:
+        out = torch.empty_like(query)
+    else:
+        out = torch.empty((B, H, M, Dv), dtype=query.dtype, device=query.device)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
     assert (block_mask_full_kv_indices is None) == (block_mask_full_kv_num_blocks is None)
     _launcher(_helion_helion_flex_attention_kernel, (64,), query, key, value, out, block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, lse, _helion_flash_flex_item_table(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), _helion_flash_flex_item_words(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), scale, block=(512, 1, 1))

@@ -62,6 +62,7 @@ from .attention_plan import SOFTCAP_KIND
 from .attention_plan import TENSOR_BIAS_KIND
 from .attention_plan import AttentionScorePlan
 from .attention_plan import FlexKvWalk
+from .attention_plan import flash_head_dim_supported
 from .attention_plan import flash_head_dims_supported
 from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
@@ -1886,12 +1887,42 @@ def _flash_kv_stage(head_dim: int) -> int:
 
 
 def _flash_deep_1cta_kv_stage_cap(head_dim: int) -> int:
-    """Largest legal per-ring K/V depth while retaining local S2."""
-    if head_dim == 64:
+    """Largest legal per-ring K/V depth while retaining local S2.
+
+    The two measured widths bound the bands: a narrower head dim stages
+    fewer bytes per ring slot than the width whose depth it inherits, so the
+    inherited depth fits by construction.
+    """
+    if not flash_head_dim_supported(head_dim):
+        return 0
+    if head_dim <= 64:
         return 4
-    if head_dim == 128:
-        return 2
-    return 0
+    return 2
+
+
+def _flash_o_store_thread_layout_lines(
+    head_dim_v: int, threads: int, *, dim_name: str, elems_name: str
+) -> str:
+    """Thread layout of the staged vector store of a ``head_dim_v``-wide tile.
+
+    Every thread stores one 16-byte packet (``elems_name`` elements: eight
+    at 16 bits) per step, so a row holds ``head_dim_v // 8`` packets. The
+    (rows, threads per row) layout tiles the ``threads``-wide store only when
+    the per-row count divides the thread count: widths whose packet count
+    does (16, 32, 64, 128) spread each row over all its packets, the others
+    (48, 80, 96, 112) take the largest common divisor, so a pass covers a row
+    slice and the copy iterates the slices. Either way every thread owns
+    packets (a thread outside the layout would address past the tile).
+    """
+    packets_per_row = head_dim_v // 8
+    threads_per_row = math.gcd(packets_per_row, threads)
+    if threads_per_row == packets_per_row:
+        dim_line = f"{dim_name} = {head_dim_v} // {elems_name}"
+    else:
+        dim_line = f"{dim_name} = {threads_per_row}"
+    return f"""{dim_line}
+flash_o_tO_layout = cute.make_ordered_layout(
+    ({threads} // {dim_name}, {dim_name}), order=(1, 0))"""
 
 
 def _flash_aliased_kv_stage_cap(
@@ -2021,14 +2052,17 @@ def _flash_uneven_kv_ring_supported(
     topology: str,
     separate_kv_rings: bool,
     mma_ptx: bool,
+    aux_smem_bytes: int = 0,
 ) -> bool:
     """Whether FA4's uneven three-slot aliased ring can host this plan.
 
     The layout exists for asymmetric head dims on the plain one-CTA FA4 body:
     the odd slot's shift is applied to the TMA destination and to the PTX
     MMA descriptor start addresses (the ``cute.gemm`` stream re-partitions
-    the ring instead), and the third slot has to fit next to the Q tiles and
-    the requested output staging.
+    the ring instead), and the third slot has to fit next to the Q tiles,
+    the requested output staging and the flex hook's shared-memory regions
+    (``aux_smem_bytes``: the staged aux tables plus the cooperative table
+    staging).
     """
     if head_dim_v is None or head_dim_v == head_dim:
         return False
@@ -2042,6 +2076,7 @@ def _flash_uneven_kv_ring_supported(
             kv_tile_n=kv_tile_n,
             head_dim_v=head_dim_v,
             uneven_kv_ring=True,
+            aux_smem_bytes=aux_smem_bytes,
         )
     )
 
@@ -4680,7 +4715,12 @@ def resolve_flash_config(
         if rescale_chunk_cols_cfg is not None:
             rescale_chunk_cols = int(rescale_chunk_cols_cfg)  # type: ignore[arg-type]
         valid_rescale_chunks = (8, 16, 32, 64) if head_dim_v == 64 else (8, 16, 32)
-        if rescale_chunk_cols not in valid_rescale_chunks:
+        # The rescale walks the ``head_dim_v`` columns in whole chunks (the
+        # runtime would fall back silently for a width that does not divide).
+        if (
+            rescale_chunk_cols not in valid_rescale_chunks
+            or head_dim_v % rescale_chunk_cols != 0
+        ):
             rescale_chunk_cols = rescale_chunk_default
         softmax_regs = int(
             _flash_env_get(
@@ -5227,10 +5267,13 @@ def resolve_flash_config(
         and head_dim_v == 128
         and exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
     )
+    # The plain cadence packets only batch the exp2 emission of the softmax
+    # pass (no head-dim dependence); every symmetric head dim takes them. The
+    # compound packets (polynomial, resident) are keyed on the widths above.
     if (
         topology != "fa4"
         or not split_or_manual_xu
-        or (head_dim not in (64, 128) and not pair_resident_packet)
+        or (not flash_head_dim_supported(head_dim) and not pair_resident_packet)
         or (
             head_dim == 128
             and exp2_packet
@@ -5480,28 +5523,37 @@ def resolve_flash_config(
         # Two staged 128 x head_dim_v output tiles do not fit next to the two
         # head_dim-wide Q tiles and a two-deep ring of head_dim-wide slots, so
         # the pair keeps the direct per-thread output store (unless the staged
-        # tiles live in the Q stages).
-        epi_tma = False
-        epi_stg = False
-        epi_stg_store = "slice"
-        epi_stg_gmem = "stage"
-    # FA4's uneven [wide, narrow, wide] ring gives the asymmetric pair a third
-    # K/V stage; it is the ring depth's only route to three on that pair, so
-    # the knob sets ``kv_stage`` itself.
-    uneven_kv_ring = _flash_bool_env("HELION_CUTE_FLASH_UNEVEN_KV_RING", False)
-    uneven_kv_ring_cfg = _cfg(FLASH_UNEVEN_KV_RING_KEY)
-    if uneven_kv_ring_cfg is not None:
-        uneven_kv_ring = bool(uneven_kv_ring_cfg)
-    if uneven_kv_ring and not _flash_uneven_kv_ring_supported(
-        head_dim,
-        head_dim_v=head_dim_v,
-        stage_output=(epi_tma or epi_stg) and not o_over_q,
-        kv_tile_n=kv_tile_n,
-        topology=topology,
-        separate_kv_rings=separate_kv_rings,
-        mma_ptx=mma_ptx,
-    ):
-        uneven_kv_ring = False
+        # tiles live in the Q stages). The list walk has no direct store (its
+        # O/LSE stores are row guarded through the staged epilogue), so the
+        # pair's list walk stages the tiles in the dead Q stages instead,
+        # which needs the one-item-per-CTA body (a persistent CTA would load
+        # the next item's Q into the bytes being staged).
+        list_walk_o_over_q = has_list_walk and _flash_o_over_q_supported(
+            head_dim,
+            head_dim_v=head_dim_v,
+            topology=topology,
+            staged_output=True,
+            persistent=False,
+            separate_kv_rings=separate_kv_rings,
+            use_2cta_instrs=use_2cta_instrs,
+            use_cga2_local_cta=use_cga2_local_cta,
+            use_clc_scheduler=use_clc_scheduler,
+            local_tma_partition=local_tma_partition,
+            tensor_4d_tma=tensor_4d_tma,
+            has_row_epilogue=has_row_epilogue,
+            row_bound_tiling=row_bound_tiling,
+        )
+        if list_walk_o_over_q:
+            persistent = False
+            persistent_ctas_per_sm = 1
+            # Derived from ``persistent`` above; re-derive for the pinned body.
+            recompute_tile_coords = False
+            o_over_q = True
+        else:
+            epi_tma = False
+            epi_stg = False
+            epi_stg_store = "slice"
+            epi_stg_gmem = "stage"
     # The flex hook's shared-memory regions come out of the K/V ring's
     # budget: the staged aux tables (``cute_flash_flex_aux_smem``) and the
     # warp-cooperative table staging (``cute_flash_flex_coalesce``, the
@@ -5534,12 +5586,31 @@ def resolve_flash_config(
     )
     flex_coalesce_slots = 1 if flex_coop_slot_bytes else 0
     flex_coop_bytes = flex_coop_slot_bytes
+    # FA4's uneven [wide, narrow, wide] ring gives the asymmetric pair a third
+    # K/V stage; it is the ring depth's only route to three on that pair, so
+    # the knob sets ``kv_stage`` itself.
+    uneven_kv_ring = _flash_bool_env("HELION_CUTE_FLASH_UNEVEN_KV_RING", False)
+    uneven_kv_ring_cfg = _cfg(FLASH_UNEVEN_KV_RING_KEY)
+    if uneven_kv_ring_cfg is not None:
+        uneven_kv_ring = bool(uneven_kv_ring_cfg)
+    if uneven_kv_ring and not _flash_uneven_kv_ring_supported(
+        head_dim,
+        head_dim_v=head_dim_v,
+        stage_output=(epi_tma or epi_stg) and not o_over_q,
+        kv_tile_n=kv_tile_n,
+        topology=topology,
+        separate_kv_rings=separate_kv_rings,
+        mma_ptx=mma_ptx,
+        # The flex hook's shared-memory regions share the ring's budget.
+        aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
+    ):
+        uneven_kv_ring = False
     if uneven_kv_ring:
         kv_stage = UNEVEN_KV_RING_DEPTH
     elif (
         topology == "fa4"
         and not separate_kv_rings
-        and (head_dim in (64, 128) or asymmetric_head_dims)
+        and flash_head_dims_supported(head_dim, head_dim_v)
     ):
         # The staging depth has to be capped for the *configured* tile width:
         # Cooperative MMA partitions each K/V slot across its two CTAs. A
@@ -9839,6 +9910,7 @@ def flash_autotune_fragments(
     # aliased ring slots are the wider K tile, and staged O fits only when the
     # schedule's byte model says so (it does not at 192/128).
     asymmetric_head_dims = head_dim_v is not None and head_dim_v != head_dim
+    value_head_dim = head_dim if head_dim_v is None else head_dim_v
     # The list walk's pair body is keyed on the query geometry (a ragged
     # last pair runs a dead or half-live second stage), never on the KV tile
     # count: its fa4 surface is the same at every length.
@@ -9885,8 +9957,16 @@ def flash_autotune_fragments(
             head_dim, head_dim_v=head_dim_v, stage_output=False
         )
     )
+    # The pair's list walk has no direct output store, so where its staged
+    # tiles do not fit beside the Q tiles the resolver stages them in the
+    # dead Q stages of the one-item-per-CTA body: that surface pins the knob
+    # (and the non-persistent body) instead of searching them.
+    pair_list_walk_o_over_q = (
+        asymmetric_head_dims and has_list_walk and defaults.o_over_q
+    )
     o_over_q_eligible = (
         (pair_fa4 or stagger_needs_o_over_q)
+        and not pair_list_walk_o_over_q
         and not defaults.persistent
         and _flash_o_over_q_supported(
             head_dim,
@@ -9907,6 +9987,7 @@ def flash_autotune_fragments(
     asymmetric_staged_output_fits = (
         not asymmetric_head_dims
         or o_over_q_eligible
+        or pair_list_walk_o_over_q
         or _flash_aliased_kv_stage_cap(
             head_dim, head_dim_v=head_dim_v, stage_output=True
         )
@@ -10062,7 +10143,7 @@ def flash_autotune_fragments(
         cap = _flash_deep_1cta_kv_stage_cap(head_dim)
         kv_stage_values = tuple(range(2, cap + 1))
         kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_values)
-    elif fa4_search_eligible and (head_dim in (64, 128) or asymmetric_head_dims):
+    elif fa4_search_eligible and flash_head_dims_supported(head_dim, value_head_dim):
         # A mixed-family fragment must represent the deepest legal cooperative
         # ring. Normalization applies each selected family's own resource cap.
         # Pinning a local-MMA family keeps its original per-CTA storage domain.
@@ -10150,7 +10231,7 @@ def flash_autotune_fragments(
         # prelude re-reads the tables); one CTA per SM, no coordinate
         # recompute.  Torch's empty BlockMask has no tables: no item order
         # to walk, pinned non-persistent.
-        if flex_trivial_walk:
+        if flex_trivial_walk or pair_list_walk_o_over_q:
             persistent = enum(False, (False, True), (False,))
         else:
             persistent = enum(defaults.persistent, (False, True), (False, True))
@@ -10308,6 +10389,11 @@ def flash_autotune_fragments(
     rescale_chunk_search = (8, 16, 32, 64) if head_dim == 64 else (8, 16, 32)
     if valid_family_flags is not None and valid_family_flags.use_clc_scheduler:
         rescale_chunk_search = (8, 16, 32)
+    # The rescale walks the ``head_dim_v``-wide output in whole chunks; a
+    # width that does not divide it resolves to the default (a dead alias).
+    rescale_chunk_search = tuple(
+        chunk for chunk in rescale_chunk_search if value_head_dim % chunk == 0
+    )
     rescale_chunk = enum(
         defaults.rescale_chunk_cols,
         (8, 16, 32, 64),
@@ -10335,10 +10421,15 @@ def flash_autotune_fragments(
     # ws_overlap keeps its 64-column epilogue chunk fixed (one TMEM load per
     # pass): searching it would only inflate the small ws-only raw product with
     # source-identical direct-store aliases.
+    # The correction epilogue tiles the ``head_dim_v``-wide output: only the
+    # widths that divide it are distinct bodies (the rest resolve to the
+    # default).
     corr_tile = enum(
         defaults.corr_tile_size,
         (8, 16, 32, 64),
-        (8, 16, 32) if fa4_search_eligible else (defaults.corr_tile_size,),
+        tuple(size for size in (8, 16, 32) if value_head_dim % size == 0)
+        if fa4_search_eligible
+        else (defaults.corr_tile_size,),
     )
     # Which FA4 warps evaluate a fused row epilogue. Without a row program the
     # value is source-neutral, so it is only searched when one exists.
@@ -10746,7 +10837,10 @@ def flash_autotune_fragments(
 
     packet_values: list[str] = ["1x1"]
     packet_search: list[str] = ["1x1"]
-    if d64_fa4 or (head_dim == 128 and fa4_search_eligible and not is_causal):
+    if fa4_search_eligible and (
+        (flash_head_dim_supported(head_dim) and head_dim != 128)
+        or (head_dim == 128 and not is_causal)
+    ):
         # The plain packets only batch the scale/exp2 instruction emission of
         # the chunked softmax pass (same arithmetic per element). Dense hd128
         # searches them like hd64; the causal hd128 surface keeps its resident
@@ -14092,9 +14186,7 @@ tAsA_aux_tma, tAgA_aux_tma = cute_cpasync_flash.tma_partition(
     setup_o_store = (
         f"""
 flash_o_store_elems = 128 // {io_dtype}.width
-flash_o_tO_dim1 = {hd} // flash_o_store_elems
-flash_o_tO_layout = cute.make_ordered_layout(
-    (128 // flash_o_tO_dim1, flash_o_tO_dim1), order=(1, 0))
+{_flash_o_store_thread_layout_lines(hd, 128, dim_name="flash_o_tO_dim1", elems_name="flash_o_store_elems")}
 flash_o_vO_layout = cute.make_layout((1, flash_o_store_elems))
 flash_o_gmem_atom = cute.make_copy_atom(
     cute.nvgpu.CopyUniversalOp(), {io_dtype}, num_bits_per_copy=128)
@@ -16129,6 +16221,14 @@ def emit_flash_fa4_device_body(
     # one buffer per softmax warp, sized by the widest request of the hook's
     # runs at this chunk width (the renderer derives the same layout); part of
     # the verified schedules' shared memory and of the storage below.
+    # The flex hook's shared-memory aux staging: the staged tables' region
+    # at the end of the storage, filled by every thread of the CTA before
+    # the setup sync (the softmax warps read it after); part of the verified
+    # schedules' shared memory like the cooperative staging below.
+    flex_aux_layout = (
+        flex_aux_smem_layout(score_plan, cfg.flex_aux_smem) if flex_body else []
+    )
+    flex_aux_bytes = sum(entry.padded_bytes for entry in flex_aux_layout)
     flex_coop_bytes = 0
     if flex_body and cfg.flex_coalesce:
         assert num_heads is not None
@@ -16151,7 +16251,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
-                    aux_smem_bytes=flex_coop_bytes,
+                    aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     cta_count=2 if use_2cta_instrs else 1,
@@ -16181,7 +16281,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
-                    aux_smem_bytes=flex_coop_bytes,
+                    aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     cta_count=2,
@@ -16214,7 +16314,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
-                    aux_smem_bytes=flex_coop_bytes,
+                    aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     causal=True,
@@ -16242,7 +16342,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
-                    aux_smem_bytes=flex_coop_bytes,
+                    aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     causal=is_causal,
@@ -16451,15 +16551,8 @@ def emit_flash_fa4_device_body(
         storage_extra_args += f", head_dim_v={hd_v}"
     if uneven_kv_ring:
         storage_extra_args += ", uneven_kv_ring=True"
-    # The flex hook's shared-memory aux staging: the staged tables' region
-    # at the end of the storage, filled by every thread of the CTA before
-    # the setup sync (the softmax warps read it after).
-    flex_aux_layout = (
-        flex_aux_smem_layout(score_plan, cfg.flex_aux_smem) if flex_body else []
-    )
     flex_aux_smem_setup = ""
     if flex_aux_layout:
-        flex_aux_bytes = sum(entry.padded_bytes for entry in flex_aux_layout)
         storage_extra_args += f", flex_aux_bytes={flex_aux_bytes}"
         flex_aux_smem_setup = "\n" + "\n".join(
             _flash_flex_aux_smem_fill(score_plan, flex_aux_layout)
@@ -17469,9 +17562,7 @@ tOsO_tma, tOgO_tma = cute_cpasync_flash.tma_partition(
         f"""
 flash_o_store_bits = 128
 flash_o_async_copy_elems = flash_o_store_bits // {io_dtype}.width
-flash_o_tO_shape_dim_1 = {hd_v} // flash_o_async_copy_elems
-flash_o_tO_layout = cute.make_ordered_layout(
-    (32 // flash_o_tO_shape_dim_1, flash_o_tO_shape_dim_1), order=(1, 0))
+{_flash_o_store_thread_layout_lines(hd_v, 32, dim_name="flash_o_tO_shape_dim_1", elems_name="flash_o_async_copy_elems")}
 flash_o_vO_layout = cute.make_layout((1, flash_o_async_copy_elems))
 flash_o_gmem_atom = cute.make_copy_atom(
     cute.nvgpu.CopyUniversalOp(), {io_dtype}, num_bits_per_copy=flash_o_store_bits)

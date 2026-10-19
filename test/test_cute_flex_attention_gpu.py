@@ -321,8 +321,9 @@ def _run(
     enable_gqa: bool = False,
     kernel_mask_mod: Callable[..., Any] | None = None,
     overrides: dict[str, object] | None = None,
+    extra_config: dict[str, object] | None = None,
 ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The fused kernel at ``FLEX_CONFIG`` (``overrides`` on top) and the
+    """The fused kernel at ``FLEX_CONFIG`` (``overrides`` / ``extra_config`` on top) and the
     eager reference: ``(code, out, lse, ref_out, ref_lse)``."""
     scale = 1.0 / math.sqrt(q.size(-1))
     helion_mod, torch_mod = mods if mods is not None else (_identity, None)
@@ -336,9 +337,8 @@ def _run(
         enable_gqa=enable_gqa,
         mask_mod=kernel_mask_mod,
     )
-    code, (out, lse) = code_and_output(
-        _flex_kernel(), args, **{**FLEX_CONFIG, **(overrides or {})}
-    )
+    config = {**FLEX_CONFIG, **(overrides or {}), **(extra_config or {})}
+    code, (out, lse) = code_and_output(_flex_kernel(), args, **config)
     ref_out, ref_lse = flex_attention(
         q,
         k,
@@ -826,3 +826,250 @@ def test_packed_qkv_slices() -> None:
     assert torch.equal(out, out_c)
     assert torch.equal(lse, lse_c)
     _assert_close(out, lse, ref_out, ref_lse)
+
+
+# -- (xiv) head dims beyond 64 and 128 -----------------------------------------
+#
+# Every multiple of 16 from 16 to 128 runs the same fa4 list-walk body at the
+# exact width: the CuTe DSL picks the SMEM swizzle the width admits (64 B at
+# multiples of 32, 32 B otherwise), the TMA boxes and the MMA extents are exact
+# and the two TMEM output accumulators take ``head_dim`` columns each.
+
+
+def _assert_close_to_fp32(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: BlockMask,
+    *,
+    torch_mod: Callable[..., Any] | None = None,
+    enable_gqa: bool = False,
+) -> None:
+    """The output against the fp32 eager reference (the tolerance is the
+    I/O dtype's own rounding of a unit-variance output, which the bf16 /
+    fp16 eager paths reach themselves)."""
+    ref32 = flex_attention(
+        q.float(),
+        k.float(),
+        v.float(),
+        score_mod=torch_mod,
+        block_mask=block_mask,
+        scale=1.0 / math.sqrt(q.size(-1)),
+        enable_gqa=enable_gqa,
+    )
+    atol = 2e-2 if out.dtype is torch.bfloat16 else 4e-3
+    torch.testing.assert_close(out.float(), ref32, atol=atol, rtol=0.0)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("head_dim", "dtype"),
+    [
+        pytest.param(16, torch.bfloat16, id="d16-bf16"),
+        pytest.param(32, torch.bfloat16, id="d32-bf16"),
+        pytest.param(80, torch.bfloat16, id="d80-bf16"),
+        pytest.param(96, torch.float16, id="d96-fp16"),
+        pytest.param(112, torch.bfloat16, id="d112-bf16"),
+    ],
+)
+def test_head_dim_causal(head_dim: int, dtype: torch.dtype) -> None:
+    q, k, v = _qkv(2, 4, 1024, 1024, head_dim, dtype)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    _assert_list_walk(code, mask=True, score=False)
+    assert f"'head_dim': {head_dim}," in code
+    assert f"flash_pvt.partition_shape_C((128, {head_dim}))" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(out, q, k, v, block_mask)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("head_dim", [32, 80, 96])
+def test_head_dim_score_mod_and_grouped_heads(head_dim: int) -> None:
+    """A relative-position bias score_mod over the causal mask, two K/V heads
+    shared by four query heads."""
+    q, k, v = _qkv(2, 4, 1024, 1024, head_dim, torch.bfloat16, kv_heads=2)
+    torch.manual_seed(1)
+    table = torch.randn(2 * 1024, device=DEVICE, dtype=torch.float32)
+    mods = _rel_bias_mods(table, 1024)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, mods=mods, enable_gqa=True
+    )
+    _assert_list_walk(code, mask=True, score=True)
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(out, q, k, v, block_mask, torch_mod=mods[1], enable_gqa=True)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("head_dim", "q_seq", "dtype"),
+    [
+        pytest.param(16, 1024, torch.bfloat16, id="d16"),
+        pytest.param(80, 1024, torch.bfloat16, id="d80"),
+        pytest.param(96, 960, torch.float16, id="d96-ragged"),
+        pytest.param(112, 64, torch.bfloat16, id="d112-sub-tile"),
+        pytest.param(48, 1024, torch.bfloat16, id="d48"),
+    ],
+)
+def test_head_dim_staged_vector_store(
+    head_dim: int, q_seq: int, dtype: torch.dtype
+) -> None:
+    """The row-guarded staged store (the TMA store off): a width whose
+    16-byte packets per row do not divide the epilogue warp spreads one pass
+    over a row slice instead of whole rows (threads past the layout would
+    otherwise address outside the tile)."""
+    q, k, v = _qkv(2, 4, q_seq, 1024, head_dim, dtype)
+    block_mask = _block_mask(_causal, 2, 4, q_seq, 1024)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, extra_config={cute_flash.FLASH_EPI_TMA_KEY: False}
+    )
+    assert "_flash_tma_o" not in code
+    # The whole-tile store, or its row-guarded sibling for a ragged length.
+    assert "_helion_flash_rt.fa4_store_o_smem_to_gmem" in code
+    threads_per_row = math.gcd(head_dim // 8, 32)
+    if threads_per_row == head_dim // 8:
+        # Whole rows per pass: the historical layout text.
+        assert (
+            f"flash_o_tO_shape_dim_1 = {head_dim} // flash_o_async_copy_elems" in code
+        )
+    else:
+        assert f"flash_o_tO_shape_dim_1 = {threads_per_row}\n" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(out, q, k, v, block_mask)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("head_dim", "kv_stage", "packet", "schedule"),
+    [
+        pytest.param(16, 51, "8x1", "16/4", id="d16-depth51"),
+        pytest.param(32, 24, "4x2", "16/4", id="d32-depth24"),
+        pytest.param(80, 7, "8x2", "16/8", id="d80-depth7"),
+        pytest.param(96, 5, "1x1", "8/2", id="d96-depth5"),
+    ],
+)
+def test_head_dim_deepest_staged_ring(
+    head_dim: int, kv_stage: int, packet: str, schedule: str
+) -> None:
+    """The deepest K/V ring the byte model allows beside the staged output at
+    the width (hd16 reaches the depth where the per-stage barrier pair pushes
+    the storage header past 3 KB), with the plain exp2 packets."""
+    q, k, v = _qkv(2, 4, 2048, 2048, head_dim, torch.bfloat16)
+    block_mask = _block_mask(_sliding_causal(512), 2, 4, 2048, 2048)
+    code, out, lse, ref_out, ref_lse = _run(
+        q,
+        k,
+        v,
+        block_mask,
+        extra_config={
+            cute_flash.FLASH_KV_STAGE_KEY: kv_stage,
+            cute_flash.FLASH_EXP2_PACKET_KEY: packet,
+            cute_flash.FLASH_E2E_SCHEDULE_KEY: schedule,
+        },
+    )
+    assert f"'kv_stage': {kv_stage}," in code
+    _assert_list_walk(code, mask=True, score=False)
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(out, q, k, v, block_mask)
+
+
+# -- (xv) the (192, 128) MLA pair on the list walk ---------------------------
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("with_score_mod", "epi_tma"),
+    [
+        pytest.param(False, True, id="causal-tma"),
+        pytest.param(True, True, id="score-tma"),
+        pytest.param(True, False, id="score-staged"),
+    ],
+)
+def test_mla_pair_list_walk_stages_output_in_the_q_stages(
+    with_score_mod: bool, epi_tma: bool
+) -> None:
+    """(192, 128) through the example kernel (its accumulator and output take
+    V's width): two staged 128 x 128 output tiles do not fit beside two
+    192-wide Q tiles and a two-deep ring, and the list walk has no direct
+    store, so its output is staged in the dead Q stages of the
+    one-item-per-CTA body (the resolver pins ``o_over_q`` on and
+    ``persistent`` off; a persistent request resolves the same way)."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 1024, 192, dtype=torch.bfloat16, device=DEVICE)
+    k = torch.randn(2, 4, 1024, 192, dtype=torch.bfloat16, device=DEVICE)
+    v = torch.randn(2, 4, 1024, 128, dtype=torch.bfloat16, device=DEVICE)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    mods = None
+    if with_score_mod:
+        table = torch.randn(1024, device=DEVICE, dtype=torch.bfloat16)
+        mods = _column_table_mods(table)
+    code, out, lse, ref_out, ref_lse = _run(
+        q,
+        k,
+        v,
+        block_mask,
+        mods=mods,
+        # The pair's packets are the exact cadence and the resident family
+        # (keyed on its 128-wide value tiles); the shared structure's 8x2
+        # plain packet is not among them.
+        extra_config={
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+            cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+            cute_flash.FLASH_EPI_TMA_KEY: epi_tma,
+        },
+    )
+    _assert_list_walk(code, mask=True, score=with_score_mod)
+    assert "'head_dim': 192, 'head_dim_v': 128," in code
+    assert "'persistent': False," in code
+    assert f"'epi_tma': {epi_tma}," in code
+    assert f"'epi_stg': {not epi_tma}," in code
+    # The staged tiles alias the Q stages: no separate ``sO`` bytes.
+    assert "flash_fa4_shared_storage(192, 2, 2, 2, cutlass.BFloat16, False, " in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(
+        out, q, k, v, block_mask, torch_mod=None if mods is None else mods[1]
+    )
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("aux_budget", "kv_stage"),
+    [
+        pytest.param(0, 3, id="uneven-ring"),
+        pytest.param(16384, 2, id="aux-tables-decline-the-uneven-ring"),
+    ],
+)
+def test_mla_pair_list_walk_uneven_ring_against_the_aux_tables(
+    aux_budget: int, kv_stage: int
+) -> None:
+    """The pair's uneven three-slot ring fills shared memory exactly; a
+    relative-bias score_mod whose staged table (``cute_flash_flex_aux_smem``,
+    8 KB here) takes bytes beyond the header padding declines it back to the
+    two-deep ring instead of overflowing the budget at launch."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 1024, 192, dtype=torch.bfloat16, device=DEVICE)
+    k = torch.randn(2, 4, 1024, 192, dtype=torch.bfloat16, device=DEVICE)
+    v = torch.randn(2, 4, 1024, 128, dtype=torch.bfloat16, device=DEVICE)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    torch.manual_seed(1)
+    table = torch.randn(2 * 1024, device=DEVICE, dtype=torch.float32)
+    mods = _rel_bias_mods(table, 1024)
+    code, out, lse, ref_out, ref_lse = _run(
+        q,
+        k,
+        v,
+        block_mask,
+        mods=mods,
+        extra_config={
+            cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+            cute_flash.FLASH_UNEVEN_KV_RING_KEY: True,
+            cute_flash.FLASH_FLEX_AUX_SMEM_KEY: aux_budget,
+        },
+    )
+    _assert_list_walk(code, mask=True, score=True)
+    assert f"'kv_stage': {kv_stage}," in code
+    assert ("flex_aux_bytes=" in code) == (aux_budget > 0)
+    _assert_close(out, lse, ref_out, ref_lse)
+    _assert_close_to_fp32(out, q, k, v, block_mask, torch_mod=mods[1])

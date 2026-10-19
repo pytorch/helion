@@ -19,7 +19,7 @@ import torch
 
 import helion
 from helion._compiler.cute import cute_flash
-from helion._compiler.cute.attention_plan import FLASH_HEAD_DIM_PAIRS
+from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
 from helion._testing import patch_cute_mma_support
@@ -159,8 +159,10 @@ def _active(fragment: ConfigSpecFragment) -> tuple[object, ...]:
 
 
 def test_head_dim_pairs() -> None:
-    assert {(64, 64), (128, 128), (192, 128)} == FLASH_HEAD_DIM_PAIRS
+    assert {(192, 128)} == FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
     assert flash_head_dims_supported(192, 128)
+    assert flash_head_dims_supported(64, 64)
+    assert flash_head_dims_supported(128, 128)
     assert not flash_head_dims_supported(192, 192)
     assert not flash_head_dims_supported(128, 64)
     assert not flash_head_dims_supported(256, 128)

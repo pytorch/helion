@@ -61,10 +61,13 @@ def helion_flex_attention_kernel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, H, M, D = query.size()
     D = hl.specialize(D)
-    assert key.size() == value.size()
+    # The V/O head dim may differ from the Q/K head dim (the MLA prefill pair
+    # 192/128): the accumulator and the output take V's width.
+    Dv = hl.specialize(value.size(-1))
     Bk, Hk, N, Dk = key.size()
     assert Bk == B
     assert Dk == D
+    assert value.size()[:3] == key.size()[:3]
     if enable_gqa:
         assert H % Hk == 0
     else:
@@ -81,7 +84,13 @@ def helion_flex_attention_kernel(
     # dims): index them modulo their own sizes, like FlexAttention's
     # ``sparse_idx_z = off_z % SPARSE_Z``.
     table_batch, table_heads, _ = block_mask_kv_num_blocks.size()
-    out = torch.empty_like(query)
+    # The output keeps the query's memory layout (a transposed or packed
+    # query gives a transposed output, like ``empty_like``); a V/O width
+    # other than the Q/K width gets a dense output of its own.
+    if Dv == D:
+        out = torch.empty_like(query)
+    else:
+        out = torch.empty((B, H, M, Dv), dtype=query.dtype, device=query.device)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
     log_2_e = 1.44269504
     block_m = hl.register_block_size(min(256, block_mask_m))
@@ -92,7 +101,7 @@ def helion_flex_attention_kernel(
     for tile_b, tile_h, tile_m in hl.tile([B, H, M], block_size=[1, 1, block_m]):
         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_m, D], dtype=torch.float32)
+        acc = hl.zeros([tile_m, Dv], dtype=torch.float32)
         q_i = query[tile_b.begin, tile_h.begin, tile_m, :]
 
         sparse_row = tile_m.begin // block_mask_m
