@@ -44,6 +44,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -18868,6 +18869,7 @@ def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 class TestCuteConfigValuePriors(TestCase):
     """The cute backend supplies per-key value priors (the learned distribution
     used by generic kernels. Flash attention instead builds structural coverage
@@ -18973,10 +18975,11 @@ class TestCuteConfigValuePriors(TestCase):
 class TestCuteBackendRequirements(TestCase):
     """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
-    This module is ``importorskip``-gated on cutlass, so the environment under
-    test already satisfies the requirements (the gate must pass here).
+    An environment that runs the cute backend's tests (HELION_BACKEND=cute)
+    must satisfy the requirements; importing cutlass alone does not imply it.
     """
 
+    @onlyBackends(["cute"])
     def test_requirements_satisfied_in_this_environment(self) -> None:
         from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
@@ -19006,11 +19009,13 @@ class TestCuteBackendRequirements(TestCase):
             )
         self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
+    @onlyBackends(["cute"])
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
 
         check_cute_backend_requirements()  # must not raise in this environment
 
+    @onlyBackends(["cute"])
     def test_validate_environment_passes(self) -> None:
         from helion._compiler.backend import CuteBackend
 
