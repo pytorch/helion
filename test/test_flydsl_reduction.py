@@ -495,6 +495,147 @@ class TestFlydslReduction(TestCase):
         self.assertIn("range_constexpr(0, 4097, 4096)", code)
         self.assertNotIn("range(0, 4097", code)
 
+    def test_oob_guard_admits_safe_overshoot(self) -> None:
+        # The allocation-aware OOB guard (backend._add) must ADMIT chunks whose
+        # last-tile wide read stays inside the tensor's hipMalloc'd segment.
+        # These are the "pow2+1" shapes (N = k*chunk + 1) that the old
+        # fixed-byte guard incorrectly rejected, forcing autotune onto a slow
+        # fallback.  Explicitly compiling the fast config must succeed and
+        # produce a correct result: the last tile's 1-valid-element tail is
+        # masked by rolled_col_pred, so the OOB read is harmless.
+        #
+        # N=24577 = 6*4096+1, f16, M=4096: store_bytes ≈192MB, 2MiB slack.
+        #   chunk=2048 V=4 → 13 tiles; last tile: 1 valid elem, 15 OOB.
+        #   chunk=2048 V=8 → 13 tiles; last tile: 1 valid elem, 15 OOB (128-bit).
+        # N=32769 = 8*4096+1, f16, M=4096: same safe-segment argument.
+        # N=16385 = 2*8192+1, bf16, M=4096: different dtype (2B/elem same as f16),
+        #   different N to prove the guard isn't special-cased to 24577/32769.
+        # N=24577, M=256: small M → store_bytes=12MB, 2MiB segment,
+        #   much smaller tensor; guard must use the real segment size.
+        from helion.runtime import Config
+
+        for M, N, chunk, v, dt in [
+            (4096, 24577, 2048, 4, torch.float16),
+            (4096, 24577, 2048, 8, torch.float16),
+            (4096, 32769, 4096, 4, torch.float16),
+            (4096, 32769, 4096, 8, torch.float16),
+            (4096, 16385, 2048, 4, torch.bfloat16),
+            (4096, 16385, 2048, 8, torch.bfloat16),
+            (256, 24577, 2048, 4, torch.float16),
+        ]:
+            x = torch.randn(M, N, device=DEVICE, dtype=dt)
+            w = torch.randn(N, device=DEVICE, dtype=dt)
+            bk = rms_norm_fwd_no_invrms.bind((x, w, 1e-5))
+            cfg = Config(
+                block_sizes=[1],
+                reduction_loops=[chunk],
+                cute_vector_widths=[v],
+                constexpr_range=True,
+            )
+            out = bk.compile_config(cfg)(x, w, 1e-5)
+            torch.testing.assert_close(
+                out.float(),
+                ref_rms(x, w).float(),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"M={M} N={N} chunk={chunk} V={v} dt={dt}",
+            )
+
+    def test_oob_guard_rejects_zero_slack_hang_config(self) -> None:
+        # The allocation-aware OOB guard must REJECT a chunk/V pair whose
+        # last-tile wide read escapes the tensor's hipMalloc'd segment.
+        # "Zero slack" means M*N*itemsize is an exact 2 MiB multiple, so the
+        # segment ends exactly at the tensor — any overshoot page-faults.
+        #
+        # Two shapes, both zero-slack (verified: store_bytes % 2MiB == 0):
+        #   4096×5120 f16: 4096*5120*2 = 40 MiB.  chunk=2048 V=8 → 8-elem OOB.
+        #   8192×3072 f16: 8192*3072*2 = 48 MiB.  chunk=2048 V=8 → 1024-elem OOB.
+        # Also check V=4 on 4096×5120: chunk=2048 V=4 → 4-elem OOB = 8 bytes;
+        # still rejected because store_bytes+8 > seg_bytes (zero slack).
+        # Proxy: the autotune candidate list must contain no config matching
+        # the rejected (chunk, V) pair for each shape.
+        import unittest.mock as mock
+
+        from helion.autotuner import FiniteSearch
+
+        # (M, N, reject_chunk, reject_v)
+        cases = [
+            (4096, 5120, 2048, 8),
+            (4096, 5120, 2048, 4),
+            (8192, 3072, 2048, 8),
+        ]
+        orig_init = FiniteSearch.__init__
+
+        def _run_and_capture(bk: object, args: tuple[object, ...]) -> list[object]:
+            captured: list[object] = []
+
+            def _capture(self: object, *a: object, **kw: object) -> None:
+                orig_init(self, *a, **kw)  # pyrefly: ignore[bad-argument-type]
+                captured.extend(getattr(self, "configs", []) or [])
+
+            with mock.patch.object(FiniteSearch, "__init__", _capture):
+                bk.autotune(args, force=True)  # pyrefly: ignore[missing-attribute]
+            return captured
+
+        for M, N, rej_chunk, rej_v in cases:
+            x = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+            w = torch.randn(N, device=DEVICE, dtype=torch.float16)
+            bk = rms_norm_fwd_no_invrms.bind((x, w, 1e-5))
+            candidates = _run_and_capture(bk, (x, w, 1e-5))
+            bad = [
+                c
+                for c in candidates
+                if c.config.get("reduction_loops") == [rej_chunk]  # pyrefly: ignore[missing-attribute]
+                and c.config.get("cute_vector_widths") == [rej_v]  # pyrefly: ignore[missing-attribute]
+            ]
+            self.assertEqual(
+                bad,
+                [],
+                msg=f"Guard must exclude chunk={rej_chunk} V={rej_v} for {M}x{N} "
+                f"(zero-slack hang shape); "
+                f"found: {[dict(c.config) for c in bad]}",  # pyrefly: ignore[missing-attribute,bad-index]
+            )
+
+    def test_oob_guard_autotune_pow2plus1_selects_fast_config(self) -> None:
+        # End-to-end: autotune for pow2+1 shapes must select a 1-row-per-block
+        # config (block_sizes=[1]) with a large chunk (>=1024) and
+        # constexpr_range=True — not the slow 256-block sub-warp fallback that
+        # the old fixed-byte guard forced.  Correctness is also checked.
+        #
+        # N=24577 = 6*4096+1: the primary regression shape.
+        # N=32769 = 8*4096+1: the second regression shape.
+        # N=16385 = 2*8192+1, bf16: different dtype + different pow2+1 family.
+        for M, N, dt in [
+            (4096, 24577, torch.float16),
+            (4096, 32769, torch.float16),
+            (4096, 16385, torch.bfloat16),
+        ]:
+            x = torch.randn(M, N, device=DEVICE, dtype=dt)
+            w = torch.randn(N, device=DEVICE, dtype=dt)
+            bk = rms_norm_fwd_no_invrms.bind((x, w, 1e-5))
+            cfg = bk.autotune((x, w, 1e-5), force=True)
+            c = cfg.config
+            self.assertEqual(
+                c.get("block_sizes"), [1], msg=f"M={M} N={N}: expected bm=1 winner"
+            )
+            rl = c.get("reduction_loops") or []
+            self.assertTrue(
+                rl and rl[0] >= 1024,  # pyrefly: ignore[bad-index]
+                msg=f"M={M} N={N}: expected chunk>=1024, got reduction_loops={rl}",
+            )
+            self.assertTrue(
+                c.get("constexpr_range"),
+                msg=f"M={M} N={N}: expected constexpr_range=True in fast winner",
+            )
+            out = bk.compile_config(cfg)(x, w, 1e-5)
+            torch.testing.assert_close(
+                out.float(),
+                ref_rms(x, w).float(),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"M={M} N={N} dt={dt}",
+            )
+
 
 if __name__ == "__main__":
     import unittest

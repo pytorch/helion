@@ -39,6 +39,18 @@ if TYPE_CHECKING:
 # vectors live outweighs the HBM savings from register caching.
 _CONSTEXPR_TILE_THRESHOLD = 16
 
+# ROCm caching-allocator large-block rounding (``kRoundLarge`` in
+# c10/cuda/CUDACachingAllocator): every tensor whose byte count lands in the
+# large regime is carved from a hipMalloc'd segment whose size is its byte
+# count rounded UP to this granularity (2 MiB).  Bytes between the tensor's
+# real end and that rounded segment end are still mapped (readable); a read
+# past the segment end page-faults.  The OOB-overshoot guard in ``_add`` uses
+# this to decide whether a last-tile wide read that spills past the reduction
+# tensor stays inside its own segment (safe) or crosses into unmapped memory
+# (GPU fault).  Smaller size regimes get an even larger segment (2/20 MiB), so
+# rounding to this granularity is a conservative (never-unsafe) lower bound.
+_ALLOC_SEGMENT_BYTES = 2 * 1024 * 1024
+
 
 def _cr_tile_threshold(max_tiles: int) -> int:
     """Max tiles for constexpr_range unrolling (0 = use hardcoded default)."""
@@ -524,14 +536,11 @@ class FlyDSLBackend(Backend):
             # extent but whose LAST tile overshoots -- not a whole chunk past it.
             if rl is not None and rl_numel is not None and rl > rl_numel:
                 return
-            # Safety: reject a looped chunk whose last pass OOBs the divided
-            # buffer (hardware buffer instructions fault on true OOB). The bound
-            # is V-dependent (V = elems/thread), so it moves with the candidate's
-            # V -- keep this in sync with the (chunk, V) enumeration below. When
-            # ``v`` is None (bm>1 warp-per-row: one 64-lane warp folds the row),
-            # memory_ops derives V = chunk // 64, so use that here too rather than
-            # V=1 -- otherwise this models the undivided element space and the
-            # bound diverges from the codegen it guards.
+            # Safety: a looped chunk whose last tile overshoots the row issues a
+            # wide buffer read that spills past column N. ``v`` = elems/thread, so
+            # the bound moves with the candidate's V; when ``v`` is None (bm>1
+            # warp-per-row: one 64-lane warp folds the row) memory_ops derives
+            # V = chunk // 64, so use that here too rather than V=1.
             if rl is not None and rl_numel is not None and rl_numel > 0:
                 v_eff = v if v is not None else max(1, rl // 64)
                 tc = rl // v_eff
@@ -539,33 +548,34 @@ class FlyDSLBackend(Backend):
                 max_div_idx = last_offset // v_eff + tc - 1
                 n_div = (rl_numel + v_eff - 1) // v_eff
                 if max_div_idx >= n_div:
-                    # The last chunk's wide read overshoots the divided buffer.
-                    # Reject only when the overshoot exceeds the AMD buffer-
-                    # descriptor slack (~512 bytes).  Small overshoots are safe
-                    # because the descriptor returns 0 for reads within the slack;
-                    # memory_ops emits a rolled_col_pred to zero those lanes.
-                    # Large overshoots page-fault; memory_ops falls back to guarded
-                    # scalar loads (_rolled_col_large_oob) for those tail chunks.
-                    # Both are handled correctly — so allow the config through.
-                    _elem_bytes = getattr(_dtype, "itemsize", None) or (
-                        2 if _dtype in (torch.float16, torch.bfloat16) else 4
+                    # The last tile's widest vectorized read reaches element
+                    #   (max_div_idx + 1) * v_eff - 1
+                    # of each row, overshooting the row's N columns by
+                    #   oob_elems = (max_div_idx + 1) * v_eff - rl_numel.
+                    # For every row but the last that spill reads into the NEXT
+                    # row (mapped, harmless; rolled_col_pred masks it away).  For
+                    # the LAST row it reads past the end of the reduction tensor's
+                    # storage.  That is safe iff the read stays inside the tensor's
+                    # own hipMalloc'd segment: the ROCm caching allocator sizes
+                    # each large tensor's segment as its byte count rounded UP to
+                    # _ALLOC_SEGMENT_BYTES, and bytes up to that rounded end are
+                    # still mapped.  A read past it page-faults -- empirically
+                    # observed as a GPU abort for N=5120, chunk=2048, V=8 at every
+                    # M where M*N*itemsize is an exact 2 MiB multiple (zero slack),
+                    # yet correct at M values that leave slack.  Base the bound on
+                    # the real tensor geometry, not a fixed byte count.
+                    _red_tensor = args[0] if args else None
+                    if not isinstance(_red_tensor, torch.Tensor):
+                        # No concrete tensor to prove the read stays mapped --
+                        # reject rather than risk a fault.
+                        return
+                    _elem_bytes = _red_tensor.element_size()
+                    _oob_elems = (max_div_idx + 1) * v_eff - rl_numel
+                    _store_bytes = _red_tensor.numel() * _elem_bytes
+                    _seg_bytes = (
+                        -(-_store_bytes // _ALLOC_SEGMENT_BYTES) * _ALLOC_SEGMENT_BYTES
                     )
-                    _oob_slots = max_div_idx - n_div + 1
-                    _oob_bytes = _oob_slots * v_eff * _elem_bytes
-                    # AMD buffer descriptors are safe up to ~512 bytes past the
-                    # allocation; beyond that the hardware page-faults (or hangs).
-                    # memory_ops's _rolled_col_large_oob path switches to scalar
-                    # guarded loads for overshoots > 512 bytes, but the
-                    # copy_atom_call for the tail chunk still issues first.
-                    # Keep the threshold tight to avoid GPU hangs.
-                    # memory_ops falls back to guarded scalar loads
-                    # (_rolled_col_large_oob) for overshoots > 512 bytes, but
-                    # even with the fallback the first copy_atom_call on the tail
-                    # chunk still issues before the guard fires.  Empirically,
-                    # overshoots up to ~1536 bytes are safe on MI350X (tested);
-                    # 2048+ causes GPU hangs (N=5120, chunk=2048, V=8).
-                    _SAFE_OOB_BYTES = 1536
-                    if _oob_bytes > _SAFE_OOB_BYTES:
+                    if _store_bytes + _oob_elems * _elem_bytes > _seg_bytes:
                         return
             key = (tuple(bs), rl, v, cr, cm, wpe, mnr, budget, tpr)
             if key in seen:
@@ -646,12 +656,21 @@ class FlyDSLBackend(Backend):
                         for v in _v_choices:
                             _tc = _looped_tc(_numel, v)
                             if 128 <= _tc <= 1024:
-                                # Filter: N/thread_count must be a power of 2
-                                # and copy width ≤ 128 bits (max BufferCopy).
+                                # Filter: N/thread_count must be a power of 2,
+                                # copy width ≤ 128 bits (max BufferCopy), AND the
+                                # row must be EXACTLY covered (_tc * _vec == N).
+                                # Without the exact-coverage check the single-pass
+                                # drops the uncovered tail when N isn't a multiple
+                                # of thread_count*V (e.g. N=8193: 1024*8=8192<8193
+                                # leaves the last column unread -> NaN/garbage).
                                 _vec = _numel // _tc
                                 _elem_bits = 16 if v == 8 else 32
                                 _is_pot = _vec > 0 and (_vec & (_vec - 1)) == 0
-                                if _is_pot and _vec * _elem_bits <= 128:
+                                if (
+                                    _is_pot
+                                    and _vec * _elem_bits <= 128
+                                    and _tc * _vec == _numel
+                                ):
                                     _add(bs, _numel, v, cr=True)
             else:
                 # bm>1: one warp/row (thread_count 64), V = chunk // 64 derived
