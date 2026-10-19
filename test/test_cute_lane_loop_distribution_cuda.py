@@ -22,6 +22,7 @@ from test.test_cute_lane_loop_distribution import _REPEATED_DEVICE_LOOP_KERNELS
 from test.test_cute_lane_loop_distribution import _REPEATED_INNER_LOOP_CONFIG
 from test.test_cute_lane_loop_distribution import _REPEATED_INNER_LOOP_WIDE_CONFIG
 from test.test_cute_lane_loop_distribution import _ROW_LANES_ON_ONE_THREAD_CONFIG
+from test.test_cute_lane_loop_distribution import _ROW_SUM_SHAPE
 from test.test_cute_lane_loop_distribution import _ROWS_ON_TWO_LANES_CONFIG
 from test.test_cute_lane_loop_distribution import _ROWS_ONE_PER_THREAD_CONFIG
 from test.test_cute_lane_loop_distribution import _SHARED_BLOCK_SIZE_CONFIG
@@ -70,6 +71,8 @@ from test.test_cute_lane_loop_distribution import _read_previous_then_store
 from test.test_cute_lane_loop_distribution import _read_reversed_then_store
 from test.test_cute_lane_loop_distribution import _read_wrapped_then_store
 from test.test_cute_lane_loop_distribution import _repeat_first_column_update
+from test.test_cute_lane_loop_distribution import _row_sum_store_config
+from test.test_cute_lane_loop_distribution import _row_sum_store_kernel
 from test.test_cute_lane_loop_distribution import _short_loop_then_read_ahead_and_store
 from test.test_cute_lane_loop_distribution import _six_loops_over_one_block_size
 from test.test_cute_lane_loop_distribution import _store_flattened_rows
@@ -81,6 +84,7 @@ from test.test_cute_lane_loop_distribution import _store_rows_shifted_by_the_ite
 from test.test_cute_lane_loop_distribution import _store_then_read_moving_backwards
 from test.test_cute_lane_loop_distribution import _two_loops_over_one_block_size
 from test.test_cute_lane_loop_distribution import _two_loops_over_one_block_size_war
+from test.test_cute_lane_loop_distribution import _two_root_kernel
 from test.test_cute_lane_loop_distribution import (
     _uniform_read_modify_write_in_a_device_loop,
 )
@@ -1464,3 +1468,141 @@ def test_segment_rows_through_a_uniform_start_match_reference() -> None:
         x = _small_integers((24 * 128,))
         expected = (x.reshape(24, 128) + v.repeat(3, 1)).reshape(-1)
         torch.testing.assert_close(run(offsets, v, x.clone()), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
+
+
+@pytest.mark.parametrize("variant", ["zeros", "ones", "scalar", "rowvec", "masked"])
+@pytest.mark.parametrize(
+    ("shape", "d", "dv", "rolled"),
+    [
+        (_ROW_SUM_SHAPE, 64, 64, None),
+        (_ROW_SUM_SHAPE, 128, 128, None),
+        (_ROW_SUM_SHAPE, 128, 128, 64),
+        (_ROW_SUM_SHAPE, 128, 128, 32),
+        (_ROW_SUM_SHAPE, 64, 64, 32),
+        (_ROW_SUM_SHAPE, 64, 128, None),
+        (_ROW_SUM_SHAPE, 128, 64, None),
+        (_ROW_SUM_SHAPE, 192, 128, None),
+        (_ROW_SUM_SHAPE, 80, 80, 64),
+        # The batch extent equal to the head dim (the silent one-element-
+        # per-row store): headdims' cell at a smaller head count, and 128.
+        ((64, 2, 256), 64, 64, None),
+        ((64, 2, 256), 64, 64, 16),
+        ((128, 2, 256), 128, 128, None),
+        ((128, 2, 256), 128, 128, 32),
+    ],
+)
+def test_full_slice_store_beside_a_row_reduction_matches_torch_and_triton(
+    variant: str, shape: tuple[int, int, int], d: int, dv: int, rolled: int | None
+) -> None:
+    """The attention backward's preprocess shape on the generic lowering: a
+    full-slice store of a broadcast value (zeros, ones, a scalar, a row
+    vector, zeros under a per-row mask) over head dim ``d`` beside
+    ``sum(o * do)`` over head dim ``dv`` in one ``hl.tile`` body.  At
+    ``d == dv`` the two share the block and a rolled reduction (the
+    resolver's choice at 128, forced by ``rolled``) left the store with no
+    coordinate outside its loop; at ``d != dv`` the masked form was placed
+    into the reduction's nest and rejected; with the batch extent equal to
+    the head dim the slice took the batch tile's index and wrote one element
+    per row, silently.  Every variant now stores every element, matching
+    torch and the Triton backend bitwise."""
+    torch.manual_seed(0)
+    b, h, m = shape
+    o = torch.randn((b, h, m, dv), dtype=torch.bfloat16, device=CUDA_DEVICE)
+    do = torch.randn_like(o)
+    row = torch.randn((d,), dtype=torch.float32, device=CUDA_DEVICE)
+    flag = (torch.rand((b, h, m), device=CUDA_DEVICE) < 0.4).to(torch.int32)
+    expected_delta = (o.float() * do.float()).sum(-1)
+    outputs: dict[str, torch.Tensor] = {}
+    for backend in ("cute", "triton"):
+        fill = 7.0 if variant == "masked" else float("nan")
+        dq = torch.full((b, h, m, d), fill, dtype=torch.float32, device=CUDA_DEVICE)
+        extra: tuple[torch.Tensor, ...] = {"rowvec": (row,), "masked": (flag,)}.get(
+            variant, ()
+        )
+        args = (o, do, *extra, dq)
+        bound = _row_sum_store_kernel(variant, backend).bind(args)  # pyrefly: ignore [missing-attribute]
+        config = _row_sum_store_config(
+            bound, rolled=rolled if backend == "cute" else None
+        )
+        delta = bound.compile_config(helion.Config(**config))(*args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(delta, expected_delta, rtol=1e-3, atol=1e-2)
+        if variant == "masked":
+            absent = (flag != 0)[..., None].expand_as(dq)
+            assert torch.all(dq[absent] == 0), backend
+            assert torch.all(dq[~absent] == 7.0), backend
+        else:
+            assert not torch.isnan(dq).any(), backend
+            if variant == "rowvec":
+                assert torch.equal(dq, row.expand_as(dq)), backend
+            else:
+                assert torch.all(dq == (1.0 if variant == "ones" else 0.0)), backend
+        outputs[backend] = dq
+    assert torch.equal(outputs["cute"], outputs["triton"])
+
+
+@pytest.mark.parametrize("variant", ["zeros", "masked"])
+@pytest.mark.parametrize("pid_type", ["persistent_blocked", "persistent_interleaved"])
+def test_full_slice_store_beside_a_row_reduction_under_a_persistent_grid(
+    variant: str, pid_type: str
+) -> None:
+    """The replica's lane loop under a persistent grid (the tile loop walks
+    several tiles per CTA): every element stored on both backends."""
+    torch.manual_seed(0)
+    b, h, m = _ROW_SUM_SHAPE
+    d = 128
+    o = torch.randn((b, h, m, d), dtype=torch.bfloat16, device=CUDA_DEVICE)
+    do = torch.randn_like(o)
+    flag = (torch.rand((b, h, m), device=CUDA_DEVICE) < 0.4).to(torch.int32)
+    expected_delta = (o.float() * do.float()).sum(-1)
+    outputs = {}
+    for backend in ("cute", "triton"):
+        fill = 7.0 if variant == "masked" else float("nan")
+        dq = torch.full((b, h, m, d), fill, dtype=torch.float32, device=CUDA_DEVICE)
+        args = (o, do, flag, dq) if variant == "masked" else (o, do, dq)
+        bound = _row_sum_store_kernel(variant, backend).bind(args)  # pyrefly: ignore [missing-attribute]
+        config = _row_sum_store_config(
+            bound,
+            rolled=64 if backend == "cute" else None,
+            pid_type=pid_type if backend == "cute" else None,
+        )
+        delta = bound.compile_config(helion.Config(**config))(*args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(delta, expected_delta, rtol=1e-3, atol=1e-2)
+        if variant == "masked":
+            absent = (flag != 0)[..., None].expand_as(dq)
+            assert torch.all(dq[absent] == 0), backend
+            assert torch.all(dq[~absent] == 7.0), backend
+        else:
+            assert torch.all(dq == 0), backend
+        outputs[backend] = dq.clone()
+    assert torch.equal(outputs["cute"], outputs["triton"])
+
+
+@pytest.mark.parametrize(("d", "chunk"), [(128, 64), (64, 16)])
+def test_full_slice_stores_in_two_root_loops_match_torch_and_triton(
+    d: int, chunk: int
+) -> None:
+    """Two root loops sharing the rolled block each store every element of
+    their own output (one replica per grid)."""
+    torch.manual_seed(0)
+    b, h, m = _ROW_SUM_SHAPE
+    o = torch.randn((b, h, m, d), dtype=torch.bfloat16, device=CUDA_DEVICE)
+    do = torch.randn_like(o)
+    expected = ((o.float() * do.float()).sum(-1), (o.float() * o.float()).sum(-1))
+    for backend in ("cute", "triton"):
+        dq = torch.full(
+            (b, h, m, d), float("nan"), dtype=torch.float32, device=CUDA_DEVICE
+        )
+        dq2 = dq.clone()
+        args = (o, do, dq, dq2)
+        bound = _two_root_kernel(backend).bind(args)  # pyrefly: ignore [missing-attribute]
+        config = _row_sum_store_config(
+            bound, rolled=chunk if backend == "cute" else None
+        )
+        delta, delta2 = bound.compile_config(helion.Config(**config))(*args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(delta, expected[0], rtol=1e-3, atol=1e-2)
+        torch.testing.assert_close(delta2, expected[1], rtol=1e-3, atol=1e-2)
+        assert torch.all(dq == 0), backend
+        assert torch.all(dq2 == 0), backend

@@ -7562,6 +7562,11 @@ def _lane_loop_headers(
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+    # CuTe: the index variable of the chunk lane loop standing in for a
+    # rolled reduction block outside its loop, per block id
+    # (``memory_ops._cute_make_rolled_replica``).  Per grid, like the lane
+    # loop itself: another root loop sharing the block gets its own.
+    rolled_reduction_replicas: dict[int, str] = dataclasses.field(default_factory=dict)
     # Preserve which logical blocks each synthetic lane variable distributes.
     # The aggregate set above is retained for existing reduction scheduling;
     # late structural lowerings need the exact association to prove coordinate
