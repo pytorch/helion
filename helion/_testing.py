@@ -1855,6 +1855,10 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+        # unittest skips tearDown when setUp skips or fails. Close the cache
+        # context in those cases too, before its generator can be finalized
+        # during another fresh_cache's cache clearing and reenter a cache lock.
+        self.addCleanup(self._test_stack.close)
 
         from torch._inductor.utils import fresh_cache
 
@@ -1865,12 +1869,6 @@ class TestCase(unittest.TestCase):
         )
 
         counters.clear()
-
-    def tearDown(self) -> None:
-        try:
-            super().tearDown()
-        finally:
-            self._test_stack.close()
 
     def assertExpectedJournal(self, value: str) -> None:
         """
