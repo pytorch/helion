@@ -317,6 +317,17 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          # Ref-eager still exercises torch.compile (test_specialize,
+          # test_compile_capture, test_custom_op, ...). On the single-GPU A10G
+          # runner the first Inductor compile after its subprocess compile pool
+          # has gone idle >60s hangs waiting on a pool that never answers, until
+          # the per-test timeout os._exit()s the worker -- which xdist then
+          # reports as a crashed worker with no traceback, blaming whatever
+          # (usually skipped) test it was holding. Compile in the test process,
+          # exactly as the MI350X job below already does for the same hang.
+          if [[ "${{ matrix.alias }}" == *a10g* && "${{ matrix.ref-eager }}" == "true" ]]; then
+            export TORCHINDUCTOR_COMPILE_THREADS=1
+          fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
@@ -352,6 +363,12 @@ jobs:
           # pushed the autotune and benchmark tests past their per-test timeout.
           if [[ "$PARALLEL" != "-n0" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
+          fi
+          # The A10G ref-eager job has a history of flaky worker crashes (see the
+          # Inductor compile-pool note in the env setup above); --durations keeps
+          # the slowest tests visible in the CI log while we watch it.
+          if [[ "${{ matrix.alias }}" == *a10g* && "${{ matrix.ref-eager }}" == "true" ]]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --durations=50"
           fi
           # B200 containers have 28 CPUs and most tests are CPU-bound compilation
           # (the GPU sits mostly idle), so eight workers roughly halve the suite.
@@ -390,6 +407,12 @@ jobs:
             # per-test timeout false-positives on a cold Triton cache and the
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
+            # Ref-eager re-runs each example's reference path eagerly rather than
+            # launching a compiled kernel once, so give it the same 300s per-test
+            # headroom tpu/pallas-interpret use.
+            if [[ "${{ matrix.ref-eager }}" == "true" ]]; then
+              TIMEOUT=300
+            fi
           elif [[ "${{ matrix.alias }}" == *mi350x* ]]; then
             # The MI350X runner exposes a single GPU shared by its xdist
             # workers. Autotuning and interleaved-benchmark tests (each timed
@@ -411,6 +434,15 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
           fi
+
+      # When an xdist worker dies without a traceback (the ref-eager flake), the
+      # conftest status file it last wrote names the test it was running. Surface
+      # it so a crash points at the real culprit, not the bystander xdist blames.
+      - name: Ref-eager crash diagnostics
+        if: always() && matrix.ref-eager
+        run: |
+          echo "=== last test each xdist worker started (helion-*.status) ==="
+          find /tmp -name 'helion-*.status' -print -exec cat {} \; -exec echo \; 2>/dev/null | head -80 || true
 
   test-notebooks:
     name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
