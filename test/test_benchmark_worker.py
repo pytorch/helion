@@ -34,6 +34,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasTpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
@@ -182,6 +183,12 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
         self.assertEqual(metrics.num_successful_candidate_measurements, 0)
 
 
+@skipIfRefEager(
+    "Spawns real benchmark-worker subprocesses and exercises their "
+    "SIGKILL/process-group reaping -- compile-mode machinery that "
+    "HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker "
+    "with no traceback) on the single-GPU A10G ref-eager runner."
+)
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
