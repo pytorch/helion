@@ -1634,6 +1634,34 @@ class TestAutotuneBudget(TestCase):
         self.assertFalse(provider._subprocess_benchmark_enabled())
         self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
+    def test_mtia_device_disables_subprocess_benchmark(self) -> None:
+        # The MTIA runtime reserves the whole device for its first client,
+        # so a spawned worker cannot open it while this process holds it.
+        from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        self.assertIsNone(backend.get_do_bench())
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.kernel.env = SimpleNamespace(
+            process_group_name=None, device=SimpleNamespace(type="mtia")
+        )
+        provider.config_spec = SimpleNamespace(backend=backend)
+
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+
+    def test_missing_device_env_does_not_break_subprocess_check(self) -> None:
+        # Stub kernels mock env without a device; the MTIA carve-out must
+        # tolerate that instead of raising AttributeError.
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+
 
 @onlyBackends(["triton", "cute"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
