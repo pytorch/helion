@@ -2685,7 +2685,7 @@ def test_cute_unsigned_scalar_load_codegen(dtype):
             assert ast.unparse(branches[0].orelse) == f"{logical}(0)"
 
 
-@skipUnlessBackends(["cute"])
+@onlyBackends(["cute"])
 class TestUnsignedScalarLoads(TestCase):
     def test_unsigned_scalar_loads_preserve_high_bits_and_tails(self):
         for dtype in (torch.uint8, torch.uint32):
