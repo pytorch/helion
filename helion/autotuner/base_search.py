@@ -3139,7 +3139,10 @@ class PopulationBasedSearch(BaseSearch):
             repeat = min(repeat, int(capstr))
         repeat = max(1, repeat)
 
-        in_process_isolation = False
+        # A custom benchmark callback owns timing, not argument isolation.
+        # If process isolation is unavailable (or delegated to the callback),
+        # keep every requested finalist's storage private in this process.
+        in_process_isolation = candidate_private_args and not dist.is_initialized()
         if use_isolated and self.settings.autotune_benchmark_fn is None:
             try:
                 isolated_results = self.benchmark_provider.benchmark_isolated(
@@ -3176,13 +3179,8 @@ class PopulationBasedSearch(BaseSearch):
                     "Candidate-private mutated-argument isolation is unavailable "
                     "for distributed in-process rebenchmarking."
                 )
-            in_process_isolation = candidate_private_args and not dist.is_initialized()
-
         private_args: _PrivateBenchmarkArgs | None = None
-        if (
-            in_process_isolation
-            and len(self.benchmark_provider.mutated_arg_indices) > 0
-        ):
+        if in_process_isolation:
             # Every finalist gets private live tensor storage, including
             # inputs that the kernel only reads (see ``_PrivateBenchmarkArgs``
             # for the sacrificial clone it keeps alive).
