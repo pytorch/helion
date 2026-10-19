@@ -70,13 +70,23 @@ def flex_bwd_hook_plan(
     grad: bool = False,
     score_region: FlexRegion | None = None,
     with_mask: bool = True,
+    q_frame: bool = False,
 ) -> AttentionScorePlan:
     """The forward-style plan the hook renderer consumes: the backward's
     regions (already in the transposed frame) as ``score_region`` /
     ``mask_region``; with ``grad`` the Jacobian region as the score region;
-    ``score_region`` overrides the score region (the additive bias ``g``)."""
-    if score_region is None:
-        score_region = plan.grad_region if grad else plan.score_region
+    ``score_region`` overrides the score region (the additive bias ``g``).
+    ``q_frame`` takes the forward-frame regions (row = Q, lanes = KV) the
+    2-CTA pair kernel's dQ clusters render, with the sequences unswapped."""
+    if q_frame:
+        assert plan.regions_q_captured
+        if score_region is None:
+            score_region = plan.grad_region_q if grad else plan.score_region_q
+        mask_region = plan.mask_region_q
+    else:
+        if score_region is None:
+            score_region = plan.grad_region if grad else plan.score_region
+        mask_region = plan.mask_region
     return AttentionScorePlan(
         head_dim=plan.head_dim,
         qk_scale_log2=1.0,
@@ -84,12 +94,13 @@ def flex_bwd_hook_plan(
         modifiers=(),
         kv_group=plan.group,
         head_dim_v=None,
-        # Swapped: the renderer's ``q`` axis is the KV sequence here.
-        q_seq=plan.kv_seq,
-        kv_seq=plan.q_seq,
+        # Swapped: the renderer's ``q`` axis is the KV sequence here (the
+        # forward frame keeps the kernel's sequences).
+        q_seq=plan.q_seq if q_frame else plan.kv_seq,
+        kv_seq=plan.kv_seq if q_frame else plan.q_seq,
         kv_walk=None,
         score_region=score_region,
-        mask_region=plan.mask_region if (with_mask and not grad) else None,
+        mask_region=mask_region if (with_mask and not grad) else None,
         aux_buffers=plan.aux_buffers,
         host_scalars=plan.host_scalars,
         scale_arg=plan.scale_arg,
@@ -850,6 +861,39 @@ def _fbwd_fit_kwargs(plan: FlexBwdPlan) -> dict[str, object]:
     }
 
 
+def flex_bwd_pair_table_steps(plan: FlexBwdPlan) -> int:
+    """The pair kernel's step-table entries: the longer of the dK/dV walk
+    (``max_steps``, a KV block's Q lists) and the dQ walk (every KV tile of
+    the sequence, the KV blocks' 128-row tiles)."""
+    kv_blocks = -(-plan.kv_seq // plan.walk.kv_block)
+    return max(plan.max_steps, kv_blocks * (plan.walk.kv_block // 128), 1)
+
+
+def flex_bwd_pair_split_p(plan: FlexBwdPlan) -> bool:
+    """Whether the pair kernel's dK/dV clusters get a P staging buffer of
+    their own (``sP``: the dS write no longer waits for the dV MMA). The
+    storage with it is exactly the SM100 capacity up to 128 step-table
+    entries; longer tables stage P in the dS buffer."""
+    import cutlass
+
+    from ._flash_runtime import flash_bwd_flex_pair_shared_storage
+
+    dtype = cutlass.BFloat16 if plan.io_dtype == torch.bfloat16 else cutlass.Float16
+    steps = flex_bwd_pair_table_steps(plan)
+    size = flash_bwd_flex_pair_shared_storage(dtype, steps, True).size_in_bytes()
+    return size <= _SM100_SMEM_CAPACITY
+
+
+def flex_bwd_pair_smem_decline(plan: FlexBwdPlan, device: torch.device) -> str:
+    """The pair kernel's reason for not fitting shared memory: its buffers
+    are fixed, so only the step table can grow past the capacity."""
+    steps = flex_bwd_pair_table_steps(plan)
+    return (
+        f"flex_bwd: the head dim 256 pair kernel's {steps}-entry step table "
+        f"does not fit shared memory (no chunked table on the pair)"
+    )
+
+
 def flex_bwd_smem_fits(plan: FlexBwdPlan, device: torch.device) -> bool:
     """Whether the plan's storage fits ``device``'s shared memory in the
     emitter's most frugal configuration (the matcher declines otherwise)."""
@@ -926,6 +970,7 @@ def _fit_smem_budget(
     """
     import cutlass
 
+    from ._flash_runtime import flash_bwd_flex_pair_shared_storage
     from ._flash_runtime import flash_bwd_shared_storage
     from .tcgen05_config import CuteTcgen05Config
 
@@ -933,6 +978,19 @@ def _fit_smem_budget(
         CuteTcgen05Config.per_cta_smem_capacity_bytes(device) or _SM100_SMEM_CAPACITY
     )
     dtype = cutlass.BFloat16 if plan.io_dtype == torch.bfloat16 else cutlass.Float16
+    tmem = flex_bwd_tmem_plan(plan.head_dim, plan.head_dim_v)
+    if tmem is not None and tmem.mode == "pair":
+        # The 2-CTA pair kernel (``cute_flash_bwd_flex_pair``): single-stage
+        # rings, the whole walk of either role in one table, no statistics
+        # MMAs / staged aux tables / persistent walk; only the step table's
+        # size depends on the shape (and whether P gets its own staging
+        # buffer, ``flex_bwd_pair_split_p``).
+        steps = flex_bwd_pair_table_steps(plan)
+        split_p = flex_bwd_pair_split_p(plan)
+        size = flash_bwd_flex_pair_shared_storage(dtype, steps, split_p).size_in_bytes()
+        if size > capacity:
+            return None
+        return _SmemPlan(1, 1, 4, 0, False, False, 0, table_steps=steps)
     d, dv = _fbwd_padded(plan.head_dim), _fbwd_padded(plan.head_dim_v)
     q_stage = 2 if d >= 128 else 4
     do_stage_max = 1 if dv >= 128 else 4
@@ -2517,6 +2575,24 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     # columns (aliased onto dP, dQ would occupy the packed dS^T's columns).
     tmem = flex_bwd_tmem_plan(d, plan.head_dim_v)
     assert tmem is not None, (d, plan.head_dim_v)
+    if tmem.mode == "pair":
+        from .cute_flash_bwd_flex_pair import codegen_flex_bwd_pair
+
+        return codegen_flex_bwd_pair(
+            cg,
+            match,
+            args=args,
+            scalar_exprs=scalar_exprs,
+            scale_expr=scale_expr,
+            io_dtype_str=io_dtype_str,
+            exp2_f32=exp2_f32,
+            mask_form=mask_form,
+            reg_split=reg_split,
+            hook_cols=hook_cols,
+            hook_pin=hook_pin,
+            bias_fold=bias_fold,
+            tile_group=tile_group,
+        )
     ds_tmem = (
         bool(df.config.config.get("cute_flash_bwd_ds_tmem", 0)) and tmem.mode == "plain"
     )

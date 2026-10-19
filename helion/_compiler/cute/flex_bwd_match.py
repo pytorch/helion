@@ -112,6 +112,13 @@ class FlexBwdTmemPlan:
     ``alias_dp``: dQ aliases dP's columns (the dQ MMA runs after the dS pass
     read dP; the next dP MMA waits for the reduce warps to drain dQ);
     D <= 128.
+    ``pair`` (D == Dv == 256): the 2-CTA pair kernel's two cluster roles
+    (the pair's M=128 MMAs pack a CTA's 64 rows as 128 lanes x N/2 columns).
+    dK/dV clusters (64 KV rows per CTA): dK@``dk_off`` 0 and dV@``dv_off``
+    128 (128 columns each), S@``s_off`` 256 and dP@``dp_off`` 320 (64 each)
+    with a second step parity 128 columns above. dQ clusters (64 Q rows per
+    CTA): S^T@0 and dP^T@64 with their parity at 128 / 192, the dQ
+    accumulator@``dq_off`` 256 (128 columns, the whole Q tile's walk).
     ``alias_s`` (D == 192 only): dP@64 overlaps S's upper half (the dP MMA
     waits on the ``s_read`` barrier until both softmax halves read S out; P
     packs into S's lower 64 columns, the upper half's store after ``s_read``
@@ -126,10 +133,11 @@ class FlexBwdTmemPlan:
     dv_off: int
     dk_off: int
     dq_off: int
+    s_off: int = 0
 
     @property
     def dq_alias(self) -> bool:
-        return self.mode != "plain"
+        return self.mode not in ("plain", "pair")
 
     @property
     def p_cols(self) -> tuple[int, int]:
@@ -158,6 +166,10 @@ def _round_up(value: int, multiple: int) -> int:
 
 def flex_bwd_tmem_plan(head_dim: int, head_dim_v: int) -> FlexBwdTmemPlan | None:
     """See :class:`FlexBwdTmemPlan` (None: the accumulators do not fit)."""
+    if (head_dim, head_dim_v) == (256, 256):
+        # dK/dV clusters: dK 0, dV 128, S 256 / 384, dP 320 / 448 (two step
+        # parities); dQ clusters: S^T 0 / 128, dP^T 64 / 192, dQ 256.
+        return FlexBwdTmemPlan("pair", 320, 128, 0, 256, s_off=256)
     dv_off = 256
     dk_off = dv_off + _round_up(head_dim_v, 32)
     dq_off = dk_off + _round_up(head_dim, 32)
@@ -177,7 +189,8 @@ def flex_bwd_tmem_plan(head_dim: int, head_dim_v: int) -> FlexBwdTmemPlan | None
 def flex_bwd_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
     """Whether the fused backward handles the (D, Dv) pair: multiples of 16
     with both at most 128 (every such pair has a plain or alias_dp TMEM plan
-    and fits shared memory), or the MLA pair (192, 128) (the alias_s plan).
+    and fits shared memory), the MLA pair (192, 128) (the alias_s plan) or
+    (256, 256) (the 2-CTA pair kernel).
     Other pairs with a TMEM plan on paper (D > 128 with a small Dv, Dv up to
     256) are not emitted: their tiles do not fit shared memory."""
     step = FLEX_BWD_HEAD_DIM_STEP
@@ -185,7 +198,7 @@ def flex_bwd_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
         return False
     if head_dim <= 128 and head_dim_v <= 128:
         return flex_bwd_tmem_plan(head_dim, head_dim_v) is not None
-    return (head_dim, head_dim_v) == (192, 128)
+    return (head_dim, head_dim_v) in ((192, 128), (256, 256))
 
 
 log = logging.getLogger(__name__)
@@ -242,6 +255,13 @@ class FlexBwdPlan:
     # The LSE tensor is already in the exp2 base with no-visible-key rows
     # mapped to 0 (the preprocess kernel's ``lse2``): the body stages it as is.
     lse_prescaled: bool = False
+    # The regions in the forward frame (row = Q, lanes = KV), rendered by the
+    # 2-CTA pair kernel's dQ clusters (``cute_flash_bwd_flex_pair``); None
+    # when the frame did not capture (only the pair plan needs them).
+    score_region_q: FlexRegion | None = None
+    mask_region_q: FlexRegion | None = None
+    grad_region_q: FlexRegion | None = None
+    regions_q_captured: bool = False
 
     @property
     def operand_shapes(self) -> tuple[tuple[int, int, int, int], ...]:
@@ -402,6 +422,9 @@ class _Body(NamedTuple):
     regions: _Regions
     # Placeholder indices (inner body graph) of the dV and dK accumulators.
     acc_slots: tuple[int, int]
+    # The same regions in the forward frame (row = Q, lanes = KV): what the
+    # 2-CTA pair kernel's dQ clusters render; None when they did not capture.
+    regions_q: _Regions | None = None
 
 
 class _BwdCtx(_Ctx):
@@ -1405,6 +1428,25 @@ def _match_inner_body(
     )
     if regions is None:
         return None
+    # The forward-frame regions (``coord_of_block`` with the axis roles
+    # swapped: the Q axis in the renderer's row slot); their failure to
+    # capture only matters to the pair kernel, which checks for them.
+    m_id, kv_id = ctx.m_id, ctx.kv_id
+    assert kv_id is not None
+    ctx.m_id, ctx.kv_id = kv_id, m_id
+    try:
+        regions_q = _capture_bwd_regions(
+            ctx,
+            graph_id,
+            s_dot,
+            score_root,
+            score_src,
+            mask_pred,
+            ds_node,
+            grad_src,
+        )
+    finally:
+        ctx.m_id, ctx.kv_id = m_id, kv_id
     # Closed world of the body's loads.
     allowed_loads = {q_load, do_load}
     for n in loads:
@@ -1437,6 +1479,7 @@ def _match_inner_body(
         lse_prescaled,
         regions,
         (dv_slot, dk_slot),
+        regions_q=regions_q,
     )
 
 
@@ -1909,6 +1952,7 @@ def _assemble(
         ctx.decline("flex_bwd: the nine core tensors must be distinct")
         return None
     regions = part_body.regions
+    regions_q = part_body.regions_q
     plan = FlexBwdPlan(
         head_dim=head_dim,
         head_dim_v=head_dim_v,
@@ -1939,16 +1983,36 @@ def _assemble(
         log2_factor=part_body.log2_factor,
         lse_prescaled=part_body.lse_prescaled,
         strides=tuple(operand_strides),
+        score_region_q=None if regions_q is None else regions_q.score,
+        mask_region_q=None if regions_q is None else regions_q.mask,
+        grad_region_q=None if regions_q is None else regions_q.grad,
+        regions_q_captured=regions_q is not None,
     )
     # The storage must fit this device's shared memory in the emitter's most
     # frugal configuration (plain rings, 4 dQ boxes, the smallest step table),
     # else the kernel has no fused path and the generic one cannot take it.
     from .cute_flash_bwd_flex import flex_bwd_smem_fits
 
+    tmem = flex_bwd_tmem_plan(head_dim, head_dim_v)
+    if tmem is not None and tmem.mode == "pair":
+        if not plan.regions_q_captured:
+            ctx.decline("flex_bwd: the pair kernel needs the forward-frame regions")
+            return None
+        if plan.operand_strides is not None:
+            ctx.decline("flex_bwd: the pair kernel takes contiguous operands only")
+            return None
+        # QB in FLEX_Q_BLOCKS and KB == FLEX_KV_BLOCK (checked above) are the
+        # 128-row multiples the pair kernel's step tiles need.
+        assert q_block % 128 == 0 and kv_block % 128 == 0, (q_block, kv_block)
     if not flex_bwd_smem_fits(plan, ctx.env.device):
-        ctx.decline(
-            f"flex_bwd: head dims ({head_dim}, {head_dim_v}) do not fit shared memory"
-        )
+        if tmem is not None and tmem.mode == "pair":
+            from .cute_flash_bwd_flex import flex_bwd_pair_smem_decline
+
+            ctx.decline(flex_bwd_pair_smem_decline(plan, ctx.env.device))
+        else:
+            ctx.decline(
+                f"flex_bwd: head dims ({head_dim}, {head_dim_v}) do not fit shared memory"
+            )
         return None
     assert ctx.kv_id is not None
     return FlexBwdMatch(

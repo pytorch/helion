@@ -572,6 +572,90 @@ def flash_bwd_shared_storage(
     return SharedStorage
 
 
+def flash_bwd_flex_pair_shared_storage(
+    dtype: object = cutlass.Float16,
+    steps: int = 0,
+    split_p: bool = True,
+) -> type:
+    """SharedStorage of the 2-CTA flex backward at head dim 256 (per CTA).
+
+    Both cluster roles share the buffers. dK/dV clusters (64 KV rows per CTA):
+    sQ / sdOt hold the CTA's 64 Q rows of the step (the S / dP B operands,
+    K-major, 256 wide), sdOqt its 128-column head dim half of dO^T then Q^T
+    (the dV / dK B operands, MN-major, 128 Q wide), sK / sV the CTA's 64 KV
+    rows, sP stages P (the dV A operand) and sdS stages dS (the dK A
+    operand), both K-major 64 x 128, so dS is written as soon as it is
+    computed instead of after the dV MMA read P. dQ clusters (64 Q rows per
+    CTA): Q / dO resident in sQ / sdOt (the S^T / dP^T A operands), K / V of
+    the step in sK / sV (B operands), a two-stage K^T ring in sdOqt (the dQ
+    MMA's B operand), dS in sdS; the dQ tile drains once per tile through
+    sK / sV. ``steps`` entries of the step table. With ``split_p`` the struct
+    is exactly the 227 KB a B200 CTA may claim up to 128 steps (the LSE /
+    delta staging holds one copy per parity shared by the two compute
+    warpgroups); longer step tables drop sP and stage P in sdS again (the dS
+    write then waits for the dV MMA).
+    """
+    steps_entries = max(steps, 1)
+    p_field = (
+        cute.struct.Align[cute.struct.MemRange[dtype, 64 * 128], 1024]
+        if split_p
+        else cute.struct.MemRange[dtype, 1]
+    )
+
+    @cute.struct
+    class SharedStoragePair:
+        sSteps: cute.struct.MemRange[cutlass.Int32, steps_entries]
+        # Single-stage operand rings (full / empty) and the dQ clusters'
+        # two-stage K^T ring.
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        dot_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        kt2_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        # S / dP of the two step parities: full (leader commits, multicast)
+        # and read by both CTAs' compute warps (arrivals on the leader).
+        stq_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+        dptq_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+        stq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+        # dK/dV clusters: P staged (both CTAs' compute warps, on the leader),
+        # dS staged (same), the dS staging released by the pair's dK MMA
+        # (multicast), P consumed by the pair's dV MMA (multicast), the last
+        # dV MMA done (multicast).
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        sds_free_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        pv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # dQ clusters: dS staged (on the leader), the dS staging released by
+        # the dQ MMA (multicast); the tile's dQ complete reuses dv_done.
+        dsq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dqq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # dK/dV clusters: two parity slots of the step's 128 LSE / delta
+        # columns, staged by the first compute warpgroup, read by both;
+        # 16-byte aligned so the compute warps' 128-bit vector loads of their
+        # 32 columns are single LDS.128 (after mma_base they sat at a 4-byte
+        # offset: an extra LDS.128 plus shuffles per load).
+        sLSE: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
+        sDelta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sdOt: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        # dO^T then Q^T (the dK/dV clusters' two 32 KB head-dim-half tiles);
+        # the dQ clusters' two-stage K^T ring.
+        sdOqt: cute.struct.Align[cute.struct.MemRange[dtype, 2 * 128 * 128], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sV: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 128], 1024]
+        # dK/dV clusters: the staged P (the dV A operand) when it fits.
+        sP: p_field
+
+    return SharedStoragePair
+
+
 @dsl_user_op
 def cpasync_reduce_bulk_add_f32(
     smem_ptr: cute.Pointer,

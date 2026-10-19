@@ -477,6 +477,78 @@ def flex_item_table(
     ).order
 
 
+# The backward's derived KV-side lists, cached per ``part_cnt`` tensor like the
+# forward's item tables.
+_FLEX_BWD_KV_TABLE_CACHE: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+def _build_flex_bwd_kv_tables(
+    part_cnt: torch.Tensor,
+    part_idx: torch.Tensor,
+    full_cnt: torch.Tensor,
+    full_idx: torch.Tensor,
+    *,
+    q_blocks: int,
+    kv_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The transposed lists of the backward BlockMask tables: from the Q-side
+    ``(Bm, Hm, >= kv_blocks)`` counts / ``(Bm, Hm, >= kv_blocks, L)`` Q block
+    lists (partial, full; the matcher admits tables with more KV columns than
+    N needs, only the first ``kv_blocks`` are KV blocks of the sequence) to
+    per-Q-block KV block lists ``(Bm, Hm, q_blocks)`` / ``(Bm, Hm, q_blocks,
+    kv_blocks)`` in ascending KV order. Every op has a static shape
+    (``argsort`` over the dense membership, no ``nonzero``), so the build is
+    legal inside a CUDA-graph capture."""
+    tables = []
+    for count, index in ((part_cnt, part_idx), (full_cnt, full_idx)):
+        count = count[..., :kv_blocks]
+        index = index[..., :kv_blocks, :]
+        # (Bm, Hm, kv_blocks, q_blocks) membership -> (Bm, Hm, q_blocks, kv_blocks)
+        dense = _dense_tiles(count, index, q_blocks).transpose(-1, -2).contiguous()
+        kv_count = dense.sum(dim=-1, dtype=torch.int32)
+        # Members first, stable: ascending KV block order among the members.
+        order = torch.argsort(dense, dim=-1, descending=True, stable=True)
+        tables.extend((kv_count.contiguous(), order.to(torch.int32).contiguous()))
+    return (tables[0], tables[1], tables[2], tables[3])
+
+
+def flex_bwd_kv_tables(
+    part_cnt: torch.Tensor,
+    part_idx: torch.Tensor,
+    full_cnt: torch.Tensor,
+    full_idx: torch.Tensor,
+    *,
+    q_blocks: int,
+    kv_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(kv_part_cnt, kv_part_idx, kv_full_cnt, kv_full_idx)``: the KV block
+    lists per Q block the fused backward's dQ clusters walk, derived on the
+    device from the Q-side tables the kernel receives (the BlockMask's
+    ``q_num_blocks`` / ``q_indices`` and full variants). Cached the way the
+    forward's item tables are (``_FLEX_ITEM_TABLE_CACHE``): a weak entry per
+    ``part_cnt`` tensor identity whose key is every table's ``data_ptr`` and
+    ``_version`` plus the block counts, so a BlockMask rebuilt in place or a
+    new mask reusing the storage misses; rebuilt on every call under
+    CUDA-graph capture (the lists must live in the graph's pool) and for
+    inference tensors (no version counter)."""
+    tables = (part_cnt, part_idx, full_cnt, full_idx)
+    kwargs = {"q_blocks": q_blocks, "kv_blocks": kv_blocks}
+    if any(table.is_inference() for table in tables) or (
+        part_cnt.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
+        return _build_flex_bwd_kv_tables(*tables, **kwargs)
+    key = (
+        tuple(sorted(kwargs.items())),
+        tuple((table.data_ptr(), table._version) for table in tables),
+    )
+    cached = _FLEX_BWD_KV_TABLE_CACHE.get(part_cnt)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    built = _build_flex_bwd_kv_tables(*tables, **kwargs)
+    _FLEX_BWD_KV_TABLE_CACHE[part_cnt] = (key, built)
+    return built
+
+
 def flex_item_flags(
     part_cnt: torch.Tensor,
     part_idx: torch.Tensor,

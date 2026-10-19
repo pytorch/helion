@@ -1508,6 +1508,110 @@ def _append_cute_wrapper_plan(
             ]
         )
         return
+    if kind == "helion_flash_bwd" and plan.get("flex_pair"):
+        # The 2-CTA flex backward at head dim 256 (``cute_flash_bwd_flex_pair``):
+        # two cluster roles per 128-row KV block. The dK/dV clusters (64 KV
+        # rows per CTA) run S / dP as the pair's M=128 MMAs over K-major K / V
+        # (A) and Q / dO (B, 64 Q rows per CTA, 256 wide) and dV / dK as
+        # M=128 N=256 MMAs over the staged P^T / dS^T (A, K-major 64 x 128)
+        # and dO^T / Q^T halves (B, MN-major: each CTA its 128 head-dim
+        # columns x 128 Q), storing (64, 64) boxes. The dQ clusters (64 Q rows
+        # of the step per CTA) run S^T / dP^T with Q / dO as the A operands
+        # and K / V as the B operands (the same tiles and layouts, the roles
+        # swapped) and dQ = dS K as an M=128 N=256 MMA over the staged dS (A)
+        # and K^T (B, MN-major: each CTA its 128 head-dim columns x 128 KV
+        # rows), reduce-added in (32 x 16) fp32 boxes. Maps are the flex
+        # (seq, D, B*H) ones (contiguous operands).
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        assert hd == 256
+        tq = plan_int("total_q_rows")
+        seq_q = plan_int("flex_seq_q")
+        seq_k = plan_int("flex_seq_k")
+        bh_q = plan_int("flex_bh_q")
+        bh_k = plan_int("flex_bh_k")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg2 = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        sel = "cute.select"
+        ssd = f"(128, 128, {hd})"
+        pvd = f"(128, {hd}, 128)"
+        q_sdb = (
+            f"cute.make_layout(({seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {seq_q * hd}))"
+        )
+        k_sdb = (
+            f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+        )
+        q_dsb = (
+            f"cute.make_layout(({hd}, {seq_q}, {bh_q}), stride=(1, {hd}, {seq_q * hd}))"
+        )
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQT = cute.make_tensor(arg{q_idx}.iterator, {q_dsb})",
+            f"_fbwd_mdOT = cute.make_tensor(arg{do_idx}.iterator, {q_dsb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg2}, (128, 128))",
+            f"_fbwd_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg2}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_pal = {bw}.make_smem_layout_a(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_dotl2 = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 2)",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_op2 = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg2})",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_dot, _fbwd_mdOtN = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do2, _fbwd_mdOtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdOT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_qt, _fbwd_mQtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQT, {sel}(_fbwd_qtl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            # The dQ clusters' operands (the Q-split orientation): Q / dO as
+            # the A operands of S^T / dP^T, K / V as their B operands, and
+            # K^T (this CTA's 128 head-dim columns x 128 KV rows) as the dQ
+            # MMA's B operand.
+            f"_fbwd_mKT = cute.make_tensor(arg{k_idx}.iterator, cute.make_layout(({hd}, {seq_k}, {bh_k}), stride=(1, {hd}, {seq_k * hd})))",
+            f"_fbwd_tma_qa, _fbwd_mQa = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_doa, _fbwd_mdOa = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kb, _fbwd_mKb = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_vb, _fbwd_mVb = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kt2, _fbwd_mKt2 = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mKT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {seq_q * hd})))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 16), 4)",
+            # The dQ clusters' once-per-tile drain: 16 boxes per 32 KB operand buffer.
+            f"_fbwd_dqsl16 = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 16), 16)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 16))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {k_sdb})",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (64, 64), 4)",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        from ..._compiler.cute.cute_flash_bwd_flex_pair import (
+            _FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS,
+        )
+
+        # The generated kernel's parameter order (one list, owned by the emitter).
+        call_args.extend(_FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS)
+        return
     if kind == "helion_flash_bwd":
         # Fused tcgen05 attention-backward host setup: four tiled_mmas (S/dP
         # smem-smem, dV tmem-A, dK smem K-major, dQ smem MN-major), TMA atoms

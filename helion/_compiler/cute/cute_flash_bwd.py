@@ -2731,17 +2731,23 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     from .flex_bwd_match import flex_bwd_tmem_plan
 
     tmem = flex_bwd_tmem_plan(match.plan.head_dim, match.plan.head_dim_v)
+    # The 2-CTA pair kernel (head dim 256) has no persistent walk, statistics
+    # MMAs, staged aux tables or chunked step table.
+    pair = tmem is not None and tmem.mode == "pair"
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=False,
-        persistent_allowed=True,
+        persistent_allowed=not pair,
         flex=True,
         tile_groups=fbwd_tile_group_choices(match.plan),
         fast_math=bool(env.settings.fast_math),
-        aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
+        aux_smem_candidates=() if pair else fbwd_aux_smem_candidates(match.plan),
         # dS^T through TMEM needs dQ's own columns (the plain TMEM plan).
         ds_tmem_allowed=tmem is not None and tmem.mode == "plain",
-        table_step_choices=fbwd_table_step_choices(match.plan, env.device),
+        stats_mma_allowed=not pair,
+        table_step_choices=(0,)
+        if pair
+        else fbwd_table_step_choices(match.plan, env.device),
         has_mask=match.plan.mask_region is not None,
         has_score=match.plan.score_region is not None,
         additive_bias=additive_bias_region(match.plan) is not None,
