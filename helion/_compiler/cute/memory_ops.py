@@ -5537,9 +5537,9 @@ def _cute_vector_load_ctx(
             # (e.g. ``numel`` not a multiple of V), the masked-tail iter
             # could load garbage in some lanes.  Gate the per-element mask
             # path correctly by requiring ``numel % V == 0`` so partial-vec
-            # straddles are impossible.
-            numel = env.block_sizes[inner_block_id].numel
-            if not env.known_multiple(numel, vec_width):
+            # straddles are impossible.  A jagged axis has no static extent
+            # and stays scalar.
+            if not env.block_sizes[inner_block_id].known_multiple(vec_width):
                 return None
         if not _cute_tile_packet_is_aligned(
             env, tensor, stride1_tensor_dim, vec_width, flat=flat_multi
