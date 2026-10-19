@@ -14,6 +14,7 @@ import dataclasses
 import functools
 import itertools
 import logging
+import math
 import operator
 import re
 from typing import TYPE_CHECKING
@@ -94,6 +95,7 @@ from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
 from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
+from .indexing import unwrap_cute_broadcast_index
 from .iota_utils import cute_free_arange_lanes
 from .tile_ops import cute_masked_block_end
 from .tile_ops import cute_tile_begin_expr
@@ -4098,6 +4100,7 @@ class _CuteLaneIndexFacts:
     vec_lane_var: str
     vec_width: int
     aligned: bool
+    aligned_vars: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4359,6 +4362,7 @@ def _cute_lane_index_facts(
         vec_lane_var,
         vec_width,
         _cute_lane_base_is_vec_aligned(strategy, block_id, owner, vec_width),
+        frozenset((strategy.offset_var(block_id),)),
     )
 
 
@@ -4601,7 +4605,23 @@ def _cute_lane_uniform_compare(
     left_form = _cute_lane_affine_form(left, lane.index_var)
     right_form = _cute_lane_affine_form(right, lane.index_var)
     if left_form is None or right_form is None:
-        return False
+        # A tile-relative bound, ``index - tile_offset < extent``, can be
+        # uniform even though its scalar offset is not an integer literal.
+        # Tile offsets are multiples of V whenever the lane base is aligned.
+        # Prove the offset's residue instead of dropping this packet.
+        form = _cute_lane_affine_alignment(
+            ast.BinOp(left=left, op=ast.Sub(), right=right), lane
+        )
+        if form is None:
+            return False
+        coefficient, alignment = form
+        if coefficient == 0:
+            # Unknown scalar offsets may wrap a narrowed integer at distinct
+            # points. Do not infer cancellation through such casts.
+            return ast.dump(left) == ast.dump(right)
+        if coefficient == -1:
+            op = _CUTE_LANE_MIRRORED_COMPARE[op]
+        return op in (ast.Lt, ast.GtE) and alignment % lane.vec_width == 0
     if left_form[0] == right_form[0]:
         # ``index + a  op  index + b``: a constant comparison.
         return True
@@ -4615,6 +4635,43 @@ def _cute_lane_uniform_compare(
     if op in (ast.LtE, ast.Gt):
         return (bound + 1 - shift) % lane.vec_width == 0
     return False
+
+
+def _cute_lane_affine_alignment(
+    node: ast.expr, lane: _CuteLaneIndexFacts
+) -> tuple[int, int] | None:
+    """Coefficient of the lane index and a proved multiple of its offset."""
+    if isinstance(node, ast.Name):
+        if node.id == lane.index_var:
+            return 1, 0
+        return 0, lane.vec_width if node.id in lane.aligned_vars else 1
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return 0, abs(node.value)
+    if isinstance(node, ast.Call) and not node.keywords:
+        name = _cute_qualified_call_name(node.func)
+        if name in _CUTE_LANE_INT_CASTS and len(node.args) == 1:
+            return _cute_lane_affine_alignment(node.args[0], lane)
+        if name in ("operator.add", "operator.sub") and len(node.args) == 2:
+            return _cute_lane_affine_alignment(
+                ast.BinOp(
+                    left=node.args[0],
+                    op=ast.Add() if name == "operator.add" else ast.Sub(),
+                    right=node.args[1],
+                ),
+                lane,
+            )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        left = _cute_lane_affine_alignment(node.left, lane)
+        right = _cute_lane_affine_alignment(node.right, lane)
+        if left is None or right is None:
+            return None
+        coefficient = left[0] + (
+            right[0] if isinstance(node.op, ast.Add) else -right[0]
+        )
+        if coefficient not in (-1, 0, 1):
+            return None
+        return coefficient, math.gcd(left[1], right[1])
+    return None
 
 
 def _cute_lane_uniform_predicate(node: ast.expr, lane: _CuteLaneIndexFacts) -> bool:
@@ -5240,7 +5297,10 @@ def _cute_vector_load_ctx(
                     inner_block_id = bid
                     lane_axis_pos = expr_pos
                     lane_on_stride1 = tensor_dim == stride1_tensor_dim
-        elif isinstance(idx, torch.Tensor) and idx.ndim == 1:
+        elif isinstance(idx, torch.Tensor) and (
+            idx.ndim == 1
+            or sum(not env.known_equal(size, 1) for size in idx.shape) == 1
+        ):
             # ``hl.arange(K)`` reaches indexing lowering as a 1-D FakeTensor,
             # not as the SymInt that identifies K. Resolve its static extent
             # back to the persistent reduction block.
@@ -5263,6 +5323,7 @@ def _cute_vector_load_ctx(
                 and subscript_pos < len(raw_subscript)
                 else None
             )
+            raw_index = unwrap_cute_broadcast_index(raw_index)
             valid_iota = (
                 is_cute_unit_stride_iota_index(raw_index)
                 if isinstance(candidate, PersistentReductionStrategy)
