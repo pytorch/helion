@@ -437,6 +437,33 @@ class Backend(abc.ABC):
         """
         return True
 
+    def fit_on_first_launch(
+        self,
+        bound_kernel: BoundKernel[Any],
+        config: Config,
+        compiled: Callable[..., object],
+    ) -> Callable[..., object]:
+        """Return the callable that runs *config*, compiled as *compiled*.
+
+        ``BoundKernel.autotune`` selected *config* (from a heuristic, a cache or
+        a search), and it may have been tuned on another device.  A backend can
+        return a callable that, when a kernel of the config exceeds this
+        device's limits at its first launch, runs a smaller variant of the
+        config instead.  The default returns *compiled*.
+        """
+        return compiled
+
+    def fit_config_for_rendering(
+        self, bound_kernel: BoundKernel[Any], args: Sequence[object]
+    ) -> None:
+        """Fit a selected config to this device before torch.compile renders it.
+
+        torch.compile renders the config into its own code instead of calling
+        the bound kernel, so ``fit_on_first_launch`` never runs there.  *args*
+        are Inductor's example inputs.  The default does nothing.
+        """
+        return None
+
     def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
         """Return how autotuning should limit grid-shaped candidates."""
         return AutotuneGridPolicy()
