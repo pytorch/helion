@@ -322,6 +322,8 @@ def _compute_block(
     dv_off: int = 256,
     s_read: bool = False,
     dv_via_do: bool = False,
+    kv_stage: int = 1,
+    kv_slot: str = "0",
 ) -> str:
     """One compute warpgroup's body (h = column half 0/1, warps 4-7 / 8-11).
 
@@ -508,10 +510,12 @@ def _compute_block(
             "storage.do_mbar_ptr.data_ptr() + 1"
             if dv_via_do
             else "storage.v_mbar_ptr.data_ptr() + 1"
+            if kv_stage == 1
+            else f"storage.v_mbar_ptr.data_ptr() + {kv_stage} + {kv_slot}"
         ),
         gm_expr=("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") + f"[None, None, {k_index}]",
         stage_buf="sdO" if dv_via_do and h == 0 else None,
-    ).replace("FBWD_KV_SLOT", "0")
+    ).replace("FBWD_KV_SLOT", kv_slot)
     if persistent and h == 1:
         # The dK staging (sdS) is free for the next tile's first dS once the
         # store has read it.
@@ -751,6 +755,12 @@ FBWD_REG_SPLITS: tuple[str, ...] = (
     "136/144/88",
     "104/160/88",
     "88/168/88",
+    # The 2-CTA kernel's splits: its compute warps spill below 152 registers
+    # (the merged walk's per-step state next to the exchange staging) and
+    # its MMA / load warps hold six rings and the cluster descriptors
+    # (FA4's 2-CTA budget of 104); its reduce warps drain half a dQ tile.
+    "104/152/104",
+    "136/136/104",
 )
 
 
@@ -798,6 +808,10 @@ class _SmemPlan:
     # KV tile with more steps walks them in chunks of this many (see
     # :func:`_fit_smem_budget` and the chunk loop of the emitter).
     table_steps: int = 0
+    # The K and V rings' depth (knob ``cute_flash_bwd_kv_stage``): with two
+    # slots the TMA warp loads the next tile's K / V while the current tile
+    # computes, instead of behind its last dQ MMA (K) and dV store (V).
+    kv_stage: int = 1
 
     @property
     def stage_lse(self) -> bool:
@@ -938,6 +952,7 @@ def _fit_smem_budget(
     table_cap: int = 0,
     single_q_stage: bool = False,
     flex_mbars: int = 8,
+    kv_stage: int = 1,
 ) -> _SmemPlan | None:
     """Fit the storage into the per-CTA SMEM capacity (None: nothing fits,
     the caller declines the fused path).
@@ -967,6 +982,9 @@ def _fit_smem_budget(
     the cap (``_FBWD_TABLE_STEPS_PREF`` / ``_FBWD_TABLE_STEPS_MIN``). A cap
     that does not fit therefore falls back to the automatic table
     (:func:`fbwd_table_step_choices` keeps such caps out of the search).
+    ``kv_stage`` (knob ``cute_flash_bwd_kv_stage``) is the K / V rings' depth;
+    a second slot costs one K and one V tile and the Q / dO rings give up
+    stages for it like for the mixed widths (at d64: 3 / 2 beside 4 / 3).
     """
     import cutlass
 
@@ -1014,7 +1032,7 @@ def _fit_smem_budget(
             d,
             q_stage,
             do_stage,
-            1,
+            kv_stage,
             dtype,
             2 * steps + 2 if persistent else steps,
             dq_boxes,
@@ -1033,13 +1051,25 @@ def _fit_smem_budget(
     q_min = 1 if single_q_stage else 2
     # (Sized with the smallest storage the table fitter accepts: four dQ
     # boxes and a minimal step table; the table is chunked, not the rings.)
+    # The second K / V slot is paid by the rings, not by the statistics form:
+    # with ``kv_stage`` 2 the shrink is sized with the statistics slices the
+    # candidates below ask for (one per Q stage), so the rings give up depth
+    # before the mode is dropped (d64: 4 / 3 -> 3 / 2 beside the two slots).
+    shrink_aug = (q_stage if stats_mma else 0) if kv_stage > 1 else 0
     while size(
-        do_stage_max, 4, 0, True, True, 0, min(cap, _FBWD_TABLE_STEPS_MIN)
+        do_stage_max,
+        4,
+        shrink_aug,
+        not (stats_mma and kv_stage > 1 and not raw_score),
+        not (stats_mma and kv_stage > 1),
+        0,
+        min(cap, _FBWD_TABLE_STEPS_MIN),
     ) > capacity and (q_stage > q_min or do_stage_max > 1):
         if do_stage_max > 1 and (do_stage_max >= q_stage or q_stage == 1):
             do_stage_max -= 1
         else:
             q_stage -= 1
+        shrink_aug = (q_stage if stats_mma else 0) if kv_stage > 1 else 0
     # (do_stage, dq_boxes, aug_stages, lse_in_mma, delta_in_mma, aux) in order
     # of preference: the staged aux tables first, the statistics MMAs with the
     # deepest dO ring, 8 dQ boxes before 4.
@@ -1073,6 +1103,7 @@ def _fit_smem_budget(
             delta_in_mma,
             aux,
             table_steps=steps,
+            kv_stage=kv_stage,
         )
 
     # The whole walk, or the explicit cap, in one table.
@@ -1299,8 +1330,16 @@ def emit_flash_bwd_flex_device_body(
     persistent: bool = False,
     total_tiles: int = 0,
     ds_tmem: bool = False,
+    s_first: bool = False,
 ) -> str:
     """The flex backward device body (1-CTA, 512 threads); see the module doc.
+
+    ``s_first`` (knob ``cute_flash_bwd_s_first``; the plain TMEM plans): the
+    tile's first S = K Q^T MMA goes into the pipe once K, Q and the stats
+    row have landed and the dO / V waits move to just ahead of dP = V dO^T;
+    the TMA warp issues the first step's dO right behind Q, ahead of the
+    stats gather. The alias_s plan has its own measured orders
+    (``boundary_opt``) and ignores it.
 
     ``persistent``: ``min(total_tiles, SMs)`` CTAs walk the tiles through the
     CLC dynamic scheduler (warp 15 steals not-yet-launched tiles in launch
@@ -1356,7 +1395,15 @@ def emit_flash_bwd_flex_device_body(
     dq_w = 64 if dq_chunked else d_pad
     dq_chunk_cols: tuple[int, ...] = tmem.dq_chunk_cols if dq_chunked else ()
     dq_phase_b_init = "        fbwd_phase_b = cutlass.Int32(0)\n" if dq_chunked else ""
-    kv_stage = 1
+    # The K / V rings' depth (``cute_flash_bwd_kv_stage``): with two slots the
+    # persistent walk's next tile loads K / V into the free slot while the
+    # current tile computes. Each non-empty tile consumes one slot of each
+    # ring, so the slot of the current tile is ``fbwd_nz_it % 2`` in every
+    # role; the dV epilogue stages through that V slot and arrives on its
+    # empty barrier (the pipeline's empty barriers follow its full ones).
+    kv_stage = smem.kv_stage if smem is not None else 1
+    assert kv_stage in (1, 2)
+    kv_slot = "(fbwd_nz_it % 2)" if kv_stage == 2 else "0"
     # dQ drains in 32-column boxes (the last one clipped by the TMA unit).
     n_chunks = -(-d // 32)
     # Each reduce warp alternates its two staging slots per box; the wait
@@ -1570,6 +1617,8 @@ def emit_flash_bwd_flex_device_body(
             dv_off=tmem.dv_off,
             s_read=tmem.mode == "alias_s",
             dv_via_do=v_early,
+            kv_stage=kv_stage,
+            kv_slot=kv_slot,
         ).replace("FBWD_DK_OFF", str(dk_off))
         for h in (0, 1)
     )
@@ -1922,6 +1971,9 @@ def emit_flash_bwd_flex_device_body(
     first_do = """            fbwd_doe = fbwd_do_prod.acquire_and_advance()
             cute.copy(_fbwd_tma_do, tDOgDO[None, fbwd_m_tile], tDOsDO[None, fbwd_doe.index], tma_bar_ptr=fbwd_doe.barrier)
 """
+    # ``first_pre``: loads issued ahead of the first step's stats gather (whose
+    # global loads sit between the Q issue and whatever follows).
+    first_pre = ""
     if v_early:
         # Stages free in the order V (after the last dP), Q (after the tail
         # dK), K (after the tail's last dQ chunk), dO (after the dV epilogue).
@@ -1930,6 +1982,12 @@ def emit_flash_bwd_flex_device_body(
     elif late_k:
         first_order = "Q and dO ahead of K and V"
         first_loads = first_do + tma_k_issue + tma_v_issue
+    elif s_first:
+        # The dO slot is free at a tile start (its ring is the step loop's);
+        # V's frees behind the previous tile's dV store, so V stays last.
+        first_order = "Q and dO ahead of the stats gather and V"
+        first_pre = first_do
+        first_loads = tma_v_issue
     else:
         first_order = "Q ahead of V"
         first_loads = tma_v_issue + first_do
@@ -1941,7 +1999,7 @@ def emit_flash_bwd_flex_device_body(
             tDOgDO = tDOgDO_qdl[None, None, 0, {q_index}]
             fbwd_qe = fbwd_q_prod.acquire_and_advance()
             cute.copy(_fbwd_tma_q, tQgQ[None, fbwd_m_tile], tQsQ[None, fbwd_qe.index], tma_bar_ptr=fbwd_qe.barrier)
-{aug_fill_first}{first_loads}            for fbwd_i in cutlass.range(1, fbwd_steps, unroll=1):
+{first_pre}{aug_fill_first}{first_loads}            for fbwd_i in cutlass.range(1, fbwd_steps, unroll=1):
 {textwrap.indent(tma_step_decode, "    ")}
                 tQgQ = tQgQ_qdl[None, None, 0, {q_index}]
                 tDOgDO = tDOgDO_qdl[None, None, 0, {q_index}]
@@ -2078,13 +2136,30 @@ def emit_flash_bwd_flex_device_body(
     )
     # The tile's steps (once per chunk of a chunked table): the peeled first
     # step, the software-pipelined loop and the tail dQ / dK.
-    mma_steps = f"""            fbwd_qe = fbwd_q_cons.wait_and_advance()
+    # The plain form's first step. ``s_first``: S = K Q^T goes into the pipe
+    # once K, Q and the stats row have landed and the dO / V waits move to
+    # just ahead of dP -- the TMA warp's V load of a tile goes out behind the
+    # previous tile's dV store (the dV epilogue stages through sV) and the
+    # first step's stats gather, so waiting for V ahead of S held the first S
+    # MMA ~1 us per tile at short walks (noop-wide's persistent walk: -2.4 %).
+    # Off: the dO / V waits ahead of S (a one-tile CTA has every load in
+    # flight from its prologue; the alias_s one-tile CTA measured 2 % slower
+    # with S0 early).
+    plain_first = f"""            fbwd_qe = fbwd_q_cons.wait_and_advance()
+            {s_gemm_for("fbwd_qe")}
+{aug_s_mma("fbwd_qe", 12)}            with cute.arch.elect_one():
+                cute_tcgen05_flash.commit(fbwd_s_full_ptr)
+{mma_dq_prologue}
+            fbwd_doe = fbwd_do_cons.wait_and_advance()
+{"" if chunked else mma_v_wait}"""
+    plain_after = f"""            fbwd_qe = fbwd_q_cons.wait_and_advance()
             fbwd_doe = fbwd_do_cons.wait_and_advance()
 {"" if chunked else mma_v_wait}            {s_gemm_for("fbwd_qe")}
 {aug_s_mma("fbwd_qe", 12)}            with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_s_full_ptr)
 {mma_dq_prologue}
-            {dp_gemm}
+"""
+    mma_steps = f"""{plain_first if s_first else plain_after}            {dp_gemm}
 {aug_dp_mma("fbwd_qe", 12)}            with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_dp_full_ptr)
             _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
@@ -2571,6 +2646,10 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     tile_group = tile_group_cfg if isinstance(tile_group_cfg, int) else 0
     stats_mma = bool(df.config.config.get("cute_flash_bwd_stats_mma", 0))
     persistent = bool(df.config.config.get("cute_flash_bwd_persistent", 0))
+    # "auto" follows the form: on for the persistent walk (measured), off for
+    # a one-tile CTA (every load is in flight from its prologue).
+    s_first_cfg = df.config.config.get("cute_flash_bwd_s_first", "auto")
+    s_first = persistent if s_first_cfg == "auto" else bool(s_first_cfg)
     # dS^T through TMEM for the dK MMA: only while dQ keeps its own TMEM
     # columns (aliased onto dP, dQ would occupy the packed dS^T's columns).
     tmem = flex_bwd_tmem_plan(d, plan.head_dim_v)
@@ -2593,6 +2672,28 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
             bias_fold=bias_fold,
             tile_group=tile_group,
         )
+    if bool(df.config.config.get("cute_flash_bwd_two_cta", 0)):
+        # The cluster-of-2 family (head dim 128): one 256-row KV tile per
+        # pair, the dQ partial reduce-added once per 256 KV rows.
+        from .cute_flash_bwd_flex_2cta import codegen_flex_bwd_2cta
+        from .cute_flash_bwd_flex_2cta import flex_bwd_two_cta_allowed
+
+        if flex_bwd_two_cta_allowed(plan, env.device):
+            return codegen_flex_bwd_2cta(
+                cg,
+                match,
+                args=args,
+                scalar_exprs=scalar_exprs,
+                scale_expr=scale_expr,
+                io_dtype_str=io_dtype_str,
+                exp2_f32=exp2_f32,
+                mask_form=mask_form,
+                reg_split=reg_split,
+                hook_cols=hook_cols,
+                hook_pin=hook_pin,
+                bias_fold=bias_fold,
+                tile_group=tile_group,
+            )
     ds_tmem = (
         bool(df.config.config.get("cute_flash_bwd_ds_tmem", 0)) and tmem.mode == "plain"
     )
@@ -2620,6 +2721,12 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     # chunks of that many steps.
     table_cap_cfg = df.config.config.get("cute_flash_bwd_table_steps", 0)
     table_cap = table_cap_cfg if isinstance(table_cap_cfg, int) else 0
+    # The K / V rings' depth: two slots only on the persistent walk (a
+    # one-tile CTA loads once) and only where the storage fits them; a
+    # requested depth that does not fit renders the one-slot kernel (the
+    # surface offers the knob only where the deepest searched storage fits).
+    kv_stage_cfg = df.config.config.get("cute_flash_bwd_kv_stage", 1)
+    kv_stage = 2 if kv_stage_cfg == 2 and persistent else 1
     smem = _fit_smem_budget(
         plan,
         stats_mma=stats_mma,
@@ -2628,8 +2735,21 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         persistent=persistent,
         aux_smem=aux_smem,
         table_cap=table_cap,
+        kv_stage=kv_stage,
         **_fbwd_fit_kwargs(plan),  # type: ignore[arg-type]
     )
+    if smem is None and kv_stage == 2:
+        kv_stage = 1
+        smem = _fit_smem_budget(
+            plan,
+            stats_mma=stats_mma,
+            raw_score=raw_score,
+            device=env.device,
+            persistent=persistent,
+            aux_smem=aux_smem,
+            table_cap=table_cap,
+            **_fbwd_fit_kwargs(plan),  # type: ignore[arg-type]
+        )
     if smem is None:
         # Not even the smallest storage (a 32-step table) fits the SM's
         # shared memory. The matcher's ``flex_bwd_smem_fits`` declined such
@@ -2666,7 +2786,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         "total_kv_rows": batch * kv_heads * plan.kv_seq,
         "q_stage": q_stage,
         "do_stage": do_stage,
-        "kv_stage": 1,
+        "kv_stage": smem.kv_stage,
         "two_cta": False,
         "persistent": persistent,
         "total_tiles": total_tiles,
@@ -2732,6 +2852,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         persistent=persistent,
         total_tiles=total_tiles,
         ds_tmem=ds_tmem,
+        s_first=s_first,
     )
     wrapped = ast_module.parse("if True:\n" + body_src)
     assert isinstance(wrapped.body[0], ast_module.If)

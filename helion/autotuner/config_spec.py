@@ -1044,6 +1044,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_exp2_f32",
         "cute_flash_bwd_mask_form",
         "cute_flash_bwd_regs",
+        "cute_flash_bwd_s_first",
+        "cute_flash_bwd_kv_stage",
         "cute_flash_bwd_hook_cols",
         "cute_flash_bwd_hook_pin",
         "cute_flash_bwd_bias_fold",
@@ -1296,6 +1298,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_exp2_f32",
         "cute_flash_bwd_mask_form",
         "cute_flash_bwd_regs",
+        "cute_flash_bwd_s_first",
+        "cute_flash_bwd_kv_stage",
         "cute_flash_bwd_hook_cols",
         "cute_flash_bwd_hook_pin",
         "cute_flash_bwd_bias_fold",
@@ -1900,6 +1904,8 @@ class ConfigSpec:
         self._cute_flash_bwd_aux_smem_candidates: tuple[int, ...] = ()
         self._cute_flash_bwd_ds_tmem_allowed: bool = False
         self._cute_flash_bwd_stats_mma_allowed: bool = True
+        self._cute_flash_bwd_s_first_allowed: bool = False
+        self._cute_flash_bwd_kv_stage_allowed: bool = False
         self._cute_flash_bwd_has_mask: bool = True
         self._cute_flash_bwd_has_hook: bool = True
         self._cute_flash_bwd_additive_bias: bool = True
@@ -1907,6 +1913,8 @@ class ConfigSpec:
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self._cute_flash_bwd_persistent_allowed: bool = True
         self._cute_flash_bwd_table_step_choices: tuple[int, ...] = (0,)
+        # The 2-CTA pair kernel's automatic step table (0: no pair kernel).
+        self._cute_flash_bwd_two_cta_table_steps: int = 0
         # The FlexAttention backward envelope: opens the mask-form knob.
         self._cute_flash_bwd_flex: bool = False
         self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
@@ -2980,6 +2988,90 @@ class ConfigSpec:
         assert isinstance(q_tile, int)
         return q_tile
 
+    def _normalize_cute_flash_bwd(self, config: dict[str, object]) -> None:
+        """The flex backward's 2-CTA family (``cute_flash_bwd_two_cta`` = 1)
+        has no persistent walk, statistics MMAs, dS^T-through-TMEM dK or
+        staged aux tables: those knobs read 0 under it, so a config that
+        sets them spells the same kernel as one that does not (one autotune
+        identity, no inert combinations in the search). The pair's step
+        table is its own (``flex_bwd_two_cta_table_steps``): a
+        ``cute_flash_bwd_table_steps`` cap at or above its automatic table
+        renders that table, so it reads 0 (the search's caps are the 1-CTA
+        kernel's, mostly far above the pair's 64-128 steps). Where the pair
+        kernel is not legal the knob renders the 1-CTA kernel, whose knobs
+        all apply: the knob itself reads 0 there."""
+        if not (self.cute_flash_bwd_search_enabled and self._cute_flash_bwd_flex):
+            return
+        # The first-step order knob reads "auto" wherever it has no effect
+        # (the alias_s and pair plans, the 2-CTA family): one identity.
+        if (
+            not self._cute_flash_bwd_s_first_allowed
+            or config.get("cute_flash_bwd_two_cta") == 1
+        ) and "cute_flash_bwd_s_first" in config:
+            config["cute_flash_bwd_s_first"] = "auto"
+        # A second K / V slot serves the persistent walk alone (a one-tile
+        # CTA loads once), nowhere the storage cannot hold it, and not the
+        # 2-CTA family: it reads 1 there.
+        if (
+            not self._cute_flash_bwd_kv_stage_allowed
+            or config.get("cute_flash_bwd_persistent") != 1
+            or config.get("cute_flash_bwd_two_cta") == 1
+        ) and "cute_flash_bwd_kv_stage" in config:
+            config["cute_flash_bwd_kv_stage"] = 1
+        if config.get("cute_flash_bwd_two_cta") != 1:
+            return
+        if not self._cute_flash_bwd_two_cta_allowed:
+            config["cute_flash_bwd_two_cta"] = 0
+            return
+        for key in (
+            "cute_flash_bwd_persistent",
+            "cute_flash_bwd_stats_mma",
+            "cute_flash_bwd_ds_tmem",
+            "cute_flash_bwd_aux_smem",
+        ):
+            if key in config:
+                config[key] = 0
+        cap = config.get("cute_flash_bwd_table_steps", 0)
+        auto = self._cute_flash_bwd_two_cta_table_steps
+        if isinstance(cap, int) and auto > 0 and cap >= auto:
+            config["cute_flash_bwd_table_steps"] = 0
+        # The pair's register split: the knob's generic default is the 1-CTA
+        # kernel's (FBWD_REG_SPLITS[0]); under the pair it reads as the
+        # pair's first seed split, so a config that pins two_cta without a
+        # split renders the measured kernel (and spells one identity with
+        # the seed).
+        from .._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
+
+        if config.get("cute_flash_bwd_regs", FBWD_REG_SPLITS[0]) == FBWD_REG_SPLITS[0]:
+            config["cute_flash_bwd_regs"] = "88/168/88"
+
+    def cute_flash_bwd_seed_configs(self) -> list[helion.Config]:
+        """The flex backward's 2-CTA family as an autotune seed where its
+        kernel is legal: the default config with the pair under each of its
+        two measured register splits (the compute warpgroups spill below 152
+        registers; the MMA and load warps hold their rings at 88 or 104), so
+        a cold search starts from both families instead of finding the pair
+        by chance."""
+        if not (
+            self.backend_name == "cute"
+            and self.cute_flash_bwd_search_enabled
+            and self._cute_flash_bwd_flex
+            and self._cute_flash_bwd_two_cta_allowed
+        ):
+            return []
+        # Two register splits: the cold autotunes of the 32K / 128K causal
+        # cells pick 88/168/88 (the dQ-reduce and load warps at 88, the
+        # compute warpgroups at 168), 0.6-1.5% ahead of 104/152/104 on the
+        # 32K proxies; both keep the compute warpgroups free of spills.
+        seeds = []
+        for regs in ("88/168/88", "104/152/104"):
+            seed = self.default_config()
+            seed.config["cute_flash_bwd_two_cta"] = 1
+            seed.config["cute_flash_bwd_regs"] = regs
+            self.normalize(seed, _fix_invalid=True)
+            seeds.append(seed)
+        return seeds
+
     def _normalize_cute_flash_gated(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3401,21 +3493,30 @@ class ConfigSpec:
         aux_smem_candidates: Sequence[int] = (),
         ds_tmem_allowed: bool = False,
         stats_mma_allowed: bool = True,
+        s_first_allowed: bool = False,
+        kv_stage_allowed: bool = False,
         has_mask: bool = True,
         has_score: bool = True,
         additive_bias: bool = True,
         table_step_choices: Sequence[int] = (0,),
+        two_cta_table_steps: int = 0,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
         Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
         fused backward emitter supports. ``two_cta_allowed`` opens the
         ``cute_flash_bwd_two_cta`` knob (cluster-of-2 tcgen05 family) when the
-        problem shape supports 256-row cluster KV tiles.
+        problem shape supports 256-row cluster KV tiles;
+        ``two_cta_table_steps`` is the flex pair kernel's automatic step
+        table (``cute_flash_bwd_table_steps`` caps at or above it render it;
+        see ``_normalize_cute_flash_bwd``).
         """
         self.cute_flash_bwd_search_enabled = True
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
+        self._cute_flash_bwd_two_cta_table_steps = (
+            two_cta_table_steps if two_cta_allowed else 0
+        )
         self._cute_flash_bwd_persistent_allowed = persistent_allowed
         self._cute_flash_bwd_flex = flex
         self._cute_flash_bwd_tile_groups = tile_groups
@@ -3423,6 +3524,8 @@ class ConfigSpec:
         self._cute_flash_bwd_aux_smem_candidates = tuple(aux_smem_candidates)
         self._cute_flash_bwd_ds_tmem_allowed = ds_tmem_allowed
         self._cute_flash_bwd_stats_mma_allowed = stats_mma_allowed
+        self._cute_flash_bwd_s_first_allowed = s_first_allowed
+        self._cute_flash_bwd_kv_stage_allowed = kv_stage_allowed
         # Which hook knobs have an effect: the mask form needs a mask region,
         # the hook group width / pin a hook at all, the fold an additive bias.
         self._cute_flash_bwd_has_mask = has_mask
@@ -3768,6 +3871,7 @@ class ConfigSpec:
             seeds.extend(flash_seeds)
         if self.backend_name == "cute" and self.cute_flash_gated_search_enabled:
             seeds.extend(self.cute_flash_gated_seed_configs())
+        seeds.extend(self.cute_flash_bwd_seed_configs())
         return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -6401,6 +6505,7 @@ class ConfigSpec:
             )
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
             self._normalize_cute_flash_gated(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_flash_bwd(config)
 
         if (
             self.backend_name == "cute"
@@ -7225,6 +7330,21 @@ class ConfigSpec:
                         fields["cute_flash_bwd_stats_mma"] = EnumFragment(
                             choices=(0, 1)
                         )
+                    if self._cute_flash_bwd_s_first_allowed:
+                        # The tile's first S MMA ahead of the dO / V waits and
+                        # the first dO load ahead of the stats gather (the plain
+                        # TMEM plans; see emit_flash_bwd_flex_device_body).
+                        # "auto" follows the form (on for the persistent walk,
+                        # off for a one-tile CTA); the search spells it out.
+                        fields["cute_flash_bwd_s_first"] = EnumFragment(
+                            choices=("auto", 0, 1), search_choices=(0, 1)
+                        )
+                    if self._cute_flash_bwd_kv_stage_allowed:
+                        # Two K / V ring slots on the persistent walk: the next
+                        # tile's K / V load while the current tile computes
+                        # (one slot beside the Q / dO rings otherwise; see
+                        # _fit_smem_budget).
+                        fields["cute_flash_bwd_kv_stage"] = EnumFragment(choices=(1, 2))
                     from .._compiler.cute.cute_flash import flash_flex_aux_smem_choices
 
                     aux_choices = flash_flex_aux_smem_choices(

@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
     from ..device_ir import DeviceIR
     from ..generate_ast import GenerateAST
+    from .flex_bwd_match import FlexBwdPlan
+    from .flex_bwd_match import FlexBwdTmemPlan
 
 __all__ = [
     "AttentionBwdMatch",
@@ -2702,6 +2704,36 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     return True
 
 
+def _flex_bwd_kv_stage_allowed(
+    plan: FlexBwdPlan, device: torch.device, tmem: FlexBwdTmemPlan | None
+) -> bool:
+    """Whether the flex backward's persistent walk can run two K / V ring
+    slots on this plan: not the pair or alias_s plans (their own boundary
+    schedules and staging), and only where ``_fit_smem_budget`` holds the
+    second slot beside the statistics-MMA form (the deepest searched storage;
+    at d128 the one-slot q1 / do1 storage is already 201 KB of 227)."""
+    from .cute_flash_bwd_flex import _fbwd_fit_kwargs
+    from .cute_flash_bwd_flex import _fit_smem_budget
+    from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
+
+    if tmem is not None and tmem.mode in ("pair", "alias_s"):
+        return False
+    candidates = fbwd_aux_smem_candidates(plan)
+    return (
+        _fit_smem_budget(
+            plan,
+            stats_mma=True,
+            raw_score=False,
+            device=device,
+            persistent=True,
+            aux_smem=max(candidates) if candidates else 0,
+            kv_stage=2,
+            **_fbwd_fit_kwargs(plan),  # type: ignore[arg-type]
+        )
+        is not None
+    )
+
+
 def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     """Enable the bwd flash search surface for the FlexAttention backward
     envelope (pins the KV tile and the Q tile to 128 rows; the list walk has
@@ -2728,15 +2760,22 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
     from .cute_flash_bwd_flex import fbwd_table_step_choices
     from .cute_flash_bwd_flex import fbwd_tile_group_choices
+    from .cute_flash_bwd_flex_2cta import flex_bwd_two_cta_allowed
+    from .cute_flash_bwd_flex_2cta import flex_bwd_two_cta_table_steps
     from .flex_bwd_match import flex_bwd_tmem_plan
 
     tmem = flex_bwd_tmem_plan(match.plan.head_dim, match.plan.head_dim_v)
     # The 2-CTA pair kernel (head dim 256) has no persistent walk, statistics
     # MMAs, staged aux tables or chunked step table.
     pair = tmem is not None and tmem.mode == "pair"
+    # The cluster-of-2 family at head dims (128, 128) (``cute_flash_bwd_flex_2cta``).
+    two_cta = not pair and flex_bwd_two_cta_allowed(match.plan, env.device)
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
-        two_cta_allowed=False,
+        two_cta_allowed=two_cta,
+        two_cta_table_steps=flex_bwd_two_cta_table_steps(match.plan, env.device)
+        if two_cta
+        else 0,
         persistent_allowed=not pair,
         flex=True,
         tile_groups=fbwd_tile_group_choices(match.plan),
@@ -2745,6 +2784,12 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         # dS^T through TMEM needs dQ's own columns (the plain TMEM plan).
         ds_tmem_allowed=tmem is not None and tmem.mode == "plain",
         stats_mma_allowed=not pair,
+        # The first-step order knob: the plain forms (the alias_s plan has
+        # its own measured orders, the pair kernel none of this).
+        s_first_allowed=not pair and (tmem is None or tmem.mode != "alias_s"),
+        # Two K / V ring slots: the plain forms' persistent walk, where the
+        # storage holds them beside the deepest searched statistics form.
+        kv_stage_allowed=_flex_bwd_kv_stage_allowed(match.plan, env.device, tmem),
         table_step_choices=(0,)
         if pair
         else fbwd_table_step_choices(match.plan, env.device),

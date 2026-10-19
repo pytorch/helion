@@ -663,6 +663,7 @@ def test_head_dim_256_pair_render() -> None:
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_table_steps",
         "cute_flash_bwd_aux_smem",
+        "cute_flash_bwd_s_first",
     ):
         assert knob not in fields, knob
 
@@ -1305,6 +1306,138 @@ def _without_source_comments(code: str) -> str:
     return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
 
 
+def _assert_s_first_order(code: str, *, on: bool) -> None:
+    """The first step's load order in the TMA warp's step block (the last
+    ``warp_idx == 13`` region: a one-tile CTA issues K in an earlier prologue
+    block) and the MMA warp's first-step wait order. ``fbwd_aug_row_fill`` is
+    the stats gather of the statistics-MMA form; without it the knob only
+    moves dO ahead of V."""
+    tma = code.split("if warp_idx == 13:")[-1].split("if warp_idx == 12:")[0]
+    first_do = tma.index("cute.copy(_fbwd_tma_do,")
+    first_v = tma.index("cute.copy(_fbwd_tma_v,")
+    gather = tma.find("fbwd_aug_row_fill(")
+    mma = code.split("if warp_idx == 12:")[-1].split("if warp_idx < 4:")[0]
+    head = mma.split("for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):")[0]
+    s0 = head.index("gemm_ptx_dyn_qk(fbwd_s_addr")
+    do_wait = head.index("fbwd_doe = fbwd_do_cons.wait_and_advance()")
+    v_wait = head.index("fbwd_ve = fbwd_v_cons.wait_and_advance()")
+    dp0 = head.index("gemm_ptx_dyn_qk(fbwd_dp_addr")
+    if on:
+        assert first_do < first_v and (gather < 0 or first_do < gather < first_v)
+        assert s0 < do_wait < v_wait < dp0
+    else:
+        assert first_v < first_do and (gather < 0 or gather < first_v)
+        assert do_wait < v_wait < s0 < dp0
+
+
+def test_s_first_knob_surface() -> None:
+    """``cute_flash_bwd_s_first`` is offered on the plain TMEM plans with
+    "auto" (follows the form: on for the persistent walk, off for a one-tile
+    CTA) as the default and the two explicit values as the searched set; the
+    alias_s plan (its own measured boundary orders) does not offer it, and a
+    config that carries it there or under the 2-CTA family reads "auto"
+    (one identity per render)."""
+    bound = _bind(_args(_tensors(), _causal))
+    fields = bound.config_spec._flat_fields()
+    knob = fields["cute_flash_bwd_s_first"]
+    assert knob.choices == ("auto", 0, 1) and knob.search_choices == (0, 1)
+    assert bound.config_spec.default_config().config["cute_flash_bwd_s_first"] == "auto"
+    plain_off = _render(bound)
+    plain_auto = _render(bound, cute_flash_bwd_s_first="auto")
+    assert plain_auto == plain_off  # one-tile CTA: auto reads off
+    _assert_s_first_order(plain_off, on=False)
+    _assert_s_first_order(_render(bound, cute_flash_bwd_s_first=1), on=True)
+    persistent_on = _render(bound, cute_flash_bwd_persistent=1)
+    assert persistent_on == _render(
+        bound, cute_flash_bwd_persistent=1, cute_flash_bwd_s_first=1
+    )
+    alias_s = _bind(_args(_tensors_dv(192, 128), _causal))
+    assert "cute_flash_bwd_s_first" not in alias_s.config_spec._flat_fields()
+    config = helion.Config(
+        **{**alias_s.config_spec.default_config().config, "cute_flash_bwd_s_first": 1}
+    )
+    alias_s.config_spec.normalize(config)
+    assert config.config["cute_flash_bwd_s_first"] == "auto"
+    pair = _bind_d128(None, q_seq=512, kv_seq=512)
+    config = helion.Config(
+        **{
+            **pair.config_spec.default_config().config,
+            "cute_flash_bwd_two_cta": 1,
+            "cute_flash_bwd_s_first": 1,
+        }
+    )
+    pair.config_spec.normalize(config)
+    assert config.config["cute_flash_bwd_s_first"] == "auto"
+
+
+def test_kv_stage_knob_surface() -> None:
+    """``cute_flash_bwd_kv_stage`` (a second K / V ring slot so the persistent
+    walk loads the next tile's K / V while the current tile computes) is
+    offered where the storage holds the slots beside the statistics form: at
+    d64 the Q / dO rings give up depth for it (4 / 3 -> 3 / 2, 217,088 B);
+    at d128 the one-slot q1 / do1 storage is already 201 KB of 227, and the
+    alias_s plan keeps its own boundary schedule. A one-tile CTA and the
+    2-CTA family read 1."""
+    bound = _bind(_args(_tensors(), _causal))
+    fields = bound.config_spec._flat_fields()
+    assert fields["cute_flash_bwd_kv_stage"].choices == (1, 2)
+    assert bound.config_spec.default_config().config["cute_flash_bwd_kv_stage"] == 1
+    plan = _match(bound).plan
+    from helion._compiler.cute.cute_flash_bwd_flex import _fbwd_fit_kwargs
+    from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
+
+    two = _fit_smem_budget(
+        plan,
+        stats_mma=True,
+        raw_score=False,
+        device=_CPU,
+        persistent=True,
+        kv_stage=2,
+        **_fbwd_fit_kwargs(plan),
+    )
+    assert two is not None
+    assert (two.q_stage, two.do_stage, two.kv_stage, two.aug_stages) == (3, 2, 2, 3)
+    plain_two = _fit_smem_budget(
+        plan, stats_mma=False, raw_score=False, device=_CPU, persistent=True, kv_stage=2
+    )
+    assert plain_two is not None and (plain_two.q_stage, plain_two.do_stage) == (4, 3)
+    for other in (
+        _bind(_args(_tensors(head_dim=128), _causal)),
+        _bind(_args(_tensors_dv(192, 128), _causal)),
+    ):
+        assert "cute_flash_bwd_kv_stage" not in other.config_spec._flat_fields()
+    for extra in ({}, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_two_cta": 1}):
+        config = helion.Config(
+            **{
+                **bound.config_spec.default_config().config,
+                **extra,
+                "cute_flash_bwd_kv_stage": 2,
+            }
+        )
+        bound.config_spec.normalize(config)
+        assert config.config["cute_flash_bwd_kv_stage"] == 1, extra
+    assert _render(
+        bound, cute_flash_bwd_persistent=1, cute_flash_bwd_kv_stage=1
+    ) == _render(bound, cute_flash_bwd_persistent=1)
+
+
+def _assert_kv_ring(code: str, *, slots: int) -> None:
+    storage = code.split("flash_bwd_shared_storage(")[1].split(")")[0].split(", ")
+    assert storage[3] == str(slots), storage[:4]
+    stages = code.count("PipelineTmaUmma.create(num_stages=2,")
+    assert (stages >= 2) == (slots == 2)
+    if slots == 2:
+        assert (
+            "fbwd_kv_empty_ptr = storage.v_mbar_ptr.data_ptr() + 2 + fbwd_nz_it % 2"
+            in code
+        )
+        assert "fbwd_epi_slot0 = 1 * (fbwd_nz_it % 2)" in code
+        assert "'kv_stage': 2" in code
+    else:
+        assert "fbwd_kv_empty_ptr = storage.v_mbar_ptr.data_ptr() + 1\n" in code
+        assert "'kv_stage': 1" in code
+
+
 # unittest runners ignore pytestmark.
 @onlyBackends(["cute"])
 class TestContiguousRenderPin(TestCase):
@@ -1312,9 +1445,335 @@ class TestContiguousRenderPin(TestCase):
     ``.expected_cute`` journal next to this file): the strided-operand
     support must not change the code contiguous inputs produce."""
 
+    def test_contiguous_persistent_s_first_render(self) -> None:
+        """The persistent plain walk (the statistics-MMA form the campaign's
+        winners run) with ``cute_flash_bwd_s_first`` at its "auto" default
+        (on for the persistent walk): the tile's first S MMA is issued before
+        the dO / V waits and the first dO load goes out behind Q, ahead of
+        the stats gather, V last."""
+        bound = _bind(_args(_tensors(), _causal))
+        code = _render(bound, cute_flash_bwd_persistent=1, cute_flash_bwd_stats_mma=1)
+        _assert_s_first_order(code, on=True)
+        self.assertExpectedJournal(_without_source_comments(code))
+
+    def test_contiguous_persistent_s_first_off_render(self) -> None:
+        """The same walk with the knob off: the dO / V waits ahead of S and
+        the first dO load behind the stats gather and V."""
+        bound = _bind(_args(_tensors(), _causal))
+        code = _render(
+            bound,
+            cute_flash_bwd_persistent=1,
+            cute_flash_bwd_stats_mma=1,
+            cute_flash_bwd_s_first=0,
+        )
+        _assert_s_first_order(code, on=False)
+        self.assertExpectedJournal(_without_source_comments(code))
+
+    def test_contiguous_persistent_kv_stage_render(self) -> None:
+        """The persistent statistics-MMA walk with two K / V ring slots: the
+        storage and the K / V pipelines two deep (the Q / dO rings 3 / 2),
+        the dV epilogue staged through the current tile's V slot and its
+        arrive on that slot's empty barrier, the plan's depth for the host
+        layouts."""
+        bound = _bind(_args(_tensors(), _causal))
+        code = _render(
+            bound,
+            cute_flash_bwd_persistent=1,
+            cute_flash_bwd_stats_mma=1,
+            cute_flash_bwd_kv_stage=2,
+        )
+        _assert_kv_ring(code, slots=2)
+        _assert_kv_ring(
+            _render(bound, cute_flash_bwd_persistent=1, cute_flash_bwd_stats_mma=1),
+            slots=1,
+        )
+        self.assertExpectedJournal(_without_source_comments(code))
+
     def test_contiguous_backward_render(self) -> None:
         bound = _bind(_args(_tensors(), _causal))
         with _as_sm100():
             code = bound.to_code(bound.config_spec.default_config())
         assert "'flex_strides'" not in code
+        self.assertExpectedJournal(_without_source_comments(code))
+
+
+# -- the 2-CTA kernel (head dim 128) -------------------------------------------
+
+
+def _bind_d128(mask_mod: Callable[..., Any] | None, **shape: int) -> BoundKernel:
+    t = _tensors(**{"head_dim": 128, **shape})
+    return _bind(_args(t, mask_mod))
+
+
+def test_two_cta_legality() -> None:
+    """The pair kernel takes head dims (128, 128), an even KV tile count and
+    contiguous maps; the knob otherwise renders the 1-CTA kernel."""
+    from helion._compiler.cute.cute_flash_bwd_flex_2cta import flex_bwd_two_cta_allowed
+    from helion._compiler.cute.cute_flash_bwd_flex_2cta import (
+        flex_bwd_two_cta_table_steps,
+    )
+
+    bound = _bind_d128(None, q_seq=512, kv_seq=512)
+    plan = _match_or_fail(bound).plan
+    assert flex_bwd_two_cta_allowed(plan, _CPU)
+    # The merged walk of a pair is at most both tiles' lists end to end.
+    assert flex_bwd_two_cta_table_steps(plan, _CPU) == 2 * plan.max_steps
+    code = _render(bound, cute_flash_bwd_two_cta=1)
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    assert "'flex_two_cta': True" in code
+    assert "cta_group=2" in code
+    # The dQ drain: the dense kernel's (32 x 32) boxes, the pair's 64 Q rows
+    # per CTA.
+    assert "(32, 32)" in code
+    # A masked walk: the pair's two KV tiles list different Q blocks; the
+    # kernel merges them (the absent flag at bit 25 of an entry) and the
+    # masked steps run the mask hook.
+    causal = _bind_d128(_causal, q_seq=512, kv_seq=512)
+    assert flex_bwd_two_cta_allowed(_match_or_fail(causal).plan, _CPU)
+    code = _render(causal, cute_flash_bwd_two_cta=1)
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    assert "fbwd_absent = fbwd_e >> 25 & 1" in code
+    assert "if fbwd_masked != 0:" in code
+    assert "cute.arch.vote_ballot_sync(fbwd_keep)" in code
+    # An odd KV tile count has no pair for the last tile.
+    odd = _bind_d128(None, q_seq=512, kv_seq=384)
+    assert not flex_bwd_two_cta_allowed(_match_or_fail(odd).plan, _CPU)
+    assert "flash_bwd_flex_2cta_shared_storage" not in _render(
+        odd, cute_flash_bwd_two_cta=1
+    )
+    d64 = _bind(_args(_tensors(q_seq=512, kv_seq=512), None))
+    assert "flash_bwd_flex_2cta_shared_storage" not in _render(
+        d64, cute_flash_bwd_two_cta=1
+    )
+
+
+def test_two_cta_table_chunks_the_walk() -> None:
+    """A walk longer than the pair's step table (its shared memory is at the
+    SM100 limit) runs in chunks: 8 q heads x 512 Q tiles do not fit, so the
+    prologue writes the CTA's whole merged walk to its region of the walk
+    scratch (a kernel argument the launch allocates, ``2 * max_steps``
+    entries per CTA) and the roles wrap their step loops in the chunk loop
+    that copies the next chunk out of it at the working warps' barrier; the
+    ``cute_flash_bwd_table_steps`` cap chunks a short walk the same way; a
+    walk that fits the table needs no scratch."""
+    from helion._compiler.cute.cute_flash_bwd_flex_2cta import flex_bwd_two_cta_allowed
+    from helion._compiler.cute.cute_flash_bwd_flex_2cta import (
+        flex_bwd_two_cta_table_steps,
+    )
+
+    bound = _bind_d128(None, heads=8, kv_heads=1, q_seq=65536, kv_seq=512)
+    plan = _match_or_fail(bound).plan
+    assert plan.max_steps == 4096
+    steps = flex_bwd_two_cta_table_steps(plan, _CPU)
+    assert 0 < steps < plan.max_steps and steps % 32 == 0
+    assert flex_bwd_two_cta_allowed(plan, _CPU)
+    code = _render(bound, cute_flash_bwd_two_cta=1)
+    assert f"fbwd_nchunks = (fbwd_steps + {steps - 1}) // {steps}" in code
+    assert "named_barrier_wait_unaligned(7, 448)" in code
+    assert "if fbwd_chunk == fbwd_nchunks - 1:" in code
+    # The follower's MMA warp walks the chunk loop too (the barrier counts it).
+    assert "if (fbwd_rank != 0) & (fbwd_steps > 0):" in code
+    # The walk scratch: 2 batches x 1 kv head x 4 KV tiles of CTAs, each
+    # 2 * max_steps entries, allocated by the launch from the Q operand.
+    assert "_helion_flash_flex_bwd_walk_scratch(query, ctas=8, stride=8192)" in code
+    assert "from helion.runtime.cute.flash_flex import flex_bwd_walk_scratch" in code
+    assert "fbwd_woff = cutlass.Int32(cute.arch.block_idx()[0]) * 8192" in code
+    assert "_fbwd_walk_ws[fbwd_woff + fbwd_gbase + fbwd_j] = fbwd_entry" in code
+    assert "if fbwd_gbase + fbwd_j < 8192:" in code
+    assert "fbwd_steps = cutlass.min(fbwd_gbase, cutlass.Int32(8192))" in code
+    # The refill is a copy of the chunk's window out of the scratch by the
+    # 448 working threads (uniform trip count, the thread's share behind a
+    # predicate); only the prologue builds the bitmaps (four set loops).
+    assert re.search(
+        r"named_barrier_wait_unaligned\(7, 448\)\n\s+"
+        r"for fbwd_ib in cutlass\.range\(0, fbwd_csteps, 448, unroll=1\):\n\s+"
+        r"fbwd_ci = fbwd_ib \+ tidx\n\s+"
+        r"if fbwd_ci < fbwd_csteps:\n\s+"
+        rf"fbwd_sSteps\[fbwd_ci\] = cutlass\.Int32\(_fbwd_walk_ws\[fbwd_woff \+ fbwd_chunk \* {steps} \+ fbwd_ci\]\)",
+        code,
+    )
+    assert code.count("cute.arch.atomic_or(") == 4
+    # The bitmap loops run over uniform bounds with a per-thread predicate:
+    # shared atomics in a loop whose trip count is per thread make ptxas
+    # guard the whole chunked kernel as divergent.
+    assert "for fbwd_jb in cutlass.range(0, fbwd_cf0, 512, unroll=1):" in code
+    assert "for fbwd_jb in cutlass.range(tidx" not in code
+    # A barrier precedes every head's bitmap clear: the previous head's L0
+    # fill reads the bitmaps (rank 1's status of each entry) in a per-thread
+    # loop with no barrier after it, and a head whose odd tile lists nothing
+    # runs no other barrier before the next head's clear. Without it the
+    # clearing warps zeroed a bitmap a slower warp was still reading and that
+    # warp dropped the step.
+    assert re.search(
+        r"cute\.arch\.sync_threads\(\)\n\s+"
+        r"for fbwd_wb in cutlass\.range\(0, 51, 512, unroll=1\):",
+        code,
+    )
+    # The bitmaps hold the 512 Q blocks plus a sentinel for the blocks a
+    # BlockMask built for a longer Q lists past the sequence (17 words each,
+    # 51 in all); every index into them is clamped to the sentinel, so such
+    # entries never reach the mbarrier words after the bitmaps.
+    assert "storage.sBits.get_tensor(cute.make_layout(51))" in code
+    assert (
+        "fbwd_x = cutlass.min(cutlass.Int32(_fbwd_full_idx[fbwd_tb, fbwd_th, fbwd_pt0, fbwd_j]), cutlass.Int32(512))"
+        in code
+    )
+    assert "fbwd_sBits.iterator + (0 + fbwd_x // 32)" in code
+    assert "fbwd_xc = cutlass.min(fbwd_xb, cutlass.Int32(512))" in code
+    assert "fbwd_sBits[17 + fbwd_xc // 32]" in code
+    assert "fbwd_sBits[34 + fbwd_xc // 32]" in code
+    assert "fbwd_sBits[0 + fbwd_xc // 32]" in code
+    assert "fbwd_xb // 32" not in code
+    # The pair's step table is its own: a ``cute_flash_bwd_table_steps``
+    # cap at or above its automatic table renders that table and reads 0
+    # under the knob (one autotune identity); a smaller cap chunks the walk
+    # and stays; the 1-CTA kernel keeps every cap of its legal set.
+    spec = bound.config_spec
+    assert spec._cute_flash_bwd_two_cta_table_steps == steps
+    for cap, expect in (
+        (1024, 0),
+        (steps, 0),
+        (steps + 4, 0),
+        (steps - 32, steps - 32),
+        (5, 5),
+        (0, 0),
+    ):
+        config = spec.default_config()
+        config.config.update(
+            {"cute_flash_bwd_two_cta": 1, "cute_flash_bwd_table_steps": cap}
+        )
+        spec.normalize(config)
+        assert config.config["cute_flash_bwd_table_steps"] == expect, cap
+    config = spec.default_config()
+    config.config["cute_flash_bwd_table_steps"] = 1024
+    spec.normalize(config)
+    assert config.config["cute_flash_bwd_table_steps"] == 1024
+    # A cap that is not a multiple of 32 and does not fit resolves to the
+    # largest multiple of 32 at or below it that does (``steps`` here), not
+    # to the one below it.
+    for cap in (steps + 1, steps + 31):
+        assert flex_bwd_two_cta_table_steps(plan, _CPU, cap) >= steps
+    short = _bind_d128(_causal, heads=4, kv_heads=2, q_seq=8192, kv_seq=1024)
+    assert flex_bwd_two_cta_table_steps(_match_or_fail(short).plan, _CPU, 64) == 64
+    code = _render(short, cute_flash_bwd_two_cta=1, cute_flash_bwd_table_steps=64)
+    assert "fbwd_nchunks = (fbwd_steps + 63) // 64" in code
+    # A walk that fits the table (64 merged steps; the 227 KB leave ~160 at
+    # this shape) renders without the chunk loop.
+    tiny = _bind_d128(_causal, heads=4, kv_heads=2, q_seq=2048, kv_seq=1024)
+    tiny_plan = _match_or_fail(tiny).plan
+    assert flex_bwd_two_cta_table_steps(tiny_plan, _CPU) == 2 * tiny_plan.max_steps
+    whole = _render(tiny, cute_flash_bwd_two_cta=1)
+    assert "fbwd_nchunks" not in whole
+    # ... and fills the table directly: no scratch argument, no copy.
+    assert "_fbwd_walk_ws" not in whole and "fbwd_walk_ws" not in whole
+    assert "_helion_flash_flex_bwd_walk_scratch" not in whole
+    assert "fbwd_sSteps[fbwd_gbase + fbwd_j] = fbwd_entry" in whole
+    assert f"if fbwd_gbase + fbwd_j < {2 * tiny_plan.max_steps}:" in whole
+    assert "fbwd_sSteps[fbwd_ci] = " not in whole
+
+
+def test_two_cta_search_surface_and_seed() -> None:
+    """The knob is searched where the pair kernel is legal (head dims
+    (128, 128), an even KV tile count), its seed carries the pair's register
+    split, and the knobs the pair has no form of read 0 under it."""
+    bound = _bind_d128(_causal, heads=4, kv_heads=2, q_seq=512, kv_seq=512)
+    spec = bound.config_spec
+    assert spec._cute_flash_bwd_two_cta_allowed
+    assert spec._flat_fields()["cute_flash_bwd_two_cta"].choices == (0, 1)
+    seeds = [
+        c
+        for c in spec.autotune_seed_configs()
+        if c.config.get("cute_flash_bwd_two_cta") == 1
+    ]
+    assert [seed.config["cute_flash_bwd_regs"] for seed in seeds] == [
+        "88/168/88",
+        "104/152/104",
+    ]
+    assert all(seed.config["cute_flash_bwd_persistent"] == 0 for seed in seeds)
+    # Under the pair the knob's generic default (the 1-CTA kernel's split)
+    # reads as the first seed split; an explicit other split and the 1-CTA
+    # kernel's default are untouched.
+    from helion._compiler.cute.cute_flash_bwd_flex import FBWD_REG_SPLITS
+
+    pinned = spec.default_config()
+    pinned.config["cute_flash_bwd_two_cta"] = 1
+    assert pinned.config["cute_flash_bwd_regs"] == FBWD_REG_SPLITS[0]
+    spec.normalize(pinned, _fix_invalid=True)
+    assert pinned.config["cute_flash_bwd_regs"] == "88/168/88"
+    other_split = spec.default_config()
+    other_split.config.update(
+        {"cute_flash_bwd_two_cta": 1, "cute_flash_bwd_regs": "104/152/104"}
+    )
+    spec.normalize(other_split, _fix_invalid=True)
+    assert other_split.config["cute_flash_bwd_regs"] == "104/152/104"
+    single = spec.default_config()
+    spec.normalize(single, _fix_invalid=True)
+    assert single.config["cute_flash_bwd_regs"] == FBWD_REG_SPLITS[0]
+    assert "setmaxregister_increase(168)" in _render(bound, cute_flash_bwd_two_cta=1)
+    config = spec.default_config()
+    config.config.update(
+        {
+            "cute_flash_bwd_two_cta": 1,
+            "cute_flash_bwd_persistent": 1,
+            "cute_flash_bwd_stats_mma": 1,
+        }
+    )
+    spec.normalize(config)
+    assert config.config["cute_flash_bwd_persistent"] == 0
+    assert config.config["cute_flash_bwd_stats_mma"] == 0
+    assert config.config["cute_flash_bwd_two_cta"] == 1
+    # A 1-CTA config keeps its knobs.
+    config = spec.default_config()
+    config.config["cute_flash_bwd_persistent"] = 1
+    spec.normalize(config)
+    assert config.config["cute_flash_bwd_persistent"] == 1
+    # The whole merged walk fits the pair's table here: every cap renders it.
+    plan = _match_or_fail(bound).plan
+    assert spec._cute_flash_bwd_two_cta_table_steps == 2 * plan.max_steps
+    config = spec.default_config()
+    config.config.update(
+        {"cute_flash_bwd_two_cta": 1, "cute_flash_bwd_table_steps": 512}
+    )
+    spec.normalize(config)
+    assert config.config["cute_flash_bwd_table_steps"] == 0
+    for other in (
+        _bind(_args(_tensors(q_seq=512, kv_seq=512), _causal)),
+        _bind_d128(_causal, q_seq=512, kv_seq=384),
+    ):
+        assert not other.config_spec._cute_flash_bwd_two_cta_allowed
+        assert other.config_spec._cute_flash_bwd_two_cta_table_steps == 0
+        assert other.config_spec._flat_fields()["cute_flash_bwd_two_cta"].choices == (
+            0,
+        )
+        assert not other.config_spec.cute_flash_bwd_seed_configs()
+        # Pinned anyway, the knob renders the 1-CTA kernel, whose knobs all
+        # apply: it reads 0 and strips nothing.
+        config = other.config_spec.default_config()
+        config.config.update(
+            {
+                "cute_flash_bwd_two_cta": 1,
+                "cute_flash_bwd_persistent": 1,
+                "cute_flash_bwd_stats_mma": 1,
+            }
+        )
+        other.config_spec.normalize(config)
+        assert config.config["cute_flash_bwd_two_cta"] == 0
+        assert config.config["cute_flash_bwd_persistent"] == 1
+        assert config.config["cute_flash_bwd_stats_mma"] == 1
+
+
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
+class TestTwoCtaRenderPin(TestCase):
+    """The exact text of one 2-CTA backward render (dense walk, GQA, head
+    dim 128; the ``.expected_cute`` journal next to this file)."""
+
+    def test_two_cta_backward_render(self) -> None:
+        bound = _bind_d128(None, heads=4, kv_heads=2, q_seq=512, kv_seq=512)
+        with _as_sm100():
+            config = bound.config_spec.default_config()
+            code = bound.to_code(
+                helion.Config(**{**config.config, "cute_flash_bwd_two_cta": 1})
+            )
+        assert "flash_bwd_flex_2cta_shared_storage" in code
         self.assertExpectedJournal(_without_source_comments(code))

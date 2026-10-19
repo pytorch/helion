@@ -35,6 +35,45 @@ _FLEX_ITEM_TABLE_CACHE: WeakIdKeyDictionary = WeakIdKeyDictionary()
 # zeroes its counter), so one allocation serves every launch on a stream.
 _FLEX_SPLIT_WORKSPACE_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 
+# The 2-CTA flex backward's walk scratch per (device, stream, CTAs, stride):
+# every CTA writes its own merged walk before it reads it back, so the buffer
+# is never cleared and one allocation serves every launch on a stream.
+_FLEX_BWD_WALK_SCRATCH_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+
+
+def flex_bwd_walk_scratch(
+    like: torch.Tensor, *, ctas: int, stride: int
+) -> torch.Tensor:
+    """Scratch of the 2-CTA flex backward's merged pair walk
+    (``cute_flash_bwd_flex_2cta``): ``ctas`` regions of ``stride`` int32 step
+    entries on ``like``'s device, one per CTA of the launch (the CTA's
+    linear block index picks its region). The prologue writes the CTA's
+    whole walk there and every chunk of the step table is a copy of a window
+    of it, so a long walk never rebuilds its membership bitmaps.
+
+    Never cleared: a region is read only by the CTA that wrote it, after
+    the CTA-wide barrier that follows the writes. Re-entrancy as for
+    :func:`flex_split_workspace`: cached per device and CUDA stream, so
+    ordered launches on one stream share it and other streams get their
+    own; allocated afresh (uncached) under CUDA-graph capture.
+    """
+
+    def build() -> torch.Tensor:
+        return torch.empty(ctas * stride, dtype=torch.int32, device=like.device)
+
+    if like.is_cuda:
+        if torch.cuda.is_current_stream_capturing():
+            return build()
+        stream = torch._C._cuda_getCurrentRawStream(like.device.index)
+    else:
+        stream = None
+    key = (like.device, stream, ctas, stride)
+    cached = _FLEX_BWD_WALK_SCRATCH_CACHE.get(key)
+    if cached is None:
+        cached = build()
+        _FLEX_BWD_WALK_SCRATCH_CACHE[key] = cached
+    return cached
+
 
 def flex_split_workspace_elems(
     items: int, splits: int, head_dim_v: int
