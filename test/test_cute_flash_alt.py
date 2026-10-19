@@ -609,9 +609,11 @@ def test_coverage_design_keeps_the_64_row_tile_witness() -> None:
         coverage = generation.flash_deterministic_population_configs()
     # the family's only output path is the TMA store: under the direct-epilogue
     # override it is unreachable, which the design reports but does not reject
-    assert generation.flash_structural_coverage_uncovered_values() == [
-        (FAMILY_KEY, "fa4_alt")
-    ]
+    # (as it does the shared staged output tile, a child of that epilogue)
+    assert set(generation.flash_structural_coverage_uncovered_values()) == {
+        (FAMILY_KEY, "fa4_alt"),
+        (cute_flash.FLASH_O_STAGE_KEY, 1),
+    }
     witnesses = [
         config.config
         for config in coverage

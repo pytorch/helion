@@ -894,6 +894,9 @@ def _append_cute_wrapper_plan(
         # The split-KV list walk (``cute_flash_kv_split``): that many CTAs
         # per pair item (the device body decodes the split id).
         kv_split = plan_int("kv_split", default=1)
+        # The tail split: the last partial wave's items as split units.
+        tail_split = plan_int("flex_tail_split", default=0)
+        tail_items_ws = plan_int("flex_tail_items_ws", default=0)
         pass_dynamic_tile_counts = plan.get("topology") != "fa4"
         hd = head_dim
         hd_v = head_dim_v
@@ -1162,12 +1165,15 @@ def _append_cute_wrapper_plan(
             # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
             # where each CTA stores its own half) or the ws_overlap tile height.
             otile = f"({q_tile_m}, {hd_v})"
+            # One sO tile shared by both query stages (``cute_flash_o_stage``
+            # = 1) keeps the layout at one stage; the device indexes stage 0.
+            o_stages = 1 if plan.get("o_stage") == 1 else q_stage
             flash_lines.extend(
                 [
                     (
                         f"_flash_osl = {bw}.make_smem_layout_epi("
                         f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, "
-                        f"{q_stage})"
+                        f"{o_stages})"
                     ),
                 ]
             )
@@ -1246,6 +1252,24 @@ def _append_cute_wrapper_plan(
                 )
             grid_cap = min(total_tiles * kv_split * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
+        elif plan.get("topology") == "fa4" and tail_split > 1:
+            # The tail split (``cute_flash_flex_tail_split``): the full waves
+            # of the device run unsplit, the last partial wave's items as
+            # ``tail_split`` split units each (one wave of CTAs); a tail the
+            # idle SMs cannot hold, a grid of one wave or less or an unknown
+            # device keeps the whole grid unsplit (the kernel reads the first
+            # tail unit as an argument).
+            from .flash_flex import flex_tail_base
+
+            tail_base = flex_tail_base(
+                total_tiles, num_sm or 0, tail_split, tail_items_ws
+            )
+            body.extend(
+                [
+                    f"    _flash_tail_base = cutlass.Int32({tail_base})",
+                    f"    grid_x = cutlass.Int32({tail_base + (total_tiles - tail_base) * tail_split})",
+                ]
+            )
         elif plan.get("topology") == "fa4":
             # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
             # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs
@@ -1284,6 +1308,8 @@ def _append_cute_wrapper_plan(
         )
         if pass_dynamic_tile_counts:
             call_args.extend(["_flash_num_bh", "_flash_total_tiles"])
+        if tail_split > 1:
+            call_args.append("_flash_tail_base")
         if lse_idx is not None:
             call_args.append("_flash_mLSE")
         if bias_idx is not None:

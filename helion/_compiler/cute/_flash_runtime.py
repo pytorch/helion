@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import functools
 from functools import partial
 from itertools import starmap
+import math
 from typing import Any
 from typing import cast
 
@@ -177,6 +178,7 @@ def flash_fa4_shared_storage(
     uneven_kv_ring: bool = False,
     flex_aux_bytes: int = 0,
     flex_coop_bytes: int = 0,
+    o_stage: int = 2,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -194,7 +196,11 @@ def flash_fa4_shared_storage(
     the load warp then issues the rest. softmax_threads is fixed at 128 (one
     warpgroup). The optional
     epi-TMA path gets a dedicated 2-stage ``sO`` buffer so persistent work-items
-    can load the next Q tile while the epilogue drains the previous O tile.
+    can load the next Q tile while the epilogue drains the previous O tile;
+    ``o_stage`` is its tile count (``cute_flash_o_stage``: 1 shares one tile
+    between the two query stages, the epilogue warp draining stage 0's store
+    before the correction warps stage stage 1, and the K/V ring takes the
+    freed tile).
 
     Cooperative two-CTA MMA partitions each K/V tile across the two CTAs.
     Allocate its per-CTA extent, matching make_smem_layout_b. Query/output
@@ -237,7 +243,7 @@ def flash_fa4_shared_storage(
         kv_ring_elems = kv_tile_n * kv_slot_dim * kv_stage // kv_cta_group_size
     clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
     clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
-    separate_o_size = 128 * head_dim_v * 2 if epi_tma else 0
+    separate_o_size = 128 * head_dim_v * o_stage if epi_tma else 0
 
     if separate_kv:
 
@@ -328,9 +334,7 @@ def flash_fa4_shared_storage(
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
             sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
-            sO: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim_v * 2], 1024
-            ]
+            sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
 
@@ -2545,6 +2549,7 @@ def fa4_disc_rowmax_causal_store_balanced(
         cute.copy(tiled_score_st, frg, tScoreSTtS[None, ci, None, None])
     cute.arch.fence_view_async_tmem_load()
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     return row_max
 
 
@@ -2633,6 +2638,7 @@ def fa4_disc_exp_convert_store(
             pfor_self_cta_rank,
         )
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -2660,6 +2666,7 @@ def _disc_chunk_release(
     if cutlass.const_expr(pforc_ptr_stage is not None):
         assert p_store_chunks == 4, "the per-chunk P release is written for 4 chunks"
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_fence_before_thread_sync()
         if ci == 0:
             mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
         else:
@@ -2671,6 +2678,7 @@ def _disc_chunk_release(
     if cutlass.const_expr(pforc_ptr_stage is None and pfor2_ptr_stage is not None):
         if ci == p_store_split - 1:
             cute.arch.fence_view_async_tmem_store()
+            tcgen05_fence_before_thread_sync()
             mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
 
 
@@ -2728,8 +2736,10 @@ def fa4_disc_exp_convert_store_causal(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -2851,6 +2861,7 @@ def fa4_disc_exp_convert_store_resident3_013_prefetch2(
         degree2,
     )
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage)
     p_sum = p_sum + _disc_resident_exp_store_rowsum(
         frg3,
@@ -2870,6 +2881,7 @@ def fa4_disc_exp_convert_store_resident3_013_prefetch2(
         degree2,
     )
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor2_ptr_stage)
     return p_sum
 
@@ -3097,8 +3109,10 @@ def fa4_disc_exp_convert_store_rep32(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3191,6 +3205,7 @@ def fa4_disc_exp_convert_store_rep32_split(
         p_sum = p_sum + _disc_chunk_rowsum(frg)
         ld_ci += 1
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     for ci in range(ld_ci, ld_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
@@ -3209,6 +3224,7 @@ def fa4_disc_exp_convert_store_rep32_split(
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
@@ -3288,8 +3304,10 @@ def fa4_disc_exp_convert_store_rep32_pipe(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if pair_ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3355,6 +3373,7 @@ def fa4_disc_exp_convert_store_resident_rep32(
             p_sum = p_sum + _disc_chunk_rowsum(cur)
         cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
@@ -3527,6 +3546,7 @@ def fa4_disc_resident_release(
     """A staged-P release of the mixed resident PASS2 (the fence and one
     arrival): at the 3/4 split on ``pfor``, after the last chunk on ``pfor2``."""
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
 
 
@@ -3538,6 +3558,7 @@ def fa4_disc_resident_finish16(
 ) -> None:
     """The last chunk's staged-P release of ``fa4_disc_resident_chunk16``."""
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3619,8 +3640,10 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if pair_ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3715,8 +3738,10 @@ def fa4_disc_exp_convert_store_rep32_causal(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3802,8 +3827,10 @@ def fa4_disc_exp_convert_store_rep32_pipe_causal(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if pair_ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -3889,8 +3916,10 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe_causal(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if pair_ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -4002,6 +4031,7 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
         p_sum = p_sum + _disc_chunk_rowsum(frg)
         ld_ci += 1
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     for ci in range(ld_ci, ld_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
@@ -4027,6 +4057,7 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
@@ -4052,8 +4083,10 @@ def fa4_disc_zero_store(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -4742,6 +4775,153 @@ def fa4_split_merge_store(
 
 
 @dsl_user_op
+def fa4_split_merge_rows(
+    ws: cute.Tensor,
+    stages: Sequence[
+        tuple[
+            cutlass.Int32,
+            cutlass.Int32,
+            cute.Tensor,
+            cutlass.Int32,
+            cutlass.Int32 | None,
+        ]
+    ],
+    o_row_stride: int,
+    lse: cute.Tensor | None,
+    lse_bh: cutlass.Int32,
+    tidx: cutlass.Int32,
+    split_id: cutlass.Int32,
+    splits: int,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    scale_log2: cutlass.Float32,
+    lse_scale: float,
+    tile_elems: int,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """The tail split's shared merge (``cute_flash_flex_tail_split``): every
+    split CTA of a work item merges its own ``32 / splits`` rows of each
+    32-row warp group once all ``splits`` partials of the item's stages are
+    in the workspace.  Lane ``l`` of warp ``w`` owns row ``w * 32 + split_id
+    * (32 / splits) + l % (32 / splits)`` and the chunks ``(l // (32 /
+    splits)) * chunks_per_lane ...`` of ``head_dim / corr_tile_size``.
+    ``stages`` lists per output stage the first split's chunk-major partial
+    tile offset (``2 * tile_elems`` per split), the first split's row-0
+    statistics offset (``512`` per split), the (128, head_dim) output tile,
+    the tile's first LSE row and the live row count (None: all rows).  The
+    loads of every stage go out first (one round trip), then per stage the
+    merged normalizer and the split weights exactly as the last-arriver merge
+    forms them, the sum in split order, the cast rows (``o_row_stride``
+    elements per row of the tile) and, from the chunk-0 lane, the row's LSE;
+    rows at or past the stage's live count store nothing (their loads read
+    the workspace's stale rows, harmlessly)."""
+    rows_per_cta = 32 // splits
+    chunks = head_dim // corr_tile_size
+    chunks_per_lane = chunks // splits
+    assert rows_per_cta * splits == 32 and chunks_per_lane * splits == chunks
+    lane = tidx % 32
+    row_local = lane % rows_per_cta
+    chunk_group = lane // rows_per_cta
+    row = (tidx // 32) * 32 + split_id * rows_per_cta + row_local
+    chunk_layout = cute.make_layout((corr_tile_size,), stride=(1,))
+    loaded = []
+    for partial_offset, _stats_offset, _gO, _lse_row_base, _live_rows in stages:
+        per_chunk = []
+        for i in range(chunks_per_lane):
+            chunk = chunk_group * chunks_per_lane + i
+            parts = []
+            for j in range(splits):
+                offset = (
+                    partial_offset
+                    + j * 2 * tile_elems
+                    + (chunk * 128 + row) * corr_tile_size
+                )
+                src = cute.make_tensor(
+                    ws.iterator + cute.assume(offset, divby=corr_tile_size),
+                    chunk_layout,
+                )
+                part = cute.make_rmem_tensor((corr_tile_size,), cutlass.Float32)
+                cute.autovec_copy(src, part)
+                parts.append(part)
+            per_chunk.append((chunk, parts))
+        loaded.append(per_chunk)
+    stats = []
+    for _partial_offset, stats_offset, _gO, _lse_row_base, _live_rows in stages:
+        per_split = []
+        for j in range(splits):
+            base = stats_offset + j * 512 + row * 2
+            per_split.append((cutlass.Float32(ws[base]), cutlass.Float32(ws[base + 1])))
+        stats.append(per_split)
+    for index, (
+        _partial_offset,
+        _stats_offset,
+        gO,
+        lse_row_base,
+        live_rows,
+    ) in enumerate(stages):
+        per_split = stats[index]
+        per_chunk = loaded[index]
+
+        def _merge(
+            per_split: list[tuple[cutlass.Float32, cutlass.Float32]] = per_split,
+            per_chunk: list[tuple[int, list[cute.Tensor]]] = per_chunk,
+            gO: cute.Tensor = gO,
+            lse_row_base: cutlass.Int32 = lse_row_base,
+        ) -> None:
+            row_max = per_split[0][0]
+            for j in range(1, splits):
+                row_max = cutlass.max(row_max, per_split[j][0])
+            safe_max = cutlass.Float32(
+                cutlass.select_(
+                    row_max == -cutlass.Float32.inf, cutlass.Float32(0.0), row_max
+                )
+            )
+            scales = [
+                cute.math.exp2(scale_log2 * (per_split[j][0] - safe_max), fastmath=True)
+                for j in range(splits)
+            ]
+            total = per_split[0][1] * scales[0]
+            for j in range(1, splits):
+                total = total + per_split[j][1] * scales[j]
+            inv_total = rcp_approx_ftz_or_zero(total)
+            weights = [scales[j] * inv_total for j in range(splits)]
+            for chunk, parts in per_chunk:
+                acc = parts[0]
+                acc.store(acc.load() * weights[0])
+                for j in range(1, splits):
+                    acc.store(acc.load() + parts[j].load() * weights[j])
+                out = cute.make_rmem_tensor((corr_tile_size,), o_dtype)
+                out.store(acc.load().to(o_dtype))
+                dst = cute.make_tensor(
+                    gO.iterator
+                    + cute.assume(row * o_row_stride + chunk * corr_tile_size, divby=8),
+                    chunk_layout,
+                )
+                cute.autovec_copy(out, dst)
+            if lse is not None:
+                value = row_max * scale_log2 + cute.math.log2(total)
+                if not math.isclose(lse_scale, 1.0, rel_tol=1e-6, abs_tol=1e-7):
+                    value = value * cutlass.Float32(lse_scale)
+
+                def _store_lse() -> None:
+                    lse[lse_row_base + row, lse_bh] = value
+
+                cutlass.cutlass_dsl.if_generate(
+                    chunk_group == 0, _store_lse, lambda: None, [], []
+                )
+
+        if live_rows is None:
+            _merge()
+        else:
+            cutlass.cutlass_dsl.if_generate(
+                row < live_rows, _merge, lambda: None, [], []
+            )
+
+
+@dsl_user_op
 def fa4_correction_epilogue_to_smem_scoped_2cta(
     flash_pvt: object,
     tOtO: cute.Tensor,
@@ -4993,8 +5173,10 @@ def resident_softmax_value_graph(
         cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
         if ci == p_store_split - 1:
             cute.arch.fence_view_async_tmem_store()
+            tcgen05_fence_before_thread_sync()
             mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     mbar_spin_wait(stats_empty_ptr_stage, stats_empty_phase, wait_hint)
     return fadd_reduce_packed(tLDrS, row_sum_init)
@@ -5056,6 +5238,7 @@ def _fa4_sp_exp_convert_store_impl(
         for ci in range(p_store_split):
             cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_fence_before_thread_sync()
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
         for ci in range(p_store_split, frag_count):
             frg = cast("cute.Tensor", src[None, ci])
@@ -5077,6 +5260,7 @@ def _fa4_sp_exp_convert_store_impl(
         for ci in range(p_store_split, p_store_chunks):
             cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_fence_before_thread_sync()
         mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
         for ci in range(frag_count):
@@ -5101,10 +5285,12 @@ def _fa4_sp_exp_convert_store_impl(
             if cutlass.const_expr(pfor2_ptr_stage is not None):
                 if ci == p_store_split - 1:
                     cute.arch.fence_view_async_tmem_store()
+                    tcgen05_fence_before_thread_sync()
                     mbarrier_arrive(
                         pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank
                     )
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_fence_before_thread_sync()
         if cutlass.const_expr(pfor2_ptr_stage is None):
             mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
         else:
@@ -5293,6 +5479,7 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
         )
         ld_ci += 1
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     for ci in range(ld_ci, frag_count):
         _disc_chunk_convert_store(
@@ -5304,6 +5491,7 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
             io_dtype,
         )
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     if cutlass.const_expr(whole_row_sum):
         return fadd_reduce_packed(tLDrS)
@@ -5558,6 +5746,7 @@ def fa4_disc_exp_convert_store_pipe(
             pfor_self_cta_rank,
         )
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
@@ -5639,8 +5828,10 @@ def fa4_disc_exp_convert_store_pipe_causal(
         if cutlass.const_expr(pfor2_ptr_stage is not None):
             if ci == p_store_split - 1:
                 cute.arch.fence_view_async_tmem_store()
+                tcgen05_fence_before_thread_sync()
                 mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
+    tcgen05_fence_before_thread_sync()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:

@@ -2013,6 +2013,7 @@ def _flash_aliased_kv_stage_cap(
     use_2cta_instrs: bool = False,
     head_dim_v: int | None = None,
     aux_smem_bytes: int = 0,
+    output_tiles: int | None = None,
 ) -> int:
     """Largest legal aliased K/V depth for the requested output storage.
 
@@ -2022,7 +2023,8 @@ def _flash_aliased_kv_stage_cap(
     uneven three-slot layout of that pair has its own fit check
     (``_flash_uneven_kv_ring_supported``).  ``aux_smem_bytes`` is shared
     memory the body adds outside the tiles (the flex hook's cooperative
-    table staging).
+    table staging).  ``output_tiles`` is the staged output tile count
+    (``cute_flash_o_stage``; None: one per query stage).
     """
     return max_fa4_kv_depth(
         FlashScheduleSpec(
@@ -2034,6 +2036,7 @@ def _flash_aliased_kv_stage_cap(
             cooperative_mma=use_2cta_instrs,
             head_dim_v=head_dim_v,
             aux_smem_bytes=aux_smem_bytes,
+            output_tiles=output_tiles,
         )
     )
 
@@ -2120,6 +2123,47 @@ def _flash_o_over_q_supported(
         and not tensor_4d_tma
         and not has_row_epilogue
         and head_dim_v <= head_dim
+    )
+
+
+def _flash_o_stage_legal(
+    *,
+    topology: str,
+    epi_tma: bool,
+    epi_stg: bool,
+    o_over_q: bool,
+    s_stage: int,
+    use_2cta_instrs: bool,
+    separate_kv_rings: bool,
+    has_row_epilogue: bool,
+    row_bound_tiling: str,
+    uneven_kv_ring: bool,
+    kv_split: int,
+    flex_tail_split: int,
+) -> bool:
+    """Where ``cute_flash_o_stage=1`` (one staged output tile shared by the
+    pair's two query stages) is legal: the fa4 pair body's plain TMA-store
+    epilogue, whose epilogue warp drains stage 0's store before the
+    correction warps stage stage 1 (the dead-stage split and a ragged query
+    length keep that order through the same barriers).  The split-KV and
+    tail-split merges, the row epilogues (their aux tables are staged in both
+    tiles), the segment tiling, the two-CTA and separate-ring bodies, the
+    asymmetric pair's uneven ring and the output over the dead Q stages each
+    stage per tile.  Codegen applies the same test; the resolver pins the
+    knob off elsewhere."""
+    return (
+        topology == "fa4"
+        and epi_tma
+        and not epi_stg
+        and not o_over_q
+        and s_stage == 2
+        and not use_2cta_instrs
+        and not separate_kv_rings
+        and not has_row_epilogue
+        and row_bound_tiling != "segment"
+        and not uneven_kv_ring
+        and kv_split == 1
+        and flex_tail_split == 0
     )
 
 
@@ -2855,6 +2899,14 @@ class FlashAttentionConfig:
     # the global tiling of a per-row KV lower bound (the segment tiling's
     # item loop reloads Q into the stages the staged O would occupy).
     o_over_q: bool = False
+    # Staged output tiles of the fa4 pair's TMA-store epilogue
+    # (``cute_flash_o_stage``): 2 stages one tile per query stage (both
+    # stores drain together); 1 shares one tile between the stages (the
+    # epilogue warp drains stage 0's TMA store before the correction warps
+    # stage stage 1 into it), which frees a K/V tile of shared memory: the
+    # aliased ring's depth cap gains one slot (head dim 128: 3 -> 4). Legal
+    # on the plain TMA epilogue only (``_flash_o_stage_legal``).
+    o_stage: int = 2
     # Tiling of a per-row KV lower-bound (ROW_KV_BEGIN) plan on the fa4 pair
     # body. ``global`` walks the sequence-wide 256-row pair grid and masks the
     # tiles the bound cuts; ``segment`` walks a host-built work table of
@@ -2898,6 +2950,14 @@ class FlashAttentionConfig:
     # math. Searched for list-walk plans with the MMA skip, default off
     # (``HELION_CUTE_FLASH_FLEX_DEAD_STAGE_SPLIT=1`` turns the default on).
     flex_dead_stage_split: bool = False
+    # FlexAttention persistent list walk (``cute_flash_flex_early_qk``): the
+    # MMA warp issues the next work item's first QK (and waits for its Q0 /
+    # K0) between this item's last PV0 and last PV1 -- S0 is free once PV0
+    # has read P0 -- instead of after the item, so the next item's first S
+    # is ready while this item's stage-1 tail drains. Searched on the fa4
+    # pair body's persistent loop (one CTA per item, no split KV), default
+    # on; the grid and the other loop forms keep the item order.
+    flex_early_qk: bool = False
     # FlexAttention list walk (``cute_flash_kv_split``): the KV walk of every
     # work item is split over this many CTAs (1, 2 or 4; 1 = off). The grid
     # becomes items x splits; split ``s`` of an item walks the ``s``-th
@@ -2917,6 +2977,16 @@ class FlashAttentionConfig:
     # of the device's SMs, so a grid with fewer items than SMs starts split;
     # a config without the key resolves to 1 and renders byte-identically.
     kv_split: int = 1
+    # FlexAttention list walk on the one-item grid
+    # (``cute_flash_flex_tail_split``): the items of the grid's last,
+    # partial wave (``total - floor(total / SMs) * SMs`` of them) run as that
+    # many split-KV work units each (2, 4 or 8: the largest power of two the
+    # idle SMs hold), merged in the kernel through the split-KV path, so the
+    # last wave takes a fraction of an item instead of a whole one (whisper:
+    # 320 items on 148 SMs = 2.16 waves, the third wave 24 CTAs); the full
+    # waves run unsplit. The launcher sizes the tail from the device's SM
+    # count and passes the first tail unit as a runtime argument. 0 off.
+    flex_tail_split: int = 0
 
 
 # TMEM is 512 columns. The FA4 score pipeline holds ``s_stage`` score buffers of
@@ -3893,6 +3963,92 @@ def _flash_flex_dead_stage_split_default(legal: bool) -> bool:
 # The split-KV knob's values: the walk of a work item over one, two or four
 # CTAs (powers of two: the split id is the low bits of the CTA id).
 FLASH_KV_SPLITS: tuple[int, ...] = (1, 2, 4)
+# ``cute_flash_flex_tail_split``: off, or the last wave's split count.
+FLASH_FLEX_TAIL_SPLITS: tuple[int, ...] = (0, 2, 4, 8)
+
+
+def _flash_flex_tail_split_legal(
+    *,
+    has_list_walk: bool,
+    pipeline_family: str,
+    persistent: bool,
+    kv_split: int,
+    num_kv: int,
+    stat_transport: str,
+    use_2cta_instrs: bool,
+    use_clc_scheduler: bool,
+    flex_trivial_walk: bool,
+    flex_dead_stage_split: bool,
+    splits: int,
+    chunks: int,
+) -> bool:
+    """Where ``cute_flash_flex_tail_split`` renders: the list walk's one-item
+    fa4 grid (the persistent loop has no wave tail), both walk forms (the
+    one-word register bitmask trims its word, the cursor walk's roles
+    consume the slice's leading tiles through the cursor), no split KV (the
+    tail is the split), a two-slot statistics transport (the merge reads the
+    row max from the second slot), no cluster scheduling and a table-backed
+    walk."""
+    return (
+        has_list_walk
+        and not flex_trivial_walk
+        and pipeline_family == "fa4"
+        and not persistent
+        and kv_split == 1
+        and stat_transport not in ("single", "single_final")
+        and not use_2cta_instrs
+        and not use_clc_scheduler
+        # The tail's merge is the plain split-KV one (no dead-stage merge).
+        and not flex_dead_stage_split
+        # The shared merge hands each split CTA ``chunks / splits`` chunks of
+        # ``32 / splits`` rows per warp.
+        and (splits == 0 or chunks % splits == 0)
+    )
+
+
+# Workspace items the tail split sizes for: the tail never exceeds one wave
+# of SMs (the launcher keeps a tail past this unsplit).
+FLASH_FLEX_TAIL_ITEMS_MAX = 256
+
+
+def _flash_flex_tail_split_realizable(
+    value_head_dim: int, corr_tile_sizes: Sequence[object]
+) -> tuple[int, ...]:
+    """The tail splits some correction tile of ``corr_tile_sizes`` realizes
+    on a ``value_head_dim``-wide output (``_flash_flex_tail_split_legal``:
+    the split divides ``value_head_dim / corr_tile_size``), 0 included."""
+    chunk_counts = tuple(
+        value_head_dim // int(size)  # pyrefly: ignore[bad-argument-type]
+        for size in corr_tile_sizes
+        if value_head_dim % int(size) == 0  # pyrefly: ignore[bad-argument-type]
+    )
+    return tuple(
+        splits
+        for splits in FLASH_FLEX_TAIL_SPLITS
+        if splits == 0 or any(chunks % splits == 0 for chunks in chunk_counts)
+    )
+
+
+def _flash_flex_tail_split_seed(
+    *, device_sm_count: int, num_bh: int | None, q_seq: int | None
+) -> int:
+    """The fragment default of ``cute_flash_flex_tail_split`` where it is
+    legal: the largest split whose tail units fill the idle SMs of the
+    last partial wave (``items = num_bh * ceil(q_seq / 256)``; at least one
+    full wave ahead of it), 0 when the device or the grid is unknown, the
+    grid is one wave or less (``cute_flash_kv_split`` covers it) or the
+    grid's last wave is full."""
+    if device_sm_count <= 0 or not num_bh or not q_seq or q_seq <= 0:
+        return 0
+    items = num_bh * -(-q_seq // 256)
+    waves_full, tail = divmod(items, device_sm_count)
+    if waves_full == 0 or tail == 0 or tail > FLASH_FLEX_TAIL_ITEMS_MAX:
+        return 0
+    seed = 0
+    for value in FLASH_FLEX_TAIL_SPLITS[1:]:
+        if tail * value <= device_sm_count:
+            seed = value
+    return seed
 
 
 def _flash_kv_split_legal(*, has_list_walk: bool, pipeline_family: str) -> bool:
@@ -6006,6 +6162,39 @@ def resolve_flash_config(
         aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
     ):
         uneven_kv_ring = False
+    # Staged output tiles (``cute_flash_o_stage``): one tile shared by the
+    # pair's stages frees a K/V slot; legal on the plain TMA epilogue without
+    # a split merge (the split knobs are read here as requested: the walk
+    # below never derives a split the config did not ask for); after the
+    # epilogue and ring forms above are final.
+    o_stage = 2
+    o_stage_cfg = _cfg(FLASH_O_STAGE_KEY)
+    if o_stage_cfg is not None:
+        o_stage = int(o_stage_cfg)  # type: ignore[arg-type]
+    if o_stage not in FLASH_O_STAGE_CHOICES:
+        raise InvalidConfig(
+            f"{FLASH_O_STAGE_KEY} must be one of {FLASH_O_STAGE_CHOICES}, "
+            f"got {o_stage!r}"
+        )
+    requested_kv_split = _cfg(FLASH_KV_SPLIT_KEY)
+    requested_tail_split = _cfg(FLASH_FLEX_TAIL_SPLIT_KEY)
+    if o_stage == 1 and not _flash_o_stage_legal(
+        topology=topology,
+        epi_tma=epi_tma,
+        epi_stg=epi_stg,
+        o_over_q=o_over_q,
+        s_stage=s_stage,
+        use_2cta_instrs=use_2cta_instrs,
+        separate_kv_rings=separate_kv_rings,
+        has_row_epilogue=has_row_epilogue,
+        row_bound_tiling=row_bound_tiling,
+        uneven_kv_ring=uneven_kv_ring,
+        kv_split=int(requested_kv_split) if requested_kv_split is not None else 1,  # type: ignore[arg-type]
+        flex_tail_split=int(requested_tail_split)  # type: ignore[arg-type]
+        if requested_tail_split is not None
+        else 0,
+    ):
+        o_stage = 2
     if uneven_kv_ring:
         kv_stage = UNEVEN_KV_RING_DEPTH
     elif (
@@ -6022,6 +6211,7 @@ def resolve_flash_config(
             "stage_output": (epi_tma or epi_stg) and not o_over_q,
             "kv_tile_n": kv_tile_n,
             "use_2cta_instrs": use_2cta_instrs,
+            "output_tiles": 1 if o_stage == 1 else None,
         }
         # The stream's ring: the deepest of 4 / 2 / 1 chunk slots that
         # leaves a two-deep K/V ring; none fitting turns the width off.
@@ -6390,6 +6580,33 @@ def resolve_flash_config(
         or stat_transport in ("single", "single_final")
     ):
         kv_split = 1
+    # The tail split: the one-item fa4 grid of a list walk with the
+    # register bitmask (one word), no split KV / dead-stage split; the
+    # value is the tail's split count.
+    flex_tail_split = 0
+    flex_tail_split_cfg = _cfg(FLASH_FLEX_TAIL_SPLIT_KEY)
+    if flex_tail_split_cfg is not None:
+        if flex_tail_split_cfg not in FLASH_FLEX_TAIL_SPLITS:
+            raise InvalidConfig(
+                f"{FLASH_FLEX_TAIL_SPLIT_KEY} must be one of {FLASH_FLEX_TAIL_SPLITS}, "
+                f"got {flex_tail_split_cfg!r}"
+            )
+        flex_tail_split = int(flex_tail_split_cfg)  # type: ignore[arg-type]
+    if not _flash_flex_tail_split_legal(
+        has_list_walk=has_list_walk,
+        pipeline_family=pipeline_family,
+        persistent=persistent,
+        kv_split=kv_split,
+        num_kv=num_kv,
+        stat_transport=stat_transport,
+        use_2cta_instrs=use_2cta_instrs,
+        use_clc_scheduler=use_clc_scheduler,
+        flex_trivial_walk=flex_trivial_walk,
+        flex_dead_stage_split=flex_dead_stage_split,
+        splits=flex_tail_split,
+        chunks=(head_dim if head_dim_v is None else head_dim_v) // corr_tile_size,
+    ):
+        flex_tail_split = 0
     # The staggered walk needs the dead-tile skip's body and a ring deep
     # enough to hold each K/V slot across the two stages' steps; it has no
     # dead tile, so the skip is pinned off under it (one identity per render).
@@ -6496,6 +6713,42 @@ def resolve_flash_config(
     if softmax_region == "shared":
         # One region runs one exp cadence: stage 0's offset follows stage 1's.
         e2e_offset0 = e2e_offset
+    # The persistent list walk's early next-item QK0: the fa4 pair body's
+    # strided ``while`` loop over one CTA per item (the split-KV walk, the
+    # cluster scheduler and the staggered walk keep the item order).
+    flex_early_qk_legal = (
+        has_list_walk
+        and topology == "fa4"
+        and persistent
+        and persistent_loop == "while"
+        and kv_split == 1
+        and not use_2cta_instrs
+        and not use_clc_scheduler
+        and not causal_stagger
+        and not alternating_warpgroups
+        # The uneven ring's next K0 (slot 0) waits for slot 1 to drain, the
+        # slot this item's pending last PV1 holds: the hoisted K0 wait would
+        # deadlock against it whatever the loader's order.
+        and not uneven_kv_ring
+    )
+    flex_early_qk = _flash_bool_env("HELION_CUTE_FLASH_FLEX_EARLY_QK", True)
+    flex_early_qk_cfg = _cfg(FLASH_FLEX_EARLY_QK_KEY)
+    if flex_early_qk_cfg is not None:
+        flex_early_qk = bool(flex_early_qk_cfg)
+    if not flex_early_qk_legal:
+        flex_early_qk = False
+    if flex_early_qk and first_load_order == 1:
+        # The hoisted head waits for the next item's Q0 and K0 while the
+        # MMA warp's last PV1 still holds this item's last V slot, so the
+        # loader's per-item prologue must issue Q0 before any acquire that
+        # can block behind that slot: with the two-stage aliased K/V ring
+        # the next item's V0 takes exactly it, and order 1 (K0, V0, Q0, Q1)
+        # blocked there before issuing Q0 -- the loader waiting on the MMA's
+        # PV1, the MMA on the loader's Q0 (the 4K causal campaign cells hung
+        # on their persistent seed). Order 3 keeps K0 first with Q0 ahead of
+        # V0; the early head takes it for every ring depth so the loader's
+        # order never depends on the MMA warp's release.
+        first_load_order = 3
     resolved = FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -6602,10 +6855,13 @@ def resolve_flash_config(
         alternating_warpgroups=alternating_warpgroups,
         uneven_kv_ring=uneven_kv_ring,
         o_over_q=o_over_q,
+        o_stage=o_stage,
         row_bound_tiling=row_bound_tiling,
         flex_skip_absent=flex_skip_absent,
         flex_dead_stage_split=flex_dead_stage_split,
         kv_split=kv_split,
+        flex_early_qk=flex_early_qk,
+        flex_tail_split=flex_tail_split,
     )
     if (
         resolved.causal_skip_dead_tile
@@ -6824,6 +7080,25 @@ FLASH_FIRST_LOAD_ORDER_CHOICES = (0, 1, 2, 3, 4, 5)
 FLASH_FIRST_LOAD_ORDER_STAGED = 5
 FLASH_KV_ORDER_KEY = "cute_flash_kv_order"
 FLASH_EPI_TMA_KEY = "cute_flash_epi_tma"
+FLASH_O_STAGE_KEY = "cute_flash_o_stage"
+# Staged output tiles of the TMA epilogue: one per query stage, or one shared.
+FLASH_O_STAGE_CHOICES: tuple[int, ...] = (2, 1)
+
+
+def _flash_o_stage_tile(o_stage: int, stage: str) -> str:
+    """The staged output tile a query stage reads or writes: its own under
+    two tiles, tile 0 under the shared tile (``cute_flash_o_stage`` = 1)."""
+    return stage if o_stage == 2 else "0"
+
+
+def _flash_o_stage_empty_slot(o_stage: int, stage: str) -> str:
+    """The ``corr_epi_empty`` barrier a stage's staging waits: its own tile's
+    under two tiles; under the shared tile the other stage's release (stage
+    0 waits "the previous item's stage 1 left the tile", stage 1 "stage 0
+    left it")."""
+    return stage if o_stage == 2 else str(1 - int(stage))
+
+
 FLASH_EPI_STG_KEY = "cute_flash_epi_stg"
 FLASH_EPI_STG_STORE_KEY = "cute_flash_epi_stg_store"
 FLASH_EPI_STG_GMEM_KEY = "cute_flash_epi_stg_gmem"
@@ -6882,7 +7157,28 @@ FLASH_CAUSAL_HEAD_PAIR_KEY = "cute_flash_causal_head_pair"
 FLASH_EARLY_PROLOGUE_LOADS_KEY = "cute_flash_early_prologue_loads"
 FLASH_FLEX_SKIP_ABSENT_KEY = "cute_flash_flex_skip_absent"
 FLASH_FLEX_DEAD_STAGE_SPLIT_KEY = "cute_flash_flex_dead_stage_split"
+FLASH_FLEX_EARLY_QK_KEY = "cute_flash_flex_early_qk"
+FLASH_FLEX_TAIL_SPLIT_KEY = "cute_flash_flex_tail_split"
 FLASH_KV_SPLIT_KEY = "cute_flash_kv_split"
+# Conditional children of the structural coverage design: a searched value
+# that renders only under its parents' values.  A design whose overrides pin
+# any parent elsewhere reports the child as uncovered telemetry, not a defect
+# (the shared staged output tile needs the TMA epilogue without the staged
+# vector store, the output over the dead Q stages, the uneven ring, the
+# segment tiling or a split merge: ``_flash_o_stage_legal``).
+FLASH_COVERAGE_CHILD_PARENTS: dict[
+    tuple[str, object], tuple[tuple[str, object], ...]
+] = {
+    (FLASH_O_STAGE_KEY, 1): (
+        (FLASH_EPI_TMA_KEY, True),
+        (FLASH_EPI_STG_KEY, False),
+        (FLASH_O_OVER_Q_KEY, False),
+        (FLASH_UNEVEN_KV_RING_KEY, False),
+        (FLASH_ROW_BOUND_TILING_KEY, "global"),
+        (FLASH_KV_SPLIT_KEY, 1),
+        (FLASH_FLEX_TAIL_SPLIT_KEY, 0),
+    ),
+}
 FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
 FLASH_SP_ROW_SUM_KEY = "cute_flash_sp_row_sum"
 FLASH_SOFTMAX_LOWERING_KEY = "cute_flash_softmax_lowering"
@@ -7102,7 +7398,26 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
         FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_FLEX_SKIP_ABSENT_KEY: True,
     },
+    # The early next-item QK0 is a property of the fa4 pair body's
+    # persistent item loop: both of its values are witnessed there (the
+    # resolver pins the knob off on the grid, so a grid row says nothing
+    # about either form of the persistent loop).
+    (FLASH_FLEX_EARLY_QK_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_PERSISTENT_KEY: True,
+    },
+    (FLASH_FLEX_EARLY_QK_KEY, False): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_PERSISTENT_KEY: True,
+    },
 }
+# The tail split is a property of the fa4 pair body's one-item grid.
+for _tail_split in (2, 4, 8):
+    FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(FLASH_FLEX_TAIL_SPLIT_KEY, _tail_split)] = {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_KV_SPLIT_KEY: 1,
+    }
 FLASH_ROWMAX_KEY = "cute_flash_rowmax"
 
 
@@ -7130,6 +7445,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_FIRST_LOAD_ORDER_KEY,
     FLASH_KV_ORDER_KEY,
     FLASH_EPI_TMA_KEY,
+    FLASH_O_STAGE_KEY,
     FLASH_EPI_STG_KEY,
     FLASH_EPI_STG_STORE_KEY,
     FLASH_EPI_STG_GMEM_KEY,
@@ -7180,6 +7496,8 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_EARLY_PROLOGUE_LOADS_KEY,
     FLASH_FLEX_SKIP_ABSENT_KEY,
     FLASH_FLEX_DEAD_STAGE_SPLIT_KEY,
+    FLASH_FLEX_EARLY_QK_KEY,
+    FLASH_FLEX_TAIL_SPLIT_KEY,
     FLASH_FLEX_MASK_FORM_KEY,
     FLASH_KV_SPLIT_KEY,
     FLASH_FLEX_AUX_SMEM_KEY,
@@ -7251,6 +7569,7 @@ def flash_effective_config_values(
         FLASH_FIRST_LOAD_ORDER_KEY: config.first_load_order,
         FLASH_KV_ORDER_KEY: config.kv_order,
         FLASH_EPI_TMA_KEY: config.epi_tma,
+        FLASH_O_STAGE_KEY: config.o_stage,
         FLASH_EPI_STG_KEY: config.epi_stg,
         FLASH_EPI_STG_STORE_KEY: config.epi_stg_store,
         FLASH_EPI_STG_GMEM_KEY: config.epi_stg_gmem,
@@ -7300,6 +7619,8 @@ def flash_effective_config_values(
         FLASH_EARLY_PROLOGUE_LOADS_KEY: config.early_prologue_loads,
         FLASH_FLEX_SKIP_ABSENT_KEY: config.flex_skip_absent,
         FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: config.flex_dead_stage_split,
+        FLASH_FLEX_EARLY_QK_KEY: config.flex_early_qk,
+        FLASH_FLEX_TAIL_SPLIT_KEY: config.flex_tail_split,
         FLASH_FLEX_MASK_FORM_KEY: config.flex_mask_form,
         FLASH_KV_SPLIT_KEY: config.kv_split,
         FLASH_FLEX_AUX_SMEM_KEY: config.flex_aux_smem,
@@ -9885,10 +10206,21 @@ def flash_attention_seed_configs(
         list_kv_stage_cap = _flash_aliased_kv_stage_cap(
             head_dim, stage_output=True, head_dim_v=head_dim_v
         )
+        # The shared staged output tile where the slot it frees deepens the
+        # seeded ring (head dim 128: 3 -> 4; two tiles stay where the ring is
+        # not at the shared-memory cap).
+        list_shared_kv_stage_cap = _flash_aliased_kv_stage_cap(
+            head_dim, stage_output=True, head_dim_v=head_dim_v, output_tiles=1
+        )
+        list_o_stage = 2
+        if min(5, list_shared_kv_stage_cap) > min(5, list_kv_stage_cap):
+            list_o_stage = 1
+            list_kv_stage_cap = list_shared_kv_stage_cap
         flex_fa4_structure = {
             FLASH_PIPELINE_FAMILY_KEY: "fa4",
             FLASH_PERSISTENT_KEY: True,
             FLASH_KV_STAGE_KEY: min(5, list_kv_stage_cap),
+            FLASH_O_STAGE_KEY: list_o_stage,
             FLASH_EXP2_PACKET_KEY: "8x2",
             FLASH_SOFTMAX_DISC_KEY: True,
             FLASH_DISC_PIPE_KEY: 2,
@@ -10860,6 +11192,44 @@ def flash_autotune_fragments(
     else:
         s_stage = enum(defaults.s_stage, (1, 2))
 
+    # One staged output tile shared by the pair's stages
+    # (``cute_flash_o_stage`` = 1): searched where the fa4 pair can run the
+    # plain TMA epilogue; the resolver pins it off elsewhere (split merges,
+    # row epilogues, the segment tiling, two-CTA and separate-ring bodies).
+    # (Not on the asymmetric pair: two staged head_dim_v tiles beside its
+    # wider Q tiles leave no two-deep ring, so the resolver drops the TMA
+    # epilogue or stages over the dead Q stages there, pinning the tile count.)
+    # (Offered only where the surface's families include a one-CTA fa4 body
+    # on the aliased ring: a surface pinned to a two-CTA, separate-ring or
+    # alternating family has no row that reaches the shared tile.)
+    o_stage_families = tuple(
+        family
+        for family in active_families
+        if FLASH_PIPELINE_FAMILY_FLAGS[family].topology == "fa4"
+        and not FLASH_PIPELINE_FAMILY_FLAGS[family].use_2cta_instrs
+        and not FLASH_PIPELINE_FAMILY_FLAGS[family].causal_two_cta
+        and not FLASH_PIPELINE_FAMILY_FLAGS[family].separate_kv_rings
+        and not FLASH_PIPELINE_FAMILY_FLAGS[family].alternating_warpgroups
+    )
+    o_stage_eligible = (
+        fa4_search_eligible
+        and bool(o_stage_families)
+        and not asymmetric_head_dims
+        and _flash_o_stage_legal(
+            topology="fa4",
+            epi_tma=True,
+            epi_stg=False,
+            o_over_q=False,
+            s_stage=2,
+            use_2cta_instrs=False,
+            separate_kv_rings=False,
+            has_row_epilogue=has_row_epilogue,
+            row_bound_tiling="global",
+            uneven_kv_ring=False,
+            kv_split=1,
+            flex_tail_split=0,
+        )
+    )
     ws_only_kv_pipeline = not fa4_search_eligible
     if num_kv < 2 and not has_list_walk:
         # (The flex pair body keeps its two-slot ring at one KV tile.)
@@ -10926,13 +11296,37 @@ def flash_autotune_fragments(
         )
         kv_stage_values = tuple(range(2, value_cap + 1))
         kv_stage_search = tuple(range(2, search_cap + 1))
+        kv_stage_coverage = None
+        if o_stage_eligible and not use_2cta_kv_layout:
+            # The slot the shared output tile frees: searched, but covered
+            # only where ``cute_flash_o_stage`` is 1 (under two tiles the
+            # resolver clamps the depth back to ``search_cap``; a two-CTA
+            # layout's deeper domain already holds the depth).
+            shared_cap = _flash_aliased_kv_stage_cap(
+                head_dim,
+                head_dim_v=head_dim_v,
+                stage_output=output_requires_tma or has_list_walk,
+                use_2cta_instrs=use_2cta_kv_layout,
+                output_tiles=1,
+            )
+            if shared_cap > search_cap:
+                kv_stage_coverage = kv_stage_search
+                kv_stage_search = tuple(range(2, shared_cap + 1))
+                kv_stage_values = tuple(
+                    dict.fromkeys((*kv_stage_values, *kv_stage_search))
+                )
         if uneven_kv_ring_eligible:
             # The uneven ring's depth is a legal resolved value, reached
             # through its own knob rather than by searching the depth.
             kv_stage_values = tuple(
                 dict.fromkeys((*kv_stage_values, UNEVEN_KV_RING_DEPTH))
             )
-        kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_search)
+        kv_stage = enum(
+            defaults.kv_stage,
+            kv_stage_values,
+            kv_stage_search,
+            coverage_choices=kv_stage_coverage,
+        )
     else:
         kv_stage = enum(defaults.kv_stage, (2, 3))
     uneven_kv_ring = enum(
@@ -10944,6 +11338,11 @@ def flash_autotune_fragments(
         defaults.o_over_q,
         (False, True),
         (False, True) if o_over_q_eligible else (defaults.o_over_q,),
+    )
+    o_stage = enum(
+        defaults.o_stage,
+        FLASH_O_STAGE_CHOICES,
+        FLASH_O_STAGE_CHOICES if o_stage_eligible else (defaults.o_stage,),
     )
     # Segment-aligned tiling of the per-row KV lower bound: searched where the
     # fa4 pair body hosts the plan's single mask; every other plan carries the
@@ -11427,6 +11826,52 @@ def flash_autotune_fragments(
         (False, True)
         if flex_dead_stage_split_searchable
         else (defaults.flex_dead_stage_split,),
+    )
+    # The persistent list walk's early next-item QK0 is searched both ways
+    # on the fa4 pair body (the resolver pins it off on the grid, the split
+    # walk and the cluster scheduler), default on.
+    flex_early_qk_searchable = has_list_walk and not pair_walk
+    flex_early_qk = enum(
+        True if flex_early_qk_searchable else defaults.flex_early_qk,
+        (False, True),
+        (False, True) if flex_early_qk_searchable else (defaults.flex_early_qk,),
+    )
+    # The last wave's split (``cute_flash_flex_tail_split``) is searched on
+    # the one-item fa4 grid of a list walk, the register walk and the cursor
+    # walk alike (the surface is the same at every KV tile count: the
+    # family is keyed on the query geometry); its default fills the idle
+    # SMs of the last partial wave where the device and grid are known.
+    flex_tail_split_searchable = (
+        not pair_walk and has_list_walk and not flex_trivial_walk
+    )
+    # A split hands each unit ``chunks / splits`` correction chunks of the
+    # output (``chunks = head_dim_v / corr_tile_size``), so the resolver
+    # keeps only the splits that divide the chunk count; on this surface a
+    # split is searched when some searched correction tile realizes it
+    # (head dim 96: 12 / 6 / 3 chunks at 8 / 16 / 32 -> 2 and 4, never 8),
+    # and the seed is the largest such split at or below the device's.
+    flex_tail_split_values = _flash_flex_tail_split_realizable(
+        value_head_dim,
+        tuple(
+            corr_tile.choices
+            if corr_tile.search_choices is None
+            else corr_tile.search_choices
+        ),
+    )
+    flex_tail_split_seed = _flash_flex_tail_split_seed(
+        device_sm_count=device_sm_count, num_bh=num_bh, q_seq=q_seq
+    )
+    flex_tail_split_seed = max(
+        value for value in flex_tail_split_values if value <= flex_tail_split_seed
+    )
+    flex_tail_split = enum(
+        flex_tail_split_seed
+        if flex_tail_split_searchable
+        else defaults.flex_tail_split,
+        FLASH_FLEX_TAIL_SPLITS,
+        flex_tail_split_values
+        if flex_tail_split_searchable
+        else (defaults.flex_tail_split,),
     )
     # The split-KV walk is searched over every legal split on list-walk
     # plans; its default (the seeds' value) follows the device's SM count
@@ -12089,6 +12534,7 @@ def flash_autotune_fragments(
         FLASH_P_CHUNK_ARRIVE_KEY: p_chunk,
         FLASH_UNEVEN_KV_RING_KEY: uneven_kv_ring,
         FLASH_O_OVER_Q_KEY: o_over_q,
+        FLASH_O_STAGE_KEY: o_stage,
         FLASH_CAUSAL_MASK_STOREBACK_KEY: causal_mask_storeback,
         FLASH_ROW_BOUND_TILING_KEY: row_bound_tiling,
         FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: causal_skip_dead_tile,
@@ -12097,6 +12543,8 @@ def flash_autotune_fragments(
         FLASH_EARLY_PROLOGUE_LOADS_KEY: early_prologue_loads,
         FLASH_FLEX_SKIP_ABSENT_KEY: flex_skip_absent,
         FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: flex_dead_stage_split,
+        FLASH_FLEX_EARLY_QK_KEY: flex_early_qk,
+        FLASH_FLEX_TAIL_SPLIT_KEY: flex_tail_split,
         FLASH_KV_SPLIT_KEY: kv_split,
         FLASH_FLEX_MASK_FORM_KEY: enum(
             "bitmask",
@@ -12534,6 +12982,7 @@ def _flash_flex_split_arg(
     items: int,
     splits: int,
     head_dim_v: int,
+    banks: int = 1,
 ) -> TensorArg:
     """Bind the split-KV walk's workspace (``flex_split_workspace``): one flat
     fp32 buffer of the partial-output tiles, the row-statistics tiles and
@@ -12548,15 +12997,16 @@ def _flash_flex_split_arg(
     env = CompileEnvironment.current()
     with env.fake_mode:
         fake_ws = torch.empty(
-            (sum(flex_split_workspace_elems(items, splits, head_dim_v)),),
+            (sum(flex_split_workspace_elems(items, splits, head_dim_v, banks)),),
             dtype=torch.float32,
             device=env.device,
         )
+    banks_kwarg = f", banks={banks}" if banks != 1 else ""
     ws_arg = TensorArg(
         df.new_var("flash_split_ws"),
         fake_ws,
         f"_helion_flash_flex_split_workspace({like_arg.host_str()}, items={items}, "
-        f"splits={splits}, head_dim_v={head_dim_v})",
+        f"splits={splits}, head_dim_v={head_dim_v}{banks_kwarg})",
     )
     df.arguments.append(ws_arg)
     df._tensor_args[fake_ws] = ws_arg
@@ -16874,6 +17324,97 @@ def _flash_fa4_load_prologue_for_order(
     return f"{load_q0}\n{load_k0}\n{load_q1}\n{load_v0}"
 
 
+def _flash_fa4_item_lines(
+    indent: str,
+    index_expr: str,
+    *,
+    item_table: str,
+    item_flags: str | None,
+) -> str:
+    """The persistent list walk's item read: ``flash_item`` from the host
+    order at ``index_expr``, or ``index_expr`` itself under the tables'
+    identity-order flag (``item_flags``, ``flex_item_flags``)."""
+    load = f"flash_item = cutlass.Int32({item_table}[{index_expr}])"
+    if item_flags is None:
+        return f"{indent}{load}"
+    # The host order is the identity: the item is the index itself.
+    return (
+        f"{indent}flash_item = {index_expr}\n"
+        f"{indent}if ({item_flags} & cutlass.Int32({FLEX_FLAG_IDENTITY_ORDER})) "
+        "== cutlass.Int32(0):\n"
+        f"{indent}    {load}"
+    )
+
+
+def _flash_fa4_wrap_early_head(
+    role_guard: str,
+    head: str,
+    item_head: str,
+    inner_a: str,
+    inner_b: str,
+    *,
+    item_prelude: str,
+    item_table: str,
+    item_flags: str | None,
+    total_tiles: int,
+    num_m_pairs: int,
+    tail: str,
+    tensor_4d_heads: int = 0,
+) -> str:
+    """The MMA warp's persistent list-walk loop with the next work item's
+    head hoisted into the current item (``cute_flash_flex_early_qk``).
+
+    ``item_head`` (8-space indented, like ``inner_a`` / ``inner_b``) is the
+    per-item code up to and including the first QK0 and its S0 commit (the
+    Q0 / K0 waits); ``inner_a`` runs from the Q1 wait through the last
+    PV0's O commit, ``inner_b`` the last PV1 and the item's release.  The
+    first item's decode, prelude and head go ahead of the loop; inside it
+    the next item's go out between ``inner_a`` and ``inner_b``: S0 is free
+    once the last PV0 has read P0, so the next item's first S is ready
+    while this item's stage-1 tail (its last softmax step, PV1, O1) drains
+    instead of after it.  ``item_prelude`` is the per-item table setup the
+    MMA warp needs (the walk's words, count and live rows), 8-space
+    indented, newline-terminated."""
+    m_pair_expr, bh_expr = _flash_power2_decode_exprs("flash_item", num_m_pairs) or (
+        f"flash_item % {num_m_pairs}",
+        f"flash_item // {num_m_pairs}",
+    )
+    decode = _flash_fa4_tile_prelude(
+        "        ", "decode", tensor_4d_heads=tensor_4d_heads
+    )
+
+    def _item(indent: str, index_expr: str) -> str:
+        lines = [
+            _flash_fa4_item_lines(
+                "        ", index_expr, item_table=item_table, item_flags=item_flags
+            ),
+            f"        flash_m_pair = {m_pair_expr}",
+            f"        flash_bh = {bh_expr}",
+            decode,
+            item_prelude.rstrip("\n"),
+            item_head,
+        ]
+        block = "\n".join(line for line in lines if line.strip())
+        return textwrap.indent(textwrap.dedent(block), indent)
+
+    return f"""
+{role_guard}
+{head}
+    flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
+    flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
+    # The first item's decode and first QK ahead of the loop; the next item's
+    # go out inside it, between this item's last PV0 and PV1.
+{_item("    ", "flash_tile_id")}
+    while flash_tile_id < {total_tiles}:
+{inner_a}
+        flash_tile_next = flash_tile_id + flash_grid_dim
+        if flash_tile_next < {total_tiles}:
+{_item("            ", "flash_tile_next")}
+{inner_b}
+        flash_tile_id = flash_tile_next
+{tail}"""
+
+
 def _flash_fa4_wrap(
     role_guard: str,
     head: str,
@@ -17069,15 +17610,8 @@ def _flash_fa4_wrap(
         m_pair_expr, bh_expr = item_decode
 
         def _item_lines(index_expr: str) -> str:
-            load = f"flash_item = cutlass.Int32({item_table}[{index_expr}])"
-            if item_flags is None:
-                return f"        {load}"
-            # The host order is the identity: the item is the index itself.
-            return (
-                f"        flash_item = {index_expr}\n"
-                f"        if ({item_flags} & cutlass.Int32({FLEX_FLAG_IDENTITY_ORDER})) "
-                "== cutlass.Int32(0):\n"
-                f"            {load}"
+            return _flash_fa4_item_lines(
+                "        ", index_expr, item_table=item_table, item_flags=item_flags
             )
 
         if kv_split > 1:
@@ -17917,6 +18451,7 @@ def _flash_flex_setup_parts(
     words_table: str | None = None,
     words_pairs: int | None = None,
     host_flags: str | None = None,
+    split_shift_expr: str | None = None,
 ) -> tuple[str, str]:
     """CTA-wide per-item setup of the BlockMask list walk (unindented lines)
     in two parts: the table reads (the words or the counts and lists, with
@@ -18031,13 +18566,22 @@ def _flash_flex_setup_parts(
         if kv_split > 1:
             # This CTA's slice of the walk: ``ceil(total / kv_split)`` tiles
             # per split from rank ``lo``; the roles' cursors drop the first
-            # ``lo`` tiles (``_flash_flex_cursor_init_lines``).
+            # ``lo`` tiles (``_flash_flex_cursor_init_lines``).  The tail
+            # split takes the unit's own shift (0 on an unsplit unit: the
+            # whole walk), as the register walk's trim does.
             shift = kv_split.bit_length() - 1
-            lines += [
-                (
+            if split_shift_expr is None:
+                per_line = (
                     f"flash_flex_per = (flash_flex_total + cutlass.Int32({kv_split - 1})) "
                     f">> cutlass.Int32({shift})"
-                ),
+                )
+            else:
+                per_line = (
+                    f"flash_flex_per = (flash_flex_total + ((cutlass.Int32(1) << "
+                    f"{split_shift_expr}) - cutlass.Int32(1))) >> {split_shift_expr}"
+                )
+            lines += [
+                per_line,
                 (
                     "flash_flex_lo = cutlass.min(flash_flex_total, "
                     "flash_kv_split_id * flash_flex_per)"
@@ -18198,7 +18742,11 @@ def _flash_flex_setup_parts(
     )
     if kv_split > 1:
         lines += _flash_flex_split_trim_lines(
-            words, kv_split=kv_split, descending=descending, population=population
+            words,
+            kv_split=kv_split,
+            descending=descending,
+            population=population,
+            split_shift_expr=split_shift_expr,
         )
         # The per-stage lists (and presence masks) follow the slice: an
         # empty slice's one fake step over tile 0 must find both stages
@@ -18260,7 +18808,12 @@ def _flash_flex_bindings(
 
 
 def _flash_flex_split_trim_lines(
-    words: int, *, kv_split: int, descending: bool, population: str
+    words: int,
+    *,
+    kv_split: int,
+    descending: bool,
+    population: str,
+    split_shift_expr: str | None = None,
 ) -> list[str]:
     """Lines trimming the union bitmask ``flash_flex_u{w}`` to this CTA's slice
     of the walk (the split-KV walk, ``flash_kv_split_id``) and binding the
@@ -18275,12 +18828,20 @@ def _flash_flex_split_trim_lines(
     steps of a few instructions.
     """
     shift = kv_split.bit_length() - 1
-    lines = [
-        f"flash_flex_total = {population}",
-        (
+    if split_shift_expr is None:
+        per_line = (
             f"flash_flex_per = (flash_flex_total + cutlass.Int32({kv_split - 1})) "
             f">> cutlass.Int32({shift})"
-        ),
+        )
+    else:
+        # The tail split: the unit's own shift (0 on an unsplit unit, whose
+        # slice is then the whole walk).
+        per_line = (
+            f"flash_flex_per = (flash_flex_total + ((cutlass.Int32(1) << {split_shift_expr}) "
+            f"- cutlass.Int32(1))) >> {split_shift_expr}"
+        )
+    trim = [
+        per_line,
         (
             "flash_flex_lo = cutlass.min(flash_flex_total, "
             "flash_kv_split_id * flash_flex_per)"
@@ -18295,9 +18856,9 @@ def _flash_flex_split_trim_lines(
             indent="    ",
         ),
     ]
-    lines += [f"flash_flex_k{word} = cutlass.Int32(0)" for word in range(words)]
-    lines.append("for flash_flex_i in cutlass.range(flash_flex_cnt, unroll=1):")
-    lines += _flash_flex_walk_step(
+    trim += [f"flash_flex_k{word} = cutlass.Int32(0)" for word in range(words)]
+    trim.append("for flash_flex_i in cutlass.range(flash_flex_cnt, unroll=1):")
+    trim += _flash_flex_walk_step(
         "flash_flex_u",
         words,
         target="flash_flex_keep",
@@ -18305,17 +18866,21 @@ def _flash_flex_split_trim_lines(
         indent="    ",
     )
     if words == 1:
-        lines.append("    flash_flex_k0 = flash_flex_k0 | flash_flex_kvbit")
+        trim.append("    flash_flex_k0 = flash_flex_k0 | flash_flex_kvbit")
     else:
         for word in range(words):
-            lines.append(
+            trim.append(
                 f"    flash_flex_k{word} = flash_flex_k{word} | cutlass.Int32("
                 f"cutlass.select_(flash_flex_kvword == {word}, flash_flex_kvbit, "
                 "cutlass.Int32(0)))"
             )
-    lines += [f"flash_flex_u{word} = flash_flex_k{word}" for word in range(words)]
-    lines.append("flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_cnt)")
-    return lines
+    trim += [f"flash_flex_u{word} = flash_flex_k{word}" for word in range(words)]
+    trim.append("flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_cnt)")
+    # (The tail split's unsplit units run the trim with shift 0 -- the whole
+    # walk.  Skipping it under a dynamic ``if``, or cutting the slice out of
+    # the word with ``fns.b32`` instead of the loops, measured the same or
+    # worse on whisper's full waves: the loops are not what those pay.)
+    return [f"flash_flex_total = {population}", *trim]
 
 
 def _flash_flex_coord_bounds(
@@ -18475,6 +19040,8 @@ def emit_flash_fa4_device_body(
     flex_split_arg: str | None = None,
     operand_strides: tuple[tuple[int, ...], ...] | None = None,
     flex_host_flags: str | None = None,
+    flex_tail_split: int = 0,
+    flex_tail_items_ws: int = 0,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -18687,6 +19254,17 @@ def emit_flash_fa4_device_body(
     # The split-KV walk (``cute_flash_kv_split``): a config past the resolver
     # carries a legal value; the caller declined the oversize cases.
     flex_kv_split = cfg.kv_split if kv_split is None else kv_split
+    # The tail split (``cute_flash_flex_tail_split``): the grid's last
+    # partial wave runs as split-KV work units of ``flex_tail_k`` each,
+    # merged through the split-KV path; the other units run the plain
+    # walk. Both paths are rendered, chosen per unit (the CTA id against the
+    # launcher's ``_flash_tail_base``).
+    flex_tail_k = flex_tail_split if (list_walk and flex_tail_split > 1) else 0
+    if flex_tail_k > 1:
+        assert not cfg.persistent and flex_kv_split == 1 and not flex_dead_split
+        assert flex_tail_items_ws > 0
+        if flex_split_arg is None:
+            flex_split_arg = "flash_split_ws"
     if flex_kv_split > 1:
         if flex_split_arg is None:
             flex_split_arg = "flash_split_ws"
@@ -19288,6 +19866,9 @@ def emit_flash_fa4_device_body(
         storage_extra_args += f", head_dim_v={hd_v}"
     if uneven_kv_ring:
         storage_extra_args += ", uneven_kv_ring=True"
+    if cfg.o_stage == 1:
+        assert epi_smem and not o_over_q
+        storage_extra_args += ", o_stage=1"
     flex_aux_smem_setup = ""
     if flex_aux_layout:
         storage_extra_args += f", flex_aux_bytes={flex_aux_bytes}"
@@ -19573,6 +20154,29 @@ flash_m_tile0 = flash_m_pair * 2
 flash_m_tile1 = flash_m_tile0 + 1
 flash_q_mma_tile0 = flash_m_tile0
 flash_q_mma_tile1 = flash_m_tile1"""
+    if flex_tail_k > 1 and not persistent:
+        # The tail split: units past ``_flash_tail_base`` (the launcher's
+        # count of unsplit units, the full waves) are ``flex_tail_k`` split
+        # units per tail item, adjacent; the item index past the base is the
+        # workspace row.
+        pid_line = "flash_pid = cutlass.Int32(cute.arch.block_idx()[0])\n"
+        tail_shift = flex_tail_k.bit_length() - 1
+        tail_decode = (
+            pid_line + "flash_kv_split_id = cutlass.Int32(0)\n"
+            "flash_kv_split_shift = cutlass.Int32(0)\n"
+            "flash_tail_item = cutlass.Int32(0)\n"
+            "if flash_pid >= _flash_tail_base:\n"
+            "    flash_tail_unit = flash_pid - _flash_tail_base\n"
+            f"    flash_tail_item = flash_tail_unit >> cutlass.Int32({tail_shift})\n"
+            f"    flash_kv_split_id = flash_tail_unit & cutlass.Int32({flex_tail_k - 1})\n"
+            f"    flash_kv_split_shift = cutlass.Int32({tail_shift})\n"
+            "    flash_pid = _flash_tail_base + flash_tail_item\n"
+        )
+        assert (
+            causal_setup_pid.count(pid_line) + noncausal_setup_pid.count(pid_line) >= 1
+        )
+        causal_setup_pid = causal_setup_pid.replace(pid_line, tail_decode, 1)
+        noncausal_setup_pid = noncausal_setup_pid.replace(pid_line, tail_decode, 1)
     if flex_kv_split > 1 and not persistent:
         # The split-KV grid: ``total_tiles * kv_split`` CTAs, the split id in
         # the low bits of the CTA id (the splits of one item are adjacent).
@@ -19626,7 +20230,7 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
             flex_bindings += f"\n_flash_mFlexItems = {flex_item_table}"
         if flex_words_table is not None:
             flex_bindings += f"\n_flash_mFlexWords = {flex_words_table}"
-        if flex_kv_split > 1:
+        if flex_kv_split > 1 or flex_tail_k > 1:
             # (The counters' view over the workspace tail is built in the
             # correction warps: a pointer built here lives across every role.)
             assert flex_split_arg is not None
@@ -19644,7 +20248,8 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
                 dead_split=flex_dead_split,
                 scalar_exprs=flex_scalar_exprs,
                 bindings=False,
-                kv_split=flex_kv_split,
+                kv_split=flex_tail_k if flex_tail_k > 1 else flex_kv_split,
+                split_shift_expr="flash_kv_split_shift" if flex_tail_k > 1 else None,
                 descending=causal_desc_kv,
                 words_table=flex_words_table,
                 words_pairs=flex_words_pairs,
@@ -20275,7 +20880,7 @@ sO = storage.sO.get_tensor(_flash_osl.outer, swizzle=_flash_osl.inner)
     tOtO1_corr_t2r = flash_o_thr_t2r.partition_S(
         tOtO1_corr_i[(None, None), None])
     tOsO0_corr = flash_pvt.get_slice(0).partition_C(sO[None, None, 0])
-    tOsO1_corr = flash_pvt.get_slice(0).partition_C(sO[None, None, 1])
+    tOsO1_corr = flash_pvt.get_slice(0).partition_C(sO[None, None, {_flash_o_stage_tile(cfg.o_stage, "1")}])
     tOsO0_corr_i = cute.logical_divide(
         tOsO0_corr, cute.make_layout((128, flash_o_corr_tile)))
     tOsO1_corr_i = cute.logical_divide(
@@ -20318,7 +20923,7 @@ flash_o_gmem_tiled_copy = cute.make_tiled_copy_tv(
 flash_epi_tidx = tidx % 32
 flash_o_gmem_thr = flash_o_gmem_tiled_copy.get_slice(flash_epi_tidx)
 tOsO_epi0 = flash_o_gmem_thr.partition_S(sO[None, None, 0])
-tOsO_epi1 = flash_o_gmem_thr.partition_S(sO[None, None, 1])
+tOsO_epi1 = flash_o_gmem_thr.partition_S(sO[None, None, {_flash_o_stage_tile(cfg.o_stage, "1")}])
 """
         # The segment tiling's TMA epilogue keeps the vector store for the
         # ragged tiles, as does a ragged query length's (``ragged_m``).
@@ -20435,10 +21040,19 @@ if warp_idx == 15:
             f"    cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + {stage})"
         )
 
-    epi_empty_prearrive = """
+    # Both staged tiles start empty; the shared tile (``o_stage`` 1) starts
+    # as "the previous item's stage 1 left it" (``empty + 1``), stage 0's
+    # own release (``empty + 0``) gates stage 1's staging.
+    epi_empty_prearrive = (
+        """
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 0)
         cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 1)"""
+        if cfg.o_stage == 2
+        else """
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 1)"""
+    )
 
     # The staged aux tile: the epilogue warp TMA-loads the row program's aux
     # rows for this work item into both sO stages as soon as the previous
@@ -20536,10 +21150,32 @@ if warp_idx == 15:
     flash_corr_epi_full_phase = cutlass.Int32(0){epi_empty_prearrive}"""
 
         def _epi_ragged_slot(stage: str, gmem: str) -> str:
+            tile = _flash_o_stage_tile(cfg.o_stage, stage)
+            if cfg.o_stage == 1:
+                # The shared tile: the lane that issued the TMA store drains
+                # its own bulk group (``wait_group`` is per issuing thread)
+                # and releases the tile in the same block; a vector-stored or
+                # dead stage releases after its rows.
+                return f"""        {_epi_wait_corr_full(stage)}
+        if flash_live_rows{stage} == cutlass.Int32(128):
+            with cute.arch.elect_one():
+                cute.copy(_flash_tma_o, tOsO_tma[None, {tile}], {gmem})
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + {stage})
+        else:
+            if flash_live_rows{stage} > cutlass.Int32(0):
+                tOgO_stg{stage} = cute.local_tile(
+                    flash_mO_stg_cur, (128, {hd_v}), (flash_m_tile{stage}, 0))
+                _helion_flash_rt.fa4_store_o_smem_to_gmem_rows(
+                    flash_o_gmem_tiled_copy, flash_o_gmem_thr,
+                    tOsO_epi{tile}, tOgO_stg{stage}, tOcO_epi, flash_live_rows{stage}, {io_dtype})
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + {stage})"""
             return f"""        {_epi_wait_corr_full(stage)}
         if flash_live_rows{stage} == cutlass.Int32(128):
             with cute.arch.elect_one():
-                cute.copy(_flash_tma_o, tOsO_tma[None, {stage}], {gmem})
+                cute.copy(_flash_tma_o, tOsO_tma[None, {tile}], {gmem})
                 cute.arch.cp_async_bulk_commit_group()
         else:
             if flash_live_rows{stage} > cutlass.Int32(0):
@@ -20547,7 +21183,7 @@ if warp_idx == 15:
                     flash_mO_stg_cur, (128, {hd_v}), (flash_m_tile{stage}, 0))
                 _helion_flash_rt.fa4_store_o_smem_to_gmem_rows(
                     flash_o_gmem_tiled_copy, flash_o_gmem_thr,
-                    tOsO_epi{stage}, tOgO_stg{stage}, tOcO_epi, flash_live_rows{stage}, {io_dtype})"""
+                    tOsO_epi{tile}, tOgO_stg{stage}, tOcO_epi, flash_live_rows{stage}, {io_dtype})"""
 
         # The drain: the bulk groups complete in order, so with the second
         # stage's TMA store in flight one group may stay pending while the
@@ -20565,7 +21201,16 @@ if warp_idx == 15:
         # The plain (S, D, B) view (``_flash_mO``, a kernel param on this
         # path like the segment tiling's) addresses the vector store; the
         # TMA-adjusted ``_flash_mOt`` is the TMA store's.
-        epi_inner = f"""{epi_aux_issue}        flash_mO_stg_cur = {epi_stg_mO_cur.replace("_flash_mOt", "_flash_mO")}
+        if cfg.o_stage == 1:
+            # The shared tile: each slot drains its own store and releases
+            # the tile (stage 0's before stage 1 is staged, stage 1's before
+            # the next item's stage 0).
+            epi_inner = f"""{epi_aux_issue}        flash_mO_stg_cur = {epi_stg_mO_cur.replace("_flash_mOt", "_flash_mO")}
+{_epi_ragged_slot("0", epi_tma_gmem0)}
+{_epi_ragged_slot("1", epi_tma_gmem1)}
+        flash_corr_epi_full_phase ^= 1"""
+        else:
+            epi_inner = f"""{epi_aux_issue}        flash_mO_stg_cur = {epi_stg_mO_cur.replace("_flash_mOt", "_flash_mO")}
 {_epi_ragged_slot("0", epi_tma_gmem0)}
 {_epi_ragged_slot("1", epi_tma_gmem1)}
 {epi_ragged_release}
@@ -20580,7 +21225,25 @@ if warp_idx == 15:
         epi_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
 {textwrap.indent(epi_tma_setup.strip(), "    ") if local_epi_tma_setup else ""}{epi_aux_setup}
     flash_corr_epi_full_phase = cutlass.Int32(0){epi_empty_prearrive}"""
-        epi_inner = f"""{epi_aux_issue}        {_epi_wait_corr_full("0")}
+        if cfg.o_stage == 1:
+            # The shared tile: stage 0's TMA store drains (its smem reads
+            # done) before stage 1 is staged into the tile, stage 1's before
+            # the next item's stage 0.
+            epi_inner = f"""{epi_aux_issue}        {_epi_wait_corr_full("0")}
+        with cute.arch.elect_one():
+            cute.copy(_flash_tma_o, tOsO_tma[None, 0], {epi_tma_gmem0})
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 0)
+        {_epi_wait_corr_full("1")}
+        with cute.arch.elect_one():
+            cute.copy(_flash_tma_o, tOsO_tma[None, 0], {epi_tma_gmem1})
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 1)
+        flash_corr_epi_full_phase ^= 1"""
+        else:
+            epi_inner = f"""{epi_aux_issue}        {_epi_wait_corr_full("0")}
         with cute.arch.elect_one():
             cute.copy(_flash_tma_o, tOsO_tma[None, 0], {epi_tma_gmem0})
             cute.arch.cp_async_bulk_commit_group()
@@ -20645,18 +21308,31 @@ if warp_idx == 15:
         epi_inner = ""
         epi_prelude = "none"
     epi_inner = flex_item_rows + epi_inner
+    epi_split_handshake = f"""        {_epi_wait_corr_full("0")}
+{textwrap.indent(_epi_release_corr_empty("0"), "        ")}
+        {_epi_wait_corr_full("1")}
+{textwrap.indent(_epi_release_corr_empty("1"), "        ")}
+        flash_corr_epi_full_phase ^= 1"""
     if flex_kv_split > 1:
         # The split-KV walk's output leaves through the merging correction
         # warps; the epilogue warp keeps the staged handshake (the corr warps
         # still commit each stage's ``corr_epi_full``) and stores nothing.
         epi_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
     flash_corr_epi_full_phase = cutlass.Int32(0){epi_empty_prearrive}"""
-        epi_inner = f"""        {_epi_wait_corr_full("0")}
-{textwrap.indent(_epi_release_corr_empty("0"), "        ")}
-        {_epi_wait_corr_full("1")}
-{textwrap.indent(_epi_release_corr_empty("1"), "        ")}
-        flash_corr_epi_full_phase ^= 1"""
+        epi_inner = epi_split_handshake
         epi_prelude = "none"
+    elif flex_tail_k > 1:
+        # A tail unit's output leaves through the merging softmax warps (the
+        # handshake alone); the other units keep the staged epilogue, laid
+        # out first: the common path falls through, so an unsplit unit's
+        # instruction fetch streams it (a jump over the tail path's code
+        # cost cold fetches once per CTA, ~4% of whisper's full waves).
+        epi_inner = (
+            f"        if {_FLASH_TAIL_UNIT_PREDICATE_NOT}:\n"
+            + textwrap.indent(epi_inner, "    ")
+            + "\n        else:\n"
+            + textwrap.indent(epi_split_handshake, "    ")
+        )
     epi_block = (
         segment_wrap(
             f"{role_next} warp_idx == {epi_warp}:",
@@ -20701,7 +21377,7 @@ if warp_idx == 15:
                     *_flash_flex_cursor_init_lines(
                         "        ",
                         descending=desc_kv,
-                        kv_split=flex_kv_split,
+                        kv_split=flex_tail_k if flex_tail_k > 1 else flex_kv_split,
                         **flex_cursor_kwargs,
                     ),
                     *_flash_flex_cursor_step_lines(
@@ -20952,9 +21628,13 @@ if warp_idx == 15:
     # and 1/4 PV K-chunks. The S/O TMEM column addresses are loop-invariant (TMEM is
     # fixed for the whole kernel) so they are hoisted into the head.
     def _mma_wait_p_ready(stage: str) -> str:
+        # The P tile was written by the softmax warps' ``tcgen05.st``: the
+        # wait's acquire orders the generic proxy, the fence orders the MMA
+        # (async proxy) after it.
         return (
             "_helion_flash_rt.mbar_spin_wait("
-            f"flash_pfor_ptr + {stage}, flash_pfor_phase, {cfg.wait_hint})"
+            f"flash_pfor_ptr + {stage}, flash_pfor_phase, {cfg.wait_hint}); "
+            "_helion_flash_rt.tcgen05_fence_after_thread_sync()"
         )
 
     def _mma_commit_s_ready(stage: str) -> str:
@@ -21050,6 +21730,9 @@ if warp_idx == 15:
         assert not pruned_interval
         assert not segment_tiling
         assert kv_stage >= FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+    mma_item_head: str | None = None
+    mma_inner_a: str | None = None
+    mma_inner_b: str | None = None
     if cfg.mma_ptx:
         # Each CTA owns 128 Q rows even when a CtaGroup.TWO MMA spans 256 rows.
         # SMEM descriptors use 16-byte units, so derive the stage stride from
@@ -21176,7 +21859,8 @@ if warp_idx == 15:
         # armed for the first live PV0.
         pv0_dead_issue = (
             "            _helion_flash_rt.mbar_spin_wait("
-            f"flash_pfor2_ptr + 0, flash_pfor_phase, {cfg.wait_hint})"
+            f"flash_pfor2_ptr + 0, flash_pfor_phase, {cfg.wait_hint}); "
+            "_helion_flash_rt.tcgen05_fence_after_thread_sync()"
             if split_p_arrive
             else ""
         )
@@ -21442,18 +22126,22 @@ if warp_idx == 15:
                 indent,
             )
 
-        def _flex_pv_issue(stage: str, indent: str) -> str:
+        def _flex_pv_issue(stage: str, indent: str, live: str | None = None) -> str:
             # The PV of an absent stage is dead work (P = 0) once the output
             # accumulator was zero-initialized by a first PV (a dead stage
             # still gets that one, so the epilogue never reads uninitialized
             # TMEM); the predicated stream still runs its folded P-last wait.
+            # ``live`` names the stage's liveness flag: the walk's
+            # ``flash_flex_pv_live`` in the loop, the item's snapshot for the
+            # last PV1 (see ``_mma_flex_inner``).
+            live = f"flash_flex_pv_live{stage}" if live is None else live
             issue = textwrap.indent(
                 textwrap.dedent(
                     _pv_gemm(stage, "flash_v_full", issue=f"flash_flex_pv_issue{stage}")
                 ),
                 indent,
             )
-            return f"""{indent}flash_flex_pv_issue{stage} = flash_flex_pv_live{stage} | cutlass.Int32(flash_o_zero{stage})
+            return f"""{indent}flash_flex_pv_issue{stage} = {live} | cutlass.Int32(flash_o_zero{stage})
 {issue}
 {indent}flash_o_zero{stage} = flash_o_zero{stage} & (flash_flex_pv_issue{stage} == 0)"""
 
@@ -21501,7 +22189,7 @@ if warp_idx == 15:
             flash_k_full.release()
 {carry}"""
 
-        def _mma_flex_inner() -> str:
+        def _mma_flex_inner() -> tuple[str, str, str]:
             """The MMA warp of the list walk: the dense protocol (one K/V
             step, two QKs and two PVs per tile, every barrier arrival kept)
             with each stage's QK / PV issued only on its live steps."""
@@ -21510,7 +22198,7 @@ if warp_idx == 15:
                 _flash_flex_cursor_init_lines(
                     "        ",
                     descending=desc_kv,
-                    kv_split=flex_kv_split,
+                    kv_split=flex_tail_k if flex_tail_k > 1 else flex_kv_split,
                     **flex_cursor_kwargs,
                 )
                 if flex_cursor
@@ -21522,7 +22210,8 @@ if warp_idx == 15:
             first = _flex_walk_lines(
                 "flash_flex_pv_live", "        ", "cutlass.Int32(0)"
             )
-            return f"""        flash_q0_full = flash_q_cons.wait_and_advance()
+            return (
+                f"""        flash_q0_full = flash_q_cons.wait_and_advance()
 {rem_init}
 {first}
         flash_flex_qk_live0 = flash_flex_pv_live0
@@ -21532,8 +22221,8 @@ if warp_idx == 15:
         # Q1 landed too; then release K0 (each only where its stage is live).
         flash_k0_full = {mma_k_cons}.wait_and_advance(){mma_prologue_signal}
 {_flex_qk_issue("0", "flash_k0_full", "        ")}
-{textwrap.indent(_mma_commit_s_ready("0"), "        ")}
-        flash_q1_full = flash_q_cons.wait_and_advance()
+{textwrap.indent(_mma_commit_s_ready("0"), "        ")}""",
+                f"""        flash_q1_full = flash_q_cons.wait_and_advance()
 {_flex_qk_issue("1", "flash_k0_full", "        ")}
 {textwrap.indent(_mma_commit_s_ready("1"), "        ")}
         flash_k0_full.release()
@@ -21548,18 +22237,24 @@ if warp_idx == 15:
         flash_q0_full.release()
         flash_q1_full.release()
 
+        # The last PV1's liveness, held apart from the walk's flag: under the
+        # early next-item QK0 (``cute_flash_flex_early_qk``) the next item's
+        # head runs between this item's last PV0 and PV1 and rewrites
+        # ``flash_flex_pv_live1`` for its own first tile.
+        flash_flex_pv_last1 = flash_flex_pv_live1
         # EPILOGUE: PV(N-1) for both stages; commit O_full.
         flash_v_full = {mma_v_cons}.wait_and_advance()
         {_mma_wait_p_ready("0")}
 {_flex_pv_issue("0", "        ")}
-{textwrap.indent(_mma_commit_o_ready("0"), "        ")}
-        {_mma_wait_p_ready("1")}
-{_flex_pv_issue("1", "        ")}
+{textwrap.indent(_mma_commit_o_ready("0"), "        ")}""",
+                f"""        {_mma_wait_p_ready("1")}
+{_flex_pv_issue("1", "        ", live="flash_flex_pv_last1")}
 {textwrap.indent(_mma_commit_o_ready("1"), "        ")}
         flash_v_full.release()
         # The 2 epilogue PV waits did NOT flip pfor_phase; flip once so the carried
         # parity matches the next work-item's correction pre-arrive.
-        flash_pfor_phase ^= 1"""
+        flash_pfor_phase ^= 1""",
+            )
 
         mma_steady_body = _mma_steady_body(pv0_live_issue)
         steady_loop_bound = kv_loop_bound_minus_1
@@ -21578,15 +22273,15 @@ if warp_idx == 15:
         flash_v_full = {mma_v_cons}.wait_and_advance(){dead_step_body}
         flash_pfor_phase ^= 1
 """
-        mma_inner = f"""        flash_q0_full = flash_q_cons.wait_and_advance()
+        mma_item_head = f"""        flash_q0_full = flash_q_cons.wait_and_advance()
 
         # PROLOGUE: QK0(0)->S0 as soon as Q0 and K0 landed, then QK1(0)->S1 once
         # Q1 landed too; then release K0. Waiting for Q1 only before QK1 lets the
         # first score tile start while the second Q tile is still in flight.
         flash_k0_full = {mma_k_cons}.wait_and_advance(){mma_prologue_signal}
 {textwrap.indent(qk0_prologue.lstrip(), "        ")}
-{textwrap.indent(_mma_commit_s_ready("0"), "        ")}
-        flash_q1_full = flash_q_cons.wait_and_advance()
+{textwrap.indent(_mma_commit_s_ready("0"), "        ")}"""
+        mma_inner_a = f"""        flash_q1_full = flash_q_cons.wait_and_advance()
 {textwrap.indent(_qk_gemm("1", "flash_k0_full").lstrip(), "        ")}
 {textwrap.indent(_mma_commit_s_ready("1"), "        ")}
         flash_k0_full.release()
@@ -21615,8 +22310,8 @@ if warp_idx == 15:
             tOrV[None, None, None, 0].layout,
             "helion_flash_pv_mma_idesc",{pv0_split_wait_arg}
             zero_init=flash_o_zero0{gemm_cta_group_arg}{pv_wait_hint_arg})
-{textwrap.indent(_mma_commit_o_ready("0"), "        ")}
-        {_mma_wait_p_ready("1")}
+{textwrap.indent(_mma_commit_o_ready("0"), "        ")}"""
+        mma_inner_b = f"""        {_mma_wait_p_ready("1")}
         _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(
             flash_o1_addr, {pv_p1},
             _helion_flash_ptx.make_smem_desc_start_addr(
@@ -21631,10 +22326,13 @@ if warp_idx == 15:
         # The 2 epilogue PV waits did NOT flip pfor_phase; flip once so the carried
         # parity matches the next work-item's correction pre-arrive (spike L1973-1977).
         flash_pfor_phase ^= 1"""
+        mma_inner = f"{mma_item_head}\n{mma_inner_a}\n{mma_inner_b}"
         if causal_stagger:
             mma_inner = _mma_stagger_inner()
+            mma_item_head = mma_inner_a = mma_inner_b = None
         if flex_skip_absent:
-            mma_inner = _mma_flex_inner()
+            mma_item_head, mma_inner_a, mma_inner_b = _mma_flex_inner()
+            mma_inner = f"{mma_item_head}\n{mma_inner_a}\n{mma_inner_b}"
     else:
         mma_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
     flash_tmem.allocate(512)
@@ -21670,11 +22368,13 @@ if warp_idx == 15:
             flash_v_full = {mma_v_cons}.wait_and_advance()
             # stage 0: PV0(i) then QK0(i+1). STAGED-P: first 96 kv on pfor.
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase, {cfg.wait_hint})
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             for flash_kp in cutlass.range_constexpr(flash_pv_split):
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc0 | (flash_kp != 0))
                 cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO0)
             _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 0, flash_pfor_phase, {cfg.wait_hint})
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             for flash_kp in cutlass.range_constexpr(flash_pv_split, flash_nk2):
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
                 cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
@@ -21689,11 +22389,13 @@ if warp_idx == 15:
                 cute_tcgen05_flash.commit(flash_s_full_ptr + 0{commit_group_arg})
             # stage 1: PV1(i) then QK1(i+1). STAGED-P: first 96 kv on pfor.
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase, {cfg.wait_hint})
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             for flash_kp in cutlass.range_constexpr(flash_pv_split):
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc1 | (flash_kp != 0))
                 cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO1)
             _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 1, flash_pfor_phase, {cfg.wait_hint})
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             for flash_kp in cutlass.range_constexpr(flash_pv_split, flash_nk2):
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
                 cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
@@ -21715,11 +22417,13 @@ if warp_idx == 15:
         # EPILOGUE: PV(N-1) for both stages; commit O_full.
         flash_v_full = {mma_v_cons}.wait_and_advance()
         _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase, {cfg.wait_hint})
+        _helion_flash_rt.tcgen05_fence_after_thread_sync()
         for flash_kp in cutlass.range_constexpr(flash_pv_split):
             _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc0 | (flash_kp != 0))
             cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
                       tOrV[None, None, flash_kp, flash_v_full.index], tOtO0)
         _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 0, flash_pfor_phase, {cfg.wait_hint})
+        _helion_flash_rt.tcgen05_fence_after_thread_sync()
         for flash_kp in cutlass.range_constexpr(flash_pv_split, flash_nk2):
             _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
             cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
@@ -21727,11 +22431,13 @@ if warp_idx == 15:
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(flash_o_full_ptr + 0{commit_group_arg})
         _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase, {cfg.wait_hint})
+        _helion_flash_rt.tcgen05_fence_after_thread_sync()
         for flash_kp in cutlass.range_constexpr(flash_pv_split):
             _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc1 | (flash_kp != 0))
             cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
                       tOrV[None, None, flash_kp, flash_v_full.index], tOtO1)
         _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 1, flash_pfor_phase, {cfg.wait_hint})
+        _helion_flash_rt.tcgen05_fence_after_thread_sync()
         for flash_kp in cutlass.range_constexpr(flash_pv_split, flash_nk2):
             _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
             cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
@@ -21751,37 +22457,71 @@ if warp_idx == 15:
         # the leader CTA issues the CtaGroup.TWO MMA instructions.
         mma_role_inner = f"""        if flash_is_leader_cta:
 {textwrap.indent(mma_inner, "    ")}"""
-    mma_role_inner = flex_item_prelude + mma_role_inner
-    mma_block = (
-        segment_wrap(
+    # The persistent list walk's early next-item QK0 (``cute_flash_flex_early_qk``):
+    # the MMA warp's own loop form, with the item prelude re-emitted per item.
+    mma_early_head = (
+        flex_persistent
+        and cfg.flex_early_qk
+        and mma_item_head is not None
+        and mma_inner_a is not None
+        and mma_inner_b is not None
+        and not use_2cta_instrs
+        and flex_kv_split == 1
+        and fa4_item_table is not None
+        and total_tiles is not None
+        and num_m_pairs is not None
+    )
+    if mma_early_head:
+        assert mma_item_head is not None
+        assert mma_inner_a is not None and mma_inner_b is not None
+        assert fa4_item_table is not None
+        assert total_tiles is not None and num_m_pairs is not None
+        mma_block = _flash_fa4_wrap_early_head(
             f"{role_next} warp_idx == 12:",
             mma_head,
-            mma_role_inner,
-            prelude="range",
-            tail=mma_tmem_teardown,
-        )
-        if segment_tiling
-        else _flash_fa4_wrap(
-            f"{role_next} warp_idx == 12:",
-            mma_head,
-            mma_role_inner,
-            persistent,
-            persistent_loop=cfg.persistent_loop,
+            mma_item_head,
+            mma_inner_a,
+            mma_inner_b,
+            item_prelude=flex_item_prelude,
             item_table=fa4_item_table,
             item_flags=fa4_item_flags,
-            kv_split=flex_kv_split,
-            prelude="decode" if flex_persistent else "none",
-            tail=mma_tmem_teardown,
             total_tiles=total_tiles,
             num_m_pairs=num_m_pairs,
-            use_2cta_instrs=use_2cta_instrs,
-            use_cga2_local_cta=use_cga2_local_cta,
-            use_clc_scheduler=use_clc_scheduler,
-            clc_heads_per_batch=clc_heads_per_batch,
+            tail=mma_tmem_teardown,
             tensor_4d_heads=tensor_4d_heads,
-            recompute_tile_coords=cfg.recompute_tile_coords,
         )
-    )
+    else:
+        mma_role_inner = flex_item_prelude + mma_role_inner
+        mma_block = (
+            segment_wrap(
+                f"{role_next} warp_idx == 12:",
+                mma_head,
+                mma_role_inner,
+                prelude="range",
+                tail=mma_tmem_teardown,
+            )
+            if segment_tiling
+            else _flash_fa4_wrap(
+                f"{role_next} warp_idx == 12:",
+                mma_head,
+                mma_role_inner,
+                persistent,
+                persistent_loop=cfg.persistent_loop,
+                item_table=fa4_item_table,
+                item_flags=fa4_item_flags,
+                kv_split=flex_kv_split,
+                prelude="decode" if flex_persistent else "none",
+                tail=mma_tmem_teardown,
+                total_tiles=total_tiles,
+                num_m_pairs=num_m_pairs,
+                use_2cta_instrs=use_2cta_instrs,
+                use_cga2_local_cta=use_cga2_local_cta,
+                use_clc_scheduler=use_clc_scheduler,
+                clc_heads_per_batch=clc_heads_per_batch,
+                tensor_4d_heads=tensor_4d_heads,
+                recompute_tile_coords=cfg.recompute_tile_coords,
+            )
+        )
 
     # SOFTMAX0/1 (warps 0-3 / 4-7): single-pass resident-row body. The
     # flash_s_full_phase carries across work-items (head); row_max/row_sum re-init
@@ -22144,6 +22884,161 @@ if warp_idx == 15:
             f"flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})"
         )
 
+    def _flex_tail_softmax_merge(stage: str) -> str:
+        """The tail split's merge protocol in a tail unit's softmax warps of
+        ``stage`` (after the final publish).  Every warp waits for its own
+        unit's arrival rank (written by the unit's correction warp of its
+        32-row group after the partial stores: the one wait on another warp
+        of the same CTA, never on another CTA); the unit whose rank is ``k``
+        is the item's last arriver, whose correction warp also wrote the
+        stage's generation-and-claims word with the new generation and no
+        claim bit.  A warp polls that word with an atomic OR of its own
+        claim bit, at most ``flash_flex_tail_spin_polls()`` times (the units
+        of an item are co-resident on a whole device and the bump comes
+        within microseconds, but under MPS or a green context fewer SMs than
+        the device reports can leave a unit waiting for one that cannot be
+        scheduled, so a unit that runs out of polls leaves its slice and
+        exits; a bit set before the bump is cleared by it): the poll that
+        sees the new generation owns the unit's ``32 / k`` rows of the group
+        if the bit was clear, and merges them (``fa4_split_merge_rows``: the
+        loads of every split first, the split order's sum, the cast rows and
+        the LSE).  The last arriver then ORs every claim bit in and merges
+        each slice whose bit was still clear, so no row is left behind and
+        no unit ever waits on another unboundedly.  When every unit is
+        resident each merges its own slice, as before."""
+        k = flex_tail_k
+        shift = k.bit_length() - 1
+        tile_elems = 128 * hd_v
+        stats_base = flex_tail_items_ws * k * 2 * tile_elems
+        bank = flex_tail_items_ws * 2 * 4
+        o_view = "_flash_mO" if cfg.epi_tma else "_flash_mOt"
+        # The stage's index in the workspace: the literal on the per-stage
+        # regions, the runtime stage under the shared softmax region (whose
+        # per-stage names -- ``flash_m_tiles``, ``flash_live_rowss`` -- are
+        # the selects the region binds per step).
+        stage_index = stage if stage in ("0", "1") else "flash_stage"
+        if operand_strides is not None:
+            o_st = operand_strides[3]
+            o_offset = (
+                f"(flash_batch * {o_st[0]} + flash_head * {o_st[1]}"
+                f" + flash_m_tile{stage} * {128 * o_st[2]})"
+            )
+            o_row_stride = o_st[2]
+        else:
+            o_offset = f"(flash_bh * {flex_q_seq} + flash_m_tile{stage} * 128) * {hd_v}"
+            o_row_stride = hd_v
+        live = f"flash_live_rows{stage}" if ragged_m else "None"
+        group_index = f"(flash_split_item * 2 + {stage_index}) * 4 + (flash_local_tidx >> cutlass.Int32(5))"
+        word_index = f"{bank} + {group_index}"
+        rank_index = f"{2 * bank} + ({group_index}) * {k} + flash_split_sid"
+        lane_zero = "(flash_local_tidx & cutlass.Int32(31)) == 0"
+        all_bits = (1 << k) - 1
+
+        def merge(slice_expr: str, indent: str) -> list[str]:
+            return [
+                f"{indent}cute.arch.sync_warp()",
+                f"{indent}_helion_flash_rt.fa4_split_merge_rows(",
+                f"{indent}    _flash_mSplitWs, ((((flash_split_item * {k}) * 2 + {stage_index}) * {tile_elems},",
+                f"{indent}    {stats_base} + ((flash_split_item * {k}) * 2 + {stage_index}) * 256, flash_split_gO,",
+                f"{indent}    flash_m_tile{stage} * 128, {live}),), {o_row_stride},",
+                f"{indent}    {'_flash_mLSE' if has_lse else 'None'}, {_stage_bh(stage)}, flash_local_tidx,",
+                f"{indent}    {slice_expr}, {k}, {hd_v}, {cfg.corr_tile_size}, {io_dtype},",
+                f"{indent}    _flash_scale_log2, {score_plan.lse_scale!r}, {tile_elems})",
+            ]
+
+        body = [
+            # The polls, each claiming the unit's bit; a poll that sees the
+            # new generation also
+            # reads the last arriving unit's id out of the word.  Only when
+            # the polls run out does the warp wait for its unit's own
+            # arrival rank (the one wait, on a warp of the same CTA): the
+            # last arriver's correction warp made the bump before writing
+            # the rank, so one more poll then sees it, and any other unit
+            # gives its slice up.
+            "flash_split_word = flash_split_gen0 << cutlass.Int32(12)",
+            f"if {lane_zero}:",
+            "    flash_split_polls = cutlass.Int32(0)",
+            (
+                "    while ((flash_split_word >> cutlass.Int32(12)) == flash_split_gen0)"
+                f" & (flash_split_polls < cutlass.Int32({flash_flex_tail_spin_polls()})):"
+            ),
+            "        flash_split_word = cutlass.Int32(cute.arch.atomic_or(",
+            f"            _flash_mSplitCntS.iterator + ({word_index}),",
+            "            cutlass.Int32(1) << flash_split_sid,",
+            '            sem="acq_rel", scope="gpu"))',
+            "        flash_split_polls += cutlass.Int32(1)",
+            "    if (flash_split_word >> cutlass.Int32(12)) == flash_split_gen0:",
+            "        flash_split_rank = cutlass.Int32(cute.arch.atomic_add(",
+            f"            _flash_mSplitCntS.iterator + ({rank_index}), cutlass.Int32(0),",
+            '            sem="acquire", scope="gpu"))',
+            "        while flash_split_rank == 0:",
+            "            flash_split_rank = cutlass.Int32(cute.arch.atomic_add(",
+            f"                _flash_mSplitCntS.iterator + ({rank_index}), cutlass.Int32(0),",
+            '                sem="acquire", scope="gpu"))',
+            f"        if flash_split_rank == {k}:",
+            "            flash_split_word = cutlass.Int32(cute.arch.atomic_or(",
+            f"                _flash_mSplitCntS.iterator + ({word_index}),",
+            "                cutlass.Int32(1) << flash_split_sid,",
+            '                sem="acq_rel", scope="gpu"))',
+            # The rank word is reset for the next launch by whoever read it;
+            # a unit that saw the bump in its polls never reads it, so the
+            # store below resets it unconditionally (the correction warp
+            # wrote it before the bump the poll acquired).
+            f"    _flash_mSplitCntS[{rank_index}] = cutlass.Int32(0)",
+            "flash_split_bumped = cutlass.Int32(0)",
+            "flash_split_mine = cutlass.Int32(0)",
+            "flash_split_lastu = cutlass.Int32(0)",
+            f"if {lane_zero}:",
+            "    flash_split_bumped = cutlass.Int32(cutlass.select_(",
+            "        (flash_split_word >> cutlass.Int32(12)) != flash_split_gen0,",
+            "        cutlass.Int32(1), cutlass.Int32(0)))",
+            "    flash_split_mine = cutlass.Int32(cutlass.select_(",
+            "        ((flash_split_word >> flash_split_sid) & cutlass.Int32(1)) == 0,",
+            "        flash_split_bumped, cutlass.Int32(0)))",
+            "    flash_split_lastu = cutlass.Int32(cutlass.select_(",
+            "        ((flash_split_word >> cutlass.Int32(8)) & cutlass.Int32(15)) == flash_split_sid,",
+            "        flash_split_bumped, cutlass.Int32(0)))",
+            "flash_split_last = cute.arch.vote_ballot_sync(flash_split_lastu != 0) != 0",
+            "if cute.arch.vote_ballot_sync(flash_split_bumped != 0) != 0:",
+            (
+                f"    flash_split_gO = cute.make_tensor({o_view}.iterator + cute.assume("
+                f"{o_offset}, divby=8), cute.make_layout((128, {hd_v}), stride=({o_row_stride}, 1)))"
+            ),
+            "    if cute.arch.vote_ballot_sync(flash_split_mine != 0) != 0:",
+            *merge("flash_split_sid", "        "),
+            # The last arriver: every slice whose bit no unit set, from the
+            # one OR that sets them all (acquire: nothing to publish, and a
+            # release would wait for the merge's stores above), walked bit by
+            # bit so the common case of none left costs no iteration.
+            "    if flash_split_last:",
+            f"        flash_split_left = cutlass.Int32({all_bits})",
+            f"        if {lane_zero}:",
+            "            flash_split_left = cutlass.Int32(cute.arch.atomic_or(",
+            f"                _flash_mSplitCntS.iterator + ({word_index}), cutlass.Int32({all_bits}),",
+            '                sem="acquire", scope="gpu"))',
+            (
+                "        flash_split_free = cutlass.Int32(cute.arch.shuffle_sync("
+                f"~flash_split_left & cutlass.Int32({all_bits}), 0))"
+            ),
+            "        while flash_split_free != 0:",
+            "            flash_split_other = cutlass.Int32(31) - cutlass.Int32(cute.arch.clz(",
+            "                flash_split_free & (cutlass.Int32(0) - flash_split_free)))",
+            *merge("flash_split_other", "            "),
+            "            flash_split_free = flash_split_free & (flash_split_free - cutlass.Int32(1))",
+        ]
+        lines = [
+            f"flash_split_sid = flash_sm_tail_unit & cutlass.Int32({k - 1})",
+            f"flash_split_item = flash_sm_tail_unit >> cutlass.Int32({shift})",
+        ]
+        if ragged_m:
+            # A stage without a live row (the dead second stage of a ragged
+            # last pair) has no partial, no arrival and nothing to merge.
+            lines.append(f"if flash_live_rows{stage} > cutlass.Int32(0):")
+            lines += [f"    {line}" for line in body]
+        else:
+            lines += body
+        return "\n" + "\n".join(f"            {line}" for line in lines)
+
     def _flex_softmax_body(
         stage: str,
         ld: str,
@@ -22376,7 +23271,7 @@ if warp_idx == 15:
                 for line in _flash_flex_cursor_init_lines(
                     "        ",
                     descending=desc_kv,
-                    kv_split=flex_kv_split,
+                    kv_split=flex_tail_k if flex_tail_k > 1 else flex_kv_split,
                     **flex_cursor_kwargs,
                 )
             )
@@ -23049,6 +23944,24 @@ if warp_idx == 15:
             # The split-KV walk's LSE is the merged statistics' (stored by
             # the merging correction warps).
             lse_store = ""
+        elif flex_tail_k > 1:
+            # A tail unit's softmax warps merge their rows of this stage
+            # (the LSE is the merged statistics'); the other units store
+            # the LSE as usual.
+            # (The unsplit units' path first: it falls through, see the
+            # epilogue warp's branch.)
+            merge = _flex_tail_softmax_merge(stage)
+            if lse_store:
+                lse_store = (
+                    "\n        if flash_sm_tail_unit < cutlass.Int32(0):"
+                    + textwrap.indent(lse_store, "    ")
+                    + "\n        else:"
+                    + merge
+                )
+            else:
+                lse_store = (
+                    "\n        if flash_sm_tail_unit >= cutlass.Int32(0):" + merge
+                )
         if flex_dead_split and lse_store:
             # A split item's LSE is the merged statistics' (stored by the
             # correction warps); its second stage's own rows, if they exist,
@@ -23172,17 +24085,43 @@ if warp_idx == 15:
                 )
         softmax_row_sum_expr = _published_row_sum()
         publish_row_max = ""
-        if flex_dead_split or flex_kv_split > 1:
-            # The merge of a split item (and every split-KV partial) needs
-            # each stage's row max too: it goes in the other alpha slot
-            # (both slots were acquired above; the correction warps read it
-            # before releasing P for the next item, ahead of any alpha
-            # publish of that item).
+        if flex_dead_split or flex_kv_split > 1 or flex_tail_k > 1:
+            # The merge of a split item (and every split-KV partial, the
+            # tail split's units included) needs each stage's row max too:
+            # it goes in the other alpha slot (both slots were acquired
+            # above; the correction warps read it before releasing P for
+            # the next item, ahead of any alpha publish of that item).
             publish_row_max = (
                 f"\n        {_scale_slot_expr(f'({corr_prod_index} ^ 1)', stage_expr)}"
                 " = flash_row_max"
             )
-        corr_publish_rowsum = f"""{rowsum_producer_acquire}        {_scale_slot_expr(corr_prod_index, stage_expr)} = {softmax_row_sum_expr}{publish_row_max}
+        tail_gen_read = ""
+        if flex_tail_k > 1:
+            # The tail split: the generation word this unit's softmax warps
+            # will wait on is read before the final publish's barrier
+            # arrive, which orders the read before the correction warps'
+            # arrival (and so before any unit's bump of the word).
+            tail_shift = flex_tail_k.bit_length() - 1
+            tail_partial, tail_stats, tail_counters = flex_split_workspace_elems(
+                flex_tail_items_ws,
+                flex_tail_k,
+                hd_v,
+                flash_flex_tail_banks(flex_tail_k),
+            )
+            # (The runtime stage under the shared softmax region, the literal
+            # on the per-stage regions.)
+            tail_gen_stage = stage if stage in ("0", "1") else "flash_stage"
+            tail_gen_index = (
+                f"{flex_tail_items_ws * 2 * 4} + ((flash_sm_tail_unit >> cutlass.Int32({tail_shift}))"
+                f" * 2 + {tail_gen_stage}) * 4 + (flash_local_tidx >> cutlass.Int32(5))"
+            )
+            tail_gen_read = f"""
+        flash_sm_tail_unit = cutlass.Int32(cute.arch.block_idx()[0]) - _flash_tail_base
+        _flash_mSplitCntS = cute.make_tensor(cute.recast_ptr(_flash_mSplitWs.iterator + {tail_partial + tail_stats}, dtype=cutlass.Int32), cute.make_layout(({tail_counters},), stride=(1,)))
+        flash_split_gen0 = cutlass.Int32(0)
+        if (flash_sm_tail_unit >= cutlass.Int32(0)) & ((flash_local_tidx & cutlass.Int32(31)) == 0):
+            flash_split_gen0 = cutlass.Int32(cute.arch.atomic_add(_flash_mSplitCntS.iterator + ({tail_gen_index}), cutlass.Int32(0), sem="relaxed", scope="gpu")) >> cutlass.Int32(12)"""
+        corr_publish_rowsum = f"""{rowsum_producer_acquire}        {_scale_slot_expr(corr_prod_index, stage_expr)} = {softmax_row_sum_expr}{publish_row_max}{tail_gen_read}
         _helion_flash_rt.named_barrier_arrive_unaligned(
             {stage_bar} + warp_idx % 4, 64)
 {lse_store}
@@ -24603,7 +25542,7 @@ if warp_idx == 15:
     def _corr_wait_epi_empty(stage: str) -> str:
         return (
             "_helion_flash_rt.mbar_spin_wait(\n"
-            f"            flash_corr_epi_empty_ptr + {stage}, "
+            f"            flash_corr_epi_empty_ptr + {_flash_o_stage_empty_slot(cfg.o_stage, stage)}, "
             f"flash_corr_epi_empty_phase, {cfg.wait_hint})"
         )
 
@@ -24746,13 +25685,31 @@ if warp_idx == 15:
         {_corr_wait_o_ready("1")}
         {_corr_wait_epi_empty("1")}
         _helion_flash_rt.{scoped_corr_epi_fn}(
-            flash_pvt, tOtO1, sO[None, None, 1], flash_local_tidx,
+            flash_pvt, tOtO1, sO[None, None, {_flash_o_stage_tile(cfg.o_stage, "1")}], flash_local_tidx,
             flash_inv_sum1, {hd_v}, {cfg.corr_tile_size}, {io_dtype}{staged_relu_keyword})
         cute.arch.fence_view_async_shared()
         {_corr_commit_epi_full("1")}
 """
 
-    def _corr_epi_kv_split(stage: str, stat_empty_arrive: str) -> str:
+    def _corr_split_head_lines(
+        split_id_expr: str, split_item_expr: str, counter_base: int, counter_elems: int
+    ) -> list[str]:
+        """The split-KV epilogue's CTA-wide names: the unit's split id, its
+        workspace item and the view over the arrival counters (the int32 tail
+        of the fp32 workspace)."""
+        return [
+            f"        flash_split_sid = {split_id_expr}",
+            f"        flash_split_item = {split_item_expr}",
+            (
+                "        _flash_mSplitCnt = cute.make_tensor(cute.recast_ptr("
+                f"_flash_mSplitWs.iterator + {counter_base}, "
+                f"dtype=cutlass.Int32), cute.make_layout(({counter_elems},), stride=(1,)))"
+            ),
+        ]
+
+    def _corr_epi_kv_split(
+        stage: str, stat_empty_arrive: str, *, tail: bool = False
+    ) -> str:
         """The scoped staged epilogue of a split-KV render (``kv_split`` > 1):
         each stage's block takes its final publishes (row sum and row max),
         stores this CTA's unnormalized fp32 partial output and the row
@@ -24766,23 +25723,32 @@ if warp_idx == 15:
         merged statistics beside them) and the second stage's partial is
         zeros with ``(-inf, 0)``, exactly the empty-row statistics."""
         assert not fa4_stat_handoff and not fa4_stat_pipeline
-        splits = flex_kv_split
+        # The tail split (``tail``): the unit's split id and workspace row
+        # come from the CTA-wide tail decode; the workspace holds the tail's
+        # items only.
+        splits = flex_tail_k if tail else flex_kv_split
+        items_ws = flex_tail_items_ws if tail else total_tiles
         idx = "flash_s_corr_cons_index"
         other = f"({idx} ^ 1)"
         tile_elems = 128 * hd_v
-        stats_base = total_tiles * splits * 2 * tile_elems
-        assert stats_base == flex_split_workspace_elems(total_tiles, splits, hd_v)[0]
+        stats_base = items_ws * splits * 2 * tile_elems
+        banks = flash_flex_tail_banks(splits) if tail else 1
+        assert (
+            stats_base == flex_split_workspace_elems(items_ws, splits, hd_v, banks)[0]
+        )
         o_view = "_flash_mO" if cfg.epi_tma else "_flash_mOt"
 
         # The split id and the item's workspace index are recomputed here
         # (the CTA id's low bits, ``bh * pairs + pair``): kept live from the
         # CTA-wide setup across every role they cost two local-memory spills
         # that the softmax and correction regions reloaded (SASS: 18 LDL).
+        # (The tail split's come from its own head, ``_corr_epi``.)
         split_id_expr = (
             f"flash_tile_id & cutlass.Int32({splits - 1})"
             if persistent
             else f"cutlass.Int32(cute.arch.block_idx()[0]) & cutlass.Int32({splits - 1})"
         )
+        split_item_expr = f"flash_bh * {num_m_pairs} + flash_m_pair"
 
         def partial_tile(split_expr: str) -> str:
             # The tile is chunk-major: the correction epilogue's chunk of
@@ -24812,19 +25778,21 @@ if warp_idx == 15:
         lane_zero = "(flash_local_tidx & cutlass.Int32(31)) == 0"
         store_args = f"flash_local_tidx, {hd_v}, {cfg.corr_tile_size}, {io_dtype}"
         partial_elems, stat_elems, counter_elems = flex_split_workspace_elems(
-            total_tiles, splits, hd_v
+            items_ws, splits, hd_v, banks
         )
         lines: list[str] = []
         if stage == "0":
             # The arrival counters are the int32 tail of the fp32 workspace.
+            # (The tail split binds the three names ahead of the per-unit
+            # branch: stage 1's branch is another region.)
+            if not tail:
+                lines += _corr_split_head_lines(
+                    split_id_expr,
+                    split_item_expr,
+                    partial_elems + stat_elems,
+                    counter_elems,
+                )
             lines += [
-                f"        flash_split_sid = {split_id_expr}",
-                f"        flash_split_item = flash_bh * {num_m_pairs} + flash_m_pair",
-                (
-                    "        _flash_mSplitCnt = cute.make_tensor(cute.recast_ptr("
-                    f"_flash_mSplitWs.iterator + {partial_elems + stat_elems}, "
-                    f"dtype=cutlass.Int32), cute.make_layout(({counter_elems},), stride=(1,)))"
-                ),
                 "        _helion_flash_rt.named_barrier_wait_unaligned(",
                 "            3 + warp_idx % 4, 64)",
             ]
@@ -24946,6 +25914,70 @@ if warp_idx == 15:
         # lane's reads (release/acquire cumulativity through the barrier,
         # CUTLASS's semaphore pattern); per-lane gpu-scope fences on top
         # cost about 1 us each on the critical tail and are not needed.
+        if tail:
+            # The tail split's arrival: after both stages' partial stores
+            # every warp counts its arrival once on the item's (32-row group)
+            # counter (a release add waits for the warp's stores to drain,
+            # so the arrival follows the second store; one add serves both
+            # stages, which is why stage 0's merge waits for the unit's
+            # stage-1 store as well -- the two stores are back to back); the
+            # last arriving warp (its acq_rel add synchronizes with the
+            # others') resets the counter and writes each live stage's
+            # generation-and-claims word with the new generation and no
+            # claim bit; then every warp publishes its arrival rank per live
+            # stage for its unit's softmax warp of that stage, which runs the
+            # merge protocol (``_flex_tail_softmax_merge``).  The words and
+            # the ranks are plain stores behind one gpu-scope fence (a
+            # release pattern the softmax warps' acquiring polls pair with):
+            # none waits for a round trip, and a word's coherence order still
+            # puts the pollers' claim ORs before or after its bump.
+            if stage == "0":
+                return "\n".join(lines) + "\n"
+            bank = items_ws * 2 * 4
+
+            def group_index(word_stage: str) -> str:
+                return (
+                    f"(flash_split_item * 2 + {word_stage}) * 4"
+                    " + (flash_local_tidx >> cutlass.Int32(5))"
+                )
+
+            def publish(word_stage: str) -> list[str]:
+                word_index = f"{bank} + {group_index(word_stage)}"
+                rank_index = f"{2 * bank} + ({group_index(word_stage)}) * {splits} + flash_split_sid"
+                return [
+                    f"if flash_split_old == cutlass.Int32({splits - 1}):",
+                    (
+                        f"    _flash_mSplitCnt[{word_index}] = "
+                        f"((flash_corr_gen0_{word_stage} + cutlass.Int32(1)) << cutlass.Int32(12))"
+                        " | (flash_split_sid << cutlass.Int32(8))"
+                    ),
+                    f"_flash_mSplitCnt[{rank_index}] = flash_split_old + cutlass.Int32(1)",
+                ]
+
+            shared: list[str] = [
+                "cute.arch.sync_warp()",
+                "flash_split_old = cutlass.Int32(0)",
+                f"if {lane_zero}:",
+                "    flash_split_old = cutlass.Int32(cute.arch.atomic_add(",
+                f"        _flash_mSplitCnt.iterator + ({group_index('0')}), cutlass.Int32(1),",
+                '        sem="acq_rel", scope="gpu"))',
+                "    cute.arch.fence_acq_rel_gpu()",
+                f"    if flash_split_old == cutlass.Int32({splits - 1}):",
+                f"        _flash_mSplitCnt[{group_index('0')}] = cutlass.Int32(0)",
+                *[f"    {line}" for line in publish("0")],
+            ]
+            if ragged_m:
+                # A stage without a live row has no partial: no word, no rank
+                # (its softmax warps skip the protocol on the same
+                # CTA-uniform test; the first stage always has live rows).
+                shared.append("    if flash_live_rows1 > cutlass.Int32(0):")
+                shared += [f"        {line}" for line in publish("1")]
+                lines.append("        if flash_live_rows0 > cutlass.Int32(0):")
+                lines += [f"            {line}" for line in shared]
+            else:
+                shared += [f"    {line}" for line in publish("1")]
+                lines += [f"        {line}" for line in shared]
+            return "\n".join(lines) + "\n"
         merge: list[str] = [
             "cute.arch.sync_warp()",
             "flash_split_old = cutlass.Int32(0)",
@@ -25047,7 +26079,7 @@ if warp_idx == 15:
             lines += [f"        {line}" for line in merge]
         return "\n".join(lines) + "\n"
 
-    def _corr_epi(stage: str, mtile: str) -> str:
+    def _corr_epi(stage: str, mtile: str, *, plain: bool = False) -> str:
         corr_cons_index = "0" if fa4_stat_handoff else "flash_s_corr_cons_index"
         scale_expr = _scale_slot_expr(corr_cons_index, stage)
         stat_empty_arrive = ""
@@ -25055,6 +26087,75 @@ if warp_idx == 15:
             stat_empty_arrive = (
                 f"        cute.arch.mbarrier_arrive("
                 f"flash_s{stage}_corr_empty_ptr + {corr_cons_index})\n"
+            )
+        if flex_tail_k > 1 and not plain:
+            # The tail split: a tail unit stores its partial and merges
+            # (the split-KV epilogue), the other units run the staged one;
+            # both advance the same handshakes.
+            assert split_corr_epi_handoff and scoped_corr_epi_smem
+            head = ""
+            if stage == "0":
+                tail_partial, tail_stats, tail_counters = flex_split_workspace_elems(
+                    flex_tail_items_ws,
+                    flex_tail_k,
+                    hd_v,
+                    flash_flex_tail_banks(flex_tail_k),
+                )
+                tail_shift = flex_tail_k.bit_length() - 1
+                tail_bank = flex_tail_items_ws * 2 * 4
+                # The generation each stage's word holds ahead of this unit's
+                # arrival (the last arriver's bump writes the next one).
+                gen_reads: list[str] = []
+                for gen_stage in ("0", "1"):
+                    gen_reads.append(
+                        f"        flash_corr_gen0_{gen_stage} = cutlass.Int32(0)"
+                    )
+                gen_reads.append(
+                    "        if (flash_corr_tail_unit >= cutlass.Int32(0))"
+                    " & ((flash_local_tidx & cutlass.Int32(31)) == 0):"
+                )
+                for gen_stage in ("0", "1"):
+                    gen_reads.append(
+                        f"            flash_corr_gen0_{gen_stage} = cutlass.Int32("
+                        "cute.arch.atomic_add(_flash_mSplitCnt.iterator + ("
+                        f"{tail_bank} + (flash_split_item * 2 + {gen_stage}) * 4"
+                        " + (flash_local_tidx >> cutlass.Int32(5))), cutlass.Int32(0),"
+                        ' sem="relaxed", scope="gpu")) >> cutlass.Int32(12)'
+                    )
+                head = (
+                    "\n".join(
+                        [
+                            (
+                                "        flash_corr_tail_unit = cutlass.Int32("
+                                "cute.arch.block_idx()[0]) - _flash_tail_base"
+                            ),
+                            *_corr_split_head_lines(
+                                f"flash_corr_tail_unit & cutlass.Int32({flex_tail_k - 1})",
+                                f"flash_corr_tail_unit >> cutlass.Int32({tail_shift})",
+                                tail_partial + tail_stats,
+                                tail_counters,
+                            ),
+                            *gen_reads,
+                        ]
+                    )
+                    + "\n"
+                )
+            # (The unsplit units' path first: it falls through, see the
+            # epilogue warp's branch.)
+            return (
+                head
+                + "        if flash_corr_tail_unit < cutlass.Int32(0):\n"
+                + textwrap.indent(
+                    _corr_epi(stage, mtile, plain=True).rstrip("\n"), "    "
+                )
+                + "\n        else:\n"
+                + textwrap.indent(
+                    _corr_epi_kv_split(stage, stat_empty_arrive, tail=True).rstrip(
+                        "\n"
+                    ),
+                    "    ",
+                )
+                + "\n"
             )
         if softmax_row_epilogue:
             # The softmax warpgroup evaluates the program; the correction warps
@@ -25126,7 +26227,7 @@ if warp_idx == 15:
         {_corr_wait_o_ready(stage)}
         {_corr_wait_epi_empty(stage)}
         _helion_flash_rt.{scoped_corr_epi_fn}(
-            flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
+            flash_pvt, tOtO{stage}, sO[None, None, {_flash_o_stage_tile(cfg.o_stage, stage)}], flash_local_tidx,
             flash_inv_sum{stage}, {hd_v}, {cfg.corr_tile_size}, {io_dtype}{staged_relu_keyword})
         cute.arch.fence_view_async_shared()
         {_corr_commit_epi_full(stage)}
@@ -25137,9 +26238,9 @@ if warp_idx == 15:
 {stat_empty_arrive}\
         _helion_flash_rt.{scoped_corr_epi_handoff_fn}(
             flash_o_full_ptr + {stage}, flash_o_full_phase,
-            flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase,
+            flash_corr_epi_empty_ptr + {_flash_o_stage_empty_slot(cfg.o_stage, stage)}, flash_corr_epi_empty_phase,
             flash_corr_epi_full_ptr + {stage},
-            flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
+            flash_pvt, tOtO{stage}, sO[None, None, {_flash_o_stage_tile(cfg.o_stage, stage)}], flash_local_tidx,
             flash_inv_sum{stage}, {hd_v}, {cfg.corr_tile_size}, {io_dtype},
             {cfg.wait_hint}{staged_relu_keyword})
 """
@@ -25149,7 +26250,7 @@ if warp_idx == 15:
 {stat_empty_arrive}\
         _helion_flash_rt.fa4_correction_epilogue_handoff_to_smem(
             flash_o_full_ptr + {stage}, flash_o_full_phase,
-            flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase,
+            flash_corr_epi_empty_ptr + {_flash_o_stage_empty_slot(cfg.o_stage, stage)}, flash_corr_epi_empty_phase,
             flash_corr_epi_full_ptr + {stage},
             flash_o_tiled_t2r, flash_o_tiled_r2s,
             tOtO{stage}_corr_t2r, tOsO{stage}_corr_r2s, tOcO_corr_t2r,
@@ -25695,6 +26796,46 @@ _FLASH_DYNAMIC_TILE_KERNEL_PARAMS = [
     "_flash_num_bh",
     "_flash_total_tiles",
 ]
+
+# The tail split's first tail unit (the count of unsplit units: the full
+# waves of the device), computed by the launcher from the SM count.
+_FLASH_FLEX_TAIL_KERNEL_PARAMS = [
+    "_flash_tail_base",
+]
+
+
+def flash_flex_tail_banks(splits: int) -> int:
+    """Counter banks of the tail split's workspace, each ``items * 2 * 4``
+    int32 words (per item, stage and 32-row group): the arrival counters,
+    the generation-and-claims words (the generation above bit 12, the last
+    arriving unit's split id in bits 8..11, one claim bit per split unit
+    below) and ``splits`` arrival ranks (one word per split unit)."""
+    return 2 + splits
+
+
+def flash_flex_tail_spin_polls() -> int:
+    """Polls of the generation word a tail unit's softmax warp makes before
+    it gives its slice up to the item's last arriving unit
+    (``cute_flash_flex_tail_split``; read at render time from
+    ``HELION_CUTE_FLASH_FLEX_TAIL_SPIN_POLLS``, 1024 by default).  The units
+    of an item are one wave of CTAs and co-resident on a whole device,
+    where the bump comes within a few microseconds; under MPS or a green
+    context fewer SMs than the device reports may leave a unit waiting for
+    one that cannot be scheduled, and the bound is what keeps that from
+    being a hang.  0 is the forced timeout of the tests: no unit but the
+    last merges anything."""
+    return max(0, int(_flash_env_get("HELION_CUTE_FLASH_FLEX_TAIL_SPIN_POLLS", "1024")))
+
+
+# The tail split's roles tell a tail unit by the CTA id against the launcher's
+# base again (a value kept live from the setup across a role's loop costs that
+# role spills; the special register and the argument are free).
+_FLASH_TAIL_UNIT_PREDICATE = (
+    "cutlass.Int32(cute.arch.block_idx()[0]) >= _flash_tail_base"
+)
+_FLASH_TAIL_UNIT_PREDICATE_NOT = (
+    "cutlass.Int32(cute.arch.block_idx()[0]) < _flash_tail_base"
+)
 
 # Lever A (epilogue TMA-store): the extra wrapper-built kernel params -- the O TMA
 # STORE atom and its smem layout. Only appended when cfg.epi_tma (fa4-only). The
@@ -26666,6 +27807,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         # Lever A: build the O TMA-store atom host-side and pass it to the corr
         # epilogue (fa4-only; the env gate already forced topology == "fa4").
         "epi_tma": cfg.epi_tma,
+        # The shared staged output tile only (two tiles keep the plan as is).
+        **({"o_stage": 1} if cfg.o_stage == 1 else {}),
         "epi_stg": cfg.epi_stg,
         "use_2cta_instrs": cfg.use_2cta_instrs,
         "use_cga2_local_cta": cfg.use_cga2_local_cta,
@@ -26845,6 +27988,35 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             df.placeholder_args.add(ws_arg.name)
             flex_split_arg = ws_arg.name
             wrapper_plan["kv_split"] = kv_split
+    # The tail split (``cute_flash_flex_tail_split``): the last partial wave's
+    # items as split units; the workspace holds one wave of items at most
+    # (the launcher sizes the tail from the SM count and keeps a larger
+    # tail unsplit), the first tail unit is a runtime kernel argument.
+    flex_tail_split = 0
+    flex_tail_items_ws = 0
+    if score_plan.has_list_walk and cfg.topology == "fa4" and cfg.flex_tail_split > 1:
+        flex_tail_items_ws = min(total_tiles, FLASH_FLEX_TAIL_ITEMS_MAX)
+        if kv_split == 1 and _flash_kv_split_fits(
+            cfg.flex_tail_split,
+            items=flex_tail_items_ws,
+            num_bh=batch,
+            seq=seq,
+            head_dim_v=head_dim_v,
+        ):
+            flex_tail_split = cfg.flex_tail_split
+            emit_flash_flex_split_module_statements(cg)
+            tail_ws_arg = _flash_flex_split_arg(
+                df,
+                q_arg,
+                items=flex_tail_items_ws,
+                splits=flex_tail_split,
+                head_dim_v=head_dim_v,
+                banks=flash_flex_tail_banks(flex_tail_split),
+            )
+            df.placeholder_args.add(tail_ws_arg.name)
+            flex_split_arg = tail_ws_arg.name
+            wrapper_plan["flex_tail_split"] = flex_tail_split
+            wrapper_plan["flex_tail_items_ws"] = flex_tail_items_ws
     aux_smem_staging = _flash_aux_smem_staging(
         cfg,
         row_emit,
@@ -26869,6 +28041,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     df.wrapper_only_params.extend(_FLASH_KERNEL_PARAMS)
     if cfg.topology != "fa4":
         df.wrapper_only_params.extend(_FLASH_DYNAMIC_TILE_KERNEL_PARAMS)
+    if flex_tail_split > 1:
+        # (After the tile counts, before the LSE: the launcher's argument order.)
+        df.wrapper_only_params.extend(_FLASH_FLEX_TAIL_KERNEL_PARAMS)
     if lse_arg is not None:
         df.wrapper_only_params.extend(_FLASH_LSE_KERNEL_PARAMS)
     if tensor_biases:
@@ -26893,11 +28068,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     df.placeholder_args.update(plan.flex_scalar_arg_names)
     if cfg.epi_tma:
         df.wrapper_only_params.extend(_FLASH_EPI_TMA_KERNEL_PARAMS)
-        if score_plan.is_flex and (seq % 256 != 0 or kv_split > 1):
+        if score_plan.is_flex and (
+            seq % 256 != 0 or kv_split > 1 or cfg.flex_tail_split > 1
+        ):
             # A ragged query length's TMA epilogue stores the last pair's
             # partial tiles through the row-guarded vector store over the
             # plain output view (see the ``ragged_m`` hybrid in the fa4
-            # body); the split-KV merge stores every tile through it.
+            # body); the split-KV merge stores every tile through it, and
+            # so do the tail split's units (their softmax-warp merge).
             df.wrapper_only_params.extend(_FLASH_EPI_TMA_RAGGED_KERNEL_PARAMS)
             wrapper_plan["epi_tma_ragged"] = True
     elif cfg.epi_stg:
@@ -27026,6 +28204,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 kv_split=kv_split,
                 flex_split_arg=flex_split_arg,
                 flex_host_flags=flex_host_flags,
+                flex_tail_split=flex_tail_split,
+                flex_tail_items_ws=flex_tail_items_ws,
             )
         )
     else:

@@ -20,8 +20,13 @@ matcher, the hook renderer and the list-walk emitter. Expectations:
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -207,12 +212,13 @@ def _qkv(
     *,
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
     kv_heads = heads if kv_heads is None else kv_heads
-    q = torch.randn(batch, heads, q_seq, 64, dtype=dtype, device=DEVICE)
-    k = torch.randn(batch, kv_heads, kv_seq, 64, dtype=dtype, device=DEVICE)
-    v = torch.randn(batch, kv_heads, kv_seq, 64, dtype=dtype, device=DEVICE)
+    q = torch.randn(batch, heads, q_seq, head_dim, dtype=dtype, device=DEVICE)
+    k = torch.randn(batch, kv_heads, kv_seq, head_dim, dtype=dtype, device=DEVICE)
+    v = torch.randn(batch, kv_heads, kv_seq, head_dim, dtype=dtype, device=DEVICE)
     return q, k, v
 
 
@@ -1356,6 +1362,313 @@ def test_dead_stage_split_merges_both_softmax_warpgroups(
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("tail_split", "kv_order", "kv_seq", "epilogue"),
+    [
+        (2, "descending", 2048, "stg"),
+        (8, "descending", 2048, "stg"),
+        (4, "ascending", 2048, "stg"),
+        (2, "descending", 4352, "stg"),
+        (4, "ascending", 4352, "stg"),
+        (8, "descending", 8192, "stg"),
+        (2, "descending", 8192, "tma"),
+        (2, "descending", 8192, "tma_shared"),
+        (4, "descending", 4352, "stg_gqa"),
+        (4, "descending", 4352, "stg_register_words"),
+    ],
+    ids=[
+        "tail2",
+        "tail8",
+        "tail4_asc",
+        "tail2_cursor",
+        "tail4_asc_cursor",
+        "tail8_cursor64",
+        "tail2_cursor64_tma_even",
+        "tail2_cursor64_tma_even_shared",
+        "tail4_cursor_gqa",
+        "tail4_two_word_register_walk",
+    ],
+)
+def test_tail_split_matches_the_unsplit_grid(
+    tail_split: int, kv_order: str, kv_seq: int, epilogue: str
+) -> None:
+    """``cute_flash_flex_tail_split``: the grid's last partial wave runs as
+    split units merged in the kernel; the full waves run unsplit.  A grid
+    of one full wave plus a tail the device's idle SMs hold eight times
+    (``8 * SMs // 8 + 16`` items: a ragged query length, a random table
+    mask with an empty row): within the merge's rounding of the unsplit
+    grid (the unsplit units bitwise, the tail items within the split-KV
+    tolerance), close to torch, repeat launches bitwise.  Both walk orders
+    (the slice is taken off the walk word from the order's end) and both
+    walk forms: the one-word register walk (16 KV tiles) and the cursor
+    walk over the words table (34 and 64 KV tiles: two words, the slice's
+    leading tiles consumed through the cursor); the TMA epilogue on an even
+    query length (the units' merge stores through the plain output view,
+    which the TMA epilogue binds only for a ragged length otherwise)."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    # One full wave plus a tail of 8..16 items (eight pairs per batch-head).
+    bh_total = sm_count // 8 + 2
+    heads = next(h for h in (4, 2, 1) if bh_total % h == 0)
+    batch = bh_total // heads
+    # GQA: half as many KV heads (the cursor walk's per-item rows and the
+    # merge are per query head either way).
+    kv_heads = heads // 2 if epilogue == "stg_gqa" and heads % 2 == 0 else heads
+    q_seq = 2048 if epilogue.startswith("tma") else 2048 - 64
+    torch.manual_seed(7)
+    rows, num_kv = -(-q_seq // 128), kv_seq // 128
+    table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.6).to(
+        torch.int32
+    )
+    table[0, 1, 3] = 0  # an empty row
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        _identity,
+        block_mask,
+        mask_mod=table_mask,
+        enable_gqa=kv_heads != heads,
+    )
+    items = batch * heads * -(-q_seq // 256)
+    waves_full, tail_items = divmod(items, sm_count)
+    assert waves_full >= 1 and tail_items > 0 and tail_items * tail_split <= sm_count
+    base = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: False,
+        # The list walk's direction (``_flash_flex_walk_step``).
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: kv_order,
+    }
+    if epilogue.startswith("tma"):
+        base = {
+            **base,
+            cute_flash.FLASH_EPI_TMA_KEY: True,
+            cute_flash.FLASH_EPI_STG_KEY: False,
+        }
+    if epilogue == "tma_shared":
+        # The shared softmax region: the merge indexes the workspace by the
+        # runtime stage.
+        base = {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"}
+    if epilogue == "stg_register_words":
+        # Two words without the host words table: the register walk trims
+        # both words.
+        base = {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False}
+    plain_fn, plain_cfg = _compile_flex(args, base)
+    tail_fn, tail_cfg = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: tail_split},
+        expect_in_code="if flash_pid >= _flash_tail_base:",
+    )
+    if epilogue.startswith("tma"):
+        assert plain_cfg.epi_tma and tail_cfg.epi_tma and q_seq % 256 == 0
+    if epilogue == "tma_shared":
+        assert tail_cfg.softmax_region == "shared"
+    if epilogue == "stg_register_words":
+        assert not tail_cfg.flex_item_words and kv_seq // 128 > 32
+    assert plain_cfg.causal_kv_order == kv_order == tail_cfg.causal_kv_order
+    assert plain_cfg.flex_tail_split == 0 and tail_cfg.flex_tail_split == tail_split
+    out_plain, lse_plain = plain_fn(*args)
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads != heads
+    )
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    torch.testing.assert_close(
+        out_tail.float(), out_plain.float(), atol=1e-2, rtol=1e-2
+    )
+    finite = torch.isfinite(lse_plain)
+    assert torch.equal(finite, torch.isfinite(lse_tail))
+    torch.testing.assert_close(lse_tail[finite], lse_plain[finite], atol=1e-3, rtol=0)
+    assert torch.equal(lse_tail[~finite], lse_plain[~finite])
+    for _ in range(3):
+        out_again, lse_again = tail_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_tail)
+        assert torch.equal(lse_again, lse_tail)
+
+
+def _tail_grid(
+    q_seq: int, bh_total: int, tail_split: int, *, kv_heads: int | None = None
+) -> tuple[tuple[Any, ...], Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """A tail-split grid: ``bh_total`` batch-heads of ``q_seq`` query rows
+    over 2048 keys under a random table mask (an empty row in it), with the
+    item count's last partial wave split ``tail_split`` ways on this device."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    heads = next(h for h in (4, 3, 2, 1) if bh_total % h == 0)
+    batch = bh_total // heads
+    kv_seq = 2048
+    torch.manual_seed(7)
+    rows, num_kv = -(-q_seq // 128), kv_seq // 128
+    table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.6).to(
+        torch.int32
+    )
+    table[0, heads - 1, min(3, rows - 1)] = 0  # an empty row
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        _identity,
+        block_mask,
+        mask_mod=table_mask,
+        enable_gqa=kv_heads is not None,
+    )
+    items = batch * heads * -(-q_seq // 256)
+    waves_full, tail_items = divmod(items, sm_count)
+    assert waves_full >= 1 and tail_items > 0 and tail_items * tail_split <= sm_count, (
+        items,
+        sm_count,
+    )
+    return args, block_mask, (q, k, v)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_tail_split_forced_timeout_leaves_the_merge_to_the_last_arriver() -> None:
+    """A tail unit polls the generation word a bounded number of times
+    before it gives its slice up; at 0 polls (``HELION_CUTE_FLASH_FLEX_TAIL
+    _SPIN_POLLS``, read at render time) no unit but the item's last arriver
+    merges anything, and that unit claims and merges every slice: the
+    output is bitwise the free run's (whose units each merge their own),
+    and repeat launches are bitwise."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    args, block_mask, (q, k, v) = _tail_grid(2048 - 64, sm_count // 8 + 2, 4)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    free_fn, _ = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4},
+        expect_in_code="flash_split_polls < cutlass.Int32(1024)",
+    )
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH_FLEX_TAIL_SPIN_POLLS": "0"}):
+        timeout_fn, _ = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4},
+            expect_in_code="flash_split_polls < cutlass.Int32(0)",
+        )
+    out_free, lse_free = free_fn(*args)
+    out_timeout, lse_timeout = timeout_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_timeout, lse_timeout, out_ref, lse_ref)
+    assert torch.equal(out_timeout, out_free)
+    assert torch.equal(lse_timeout, lse_free)
+    for _ in range(3):
+        out_again, lse_again = timeout_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_free)
+        assert torch.equal(lse_again, lse_free)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_tail_split_with_an_empty_last_stage_and_eight_units() -> None:
+    """A query length whose last pair has no second tile (``q_seq % 256 <=
+    128``): the dead stage stores no partial, counts no arrival and merges
+    nothing on any unit, at the widest split (8) over a one-wave-plus-tail
+    grid; within the merge's rounding of the unsplit grid, repeat launches
+    bitwise."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    q_seq = 2048 + 64
+    pairs = -(-q_seq // 256)
+    # One full wave plus the smallest tail eight units of which fit the SMs.
+    bh_total = next(
+        bh
+        for bh in range(1, 4 * sm_count)
+        if bh * pairs > sm_count and 0 < (bh * pairs) % sm_count <= sm_count // 8
+    )
+    args, block_mask, (q, k, v) = _tail_grid(q_seq, bh_total, 8)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    plain_fn, _ = _compile_flex(args, base)
+    tail_fn, tail_cfg = _compile_flex(
+        args, {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 8}
+    )
+    assert tail_cfg.flex_tail_split == 8
+    out_plain, lse_plain = plain_fn(*args)
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    torch.testing.assert_close(
+        out_tail.float(), out_plain.float(), atol=1e-2, rtol=1e-2
+    )
+    finite = torch.isfinite(lse_plain)
+    assert torch.equal(finite, torch.isfinite(lse_tail))
+    torch.testing.assert_close(lse_tail[finite], lse_plain[finite], atol=1e-3, rtol=0)
+    for _ in range(3):
+        out_again, lse_again = tail_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_tail)
+        assert torch.equal(lse_again, lse_tail)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
+    """Grouped-query heads (two query heads per key head) with a tail split
+    of 4; a CUDA-graph capture of the launch (the workspace and its counters
+    captured with it) replays the eager result bitwise, three times."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    bh_total = next(bh for bh in range(sm_count // 8 + 2, 4 * sm_count) if bh % 4 == 0)
+    args, block_mask, (q, k, v) = _tail_grid(2048 - 64, bh_total, 4, kv_heads=2)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    tail_fn, tail_cfg = _compile_flex(
+        args, {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4}
+    )
+    assert tail_cfg.flex_tail_split == 4
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask, enable_gqa=True)
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = tail_fn(*args)
+    for _ in range(3):
+        graph_out.fill_(0)
+        graph_lse.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, out_tail)
+        assert torch.equal(graph_lse, lse_tail)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 @pytest.mark.parametrize("kv_split", [2, 4])
 @pytest.mark.parametrize(
     ("q_seq", "kv_seq", "body", "dead_split"),
@@ -1460,7 +1773,10 @@ def _copy_tables(args: tuple[Any, ...], block_mask: Any) -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
-def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -> None:
+@pytest.mark.parametrize("early_qk", [True, False], ids=["early_qk", "item_order"])
+def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites(
+    early_qk: bool,
+) -> None:
     batch, heads, seq = 2, 4, 2048 + 128  # a ragged last pair: 9 pairs, 17 rows
     rows = num_kv = -(-seq // 128)
     torch.manual_seed(2)
@@ -1483,9 +1799,18 @@ def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -
     args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
     fn_grid, _ = _compile_flex(args, PAIR_DESC)
     fn_persistent, resolved = _compile_flex(
-        args, {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: True}
+        args,
+        {
+            **PAIR_DESC,
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+            cute_flash.FLASH_FLEX_EARLY_QK_KEY: early_qk,
+        },
+        expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim"
+        if early_qk
+        else None,
     )
     assert resolved.persistent and resolved.persistent_loop == "while"
+    assert resolved.flex_early_qk is early_qk
 
     def check() -> None:
         out, lse = fn_grid(*args)
@@ -1509,6 +1834,190 @@ def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -
     )
     _copy_tables(args, block_mask)
     check()
+
+
+def _stage1_tail_absent(num_kv: int) -> Callable[..., Any]:
+    """Even query tiles (stage 0) see every KV tile; odd query tiles (stage
+    1) see all but the two highest: on the descending walk every item's
+    first tile is absent for stage 1 and its last tile live for it. (One
+    pointwise relation of both indices: a q-only term or-ed with a kv-only
+    term is not a flex hook region.)"""
+
+    def mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return kv_idx // 128 + (q_idx // 128) % 2 * 2 < num_kv
+
+    return mask
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "structured", [True, False], ids=["stage1_tail_absent", "random_table"]
+)
+def test_persistent_early_qk_wraps_items_under_the_absent_stage_skip(
+    structured: bool,
+) -> None:
+    """The early next-item QK0 with ``cute_flash_flex_skip_absent`` on a grid
+    every CTA of which walks at least two items, so the hoisted head runs
+    inside the loop (the 72-item shape above walks one item per CTA and
+    never reaches it). That head set the walk's stage-1 liveness flag for
+    the NEXT item's first tile between this item's last PV0 and PV1, so a
+    last tile live for stage 1 followed by an item whose first tile is not
+    lost its last PV1 (O1 short of that tile, silently). The structured mask
+    makes that the case at every item boundary; the random table covers the
+    rest. Bitwise the one-item grid with the skip and the persistent loop
+    without it, and within tolerance of torch."""
+    batch, seq = 2, 2048 + 128  # a ragged last pair: 9 pairs, 17 rows
+    rows = num_kv = -(-seq // 128)
+    pairs = -(-rows // 2)
+    num_sm = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    heads = -(-(2 * num_sm) // (batch * pairs))
+    items = batch * heads * pairs
+    assert items >= 2 * num_sm
+    mask_dev: Callable[..., Any] | None = None
+    if structured:
+        mask_ref = _stage1_tail_absent(num_kv)
+    else:
+        torch.manual_seed(3)
+        table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.35).to(
+            torch.int32
+        )
+        table[0, 1, 2:4] = 0  # an empty pair
+
+        def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+        def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+        mask_ref, mask_dev = table_mask_ref, table_mask
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        mask_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=mask_dev)
+    skip = {cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True}
+    fn_grid, grid_cfg = _compile_flex(args, {**PAIR_DESC, **skip})
+    assert grid_cfg.flex_skip_absent and not grid_cfg.persistent
+    early = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+        cute_flash.FLASH_FLEX_EARLY_QK_KEY: True,
+    }
+    fn_skip, cfg_skip = _compile_flex(
+        args,
+        {**early, **skip},
+        expect_in_code=(
+            "flash_flex_pv_issue1 = flash_flex_pv_last1 | cutlass.Int32(flash_o_zero1)"
+        ),
+    )
+    assert cfg_skip.persistent and cfg_skip.flex_early_qk and cfg_skip.flex_skip_absent
+    # The persistent grid is capped at the SMs' CTAs: every CTA wraps.
+    assert items > num_sm * cfg_skip.persistent_ctas_per_sm
+    fn_dense, cfg_dense = _compile_flex(
+        args, early, expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim"
+    )
+    assert cfg_dense.flex_early_qk and not cfg_dense.flex_skip_absent
+    out, lse = fn_grid(*args)
+    out_skip, lse_skip = fn_skip(*args)
+    out_dense, lse_dense = fn_dense(*args)
+    torch.cuda.synchronize()
+    finite = torch.isfinite(lse)
+    for out_x, lse_x in ((out_skip, lse_skip), (out_dense, lse_dense)):
+        assert torch.equal(out_x, out)
+        assert torch.equal(torch.isfinite(lse_x), finite)
+        assert torch.equal(lse_x[finite], lse[finite])
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_skip, lse_skip, out_ref, lse_ref)
+
+
+# The campaign cell whose persistent list-walk seed deadlocked (causal, b4
+# h16 s4096 d128, BlockMask 128): 1024 items over a 148-CTA grid.
+_EARLY_QK_ORDER1_SHAPE = (4, 16, 4096, 128)
+_EARLY_QK_ORDER1_OK = "EARLY_QK_ORDER1_OK"
+
+
+def _early_qk_order1_child() -> None:
+    """The body of ``test_persistent_early_qk_with_first_load_order_1_completes``
+    (run in a subprocess): the persistent early-QK kernel with the loader's
+    order 1 (K0, V0, Q0, Q1) and the two-stage K/V ring, against the
+    one-item grid of the same body."""
+    batch, heads, seq, head_dim = _EARLY_QK_ORDER1_SHAPE
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(batch, heads, seq, head_dim, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    block_mask = create_block_mask(
+        _causal, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    body = {
+        **PAIR_DESC,
+        cute_flash.FLASH_KV_STAGE_KEY: 2,
+        cute_flash.FLASH_FIRST_LOAD_ORDER_KEY: 1,
+    }
+    fn_grid, grid_cfg = _compile_flex(args, body)
+    assert grid_cfg.first_load_order == 1 and grid_cfg.kv_stage == 2
+    fn_persistent, cfg = _compile_flex(
+        args,
+        {
+            **body,
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+            cute_flash.FLASH_FLEX_EARLY_QK_KEY: True,
+        },
+        expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim",
+    )
+    assert cfg.persistent and cfg.flex_early_qk and cfg.kv_stage == 2
+    # The early head takes the loader's order 3 (K0, Q0, V0, Q1).
+    assert cfg.first_load_order == 3
+    out, lse = fn_grid(*args)
+    out_p, lse_p = fn_persistent(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_p, out)
+    assert torch.equal(lse_p, lse)
+    print(_EARLY_QK_ORDER1_OK, flush=True)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_persistent_early_qk_with_first_load_order_1_completes() -> None:
+    """The early next-item QK0 hoists the MMA warp's waits for the next
+    item's Q0 and K0 ahead of its last PV1, which still holds this item's
+    last V slot. With the loader's order 1 (K0, V0, Q0, Q1) and the
+    two-stage aliased K/V ring the loader blocked on the next V0's slot
+    before issuing Q0: the loader waiting on the MMA's PV1, the MMA on the
+    loader's Q0, every CTA that wraps (the 4K causal campaign cells hung on
+    their persistent seed). The resolver now gives the early head order 3
+    (K0, Q0, V0, Q1). The cell runs in a subprocess under a timeout so a
+    reintroduced deadlock fails the suite instead of hanging it."""
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('flex_gpu_child', {str(Path(__file__).resolve())!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['flex_gpu_child'] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "module._early_qk_order1_child()\n"
+    )
+    env = {**os.environ, "HELION_BACKEND": "cute"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        tail = (
+            (exc.stderr or b"")[-2000:] if isinstance(exc.stderr, bytes) else exc.stderr
+        )
+        raise AssertionError(
+            f"the persistent early-QK kernel did not complete (deadlock): {tail!r}"
+        ) from exc
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert _EARLY_QK_ORDER1_OK in proc.stdout, proc.stdout[-2000:]
 
 
 def _dilated(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
@@ -1897,3 +2406,94 @@ def test_flex_hook_fast_full_is_bitwise_the_plain_hook(case: str) -> None:
     torch.cuda.synchronize()
     assert torch.equal(out, out_ref)
     assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    "case",
+    [
+        "causal_d128_persistent",
+        "band_d64_persistent",
+        "gqa_d64_grid",
+        "ragged_d128_persistent",
+        "shared_region_d128_persistent",
+        "cross_d64_persistent",
+        "many_items_shared_d128_persistent",
+        "fp16_d128_persistent",
+    ],
+)
+def test_shared_staged_output_tile_is_bitwise_the_two_tiles(case: str) -> None:
+    """``cute_flash_o_stage``: one staged output tile shared by the pair's two
+    query stages (the epilogue warp drains stage 0's TMA store before the
+    correction warps stage stage 1 into the tile) gives the same output and
+    LSE as a tile per stage: on the persistent loop at head dim 128, where
+    the freed tile deepens the K/V ring from 3 to 4 slots; at head dim 64;
+    with grouped-query heads on the plain grid; on a ragged query length
+    (the hybrid TMA / row-guarded epilogue); under the shared softmax
+    region; on a persistent cross-attention grid (448 queries over 1536
+    unmasked keys, the whisper shape's form); with more items than twice the
+    device's SMs under the shared region, so every CTA crosses item
+    boundaries (odd counts on some) and the shared tile is handed between
+    items, repeated over five launches; and in fp16."""
+    head_dim = 128 if "d128" in case else 64
+    persistent = "persistent" in case
+    batch, heads = 2, 2
+    if "many_items" in case:
+        # 8 x 10 batch-heads x 4 pairs = 320 items: 2-3 per CTA on 148 SMs.
+        batch, heads = 8, 10
+    kv_heads = 1 if "gqa" in case else None
+    seq = 1024 + (128 if "ragged" in case else 0)
+    q_seq, kv_seq = (448, 1536) if "cross" in case else (seq, seq)
+    q, k, v = _qkv(
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=torch.float16 if "fp16" in case else torch.bfloat16,
+    )
+    if "many_items" in case:
+        sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        assert batch * heads * (q_seq // 256) >= 2 * sm_count
+    mask = noop_mask if "cross" in case else _band if "band" in case else _causal
+    block_mask = create_block_mask(
+        mask, batch, heads, q_seq, kv_seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, enable_gqa=kv_heads is not None)
+    base = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+        cute_flash.FLASH_KV_STAGE_KEY: 4,
+    }
+    if "shared" in case:
+        base[cute_flash.FLASH_SOFTMAX_REGION_KEY] = "shared"
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for o_stage in (2, 1):
+        fn, resolved = _compile_flex(
+            args, {**base, cute_flash.FLASH_O_STAGE_KEY: o_stage}
+        )
+        assert resolved.o_stage == o_stage and resolved.epi_tma
+        assert resolved.softmax_region == (
+            "shared" if "shared" in case else "per_stage"
+        )
+        # Two staged tiles at head dim 128 clamp the ring to the 227 KB cap.
+        assert resolved.kv_stage == (3 if head_dim == 128 and o_stage == 2 else 4)
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        results[o_stage] = (out, lse)
+        if o_stage == 1 and "many_items" in case:
+            # The tile is handed between items on every CTA: repeat launches.
+            for _ in range(5):
+                again_out, again_lse = fn(*args)
+                torch.cuda.synchronize()
+                assert torch.equal(again_out, out)
+                assert torch.equal(again_lse, lse)
+    assert torch.equal(results[1][0], results[2][0])
+    assert torch.equal(results[1][1], results[2][1])
+    out_ref, lse_ref = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads is not None
+    )
+    _assert_close_to_reference(*results[1], out_ref, lse_ref)

@@ -2147,16 +2147,20 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # score region) and the shared softmax region
     # (``cute_flash_softmax_region``, live on list-walk plans of the fa4
     # family) and the hooked PASS1's all-kept fast path
-    # (``cute_flash_flex_hook_fast_full``, live on the same plans); the
-    # two-warpgroup body measures both of its O epilogues
-    # (``cute_flash_epi_stg``).
+    # (``cute_flash_flex_hook_fast_full``, live on the same plans) and the
+    # last wave's split (``cute_flash_flex_tail_split``, live only on the
+    # one-item fa4 grid of a one-word list walk); the two-warpgroup body
+    # measures both of its O epilogues (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons, the
     # pair's cluster size and the causal body's mask phases one more; the
     # shared softmax region adds its searched values, the load warp and the
     # extra K ring slot their two measured values each (82 -> 86), the
-    # hooked PASS1's all-kept fast path one more (87). Keep the upstream
-    # bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 87
+    # hooked PASS1's all-kept fast path one more (87), the tail split's
+    # singleton one more (88), the shared staged output tile's singleton
+    # (``cute_flash_o_stage``, live only on the one-CTA fa4 pair's TMA
+    # epilogue) one more (89). Keep the upstream bound on all other values
+    # and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 89
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
