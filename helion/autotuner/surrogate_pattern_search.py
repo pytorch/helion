@@ -25,7 +25,13 @@ from .pattern_search import PatternSearch
 from .search_space_logger import canonical_config_id
 from helion._dist_utils import sync_seed
 
-_CUTE_FLASH_LANE_POLICY_VERSION = 16
+# 17: a pipeline lane whose conditional candidate search finds no unmeasured
+# config counts as exhausted instead of leaving the qualification incomplete.
+_CUTE_FLASH_LANE_POLICY_VERSION = 17
+# Raw per-family product up to which the structural qualification enumerates
+# the effective (normalized) CuTe-flash search space (0.4 s for 1024 at the
+# d256 pair cell); larger spaces stay sampled.
+_FLASH_EXACT_SPACE_RAW_FLOOR = 1024
 _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
 _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
 _FLASH_TERMINAL_COORDINATE_POLICY = "same_leaf_full_surface_normalized_coordinate_v2"
@@ -645,6 +651,11 @@ class LFBOPatternSearch(PatternSearch):
             random_fallback_target=self._random_fallback_population_target(),
             visited=visited,
         )
+        # Configs the budget never attempted are no evidence for the
+        # structural qualification (they were dropped from the population).
+        initial_population = [
+            member for member in initial_population if member.status != "skipped"
+        ]
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -729,6 +740,27 @@ class LFBOPatternSearch(PatternSearch):
                 "required CuTe flash structural qualification did not complete: "
                 + "; ".join(failures)
             )
+        if phase is not None:
+            # A complete qualification's lanes carry their metrics; the lanes
+            # the conditional search exhausted (no unmeasured candidate within
+            # reach of a measured parent) are logged once here.
+            leaf_rows = phase.get("leaf_results", [])
+            assert isinstance(leaf_rows, list)
+            exhausted_lanes = []
+            for row in leaf_rows:
+                lanes = row["pipeline_lanes"]
+                assert isinstance(lanes, list)
+                exhausted_lanes.extend(
+                    f"{row['family']}:{lane['key']}={lane['value']!r}"
+                    for lane in lanes
+                    if lane["conditional_exhausted"]
+                )
+            if exhausted_lanes:
+                self.log(
+                    "Structural qualification: no unmeasured conditional candidate "
+                    "is reachable in "
+                    f"{', '.join(exhausted_lanes)}; the lane(s) count as exhausted."
+                )
 
         starting_paths = self._select_starting_paths()
         starting_points = [member for member, _constraints in starting_paths]
@@ -1304,8 +1336,13 @@ class LFBOPatternSearch(PatternSearch):
             }
             for member in initial_population
         }
+        # A small surface (the d256 pair: two families, eight searched knobs,
+        # 384 raw combinations that normalize to 68 configs) must be
+        # enumerated for its lanes to be provably exhausted; otherwise every
+        # config is measured in the initial population, no conditional
+        # candidate exists and the qualification reports the lanes incomplete.
         exact_space_raw_budget = max(
-            1,
+            _FLASH_EXACT_SPACE_RAW_FLOOR,
             self.initial_population,
             len(initial_population),
         )
@@ -1429,6 +1466,11 @@ class LFBOPatternSearch(PatternSearch):
                         "repair_candidate_ids": [],
                         "successful_repair_candidate_ids": [],
                         "repair_parent_decisions": [],
+                        # A conditional job found no unmeasured config within
+                        # the neighbor budget of any measured parent in the
+                        # lane: everything reachable is measured, which is
+                        # what an enumerated space would have proven.
+                        "conditional_exhausted": False,
                         "terminal_failure_exhausted": False,
                         "complete": False,
                     }
@@ -1837,9 +1879,14 @@ class LFBOPatternSearch(PatternSearch):
                                 neighbor_limit,
                             )
                         )
-                        ids = add_members(
-                            novel_unbenchmarked_members(added)[:1], round_members
-                        )
+                        novel = novel_unbenchmarked_members(added)
+                        ids = add_members(novel[:1], round_members)
+                        if not novel:
+                            # Nothing left to measure within reach of any
+                            # measured parent of the lane (see the lane
+                            # metric): the lane counts as exhausted rather
+                            # than leaving the qualification incomplete.
+                            lane_metrics[(leaf, lane)]["conditional_exhausted"] = True
                         visited.update(member.config for member in added)
                         parent_decisions.append(
                             {
@@ -3347,14 +3394,20 @@ class LFBOPatternSearch(PatternSearch):
                     or successful_repair_ids
                 )
                 attempts = pipeline_lane_attempts(leaf, _lane)
+                # The lane's conditional quota is met by enough measured
+                # candidates, or by the search having nothing unmeasured left
+                # to reach (then every reachable config of the lane was tried).
+                conditional_exhausted = bool(lane_metric["conditional_exhausted"])
+                conditional_satisfied = bool(
+                    not lane_metric["conditional_required"]
+                    or len(set(cast_ids))
+                    >= policy.conditional_candidates_per_pipeline_lane
+                    or conditional_exhausted
+                )
                 terminal_failure_exhausted = bool(
                     not has_success
                     and lane_metric["witness_attempted"]
-                    and (
-                        not lane_metric["conditional_required"]
-                        or len(set(cast_ids))
-                        >= policy.conditional_candidates_per_pipeline_lane
-                    )
+                    and conditional_satisfied
                     and len(repair_ids) == policy.qualification_failure_retries
                     and len(repair_parent_decisions)
                     == policy.qualification_failure_retries
@@ -3367,12 +3420,12 @@ class LFBOPatternSearch(PatternSearch):
                 lane_metric["terminal_failure_exhausted"] = terminal_failure_exhausted
                 lane_metric["complete"] = bool(
                     lane_metric["witness_attempted"]
+                    and conditional_satisfied
                     and (
-                        not lane_metric["conditional_required"]
-                        or len(set(cast_ids))
-                        >= policy.conditional_candidates_per_pipeline_lane
+                        has_success
+                        or terminal_failure_exhausted
+                        or conditional_exhausted
                     )
-                    and (has_success or terminal_failure_exhausted)
                 )
             leaf_metrics[leaf]["complete"] = bool(successful) and all(
                 bool(metric["complete"]) for metric in cast_lanes

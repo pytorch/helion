@@ -2081,6 +2081,13 @@ class CuteBackend(Backend):
         # the autotuner has to compile + benchmark each config inline.
         return False
 
+    def supports_parallel_render(self) -> bool:
+        # Code generation only reads the device facts the render pool
+        # captures (the MMA-support probe's current device, device properties
+        # for shared-memory and SM budgets); the DSL JIT runs at first call in
+        # the parent. Forked workers render byte-identical source.
+        return True
+
     def setup_compile_cache_dir(self, device_index: int) -> None:
         if "CUTE_DSL_CACHE_DIR" not in os.environ:
             from ...autotuner.local_cache import helion_cute_cache_dir

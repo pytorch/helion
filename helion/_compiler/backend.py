@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from ..runtime.settings import PrecompileMode
     from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
@@ -717,6 +718,18 @@ class Backend(abc.ABC):
         Other backends (Pallas, CuTe) may not need or support this.
         """
         return True
+
+    def supports_parallel_render(self) -> bool:
+        """Whether autotune candidates may be rendered in forked workers.
+
+        Code generation for such a backend is a pure function of the bound
+        kernel and the config whose only CUDA reads are the device facts
+        ``helion.autotuner.render_pool.CudaDeviceFacts`` captures, so a child
+        forked from the autotuning process renders byte-identical source
+        without touching the driver. Backends with a precompile pool do not
+        need it; see :mod:`helion.autotuner.render_pool`.
+        """
+        return False
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
         """Point the backend's on-disk compile cache at Helion's cache root.
@@ -1506,9 +1519,11 @@ class Backend(abc.ABC):
         """
         force = force or bound_kernel.settings.force_autotune
 
-        # Disable precompile for backends that don't support it
-        if not self.supports_precompile():
-            bound_kernel.settings.autotune_precompile = None
+        # Backends without a precompile pool keep only the fork mode, and only
+        # when they render candidates in forked workers instead.
+        bound_kernel.settings.autotune_precompile = autotune_precompile_mode(
+            self, bound_kernel.settings.autotune_precompile
+        )
 
         if bound_kernel.settings.autotune_effort == "none" and (
             force or not bound_kernel.kernel.configs
@@ -4014,3 +4029,22 @@ from .metal.backend import MetalBackend  # noqa: E402, F401
 from .pallas.backend import PallasBackend  # noqa: E402, F401
 from .triton.backend import TileIRBackend  # noqa: E402, F401
 from .triton.backend import TritonBackend  # noqa: E402, F401
+
+
+def autotune_precompile_mode(
+    backend: Backend, requested: PrecompileMode
+) -> PrecompileMode:
+    """The ``autotune_precompile`` mode ``backend`` honours.
+
+    A backend with a precompile pool takes the setting as is. One without
+    keeps ``"fork"`` only to render candidates in forked workers
+    (``Backend.supports_parallel_render``); ``"spawn"`` has no equivalent
+    there and turns into ``None`` like any other mode. A function rather
+    than a method so any object with ``supports_precompile`` (test doubles
+    included) can stand in for a backend that has a pool.
+    """
+    if backend.supports_precompile():
+        return requested
+    if requested == "fork" and backend.supports_parallel_render():
+        return "fork"
+    return None
