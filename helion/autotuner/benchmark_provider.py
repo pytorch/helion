@@ -1244,6 +1244,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         if len(self.mutated_arg_indices) > 0:
             return False
+        if getattr(getattr(self.kernel.env, "device", None), "type", None) == "mtia":
+            # The MTIA runtime reserves the whole device for its first client,
+            # so a spawned worker cannot open it while this process holds it.
+            return False
         if not self.kernel.supports_subprocess_benchmark():
             return False
         backend = getattr(self.config_spec, "backend", None)

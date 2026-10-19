@@ -473,7 +473,7 @@ def test_narrow_n8_one_shot_chain_completes_with_four_k_tiles_over_two_stages(
     )
 
 
-_UNPROVEN_OUTPUT_DTYPES = (
+_OUTPUT_VIEW_DTYPES = (
     torch.float16,
     torch.bfloat16,
     torch.float32,
@@ -485,16 +485,18 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous().view(torch.uint8)
 
 
-@pytest.mark.parametrize("dtype", _UNPROVEN_OUTPUT_DTYPES, ids=str)
-@pytest.mark.parametrize("case", TMA_STORE_ILLEGAL_OUTPUTS)
-def test_unproven_output_views_are_stored_exactly(
-    case: str, dtype: torch.dtype
+def _assert_column_major_tma_store(source: str) -> None:
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert "cute.nvgpu.CopyR2GOp()" not in source
+    assert "'kind': 'tcgen05_d_tma'" in source
+    assert "'d_column_major': True" in source
+    assert "'rank3_mnl_tensor': True" in source
+    assert "tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR" in source
+
+
+def _assert_output_view_stored_exactly(
+    case: str, dtype: torch.dtype, *, column_major_tma: bool
 ) -> None:
-    # An output view that violates a TensorMap constraint (row stride that is
-    # not a 16-byte multiple, N-major storage, 8-byte-aligned base) used to
-    # go through the TMA store and came back mostly wrong.  It now takes the
-    # SIMT store: bitwise equal to the TMA-stored result of the same kernel
-    # on a contiguous output, and close to the reference.
     torch.manual_seed(0)
     in_dtype = torch.bfloat16 if dtype == torch.bfloat16 else torch.float16
     a = torch.randn(512, 256, device=DEVICE, dtype=in_dtype)
@@ -505,15 +507,51 @@ def test_unproven_output_views_are_stored_exactly(
     assert "cute.copy(tcgen05_tma_store_atom" in tma_source
     view = _output_view(case, dtype, device=DEVICE)
     outputs, source = _outputs(_gemm_into, (a, b, view), config)
-    assert "tcgen05_tma_store_atom" not in source
-    assert "cute.nvgpu.CopyR2GOp()" in source
+    if column_major_tma:
+        _assert_column_major_tma_store(source)
+        assert view.stride(0) == 1
+        assert view.stride(1) * dtype.itemsize % 16 == 0
+    else:
+        assert "tcgen05_tma_store_atom" not in source
+        assert "'kind': 'tcgen05_d_tma'" not in source
+        assert "cute.nvgpu.CopyR2GOp()" in source
+    assert all(out is view for out in outputs)
     assert torch.equal(_bits(view), _bits(contiguous))
+    # Stores into a padded view must leave the surrounding allocation intact.
+    if case in ("row_stride_8B", "column_major_stride_16B", "column_major_stride_8B"):
+        assert view._base is not None
+        assert torch.count_nonzero(_bits(view._base[:, 512:])).item() == 0
+    elif case == "base_8B":
+        assert view._base is not None
+        pad = 8 // dtype.itemsize
+        assert torch.count_nonzero(_bits(view._base[:pad])).item() == 0
+        assert torch.count_nonzero(_bits(view._base[-pad:])).item() == 0
     expected = a.float() @ b.float()
     if dtype == torch.float8_e4m3fn:
         tolerance = {"rtol": 1e-1, "atol": 5e-1}
     else:
         tolerance = {"rtol": 2e-2, "atol": 2e-2}
     torch.testing.assert_close(view.float(), expected, **tolerance)
+
+
+@pytest.mark.parametrize("dtype", _OUTPUT_VIEW_DTYPES, ids=str)
+@pytest.mark.parametrize("case", TMA_STORE_ILLEGAL_OUTPUTS)
+def test_unproven_output_views_are_stored_exactly(
+    case: str, dtype: torch.dtype
+) -> None:
+    # An 8-byte outer stride or base alignment violates a TensorMap constraint.
+    # The SIMT fallback must preserve the exact result and surrounding storage.
+    _assert_output_view_stored_exactly(case, dtype, column_major_tma=False)
+
+
+@pytest.mark.parametrize("dtype", _OUTPUT_VIEW_DTYPES, ids=str)
+@pytest.mark.parametrize("case", ["column_major", "column_major_stride_16B"])
+def test_column_major_output_views_keep_the_tma_store(
+    case: str, dtype: torch.dtype
+) -> None:
+    # Proven M-contiguous outputs use a column-major D descriptor and SMEM tile.
+    # The store must remain bitwise equal to the row-major TMA result.
+    _assert_output_view_stored_exactly(case, dtype, column_major_tma=True)
 
 
 @pytest.mark.parametrize("factory", sorted(FRESH_FACTORY_GEMMS))
@@ -537,17 +575,16 @@ def test_tensor_method_factory_outputs_keep_the_tma_store(factory: str) -> None:
     )
 
 
-def test_fresh_column_major_strided_output_is_stored_exactly() -> None:
-    # Fresh but N-major: not what the staged row-major D tile addresses, so
-    # the SIMT store writes it, bitwise equal to the TMA-stored result.
+def test_fresh_column_major_strided_output_keeps_the_tma_store() -> None:
+    # A fresh M-contiguous output uses column-major TMA without changing the
+    # logical result or its strides.
     torch.manual_seed(0)
     a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
     b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
     config = _config(pid_type="persistent_interleaved")
     reference, _ = _outputs(_gemm, (a, b), config)
     outputs, source = _outputs(_gemm_empty_strided_column_major, (a, b), config)
-    assert "tcgen05_tma_store_atom" not in source
-    assert "cute.nvgpu.CopyR2GOp()" in source
+    _assert_column_major_tma_store(source)
     for out in outputs:
         assert out.stride() == (1, 512)
         assert torch.equal(out.contiguous(), reference[0])

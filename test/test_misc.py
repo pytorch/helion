@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _codegen_skip_reason
 from ._cute_binding import _cpu_bind
 from ._cute_binding import _forbid_native_compile
 from ._cute_binding import _mock_cuda_unavailable
@@ -1900,13 +1901,20 @@ class TestHelionCutePrinter(TestCase):
                 result[row] = x[row] + value
             return result
 
+        backends = [
+            backend
+            for backend in ("cute", "triton")
+            if _codegen_skip_reason(backend) is None
+        ]
+        if not backends:
+            raise unittest.SkipTest("no backend can generate device source")
         with (
             _mock_cuda_unavailable(),
             _target(),
             _forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
-            for backend in ("cute", "triton"):
+            for backend in backends:
                 kernel = helion.kernel(
                     powers, backend=backend, static_shapes=True, autotune_effort="none"
                 )

@@ -135,7 +135,7 @@ def _load_vector_with_policy(
     ip: ir.InsertionPoint | None = None,
 ) -> ir.Value:
     """Load ``words`` aligned 32-bit words and bitcast them to the requested
-    vector type (``words`` is 4, 2 or 1: a 16-, 8- or 4-byte packet)."""
+    vector type (``words`` is 8, 4, 2 or 1: a 32-, 16-, 8- or 4-byte packet)."""
     addr = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
     u32 = cutlass.Uint32.mlir_type
     # One output is the scalar result type; two or more form a struct.

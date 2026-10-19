@@ -1106,6 +1106,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_signed_bitfield_bf16",
@@ -1244,6 +1245,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_signed_bitfield_bf16",
@@ -1394,6 +1396,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
+        "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_signed_bitfield_bf16",
@@ -1469,6 +1472,7 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
             "l2_last",
             "l1_l2_first",
             "l1_l2_last",
+            "nc_l2_first",
         )
     return ("",)
 
@@ -1607,6 +1611,9 @@ class ConfigSpec:
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # All independent vetoes, including callers without a diagnostic reason.
+        # A backend may restore a restriction it owns only if no other veto exists.
+        self.disallowed_pid_type_causes: dict[str, set[str | None]] = {}
         # (feature, reason) pairs for every non-pid_type search-space restriction
         # (currently the tcgen05 narrowing applied per matmul), for search-space
         # logging. De-duplicated; ordered by first occurrence.
@@ -2081,6 +2088,7 @@ class ConfigSpec:
         """
 
         newly_disabled = pid_type in self.allowed_pid_types
+        self.disallowed_pid_type_causes.setdefault(pid_type, set()).add(reason)
         if newly_disabled and reason is not None:
             self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
@@ -3880,7 +3888,7 @@ class ConfigSpec:
 
     @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
-        """Whether the fixed async-store policy is valid for this target."""
+        """Whether the fixed store-policy descriptor is valid for this target."""
 
         return fixed_l2_evict_last_store_policy_supported(
             self.target_device_capability,
@@ -4610,6 +4618,22 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "CuTe reduction pipeline depth 4 requires the pipelined schedule"
                 )
+
+    def _normalize_cute_store_policy(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_store_policy"
+        if key not in config:
+            return
+        value = config[key]
+        if value not in ("default", "l2_evict_last"):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} must be one of ('default', 'l2_evict_last'), got {value!r}"
+                )
+            config[key] = "default"
+        if not self.cute_l2_evict_last_store_policy_supported:
+            config[key] = "default"
 
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -5479,6 +5503,7 @@ class ConfigSpec:
             )
             self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_store_policy(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
@@ -7264,6 +7289,13 @@ class ConfigSpec:
                     fields["cute_reduction_pipeline_depth"] = EnumFragment(
                         choices=(2, 4)
                     )
+                fields["cute_store_policy"] = EnumFragment(
+                    choices=(
+                        ("default", "l2_evict_last")
+                        if self.cute_l2_evict_last_store_policy_supported
+                        else ("default",)
+                    )
+                )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)
@@ -8065,7 +8097,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.dim_max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
-        self.max_size: int = self.dim_max_size
+        self._max_size: int = self.dim_max_size
+        self._max_size_revision: int = 0
         # A search surface may pin the default (non-autotuned) block size while
         # widening the autotuner's range (see ``_fragment``).
         self.default_size: int | None = None
@@ -8105,6 +8138,22 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
             self.max_size = self.min_size
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    @max_size.setter
+    def max_size(self, value: int) -> None:
+        # Record even an equal assignment: an independent consumer or explicit
+        # user bound may impose the same ceiling as an earlier compiler cap.
+        self._max_size = value
+        self._max_size_revision += 1
+
+    @property
+    def max_size_revision(self) -> int:
+        """Mutation token for a compiler-owned ceiling that may later widen."""
+        return self._max_size_revision
 
     def update_max(self, value: int) -> None:
         clamped = max(value, 1)

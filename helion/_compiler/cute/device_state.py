@@ -8,8 +8,6 @@ from typing import Literal
 from typing import Protocol
 from typing import cast
 
-import torch
-
 from ... import exc
 
 if TYPE_CHECKING:
