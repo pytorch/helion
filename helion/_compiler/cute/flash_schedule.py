@@ -4,7 +4,7 @@ from collections import defaultdict
 import dataclasses
 import enum
 
-from .attention_plan import flash_head_dims_supported
+from .attention_plan import flash_pair_head_dims_supported
 
 
 class FlashScheduleError(ValueError):
@@ -863,7 +863,7 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     Score storage is always two local query slots. With two CTAs this becomes
     four aggregate CTA-local slices; it is not a temporal four-stage score ring.
     """
-    if not flash_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
+    if not flash_pair_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
         raise FlashScheduleError(
             "FA4 schedule requires a symmetric head_dim that is a multiple of "
             "16 up to 128, or the 192/128 pair"

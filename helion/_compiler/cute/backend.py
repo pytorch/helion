@@ -1118,6 +1118,8 @@ def _detect_flex_attention_loop(
         for block_id in (match.b_block_id, match.h_block_id)
     ):
         return False
+    # (The matcher admits the widths above the pair body's only where the
+    # single-tile body's cooperative pair hosts the walk.)
     if not flash_head_dims_supported(match.head_dim, match.head_dim_v):
         return False
     state.attention_flash_score_plan = match.plan

@@ -37,8 +37,15 @@ def flash_shared_storage(
     dtype: object = cutlass.Float16,
     o_stage: int = 0,
     q_rows: int = 128,
+    kv_rows: int = 128,
+    two_cta: bool = False,
 ) -> type:
     """Build the SharedStorage struct for a given head_dim / kv_stage / s_stage.
+    ``kv_rows`` is the per-CTA K/V tile height: 128, or 64 when the cooperative
+    two-CTA MMA splits every K/V tile across the CTA pair; ``two_cta`` adds the
+    ``tmem_dealloc_mbar`` the pair's TMEM allocator hands off through (every
+    tcgen05 instruction of a kernel shares one cta_group, so the pair's
+    allocate / free are ``cta_group::2`` and the peers release together).
 
     K and V live in SEPARATE smem (a single buffer can't guarantee QK finishes
     reading K before V overwrites it). With ``kv_stage > 1`` each is a
@@ -56,6 +63,33 @@ def flash_shared_storage(
     query-tile height (128, or 64 for the M=64 tcgen05 tile).
     """
 
+    if two_cta:
+
+        @cute.struct
+        class SharedStorageTwoCta:
+            q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * kv_stage]
+            v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * kv_stage]
+            mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * s_stage]
+            mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            p_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * s_stage]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_holding_buf: cutlass.Int32
+            sQ: cute.struct.Align[cute.struct.MemRange[dtype, q_rows * head_dim], 1024]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, kv_rows * head_dim * kv_stage], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, kv_rows * head_dim * kv_stage], 1024
+            ]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[dtype, q_rows * head_dim * o_stage], 1024
+            ]
+
+        return SharedStorageTwoCta
+
     @cute.struct
     class SharedStorage:
         q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
@@ -72,10 +106,10 @@ def flash_shared_storage(
         tmem_holding_buf: cutlass.Int32
         sQ: cute.struct.Align[cute.struct.MemRange[dtype, q_rows * head_dim], 1024]
         sK: cute.struct.Align[
-            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            cute.struct.MemRange[dtype, kv_rows * head_dim * kv_stage], 1024
         ]
         sV: cute.struct.Align[
-            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            cute.struct.MemRange[dtype, kv_rows * head_dim * kv_stage], 1024
         ]
         sO: cute.struct.Align[
             cute.struct.MemRange[dtype, q_rows * head_dim * o_stage], 1024
