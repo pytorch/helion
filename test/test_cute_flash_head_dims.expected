@@ -1784,6 +1784,376 @@ def _dense_attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor,
     # src[test_cute_flash_head_dims.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
 
+--- assertExpectedJournal(TestRenderPins.test_render_d256_cooperative_pair_issue_knobs)
+from __future__ import annotations
+
+import math
+import torch
+import cutlass
+import cutlass.cute as cute
+from helion.runtime import default_cute_launcher as _default_cute_launcher
+from helion._utils import next_power_of_2 as _next_power_of_2
+import cutlass.utils as cutlass_utils_flash
+import cutlass.pipeline as cutlass_pipeline_flash
+from cutlass.cute.nvgpu import cpasync as cute_cpasync_flash
+from cutlass.cute.nvgpu import tcgen05 as cute_tcgen05_flash
+import cutlass.utils.blackwell_helpers as sm100_utils_flash
+import helion._compiler.cute._flash_runtime as _helion_flash_rt
+import helion._compiler.cute._flash_gemm_ptx as _helion_flash_ptx
+
+_helion_flash_runtime_abi = 7
+
+@cute.kernel
+def _helion__dense_causal_attention(q_view, k_view, v_view, out, _flash_qk_mma, _flash_pv_mma, _flash_tma_q, _flash_mQt, _flash_tma_k, _flash_mKt, _flash_tma_v, _flash_mVt, _flash_mOt, _flash_qsl, _flash_ksl, _flash_vsl, _flash_ptl, _flash_scale_log2, _flash_num_kv_tiles, _flash_num_bh, _flash_total_tiles):
+    tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    flash_mma_tile_coord_v = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    flash_is_leader_cta = flash_mma_tile_coord_v == cutlass.Int32(0)
+    flash_cta_layout_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_flash_qk_mma.thr_id.shape,))
+    flash_pid = cutlass.Int32(cute.arch.cluster_idx()[0])
+    flash_lpt_group = flash_pid // cutlass.Int32(64)
+    flash_lpt_mod = flash_pid % cutlass.Int32(64)
+    flash_bh = flash_lpt_group * 8 + flash_lpt_mod % 8
+    flash_q_mma_tile = cutlass.Int32(7) - flash_lpt_mod // 8
+    flash_m_tile = flash_q_mma_tile * 2 + flash_mma_tile_coord_v
+    flash_m_tile_hi = flash_m_tile | cutlass.Int32(1)
+    flash_local_tidx = tidx % 128
+    if warp_idx == 0:
+        cute_cpasync_flash.prefetch_descriptor(_flash_tma_q)
+        cute_cpasync_flash.prefetch_descriptor(_flash_tma_k)
+        cute_cpasync_flash.prefetch_descriptor(_flash_tma_v)
+    _flash_storage_cls = _helion_flash_rt.flash_shared_storage(256, 2, 2, cutlass.BFloat16, o_stage=0, q_rows=128, kv_rows=64, two_cta=True, k_stage=3)
+    smem = cutlass_utils_flash.SmemAllocator()
+    storage = smem.allocate(_flash_storage_cls)
+    sQ = storage.sQ.get_tensor(_flash_qsl.outer, swizzle=_flash_qsl.inner)
+    sK = storage.sK.get_tensor(_flash_ksl.outer, swizzle=_flash_ksl.inner)
+    sV = storage.sV.get_tensor(_flash_vsl.outer, swizzle=_flash_vsl.inner)
+    flash_tmem_bar = cutlass_pipeline_flash.NamedBarrier(barrier_id=1, num_threads=256)
+    flash_tmem = cutlass_utils_flash.TmemAllocator(storage.tmem_holding_buf.ptr, barrier_for_retrieve=flash_tmem_bar, allocator_warp_id=1, is_two_cta=True, two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.data_ptr())
+    flash_q_bytes = cute.size_in_bytes(cutlass.BFloat16, cute.select(_flash_qsl, mode=[0, 1, 2])) * 2
+    flash_k_bytes = cute.size_in_bytes(cutlass.BFloat16, cute.select(_flash_ksl, mode=[0, 1, 2])) * 2
+    flash_q_prod, flash_q_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=flash_q_bytes, barrier_storage=storage.q_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    flash_k_prod, flash_k_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=3, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=flash_k_bytes, barrier_storage=storage.k_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    cute.arch.mbarrier_init_fence()
+    flash_qkt = _flash_qk_mma.get_slice(flash_mma_tile_coord_v)
+    tSrQ = flash_qkt.make_fragment_A(sQ)
+    tSrK = flash_qkt.make_fragment_B(sK)
+    flash_qk_acc_shape = flash_qkt.partition_shape_C((256, 128))
+    tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
+    gQ = cute.flat_divide(_flash_mQt, cute.select((256, 128, 256), mode=[0, 2]))
+    gK = cute.flat_divide(_flash_mKt, cute.select((128, 128, 256), mode=[1, 2]))
+    tSgQ = flash_qkt.partition_A(gQ)
+    tSgK = flash_qkt.partition_B(gK)
+    tQsQ, tQgQ_qdl = cute_cpasync_flash.tma_partition(_flash_tma_q, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(tSgQ, 0, 3))
+    tKsK, tKgK_kdl = cute_cpasync_flash.tma_partition(_flash_tma_k, 0, cute.make_layout(1), cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
+    tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
+    tKgK = tKgK_kdl[None, None, 0, flash_bh]
+    flash_active_count = flash_m_tile_hi - cutlass.Int32(0) + cutlass.Int32(1)
+    flash_v_bytes = cute.size_in_bytes(cutlass.BFloat16, cute.select(_flash_vsl, mode=[0, 1, 2])) * 2
+    flash_v_prod, flash_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=2, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=flash_v_bytes, barrier_storage=storage.v_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    cute.arch.mbarrier_init_fence()
+    flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
+    tOrV = flash_pvt.make_fragment_B(sV)
+    flash_pv_acc_shape = flash_pvt.partition_shape_C((256, 256))
+    tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
+    gV = cute.flat_divide(_flash_mVt, cute.select((128, 256, 128), mode=[1, 2]))
+    tOgV = flash_pvt.partition_B(gV)
+    tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(_flash_tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
+    tVgV = tVgV_dkl[None, 0, None, flash_bh]
+    flash_tmem.allocate(512)
+    if warp_idx == 1:
+        flash_tmem.relinquish_alloc_permit()
+    flash_mma_s_prod, flash_mma_s_cons = cutlass_pipeline_flash.PipelineUmmaAsync.create(num_stages=2, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread, 256), barrier_storage=storage.mma_s_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    flash_mma_o_prod, flash_mma_o_cons = cutlass_pipeline_flash.PipelineUmmaAsync.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread, 256), barrier_storage=storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    flash_p_ready_prod, flash_p_ready_cons = cutlass_pipeline_flash.PipelineAsyncUmma.create(num_stages=2, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread, 256), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), barrier_storage=storage.p_ready_mbar_ptr.data_ptr(), cta_layout_vmnk=flash_cta_layout_vmnk, defer_sync=True).make_participants()
+    cute.arch.mbarrier_init_fence()
+    cutlass_pipeline_flash.pipeline_init_arrive(cluster_shape_mn=flash_cta_layout_vmnk, is_relaxed=True)
+    cutlass_pipeline_flash.pipeline_init_wait(cluster_shape_mn=flash_cta_layout_vmnk)
+    flash_tmem.wait_for_alloc()
+    flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+    flash_s_layout = tStS.layout
+    tStS0 = cute.make_tensor(flash_tmem_ptr, flash_s_layout)
+    tStS1 = cute.make_tensor(flash_tmem_ptr + 128, flash_s_layout)
+    tOtO = cute.make_tensor(flash_tmem_ptr + 256, tOtO.layout)
+    tP = cute.make_tensor(flash_tmem_ptr, _flash_ptl.outer)
+    tOrP0 = flash_pvt.make_fragment_A(tP)
+    tOrP1 = cute.make_tensor(tOrP0.iterator + cutlass.Float32.width // cutlass.BFloat16.width * 128, tOrP0.layout)
+    cS = cute.make_identity_tensor((128, 128))
+    tScS = flash_qkt.partition_C(cS)
+    flash_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+    flash_tiled_ld0 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS0)
+    flash_tiled_ld1 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS1)
+    flash_thr_ld0 = flash_tiled_ld0.get_slice(flash_local_tidx)
+    flash_thr_ld1 = flash_tiled_ld1.get_slice(flash_local_tidx)
+    tLDtS0 = flash_thr_ld0.partition_S(tStS0)
+    tLDtS1 = flash_thr_ld1.partition_S(tStS1)
+    tLDcS = flash_thr_ld0.partition_D(tScS)
+    flash_tilePlikeFP32 = 128 // cutlass.Float32.width * cutlass.BFloat16.width
+    flash_P_layout = cute.composition(flash_s_layout, cute.make_layout((128, flash_tilePlikeFP32)))
+    tStS_P0 = cute.make_tensor(flash_tmem_ptr, flash_P_layout)
+    tStS_P1 = cute.make_tensor(flash_tmem_ptr + 128, flash_P_layout)
+    flash_tScS_P_layout = cute.composition(tScS.layout, cute.make_layout((128, flash_tilePlikeFP32)))
+    tScS_P = cute.make_tensor(tScS.iterator, flash_tScS_P_layout)
+    flash_st_atom = cute.make_copy_atom(cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+    flash_tiled_st0 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P0)
+    flash_tiled_st1 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P1)
+    flash_thr_st0 = flash_tiled_st0.get_slice(flash_local_tidx)
+    flash_thr_st1 = flash_tiled_st1.get_slice(flash_local_tidx)
+    tSTtS0 = flash_thr_st0.partition_D(tStS_P0)
+    tSTtS1 = flash_thr_st1.partition_D(tStS_P1)
+    tSTcS = flash_thr_st0.partition_S(tScS_P)
+    if warp_idx >= 4:
+        cute.arch.setmaxregister_increase(184)
+    else:
+        cute.arch.setmaxregister_decrease(96)
+    if warp_idx == 0:
+        if flash_is_leader_cta:
+            flash_active_count = flash_m_tile_hi - cutlass.Int32(0) + cutlass.Int32(1)
+            flash_q_full = flash_q_cons.wait_and_advance()
+            flash_nk = cute.size(tSrQ, mode=[2])
+            flash_nk2 = cute.size(tOrP0, mode=[2])
+            flash_p_idx = cutlass.Int32(0)
+            flash_qk_idx = cutlass.Int32(0)
+            flash_o_started = cutlass.Boolean(False)
+            flash_k_full = flash_k_cons.wait_and_advance()
+            flash_s_handle = flash_mma_s_prod.acquire_and_advance()
+            for flash_kp in cutlass.range(flash_nk, unroll_full=True):
+                _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
+                cute.gemm(_flash_qk_mma, tStS0, tSrQ[None, None, flash_kp, flash_q_full.index], tSrK[None, None, flash_kp, flash_k_full.index], tStS0)
+            flash_s_handle.commit()
+            flash_k_full.release()
+            flash_qk_idx = (flash_qk_idx + 1) % 2
+            for flash_active_kv in cutlass.range(flash_active_count, unroll=1):
+                flash_kv = cutlass.Int32(0) + flash_active_kv
+                if flash_active_kv + cutlass.Int32(1) < flash_active_count:
+                    flash_k_full = flash_k_cons.wait_and_advance()
+                    flash_s_handle = flash_mma_s_prod.acquire_and_advance()
+                    if flash_qk_idx % 2 == 0:
+                        for flash_kp in cutlass.range(flash_nk, unroll_full=True):
+                            _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
+                            cute.gemm(_flash_qk_mma, tStS0, tSrQ[None, None, flash_kp, flash_q_full.index], tSrK[None, None, flash_kp, flash_k_full.index], tStS0)
+                    else:
+                        for flash_kp in cutlass.range(flash_nk, unroll_full=True):
+                            _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
+                            cute.gemm(_flash_qk_mma, tStS1, tSrQ[None, None, flash_kp, flash_q_full.index], tSrK[None, None, flash_kp, flash_k_full.index], tStS1)
+                    flash_s_handle.commit()
+                    flash_k_full.release()
+                    flash_qk_idx = (flash_qk_idx + 1) % 2
+                flash_p_full = flash_p_ready_cons.wait_and_advance()
+                flash_v_full = flash_v_cons.wait_and_advance()
+                flash_o_handle = flash_mma_o_prod.acquire_and_advance()
+                flash_first_acc = flash_o_started
+                if flash_p_idx % 2 == 0:
+                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
+                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
+                        cute.gemm(_flash_pv_mma, tOtO, tOrP0[None, None, flash_kp, 0], tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
+                else:
+                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
+                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
+                        cute.gemm(_flash_pv_mma, tOtO, tOrP1[None, None, flash_kp, 0], tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
+                flash_o_handle.commit()
+                flash_v_full.release()
+                flash_p_full.release()
+                flash_p_idx = (flash_p_idx + 1) % 2
+                flash_o_started = cutlass.Boolean(True)
+            flash_q_full.release()
+            flash_mma_s_prod.tail()
+            flash_mma_o_prod.tail()
+    if warp_idx == 2:
+        flash_active_count = flash_m_tile_hi - cutlass.Int32(0) + cutlass.Int32(1)
+        flash_q_empty = flash_q_prod.acquire_and_advance()
+        cute.copy(_flash_tma_q, tQgQ[None, flash_q_mma_tile], tQsQ[None, flash_q_empty.index], tma_bar_ptr=flash_q_empty.barrier)
+        if cutlass.Int32(0) < flash_active_count:
+            flash_k_empty = flash_k_prod.acquire_and_advance()
+            cute.copy(_flash_tma_k, tKgK[None, cutlass.Int32(0) + cutlass.Int32(0)], tKsK[None, flash_k_empty.index], tma_bar_ptr=flash_k_empty.barrier)
+            flash_v_empty = flash_v_prod.acquire_and_advance()
+            cute.copy(_flash_tma_v, tVgV[None, cutlass.Int32(0) + cutlass.Int32(0)], tVsV[None, flash_v_empty.index], tma_bar_ptr=flash_v_empty.barrier)
+        if cutlass.Int32(1) < flash_active_count:
+            flash_k_empty = flash_k_prod.acquire_and_advance()
+            cute.copy(_flash_tma_k, tKgK[None, cutlass.Int32(0) + cutlass.Int32(1)], tKsK[None, flash_k_empty.index], tma_bar_ptr=flash_k_empty.barrier)
+            flash_v_empty = flash_v_prod.acquire_and_advance()
+            cute.copy(_flash_tma_v, tVgV[None, cutlass.Int32(0) + cutlass.Int32(1)], tVsV[None, flash_v_empty.index], tma_bar_ptr=flash_v_empty.barrier)
+        if cutlass.Int32(2) < flash_active_count:
+            flash_k_empty = flash_k_prod.acquire_and_advance()
+            cute.copy(_flash_tma_k, tKgK[None, cutlass.Int32(0) + cutlass.Int32(2)], tKsK[None, flash_k_empty.index], tma_bar_ptr=flash_k_empty.barrier)
+        for flash_active_kv in cutlass.range(flash_active_count, unroll=1):
+            flash_kv = cutlass.Int32(0) + flash_active_kv
+            if flash_active_kv + cutlass.Int32(3) < flash_active_count:
+                flash_k_empty = flash_k_prod.acquire_and_advance()
+                cute.copy(_flash_tma_k, tKgK[None, flash_kv + cutlass.Int32(3)], tKsK[None, flash_k_empty.index], tma_bar_ptr=flash_k_empty.barrier)
+            if flash_active_kv + cutlass.Int32(2) < flash_active_count:
+                flash_v_empty = flash_v_prod.acquire_and_advance()
+                cute.copy(_flash_tma_v, tVgV[None, flash_kv + cutlass.Int32(2)], tVsV[None, flash_v_empty.index], tma_bar_ptr=flash_v_empty.barrier)
+        flash_q_prod.tail()
+        flash_k_prod.tail()
+        flash_v_prod.tail()
+    if warp_idx >= 4:
+        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+        flash_row_sum = cutlass.Float32(0.0)
+        flash_s_idx = cutlass.Int32(0)
+        flash_o_started = cutlass.Boolean(False)
+        for flash_active_kv in cutlass.range(flash_m_tile - cutlass.Int32(0), unroll=1):
+            flash_kv = cutlass.Int32(0) + flash_active_kv
+            flash_s_full = flash_mma_s_cons.wait_and_advance()
+            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+            if flash_s_idx % 2 == 0:
+                cute.copy(flash_tiled_ld0, tLDtS0, tLDrS)
+            else:
+                cute.copy(flash_tiled_ld1, tLDtS1, tLDrS)
+            cute.arch.fence_view_async_tmem_load()
+            flash_old_row_max = flash_row_max
+            flash_row_max = tLDrS.load().reduce(cute.ReductionOp.MAX, flash_row_max, 0)
+            flash_row_max_safe = flash_row_max
+            if flash_row_max == -cutlass.Float32.inf:
+                flash_row_max_safe = cutlass.Float32(0.0)
+            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+            flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
+            if flash_o_started & (flash_acc_log >= -8.0):
+                flash_row_max = flash_old_row_max
+                flash_row_max_safe = flash_old_row_max
+                flash_alpha = cutlass.Float32(1.0)
+            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2
+            _helion_flash_rt.exp2_split_inplace(tLDrS, _flash_scale_log2, flash_minus_max_scale, 8, 2)
+            flash_p_sum = tLDrS.load().reduce(cute.ReductionOp.ADD, 0.0, 0)
+            tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+            tSTrS_e = cute.make_tensor(cute.recast_ptr(tSTrS.iterator, dtype=cutlass.BFloat16), tLDrS.layout)
+            tSTrS_e.store(tLDrS.load().to(cutlass.BFloat16))
+            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
+            if flash_s_idx % 2 == 0:
+                cute.copy(flash_tiled_st0, tSTrS, tSTtS0)
+            else:
+                cute.copy(flash_tiled_st1, tSTrS, tSTtS1)
+            cute.arch.fence_view_async_tmem_store()
+            if flash_o_started:
+                flash_o_full = flash_mma_o_cons.wait_and_advance()
+                if cute.arch.vote_ballot_sync(flash_alpha < 1.0) != 0:
+                    _helion_flash_rt.rescale_o_tmem(tOtO, flash_alpha, flash_local_tidx, 256, 16)
+                    cute.arch.fence_view_async_tmem_store()
+                flash_o_full.release()
+            flash_p_handle = flash_p_ready_prod.acquire_and_advance()
+            flash_p_handle.commit()
+            flash_s_full.release()
+            flash_o_started = cutlass.Boolean(True)
+            flash_s_idx = (flash_s_idx + 1) % 2
+        for flash_active_kv in cutlass.range(flash_m_tile_hi - flash_m_tile + cutlass.Int32(1), unroll=1):
+            flash_kv = flash_m_tile + flash_active_kv
+            flash_s_full = flash_mma_s_cons.wait_and_advance()
+            flash_alpha = cutlass.Float32(1.0)
+            if (flash_mma_tile_coord_v != 0) | (flash_kv != flash_m_tile_hi):
+                tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+                if flash_s_idx % 2 == 0:
+                    cute.copy(flash_tiled_ld0, tLDtS0, tLDrS)
+                else:
+                    cute.copy(flash_tiled_ld1, tLDtS1, tLDrS)
+                cute.arch.fence_view_async_tmem_load()
+                if flash_kv >= flash_m_tile:
+                    _helion_flash_rt.causal_mask_t2r(tLDrS, tLDcS, flash_q_mma_tile * 2, flash_kv)
+                flash_old_row_max = flash_row_max
+                flash_row_max = tLDrS.load().reduce(cute.ReductionOp.MAX, flash_row_max, 0)
+                flash_row_max_safe = flash_row_max
+                if flash_row_max == -cutlass.Float32.inf:
+                    flash_row_max_safe = cutlass.Float32(0.0)
+                flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+                flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
+                if flash_o_started & (flash_acc_log >= -8.0):
+                    flash_row_max = flash_old_row_max
+                    flash_row_max_safe = flash_old_row_max
+                    flash_alpha = cutlass.Float32(1.0)
+                flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2
+                _helion_flash_rt.exp2_split_inplace(tLDrS, _flash_scale_log2, flash_minus_max_scale, 8, 2)
+                flash_p_sum = tLDrS.load().reduce(cute.ReductionOp.ADD, 0.0, 0)
+                tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+                tSTrS_e = cute.make_tensor(cute.recast_ptr(tSTrS.iterator, dtype=cutlass.BFloat16), tLDrS.layout)
+                tSTrS_e.store(tLDrS.load().to(cutlass.BFloat16))
+                flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
+                if flash_s_idx % 2 == 0:
+                    cute.copy(flash_tiled_st0, tSTrS, tSTtS0)
+                else:
+                    cute.copy(flash_tiled_st1, tSTrS, tSTtS1)
+                cute.arch.fence_view_async_tmem_store()
+            else:
+                flash_zero_p = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+                for flash_zi in cutlass.range_constexpr(cute.size(flash_zero_p)):
+                    flash_zero_p[flash_zi] = cutlass.Float32(0.0)
+                if flash_s_idx % 2 == 0:
+                    cute.copy(flash_tiled_st0, flash_zero_p, tSTtS0)
+                else:
+                    cute.copy(flash_tiled_st1, flash_zero_p, tSTtS1)
+                cute.arch.fence_view_async_tmem_store()
+            if flash_o_started:
+                flash_o_full = flash_mma_o_cons.wait_and_advance()
+                if cute.arch.vote_ballot_sync(flash_alpha < 1.0) != 0:
+                    _helion_flash_rt.rescale_o_tmem(tOtO, flash_alpha, flash_local_tidx, 256, 16)
+                    cute.arch.fence_view_async_tmem_store()
+                flash_o_full.release()
+            flash_p_handle = flash_p_ready_prod.acquire_and_advance()
+            flash_p_handle.commit()
+            flash_s_full.release()
+            flash_o_started = cutlass.Boolean(True)
+            flash_s_idx = (flash_s_idx + 1) % 2
+        flash_o_full = flash_mma_o_cons.wait_and_advance()
+        flash_inv_sum = cutlass.Float32(1.0) / flash_row_sum
+        gO = cute.flat_divide(_flash_mOt, cute.select((128, 256, 128), mode=[0, 1]))
+        tOgO_mma = flash_pvt.partition_C(gO)[None, None, None, flash_q_mma_tile * 2, 0, flash_bh]
+        flash_epi_tiler = ((cute.size(tOtO, mode=[0, 0]), cute.size(tOtO, mode=[0, 1])),)
+        tOtO_epi = cute.zipped_divide(tOtO, flash_epi_tiler)
+        gO_epi = cute.zipped_divide(tOgO_mma, flash_epi_tiler)
+        flash_o_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition.x64), cutlass.Float32)
+        flash_tiled_o_ld = cute_tcgen05_flash.make_tmem_copy(flash_o_ld_atom, tOtO_epi[None, 0])
+        flash_thr_o_ld = flash_tiled_o_ld.get_slice(flash_local_tidx)
+        tDtO = flash_thr_o_ld.partition_S(tOtO_epi)
+        tDgO = flash_thr_o_ld.partition_D(gO_epi)
+        flash_reg = cute.make_rmem_tensor(tDgO[None, None, 0].shape, cutlass.Float32)
+        flash_rego = cute.make_rmem_tensor(tDgO[None, None, 0].shape, cutlass.BFloat16)
+        for flash_i in cutlass.range(cute.size(tDtO, mode=[2])):
+            cute.copy(flash_tiled_o_ld, tDtO[None, None, flash_i], flash_reg)
+            flash_reg.store(flash_reg.load() * flash_inv_sum)
+            flash_rego.store(flash_reg.load().to(cutlass.BFloat16))
+            cute.autovec_copy(flash_rego, tDgO[None, None, flash_i])
+        flash_o_full.release()
+        flash_p_ready_prod.tail()
+    cute.arch.barrier()
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+    if warp_idx == 1:
+        flash_tmem.free(flash_tmem_ptr)
+# src[test_cute_flash_head_dims.py:N]: def _dense_causal_attention(
+# src[test_cute_flash_head_dims.py:N]:     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+# src[test_cute_flash_head_dims.py:N]: ) -> torch.Tensor:
+# src[test_cute_flash_head_dims.py:N-N]: ...
+_helion__dense_causal_attention._helion_cute_wrapper_plans = [{'kind': 'helion_flash', 'seq': 2048, 'head_dim': 256, 'dtype': 'cutlass.BFloat16', 'batch': 8, 'scale_log2': 0.09016844005556021, 'kv_stage': 2, 'k_stage': 3, 'kv_tile_n': 128, 's_stage': 2, 'persistent': False, 'persistent_ctas_per_sm': 1, 'total_tiles': 64, 'pair_cluster': 1, 'topology': 'ws_overlap', 'q_stage': 1, 'q_tile_m': 128, 'ws_one_pass': False, 'epi_tma': False, 'epi_stg': False, 'use_2cta_instrs': True, 'use_cga2_local_cta': False, 'use_clc_scheduler': False, 'clc_heads_per_batch': 0, 'local_tma_partition': False, 'q_idx': 0, 'k_idx': 1, 'v_idx': 2, 'o_idx': 3}]
+_helion__dense_causal_attention._helion_cute_cluster_shape = (2, 1, 1)
+
+def _dense_causal_attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_cute_launcher):
+    # src[test_cute_flash_head_dims.py:N]: m_dim = q_in.size(-2)
+    m_dim = q_in.size(-2)
+    # src[test_cute_flash_head_dims.py:N]: n_dim = k_in.size(-2)
+    n_dim = k_in.size(-2)
+    # src[test_cute_flash_head_dims.py:N]: head_dim = hl.specialize(q_in.size(-1))
+    head_dim = 256
+    # src[test_cute_flash_head_dims.py:N]: q_view = q_in.reshape([-1, m_dim, head_dim])
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    # src[test_cute_flash_head_dims.py:N]: k_view = k_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    # src[test_cute_flash_head_dims.py:N]: v_view = v_in.reshape([-1, n_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    # src[test_cute_flash_head_dims.py:N]: out = torch.empty_like(q_view)
+    out = torch.empty_like(q_view)
+    # src[test_cute_flash_head_dims.py:N]: qk_scale = (1.0 / math.sqrt(head_dim)) * math.log2(math.e)
+    qk_scale = 1.0 / math.sqrt(head_dim) * math.log2(math.e)
+    # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+    _BLOCK_SIZE_1 = 128
+    # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+    # src[test_cute_flash_head_dims.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+    # src[test_cute_flash_head_dims.py:N]:     l_i = torch.full_like(m_i, 1.0)
+    # src[test_cute_flash_head_dims.py:N-N]: ...
+    _RDIM_SIZE_4 = _next_power_of_2(_BLOCK_SIZE_1)
+    _launcher(_helion__dense_causal_attention, (128,), q_view, k_view, v_view, out, block=(256, 1, 1))
+    # src[test_cute_flash_head_dims.py:N]: return out.view(q_in.size())
+    return out.view(q_in.size())
+
 --- assertExpectedJournal(TestRenderPins.test_render_d256_flex_cooperative_pair)
 from __future__ import annotations
 

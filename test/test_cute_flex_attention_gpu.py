@@ -1643,3 +1643,150 @@ def test_list_walk_on_the_cooperative_pair_short_and_grouped_queries(
     assert "if flash_local_tidx < flash_live_rows:" in code
     assert f"'total_tiles': {2 * 4 * -(-q_seq // 256)}," in code
     _assert_close(out, lse, ref_out, ref_lse)
+
+
+# -- (y) the pair's issue-stream knobs on the list walk ----------------------------
+
+
+_ALL_PAIR_KNOBS = {
+    cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+    cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+    cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+}
+_PAIR_KNOB_CASES = [
+    pytest.param(
+        2048,
+        2048,
+        None,
+        256,
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d256-loader",
+    ),
+    pytest.param(
+        2048,
+        2048,
+        2,
+        256,
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d256-gqa-loader",
+    ),
+    pytest.param(
+        1024,
+        512,
+        None,
+        256,
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d256-ragged-q-loader",
+    ),
+    pytest.param(
+        512,
+        1024,
+        None,
+        192,
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d192-ragged-kv-loader",
+    ),
+    pytest.param(
+        2048,
+        2048,
+        None,
+        256,
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d256-loader-k3",
+    ),
+    pytest.param(
+        2048,
+        2048,
+        2,
+        256,
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d256-gqa-loader-k3",
+    ),
+    pytest.param(
+        1024,
+        512,
+        None,
+        256,
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d256-ragged-q-loader-k3",
+    ),
+    pytest.param(
+        512,
+        1024,
+        None,
+        192,
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d192-ragged-kv-loader-k3",
+    ),
+    pytest.param(
+        2048,
+        2048,
+        None,
+        256,
+        {cute_flash.FLASH_WS_MASK_PHASES_KEY: True},
+        id="d256-mask",
+    ),
+    pytest.param(2048, 2048, None, 256, _ALL_PAIR_KNOBS, id="d256-all"),
+    pytest.param(2048, 2048, 2, 256, _ALL_PAIR_KNOBS, id="d256-gqa-all"),
+    pytest.param(1024, 512, None, 256, _ALL_PAIR_KNOBS, id="d256-ragged-q-all"),
+    pytest.param(512, 1024, None, 192, _ALL_PAIR_KNOBS, id="d192-ragged-kv-all"),
+    pytest.param(16384, 16384, None, 256, _ALL_PAIR_KNOBS, id="d256-cursor-16k-all"),
+]
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "kv_heads", "head_dim", "knobs"), _PAIR_KNOB_CASES
+)
+def test_pair_issue_knobs_on_the_list_walk(
+    q_seq: int,
+    kv_seq: int,
+    kv_heads: int | None,
+    head_dim: int,
+    knobs: dict[str, object],
+) -> None:
+    """The cooperative pair's list walk with its issue-stream knobs: the
+    union-list loads move to warp 2 of both CTAs (the leader's warp 0 only
+    waits on full barriers and issues), the K ring takes one more slot than
+    V's, and the mask phases run the item's leading full tiles without the
+    mask hook (the walk order unchanged). No arithmetic step changes, so
+    the output and the LSE are bitwise the knobs-off walk's -- at 16K keys
+    through the cursor walk over the host words."""
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, head_dim, torch.bfloat16, kv_heads=kv_heads)
+    block_mask = _block_mask(_causal, 2, 4, q_seq, kv_seq)
+    enable_gqa = kv_heads is not None
+    base = {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+    code_off, out_off, lse_off, ref_out, ref_lse = _run(
+        q, k, v, block_mask, overrides=base, enable_gqa=enable_gqa
+    )
+    code, out, lse, _, _ = _run(
+        q, k, v, block_mask, overrides={**base, **knobs}, enable_gqa=enable_gqa
+    )
+    assert "'use_2cta_instrs': True" in code
+    loader_on = bool(knobs.get(cute_flash.FLASH_WS_LOADER_WARP_KEY))
+    assert ("if warp_idx == 2:" in code) == loader_on
+    assert "if warp_idx == 2:" not in code_off
+    if loader_on:
+        leader = code.index("if flash_is_leader_cta:")
+        loader = code.index("if warp_idx == 2:")
+        assert "cute.copy(_flash_tma_" not in code[leader:loader]
+    assert ("k_stage=" in code) == (cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY in knobs)
+    # The walk's mask phases: the leading run of full tiles without the hook.
+    assert ("cutlass.range(flash_flex_lead, unroll=1)" in code) == bool(
+        knobs.get(cute_flash.FLASH_WS_MASK_PHASES_KEY)
+    )
+    assert "flash_kv = flash_m_tile + flash_active_kv" not in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    assert torch.equal(out, out_off) and torch.equal(lse, lse_off)

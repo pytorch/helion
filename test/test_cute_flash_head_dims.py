@@ -13,6 +13,7 @@ follow the example's V-width generalization).
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib
 import math
@@ -563,6 +564,23 @@ class TestRenderPins(TestCase):
         self.assertExpectedJournal(
             _render_dense_causal(
                 256, config={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+            )
+        )
+
+    def test_render_d256_cooperative_pair_issue_knobs(self) -> None:
+        """The d256 causal pair with its three issue-stream knobs on: the
+        loads in warp 2 of both CTAs (the leader's warp 0 only waits and
+        issues), the consumer loop split at the diagonal, the three-deep K
+        ring."""
+        self.assertExpectedJournal(
+            _render_dense_causal(
+                256,
+                config={
+                    cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+                    cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+                    cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+                    cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+                },
             )
         )
 
@@ -1241,6 +1259,14 @@ def test_flex_list_walk_runs_on_the_cooperative_pair_above_128() -> None:
         ),
         cute_flash.FLASH_CAUSAL_LPT_L2_SHIFT_KEY: {0, 1},
         cute_flash.FLASH_FLEX_MASK_FORM_KEY: {"bitmask", "element"},
+        # The pair's separate load warp: the walk's union-list loads move
+        # with their cursors.
+        cute_flash.FLASH_WS_LOADER_WARP_KEY: {False, True},
+        # The extra K ring slot fits beside the pair's two-deep V ring at
+        # 256; the mask phases run the item's leading full tiles without
+        # the hook.
+        cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: {0, 1},
+        cute_flash.FLASH_WS_MASK_PHASES_KEY: {False, True},
     }
     assert _active(fragments[cute_flash.FLASH_S_STAGE_KEY]) == (2,)
     assert _active(fragments[cute_flash.FLASH_KV_STAGE_KEY]) == (2,)
@@ -1898,3 +1924,504 @@ def test_d256_causal_pair_cell_identities_render_distinct_texts() -> None:
             assert row[cute_flash.FLASH_S_STAGE_KEY] == "2"
             assert row[cute_flash.FLASH_EPI_STG_STORE_KEY] == "'slice'"
             assert row[cute_flash.FLASH_EPI_STG_KEY] == "False"
+
+
+# -- (y) the single-tile bodies' issue-stream knobs: the pair's load warp -----------
+
+
+def test_load_warp_resolves_on_the_cooperative_pair() -> None:
+    """The separate load warp exists on the two-stage single-tile bodies: the
+    cooperative pair (dense, causal, persistent and the list walk alike) and
+    the single CTA; the fa4 bodies normalize the request away so one render
+    keeps one identity."""
+    pair = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+    }
+    for head_dim in (144, 192, 256):
+        assert _resolve(head_dim, pair).ws_loader_warp, head_dim
+    assert _resolve(256, pair, is_causal=False).ws_loader_warp
+    assert _resolve(256, {**pair, cute_flash.FLASH_PERSISTENT_KEY: True}).ws_loader_warp
+    walk = _resolve(256, pair, has_list_walk=True)
+    assert walk.use_2cta_instrs and walk.ws_loader_warp
+    single = {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+    for head_dim in (64, 128, 192, 256):
+        resolved = _resolve(head_dim, single)
+        assert not resolved.use_2cta_instrs and resolved.ws_loader_warp, head_dim
+    assert _resolve(128, single, is_causal=False).ws_loader_warp
+    fa4 = _resolve(128, {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"})
+    assert fa4.topology == "fa4" and not fa4.ws_loader_warp
+    # The resolved value is a fixed point of normalization.
+    resolved = _resolve(256, pair)
+    again = _resolve(256, dict(cute_flash.flash_effective_config_values(resolved)))
+    assert again.ws_loader_warp
+
+
+def test_load_warp_is_searched_on_the_pinned_pair_surface() -> None:
+    """Every surface whose rows are all two-stage single-tile bodies searches
+    the load warp (the pinned pair, the mixed d256 causal surface of pair
+    and single CTA, a ws-only d64 surface); the fa4-eligible surfaces keep
+    it at rest (a value their fa4 rows would normalize away is an
+    unreachable column of the coverage design)."""
+    with patch.dict(os.environ, {}, clear=True):
+        pinned = cute_flash.flash_autotune_fragments(
+            256,
+            32,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+            pipeline_family_override="ws_2cta",
+        )
+    assert _active(pinned[cute_flash.FLASH_WS_LOADER_WARP_KEY]) == (False, True)
+    assert _active(_fragments(256)[cute_flash.FLASH_WS_LOADER_WARP_KEY]) == (
+        False,
+        True,
+    )
+    assert _active(_fragments(128)[cute_flash.FLASH_WS_LOADER_WARP_KEY]) == (False,)
+    with patch.dict(os.environ, {}, clear=True):
+        ws_only = cute_flash.flash_autotune_fragments(
+            64,
+            48,
+            num_bh=64,
+            is_causal=False,
+            standard_dense_output=True,
+            pipeline_family_override="ws_overlap",
+        )
+    assert _active(ws_only[cute_flash.FLASH_WS_LOADER_WARP_KEY]) == (False, True)
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = cute_flash.flash_attention_seed_configs(
+            256,
+            32,
+            dtype=torch.bfloat16,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+    pair_seeds = [
+        seed.config
+        for seed in seeds
+        if seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY) == "ws_2cta"
+    ]
+    assert {seed.get(cute_flash.FLASH_WS_LOADER_WARP_KEY) for seed in pair_seeds} == {
+        False,
+        True,
+    }
+
+
+def _leader_and_loader(code: str) -> tuple[str, str]:
+    leader = code.index("if flash_is_leader_cta:")
+    loader = code.index("if warp_idx == 2:")
+    consumer = code.index("if warp_idx >= 4:", loader)
+    return code[leader:loader], code[loader:consumer]
+
+
+def test_render_d256_cooperative_pair_load_warp() -> None:
+    """With the load warp on, warp 2 of both CTAs runs every TMA load and the
+    ring tails while the leader's warp 0 keeps the MMA stream alone; off, the
+    render is the pair's unchanged body. The flex list walk renders it the
+    same way (its union-list loads move with their cursors)."""
+    base = _render_dense_causal(
+        256, config={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+    )
+    assert "if warp_idx == 2:" not in base
+    for code in (
+        _render_dense_causal(
+            256,
+            config={
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+                cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            },
+        ),
+        _render_dense_causal(
+            256,
+            config={
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+                cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+                cute_flash.FLASH_PERSISTENT_KEY: True,
+            },
+        ),
+        _render_flex(
+            256,
+            config={
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+                cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            },
+        ),
+    ):
+        leader, loader = _leader_and_loader(code)
+        assert "cute.copy(_flash_tma_" not in leader
+        assert (
+            "cute.gemm(_flash_qk_mma" in leader and "cute.gemm(_flash_pv_mma" in leader
+        )
+        assert loader.count("cute.copy(_flash_tma_k") >= 3
+        assert "cute.gemm(" not in loader
+        for tail in (
+            "flash_q_prod.tail()",
+            "flash_k_prod.tail()",
+            "flash_v_prod.tail()",
+        ):
+            assert tail in loader and tail not in leader
+
+
+# -- (y) the single-tile bodies' issue-stream knobs: the causal mask phases ----------
+
+
+def test_mask_phases_resolve_on_the_causal_single_tile_bodies() -> None:
+    """The diagonal split exists on the causal two-stage single-tile bodies
+    (the pair and the single CTA) and, as the leading run of full tiles, on
+    the list walk; dense plans and the fa4 bodies normalize it away."""
+    pair = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+    }
+    for head_dim in (144, 192, 256):
+        assert _resolve(head_dim, pair).ws_mask_phases, head_dim
+    assert _resolve(256, {**pair, cute_flash.FLASH_PERSISTENT_KEY: True}).ws_mask_phases
+    assert not _resolve(256, pair, is_causal=False).ws_mask_phases
+    # The list walk: the item's leading run of full tiles is the phase.
+    assert _resolve(256, pair, has_list_walk=True).ws_mask_phases
+    assert _resolve(256, pair, is_causal=False, has_list_walk=True).ws_mask_phases
+    single = {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+    for head_dim in (64, 128, 192, 256):
+        resolved = _resolve(head_dim, single)
+        assert not resolved.use_2cta_instrs and resolved.ws_mask_phases, head_dim
+    assert not _resolve(128, single, is_causal=False).ws_mask_phases
+    fa4 = _resolve(128, {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"})
+    assert fa4.topology == "fa4" and not fa4.ws_mask_phases
+    resolved = _resolve(128, single)
+    again = _resolve(128, dict(cute_flash.flash_effective_config_values(resolved)))
+    assert again.ws_mask_phases
+
+
+def test_mask_phases_are_searched_on_causal_single_tile_surfaces() -> None:
+    """Every causal surface whose rows are all single-tile bodies searches the
+    split (the pinned pair, the mixed d256 surface); dense pair and fa4
+    surfaces keep it at rest."""
+    with patch.dict(os.environ, {}, clear=True):
+        pinned = cute_flash.flash_autotune_fragments(
+            256,
+            32,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+            pipeline_family_override="ws_2cta",
+        )
+        dense_pinned = cute_flash.flash_autotune_fragments(
+            256,
+            32,
+            num_bh=64,
+            is_causal=False,
+            standard_dense_output=True,
+            pipeline_family_override="ws_2cta",
+        )
+    key = cute_flash.FLASH_WS_MASK_PHASES_KEY
+    assert _active(pinned[key]) == (False, True)
+    assert _active(dense_pinned[key]) == (False,)
+    assert _active(_fragments(256)[key]) == (False, True)
+    assert _active(_fragments(128)[key]) == (False,)
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = cute_flash.flash_attention_seed_configs(
+            256,
+            32,
+            dtype=torch.bfloat16,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+    assert any(
+        seed.config.get(key) and seed.config.get(cute_flash.FLASH_WS_LOADER_WARP_KEY)
+        for seed in seeds
+    )
+
+
+def test_render_mask_phases_split_the_diagonal_out() -> None:
+    """The split loop: the tiles below the diagonal without the causal mask,
+    then the diagonal tiles with it (one mask call in the render), on the
+    pair and on the single CTA; off, the single loop with its guarded mask."""
+    for family, head_dim in (("ws_2cta", 256), ("ws_overlap", 192)):
+        base = _render_dense_causal(
+            head_dim, config={cute_flash.FLASH_PIPELINE_FAMILY_KEY: family}
+        )
+        code = _render_dense_causal(
+            head_dim,
+            config={
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+                cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            },
+        )
+        assert (
+            base.count("causal_mask_t2r(") == 1 and code.count("causal_mask_t2r(") == 1
+        )
+        assert "cutlass.range(flash_m_tile - cutlass.Int32(0), unroll=1)" in code
+        assert "flash_kv = flash_m_tile + flash_active_kv" in code
+        assert "flash_kv = flash_m_tile + flash_active_kv" not in base
+        below = code.index("cutlass.range(flash_m_tile - cutlass.Int32(0), unroll=1)")
+        diagonal = code.index("flash_kv = flash_m_tile + flash_active_kv")
+        assert "causal_mask_t2r(" not in code[below:diagonal]
+        assert "causal_mask_t2r(" in code[diagonal:]
+
+
+# -- (y) the single-tile bodies' issue-stream knobs: the extra K ring slot ----------
+
+
+def test_extra_k_slot_resolves_where_it_fits() -> None:
+    """One more K ring slot where the byte model fits it beside the V ring:
+    the pair at 144-256 (dense, causal, the list walk), the single CTA by
+    bytes (not at 256: its full-height ring leaves no room); the fa4 bodies
+    keep their own rings."""
+    pair = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+    }
+    for head_dim in (144, 192, 256):
+        assert _resolve(head_dim, pair).ws_k_stage_extra == 1, head_dim
+    assert _resolve(256, pair, is_causal=False).ws_k_stage_extra == 1
+    assert _resolve(256, pair, has_list_walk=True).ws_k_stage_extra == 1
+    assert (
+        _resolve(256, {**pair, cute_flash.FLASH_PERSISTENT_KEY: True}).ws_k_stage_extra
+        == 1
+    )
+    single = {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+    limit = cute_flash.FlashScheduleLimits().shared_memory_bytes
+    for head_dim in (64, 128, 192, 256):
+        resolved = _resolve(head_dim, single)
+        fits = (
+            cute_flash._flash_ws_storage_bytes(
+                head_dim,
+                resolved.kv_stage,
+                q_tile_m=128,
+                s_stage=2,
+                epi_stg=resolved.epi_stg,
+                k_stage_extra=1,
+            )
+            <= limit
+        )
+        assert resolved.ws_k_stage_extra == int(fits), head_dim
+    assert _resolve(128, single).ws_k_stage_extra == 1
+    assert _resolve(256, single).ws_k_stage_extra == 0
+    fa4 = _resolve(128, {**pair, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"})
+    assert fa4.topology == "fa4" and fa4.ws_k_stage_extra == 0
+    resolved = _resolve(256, pair)
+    again = _resolve(256, dict(cute_flash.flash_effective_config_values(resolved)))
+    assert again.ws_k_stage_extra == 1
+
+
+def test_extra_k_slot_byte_model_matches_the_runtime_storage() -> None:
+    cutlass = importlib.import_module("cutlass")
+    flash_shared_storage = importlib.import_module(
+        "helion._compiler.cute._flash_runtime"
+    ).flash_shared_storage
+    for head_dim in (64, 128, 192, 256):
+        for kv_stage in (1, 2, 3):
+            for two_cta in (False, True):
+                for staged in (False, True):
+                    kv_rows = 64 if two_cta else 128
+                    runtime = flash_shared_storage(
+                        head_dim,
+                        kv_stage,
+                        2,
+                        cutlass.BFloat16,
+                        o_stage=1 if staged else 0,
+                        q_rows=128,
+                        kv_rows=kv_rows,
+                        two_cta=two_cta,
+                        k_stage=kv_stage + 1,
+                    ).size_in_bytes()
+                    assert runtime == cute_flash._flash_ws_storage_bytes(
+                        head_dim,
+                        kv_stage,
+                        q_tile_m=128,
+                        s_stage=2,
+                        epi_stg=staged,
+                        kv_rows=kv_rows,
+                        two_cta=two_cta,
+                        k_stage_extra=1,
+                    ), (head_dim, kv_stage, two_cta, staged)
+    limit = cute_flash.FlashScheduleLimits().shared_memory_bytes
+    pair = {
+        "q_tile_m": 128,
+        "s_stage": 2,
+        "epi_stg": False,
+        "kv_rows": 64,
+        "two_cta": True,
+    }
+    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=1, **pair) <= limit
+    assert cute_flash._flash_ws_storage_bytes(256, 2, k_stage_extra=2, **pair) > limit
+
+
+def test_extra_k_slot_is_searched_where_every_row_fits_it() -> None:
+    """A pinned pair surface searches the slot where it fits beside every
+    searched ring depth (192 and 256: rings of at most three); the d144 and
+    d176 pair surfaces search five- and four-deep rings whose deepest rows
+    have no room for it, so they keep it at rest (a searched value those
+    rows normalize away would be an alias of their slot-off row). The mixed
+    d256 causal surface does not search it either (the single CTA's
+    full-height ring has no room), nor the fa4-eligible d128 surface."""
+    key = cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY
+    for head_dim, searched in ((144, (0,)), (176, (0,)), (192, (0, 1)), (256, (0, 1))):
+        with patch.dict(os.environ, {}, clear=True):
+            pinned = cute_flash.flash_autotune_fragments(
+                head_dim,
+                32,
+                num_bh=64,
+                is_causal=True,
+                standard_causal_output=True,
+                pipeline_family_override="ws_2cta",
+            )
+        assert _active(pinned[key]) == searched, head_dim
+        depths = _active(pinned[cute_flash.FLASH_KV_STAGE_KEY])
+        assert (max(depths) <= 3) == (searched == (0, 1)), (head_dim, depths)  # type: ignore[type-var]
+    assert _active(_fragments(256)[key]) == (0,)
+    assert _active(_fragments(128)[key]) == (0,)
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = cute_flash.flash_attention_seed_configs(
+            256,
+            32,
+            dtype=torch.bfloat16,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+    assert any(
+        seed.config.get(key) == 1
+        and seed.config.get(cute_flash.FLASH_WS_LOADER_WARP_KEY)
+        and seed.config.get(cute_flash.FLASH_WS_MASK_PHASES_KEY)
+        for seed in seeds
+    )
+
+
+def test_render_extra_k_slot_deepens_the_k_ring_alone() -> None:
+    code = _render_dense_causal(
+        256,
+        config={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+    )
+    base = _render_dense_causal(
+        256, config={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+    )
+    assert "k_stage=3)" in code and "k_stage=" not in base
+    k_pipe = code.index("flash_k_prod, flash_k_cons = ")
+    v_pipe = code.index("flash_v_prod, flash_v_cons = ")
+    assert "num_stages=3" in code[k_pipe : k_pipe + 200]
+    assert "num_stages=2" in code[v_pipe : v_pipe + 200]
+    flex = _render_flex(
+        256,
+        config={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+    )
+    assert "k_stage=3)" in flex
+
+
+def test_render_flex_walk_mask_phases_run_the_leading_full_tiles_first() -> None:
+    """On the list walk the mask phases split the softmax loop at the item's
+    leading run of full tiles (``flash_flex_lead``, counted from the words
+    at item start): the first loop has no mask hook, the second keeps it;
+    the register walk (one word) counts with a select chain, the cursor walk
+    (16K keys, four words) with a loop over the item's words. The tile order
+    and the handshakes are the single loop's."""
+    base = {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+    on = {**base, cute_flash.FLASH_WS_MASK_PHASES_KEY: True}
+    for seq, cursor in ((1024, False), (16384, True)):
+        off_code = _render_flex(256, seq=seq, config=base)
+        code = _render_flex(256, seq=seq, config=on)
+        assert "flash_flex_lead" not in off_code
+        assert (
+            "for flash_active_kv in cutlass.range(flash_flex_lead, unroll=1):" in code
+        )
+        assert (
+            "for flash_active_kv in cutlass.range(flash_active_count - flash_flex_lead, unroll=1):"
+            in code
+        )
+        lead = code.index("cutlass.range(flash_flex_lead, unroll=1)")
+        rest = code.index(
+            "cutlass.range(flash_active_count - flash_flex_lead, unroll=1)"
+        )
+        assert "if flash_flex_needs_mask:" not in code[lead:rest]
+        assert "if flash_flex_needs_mask:" in code[rest:]
+        assert code.count("flash_s_full = flash_mma_s_cons.wait_and_advance()") == (
+            off_code.count("flash_s_full = flash_mma_s_cons.wait_and_advance()") + 1
+        )
+        assert ("for flash_lw in cutlass.range(" in code) == cursor
+        assert (
+            "_flash_mFlexWords[flash_flex_wbase"
+            in code[: code.index("flash_flex_lead = cutlass.Int32(0)") + 4000]
+        ) == cursor
+
+
+def test_render_single_cta_load_warp_carries_the_look_ahead_loads() -> None:
+    """With the load warp on, warp 2 carries the single CTA's whole ring (the
+    flat body's early prologue issue included: the ring's producer states
+    must be one warp's) and warp 0 the MMA stream alone; off, the render is
+    the body's unchanged text with its prologue loads ahead of the roles."""
+    for head_dim, extra in ((192, {}), (128, {"cute_flash_mma_interleave": False})):
+        base = _render_dense_causal(
+            head_dim,
+            config={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap", **extra},
+        )
+        assert "if warp_idx == 2:" not in base
+        code = _render_dense_causal(
+            head_dim,
+            config={
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+                cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+                **extra,
+            },
+        )
+        loader = code.index("    if warp_idx == 2:")
+        role0 = code.rindex("    if warp_idx == 0:", 0, loader)
+        consumer = code.index("    if warp_idx >= 4:", loader)
+        mma, loads = code[role0:loader], code[loader:consumer]
+        assert "cute.copy(_flash_tma_" not in mma and "cute.gemm(" in mma
+        assert loads.count("cute.copy(_flash_tma_") >= 2 and "cute.gemm(" not in loads
+        # The flat body's early prologue issue (ahead of the roles, from warp
+        # 0) moves into the load warp's role: the ring's producer states must
+        # be one warp's.
+        assert "cute.copy(_flash_tma_q" in base[: base.index("    if warp_idx >= 4:")]
+        assert "cute.copy(_flash_tma_" not in code[:role0]
+        assert "cute.copy(_flash_tma_q" in loads
+
+
+def test_extra_k_slot_sizes_the_host_k_layout() -> None:
+    """The host K smem layout (the TMA destination and the MMA operand) takes
+    the K ring's own depth: a one-stage layout has no stage stride (its slot 1
+    is slot 0), so a single-tile body at kv_stage 1 with the extra slot carries
+    ``k_stage`` 2 in its plan and the wrapper builds its K layout two deep
+    while V's stays one; with the slot off the plan has no such key."""
+    from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+    def plan_of(code: str) -> dict[str, object]:
+        marker = "._helion_cute_wrapper_plans = "
+        payload = next(line for line in code.splitlines() if marker in line)
+        (plan,) = ast.literal_eval(payload.split(marker, 1)[1])
+        assert isinstance(plan, dict)
+        return plan
+
+    def host_layout_depths(plan: dict[str, object]) -> tuple[str, str]:
+        body: list[str] = []
+        _append_cute_wrapper_plan(body, [], plan, num_sm=148)
+        source = "\n".join(body)
+        ksl = re.search(r"_flash_ksl = .*make_smem_layout_b\(.*, (\d+)\)", source)
+        vsl = re.search(r"_flash_vsl = .*make_smem_layout_b\(.*, (\d+)\)", source)
+        assert ksl is not None and vsl is not None
+        return ksl.group(1), vsl.group(1)
+
+    ws = {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+    for head_dim, kv_stage, extra in (
+        (192, 1, {}),
+        (128, 2, {"cute_flash_mma_interleave": False}),
+    ):
+        base = plan_of(_render_dense_causal(head_dim, config={**ws, **extra}))
+        assert base["kv_stage"] == kv_stage and "k_stage" not in base
+        assert host_layout_depths(base) == (str(kv_stage), str(kv_stage))
+        plan = plan_of(
+            _render_dense_causal(
+                head_dim,
+                config={**ws, **extra, cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1},
+            )
+        )
+        assert plan["kv_stage"] == kv_stage and plan["k_stage"] == kv_stage + 1
+        assert host_layout_depths(plan) == (str(kv_stage + 1), str(kv_stage))

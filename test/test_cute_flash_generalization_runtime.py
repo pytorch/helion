@@ -145,6 +145,7 @@ def _run_and_check(
     config_values: dict[str, object] | None = None,
     repeat_count: int = 3,
     bound_out: list[helion.runtime.kernel.BoundKernel] | None = None,
+    output_out: list[torch.Tensor] | None = None,
 ) -> tuple[str, cute_flash.FlashAttentionConfig]:
     torch.manual_seed(
         1700
@@ -176,6 +177,8 @@ def _run_and_check(
     output = bound(q, k, v)
     for _ in range(repeat_count - 1):
         assert torch.equal(output, bound(q, k, v))
+    if output_out is not None:
+        output_out.append(output)
     expected = torch.nn.functional.scaled_dot_product_attention(
         q,
         k,
@@ -889,3 +892,278 @@ def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count
     assert _cute_resident_clusters((4, 1, 1), DEVICE) == clusters
     assert _cute_resident_clusters((2, 1, 1), DEVICE) is None
     assert _cute_resident_clusters((4, 1, 1), None) is None
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "persistent"),
+    (
+        pytest.param(256, torch.bfloat16, True, False, id="d256-causal"),
+        pytest.param(256, torch.bfloat16, True, True, id="d256-causal-persistent"),
+        pytest.param(256, torch.float16, False, False, id="d256-dense"),
+        pytest.param(256, torch.float16, True, False, id="d256-causal-fp16"),
+        pytest.param(192, torch.bfloat16, True, False, id="d192-causal"),
+        pytest.param(160, torch.bfloat16, False, True, id="d160-dense-persistent"),
+        pytest.param(144, torch.bfloat16, True, False, id="d144-causal"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_issue_knobs_run(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    persistent: bool,
+) -> None:
+    """The pair's issue-stream knobs: warp 2 of both CTAs runs the TMA ring
+    (the leader's warp 0 only waits on full barriers and issues the pair's
+    MMAs), the causal consumer loop splits at the diagonal (the mask runs
+    on the diagonal tiles alone) and the K ring is one slot deeper than V's.
+    The output is bitwise the knobs-off pair's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            **base,
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        output_out=outputs,
+    )
+    assert resolved.use_2cta_instrs and resolved.persistent == persistent
+    assert resolved.ws_loader_warp and resolved.ws_k_stage_extra == 1
+    assert resolved.ws_mask_phases == is_causal
+    assert "if warp_idx == 2:" in code
+    assert f"k_stage={resolved.kv_stage + 1})" in code
+    assert ("flash_kv = flash_m_tile + flash_active_kv" in code) == is_causal
+    assert torch.equal(outputs[0], outputs[1])
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_persistent_loop_runs_past_the_resident_clusters() -> None:
+    """The persistent pair with its issue-stream knobs on more items than
+    the resident clusters (8 heads x 16 items of 256 rows = 128 items
+    against the 74 clusters of a 148-SM part): the load warp runs ahead
+    into the next item's prologue while the MMA warp and the consumers
+    finish the current one (the persistent wrap's per-item barrier orders
+    the ring across items). Bitwise the knobs-off pair's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=4096,
+        num_heads=8,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=4096,
+        num_heads=8,
+        repeat_count=3,
+        config_values={
+            **base,
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        output_out=outputs,
+    )
+    assert resolved.use_2cta_instrs and resolved.persistent
+    assert resolved.ws_loader_warp and resolved.ws_mask_phases
+    assert resolved.ws_k_stage_extra == 1
+    assert "if warp_idx == 2:" in code
+    assert torch.equal(outputs[0], outputs[1])
+
+
+_SINGLE_TILE_KNOB_CASES = (
+    pytest.param(
+        128,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d128-causal",
+    ),
+    pytest.param(
+        128,
+        torch.float16,
+        False,
+        {cute_flash.FLASH_PERSISTENT_KEY: True},
+        {cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1},
+        id="d128-dense-persistent-fp16",
+    ),
+    pytest.param(
+        64,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d64-causal",
+    ),
+    pytest.param(
+        192,
+        torch.bfloat16,
+        True,
+        {cute_flash.FLASH_EPI_STG_KEY: False},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d192-causal-direct",
+    ),
+    # The load warp: the whole TMA ring (the prologue included, which the
+    # flat body otherwise issues ahead of the roles from warp 0) moves to
+    # warp 2 and warp 0 keeps the MMA stream.
+    pytest.param(
+        192,
+        torch.bfloat16,
+        True,
+        {},
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d192-causal-loader",
+    ),
+    pytest.param(
+        192,
+        torch.float16,
+        False,
+        {cute_flash.FLASH_EPI_STG_KEY: False},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d192-dense-loader-slot",
+    ),
+    pytest.param(
+        128,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d128-causal-all",
+    ),
+    pytest.param(
+        128,
+        torch.bfloat16,
+        False,
+        {cute_flash.FLASH_PERSISTENT_KEY: True, cute_flash.FLASH_EPI_STG_KEY: True},
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d128-dense-persistent-staged-loader",
+    ),
+    pytest.param(
+        64,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d64-causal-all",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "extra", "knobs"), _SINGLE_TILE_KNOB_CASES
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_single_tile_body_issue_knobs_run(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    extra: dict[str, object],
+    knobs: dict[str, object],
+) -> None:
+    """The single CTA's two-stage body with the knobs its surfaces search
+    (the d64-d128 ws surfaces, the three-tile exact spaces, the mixed
+    d144-d256 causal surfaces): the TMA ring on its own warp, the diagonal
+    tiles in their own loop and the K ring one slot deeper than V's -- at
+    d192 a two-deep K ring beside a one-deep V ring, where the host K
+    layout must be two deep (a one-stage layout has no stage stride) and
+    the slot fits beside the direct store alone. Bitwise the knobs-off
+    body's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+        **({"cute_flash_mma_interleave": False} if head_dim <= 128 else {}),
+        **extra,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={**base, **knobs},
+        output_out=outputs,
+    )
+    loader = cute_flash.FLASH_WS_LOADER_WARP_KEY in knobs
+    mask_phases = cute_flash.FLASH_WS_MASK_PHASES_KEY in knobs
+    slot = cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY in knobs
+    assert not resolved.use_2cta_instrs
+    if cute_flash.FLASH_PERSISTENT_KEY in extra:
+        assert resolved.persistent == extra[cute_flash.FLASH_PERSISTENT_KEY]
+    assert resolved.ws_loader_warp == loader
+    assert ("if warp_idx == 2:" in code) == loader
+    if loader:
+        role2 = code.index("    if warp_idx == 2:")
+        role0 = code.rindex("    if warp_idx == 0:", 0, role2)
+        assert "cute.copy(_flash_tma_" not in code[role0:role2]
+        assert "cute.copy(_flash_tma_q" in code[role2:]
+    assert resolved.ws_k_stage_extra == int(slot)
+    assert (f"k_stage={resolved.kv_stage + 1})" in code) == slot
+    assert resolved.ws_mask_phases == mask_phases
+    assert ("flash_kv = flash_m_tile + flash_active_kv" in code) == mask_phases
+    assert torch.equal(outputs[0], outputs[1])

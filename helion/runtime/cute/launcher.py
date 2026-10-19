@@ -868,6 +868,8 @@ def _append_cute_wrapper_plan(
             "row_kv_begin_heads_per_batch", default=1
         )
         kv_stage = plan_int("kv_stage")
+        # The K ring may be one slot deeper than V's (``k_stage``).
+        k_stage = plan_int("k_stage", default=kv_stage)
         q_stage = plan_int("q_stage", default=1)
         use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
         use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
@@ -1007,8 +1009,8 @@ def _append_cute_wrapper_plan(
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({cluster_m}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
-            # the device-body kv_stage + the SharedStorage MemRange depths.
-            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
+            # the device-body ring depths + the SharedStorage MemRange depths.
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {k_stage})",
             f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
         ]
         if hd_v != hd:
@@ -1033,7 +1035,7 @@ def _append_cute_wrapper_plan(
             if uneven_kv_ring:
                 flash_lines.append(
                     "_flash_ksl = cute.make_composed_layout(_flash_ksl.inner, 0, "
-                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {kv_stage}), "
+                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {k_stage}), "
                     "stride=(*_flash_ksl.outer.stride[:-1], _flash_kv_stage_stride)))"
                 )
             flash_lines.append(
