@@ -121,6 +121,7 @@ def _run(
     m: int,
     n: int,
     d: int,
+    dv: int | None = None,
     score_mod: Callable[..., torch.Tensor] = _identity_score,
     score_mod_bwd: Callable[..., torch.Tensor] = _identity_grad,
     mask_mod: Callable[..., torch.Tensor] | None = None,
@@ -130,25 +131,30 @@ def _run(
     config_overrides: dict[str, object] | None = None,
     layout: str = "bhsd",
     dtype: torch.dtype = torch.bfloat16,
+    table_steps: int = 0,
+    block_size: int | tuple[int, int] = 128,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
-    (``config_overrides``: knob values on top of it) and return the gradients,
-    the fp32 reference gradients and the generated code.
+    (``config_overrides``: knob values on top of it; ``table_steps``: a
+    step-table cap, forced even when the shape is too small to offer it) and
+    return the gradients, the fp32 reference gradients and the generated code.
 
     ``layout``: ``bhsd`` (contiguous), ``bshd`` (``[B, S, H, D]`` allocations
     viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
     (Q/K/V head-dim slices of one ``[B, S, H, 3 * D]`` buffer, O and dO
-    transposed); the values are the same for every layout."""
+    transposed); the values are the same for every layout. ``dv`` is the
+    value head dim (V / dO / dV columns; default ``d``)."""
+    dv = d if dv is None else dv
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     q = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
     k = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
-    v = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
-    do = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
+    v = torch.randn((b, hkv, n, dv), device=DEVICE, dtype=dtype, generator=gen)
+    do = torch.randn((b, hq, m, dv), device=DEVICE, dtype=dtype, generator=gen)
     if layout == "bshd":
         q, k, v, do = (_as_bshd(t) for t in (q, k, v, do))
     elif layout == "packed":
         assert hq == hkv and m == n
-        qkv = torch.empty((b, m, hq, 3 * d), device=DEVICE, dtype=dtype)
+        qkv = torch.empty((b, m, hq, 2 * d + dv), device=DEVICE, dtype=dtype)
         q = qkv[..., :d].transpose(1, 2).copy_(q)
         k = qkv[..., d : 2 * d].transpose(1, 2).copy_(k)
         v = qkv[..., 2 * d :].transpose(1, 2).copy_(v)
@@ -166,7 +172,7 @@ def _run(
         m,
         n,
         device=str(DEVICE),
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=block_size,
     )
     kernel = flex_example.helion_flex_attention_backward_kernel
     args = flex_example.flex_attention_backward_args(
@@ -191,6 +197,12 @@ def _run(
         for key in config_overrides:
             assert key in fields, f"{key} is not a knob of this kernel"
         config = helion.Config(**{**config.config, **config_overrides})
+    if table_steps:
+        import helion
+
+        config = helion.Config(
+            **{**config.config, "cute_flash_bwd_table_steps": table_steps}
+        )
     code = bound.to_code(config)
     assert "fbwd_sSteps" in code, "the fused flex backward did not fire"
     bound.set_config(config)
@@ -274,6 +286,84 @@ def test_sliding_window_mask() -> None:
 @_gpu_test
 def test_grouped_query_heads_head_dim_128() -> None:
     got, ref, _ = _run(b=1, hq=4, hkv=2, m=256, n=256, d=128, mask_mod=_causal)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(64, 128), (128, 64)])
+def test_mixed_head_dims(d: int, dv: int) -> None:
+    """D != Dv: the dP MMA's K extent and the dV width follow Dv, the dK / dQ
+    widths D (grouped heads, causal, ragged N)."""
+    got, ref, code = _run(b=1, hq=4, hkv=2, m=256, n=320, d=d, dv=dv, mask_mod=_causal)
+    assert f"'head_dim_v': {dv}" in code
+    assert f"partition_shape_C((128, {dv}))" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(96, 96), (80, 80), (32, 32), (48, 112)])
+def test_padded_head_dims(d: int, dv: int) -> None:
+    """Head dims that are not multiples of 64: the smem tiles pad to whole
+    swizzle atoms while the MMAs, TMEM accumulators and stores run the exact
+    extents (grouped heads, causal, ragged M and N)."""
+    got, ref, code = _run(b=1, hq=4, hkv=2, m=320, n=192, d=d, dv=dv, mask_mod=_causal)
+    assert f"flash_bwd_shared_storage({-(-d // 64) * 64}, " in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_mla_head_dims_192_128() -> None:
+    """The MLA pair (D=192, Dv=128): dQ aliases S / dP in TMEM (``alias_s``),
+    dP's MMA waits on the s_read barrier, one Q / dO stage, the dK epilogue
+    reuses its two staging slots for three boxes."""
+    got, ref, code = _run(
+        b=1, hq=4, hkv=2, m=320, n=192, d=192, dv=128, mask_mod=_causal
+    )
+    assert "fbwd_sread_ptr" in code
+    # Six steps per tile: the eight-box staging still fits beside the table.
+    assert "flash_bwd_shared_storage(192, 1, 1, 1, cutlass.BFloat16, 6, 8, " in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "overrides"),
+    [
+        # The MLA pair on the persistent walk with the statistics MMAs (one Q
+        # stage, the alias_s drain / s_read waits across tiles).
+        (192, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # A padded width (dQ aliases dP: the dS^T-through-TMEM knob is not
+        # offered) on the persistent walk with the statistics MMAs.
+        (96, 96, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # A small width keeps dQ's own TMEM columns: dS^T through TMEM applies;
+        # three dQ boxes per step alternate the staging slots across steps.
+        (96, 96, {"cute_flash_bwd_tile_group": 0}),
+        (32, 32, {"cute_flash_bwd_ds_tmem": 1, "cute_flash_bwd_persistent": 1}),
+        # Mixed widths with the dO ring at one stage and the KV-fastest order.
+        (64, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_tile_group": 0}),
+    ],
+)
+def test_head_dims_non_default_knobs(
+    d: int, dv: int, overrides: dict[str, object]
+) -> None:
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=640,
+        n=512,
+        d=d,
+        dv=dv,
+        mask_mod=_causal,
+        config_overrides=overrides,
+    )
+    if overrides.get("cute_flash_bwd_persistent"):
+        assert "fbwd_tfull_ptr" in code
+    if (d, dv) == (192, 128) and overrides.get("cute_flash_bwd_stats_mma"):
+        # The statistics slices leave room for four staging boxes: the chunked
+        # dQ drain with one box per warp (each store waits for its slot).
+        assert ", 4, 1, False, False, 0, head_dim_v=128, flex_mbars=9)" in code
+        assert "fbwd_sdq_box = fbwd_sdq[None, None, warp_idx]" in code
     _assert_close(got, ref)
 
 
@@ -420,6 +510,224 @@ def test_softcap_score_mod_with_jacobian() -> None:
         score_mod_bwd=score_mod_bwd,
     )
     assert "fbwd_spre" in code and "fbwd_mul_pairs_packed" in code
+    _assert_close(got, ref)
+
+
+def _assert_same_walk(
+    whole: tuple[torch.Tensor, ...], chunked: tuple[torch.Tensor, ...]
+) -> None:
+    """A chunked walk runs the same step sequence: dK / dV accumulate in the
+    same order (bitwise equal); dQ's fp32 reduce-adds from different CTAs
+    land in any order (run to run), so its bf16 result may round one ulp
+    either way."""
+    assert torch.equal(whole[1], chunked[1]), "dK differs"
+    assert torch.equal(whole[2], chunked[2]), "dV differs"
+    dq_a, dq_b = whole[0].float(), chunked[0].float()
+    ulp = torch.maximum(dq_a.abs(), dq_b.abs()) * 2.0**-7
+    slack = 1e-6 * dq_a.abs().max()
+    assert bool(((dq_a - dq_b).abs() <= ulp + slack).all()), "dQ differs"
+
+
+@_gpu_test
+def test_chunked_table_matches_the_whole_walk() -> None:
+    # 17 Q tiles x 2 q heads: 34 steps on KV tile 0 (28 on tile 3) in chunks
+    # of 16 (16 + 16 + 2) against the whole walk in one table; the causal
+    # diagonal puts masked steps in every chunk sequence.
+    kw = {"b": 1, "hq": 2, "hkv": 1, "m": 2176, "n": 512, "d": 64, "mask_mod": _causal}
+    whole, ref, _ = _run(**kw)
+    chunked, _, code = _run(**kw, table_steps=16)
+    assert "fbwd_nchunks = (fbwd_steps + 15) // 16" in code
+    assert "named_barrier_wait_unaligned(7, 448)" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "overrides"),
+    [
+        (64, 64, {}),
+        (128, 128, {}),
+        (64, 64, {"cute_flash_bwd_persistent": 1}),
+        (128, 128, {"cute_flash_bwd_persistent": 1}),
+        # The statistics MMAs (their per-stage aug barriers) across chunks.
+        (64, 64, {"cute_flash_bwd_stats_mma": 1}),
+        (128, 128, {"cute_flash_bwd_stats_mma": 1}),
+        (128, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # Every knob that touches the per-step pipelines, chunked.
+        (
+            64,
+            64,
+            {
+                "cute_flash_bwd_persistent": 1,
+                "cute_flash_bwd_stats_mma": 1,
+                "cute_flash_bwd_ds_tmem": 1,
+                "cute_flash_bwd_tile_group": 0,
+            },
+        ),
+        # A padded width (dQ aliases dP: the chunk's first dP waits for the
+        # drain) and the MLA pair (dQ aliases S: the chunk's first S waits).
+        (96, 96, {}),
+        (192, 128, {}),
+        (192, 128, {"cute_flash_bwd_persistent": 1}),
+    ],
+)
+def test_chunked_grouped_heads_ragged(
+    d: int, dv: int, overrides: dict[str, object]
+) -> None:
+    # Group 4, ragged M (1000 rows: 8 Q tiles) and N (384 rows: 3 KV tiles):
+    # 32 steps on KV tile 0 in chunks of 12 (12 + 12 + 8).
+    kw = {
+        "b": 1,
+        "hq": 4,
+        "hkv": 1,
+        "m": 1000,
+        "n": 384,
+        "d": d,
+        "dv": dv,
+        "mask_mod": _causal,
+    }
+    whole, ref, _ = _run(**kw, config_overrides=overrides or None)
+    chunked, _, code = _run(**kw, config_overrides=overrides or None, table_steps=12)
+    assert "fbwd_nchunks = (fbwd_steps + 11) // 12" in code
+    if d == 192:
+        # The chunked dQ drain with the eight-box staging across chunked tables.
+        assert "cute.copy(fbwd_tiled_dq_ld, tRDtDQ_B, tRDrDQ)" in code
+        assert ", 8, 0, True, True, 0, head_dim_v=128, flex_mbars=9)" in code
+    if overrides.get("cute_flash_bwd_persistent"):
+        assert "fbwd_sSteps[24 + fbwd_tbuf]" in code
+        assert "if (fbwd_i == 0) & (fbwd_chunk == 0) & (fbwd_nz_it > 0):" in code
+    if overrides.get("cute_flash_bwd_stats_mma"):
+        assert "fbwd_aug_full_ptr" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("table_steps", [5, 7])
+def test_chunked_q_block_256(table_steps: int) -> None:
+    # 256-row Q blocks over 1000 rows: 4 blocks = 8 tiles (the last past M),
+    # 2 q heads: 16 steps in chunks of 5 (5 + 5 + 5 + 1) or 7 (7 + 7 + 2), so
+    # chunks start on the second tile of a block (odd step in the pair) too.
+    kw = {"b": 1, "hq": 2, "hkv": 1, "m": 1000, "n": 256, "d": 64, "mask_mod": _causal}
+    whole, ref, _ = _run(**kw, block_size=(256, 128))
+    chunked, _, code = _run(**kw, block_size=(256, 128), table_steps=table_steps)
+    assert f"fbwd_nchunks = (fbwd_steps + {table_steps - 1}) // {table_steps}" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("d", [64, 128])
+def test_chunked_persistent_two_tiles_per_cta(d: int) -> None:
+    # 2 batches x 8 kv heads x 12 KV tiles = 192 tiles over 148 SMs: the
+    # persistent CTAs walk a second tile (table buffer 1, the nz_it > 0 and
+    # chunk terms together, the TMA warp building tile t+1's table while tile
+    # t refills its chunks); group 2, causal (masked diagonal), 3-step chunks
+    # of up to 24 steps per tile.
+    overrides = {"cute_flash_bwd_persistent": 1}
+    kw = {"b": 2, "hq": 16, "hkv": 8, "m": 1536, "n": 1536, "d": d, "mask_mod": _causal}
+    whole, ref, code = _run(**kw, config_overrides=overrides)
+    assert "fbwd_tissued_ptr" in code and "fbwd_nchunks" not in code
+    chunked, _, code = _run(**kw, config_overrides=overrides, table_steps=3)
+    assert "fbwd_nchunks = (fbwd_steps + 2) // 3" in code
+    # The length words follow the two 3-step buffers.
+    assert "fbwd_sSteps[6 + fbwd_tbuf]" in code
+    assert torch.cuda.get_device_properties(0).multi_processor_count < 192
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("persistent", [0, 1])
+def test_single_step_chunks(persistent: int) -> None:
+    # A sliding window: 1-2 (partial) steps per KV tile, one step per chunk:
+    # every chunk is a peeled first step with an empty pipelined loop.
+    overrides = {"cute_flash_bwd_persistent": 1} if persistent else None
+    kw = {
+        "b": 1,
+        "hq": 2,
+        "hkv": 2,
+        "m": 1024,
+        "n": 1024,
+        "d": 64,
+        "mask_mod": _window64,
+    }
+    whole, ref, _ = _run(**kw, config_overrides=overrides)
+    chunked, _, code = _run(**kw, config_overrides=overrides, table_steps=1)
+    assert "fbwd_nchunks = (fbwd_steps + 0) // 1" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv"), [(64, 32), (32, 48), (64, 128), (96, 64), (48, 32)]
+)
+def test_ds_tmem_mixed_head_dims(d: int, dv: int) -> None:
+    """dS^T through TMEM with D != Dv (both orders, padded D): the dK MMA
+    runs with N = D, not the dV MMA's N = Dv."""
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=320,
+        n=256,
+        d=d,
+        dv=dv,
+        mask_mod=_causal,
+        config_overrides={"cute_flash_bwd_ds_tmem": 1},
+    )
+    assert "helion_fbwd_dskts_idesc" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(96, 64), (80, 64), (96, 48)])
+def test_dq_partition_past_tmem_end(d: int, dv: int) -> None:
+    """Plain plans whose padded dQ partition would reach past TMEM column
+    512: only the stored chunks are loaded (dq checked)."""
+    got, ref, code = _run(b=1, hq=2, hkv=2, m=384, n=256, d=d, dv=dv, mask_mod=_causal)
+    assert "tRDtDQ[None, fbwd_c, None, None]" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "dtype"),
+    [
+        (80, 80, torch.float16),
+        (64, 128, torch.float16),
+        (96, 64, torch.bfloat16),
+        (192, 128, torch.bfloat16),
+    ],
+)
+def test_softcap_jacobian_head_dims(d: int, dv: int, dtype: torch.dtype) -> None:
+    """The Jacobian hook (a non-identity ``score_mod_bwd``) with the causal
+    mask on padded / mixed / MLA head dims, fp16 included."""
+    cap = 20.0
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1.0 - t * t)
+
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=384,
+        n=256,
+        d=d,
+        dv=dv,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=_causal,
+        dtype=dtype,
+    )
+    assert "fbwd_spre" in code
     _assert_close(got, ref)
 
 

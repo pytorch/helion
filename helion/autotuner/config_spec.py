@@ -1052,6 +1052,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_aux_smem",
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
+        "cute_flash_bwd_table_steps",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1303,6 +1304,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_aux_smem",
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
+        "cute_flash_bwd_table_steps",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1903,6 +1905,7 @@ class ConfigSpec:
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self._cute_flash_bwd_persistent_allowed: bool = True
+        self._cute_flash_bwd_table_step_choices: tuple[int, ...] = (0,)
         # The FlexAttention backward envelope: opens the mask-form knob.
         self._cute_flash_bwd_flex: bool = False
         self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
@@ -3399,6 +3402,7 @@ class ConfigSpec:
         has_mask: bool = True,
         has_score: bool = True,
         additive_bias: bool = True,
+        table_step_choices: Sequence[int] = (0,),
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3421,6 +3425,9 @@ class ConfigSpec:
         self._cute_flash_bwd_has_mask = has_mask
         self._cute_flash_bwd_has_hook = has_mask or has_score
         self._cute_flash_bwd_additive_bias = additive_bias
+        # Steps per step-table buffer of the flex list walk (0 = automatic);
+        # the detector offers the caps that chunk the problem's walk.
+        self._cute_flash_bwd_table_step_choices = tuple(table_step_choices)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -7226,6 +7233,14 @@ class ConfigSpec:
                         # The dK MMA's dS^T operand from TMEM (TS mode) instead
                         # of the smem dS staging (head dim 64).
                         fields["cute_flash_bwd_ds_tmem"] = EnumFragment(choices=(0, 1))
+                    if len(self._cute_flash_bwd_table_step_choices) > 1:
+                        # Steps per step-table buffer, i.e. per chunk of a KV
+                        # tile's walk (0 = automatic: the whole walk when it fits,
+                        # else the largest table that does); see
+                        # cute_flash_bwd_flex.fbwd_table_step_choices.
+                        fields["cute_flash_bwd_table_steps"] = EnumFragment(
+                            choices=self._cute_flash_bwd_table_step_choices
+                        )
                     if self._cute_flash_bwd_fast_math:
                         # Elements of every 16 sent to the polynomial exp2 on the
                         # FMA pipe (an approximation: fast_math kernels only).

@@ -1008,10 +1008,12 @@ def _detect_flex_attention_bwd_loop(
     whole-graph-set match, probed once per device function."""
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_flash_bwd import _flash_bwd_gate_enabled
     from .flex_bwd_match import match_flex_attention_bwd
     from .flex_match import FLEX_PLAN_ENABLED
 
-    if not FLEX_PLAN_ENABLED:
+    # ``HELION_CUTE_FLASH_BWD=0`` disables the fused backward, dense and flex.
+    if not FLEX_PLAN_ENABLED or not _flash_bwd_gate_enabled():
         return False
     device_ir = HostFunction.current().device_ir
     root_grid_ids = device_ir.grid_block_ids[0]
