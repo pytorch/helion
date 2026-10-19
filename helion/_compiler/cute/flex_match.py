@@ -29,6 +29,7 @@ always callable.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import operator
 from typing import TYPE_CHECKING
@@ -66,6 +67,10 @@ FLEX_PLAN_ENABLED = True
 FLEX_KV_BLOCK = 128
 FLEX_Q_BLOCKS = (128, 256)
 LOG2E = 1.4426950408889634
+# TMA operand strides must be multiples of 16 bytes (the inner stride is 1).
+FLEX_OPERAND_ALIGN_BYTES = 16
+
+log = logging.getLogger(__name__)
 # Coordinates in region order: the placeholder names and the plan contract.
 FLEX_COORDS = ("b", "h", "q", "kv")
 _COORD_PLACEHOLDER_NAMES = {
@@ -237,6 +242,28 @@ class FlexMatch:
     scale_value: float | None
     exp_base: str
     trailing_scale: float
+    # The strides of the four ``[B, H, S, D]`` operands (``flex_operand_strides``
+    # form: row-major for a contiguous tensor); ``operand_strides`` is ``None``
+    # when every operand is contiguous (the rank-3 ``(S, D, B*H)`` TMA maps)
+    # and the ``(Q, K, V, O)`` tuple otherwise (the rank-4 ``(S, D, H, B)``
+    # maps built from these strides).
+    q_strides: tuple[int, ...]
+    k_strides: tuple[int, ...]
+    v_strides: tuple[int, ...]
+    o_strides: tuple[int, ...]
+
+    @property
+    def operand_strides(self) -> tuple[tuple[int, ...], ...] | None:
+        kv_shape = (self.batch, self.kv_heads, self.kv_seq)
+        pairs = (
+            (self.q_strides, (self.batch, self.heads, self.q_seq, self.head_dim)),
+            (self.k_strides, (*kv_shape, self.head_dim)),
+            (self.v_strides, (*kv_shape, self.head_dim_v)),
+            (self.o_strides, (self.batch, self.heads, self.q_seq, self.head_dim_v)),
+        )
+        if all(strides == contiguous_strides(shape) for strides, shape in pairs):
+            return None
+        return tuple(strides for strides, _ in pairs)
 
     @property
     def loop_block_ids(self) -> tuple[int, ...]:
@@ -362,6 +389,53 @@ def _host_tensor_value(node: object) -> torch.Tensor | None:
     assert isinstance(node, torch.fx.Node)
     value = node.meta.get("val")
     return value if isinstance(value, torch.Tensor) else None
+
+
+def contiguous_strides(shape: Sequence[int]) -> tuple[int, ...]:
+    """The row-major strides of ``shape``."""
+    strides: list[int] = []
+    stride = 1
+    for size in reversed(tuple(shape)):
+        strides.append(stride)
+        stride *= max(int(size), 1)
+    return tuple(reversed(strides))
+
+
+def flex_operand_strides(value: torch.Tensor) -> tuple[int, ...] | None:
+    """The strides a 4-D attention operand is addressed with, or ``None``
+    when the fused path cannot describe it.
+
+    The TMA descriptors take any layout whose last stride is 1 and whose
+    other strides (and the storage offset) are non-zero multiples of 16
+    bytes: the ``[B, S, H, D]``-allocated ``.transpose(1, 2)`` view every
+    model produces, a head-dim slice of a packed QKV buffer and the plain
+    contiguous tensor alike. A size-1 dimension is addressed by at most one
+    coordinate, so its (arbitrary) torch stride is replaced by the row-major
+    one; a zero stride on a wider dimension (an ``expand``) is declined. The
+    LSE and the BlockMask tables are not operands of this rule.
+    """
+    if value.ndim != 4:
+        return None
+    align = FLEX_OPERAND_ALIGN_BYTES // value.element_size()
+    shape = tuple(int(size) for size in value.shape)
+    strides = tuple(int(stride) for stride in value.stride())
+    if strides[-1] != 1 and shape[-1] != 1:
+        return None
+    if int(value.storage_offset()) % align:
+        return None
+    dense = contiguous_strides(shape)
+    out: list[int] = []
+    for dim, (size, stride) in enumerate(zip(shape, strides, strict=True)):
+        if size == 1:
+            out.append(dense[dim])
+            continue
+        if dim == 3:
+            out.append(1)
+            continue
+        if stride == 0 or stride % align:
+            return None
+        out.append(stride)
+    return tuple(out)
 
 
 def _load_parts(node: object) -> tuple[torch.fx.Node, list[object]] | None:
@@ -783,9 +857,29 @@ def match_flex_envelope(
     ``graphs`` are ``device_ir.graphs`` (surface time) or the codegen copies
     (``fn.codegen.codegen_graphs``); ``root_grid_ids`` is the kernel's single
     root grid. ``reasons`` collects the first failing condition for
-    diagnostics. The result's node identities belong to ``graphs``; callers
-    must not mix the two graph sets.
+    diagnostics; without it the first decline is logged at DEBUG level
+    (``HELION_LOGS=+helion._compiler.cute.flex_match``). The result's node
+    identities belong to ``graphs``; callers must not mix the two graph sets.
     """
+    logged = reasons is None and log.isEnabledFor(logging.DEBUG)
+    if logged:
+        reasons = []
+    match = _match_flex_envelope(
+        graphs, root_grid_ids, env=env, host_function=host_function, reasons=reasons
+    )
+    if match is None and logged and reasons:
+        log.debug("flex forward envelope declined: %s", reasons[0])
+    return match
+
+
+def _match_flex_envelope(
+    graphs: Iterable[GraphInfo],
+    root_grid_ids: Sequence[int],
+    *,
+    env: CompileEnvironment,
+    host_function: HostFunction | None,
+    reasons: list[str] | None,
+) -> FlexMatch | None:
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
@@ -2036,10 +2130,17 @@ def _assemble(
         ):
             ctx.decline("flex: K/V shape or dtype mismatch")
             return None
-    for value in (q_value, k_value, v_value):
-        if not value.is_contiguous():
-            ctx.decline("flex: Q/K/V must be contiguous")
+    operand_strides: list[tuple[int, ...]] = []
+    for label, value in (("Q", q_value), ("K", k_value), ("V", v_value)):
+        strides = flex_operand_strides(value)
+        if strides is None:
+            ctx.decline(
+                f"flex: {label} strides {tuple(value.stride())} are not a unit "
+                "inner stride with non-zero 16-byte aligned outer strides"
+            )
             return None
+        operand_strides.append(strides)
+    q_strides, k_strides, v_strides = operand_strides
     if not flash_head_dims_supported(head_dim, head_dim_v):
         ctx.decline(f"flex: unsupported head dims ({head_dim}, {head_dim_v})")
         return None
@@ -2115,7 +2216,7 @@ def _assemble(
     )
     if epilogue is None:
         return None
-    o_name, lse_name, lse_log_base = epilogue
+    o_name, o_strides, lse_name, lse_log_base = epilogue
 
     # Closed world of host tensors.
     aux_names = tuple(buffer.name for buffer in part_body.regions.aux)
@@ -2226,6 +2327,10 @@ def _assemble(
         scale_value=scale_literal,
         exp_base=part_body.exp_base,
         trailing_scale=part_body.trailing_scale,
+        q_strides=q_strides,
+        k_strides=k_strides,
+        v_strides=v_strides,
+        o_strides=o_strides,
     )
 
 
@@ -2306,9 +2411,10 @@ def _match_epilogue(
     bhm: tuple[int, int, int],
     head_dim_v: int,
     io_dtype: torch.dtype,
-) -> tuple[str, str | None, str | None] | None:
+) -> tuple[str, tuple[int, ...], str | None, str | None] | None:
     """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store and the
-    optional LSE store; returns ``(o_name, lse_name, lse_log_base)``."""
+    optional LSE store; returns ``(o_name, o_strides, lse_name,
+    lse_log_base)``."""
     from ...language import memory_ops
 
     l_safe: torch.fx.Node = final_l
@@ -2335,6 +2441,7 @@ def _match_epilogue(
             ctx.decline("flex: store inside a loop body")
             return None
     o_name: str | None = None
+    o_strides: tuple[int, ...] = ()
     lse_name: str | None = None
     lse_log_base: str | None = None
     batch, heads, q_seq = bhm
@@ -2379,12 +2486,18 @@ def _match_epilogue(
                 tuple(int(size) for size in host.shape)
                 != (batch, heads, q_seq, head_dim_v)
                 or host.dtype != io_dtype
-                or not host.is_contiguous()
                 or o_name is not None
             ):
                 ctx.decline("flex: the O tensor geometry is wrong or duplicated")
                 return None
-            o_name = name
+            strides = flex_operand_strides(host)
+            if strides is None:
+                ctx.decline(
+                    f"flex: O strides {tuple(host.stride())} are not a unit "
+                    "inner stride with non-zero 16-byte aligned outer strides"
+                )
+                return None
+            o_name, o_strides = name, strides
             continue
         if host.ndim == 3:
             if len(indices) != 3:
@@ -2411,7 +2524,7 @@ def _match_epilogue(
     if o_name is None:
         ctx.decline("flex: no O store")
         return None
-    return o_name, lse_name, lse_log_base
+    return o_name, o_strides, lse_name, lse_log_base
 
 
 def _lse_log_base(

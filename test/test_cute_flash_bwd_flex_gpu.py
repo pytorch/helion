@@ -128,16 +128,33 @@ def _run(
     repeats: int = 1,
     seed: int = 0,
     config_overrides: dict[str, object] | None = None,
+    layout: str = "bhsd",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
     (``config_overrides``: knob values on top of it) and return the gradients,
-    the fp32 reference gradients and the generated code."""
+    the fp32 reference gradients and the generated code.
+
+    ``layout``: ``bhsd`` (contiguous), ``bshd`` (``[B, S, H, D]`` allocations
+    viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
+    (Q/K/V head-dim slices of one ``[B, S, H, 3 * D]`` buffer, O and dO
+    transposed); the values are the same for every layout."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
-    dtype = torch.bfloat16
     q = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
     k = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
     v = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
     do = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
+    if layout == "bshd":
+        q, k, v, do = (_as_bshd(t) for t in (q, k, v, do))
+    elif layout == "packed":
+        assert hq == hkv and m == n
+        qkv = torch.empty((b, m, hq, 3 * d), device=DEVICE, dtype=dtype)
+        q = qkv[..., :d].transpose(1, 2).copy_(q)
+        k = qkv[..., d : 2 * d].transpose(1, 2).copy_(k)
+        v = qkv[..., 2 * d :].transpose(1, 2).copy_(v)
+        do = _as_bshd(do)
+    else:
+        assert layout == "bhsd"
     scale = 1.0 / math.sqrt(d)
     ref_dq, ref_dk, ref_dv, out, lse = _reference_grads(
         q, k, v, do, ref_score_mod or score_mod, mask_mod, scale
@@ -177,9 +194,10 @@ def _run(
     code = bound.to_code(config)
     assert "fbwd_sSteps" in code, "the fused flex backward did not fire"
     bound.set_config(config)
+    out = out.to(dtype) if layout == "bhsd" else _as_bshd(out.to(dtype))
     # The row-sum preprocess kernel would otherwise autotune per test shape.
     pre = flex_example._flex_attention_bwd_preprocess
-    pre_bound = pre.bind((out.to(dtype), do, lse))
+    pre_bound = pre.bind((out, do, lse))
     pre_bound.set_config(pre_bound.config_spec.default_config())
     got = None
     for _ in range(repeats):
@@ -187,7 +205,7 @@ def _run(
             q,
             k,
             v,
-            out.to(dtype),
+            out,
             lse,
             do,
             score_mod=score_mod,
@@ -199,6 +217,16 @@ def _run(
     assert got is not None
     torch.cuda.synchronize()
     return got, (ref_dq, ref_dk, ref_dv), code
+
+
+def _as_bshd(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s values in a ``[B, S, H, D]`` allocation viewed ``[B, H, S, D]``."""
+    batch, heads, seq, head_dim = t.shape
+    return (
+        torch.empty((batch, seq, heads, head_dim), device=t.device, dtype=t.dtype)
+        .transpose(1, 2)
+        .copy_(t)
+    )
 
 
 def _assert_close(
@@ -401,3 +429,137 @@ def test_repeated_launches_are_stable() -> None:
         b=1, hq=2, hkv=2, m=384, n=384, d=64, mask_mod=_causal, repeats=50
     )
     _assert_close(got, ref)
+
+
+# -- strided operands ---------------------------------------------------------
+
+
+def _assert_rank4_maps(code: str) -> None:
+    assert "'flex_strides': (" in code
+    assert "tQgQ = tQgQ_qdl[None, None, 0, fbwd_hq, fbwd_b]" in code
+    assert "tKgK_kdl[None, None, 0, fbwd_hk, fbwd_b]" in code
+    assert "_fbwd_mdKt[None, None, fbwd_hk, fbwd_b]" in code
+    assert "tQgQ_qdl[None, None, 0, fbwd_bhq]" not in code
+
+
+def _assert_same_gradients(
+    got: tuple[torch.Tensor, ...], got_c: tuple[torch.Tensor, ...]
+) -> None:
+    """dK / dV are accumulated in TMEM in the step-table order (bitwise across
+    layouts); dQ goes through fp32 reduce-adds whose arrival order varies."""
+    dq, dk, dv = got
+    dq_c, dk_c, dv_c = got_c
+    assert torch.equal(dk, dk_c)
+    assert torch.equal(dv, dv_c)
+    peak = max(dq_c.float().abs().max().item(), 1e-6)
+    assert (dq.float() - dq_c.float()).abs().max().item() / peak < 1e-3
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("hq", "hkv", "m", "n", "d", "dtype", "mask_mod"),
+    [
+        (2, 2, 512, 512, 64, torch.bfloat16, _causal),
+        (4, 2, 256, 256, 128, torch.float16, _causal),
+        (2, 2, 192, 320, 64, torch.bfloat16, _window64),
+        (2, 2, 256, 384, 64, torch.bfloat16, _prefix_only),
+    ],
+    ids=["causal_d64", "gqa_d128_fp16", "ragged_unequal", "empty_kv_tiles"],
+)
+def test_transposed_views_match_the_contiguous_path(
+    hq: int, hkv: int, m: int, n: int, d: int, dtype: torch.dtype, mask_mod
+) -> None:
+    """``[B, S, H, D].transpose(1, 2)`` Q/K/V/dO (dK/dV ``empty_like`` keep the
+    layout) run the fused backward through rank-4 TMA maps: dK/dV bitwise the
+    contiguous run, dQ within reduce-add reordering, all within tolerance of
+    the fp32 reference; the empty KV tiles' zero rows land in the strided
+    dK/dV too."""
+    got_c, _, code_c = _run(
+        b=2, hq=hq, hkv=hkv, m=m, n=n, d=d, mask_mod=mask_mod, dtype=dtype
+    )
+    assert "'flex_strides'" not in code_c
+    got, ref, code = _run(
+        b=2,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=d,
+        mask_mod=mask_mod,
+        dtype=dtype,
+        layout="bshd",
+    )
+    _assert_rank4_maps(code)
+    assert got[1].stride() == (hkv * n * d, d, hkv * d, 1)
+    assert got[2].stride() == (hkv * n * d, d, hkv * d, 1)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+    if mask_mod is _prefix_only:
+        assert torch.all(got[1][:, :, 128:] == 0) and torch.all(got[2][:, :, 128:] == 0)
+
+
+@_gpu_test
+def test_packed_qkv_slices_backward() -> None:
+    got_c, _, _ = _run(b=2, hq=2, hkv=2, m=512, n=512, d=64, mask_mod=_causal)
+    got, ref, code = _run(
+        b=2, hq=2, hkv=2, m=512, n=512, d=64, mask_mod=_causal, layout="packed"
+    )
+    _assert_rank4_maps(code)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_transposed_views_persistent_walk() -> None:
+    """The CLC persistent walk decodes the head / batch per tile too."""
+    overrides = {"cute_flash_bwd_persistent": 1}
+    got_c, _, _ = _run(
+        b=2,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=64,
+        mask_mod=_causal,
+        config_overrides=overrides,
+    )
+    got, ref, code = _run(
+        b=2,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=64,
+        mask_mod=_causal,
+        config_overrides=overrides,
+        layout="bshd",
+    )
+    assert "fbwd_tissued_ptr" in code
+    _assert_rank4_maps(code)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_transposed_o_and_do_preprocess_is_bitwise() -> None:
+    """The preprocess reads O / dO through their 4-D views (no host copy):
+    transposed inputs give bitwise the contiguous ``delta`` / ``lse2``."""
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    o = torch.randn((2, 4, 512, 64), device=DEVICE, dtype=torch.bfloat16, generator=gen)
+    do = torch.randn(
+        (2, 4, 512, 64), device=DEVICE, dtype=torch.bfloat16, generator=gen
+    )
+    lse = torch.randn((2, 4, 512), device=DEVICE, dtype=torch.float32, generator=gen)
+    lse[0, 0, :7] = float("-inf")
+    pre = flex_example._flex_attention_bwd_preprocess
+    for args in ((o, do, lse), (_as_bshd(o), _as_bshd(do), lse)):
+        pre_bound = pre.bind(args)
+        pre_bound.set_config(pre_bound.config_spec.default_config())
+    delta_c, lse2_c = pre(o, do, lse)
+    delta, lse2 = pre(_as_bshd(o), _as_bshd(do), lse)
+    torch.cuda.synchronize()
+    assert torch.equal(delta, delta_c)
+    assert torch.equal(lse2, lse2_c)
+    expected = (o.float() * do.float()).sum(-1)
+    torch.testing.assert_close(delta_c, expected, atol=1e-2, rtol=1e-3)
+    assert torch.all(lse2_c[0, 0, :7] == 0)

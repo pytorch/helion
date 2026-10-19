@@ -259,6 +259,25 @@ def _render_hooks(
     return hooks, plain, masked, jac
 
 
+def _fbwd_operand_index(plan: FlexBwdPlan) -> tuple[str, str, str]:
+    """The trailing coordinates of the K/V/dK/dV and Q/dO gmem views and the
+    per-step decode of the Q head: ``(k_index, q_index, hq_decode)``.
+
+    Contiguous operands are ``(seq, D, B*H)`` maps indexed by the collapsed
+    batch head (``fbwd_bhk`` / ``fbwd_bhq``); strided operands
+    (``plan.operand_strides``) are ``(seq, D, H, B)`` maps indexed by the
+    head and the batch (``fbwd_hk`` / ``fbwd_b`` are decoded per tile, the Q
+    head of a step from its collapsed index).
+    """
+    if plan.operand_strides is None:
+        return "fbwd_bhk", "fbwd_bhq", ""
+    return (
+        "fbwd_hk, fbwd_b",
+        "fbwd_hq, fbwd_b",
+        f"\n            fbwd_hq = fbwd_bhq - fbwd_b * {plan.heads}",
+    )
+
+
 def _compute_block(
     *,
     h: int,
@@ -297,6 +316,7 @@ def _compute_block(
     from .cute_flash_bwd import _fbwd_epilogue_block
 
     d = plan.head_dim
+    k_index, _, _ = _fbwd_operand_index(plan)
     warp_lo, warp_hi = (4, 8) if h == 0 else (8, 12)
     has_score = plan.score_region is not None and not bias_fold
     has_grad = plan.grad_region is not None
@@ -428,7 +448,7 @@ def _compute_block(
         io_dtype=io_dtype,
         dkv_wait="fbwd_nz_it % 2" if persistent else "0",
         v_empty_expr="storage.v_mbar_ptr.data_ptr() + 1",
-        gm_expr=("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") + "[None, None, fbwd_bhk]",
+        gm_expr=("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") + f"[None, None, {k_index}]",
     ).replace("FBWD_KV_SLOT", "0")
     if persistent and h == 1:
         # The dK staging (sdS) is free for the next tile's first dS once the
@@ -446,7 +466,7 @@ def _compute_block(
         if fbwd_zrow < {plan.kv_seq}:
             fbwd_zeros = cute.make_rmem_tensor(cute.make_layout({d}), {io_dtype})
             fbwd_zeros.fill({io_dtype}(0.0))
-            fbwd_zdst = cute.make_tensor({zero_target}[None, None, fbwd_bhk][fbwd_zrow, None].iterator, cute.make_layout({d}))
+            fbwd_zdst = cute.make_tensor({zero_target}[None, None, {k_index}][fbwd_zrow, None].iterator, cute.make_layout({d}))
             cute.autovec_copy(fbwd_zeros, fbwd_zdst)
 """
     pin_line = (
@@ -937,6 +957,7 @@ def emit_flash_bwd_flex_device_body(
     from .cute_flash_bwd import _FBWD_2CTA_DS_OFFSETS
 
     d = plan.head_dim
+    k_index, q_index, hq_decode = _fbwd_operand_index(plan)
     dk_off = 256 + (64 if d == 64 else 128)
     dq_off = 384 if d == 64 else 128
     kv_stage = 1
@@ -1112,6 +1133,8 @@ def emit_flash_bwd_flex_device_body(
     step_decode = f"""            fbwd_e = cutlass.Int32(fbwd_sSteps[fbwd_tbase + fbwd_i])
             fbwd_m_tile = fbwd_e & 65535
             fbwd_bhq = fbwd_bhk * {plan.group} + ((fbwd_e >> 16) & 255)"""
+    # The TMA warp also needs the Q head of the step for the rank-4 maps.
+    tma_step_decode = step_decode + hq_decode
     aug = smem.aug_stages > 0
     stat_views = "".join(
         f"    {name} = storage.{field}.get_tensor(cute.make_layout(2 * 128))\n"
@@ -1284,7 +1307,7 @@ def emit_flash_bwd_flex_device_body(
         tab_alias = ""
         tma_k_issue = (
             "            fbwd_ke = fbwd_k_prod.acquire_and_advance()\n"
-            "            cute.copy(_fbwd_tma_k, tKgK_kdl[None, None, 0, fbwd_bhk][None, fbwd_n_tile], tKsK[None, fbwd_ke.index], tma_bar_ptr=fbwd_ke.barrier)\n"
+            f"            cute.copy(_fbwd_tma_k, tKgK_kdl[None, None, 0, {k_index}][None, fbwd_n_tile], tKsK[None, fbwd_ke.index], tma_bar_ptr=fbwd_ke.barrier)\n"
         )
         tma_issued = (
             "        cute.arch.sync_warp()\n"
@@ -1311,7 +1334,7 @@ def emit_flash_bwd_flex_device_body(
             "        # K stage is never recycled, so its producer state ends here (no tail).\n"
             "        if fbwd_steps > 0:\n"
             "            fbwd_ke = fbwd_k_prod.acquire_and_advance()\n"
-            "            cute.copy(_fbwd_tma_k, tKgK_kdl[None, None, 0, fbwd_bhk][None, fbwd_n_tile], tKsK[None, fbwd_ke.index], tma_bar_ptr=fbwd_ke.barrier)\n"
+            f"            cute.copy(_fbwd_tma_k, tKgK_kdl[None, None, 0, {k_index}][None, fbwd_n_tile], tKsK[None, fbwd_ke.index], tma_bar_ptr=fbwd_ke.barrier)\n"
             + _step_table_loop(plan)
             + "    cute.arch.sync_threads()\n"
         )
@@ -1324,20 +1347,20 @@ def emit_flash_bwd_flex_device_body(
 {tma_k_issue}            # First step's Q ahead of V (S = K Q^T is the first MMA; dP = V dO^T follows).
             fbwd_e = cutlass.Int32(fbwd_sSteps[fbwd_tbase])
             fbwd_m_tile = fbwd_e & 65535
-            fbwd_bhq = fbwd_bhk * {plan.group} + (fbwd_e >> 16 & 255)
-            tQgQ = tQgQ_qdl[None, None, 0, fbwd_bhq]
-            tDOgDO = tDOgDO_qdl[None, None, 0, fbwd_bhq]
+            fbwd_bhq = fbwd_bhk * {plan.group} + (fbwd_e >> 16 & 255){hq_decode}
+            tQgQ = tQgQ_qdl[None, None, 0, {q_index}]
+            tDOgDO = tDOgDO_qdl[None, None, 0, {q_index}]
             fbwd_qe = fbwd_q_prod.acquire_and_advance()
             cute.copy(_fbwd_tma_q, tQgQ[None, fbwd_m_tile], tQsQ[None, fbwd_qe.index], tma_bar_ptr=fbwd_qe.barrier)
-{aug_fill_first}            tVgV = tVgV_kdl[None, None, 0, fbwd_bhk]
+{aug_fill_first}            tVgV = tVgV_kdl[None, None, 0, {k_index}]
             fbwd_ve = fbwd_v_prod.acquire_and_advance()
             cute.copy(_fbwd_tma_v, tVgV[None, fbwd_n_tile], tVsV[None, fbwd_ve.index], tma_bar_ptr=fbwd_ve.barrier)
             fbwd_doe = fbwd_do_prod.acquire_and_advance()
             cute.copy(_fbwd_tma_do, tDOgDO[None, fbwd_m_tile], tDOsDO[None, fbwd_doe.index], tma_bar_ptr=fbwd_doe.barrier)
             for fbwd_i in cutlass.range(1, fbwd_steps, unroll=1):
-{textwrap.indent(step_decode, "    ")}
-                tQgQ = tQgQ_qdl[None, None, 0, fbwd_bhq]
-                tDOgDO = tDOgDO_qdl[None, None, 0, fbwd_bhq]
+{textwrap.indent(tma_step_decode, "    ")}
+                tQgQ = tQgQ_qdl[None, None, 0, {q_index}]
+                tDOgDO = tDOgDO_qdl[None, None, 0, {q_index}]
                 fbwd_qe = fbwd_q_prod.acquire_and_advance()
                 cute.copy(_fbwd_tma_q, tQgQ[None, fbwd_m_tile], tQsQ[None, fbwd_qe.index], tma_bar_ptr=fbwd_qe.barrier)
 {aug_fill_loop}                fbwd_doe = fbwd_do_prod.acquire_and_advance()
@@ -1650,6 +1673,7 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
     from .cute_flash_bwd import _FLASH_BWD_KERNEL_PARAMS
     from .flex_match import flex_host_scalar_device_name
     from .flex_match import flex_host_scalar_symbol
+    from .flex_match import flex_operand_strides
 
     df = cg.device_function
     plan = match.plan
@@ -1674,13 +1698,28 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         args[name] = df.tensor_arg(host_tensors[name], prefer_name=prefer_name)
     d = plan.head_dim
     batch, heads, kv_heads = plan.batch, plan.heads, plan.kv_heads
+    # The six operands must carry the strides the matcher recorded (the
+    # launcher's TMA maps are built from them); dQ, LSE and delta stay
+    # contiguous.
+    operand_names = (
+        match.q_name,
+        match.do_name,
+        match.k_name,
+        match.v_name,
+        match.dk_name,
+        match.dv_name,
+    )
+    for name, shape, strides in zip(
+        operand_names, plan.operand_shapes, plan.strides, strict=True
+    ):
+        fake = args[name].fake_value
+        if (
+            tuple(int(s) for s in fake.shape) != shape
+            or fake.dtype != plan.io_dtype
+            or flex_operand_strides(fake) != strides
+        ):
+            return False
     checks = (
-        (match.q_name, (batch, heads, plan.q_seq, d), plan.io_dtype),
-        (match.do_name, (batch, heads, plan.q_seq, plan.head_dim_v), plan.io_dtype),
-        (match.k_name, (batch, kv_heads, plan.kv_seq, d), plan.io_dtype),
-        (match.v_name, (batch, kv_heads, plan.kv_seq, plan.head_dim_v), plan.io_dtype),
-        (match.dk_name, (batch, kv_heads, plan.kv_seq, d), plan.io_dtype),
-        (match.dv_name, (batch, kv_heads, plan.kv_seq, plan.head_dim_v), plan.io_dtype),
         (match.dq_name, (batch, heads, plan.q_seq, d), torch.float32),
         (match.lse_name, (batch, heads, plan.q_seq), torch.float32),
         (match.delta_name, (batch, heads, plan.q_seq), torch.float32),
@@ -1822,6 +1861,14 @@ def codegen_attention_flash_bwd_flex(cg: GenerateAST, match: FlexBwdMatch) -> bo
         "flex_dq_boxes": dq_boxes,
         "flex_aug_stages": smem.aug_stages,
     }
+    if plan.operand_strides is not None:
+        # Strided operands: the launcher builds rank-4 (S, D, H, B) maps for
+        # Q / dO / K / V / dK / dV from these strides (the device body
+        # indexes them by head and batch).
+        wrapper_plan["flex_strides"] = plan.operand_strides
+        wrapper_plan["flex_batch"] = batch
+        wrapper_plan["flex_heads"] = heads
+        wrapper_plan["flex_kv_heads"] = kv_heads
     cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
     df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
     if smem.aug_stages:

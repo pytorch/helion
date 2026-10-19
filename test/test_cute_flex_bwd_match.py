@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import logging
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
@@ -32,7 +34,9 @@ from helion._compiler.cute.cute_flash_bwd_flex import fbwd_aux_smem_candidates
 from helion._compiler.cute.flex_bwd_match import FlexBwdMatch
 from helion._compiler.cute.flex_bwd_match import match_flex_attention_bwd
 from helion._testing import EXAMPLES_DIR
+from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.runtime.kernel import Kernel
@@ -382,3 +386,208 @@ def test_declines_kv_block_other_than_128() -> None:
     reasons: list[str] = []
     assert _match(_bind(_args(t, _causal, block_size=(128, 64))), reasons) is None
     assert any("KB" in r for r in reasons), reasons
+
+
+# -- strided operands ---------------------------------------------------------
+
+
+def _transposed_tensors(
+    batch: int = 2,
+    heads: int = 4,
+    q_seq: int = 512,
+    kv_seq: int = 512,
+    head_dim: int = 64,
+    *,
+    kv_heads: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """``[B, H, S, D]`` views of ``[B, S, H, D]`` allocations (the layout
+    every model produces); LSE stays contiguous."""
+    kv_heads = heads if kv_heads is None else kv_heads
+    dtype = torch.bfloat16
+
+    def view(b: int, s: int, h: int, d: int) -> torch.Tensor:
+        return torch.randn(b, s, h, d, dtype=dtype).transpose(1, 2)
+
+    return {
+        "q": view(batch, q_seq, heads, head_dim),
+        "k": view(batch, kv_seq, kv_heads, head_dim),
+        "v": view(batch, kv_seq, kv_heads, head_dim),
+        "do": view(batch, q_seq, heads, head_dim),
+        "lse": torch.randn(batch, heads, q_seq, dtype=torch.float32),
+        "out": view(batch, q_seq, heads, head_dim),
+    }
+
+
+def _wrapper_plan(code: str) -> dict[str, Any]:
+    import ast
+
+    for line in code.splitlines():
+        if "._helion_cute_wrapper_plans = " in line:
+            (plan,) = ast.literal_eval(line.split(" = ", 1)[1])
+            return plan
+    raise AssertionError("no wrapper plan in the generated module")
+
+
+def _host_lines(plan: dict[str, Any]) -> str:
+    from helion.runtime.cute import launcher
+
+    body: list[str] = []
+    call_args: list[str] = []
+    launcher._append_cute_wrapper_plan(body, call_args, plan, num_sm=148)
+    return "\n".join(body)
+
+
+def test_contiguous_operands_keep_the_rank3_maps() -> None:
+    """Contiguous operands: row-major strides recorded, ``operand_strides``
+    ``None``, the rank-3 ``(seq, D, B*H)`` render (the render-unchanged pin
+    of the strided work)."""
+    t = _tensors()
+    bound = _bind(_args(t, _causal))
+    match = _match_or_fail(bound)
+    plan = match.plan
+    assert plan.strides == ((131072, 32768, 64, 1),) * 6
+    assert plan.operand_strides is None
+    with _as_sm100():
+        code = bound.to_code(bound.config_spec.default_config())
+    wrapper = _wrapper_plan(code)
+    assert "flex_strides" not in wrapper
+    assert "tQgQ = tQgQ_qdl[None, None, 0, fbwd_bhq]" in code
+    assert "tKgK_kdl[None, None, 0, fbwd_bhk]" in code
+    assert "fbwd_hq = " not in code
+    assert (
+        "_fbwd_mQ = cute.make_tensor(arg0.iterator, cute.make_layout((512, 64, 8), "
+        "stride=(64, 1, 32768)))"
+    ) in _host_lines(wrapper)
+
+
+@pytest.mark.parametrize(("kv_heads", "head_dim"), [(4, 64), (2, 128)])
+def test_transposed_operands_take_the_rank4_maps(kv_heads: int, head_dim: int) -> None:
+    """Transposed Q/K/V/dO (dK/dV ``empty_like`` inherit the layout): the
+    matcher records the six strides, the surface is enabled, the render
+    indexes rank-4 ``(seq, D, H, B)`` views by head and batch (the Q head of
+    a step decoded from its collapsed index) and the launcher builds the maps
+    from the strides; dQ / LSE / delta stay flat."""
+    t = _transposed_tensors(head_dim=head_dim, kv_heads=kv_heads)
+    bound = _bind(_args(t, _causal))
+    match = _match_or_fail(bound)
+    plan = match.plan
+    q_st = (512 * 4 * head_dim, head_dim, 4 * head_dim, 1)
+    kv_st = (512 * kv_heads * head_dim, head_dim, kv_heads * head_dim, 1)
+    assert plan.strides == (q_st, q_st, kv_st, kv_st, kv_st, kv_st)
+    assert plan.operand_strides == plan.strides
+    spec = bound.config_spec
+    assert spec.cute_flash_bwd_search_enabled
+    # The same knob space (and seed) as the contiguous specialization.
+    contiguous = _bind(_args(_tensors(head_dim=head_dim, kv_heads=kv_heads), _causal))
+    assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
+    assert spec.default_config() == contiguous.config_spec.default_config()
+    with _as_sm100():
+        code = bound.to_code(spec.default_config())
+    assert "fbwd_sSteps" in code
+    wrapper = _wrapper_plan(code)
+    assert wrapper["flex_strides"] == plan.strides
+    assert (wrapper["flex_batch"], wrapper["flex_heads"], wrapper["flex_kv_heads"]) == (
+        2,
+        4,
+        kv_heads,
+    )
+    assert "fbwd_hq = fbwd_bhq - fbwd_b * 4" in code
+    assert "tQgQ = tQgQ_qdl[None, None, 0, fbwd_hq, fbwd_b]" in code
+    assert "tDOgDO = tDOgDO_qdl[None, None, 0, fbwd_hq, fbwd_b]" in code
+    assert "tKgK_kdl[None, None, 0, fbwd_hk, fbwd_b]" in code
+    assert "tVgV = tVgV_kdl[None, None, 0, fbwd_hk, fbwd_b]" in code
+    assert "_fbwd_mdVt[None, None, fbwd_hk, fbwd_b]" in code
+    assert "_fbwd_mdKt[None, None, fbwd_hk, fbwd_b]" in code
+    assert "tQgQ_qdl[None, None, 0, fbwd_bhq]" not in code
+    assert "tKgK_kdl[None, None, 0, fbwd_bhk]" not in code
+    assert "[None, None, fbwd_bhk]" not in code
+    # The fp32 dQ reduce-add keeps the flat contiguous map.
+    assert "_fbwd_mDQt[None, None, fbwd_bhq]" in code
+    host = _host_lines(wrapper)
+    assert (
+        f"_fbwd_mQ = cute.make_tensor(arg0.iterator, cute.make_layout((512, {head_dim}, 4, 2), "
+        f"stride=({4 * head_dim}, 1, {head_dim}, {q_st[0]})))"
+    ) in host
+    assert (
+        f"_fbwd_mdK = cute.make_tensor(arg7.iterator, cute.make_layout((512, {head_dim}, {kv_heads}, 2), "
+        f"stride=({kv_heads * head_dim}, 1, {head_dim}, {kv_st[0]})))"
+    ) in host
+    assert (
+        "_fbwd_mDQ2 = cute.make_tensor(arg6.iterator, cute.make_layout((512, " in host
+    )
+
+
+def test_packed_qkv_slices_are_admitted() -> None:
+    qkv = torch.randn(2, 512, 4, 192, dtype=torch.bfloat16)
+    t = _tensors()
+    t["q"] = qkv[..., :64].transpose(1, 2)
+    t["k"] = qkv[..., 64:128].transpose(1, 2)
+    t["v"] = qkv[..., 128:].transpose(1, 2)
+    bound = _bind(_args(t, _causal))
+    plan = _match_or_fail(bound).plan
+    assert (
+        plan.strides[0] == plan.strides[2] == plan.strides[3] == (393216, 192, 768, 1)
+    )
+    # dO and dK / dV (``empty_like`` of the slice views) are dense.
+    assert plan.strides[1] == (131072, 32768, 64, 1)
+    assert plan.strides[4] == plan.strides[5] == (131072, 64, 256, 1)
+    assert bound.config_spec.cute_flash_bwd_search_enabled
+
+
+def test_unaligned_strides_decline_and_log(caplog: pytest.LogCaptureFixture) -> None:
+    """A dO view whose outer strides are not multiples of 16 bytes leaves the
+    fused path; the first decline reason is logged at DEBUG level."""
+    t = _tensors()
+    t["do"] = torch.randn(2, 512, 4, 68, dtype=torch.bfloat16)[..., :64].transpose(1, 2)
+    assert tuple(t["do"].stride()) == (139264, 68, 272, 1)
+    with caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.flex_bwd_match"):
+        bound = _bind(_args(t, _causal))
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == (
+        "flex_bwd: dO strides (139264, 68, 272, 1) are not a unit inner stride "
+        "with non-zero 16-byte aligned outer strides"
+    )
+    assert not bound.config_spec.cute_flash_bwd_search_enabled
+    assert any(
+        record.getMessage() == f"flex backward envelope declined: {reasons[0]}"
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+def test_expanded_operands_decline() -> None:
+    """Expanded (zero-stride) K/V are not TMA layouts: declined, so the
+    generic path serves them as before."""
+    t = _tensors()
+    t["k"] = torch.randn(1, 4, 512, 64, dtype=torch.bfloat16).expand(2, 4, 512, 64)
+    t["v"] = torch.randn(2, 1, 512, 64, dtype=torch.bfloat16).expand(2, 4, 512, 64)
+    assert t["k"].stride()[0] == 0 and t["v"].stride()[1] == 0
+    bound = _bind(_args(t, _causal))
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == (
+        "flex_bwd: K strides (0, 32768, 64, 1) are not a unit inner stride "
+        "with non-zero 16-byte aligned outer strides"
+    )
+    assert not bound.config_spec.cute_flash_bwd_search_enabled
+
+
+def _without_source_comments(code: str) -> str:
+    """The generated module without its ``# src[file:line]`` comments (line
+    numbers of the example source, not generated code)."""
+    return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
+
+
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
+class TestContiguousRenderPin(TestCase):
+    """The exact text of one contiguous backward render (the
+    ``.expected_cute`` journal next to this file): the strided-operand
+    support must not change the code contiguous inputs produce."""
+
+    def test_contiguous_backward_render(self) -> None:
+        bound = _bind(_args(_tensors(), _causal))
+        with _as_sm100():
+            code = bound.to_code(bound.config_spec.default_config())
+        assert "'flex_strides'" not in code
+        self.assertExpectedJournal(_without_source_comments(code))

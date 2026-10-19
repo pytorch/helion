@@ -163,6 +163,10 @@ class FlashGraphOutputPlan(NamedTuple):
     tensor_4d_heads: int | None = None
     kv_walk_names: tuple[str, ...] = ()
     aux_names: tuple[str, ...] = ()
+    # Flex operands that are not all contiguous: the ``(Q, K, V, O)`` strides
+    # (``flex_match.flex_operand_strides`` form) the rank-4 ``(S, D, H, B)``
+    # TMA maps are built from; ``None`` keeps the rank-3 contiguous maps.
+    operand_strides: tuple[tuple[int, ...], ...] | None = None
 
     @property
     def value_head_dim(self) -> int:
@@ -196,6 +200,7 @@ def _flash_flex_graph_output_plan(match: FlexMatch) -> FlashGraphOutputPlan:
         tensor_4d_heads=match.heads,
         kv_walk_names=match.table_names,
         aux_names=match.aux_names,
+        operand_strides=match.operand_strides,
     )
 
 
@@ -14501,12 +14506,13 @@ flash_batch = flash_bh // {tensor_4d_heads}"""
     if prelude == "decode":
         return textwrap.indent(decode, indent)
     if tensor_4d_heads > 0:
+        kv_head = _flash_kv_bh_expr(kv_group, "flash_head")
         body = (
             decode
-            + """
+            + f"""
 tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]
-tKgK = tKgK_kdl[None, None, 0, flash_head, flash_batch]
-tVgV = tVgV_dkl[None, 0, None, flash_head, flash_batch]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_head}, flash_batch]
+tVgV = tVgV_dkl[None, 0, None, {kv_head}, flash_batch]"""
         )
         return textwrap.indent(body, indent)
     kv_bh = _flash_kv_bh_expr(kv_group)
@@ -15653,6 +15659,7 @@ def emit_flash_fa4_device_body(
     flex_words_pairs: int | None = None,
     kv_split: int | None = None,
     flex_split_arg: str | None = None,
+    operand_strides: tuple[tuple[int, ...], ...] | None = None,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -15758,9 +15765,11 @@ def emit_flash_fa4_device_body(
     assert q_stage == 2
     s_corr_stage = 2
     assert total_tiles % num_bh == 0
-    # Grouped-query K/V slices read batch head ``flash_bh // kv_group``.
+    # Grouped-query K/V slices read batch head ``flash_bh // kv_group`` (the
+    # rank-4 maps: head ``flash_head // kv_group`` of batch ``flash_batch``).
     kv_group = score_plan.kv_group
     kv_bh = _flash_kv_bh_expr(kv_group)
+    kv_head = _flash_kv_bh_expr(kv_group, "flash_head")
     if cfg.skip_rescale_stats:
         cfg = dataclasses.replace(cfg, skip_rescale_stats=False)
     is_causal = score_plan.is_causal
@@ -16052,12 +16061,18 @@ def emit_flash_fa4_device_body(
         use_tmem_row_reduce and not is_causal and not cfg.softmax_disc
     )
     persistent = cfg.persistent
+    # Rank-4 ``(S, D, H, B)`` operand maps: the dense fp16/hd64 family's knob,
+    # or strided flex operands (``operand_strides``, the ``(Q, K, V, O)``
+    # strides the launcher builds the maps from; K/V carry their own head
+    # count and the split-KV merge store addresses O by its strides).
+    strided_operands = operand_strides is not None
     use_tensor_4d_tma = (
-        cfg.tensor_4d_tma
+        (cfg.tensor_4d_tma or strided_operands)
         and tensor_4d_batch > 0
         and tensor_4d_heads > 0
         and tensor_4d_batch * tensor_4d_heads == num_bh
     )
+    assert use_tensor_4d_tma or not strided_operands
     if not use_tensor_4d_tma:
         tensor_4d_heads = 0
     use_2cta_instrs = cfg.use_2cta_instrs
@@ -16846,8 +16861,8 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
 flash_head = flash_bh % {tensor_4d_heads}
 flash_batch = flash_bh // {tensor_4d_heads}
 tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]
-tKgK = tKgK_kdl[None, None, 0, flash_head, flash_batch]
-tVgV = tVgV_dkl[None, 0, None, flash_head, flash_batch]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_head}, flash_batch]
+tVgV = tVgV_dkl[None, 0, None, {kv_head}, flash_batch]"""
     elif causal_head_pair:
         setup_gmem_slice = f"""
 tQgQ0 = tQgQ_qdl[None, None, 0, flash_bh0]
@@ -17882,8 +17897,8 @@ if warp_idx == 15:
             )
         elif use_tensor_4d_tma:
             load_mq_cur = "_flash_mQt[None, None, flash_head, flash_batch]"
-            load_mk_cur = "_flash_mKt[None, None, flash_head, flash_batch]"
-            load_mv_cur = "_flash_mVt[None, None, flash_head, flash_batch]"
+            load_mk_cur = f"_flash_mKt[None, None, {kv_head}, flash_batch]"
+            load_mv_cur = f"_flash_mVt[None, None, {kv_head}, flash_batch]"
         else:
             load_mq_cur = "_flash_mQt[None, None, flash_bh]"
             load_mk_cur = f"_flash_mKt[None, None, {kv_bh}]"
@@ -21715,10 +21730,22 @@ if warp_idx == 15:
         )
         for split in range(splits):
             merge.append(f"    flash_split_gP{split} = {partial_tile(str(split))}")
-        o_offset = f"(flash_bh * {flex_q_seq} + flash_m_tile{stage} * 128) * {hd_v}"
+        if operand_strides is not None:
+            # Strided O: the tile's first element by the recorded strides
+            # (each a multiple of the 16-byte alignment), rows ``o_st[2]``
+            # elements apart.
+            o_st = operand_strides[3]
+            o_offset = (
+                f"(flash_batch * {o_st[0]} + flash_head * {o_st[1]}"
+                f" + flash_m_tile{stage} * {128 * o_st[2]})"
+            )
+            o_row_stride = o_st[2]
+        else:
+            o_offset = f"(flash_bh * {flex_q_seq} + flash_m_tile{stage} * 128) * {hd_v}"
+            o_row_stride = hd_v
         merge.append(
             f"    flash_split_gO = cute.make_tensor({o_view}.iterator + cute.assume("
-            f"{o_offset}, divby=8), cute.make_layout((128, {hd_v}), stride=({hd_v}, 1)))"
+            f"{o_offset}, divby=8), cute.make_layout((128, {hd_v}), stride=({o_row_stride}, 1)))"
         )
         partials = ", ".join(f"flash_split_gP{split}" for split in range(splits))
         weights = ", ".join(
@@ -22518,6 +22545,8 @@ class FlashTensorPlan(NamedTuple):
     # launcher indexes ``_flash_scale`` by argument position).
     flex_scalar_arg_names: tuple[str, ...] = ()
     flex_scale_arg_name: str | None = None
+    # Strided flex operands (``FlashGraphOutputPlan.operand_strides``).
+    operand_strides: tuple[tuple[int, ...], ...] | None = None
 
     @property
     def value_head_dim(self) -> int:
@@ -22537,6 +22566,7 @@ def _flash_flex_tensor_plan(
     from ..host_function import HostFunction
     from .flex_match import flex_host_scalar_device_name
     from .flex_match import flex_host_scalar_symbol
+    from .flex_match import flex_operand_strides
 
     plan = match.plan
     walk = plan.kv_walk
@@ -22562,21 +22592,37 @@ def _flash_flex_tensor_plan(
         prefer_name = name if name.isidentifier() else None
         args[name] = df.tensor_arg(host_tensors[name], prefer_name=prefer_name)
     batch, heads, kv_heads = match.batch, match.heads, match.kv_heads
-    for name, expected_shape, expected_dtype in (
-        (match.q_name, (batch, heads, match.q_seq, match.head_dim), match.io_dtype),
-        (match.k_name, (batch, kv_heads, match.kv_seq, match.head_dim), match.io_dtype),
+    for name, expected_shape, expected_dtype, expected_strides in (
+        (
+            match.q_name,
+            (batch, heads, match.q_seq, match.head_dim),
+            match.io_dtype,
+            match.q_strides,
+        ),
+        (
+            match.k_name,
+            (batch, kv_heads, match.kv_seq, match.head_dim),
+            match.io_dtype,
+            match.k_strides,
+        ),
         (
             match.v_name,
             (batch, kv_heads, match.kv_seq, match.head_dim_v),
             match.io_dtype,
+            match.v_strides,
         ),
-        (match.o_name, (batch, heads, match.q_seq, match.head_dim_v), match.io_dtype),
+        (
+            match.o_name,
+            (batch, heads, match.q_seq, match.head_dim_v),
+            match.io_dtype,
+            match.o_strides,
+        ),
     ):
         value = args[name].fake_value
         if (
             tuple(int(size) for size in value.shape) != expected_shape
             or value.dtype != expected_dtype
-            or not value.is_contiguous()
+            or flex_operand_strides(value) != expected_strides
         ):
             return None
     lse_arg = None
@@ -22656,6 +22702,7 @@ def _flash_flex_tensor_plan(
         flex_scale_expr=scale_expr,
         flex_scalar_arg_names=tuple(scalar_arg_names),
         flex_scale_arg_name=scale_arg_name,
+        operand_strides=match.operand_strides,
     )
 
 
@@ -23138,7 +23185,12 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         clc_heads_per_batch = batch
     if clc_heads_per_batch != cfg.clc_heads_per_batch:
         cfg = dataclasses.replace(cfg, clc_heads_per_batch=clc_heads_per_batch)
-    use_tensor_4d_tma = (
+    # Strided flex operands (a ``[B, S, H, D]`` transpose, a packed-QKV slice)
+    # are addressed through rank-4 ``(S, D, H, B)`` TMA maps built from their
+    # strides: the dense 4D-TMA family's device indexing, with grouped K/V
+    # heads and separate Q / K/V geometries.
+    strided_operands = plan.operand_strides is not None
+    use_tensor_4d_tma = strided_operands or (
         cfg.tensor_4d_tma
         and not is_causal
         and head_dim == 64
@@ -23147,10 +23199,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         and plan.tensor_4d_heads > 0
         and not score_plan.modifiers
     )
-    # BHSD descriptors address Q's full head set. The tensor plan only proves
-    # the 4D geometry when the K/V bases match Q's, which grouped K/V heads
-    # never do, so the 4D device and launcher paths never see kv_group > 1.
-    assert not (use_tensor_4d_tma and kv_group != 1)
+    # BHSD descriptors address Q's full head set. The dense tensor plan only
+    # proves the 4D geometry when the K/V bases match Q's, which grouped K/V
+    # heads never do; the strided flex maps carry the K/V head count.
+    assert not (use_tensor_4d_tma and kv_group != 1 and not strided_operands)
     if (
         cfg.small_biased
         and row_emit is None
@@ -23352,6 +23404,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     if use_tensor_4d_tma:
         wrapper_plan["tensor_4d_batch"] = plan.tensor_4d_batch
         wrapper_plan["tensor_4d_heads"] = plan.tensor_4d_heads
+    if strided_operands:
+        wrapper_plan["operand_strides"] = plan.operand_strides
     if cfg.use_clc_scheduler and cfg.clc_use_pdl:
         wrapper_plan["use_pdl"] = True
     if lse_arg is not None:
@@ -23605,6 +23659,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 score_plan=score_plan,
                 tensor_4d_batch=plan.tensor_4d_batch if use_tensor_4d_tma else 0,
                 tensor_4d_heads=plan.tensor_4d_heads if use_tensor_4d_tma else 0,
+                operand_strides=plan.operand_strides,
                 target_device_capability=(
                     CompileEnvironment.current().config_spec.target_device_capability
                 ),

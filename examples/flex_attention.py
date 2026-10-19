@@ -295,22 +295,24 @@ def _flex_attention_bwd_preprocess(
     (fp32) and the forward's natural-log LSE in the exp2 base, ``lse2 = lse *
     log2(e)``, with a row that saw no key (``lse == -inf``) mapped to 0 so the
     main kernel's ``score * log2(e) - lse2`` stays finite (its P is 0 anyway:
-    every score of such a row is masked)."""
-    head_dim = hl.specialize(o_in.size(-1))
-    o = o_in.reshape(-1, head_dim)
-    do = do_in.reshape(-1, head_dim)
-    lse = lse_in.reshape(-1)
-    total = o.size(0)
-    delta = torch.empty(total, device=o.device, dtype=torch.float32)
-    lse2 = torch.empty(total, device=o.device, dtype=torch.float32)
+    every score of such a row is masked).
+
+    ``o_in`` / ``do_in`` are indexed as the ``[B, H, M, D]`` views they are
+    (a ``[B, S, H, D]`` allocation's transpose included): a row-flattening
+    reshape would copy such views on the host before every backward."""
+    B, H, M, _ = o_in.size()
+    delta = torch.empty((B, H, M), device=o_in.device, dtype=torch.float32)
+    lse2 = torch.empty((B, H, M), device=o_in.device, dtype=torch.float32)
     log_2_e = 1.44269504
-    for tile in hl.tile(total):
-        delta[tile] = torch.sum(
-            o[tile, :].to(torch.float32) * do[tile, :].to(torch.float32), dim=-1
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o_in[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do_in[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        lse_rows = lse_in[tile_b, tile_h, tile_m]
+        lse2[tile_b, tile_h, tile_m] = (
+            torch.where(lse_rows == float("-inf"), 0.0, lse_rows) * log_2_e
         )
-        lse_row = lse[tile]
-        lse2[tile] = torch.where(lse_row == float("-inf"), 0.0, lse_row) * log_2_e
-    return delta.reshape(o_in.size()[:-1]), lse2.reshape(o_in.size()[:-1])
+    return delta, lse2
 
 
 def _gradient_accuracy_check(actual: object, expected: object) -> None:

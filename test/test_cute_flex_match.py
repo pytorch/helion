@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import logging
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
@@ -26,6 +28,7 @@ pytest.importorskip("cutlass.cute")
 
 from test._cute_aux import _cpu_codegen
 
+import helion
 from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flex_match
@@ -37,7 +40,9 @@ from helion._compiler.cute.flex_match import match_flex_envelope
 from helion._compiler.variable_origin import ClosureOrigin
 from helion._compiler.variable_origin import NameOrigin
 from helion._testing import EXAMPLES_DIR
+from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.runtime.kernel import Kernel
@@ -880,3 +885,313 @@ def test_declared_ceiling_below_128_keeps_the_generic_path(
     q_spec = spec.block_sizes.block_id_lookup(0)
     assert (q_spec.declared_max_size, q_spec.max_size) == (64, 64)
     assert spec.default_config().block_sizes[0] <= 64
+
+
+# -- strided operands ---------------------------------------------------------
+
+
+def _transposed(*shape: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """A ``[B, H, S, D]`` view of a ``[B, S, H, D]`` allocation (the layout
+    every model produces)."""
+    batch, heads, seq, head_dim = shape
+    return torch.randn(batch, seq, heads, head_dim, dtype=dtype).transpose(1, 2)
+
+
+def _packed_qkv(
+    batch: int, heads: int, seq: int, head_dim: int, *, pad: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q/K/V as head-dim slices of one ``[B, S, H, 3 * D (+ pad)]`` buffer."""
+    qkv = torch.randn(batch, seq, heads, 3 * head_dim + pad, dtype=torch.float16)
+    q = qkv[..., :head_dim].transpose(1, 2)
+    k = qkv[..., head_dim : 2 * head_dim].transpose(1, 2)
+    v = qkv[..., 2 * head_dim : 3 * head_dim].transpose(1, 2)
+    return q, k, v
+
+
+def _wrapper_plan(code: str) -> dict[str, Any]:
+    """The flash wrapper plan embedded in a generated module."""
+    import ast
+
+    for line in code.splitlines():
+        if "._helion_cute_wrapper_plans = " in line:
+            (plan,) = ast.literal_eval(line.split(" = ", 1)[1])
+            return plan
+    raise AssertionError("no wrapper plan in the generated module")
+
+
+def _host_lines(plan: dict[str, Any]) -> list[str]:
+    """The launcher's host-wrapper lines for ``plan`` (built on the CPU)."""
+    from helion.runtime.cute import launcher
+
+    body: list[str] = []
+    call_args: list[str] = []
+    launcher._append_cute_wrapper_plan(body, call_args, plan, num_sm=148)
+    return body
+
+
+def test_contiguous_operands_keep_the_rank3_maps() -> None:
+    """Contiguous Q/K/V/O record row-major strides, ``operand_strides`` is
+    ``None`` and the render is the rank-3 ``(S, D, B*H)`` path: no
+    ``operand_strides`` entry in the wrapper plan, the collapsed batch head
+    indexes the TMA views (the render-unchanged pin of the strided work)."""
+    q, k, v = _qkv()
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    match = _match_or_fail(bound)
+    assert (
+        match.q_strides == match.k_strides == match.o_strides == (262144, 65536, 64, 1)
+    )
+    assert match.operand_strides is None
+    with _as_sm100(flex=True):
+        code = bound.to_code(bound.config_spec.default_config())
+    plan = _wrapper_plan(code)
+    assert "operand_strides" not in plan
+    assert "tQgQ = tQgQ_qdl[None, None, 0, flash_bh]" in code
+    assert "flash_head, flash_batch]" not in code
+    assert any(
+        "_flash_mQ = cute.make_tensor(arg0.iterator, cute.make_layout((1024, 64, 8), "
+        "stride=(64, 1, 65536)))" in line
+        for line in _host_lines(plan)
+    )
+
+
+@pytest.mark.parametrize("kv_heads", [4, 2])
+def test_transposed_operands_take_the_rank4_maps(kv_heads: int) -> None:
+    """``[B, S, H, D].transpose(1, 2)`` Q/K/V (and the O ``empty_like``
+    inherits the layout): the matcher records the strides, the surface is
+    the same as the contiguous one, and the render indexes rank-4
+    ``(S, D, H, B)`` TMA views by head and batch (K/V by the grouped head)
+    built by the launcher from the recorded strides."""
+    q = _transposed(2, 4, 1024, 64)
+    k = _transposed(2, kv_heads, 1024, 64)
+    v = _transposed(2, kv_heads, 1024, 64)
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(
+        _flex_kernel(),
+        _flex_args(q, k, v, _identity, block_mask, enable_gqa=kv_heads != 4),
+        flex=True,
+    )
+    match = _match_or_fail(bound)
+    assert match.q_strides == match.o_strides == (262144, 64, 256, 1)
+    assert (
+        match.k_strides == match.v_strides == (kv_heads * 65536, 64, kv_heads * 64, 1)
+    )
+    assert match.operand_strides == (
+        match.q_strides,
+        match.k_strides,
+        match.v_strides,
+        match.o_strides,
+    )
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_block_size_targets == {0: 128, 1: 128}
+    # The same knob space (and seed) as the contiguous specialization.
+    contiguous = _bind(
+        _flex_kernel(),
+        _flex_args(
+            *_qkv(kv_heads=kv_heads), _identity, block_mask, enable_gqa=kv_heads != 4
+        ),
+        flex=True,
+    )
+    assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
+    config = spec.default_config()
+    assert config == contiguous.config_spec.default_config()
+    with _as_sm100(flex=True):
+        code = bound.to_code(config)
+    assert "flash_flex_status" in code
+    plan = _wrapper_plan(code)
+    assert plan["operand_strides"] == match.operand_strides
+    assert (plan["tensor_4d_batch"], plan["tensor_4d_heads"]) == (2, 4)
+    assert "flash_head = flash_bh % 4" in code
+    assert "tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]" in code
+    kv_head = "flash_head" if kv_heads == 4 else "flash_head // 2"
+    assert f"tKgK = tKgK_kdl[None, None, 0, {kv_head}, flash_batch]" in code
+    assert f"tVgV = tVgV_dkl[None, 0, None, {kv_head}, flash_batch]" in code
+    assert "tQgQ_qdl[None, None, 0, flash_bh]" not in code
+    host = "\n".join(_host_lines(plan))
+    assert (
+        "_flash_mQ = cute.make_tensor(arg0.iterator, cute.make_layout((1024, 64, 4, 2), "
+        "stride=(256, 1, 64, 262144)))"
+    ) in host
+    assert (
+        f"_flash_mK = cute.make_tensor(arg1.iterator, cute.make_layout((1024, 64, {kv_heads}, 2), "
+        f"stride=({kv_heads * 64}, 1, 64, {kv_heads * 65536})))"
+    ) in host
+    assert (
+        f"_flash_mV = cute.make_tensor(arg2.iterator, cute.make_layout((64, 1024, {kv_heads}, 2), "
+        f"stride=(1, {kv_heads * 64}, 64, {kv_heads * 65536})))"
+    ) in host
+    assert (
+        "_flash_mO = cute.make_tensor(arg3.iterator, cute.make_layout((1024, 64, 4, 2), "
+        "stride=(256, 1, 64, 262144)))"
+    ) in host
+
+
+def test_strided_epilogues_address_o_by_its_strides() -> None:
+    """Every output path of the transposed case addresses O through the
+    rank-4 view: the TMA store, the staged store and the split-KV merge
+    (which builds its tile from the recorded strides)."""
+    q, k, v = (_transposed(2, 4, 1024, 64) for _ in range(3))
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    base = bound.config_spec.default_config().config
+    renders: dict[str, str] = {}
+    with _as_sm100(flex=True):
+        for name, overrides in (
+            (
+                "tma",
+                {
+                    "cute_flash_epi_tma": True,
+                    "cute_flash_epi_stg": False,
+                    "cute_flash_kv_split": 1,
+                },
+            ),
+            (
+                "stg",
+                {
+                    "cute_flash_epi_tma": False,
+                    "cute_flash_epi_stg": True,
+                    "cute_flash_kv_split": 1,
+                },
+            ),
+            (
+                "split",
+                {
+                    "cute_flash_epi_tma": False,
+                    "cute_flash_epi_stg": True,
+                    "cute_flash_kv_split": 2,
+                },
+            ),
+        ):
+            renders[name] = bound.to_code(helion.Config(**{**base, **overrides}))
+    assert "tOgO_tma[None, flash_m_tile0, 0, flash_head, flash_batch]" in renders["tma"]
+    assert (
+        "flash_mO_cur = _flash_mOt[None, None, flash_head, flash_batch]"
+        in renders["stg"]
+    )
+    assert (
+        "cute.assume(flash_batch * 262144 + flash_head * 64 + flash_m_tile0 * 32768, "
+        "divby=8), cute.make_layout((128, 64), stride=(256, 1)))"
+    ) in renders["split"]
+    for code in renders.values():
+        assert "flash_bh * 1024" not in code
+
+
+def test_packed_qkv_slices_are_admitted() -> None:
+    """Head-dim slices of one packed QKV buffer: outer strides of ``3 * D``
+    (16-byte aligned) are admitted; the O ``empty_like`` of the slice view is
+    a dense ``[B, S, H, D]`` allocation."""
+    q, k, v = _packed_qkv(2, 4, 1024, 64)
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    match = _match_or_fail(bound)
+    assert (
+        match.q_strides == match.k_strides == match.v_strides == (786432, 192, 768, 1)
+    )
+    assert match.o_strides == (262144, 64, 256, 1)
+    assert bound.config_spec.cute_flash_search_enabled
+    with _as_sm100(flex=True):
+        code = bound.to_code(bound.config_spec.default_config())
+    assert _wrapper_plan(code)["operand_strides"] == match.operand_strides
+
+
+@pytest.mark.parametrize("case", ["misaligned", "non_unit_inner"])
+def test_unaligned_strides_decline_and_log(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A head-dim slice whose outer stride is not a multiple of 16 bytes, or a
+    non-unit inner stride, leaves the fused path (the TMA descriptors cannot
+    describe it); the first decline reason is logged at DEBUG level."""
+    if case == "misaligned":
+        q, k, v = _packed_qkv(2, 4, 1024, 64, pad=4)
+        expected_strides = (802816, 196, 784, 1)
+    else:
+        q, k, v = (
+            torch.randn(2, 4, 1024, 128, dtype=torch.float16)[..., ::2]
+            for _ in range(3)
+        )
+        expected_strides = (524288, 131072, 128, 2)
+    assert tuple(q.stride()) == expected_strides
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    with caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.flex_match"):
+        bound = _bind(
+            _flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True
+        )
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == (
+        f"flex: Q strides {expected_strides} are not a unit inner stride with "
+        "non-zero 16-byte aligned outer strides"
+    )
+    assert not bound.config_spec.cute_flash_search_enabled
+    assert any(
+        record.getMessage() == f"flex forward envelope declined: {reasons[0]}"
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+def test_expanded_operands_decline() -> None:
+    """A zero stride on a dimension wider than one (``expand``) is not a TMA
+    layout: declined (the generic path serves it), in K/V and in O alike."""
+    q, _, _ = _qkv()
+    k = torch.randn(1, 4, 1024, 64, dtype=torch.float16).expand(2, 4, 1024, 64)
+    v = torch.randn(2, 1, 1024, 64, dtype=torch.float16).expand(2, 4, 1024, 64)
+    assert k.stride()[0] == 0 and v.stride()[1] == 0
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == (
+        "flex: K strides (0, 65536, 64, 1) are not a unit inner stride with "
+        "non-zero 16-byte aligned outer strides"
+    )
+    assert not bound.config_spec.cute_flash_search_enabled
+    # A broadcast batch of size one keeps its (arbitrary) stride admissible.
+    q1 = torch.randn(1, 4, 1024, 64, dtype=torch.float16)
+    k1 = torch.randn(1, 4, 1024, 64, dtype=torch.float16)
+    block_mask = create_block_mask(
+        _causal, 1, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(
+        _flex_kernel(), _flex_args(q1, k1, k1.clone(), _identity, block_mask), flex=True
+    )
+    assert _match_or_fail(bound).operand_strides is None
+
+
+def _without_source_comments(code: str) -> str:
+    """The generated module without its ``# src[file:line]`` comments (line
+    numbers of the example source, not generated code)."""
+    return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
+
+
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
+class TestContiguousRenderPin(TestCase):
+    """The exact text of one contiguous forward render (the
+    ``.expected_cute`` journal next to this file): the strided-operand
+    support must not change the code contiguous inputs produce."""
+
+    def test_contiguous_forward_render(self) -> None:
+        q, k, v = _qkv()
+        block_mask = create_block_mask(
+            _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+        )
+        bound = _bind(
+            _flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True
+        )
+        with _as_sm100(flex=True):
+            code = bound.to_code(bound.config_spec.default_config())
+        assert "'operand_strides'" not in code
+        self.assertExpectedJournal(_without_source_comments(code))
