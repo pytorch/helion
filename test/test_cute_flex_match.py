@@ -1195,3 +1195,51 @@ class TestContiguousRenderPin(TestCase):
             code = bound.to_code(bound.config_spec.default_config())
         assert "'operand_strides'" not in code
         self.assertExpectedJournal(_without_source_comments(code))
+
+
+# -- long KV lengths ---------------------------------------------------------------
+
+
+def _synthetic_causal_block_mask(seq: int) -> Any:
+    """A causal 128-block BlockMask built from its tables (the dense
+    evaluation of a 128K x 128K mask is too slow on the CPU): the diagonal
+    block partial, the blocks below full."""
+    from torch.nn.attention.flex_attention import BlockMask
+
+    rows = -(-seq // 128)
+    ar = torch.arange(rows, dtype=torch.int32)
+    kv_num = torch.ones(1, 1, rows, dtype=torch.int32)
+    kv_idx = torch.zeros(1, 1, rows, rows, dtype=torch.int32)
+    kv_idx[0, 0, :, 0] = ar
+    full_num = ar[None, None].clone()
+    full_idx = ar[None, None, None, :].expand(1, 1, rows, rows).contiguous()
+    return BlockMask.from_kv_blocks(
+        kv_num, kv_idx, full_num, full_idx, BLOCK_SIZE=128, mask_mod=_causal
+    )
+
+
+def test_long_kv_render_does_not_grow_with_the_sequence() -> None:
+    """A 128K causal flex forward (1024 KV tiles, 32 bitmask words) renders
+    the same code as a 16K one up to the numeric literals: the item words
+    are walked through a cursor, not materialised in registers."""
+    renders = {}
+    for seq in (16384, 131072):
+        q = torch.randn(1, 2, seq, 64, dtype=torch.bfloat16)
+        k = torch.randn(1, 2, seq, 64, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, seq, 64, dtype=torch.bfloat16)
+        block_mask = _synthetic_causal_block_mask(seq)
+        bound = _bind(
+            _flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True
+        )
+        assert bound.config_spec.cute_flash_search_enabled
+        config = bound.config_spec.default_config()
+        assert config.config[cute_flash.FLASH_FLEX_ITEM_WORDS_KEY] is True
+        with _as_sm100(flex=True):
+            renders[seq] = bound.to_code(config)
+    short, long = renders[16384], renders[131072]
+    assert short.count("\n") == long.count("\n")
+    assert re.sub(r"\d+", "N", short) == re.sub(r"\d+", "N", long)
+    assert "while flash_flex_rem == 0 and flash_flex_cw > flash_flex_low:" in long
+    assert "flash_flex_rem1" not in long
+    # The words argument carries the header: 4 + 4 * words entries per item.
+    assert "_helion_flash_flex_item_words(" in long

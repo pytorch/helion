@@ -45,7 +45,9 @@ from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_fragment import EnumFragment
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from ...runtime.cute.flash_flex import flex_mask_words
 from ...runtime.cute.flash_flex import flex_split_workspace_elems
+from ...runtime.cute.flash_flex import flex_words_header
 from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
 from .attention_plan import ALIBI_BIAS_KIND
@@ -5883,6 +5885,10 @@ def resolve_flash_config(
         flex_item_words = (
             True if flex_item_words_cfg is None else bool(flex_item_words_cfg)
         )
+        if _flash_flex_mask_words(num_kv) > FLEX_REGISTER_WORDS_MAX:
+            # The register bitmasks would grow with the KV length: the host
+            # words and their cursor walk serve every longer sequence.
+            flex_item_words = True
     flex_prefetch = 0
     if flex_prefetch_regs and not flex_rolled_chunks:
         flex_prefetch = flash_flex_prefetch_default(flex_prefetch_regs)
@@ -9447,6 +9453,34 @@ def flash_attention_seed_configs(
             FLASH_OTHER_REGS_KEY: 48,
             FLASH_FIRST_LOAD_ORDER_KEY: 3,
         }
+        # The long walk (the 2026-10-16 campaign's causal 128K hd128 winner,
+        # 1024 KV tiles per item): one CTA per pair item (the persistent
+        # strided order streams every head's K/V at once and thrashes L2 on
+        # long rows: 45 vs 34 ms), a two-slot ring, the 16-column cadence
+        # with a one-deep PASS2 pipe and Rep16 loads/stores, split P arrival,
+        # 168/80/32 registers and the ascending order; the cadence emulates
+        # 2 of 16 pairs (the MUFU pipe is not the bound on long rows: 16/6
+        # measured 1-1.5% behind 16/2 and the hardware-only cadence there).
+        flex_long_walk = {
+            **flex_fa4_structure,
+            FLASH_PERSISTENT_KEY: False,
+            FLASH_KV_STAGE_KEY: min(2, list_kv_stage_cap),
+            FLASH_E2E_SCHEDULE_KEY: "16/2",
+            FLASH_E2E_OFFSET_KEY: 2,
+            FLASH_E2E_OFFSET0_KEY: 9,
+            FLASH_EXP2_PACKET_KEY: "4x2",
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_S_LOAD_REP_KEY: 16,
+            FLASH_P_STORE_REP_KEY: 16,
+            FLASH_CAUSAL_KV_ORDER_KEY: "ascending",
+            FLASH_FIRST_LOAD_ORDER_KEY: 0,
+            FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            FLASH_SOFTMAX_REGS_KEY: 168,
+            FLASH_CORR_REGS_KEY: 80,
+            FLASH_OTHER_REGS_KEY: 32,
+            FLASH_CORR_TILE_SIZE_KEY: 8,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 32,
+        }
         source_variants += (
             (
                 FLASH_E2E_SCHEDULE_KEY,
@@ -9461,6 +9495,7 @@ def flash_attention_seed_configs(
             (FLASH_E2E_SCHEDULE_KEY, "16/4", flex_short_walk),
             (FLASH_EXP2_PACKET_KEY, "4x2", flex_medium_walk),
             (FLASH_KV_STAGE_KEY, min(10, list_kv_stage_cap), flex_fa4_template),
+            (FLASH_PERSISTENT_KEY, False, flex_long_walk),
         )
         if not has_score_modifiers:
             # A score region runs the hook on every tile; the resident PASS2
@@ -11228,7 +11263,14 @@ def flash_autotune_fragments(
         FLASH_FLEX_ITEM_WORDS_KEY: enum(
             has_list_walk,
             (False, True),
-            (False, True) if has_list_walk else (False,),
+            # Register bitmasks only up to FLEX_REGISTER_WORDS_MAX words; a
+            # longer KV length walks the host words through the cursor.
+            (False, True)
+            if has_list_walk
+            and _flash_flex_mask_words(num_kv) <= FLEX_REGISTER_WORDS_MAX
+            else (True,)
+            if has_list_walk
+            else (False,),
         ),
         FLASH_S_RESIDENT_KEY: enum(
             False,
@@ -11640,10 +11682,11 @@ def _flash_flex_words_arg(
     assert len(walk_args) == 4
     lists = 2 if q_block == 256 else 4
     words = _flash_flex_mask_words(num_kv)
+    row = flex_words_header(num_kv) + lists * words
     env = CompileEnvironment.current()
     with env.fake_mode:
         fake = torch.empty(
-            (batch * heads * num_pairs * lists * words,),
+            (batch * heads * num_pairs * row,),
             dtype=torch.int32,
             device=env.device,
         )
@@ -15095,9 +15138,15 @@ def _flash_fa4_segment_wrap(
 {tail}"""
 
 
-def _flash_flex_mask_words(num_kv: int) -> int:
-    """32-bit words of a per-row KV tile bitmask over ``num_kv`` tiles."""
-    return -(-num_kv // 32)
+# 32-bit words of a per-row KV tile bitmask over ``num_kv`` tiles (the host
+# table builder's rule).
+_flash_flex_mask_words = flex_mask_words
+
+
+def _flash_flex_lists(walk: FlexKvWalk) -> int:
+    """Lists per pair item of the words table: ``[partial, full]`` of the
+    pair's one 256-row BlockMask row, or of each of its two 128-row rows."""
+    return 2 if walk.q_block == 256 else 4
 
 
 def _flash_flex_word_select(prefix: str, words: int, word_expr: str) -> str:
@@ -15276,7 +15325,9 @@ def _flash_flex_stream_fill(
     return "\n".join(lines)
 
 
-def _flash_flex_split_status_lines(stage: str, words: int, *, indent: str) -> list[str]:
+def _flash_flex_split_status_lines(
+    stage: str, words: int, *, indent: str, cursor: bool = False
+) -> list[str]:
     """Lines overriding ``flash_flex_status`` on a split item
     (``flash_flex_split``): the two stages take the first stage's tiles
     alternately (stage ``s`` the steps of parity ``s``, the second stage from
@@ -15289,8 +15340,12 @@ def _flash_flex_split_status_lines(stage: str, words: int, *, indent: str) -> li
                 f"(flash_flex_split != 0) & ({odd}), cutlass.Int32(0), flash_flex_status))"
             )
         ]
-    alt = _flash_flex_status_line(
-        "flash_flex_p0_", "flash_flex_f0_", words, indent=indent
+    alt = (
+        _flash_flex_cursor_status_line(indent, "0")
+        if cursor
+        else _flash_flex_status_line(
+            "flash_flex_p0_", "flash_flex_f0_", words, indent=indent
+        )
     ).replace("flash_flex_status =", "flash_flex_status_alt =", 1)
     return [
         alt,
@@ -15314,6 +15369,269 @@ def _flash_flex_status_line(
         f"{indent}flash_flex_status = cutlass.Int32(cutlass.select_("
         f"({part_word} & flash_flex_kvbit) != 0, cutlass.Int32(2), "
         f"cutlass.Int32(cutlass.select_(({full_word} & flash_flex_kvbit) != 0, "
+        "cutlass.Int32(1), cutlass.Int32(0)))))"
+    )
+
+
+# Device-built register bitmasks (``cute_flash_flex_item_words=False``) are
+# offered up to this many words; longer KV lengths take the host words table
+# and its cursor walk, whose code and registers do not grow with the length.
+FLEX_REGISTER_WORDS_MAX = 2
+
+
+def _flash_flex_cursor(num_kv: int, words_table: str | None) -> bool:
+    """Whether the list walk reads its bitmask words through a cursor.
+
+    With two words or more the per-item words stay in the host table (one
+    header and ``lists * words`` entries per item, ``flex_words_header``):
+    every walking role keeps the current union word and its stage words in
+    four registers, moves to the next non-empty word when the current one is
+    exhausted (a load per word, L1-resident) and reads the tile's status off
+    the current word, so the code, the registers and the per-step cost are
+    independent of the KV length. A one-word mask keeps the register walk.
+    """
+    return words_table is not None and flex_words_header(num_kv) > 0
+
+
+def _flash_flex_cursor_names(lists: int) -> list[str]:
+    """The current word of each list, in table order."""
+    return ["flash_flex_wp0", "flash_flex_wf0", "flash_flex_wp1", "flash_flex_wf1"][
+        :lists
+    ]
+
+
+def _flash_flex_cursor_loads(
+    indent: str, word_expr: str, *, words: int, lists: int
+) -> list[str]:
+    """Lines loading the ``lists`` words at word index ``word_expr`` of the
+    item's row into the cursor's current-word registers."""
+    return [
+        f"{indent}{name} = cutlass.Int32(_flash_mFlexWords[flash_flex_wbase + "
+        f"cutlass.Int32({index * words}) + {word_expr}])"
+        for index, name in enumerate(_flash_flex_cursor_names(lists))
+    ]
+
+
+def _flash_flex_cursor_union(
+    indent: str, word_expr: str, *, words: int, lists: int
+) -> str:
+    """The union word at ``word_expr`` as one expression of the loads."""
+    return " | ".join(
+        f"cutlass.Int32(_flash_mFlexWords[flash_flex_wbase + "
+        f"cutlass.Int32({index * words}) + {word_expr}])"
+        for index in range(lists)
+    )
+
+
+def _flash_flex_cursor_scan_lines(
+    indent: str,
+    *,
+    word: str,
+    rem: str,
+    words: int,
+    lists: int,
+    descending: bool,
+    keep_words: bool,
+) -> list[str]:
+    """Lines moving a cursor (``word`` index, remaining union bits ``rem``)
+    to the next non-empty union word while the current one is exhausted:
+    ``descending`` scans down to the header's lowest non-empty word,
+    ascending up to the highest. ``keep_words`` loads the list words into
+    the cursor's registers (the walk's own cursor); a lookahead on
+    temporaries only forms their union."""
+    if descending:
+        cond = f"({rem} == 0) and ({word} > flash_flex_low)"
+        advance = f"{word} - cutlass.Int32(1)"
+    else:
+        cond = f"({rem} == 0) and ({word} < flash_flex_hiw)"
+        advance = f"{word} + cutlass.Int32(1)"
+    lines = [f"{indent}while {cond}:", f"{indent}    {word} = {advance}"]
+    if keep_words:
+        lines += _flash_flex_cursor_loads(
+            indent + "    ", word, words=words, lists=lists
+        )
+        lines.append(
+            f"{indent}    {rem} = {' | '.join(_flash_flex_cursor_names(lists))}"
+        )
+    else:
+        lines.append(
+            f"{indent}    {rem} = "
+            + _flash_flex_cursor_union("", word, words=words, lists=lists)
+        )
+    return lines
+
+
+def _flash_flex_cursor_top_expr(rem: str, word: str, *, descending: bool) -> str:
+    """The tile of the first bit of ``rem`` in walk order (the highest set
+    bit descending, the lowest ascending); ``rem`` must be non-zero."""
+    value = rem if descending else f"{rem} & (cutlass.Int32(0) - {rem})"
+    return (
+        f"{word} * cutlass.Int32(32) + cutlass.Int32(31) - "
+        f"cutlass.Int32(cute.arch.clz({value}))"
+    )
+
+
+def _flash_flex_cursor_init_lines(
+    indent: str, *, words: int, lists: int, descending: bool, kv_split: int
+) -> list[str]:
+    """Lines resetting a role's cursor at the top of a work item: one past
+    the first word of the walk (the header's highest / lowest non-empty
+    union word), an exhausted current word, and under the split-KV walk the
+    ``flash_flex_lo`` tiles ahead of this CTA's slice consumed
+    (``_flash_flex_cursor_consume_lines``: whole words by population)."""
+    start = (
+        "flash_flex_hiw + cutlass.Int32(1)"
+        if descending
+        else "flash_flex_low - cutlass.Int32(1)"
+    )
+    lines = [
+        f"{indent}flash_flex_cw = {start}",
+        f"{indent}flash_flex_rem = cutlass.Int32(0)",
+        *(
+            f"{indent}{name} = cutlass.Int32(0)"
+            for name in _flash_flex_cursor_names(lists)
+        ),
+    ]
+    if kv_split > 1:
+        lines += _flash_flex_cursor_consume_lines(
+            indent,
+            "flash_flex_lo",
+            words=words,
+            lists=lists,
+            descending=descending,
+        )
+    return lines
+
+
+def _flash_flex_cursor_step_lines(
+    indent: str, target: str, *, words: int, lists: int, descending: bool
+) -> list[str]:
+    """Lines taking the next tile of the walk through the cursor: the walk
+    moves to the next non-empty union word when the current one is
+    exhausted (``descending`` scans down from the highest word and takes the
+    highest set bit, ascending the mirror), ``target`` is the tile and
+    ``flash_flex_kvbit`` its bit in the current words (0 on the fake step
+    of an exhausted walk: every status and presence test then reads
+    absent), and the bit is cleared from the remaining union word."""
+    top = _flash_flex_cursor_top_expr(
+        "flash_flex_rem", "flash_flex_cw", descending=descending
+    )
+    return [
+        *_flash_flex_cursor_scan_lines(
+            indent,
+            word="flash_flex_cw",
+            rem="flash_flex_rem",
+            words=words,
+            lists=lists,
+            descending=descending,
+            keep_words=True,
+        ),
+        (
+            f"{indent}{target} = cutlass.Int32(cutlass.select_(flash_flex_rem != 0, "
+            f"{top}, cutlass.Int32(0)))"
+        ),
+        (
+            f"{indent}flash_flex_kvbit = cutlass.Int32(cutlass.select_(flash_flex_rem != 0, "
+            f"cutlass.Int32(1) << ({target} & cutlass.Int32(31)), cutlass.Int32(0)))"
+        ),
+        f"{indent}flash_flex_rem = flash_flex_rem & ~flash_flex_kvbit",
+    ]
+
+
+def _flash_flex_cursor_peek_lines(
+    indent: str, target: str, *, words: int, lists: int, descending: bool
+) -> list[str]:
+    """Lines reading the walk's next tile through the cursor without moving
+    it (the scan of ``_flash_flex_cursor_step_lines`` on temporaries):
+    ``target`` is the next tile of the item's walk, 0 when none remains
+    (the loads a hook prefetches for it are then dead). The peek is not
+    bounded by a split-KV slice: at a slice's last step it names the next
+    slice's first tile, whose prefetch is dead the same way."""
+    top = _flash_flex_cursor_top_expr(
+        "flash_flex_prem", "flash_flex_pkw", descending=descending
+    )
+    return [
+        f"{indent}flash_flex_pkw = flash_flex_cw",
+        f"{indent}flash_flex_prem = flash_flex_rem",
+        *_flash_flex_cursor_scan_lines(
+            indent,
+            word="flash_flex_pkw",
+            rem="flash_flex_prem",
+            words=words,
+            lists=lists,
+            descending=descending,
+            keep_words=False,
+        ),
+        (
+            f"{indent}{target} = cutlass.Int32(cutlass.select_(flash_flex_prem != 0, "
+            f"{top}, cutlass.Int32(0)))"
+        ),
+    ]
+
+
+def _flash_flex_cursor_consume_lines(
+    indent: str,
+    count_expr: str,
+    *,
+    words: int,
+    lists: int,
+    descending: bool,
+    bit_lines: Sequence[str] = (),
+    word_lines: Sequence[str] = (),
+) -> list[str]:
+    """Lines consuming the next ``count_expr`` tiles of the walk through the
+    cursor in O(words + 32) steps: a word whose population fits the
+    remaining count goes at once (``word_lines``, run with the word's
+    remaining bits in ``flash_flex_rem``), the last word bit by bit
+    (``bit_lines``, run with the bit in ``flash_flex_kvbit``). The split-KV
+    init drops the slice's leading tiles this way, the dead-stage split
+    scans the slice."""
+    top = _flash_flex_cursor_top_expr(
+        "flash_flex_rem", "flash_flex_cw", descending=descending
+    )
+    body = "    "
+    return [
+        f"{indent}flash_flex_left = {count_expr}",
+        f"{indent}while flash_flex_left > 0:",
+        *_flash_flex_cursor_scan_lines(
+            indent + body,
+            word="flash_flex_cw",
+            rem="flash_flex_rem",
+            words=words,
+            lists=lists,
+            descending=descending,
+            keep_words=True,
+        ),
+        f"{indent}{body}flash_flex_wc = cutlass.Int32(cute.arch.popc(flash_flex_rem))",
+        f"{indent}{body}if flash_flex_wc <= flash_flex_left:",
+        *(f"{indent}{body}    {line}" for line in word_lines),
+        # An exhausted walk (no word left) ends the loop too.
+        (
+            f"{indent}{body}    flash_flex_left = cutlass.Int32(cutlass.select_("
+            "flash_flex_wc == 0, cutlass.Int32(0), flash_flex_left - flash_flex_wc))"
+        ),
+        f"{indent}{body}    flash_flex_rem = cutlass.Int32(0)",
+        f"{indent}{body}else:",
+        f"{indent}{body}    for flash_flex_i in cutlass.range(flash_flex_left, unroll=1):",
+        f"{indent}{body}        flash_flex_kvbit = cutlass.Int32(1) << ({top} & cutlass.Int32(31))",
+        *(f"{indent}{body}        {line}" for line in bit_lines),
+        f"{indent}{body}        flash_flex_rem = flash_flex_rem & ~flash_flex_kvbit",
+        f"{indent}{body}    flash_flex_left = cutlass.Int32(0)",
+    ]
+
+
+def _flash_flex_cursor_present_expr(list_stage: str) -> str:
+    """Whether the stage sees the tile just taken (its current words)."""
+    return f"((flash_flex_wp{list_stage} | flash_flex_wf{list_stage}) & flash_flex_kvbit) != 0"
+
+
+def _flash_flex_cursor_status_line(indent: str, list_stage: str) -> str:
+    """``flash_flex_status`` of the current tile off the cursor's words: 2
+    in the stage's partial list, 1 in its full list, else 0."""
+    return (
+        f"{indent}flash_flex_status = cutlass.Int32(cutlass.select_("
+        f"(flash_flex_wp{list_stage} & flash_flex_kvbit) != 0, cutlass.Int32(2), "
+        f"cutlass.Int32(cutlass.select_((flash_flex_wf{list_stage} & flash_flex_kvbit) != 0, "
         "cutlass.Int32(1), cutlass.Int32(0)))))"
     )
 
@@ -15412,6 +15730,101 @@ def _flash_flex_setup(
             ("0", "flash_m_tile0", True),
             ("1", "flash_m_tile1", table_rows % 2 == 0),
         ]
+    if _flash_flex_cursor(num_kv, words_table):
+        # The cursor walk: the item's header (the union's population, its
+        # highest and lowest non-empty word, the stage presence flags) is
+        # all the setup reads; every role scans the words through its own
+        # cursor (``_flash_flex_cursor_step_lines``).
+        assert words_pairs is not None
+        lists = _flash_flex_lists(walk)
+        assert lists == 2 * len(rows)
+        header = flex_words_header(num_kv)
+        stride = header + lists * words
+        lines += [
+            (
+                f"flash_flex_wrow = (flash_bh * cutlass.Int32({words_pairs}) + flash_m_pair) "
+                f"* cutlass.Int32({stride})"
+            ),
+            "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])",
+            "flash_flex_hiw = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])",
+            "flash_flex_low = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])",
+            f"flash_flex_wbase = flash_flex_wrow + cutlass.Int32({header})",
+        ]
+        if kv_split > 1:
+            # This CTA's slice of the walk: ``ceil(total / kv_split)`` tiles
+            # per split from rank ``lo``; the roles' cursors drop the first
+            # ``lo`` tiles (``_flash_flex_cursor_init_lines``).
+            shift = kv_split.bit_length() - 1
+            lines += [
+                (
+                    f"flash_flex_per = (flash_flex_total + cutlass.Int32({kv_split - 1})) "
+                    f">> cutlass.Int32({shift})"
+                ),
+                (
+                    "flash_flex_lo = cutlass.min(flash_flex_total, "
+                    "flash_kv_split_id * flash_flex_per)"
+                ),
+                "flash_flex_cnt = cutlass.min(flash_flex_total - flash_flex_lo, flash_flex_per)",
+                "flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_cnt)",
+            ]
+        else:
+            lines.append(
+                "flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_total)"
+            )
+        if dead_split:
+            assert present_masks and lists == 4
+            if kv_split > 1:
+                # Whether the second stage sees any tile of this CTA's slice:
+                # a pass of the cursor over the slice (a few instructions per
+                # tile, once per item).
+                stage1 = "(flash_flex_wp1 | flash_flex_wf1)"
+                lines += [
+                    "flash_flex_any1 = cutlass.Int32(0)",
+                    *_flash_flex_cursor_init_lines(
+                        "",
+                        words=words,
+                        lists=lists,
+                        descending=descending,
+                        kv_split=kv_split,
+                    ),
+                    *_flash_flex_cursor_consume_lines(
+                        "",
+                        "flash_flex_cnt",
+                        words=words,
+                        lists=lists,
+                        descending=descending,
+                        word_lines=[
+                            (
+                                "flash_flex_any1 = flash_flex_any1 | cutlass.Int32("
+                                f"({stage1} & flash_flex_rem) != 0)"
+                            )
+                        ],
+                        bit_lines=[
+                            (
+                                "flash_flex_any1 = flash_flex_any1 | cutlass.Int32("
+                                f"({stage1} & flash_flex_kvbit) != 0)"
+                            )
+                        ],
+                    ),
+                    (
+                        "flash_flex_split = cutlass.Int32(flash_flex_any1 == 0) & "
+                        "cutlass.Int32(flash_num_active_kv >= 2)"
+                    ),
+                ]
+            else:
+                lines += [
+                    "flash_flex_flags = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])",
+                    (
+                        "flash_flex_split = cutlass.Int32((flash_flex_flags & cutlass.Int32(2)) == 0) & "
+                        "cutlass.Int32(flash_num_active_kv >= 2)"
+                    ),
+                ]
+            lines.append(
+                "flash_flex_qrow1 = cutlass.Int32(cutlass.select_("
+                "flash_flex_split != 0, flash_m_tile0, flash_m_tile1))"
+            )
+        lines += _flash_flex_live_rows(score_plan, ragged_m)
+        return "\n" + "\n".join(lines)
     if words_table is not None:
         # One row of words per pair item: the stages' [partial, full] words.
         assert words_pairs is not None
@@ -15880,6 +16293,13 @@ def emit_flash_fa4_device_body(
     # same softmax body.
     flex_body = score_plan.is_flex
     list_walk = score_plan.has_list_walk
+    # The list walk's bitmask access: register words (one word, or the
+    # device-built masks) or the cursor over the host words table.
+    flex_cursor = list_walk and _flash_flex_cursor(num_kv, flex_words_table)
+    flex_cursor_kwargs: dict[str, int] = {
+        "words": _flash_flex_mask_words(num_kv),
+        "lists": _flash_flex_lists(score_plan.kv_walk) if score_plan.kv_walk else 4,
+    }
     interval_kv = is_causal or pruned_interval or flex_body
     if interval_kv and not flex_body:
         assert not cfg.persistent
@@ -17930,33 +18350,59 @@ if warp_idx == 15:
         # warpgroups: its own copy of the remaining bitmask, the first tile
         # before the prologue and the next tile at the top of each step.
         flex_words = _flash_flex_mask_words(num_kv)
-        flex_load_prelude = "\n".join(
-            [
-                *(
-                    f"        flash_flex_rem{word} = flash_flex_u{word}"
-                    for word in range(flex_words)
-                ),
-                *_flash_flex_walk_step(
+        if flex_cursor:
+            flex_load_prelude = "\n".join(
+                [
+                    *_flash_flex_cursor_init_lines(
+                        "        ",
+                        descending=desc_kv,
+                        kv_split=flex_kv_split,
+                        **flex_cursor_kwargs,
+                    ),
+                    *_flash_flex_cursor_step_lines(
+                        "        ",
+                        "flash_kv_first",
+                        descending=desc_kv,
+                        **flex_cursor_kwargs,
+                    ),
+                ]
+            )
+            load_next_stmt = "\n".join(
+                _flash_flex_cursor_step_lines(
+                    "            ",
+                    "flash_kv_next",
+                    descending=desc_kv,
+                    **flex_cursor_kwargs,
+                )
+            )
+        else:
+            flex_load_prelude = "\n".join(
+                [
+                    *(
+                        f"        flash_flex_rem{word} = flash_flex_u{word}"
+                        for word in range(flex_words)
+                    ),
+                    *_flash_flex_walk_step(
+                        "flash_flex_rem",
+                        flex_words,
+                        target="flash_kv_first",
+                        descending=desc_kv,
+                        indent="        ",
+                    ),
+                ]
+            )
+            load_next_stmt = "\n".join(
+                _flash_flex_walk_step(
                     "flash_flex_rem",
                     flex_words,
-                    target="flash_kv_first",
+                    target="flash_kv_next",
                     descending=desc_kv,
-                    indent="        ",
-                ),
-            ]
-        )
+                    indent="            ",
+                )
+            )
         flex_load_prelude += "\n"
         load_first_kv = "flash_kv_first"
         load_next_kv = "flash_kv_next"
-        load_next_stmt = "\n".join(
-            _flash_flex_walk_step(
-                "flash_flex_rem",
-                flex_words,
-                target="flash_kv_next",
-                descending=desc_kv,
-                indent="            ",
-            )
-        )
     elif pruned_interval and desc_kv:
         load_first_kv = "flash_kv_last"
         load_next_kv = "flash_kv_last - cutlass.Int32(1) - flash_kv_load_iter"
@@ -18576,15 +19022,21 @@ if warp_idx == 15:
             if flex_dead_split:
                 # A split item issues each tile for one stage: step parity
                 # ``s`` to stage ``s``, both from the first stage's lists.
-                word0 = _flash_flex_word_select(
-                    "flash_flex_n0_", words, "flash_flex_kvword"
-                )
-                word1 = _flash_flex_word_select(
-                    "flash_flex_n1_", words, "flash_flex_kvword"
-                )
+                if flex_cursor:
+                    present0 = _flash_flex_cursor_present_expr("0")
+                    present1 = _flash_flex_cursor_present_expr("1")
+                else:
+                    word0 = _flash_flex_word_select(
+                        "flash_flex_n0_", words, "flash_flex_kvword"
+                    )
+                    word1 = _flash_flex_word_select(
+                        "flash_flex_n1_", words, "flash_flex_kvword"
+                    )
+                    present0 = f"({word0} & flash_flex_kvbit) != 0"
+                    present1 = f"({word1} & flash_flex_kvbit) != 0"
                 return [
-                    f"{indent}flash_flex_n0b = cutlass.Int32(({word0} & flash_flex_kvbit) != 0)",
-                    f"{indent}flash_flex_n1b = cutlass.Int32(({word1} & flash_flex_kvbit) != 0)",
+                    f"{indent}flash_flex_n0b = cutlass.Int32({present0})",
+                    f"{indent}flash_flex_n1b = cutlass.Int32({present1})",
                     f"{indent}flash_flex_odd = ({step_expr}) & cutlass.Int32(1)",
                     (
                         f"{indent}{prefix}0 = cute.arch.make_warp_uniform(cutlass.Int32("
@@ -18599,31 +19051,36 @@ if warp_idx == 15:
                 ]
             for stage in ("0", "1"):
                 list_stage = "0" if flex_walk.q_block == 256 else stage
-                word = _flash_flex_word_select(
-                    f"flash_flex_n{list_stage}_", words, "flash_flex_kvword"
-                )
+                if flex_cursor:
+                    present = _flash_flex_cursor_present_expr(list_stage)
+                else:
+                    word = _flash_flex_word_select(
+                        f"flash_flex_n{list_stage}_", words, "flash_flex_kvword"
+                    )
+                    present = f"({word} & flash_flex_kvbit) != 0"
                 # A warp-uniform 0/1 Int32: the issue flag the PTX streams
                 # test with one ``setp`` + uniform branch (the uniformity
                 # shuffle is paid here, off the MMA issue chain).
                 lines.append(
                     f"{indent}{prefix}{stage} = cute.arch.make_warp_uniform("
-                    f"cutlass.Int32(({word} & flash_flex_kvbit) != 0))"
+                    f"cutlass.Int32({present}))"
                 )
             return lines
 
         def _flex_walk_lines(prefix: str, indent: str, step_expr: str) -> str:
-            return "\n".join(
-                [
-                    *_flash_flex_walk_step(
-                        "flash_flex_rem",
-                        _flash_flex_mask_words(num_kv),
-                        target="flash_kv_mma",
-                        descending=desc_kv,
-                        indent=indent,
-                    ),
-                    *_flex_live_lines(prefix, indent, step_expr),
-                ]
-            )
+            if flex_cursor:
+                step = _flash_flex_cursor_step_lines(
+                    indent, "flash_kv_mma", descending=desc_kv, **flex_cursor_kwargs
+                )
+            else:
+                step = _flash_flex_walk_step(
+                    "flash_flex_rem",
+                    _flash_flex_mask_words(num_kv),
+                    target="flash_kv_mma",
+                    descending=desc_kv,
+                    indent=indent,
+                )
+            return "\n".join([*step, *_flex_live_lines(prefix, indent, step_expr)])
 
         def _flex_qk_issue(stage: str, k_state: str, indent: str) -> str:
             # A skipped QK leaves S stale (the stage's softmax takes the
@@ -18704,8 +19161,17 @@ if warp_idx == 15:
             with each stage's QK / PV issued only on its live steps."""
             words = _flash_flex_mask_words(num_kv)
             rem_init = "\n".join(
-                f"        flash_flex_rem{word} = flash_flex_u{word}"
-                for word in range(words)
+                _flash_flex_cursor_init_lines(
+                    "        ",
+                    descending=desc_kv,
+                    kv_split=flex_kv_split,
+                    **flex_cursor_kwargs,
+                )
+                if flex_cursor
+                else [
+                    f"        flash_flex_rem{word} = flash_flex_u{word}"
+                    for word in range(words)
+                ]
             )
             first = _flex_walk_lines(
                 "flash_flex_pv_live", "        ", "cutlass.Int32(0)"
@@ -19470,7 +19936,15 @@ if warp_idx == 15:
 {textwrap.indent(masked_rowmax_block, "    ")}
             else:
 {textwrap.indent(full_rowmax_block, "    ")}"""
-            loop_pass2_block = f"""            if flash_flex_needs_mask:
+            if pass2_masked_block == pass2_block:
+                # The masked PASS1 stores the masked scores back, so PASS2
+                # is the same call on both kinds of tile; one copy keeps the
+                # softmax loop's hot code half the size (ptxas inlines each
+                # branch separately: two 500-instruction exp passes per
+                # warpgroup region, measured ~1% on causal 128K hd128).
+                loop_pass2_block = pass2_block
+            else:
+                loop_pass2_block = f"""            if flash_flex_needs_mask:
 {textwrap.indent(pass2_masked_block, "    ")}
             else:
 {textwrap.indent(pass2_block, "    ")}"""
@@ -19488,10 +19962,22 @@ if warp_idx == 15:
             needs_mask_line = ""
             if fused_branches is not None:
                 fused_branches = [(None, full_rowmax_block, pass2_block)]
-        item_prelude = "".join(
-            f"        flash_flex_rem{word} = flash_flex_u{word}\n"
-            for word in range(words if list_walk else 0)
-        ) + _flash_flex_unique_blocks(
+        if flex_cursor:
+            item_prelude = "".join(
+                f"{line}\n"
+                for line in _flash_flex_cursor_init_lines(
+                    "        ",
+                    descending=desc_kv,
+                    kv_split=flex_kv_split,
+                    **flex_cursor_kwargs,
+                )
+            )
+        else:
+            item_prelude = "".join(
+                f"        flash_flex_rem{word} = flash_flex_u{word}\n"
+                for word in range(words if list_walk else 0)
+            )
+        item_prelude += _flash_flex_unique_blocks(
             [_flash_flex_hook_lines(hook.item_prelude, " " * 8) for hook in hooks]
         )
         prefetch_depth = max((hook.prefetch_depth for hook in hooks), default=0)
@@ -19510,7 +19996,14 @@ if warp_idx == 15:
         peek_lines: list[str] = []
         first_tile = "0"
         needs_peek = prefetch_depth or coop_slots
-        if needs_peek and list_walk:
+        if needs_peek and flex_cursor:
+            peek_lines = _flash_flex_cursor_peek_lines(
+                "            ",
+                "flash_kv_peek",
+                descending=desc_kv,
+                **flex_cursor_kwargs,
+            )
+        elif needs_peek and list_walk:
             peek_lines = _flash_flex_walk_peek(
                 "flash_flex_rem",
                 words,
@@ -19528,7 +20021,22 @@ if warp_idx == 15:
             ]
             if desc_kv:
                 first_tile = f"{kv_loop_bound} - cutlass.Int32(1)"
-        if list_walk:
+        if flex_cursor:
+            tile_prologue_lines = [
+                *_flash_flex_cursor_step_lines(
+                    "            ", "flash_kv", descending=desc_kv, **flex_cursor_kwargs
+                ),
+                *peek_lines,
+                _flash_flex_cursor_status_line("            ", list_stage),
+                *(
+                    _flash_flex_split_status_lines(
+                        stage, words, indent="            ", cursor=True
+                    )
+                    if flex_dead_split
+                    else []
+                ),
+            ]
+        elif list_walk:
             tile_prologue_lines = [
                 *_flash_flex_walk_step(
                     "flash_flex_rem",
@@ -19583,17 +20091,20 @@ if warp_idx == 15:
         )
         pre_loop_fill = ""
         tile_epilogue = ""
-        first_peek = (
-            _flash_flex_walk_peek(
+        if flex_cursor:
+            first_peek = _flash_flex_cursor_peek_lines(
+                "        ", "flash_kv_peek", descending=desc_kv, **flex_cursor_kwargs
+            )
+        elif list_walk:
+            first_peek = _flash_flex_walk_peek(
                 "flash_flex_rem",
                 words,
                 target="flash_kv_peek",
                 descending=desc_kv,
                 indent="        ",
             )
-            if list_walk
-            else [f"        flash_kv_peek = {first_tile}"]
-        )
+        else:
+            first_peek = [f"        flash_kv_peek = {first_tile}"]
         pre_loop_parts: list[str] = []
         epilogue_parts: list[str] = []
         if prefetch_depth:
