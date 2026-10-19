@@ -558,6 +558,10 @@ def _make_prepared_arg_guard(
     checks = [f"len(args) == {len(args)}"]
     counter = itertools.count()
     tensor_paths: list[tuple[str, torch.Tensor]] = []
+    # Plain tensors whose dtype / device / shape / stride one C++ guard
+    # (dynamo's ``TensorGuards``) checks in front of the Python checks: ~0.1
+    # us per tensor against ~0.5 us for the four attribute comparisons.
+    cxx_tensor_paths: list[tuple[str, torch.Tensor]] = []
 
     def append_checks(
         value: object,
@@ -574,19 +578,24 @@ def _make_prepared_arg_guard(
                 relation = "is" if value is previous_tensor else "is not"
                 checks.append(f"{prefix} {relation} {previous_prefix}")
             tensor_paths.append((prefix, value))
-            namespace[f"dtype_{token}"] = value.dtype
-            namespace[f"shape_{token}"] = value.shape
-            namespace[f"stride_{token}"] = value.stride()
-            namespace[f"device_{token}"] = value.device
-            checks.extend(
-                (
-                    f"{prefix}.dtype is dtype_{token}",
-                    f"{prefix}.shape == shape_{token}",
-                    f"{prefix}.stride() == stride_{token}",
-                    f"{prefix}.device == device_{token}",
-                )
-            )
             static_indices = getattr(value, "_dynamo_static_indices", None)
+            if value_type is torch.Tensor and static_indices is None:
+                # (The C++ guard also pins requires_grad and the dispatch
+                # keys: a change there falls back to the full dispatch.)
+                cxx_tensor_paths.append((prefix, value))
+            else:
+                namespace[f"dtype_{token}"] = value.dtype
+                namespace[f"shape_{token}"] = value.shape
+                namespace[f"stride_{token}"] = value.stride()
+                namespace[f"device_{token}"] = value.device
+                checks.extend(
+                    (
+                        f"{prefix}.dtype is dtype_{token}",
+                        f"{prefix}.shape == shape_{token}",
+                        f"{prefix}.stride() == stride_{token}",
+                        f"{prefix}.device == device_{token}",
+                    )
+                )
             if static_indices is None:
                 checks.append(
                     f"getattr({prefix}, '_dynamo_static_indices', None) is None"
@@ -692,7 +701,58 @@ def _make_prepared_arg_guard(
 
     for index, arg in enumerate(args):
         append_checks(arg, f"args[{index}]", kernel._annotations[index])
+    if cxx_tensor_paths:
+        cxx_check = _prepared_cxx_tensor_check(
+            [tensor for _prefix, tensor in cxx_tensor_paths]
+        )
+        if cxx_check is not None:
+            namespace["cxx_tensor_check"] = cxx_check
+            paths = ", ".join(prefix for prefix, _tensor in cxx_tensor_paths)
+            # After every structural check: a path below a container or a
+            # closure cell exists only once the checks before it have held
+            # (a shorter list, a builtin in a function's place), and the
+            # chain short-circuits before reading it.
+            checks.append(f"cxx_tensor_check({paths})")
+        else:
+            for prefix, value in cxx_tensor_paths:
+                token = next(counter)
+                namespace[f"dtype_{token}"] = value.dtype
+                namespace[f"shape_{token}"] = value.shape
+                namespace[f"stride_{token}"] = value.stride()
+                namespace[f"device_{token}"] = value.device
+                checks.extend(
+                    (
+                        f"{prefix}.dtype is dtype_{token}",
+                        f"{prefix}.shape == shape_{token}",
+                        f"{prefix}.stride() == stride_{token}",
+                        f"{prefix}.device == device_{token}",
+                    )
+                )
     return eval(f"lambda args: {' and '.join(checks)}", namespace)
+
+
+def _prepared_cxx_tensor_check(
+    tensors: Sequence[torch.Tensor],
+) -> Callable[..., bool] | None:
+    """One C++ check of every tensor's type, dtype, device, requires_grad,
+    dispatch keys, sizes and strides against these tensors' (dynamo's
+    ``TensorGuards``), or None when the guard is unavailable or does not
+    accept them (the Python checks then stand alone)."""
+    try:
+        from torch._C._dynamo.guards import TensorGuards
+    except ImportError:  # pragma: no cover - older torch
+        return None
+    try:
+        guards = TensorGuards(
+            *tensors,
+            dynamic_dims_sizes=cast("Any", [list(t.shape) for t in tensors]),
+            dynamic_dims_strides=cast("Any", [list(t.stride()) for t in tensors]),
+        )
+        if not guards.check(*tensors):
+            return None
+    except Exception:
+        return None
+    return guards.check
 
 
 class _PreparedCall:
@@ -3354,12 +3414,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     _inner: Callable[[Sequence[object]], Hashable] = inner,
                     _index: int | str = v.index,
                 ) -> Hashable:
-                    result = _inner(args)
+                    result: Any = _inner(args)
                     if isinstance(result, dict):
-                        return cast("Hashable", result[_index])
+                        return result[_index]
                     if isinstance(_index, str):
-                        return cast("Hashable", getattr(result, _index))
-                    return cast("Sequence[Hashable]", result)[_index]
+                        return getattr(result, _index)
+                    return result[_index]
 
                 return getitem_extractor
             if isinstance(v, LocalSource):
@@ -3369,8 +3429,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     args: Sequence[object],
                     _index: int = index,
                 ) -> Hashable:
-                    return cast("Hashable", args[_index])
+                    return args[_index]  # pyrefly: ignore[bad-return]
 
+                # The argument index, for generated guards that read the
+                # argument directly instead of calling the extractor.
+                local_extractor._helion_arg_index = index  # pyrefly: ignore[missing-attribute]
                 return local_extractor
             raise exc.SpecializeArgType(v)
 
