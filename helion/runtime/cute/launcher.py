@@ -7688,8 +7688,10 @@ class _CuteFastRelaunch:
                 )
             ) and not self.scalar_guards[position].matches(args, self.constexpr_flags):
                 return _CUTE_FASTPATH_MISS
+        # (No ``typing.cast`` on this path: it is a Python call per use, and
+        # the pointer gather and the slot pokes run once per tensor.)
         pointers = [
-            cast("torch.Tensor", args[index]).data_ptr()
+            args[index].data_ptr()  # pyrefly: ignore[missing-attribute]
             for index in self.pointer_indices
         ]
         # The compiled schema's pointer alignment (no pointer equality).
@@ -7707,14 +7709,14 @@ class _CuteFastRelaunch:
             # profiling wrappers) has no such array and keeps packing
             # ``exe_args`` itself through ``run_compiled_program``.
             packed_args = self.packed_args
-            slots = cast("Any", self.exe_args if packed_args is None else packed_args)
+            slots: Any = self.exe_args if packed_args is None else packed_args
             for position, writer in self.pointer_writers:
-                cast("Any", writer).value = pointers[position]
+                writer.value = pointers[position]  # pyrefly: ignore[missing-attribute]
             for position, slot in self.pointer_slots:
                 slots[slot] = pointers[position]
             if raw != self.last_raw:
                 for stream_writer in self.by_ref_writers:
-                    cast("Any", stream_writer).value = raw
+                    stream_writer.value = raw  # pyrefly: ignore[missing-attribute]
                 for stream_slot in self.by_val_slots:
                     slots[stream_slot] = raw
                 self.last_raw = raw
@@ -7723,14 +7725,15 @@ class _CuteFastRelaunch:
                     True,
                     cast("Any", self.executor).run_compiled_program(self.exe_args),
                 )
+            capi_func: Any = self.capi_func
             try:
-                cast("Any", self.capi_func)(packed_args)
+                capi_func(packed_args)
             except Exception as error:
                 _cute_raise_direct_launch_crash(error)
-            cuda_result = self.cuda_result
+            cuda_result: Any = self.cuda_result
             if cuda_result is None:
                 return (True, None)
-            error_code = cast("Any", cuda_result).value
+            error_code = cuda_result.value
             if error_code == 0:
                 return (True, 0)
             raise cast("Any", self.cuda_error)(error_code)
@@ -8269,7 +8272,7 @@ def default_cute_launcher(
 ) -> object:
     # The relaunch of a kernel launched before, compared as the host code
     # spells the launch (every tensor and scalar argument still guarded).
-    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    fastpath = getattr(cute_kernel, "_helion_cute_fastpath", None)
     if fastpath.__class__ is _CuteFastRelaunch:
         hit, result = fastpath.try_launch_raw(args, grid, kwargs)
         if hit:
