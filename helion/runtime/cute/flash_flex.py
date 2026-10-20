@@ -113,6 +113,13 @@ def flex_mask_words(num_kv: int) -> int:
 # mask keeps the header-less rows (the words are registers there).
 FLEX_WORDS_HEADER = 4
 
+# The host flags of the list walk's tables (``flex_item_flags``), a runtime
+# kernel scalar: bit 0, every list is full (no partial tile, every KV tile in
+# every row's full list: torch's noop / full BlockMask); bit 1, the item
+# order is the identity.
+FLEX_FLAG_ALL_FULL = 1
+FLEX_FLAG_IDENTITY_ORDER = 2
+
 
 def flex_words_header(num_kv: int) -> int:
     """Length of the per-item header of ``flex_item_words`` rows (0 or
@@ -214,12 +221,17 @@ def _build_flex_item_tables(
     num_pairs: int,
     num_kv: int,
     group: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The item order and the per-item bitmask words (see ``flex_item_table``
-    and ``flex_item_words``), built together from one pass over the tables.
+    flag_bits: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """The item order, the per-item bitmask words and the flag bits (see
+    ``flex_item_table``, ``flex_item_words`` and ``flex_item_flags``), built
+    together from one pass over the tables.
     ``group`` > 0 orders the items longest-first within groups of that many
     consecutive batch-heads (the launch group whose K/V stay in L2), the
-    groups in order; 0 is one group over every batch-head."""
+    groups in order; 0 is one group over every batch-head.  ``flag_bits``
+    adds the two-element device tensor the host flags are read from (no
+    sync here: ``flex_item_flags`` reads it back lazily); False leaves it
+    None (the table path).  Every op below allows a CUDA-graph capture."""
     # Every op below has a static shape (no ``nonzero`` / ``.item()``), so
     # the build is legal inside a CUDA-graph capture.
     assert q_block in (128, 256)
@@ -231,6 +243,8 @@ def _build_flex_item_tables(
         assert rows >= num_pairs
         part = part[:, :, :num_pairs]
         full = full[:, :, :num_pairs]
+        # The rows the walk reads (the flags are theirs).
+        real_part, real_full = part, full
         pair_union = torch.maximum(part, full)
         # One row per pair: [partial words, full words].
         per_pair = torch.stack([part, full], dim=3)
@@ -238,6 +252,7 @@ def _build_flex_item_tables(
         # Rows ``2p`` and ``2p + 1`` form pair ``p``; a ragged query length
         # leaves the last pair with a single row (its second stage: no tiles).
         assert num_pairs * 2 >= rows >= num_pairs * 2 - 1
+        real_part, real_full = part, full
         if rows < num_pairs * 2:
             pad = (0, 0, 0, num_pairs * 2 - rows)
             part = torch.nn.functional.pad(part, pad)
@@ -275,7 +290,58 @@ def _build_flex_item_tables(
         # longest-first order holds within each group).
         groups = torch.div(order, num_pairs * group, rounding_mode="floor")
         order = order[torch.sort(groups, stable=True).indices]
-    return order.to(torch.int32), words.contiguous()
+    order = order.to(torch.int32)
+    bits = _flex_flag_bits(real_part, real_full, order) if flag_bits else None
+    return order, words.contiguous(), bits
+
+
+def _flex_flag_bits(
+    part: torch.Tensor, full: torch.Tensor, order: torch.Tensor
+) -> torch.Tensor:
+    """The two device booleans behind the host flags: no row has a partial
+    tile and every row's full list holds every KV tile (``part`` / ``full``
+    the dense membership of the rows the walk reads), and ``order`` is the
+    identity.  Built with the tables (two tiny reductions, no sync)."""
+    all_full = torch.logical_and(torch.all(part == 0), torch.all(full != 0))
+    identity = torch.all(
+        order == torch.arange(order.numel(), device=order.device, dtype=order.dtype)
+    )
+    return torch.stack([all_full, identity])
+
+
+def _flex_flags_from_bits(bits: torch.Tensor) -> int:
+    """``FLEX_FLAG_ALL_FULL`` / ``FLEX_FLAG_IDENTITY_ORDER`` from the flag
+    bits: the one device-to-host read of the host flags."""
+    all_full, identity = bits.tolist()
+    return (FLEX_FLAG_ALL_FULL if all_full else 0) | (
+        FLEX_FLAG_IDENTITY_ORDER if identity else 0
+    )
+
+
+class _FlexItemTables:
+    """One cache entry of the list walk's host tables: the item order, the
+    words and the flag bits, whose host read (``flags``) happens at most
+    once, when ``flex_item_flags`` first asks for it (the ws body, the
+    cooperative pair and the cursor walk bind no flags and never sync)."""
+
+    __slots__ = ("flag_bits", "flags", "order", "words")
+
+    def __init__(
+        self, order: torch.Tensor, words: torch.Tensor, flag_bits: torch.Tensor | None
+    ) -> None:
+        self.order = order
+        self.words = words
+        self.flag_bits = flag_bits
+        self.flags: int | None = None
+
+
+def _flex_tables_uncached(tables: tuple[torch.Tensor, ...]) -> bool:
+    """Whether the tables are rebuilt on every call: inference tensors
+    (no version counter) and a CUDA-graph capture (the replay must recompute
+    them from the tables it reads)."""
+    return any(table.is_inference() for table in tables) or (
+        tables[0].is_cuda and torch.cuda.is_current_stream_capturing()
+    )
 
 
 def _flex_item_tables(
@@ -283,16 +349,28 @@ def _flex_item_tables(
     part_idx: torch.Tensor,
     full_cnt: torch.Tensor,
     full_idx: torch.Tensor,
-    **kwargs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    q_block: int,
+    batch: int,
+    heads: int,
+    num_pairs: int,
+    num_kv: int,
+    group: int = 0,
+) -> _FlexItemTables:
     """``_build_flex_item_tables`` cached per ``part_cnt`` tensor behind the
     four tables' pointers and version counters (rebuilt on every call under
-    CUDA-graph capture and for inference tensors)."""
+    CUDA-graph capture and for inference tensors, without the flag bits)."""
     tables = (part_cnt, part_idx, full_cnt, full_idx)
-    if any(table.is_inference() for table in tables) or (
-        part_cnt.is_cuda and torch.cuda.is_current_stream_capturing()
-    ):
-        return _build_flex_item_tables(*tables, **kwargs)
+    kwargs = {
+        "q_block": q_block,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": num_pairs,
+        "num_kv": num_kv,
+        "group": group,
+    }
+    if _flex_tables_uncached(tables):
+        return _FlexItemTables(*_build_flex_item_tables(*tables, **kwargs))
     key = (
         tuple(sorted(kwargs.items())),
         tuple((table.data_ptr(), table._version) for table in tables),
@@ -301,7 +379,7 @@ def _flex_item_tables(
     # launch group differs from the words table's call): a single slot
     # thrashed between the two calls of one launch and rebuilt both tables
     # every call.
-    cached: tuple[object, dict[object, tuple[torch.Tensor, torch.Tensor]]] | None = (
+    cached: tuple[object, dict[object, _FlexItemTables]] | None = (
         _FLEX_ITEM_TABLE_CACHE.get(part_cnt)
     )
     if cached is None or cached[0] != key[1]:
@@ -309,7 +387,9 @@ def _flex_item_tables(
         _FLEX_ITEM_TABLE_CACHE[part_cnt] = cached
     built = cached[1].get(key[0])
     if built is None:
-        built = _build_flex_item_tables(*tables, **kwargs)
+        built = _FlexItemTables(
+            *_build_flex_item_tables(*tables, flag_bits=True, **kwargs)
+        )
         cached[1][key[0]] = built
     return built
 
@@ -352,7 +432,7 @@ def flex_item_words(
         heads=heads,
         num_pairs=num_pairs,
         num_kv=num_kv,
-    )[1]
+    ).words
 
 
 def flex_item_table(
@@ -394,4 +474,57 @@ def flex_item_table(
         num_pairs=num_pairs,
         num_kv=num_kv,
         group=group,
-    )[0]
+    ).order
+
+
+def flex_item_flags(
+    part_cnt: torch.Tensor,
+    part_idx: torch.Tensor,
+    full_cnt: torch.Tensor,
+    full_idx: torch.Tensor,
+    *,
+    q_block: int,
+    batch: int,
+    heads: int,
+    num_pairs: int,
+    num_kv: int,
+    group: int = 0,
+) -> int:
+    """Host flags of the flex list walk's tables, a runtime kernel scalar
+    (a plain ``int`` argument: no recompile, the compiled kernel branches
+    on it).
+
+    ``FLEX_FLAG_ALL_FULL`` (bit 0): no row has a partial tile and every row's
+    full list holds every KV tile (torch's noop / full BlockMask).  The
+    device then takes the words of ``flex_item_words`` as constants without
+    loading them, so every step runs the full path, exactly as the table
+    would have made it (a full tile never runs the mask hook).  A ragged
+    query length's dead second stage (no row) is excluded on both sides.
+
+    ``FLEX_FLAG_IDENTITY_ORDER`` (bit 1): the item order of
+    ``flex_item_table`` (with this ``group``) is the identity (every pair has
+    the same tile count, e.g. every non-causal full walk), so the device
+    decodes the pair item from its work-item id without the table load.
+
+    Built with the tables and cached like them; the flags are read back to
+    the host once per cached entry, here (one stream sync, only for the
+    renders that bind them).  0 under CUDA-graph capture and for inference
+    tensors, without touching the tables (they are rebuilt on every call
+    there, by the words and order arguments): the device loads the tables.
+    """
+    tables = (part_cnt, part_idx, full_cnt, full_idx)
+    if _flex_tables_uncached(tables):
+        return 0
+    entry = _flex_item_tables(
+        *tables,
+        q_block=q_block,
+        batch=batch,
+        heads=heads,
+        num_pairs=num_pairs,
+        num_kv=num_kv,
+        group=group,
+    )
+    if entry.flags is None:
+        assert entry.flag_bits is not None
+        entry.flags = _flex_flags_from_bits(entry.flag_bits)
+    return entry.flags

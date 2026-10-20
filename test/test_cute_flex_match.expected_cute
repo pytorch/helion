@@ -20,9 +20,10 @@ import helion._compiler.cute._flash_gemm_ptx as _helion_flash_ptx
 _helion_flash_runtime_abi = 7
 from helion.runtime.cute.flash_flex import flex_item_table as _helion_flash_flex_item_table
 from helion.runtime.cute.flash_flex import flex_item_words as _helion_flash_flex_item_words
+from helion.runtime.cute.flash_flex import flex_item_flags as _helion_flash_flex_item_flags
 
 @cute.kernel
-def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, lse, flash_flex_items, flash_flex_words, scale, _flash_qk_mma, _flash_pv_mma, _flash_tma_q, _flash_mQt, _flash_tma_k, _flash_mKt, _flash_tma_v, _flash_mVt, _flash_mOt, _flash_qsl, _flash_ksl, _flash_vsl, _flash_ptl, _flash_scale_log2, _flash_num_kv_tiles, _flash_mLSE, _flash_scale, _flash_osl):
+def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, lse, flash_flex_items, flash_flex_words, scale, flash_flex_host_flags, _flash_qk_mma, _flash_pv_mma, _flash_tma_q, _flash_mQt, _flash_tma_k, _flash_mKt, _flash_tma_v, _flash_mVt, _flash_mOt, _flash_qsl, _flash_ksl, _flash_vsl, _flash_ptl, _flash_scale_log2, _flash_num_kv_tiles, _flash_mLSE, _flash_scale, _flash_osl):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     flash_mma_tile_coord_v = cutlass.Int32(0)
@@ -33,6 +34,7 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
     _flash_heads = 4
     _flash_mFlexItems = flash_flex_items
     _flash_mFlexWords = flash_flex_words
+    _flash_flex_hflags = cutlass.Int32(flash_flex_host_flags)
     _flash_kv_tail_cols = cutlass.Int32(128)
     _flash_last_tile = 7
     flash_local_tidx = tidx % 128
@@ -102,7 +104,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -115,10 +119,15 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_flex_b = flash_bh // _flash_heads
             flash_flex_h = flash_bh % _flash_heads
             flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+            flash_flex_p0_0 = cutlass.Int32(0)
+            flash_flex_f0_0 = cutlass.Int32(255)
+            flash_flex_p1_0 = cutlass.Int32(0)
+            flash_flex_f1_0 = cutlass.Int32(255)
+            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
             flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
             flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
             flash_flex_rem0 = flash_flex_u0
@@ -183,7 +192,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -193,10 +204,15 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_flex_b = flash_bh // _flash_heads
             flash_flex_h = flash_bh % _flash_heads
             flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+            flash_flex_p0_0 = cutlass.Int32(0)
+            flash_flex_f0_0 = cutlass.Int32(255)
+            flash_flex_p1_0 = cutlass.Int32(0)
+            flash_flex_f1_0 = cutlass.Int32(255)
+            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
             flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
             flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
             flash_q0_full = flash_q_cons.wait_and_advance()
@@ -266,7 +282,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -344,7 +362,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -354,10 +374,15 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_flex_b = flash_bh // _flash_heads
             flash_flex_h = flash_bh % _flash_heads
             flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+            flash_flex_p0_0 = cutlass.Int32(0)
+            flash_flex_f0_0 = cutlass.Int32(255)
+            flash_flex_p1_0 = cutlass.Int32(0)
+            flash_flex_f1_0 = cutlass.Int32(255)
+            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
             flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
             flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
             flash_flex_rem0 = flash_flex_u0
@@ -482,7 +507,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -492,10 +519,15 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_flex_b = flash_bh // _flash_heads
             flash_flex_h = flash_bh % _flash_heads
             flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+            flash_flex_p0_0 = cutlass.Int32(0)
+            flash_flex_f0_0 = cutlass.Int32(255)
+            flash_flex_p1_0 = cutlass.Int32(0)
+            flash_flex_f1_0 = cutlass.Int32(255)
+            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
             flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
             flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
             flash_flex_rem0 = flash_flex_u0
@@ -590,7 +622,9 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
         while flash_tile_id < 32:
-            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+            flash_item = flash_tile_id
+            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
             flash_m_pair = flash_item & cutlass.Int32(3)
             flash_bh = flash_item >> 2
             flash_m_tile0 = flash_m_pair * 2
@@ -600,10 +634,15 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_flex_b = flash_bh // _flash_heads
             flash_flex_h = flash_bh % _flash_heads
             flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+            flash_flex_p0_0 = cutlass.Int32(0)
+            flash_flex_f0_0 = cutlass.Int32(255)
+            flash_flex_p1_0 = cutlass.Int32(0)
+            flash_flex_f1_0 = cutlass.Int32(255)
+            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
             flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
             flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
             for flash_kv in cutlass.range(flash_num_active_kv - 1, unroll=1):
@@ -668,5 +707,5 @@ def helion_flex_attention_kernel(query: torch.Tensor, key: torch.Tensor, value: 
         out = torch.empty((B, H, M, Dv), dtype=query.dtype, device=query.device)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
     assert (block_mask_full_kv_indices is None) == (block_mask_full_kv_num_blocks is None)
-    _launcher(_helion_helion_flex_attention_kernel, (64,), query, key, value, out, block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, lse, _helion_flash_flex_item_table(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), _helion_flash_flex_item_words(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), scale, block=(512, 1, 1))
+    _launcher(_helion_helion_flex_attention_kernel, (64,), query, key, value, out, block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, lse, _helion_flash_flex_item_table(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), _helion_flash_flex_item_words(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), scale, _helion_flash_flex_item_flags(block_mask_kv_num_blocks, block_mask_kv_indices, block_mask_full_kv_num_blocks, block_mask_full_kv_indices, q_block=128, batch=2, heads=4, num_pairs=4, num_kv=8), block=(512, 1, 1))
     return (out, lse)

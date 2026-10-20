@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+import dataclasses
+import itertools
 import math
 import os
 import re
@@ -321,6 +323,44 @@ def test_explicit_requests_outside_the_pins_resolve_away(
 ) -> None:
     pinned = cute_flash.flash_effective_config_values(_resolve({**BODY, **request_}))
     assert pinned == cute_flash.flash_effective_config_values(_resolve(BODY))
+
+
+def test_cooperative_pair_request_is_honoured_on_the_table_backed_walk() -> None:
+    """``ws_2cta`` within the pair body's value width: the single-tile
+    body's cooperative pair hosts the symmetric table-backed walk on
+    request (it measured well behind the pair body, 25% on the d128 cross
+    walk and 52% on whisper's d64 ragged walk, 2026-10-17, so the
+    unattended surface keeps the pair body alone); the trivial walk and
+    the other families stay pinned to the pair body."""
+    request = {**BODY, cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+    resolved = _resolve(request)
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.topology == "ws_overlap" and resolved.use_2cta_instrs
+    assert _resolve(request, flex_trivial_walk=True).pipeline_family == "fa4"
+    surface = {
+        "num_bh": NUM_BH,
+        "dtype": torch.bfloat16,
+        "is_causal": False,
+        "has_kv_tile_pruning": False,
+        "requires_ws_overlap": False,
+        "small_biased_candidate": False,
+        "standard_dense_output": False,
+        "standard_causal_output": False,
+        "output_requires_tma": False,
+        "supports_tensor_4d_tma": False,
+        "plain_row_body": False,
+        "has_score_modifiers": True,
+        "score_modifier_kinds": (FLEX_SCORE_KIND,),
+        "has_list_walk": True,
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        for requested in (None, "ws_2cta"):
+            assert cute_flash._flash_legal_autotune_pipeline_families(
+                HEAD_DIM,
+                16,
+                requested_family=requested,
+                **surface,  # pyrefly: ignore[bad-argument-type]
+            ) == ("fa4",)
 
 
 def test_direct_store_request_resolves_to_the_staged_epilogue() -> None:
@@ -1569,7 +1609,34 @@ def test_ragged_query_length_guards_the_staged_store_and_the_lse(q_seq: int) -> 
         assert f"cute.copy(_flash_tma_o, tOsO_tma[None, {stage}]" in tma
     assert "flash_mO_stg_cur = _flash_mO[None, None, flash_bh]" in tma
     assert "_flash_mO[" not in staged
-    assert "cp_async_bulk_wait_group(1, read=True)" not in tma
+    # Both stages' stores are issued before either stage is released (the
+    # pipelined TMA path's order): no drain inside a stage's branch; the
+    # release drains the first stage's bulk group behind the second's TMA
+    # store when there is one, alone otherwise, then the second's.
+    epilogue = next(
+        block
+        for block in _roles(tma).values()
+        if "cute.copy(_flash_tma_o, tOsO_tma[None, 0]" in block
+    )
+    assert epilogue.count("cp_async_bulk_commit_group()") == 2
+    stripped = "\n".join(line.strip() for line in epilogue.splitlines())
+    assert (
+        "cute.arch.cp_async_bulk_commit_group()\n"
+        "cute.arch.cp_async_bulk_wait_group(0, read=True)"
+    ) not in stripped
+    assert (
+        "with cute.arch.elect_one():\n"
+        "if flash_live_rows1 == cutlass.Int32(128):\n"
+        "cute.arch.cp_async_bulk_wait_group(1, read=True)\n"
+        "else:\n"
+        "cute.arch.cp_async_bulk_wait_group(0, read=True)\n"
+        "cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 0)\n"
+        "cute.arch.cp_async_bulk_wait_group(0, read=True)\n"
+        "cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 1)"
+    ) in stripped
+    assert epilogue.count("mbarrier_arrive(flash_corr_epi_empty_ptr + 0)") == 2
+    assert epilogue.count("mbarrier_arrive(flash_corr_epi_empty_ptr + 1)") == 2
+    assert "cp_async_bulk_wait_group(1, read=True)" not in staged
 
 
 def test_aligned_query_length_keeps_the_unguarded_stores() -> None:
@@ -1887,8 +1954,6 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
     """Render the probe kernel on CPU with the flex plan injected at codegen
     (what the matcher will do): the tables become ``kv_walk_args`` and the
     score plan carries a 128-row BlockMask walk with a mask region."""
-    import dataclasses
-
     from test._cute_aux import _cpu_codegen
 
     import helion
@@ -1986,6 +2051,32 @@ def test_codegen_emits_the_fa4_list_walk_at_every_kv_tile_count(
         )
         assert "for flash_flex_i in cutlass.range(flash_flex_c" not in code
         assert "_flash_mFlexPartCnt" not in code
+        # The tables' host flags (``flex_item_flags``, a runtime scalar
+        # argument after the words): the words are bound to their all-full
+        # constants (the second stage's row of the last pair is missing at
+        # an odd row count: no tiles there) and loaded only while the
+        # all-full bit is clear.
+        assert (
+            "_helion_flash_flex_item_flags(part_cnt, part_idx, full_cnt, full_idx, "
+            f"q_block=128, batch=2, heads=4, num_pairs={pairs}, num_kv={num_kv})"
+        ) in code
+        assert "_flash_flex_hflags = cutlass.Int32(flash_flex_host_flags)" in code
+        full_word = (1 << num_kv) - 1
+        rows = -(-seq // 128)
+        f1_word = (
+            f"cutlass.Int32({full_word})"
+            if rows % 2 == 0
+            else f"cutlass.Int32(cutlass.select_(flash_m_tile1 < {rows}, "
+            f"cutlass.Int32({full_word}), cutlass.Int32(0)))"
+        )
+        assert (
+            f"flash_flex_p0_0 = cutlass.Int32(0)\n"
+            f"            flash_flex_f0_0 = cutlass.Int32({full_word})\n"
+            f"            flash_flex_p1_0 = cutlass.Int32(0)\n"
+            f"            flash_flex_f1_0 = {f1_word}\n"
+            "            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):\n"
+            "                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])"
+        ) in code
     else:
         # The device walk: the body binds the tables by name and builds the
         # masks from the counts and lists.
@@ -2311,7 +2402,13 @@ def test_codegen_s_resident_keeps_the_score_row_in_registers_for_unmasked_tiles(
             cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
         },
     )
-    assert rep16.count("fa4_disc_exp_convert_store_resident_rep16(") == 2
+    # The Rep16 resident PASS2: one call per resident chunk, each in a
+    # region of its own (the staged-P stores keep their chunk order), and
+    # the last release once, per stage.
+    assert rep16.count("fa4_disc_resident_chunk16(flash_res_frg") == 8
+    assert rep16.count("if flash_kv >= cutlass.Int32(0):") == 8
+    assert rep16.count("fa4_disc_resident_finish16(") == 2
+    assert "fa4_disc_exp_convert_store_resident_rep16(" not in rep16
     # Rep32 stores with the split P arrival: the mixed Rep32/Rep16
     # publication over the resident chunks (FA4's 3/4 release).
     mixed = _codegen_with_flex_plan(
@@ -2322,15 +2419,69 @@ def test_codegen_s_resident_keeps_the_score_row_in_registers_for_unmasked_tiles(
             cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
         },
     )
-    assert mixed.count("fa4_disc_exp_convert_store_resident_rep32_split(") == 2
+    # The mixed Rep32/Rep16 resident PASS2 per stage: one Rep32 pair below
+    # the 3/4 split, the odd chunk and the last chunk through Rep16 stores,
+    # each in a region of its own, and the two releases.
     assert (
-        "flash_tiled_st32_0, tST32tS0, tST32cS, flash_tiled_st0, tSTtS0, tSTcS" in mixed
+        mixed.count(
+            "fa4_disc_resident_pair32(flash_p_sum, flash_res_frg0, flash_res_frg1, "
+        )
+        == 2
     )
-    assert "flash_pfor_ptr + 0, flash_pfor2_ptr + 0, flash_LD_CHUNKS" in mixed
+    assert mixed.count("fa4_disc_resident_chunk16_store(flash_res_frg2, ") == 2
+    assert mixed.count("fa4_disc_resident_chunk16_store(flash_res_frg3, ") == 2
+    assert mixed.count("fa4_disc_resident_release(flash_pfor_ptr + ") == 2
+    assert mixed.count("fa4_disc_resident_release(flash_pfor2_ptr + ") == 2
+    assert mixed.count("if flash_kv >= cutlass.Int32(0):") == 6
+    # The pair folds into the carried row sum in the reload order; the odd
+    # and the last chunk add their sums; stage 1 stores through its views
+    # and releases its barriers, the split release before the last chunk.
     assert (
-        "flash_pfor_ptr + 1, flash_pfor2_ptr + 1, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS"
-        in rep16
+        "flash_p_sum = _helion_flash_rt.fa4_disc_resident_pair32(flash_p_sum, " in mixed
     )
+    assert "flash_p_sum + _helion_flash_rt.fa4_disc_resident_chunk16_store(" in mixed
+    assert (
+        "fa4_disc_resident_pair32(flash_p_sum, flash_res_frg0, flash_res_frg1, "
+        "flash_tiled_st32_1, tST32tS1, tST32cS, " in mixed
+    )
+    assert (
+        "fa4_disc_resident_chunk16_store(flash_res_frg3, flash_tiled_st1, tSTtS1, tSTcS, "
+        in mixed
+    )
+    stage1 = mixed[mixed.index("(warp_idx >= 4) & (warp_idx < 8):") :]
+    order = [
+        stage1.index("fa4_disc_resident_pair32("),
+        stage1.index("fa4_disc_resident_chunk16_store(flash_res_frg2, "),
+        stage1.index("fa4_disc_resident_release(flash_pfor_ptr + 1)"),
+        stage1.index("fa4_disc_resident_chunk16_store(flash_res_frg3, "),
+        stage1.index("fa4_disc_resident_release(flash_pfor2_ptr + 1)"),
+    ]
+    assert order == sorted(order), order
+    # The Rep16 form: the four chunk calls in chunk order per stage, each
+    # with its stage's views and barriers, then the final release; the
+    # template's zero row sum is the only one (no second initialisation).
+    for stage in ("0", "1"):
+        calls = [
+            f"fa4_disc_resident_chunk16(flash_res_frg{chunk}, flash_tiled_st{stage}, "
+            f"tSTtS{stage}, tSTcS, "
+            for chunk in range(4)
+        ]
+        positions = [rep16.index(call) for call in calls]
+        assert positions == sorted(positions), positions
+        for chunk in range(4):
+            assert (
+                f"{chunk}, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, "
+                f"flash_pfor_ptr + {stage}, flash_pfor2_ptr + {stage}, " in rep16
+            )
+        assert rep16.index(calls[3]) < rep16.index(
+            f"fa4_disc_resident_finish16(flash_pfor_ptr + {stage}, flash_pfor2_ptr + {stage})"
+        )
+    for src in (rep16, mixed):
+        lines = [line.strip() for line in src.splitlines()]
+        assert not any(
+            a == b == "flash_p_sum = cutlass.Float32(0.0)"
+            for a, b in itertools.pairwise(lines)
+        )
 
 
 @pytest.mark.parametrize(
@@ -2442,6 +2593,115 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
     assert flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is order
     full_cnt[0, 0, 0] = 0
     assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is not flat
+
+
+def _flex_tables_from_dense(
+    partial: torch.Tensor, full: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The BlockMask's count and index lists of two dense memberships."""
+    tables = []
+    for member in (partial, full):
+        order = torch.argsort(
+            member.to(torch.int8), dim=-1, descending=True, stable=True
+        )
+        tables.extend(
+            (member.sum(-1).to(torch.int32), order.to(torch.int32).contiguous())
+        )
+    return tables[0], tables[1], tables[2], tables[3]
+
+
+@pytest.mark.parametrize(("q_block", "rows"), [(128, 16), (128, 17), (256, 8)])
+def test_flex_item_flags_name_the_all_full_tables_and_the_identity_order(
+    q_block: int, rows: int
+) -> None:
+    """``flex_item_flags``: bit 0 when no row has a partial tile and every
+    row's full list is every tile (a ragged query length's missing row does
+    not count), bit 1 when the longest-first item order is the identity;
+    one host read per build, cached with the tables, 0 for inference
+    tensors (the tables are rebuilt per call there, no sync)."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+    from helion.runtime.cute.flash_flex import flex_item_table
+
+    batch, heads, num_kv = 2, 4, 12
+    num_pairs = -(-rows // 2) if q_block == 128 else rows
+    kwargs = {
+        "q_block": q_block,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": num_pairs,
+        "num_kv": num_kv,
+    }
+    shape = (batch, heads, rows, num_kv)
+    none = torch.zeros(shape, dtype=torch.bool)
+    every = torch.ones(shape, dtype=torch.bool)
+    # torch's noop / full BlockMask: every tile in every row's full list.
+    assert (
+        flex_item_flags(*_flex_tables_from_dense(none, every), **kwargs)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    # Every row sees the same half of the tiles, as full tiles: the
+    # counts are equal (identity order) but the lists are not all full.
+    half = every.clone()
+    half[..., num_kv // 2 :] = False
+    assert (
+        flex_item_flags(*_flex_tables_from_dense(none, half), **kwargs)
+        == FLEX_FLAG_IDENTITY_ORDER
+    )
+    # The same tiles as partial tiles: equal counts still, not all full.
+    assert (
+        flex_item_flags(*_flex_tables_from_dense(half, none), **kwargs)
+        == FLEX_FLAG_IDENTITY_ORDER
+    )
+    # A causal-like staircase (unequal counts) over full tiles: neither.
+    stair = every.clone()
+    for row in range(rows):
+        stair[:, :, row, min(num_kv, row + 1) :] = False
+    assert flex_item_flags(*_flex_tables_from_dense(none, stair), **kwargs) == 0
+    # One tile short in the last item's row flips bit 0 off and keeps the
+    # order (the items' unions stay non-increasing); short in the first
+    # pair (both of its rows), the longest-first sort moves it.
+    short = every.clone()
+    short[batch - 1, heads - 1, rows - 1, 3] = False
+    assert (
+        flex_item_flags(*_flex_tables_from_dense(none, short), **kwargs)
+        == FLEX_FLAG_IDENTITY_ORDER
+    )
+    short[0, 0, : (2 if q_block == 128 else 1), 3] = False
+    assert flex_item_flags(*_flex_tables_from_dense(none, short), **kwargs) == 0
+    # Cached with the tables: one build; the host read happens once, lazily,
+    # only when the flags are asked for (the words and order arguments of a
+    # render that binds no flags never sync). Inference tensors take the
+    # uncached path and return 0 without building anything.
+    from helion.runtime.cute import flash_flex
+    from helion.runtime.cute.flash_flex import flex_item_words
+
+    tables = _flex_tables_from_dense(none, every)
+    with (
+        patch.object(
+            flash_flex,
+            "_build_flex_item_tables",
+            wraps=flash_flex._build_flex_item_tables,
+        ) as build,
+        patch.object(
+            flash_flex, "_flex_flags_from_bits", wraps=flash_flex._flex_flags_from_bits
+        ) as read,
+    ):
+        words = flex_item_words(*tables, **kwargs)
+        order = flex_item_table(*tables, **kwargs)
+        assert build.call_count == 1 and read.call_count == 0
+        flags = flex_item_flags(*tables, **kwargs)
+        assert flags == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+        assert flex_item_flags(*tables, **kwargs) == flags
+        assert flex_item_words(*tables, **kwargs) is words
+        assert flex_item_table(*tables, **kwargs) is order
+        assert build.call_count == 1 and read.call_count == 1
+        with torch.inference_mode():
+            inference = tuple(table.clone() for table in tables)
+        assert all(table.is_inference() for table in inference)
+        assert flex_item_flags(*inference, **kwargs) == 0
+        assert build.call_count == 1 and read.call_count == 1
 
 
 # --------------------------------------------------------------------------
@@ -3168,8 +3428,204 @@ def test_long_walk_seed_is_in_the_list_walk_population() -> None:
         and cfg.causal_kv_order == "ascending"
         and (cfg.softmax_regs, cfg.corr_regs, cfg.other_regs) == (168, 80, 32)
     ]
-    assert len(long) == 1, [
+    # Once with the per-stage softmax regions, once with the shared region
+    # (whose one exp cadence ties stage 0's offset to stage 1's).
+    assert sorted(cfg.softmax_region for cfg in long) == ["per_stage", "shared"], [
         (cfg.persistent, cfg.kv_stage, cfg.e2e_schedule) for cfg in seeds
     ]
-    assert long[0].disc_pipe_depth == 1 and long[0].split_p_arrive
-    assert long[0].rescale_threshold == 8.0 and long[0].exp2_packet == "4x2"
+    for cfg in long:
+        assert cfg.disc_pipe_depth == 1 and cfg.split_p_arrive
+        assert cfg.rescale_threshold == 8.0 and cfg.exp2_packet == "4x2"
+    per_stage, shared = sorted(long, key=lambda cfg: cfg.softmax_region)
+    assert (per_stage.e2e_offset0, per_stage.e2e_offset) == (9, 2)
+    assert (shared.e2e_offset0, shared.e2e_offset) == (2, 2)
+
+
+# --------------------------------------------------------------------------
+# One softmax region for both query stages (``cute_flash_softmax_region``)
+# --------------------------------------------------------------------------
+
+SHARED_REGION: dict[str, object] = {
+    **BODY,
+    cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared",
+}
+
+
+def test_softmax_region_knob_is_legal_on_the_list_walk_only() -> None:
+    """``cute_flash_softmax_region``: appended behind the resident knob;
+    ``shared`` on the list walk's chunked fa4 body (with or without a score
+    region: the hook's staging ring is indexed by the runtime stage), one
+    CTA per pair (any P store form); per stage elsewhere; an unknown value
+    is declined. One region runs one exp cadence: stage 0's offset follows
+    stage 1's."""
+    key = cute_flash.FLASH_SOFTMAX_REGION_KEY
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    # Appended right behind the resident knob (axes added later sit behind it).
+    assert keys.index(key) == keys.index(cute_flash.FLASH_S_RESIDENT_KEY) + 1
+    assert _resolve(BODY).softmax_region == "per_stage"
+    shared = _resolve(SHARED_REGION)
+    assert shared.softmax_region == "shared"
+    tied = _resolve(
+        {
+            **SHARED_REGION,
+            cute_flash.FLASH_E2E_OFFSET0_KEY: 5,
+            cute_flash.FLASH_E2E_OFFSET_KEY: 1,
+        }
+    )
+    assert (tied.e2e_offset0, tied.e2e_offset) == (1, 1)
+    apart = _resolve(
+        {
+            **BODY,
+            cute_flash.FLASH_E2E_OFFSET0_KEY: 5,
+            cute_flash.FLASH_E2E_OFFSET_KEY: 1,
+        }
+    )
+    assert (apart.e2e_offset0, apart.e2e_offset) == (5, 1)
+    assert _resolve({**SHARED_REGION}, has_score_modifiers=True).softmax_region == (
+        "shared"
+    )
+    assert _resolve(SHARED_REGION, has_list_walk=False).softmax_region == "per_stage"
+    mixed = _resolve(
+        {
+            **SHARED_REGION,
+            cute_flash.FLASH_P_STORE_REP_KEY: 32,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        }
+    )
+    assert mixed.softmax_region == "shared" and mixed.p_store_repetition == 32
+    with pytest.raises(InvalidConfig, match="per_stage"):
+        _resolve({**SHARED_REGION, key: "bogus"})
+
+
+def _shared_softmax_roles(src: str) -> dict[str, str]:
+    """The softmax role blocks of a render (per stage, or the shared one)."""
+    return {
+        name: block
+        for name, block in _roles(src).items()
+        if "warp_idx < 4" in name or "warp_idx < 8" in name
+    }
+
+
+def test_shared_softmax_region_renders_one_role_for_both_stages() -> None:
+    """The shared region: one ``warp_idx < 8`` softmax role whose stage is a
+    warp-uniform runtime value selecting the TMEM columns, the s_corr
+    barrier pair, the P/S-full barriers, the named barrier ids and the
+    query tile; the list walk reads the stage's status words through a
+    select of the two stages' words. The per-stage render keeps its two
+    roles and none of the runtime-stage bindings."""
+    plan = _flex_plan(mask_region=object())
+    per_stage = _render(_resolve(BODY), plan)
+    assert len(_shared_softmax_roles(per_stage)) == 2
+    assert "flash_stage" not in per_stage
+
+    src = _render(_resolve(SHARED_REGION), plan)
+    roles = _shared_softmax_roles(src)
+    assert list(roles) == ["if warp_idx < 8:"], list(roles)
+    role = roles["if warp_idx < 8:"]
+    for line in (
+        "flash_stage = cute.arch.make_warp_uniform(warp_idx // 4)",
+        "tStSs = cute.make_tensor(flash_tmem_ptr + flash_stage * 128, tStS.layout)",
+        "tLDtSs = flash_thr_lds.partition_S(tStSs)",
+        "tStSs_P = cute.make_tensor(tStSs.iterator, flash_P_layout)",
+        "tSTtSs = flash_thr_sts.partition_D(tStSs_P)",
+        "flash_ss_corr_full_ptr = flash_s0_corr_full_ptr + flash_stage * 4",
+        "flash_ss_corr_empty_ptr = flash_ss_corr_full_ptr + 2",
+        "flash_m_tiles = flash_m_tile0 + flash_stage",
+    ):
+        assert line in role, line
+    loop = _softmax_loop(role)
+    for text in (
+        "flash_s_full_ptr + flash_stage, flash_s_full_phase",
+        "3 + flash_stage * 4 + warp_idx % 4, 64)",
+        "flash_pfor_ptr + flash_stage",
+        "flash_pfor2_ptr + flash_stage",
+        "flash_ss_corr_empty_ptr + flash_s_corr_prod_index",
+        "flash_flex_ps_0 & flash_flex_kvbit",
+        "flash_tiled_lds, tLDtSs, tLDcS, flash_tiled_sts, tSTtSs, tSTcS",
+    ):
+        assert text in loop, text
+    # The register words are the item's: their stage select sits in the
+    # item prelude, before the loop, not per step.
+    head = role[: role.index(loop)]
+    for text in (
+        (
+            "flash_flex_ps_0 = cutlass.Int32(cutlass.select_(flash_stage == 0, "
+            "flash_flex_p0_0, flash_flex_p1_0))"
+        ),
+        (
+            "flash_flex_fs_0 = cutlass.Int32(cutlass.select_(flash_stage == 0, "
+            "flash_flex_f0_0, flash_flex_f1_0))"
+        ),
+    ):
+        assert text in head and text not in loop, text
+    assert "flash_q_mma_tiles" not in role
+    # The whole kernel carries one PASS2 call; the loop and the tail name no
+    # per-stage TMEM view, barrier or query tile (the role head keeps the
+    # shared descriptor setup's static views, unused).
+    assert src.count("flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store") == 1
+    tail = role[role.index(loop) + len(loop) :]
+    for name in (
+        "tLDtS0",
+        "tLDtS1",
+        "tSTtS0",
+        "tSTtS1",
+        "flash_s0_corr",
+        "flash_s1_corr",
+    ):
+        assert name not in loop, name
+        assert name not in tail, name
+    assert "flash_m_tiles * 128 + flash_local_tidx" in tail  # the LSE rows
+    assert "flash_ss_corr_empty_ptr + " in tail
+
+
+def test_shared_softmax_region_selects_the_cursor_words_per_step() -> None:
+    """On the host words table (the cursor walk) the shared region picks its
+    stage's current partial / full words off the cursor's four registers at
+    every step, and the tail wait takes the stage's s_corr barrier."""
+    cfg = _resolve(SHARED_REGION, num_kv=128)
+    assert cfg.softmax_region == "shared" and cfg.flex_item_words
+    src = _render(cfg, _flex_plan(kv_seq=16384, mask_region=object()), words_table=True)
+    roles = _shared_softmax_roles(src)
+    assert list(roles) == ["if warp_idx < 8:"]
+    role = roles["if warp_idx < 8:"]
+    loop = _softmax_loop(role)
+    assert (
+        "flash_flex_wps = cutlass.Int32(cutlass.select_(flash_stage == 0, "
+        "flash_flex_wp0, flash_flex_wp1))" in loop
+    )
+    assert (
+        "flash_flex_wfs = cutlass.Int32(cutlass.select_(flash_stage == 0, "
+        "flash_flex_wf0, flash_flex_wf1))" in loop
+    )
+    assert "flash_flex_wps & flash_flex_kvbit" in loop
+    tail = role[role.index(loop) + len(loop) :]
+    assert "flash_ss_corr_empty_ptr + " in tail
+    assert "flash_s0_corr_empty_ptr" not in tail and "flash_s1_corr" not in tail
+
+
+def test_shared_softmax_region_renders_the_trivial_walk_without_stage_words() -> None:
+    """Torch's empty BlockMask (``kv_walk.trivial``: one KV block over the
+    sequence) builds no bitmask words, so the shared item prelude binds the
+    stage's query tile only: a select of the two stages' words would name
+    registers the kernel never defines (a trace-time NameError)."""
+    cfg = _resolve(SHARED_REGION, flex_trivial_walk=True)
+    assert cfg.softmax_region == "shared"
+    for mask_region, score_region in ((object(), None), (None, object())):
+        plan = _flex_plan(mask_region=mask_region, score_region=score_region)
+        assert plan.kv_walk is not None
+        plan = dataclasses.replace(
+            plan, kv_walk=dataclasses.replace(plan.kv_walk, trivial=True)
+        )
+        assert not plan.has_list_walk
+        src = _render(cfg, plan)
+        roles = _shared_softmax_roles(src)
+        assert list(roles) == ["if warp_idx < 8:"], list(roles)
+        role = roles["if warp_idx < 8:"]
+        assert "flash_m_tiles = flash_m_tile0 + flash_stage" in role
+        assert "cutlass.select_(flash_stage == 0, flash_flex_" not in src
+        names = [
+            node for node in ast.walk(ast.parse(src)) if isinstance(node, ast.Name)
+        ]
+        stored = {node.id for node in names if isinstance(node.ctx, ast.Store)}
+        loaded = {node.id for node in names if isinstance(node.ctx, ast.Load)}
+        assert not {name for name in loaded - stored if name.startswith("flash_flex_")}

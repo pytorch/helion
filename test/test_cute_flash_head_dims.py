@@ -527,6 +527,23 @@ class TestRenderPins(TestCase):
         the per-tile status, the mask hook per score chunk, the zero P tile)."""
         self.assertExpectedJournal(_render_flex(256))
 
+    def test_render_d64_flex_cooperative_pair_on_request(self) -> None:
+        """Within the pair body's value width the cooperative pair is legal
+        on request for the table-backed walk (``_flash_ws_two_cta_list_walk``;
+        not searched: it measured 26-52% behind the pair body): the flex
+        example at 64 with ``ws_2cta`` renders the pair's list walk (the
+        cluster decode, the per-tile status) instead of the fa4 pair body,
+        which the default request keeps."""
+        request = {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}
+        pair = _render_flex(64, config=request)
+        assert "cute.arch.block_idx_in_cluster()" in pair
+        assert "'topology': 'ws_overlap'" in pair
+        assert "flash_flex_status" in pair
+        assert "_helion_flash_flex_item_words(" in pair
+        body = _render_flex(64)
+        assert "cute.arch.block_idx_in_cluster()" not in body
+        assert "'topology': 'fa4'" in body
+
     def test_render_d192_single_tile_body(self) -> None:
         """The dense causal kernel at 192 on the single-tile body alone
         (``ws_overlap``, one CTA per 128-row tile): the flat grid, the

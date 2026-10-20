@@ -3160,7 +3160,7 @@ def fa4_disc_exp_convert_store_resident_rep32(
 ) -> Float32:
     """Rep32 PASS2 over the score chunks PASS1 left resident in registers
     (``cute_flash_s_resident``) without the split P arrival (with it the
-    Rep32 stores take ``fa4_disc_exp_convert_store_resident_rep32_split``):
+    Rep32 stores take the per-pair ``fa4_disc_resident_pair32`` regions):
     no TMEM reload, the same per-chunk numerics and P-store pairing as
     ``fa4_disc_exp_convert_store_rep32_pipe`` and one release after the
     last pair.  ``frgs`` are the ``2 * p_store_chunks`` 32-column fragments
@@ -3200,116 +3200,8 @@ def fa4_disc_exp_convert_store_resident_rep32(
     return p_sum
 
 
-def fa4_disc_exp_convert_store_resident_rep32_split(
-    frgs: tuple,
-    tiled_st32: object,
-    tST32tS: cute.Tensor,
-    tST32cS: cute.Tensor,
-    tiled_st16: object,
-    tST16tS: cute.Tensor,
-    tST16cS: cute.Tensor,
-    scale: Float32,
-    minus_max_scale: Float32,
-    e2e_freq: int,
-    e2e_res: int,
-    e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
-    ld_chunks: int,
-    io_dtype: object = cutlass.Float16,
-    pfor_peer_cta_rank: object = None,
-    pfor_self_cta_rank: object = None,
-    pair_batch: int = 1,
-    emu_batch: int = 1,
-    degree2: bool = False,
-    degree1: bool = False,
-) -> Float32:
-    """``fa4_disc_exp_convert_store_rep32_split`` over the score chunks PASS1
-    left resident in registers (``cute_flash_s_resident``): Rep32 stores of
-    the chunk pairs below the 3/4 split, a Rep16 store of the odd chunk,
-    the staged-P release at 96 columns, the last Rep16 chunk and the final
-    release; no TMEM reload."""
-    p_sum = cutlass.Float32(0.0)
-    split_ld_chunks = ld_chunks * 3 // 4
-    pair_chunks = split_ld_chunks // 2
-    for pair_ci in range(pair_chunks):
-        frg0 = frgs[pair_ci * 2]
-        frg1 = frgs[pair_ci * 2 + 1]
-        _disc_chunk_exp(
-            frg0,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            False,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-        )
-        _disc_chunk_exp(
-            frg1,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            pair_ci * 2 + 1 >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-        )
-        _disc_chunk_pair_convert_store(
-            frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
-        )
-        p_sum = p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
-    ld_ci = pair_chunks * 2
-    if cutlass.const_expr(split_ld_chunks % 2 != 0):
-        frg = frgs[ld_ci]
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ld_ci >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-        )
-        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-        ld_ci += 1
-    cute.arch.fence_view_async_tmem_store()
-    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    for ci in range(ld_ci, ld_chunks):
-        frg = frgs[ci]
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ci >= ld_chunks - 1,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-        )
-        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(frg)
-    cute.arch.fence_view_async_tmem_store()
-    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
-
-
-def fa4_disc_exp_convert_store_resident_rep16(
-    frgs: tuple,
+def fa4_disc_resident_chunk16(
+    frg: cute.Tensor,
     tiled_st: object,
     tSTtS: cute.Tensor,
     tSTcS: cute.Tensor,
@@ -3318,58 +3210,179 @@ def fa4_disc_exp_convert_store_resident_rep16(
     e2e_freq: int,
     e2e_res: int,
     e2e_offset: int,
-    pfor_ptr_stage: object,
-    pfor2_ptr_stage: object,
+    ci: int,
     p_store_split: int,
     p_store_chunks: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
     io_dtype: object = cutlass.Float16,
+    pforc_ptr_stage: object = None,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
     pair_batch: int = 1,
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
-    pforc_ptr_stage: object = None,
 ) -> Float32:
-    """Rep16 PASS2 over the score chunks PASS1 left resident in registers
-    (``cute_flash_s_resident`` with Rep16 P stores): one store chunk per
-    32-column score chunk and the staged-P releases of
-    ``fa4_disc_exp_convert_store_pipe`` (the 3/4 + 1/4 split or the per-chunk
-    arrivals), without the TMEM reload."""
-    p_sum = cutlass.Float32(0.0)
-    for ci in range(p_store_chunks):
-        cur = frgs[ci]
-        _disc_chunk_exp(
-            cur,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ci >= p_store_chunks - 1,
-            pair_batch,
-            emu_batch,
-            degree2,
-            degree1,
-        )
-        _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
-        p_sum = p_sum + _disc_chunk_rowsum(cur)
-        _disc_chunk_release(
-            ci,
-            p_store_split,
-            p_store_chunks,
-            pfor_ptr_stage,
-            pfor2_ptr_stage,
-            pforc_ptr_stage,
-            pfor_peer_cta_rank,
-            pfor_self_cta_rank,
-        )
+    """One chunk of the Rep16 resident PASS2 (``cute_flash_s_resident`` with
+    Rep16 P stores): the exp, the convert and in-place store, the row-sum
+    fold and the staged-P release of ``fa4_disc_exp_convert_store_pipe``
+    (the 3/4 + 1/4 split or the per-chunk arrivals), without the TMEM
+    reload; the same per-chunk numerics as the reload form.  The kernel
+    body calls it per resident chunk inside a region of its own: with the
+    row resident nothing ties chunk ``c + 1``'s exps to chunk ``c``'s
+    ``tcgen05.st``, and ptxas sank every store (with the 3/4 release) below
+    the whole row's exps, so the PV MMA started a softmax later than on
+    the reload form; a region boundary per chunk keeps them in order."""
+    _disc_chunk_exp(
+        frg,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        ci >= p_store_chunks - 1,
+        pair_batch,
+        emu_batch,
+        degree2,
+        degree1,
+    )
+    _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
+    p_sum = _disc_chunk_rowsum(frg)
+    _disc_chunk_release(
+        ci,
+        p_store_split,
+        p_store_chunks,
+        pfor_ptr_stage,
+        pfor2_ptr_stage,
+        pforc_ptr_stage,
+        pfor_peer_cta_rank,
+        pfor_self_cta_rank,
+    )
+    return p_sum
+
+
+def fa4_disc_resident_pair32(
+    p_sum: Float32,
+    frg0: cute.Tensor,
+    frg1: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pair_ci: int,
+    ld_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
+) -> Float32:
+    """One chunk pair of the mixed Rep32/Rep16 resident PASS2
+    (``cute_flash_s_resident`` with Rep32 P stores and the split P arrival):
+    the two chunks' exps and one Rep32 store, and the row sum carried in:
+    ``(p_sum + chunk 0) + chunk 1``, the reload form's fold order (bitwise
+    with it past one pair, kv tiles of 192 columns and more); the kernel
+    body calls it per pair inside a region of its own (see
+    ``fa4_disc_resident_chunk16``)."""
+    _disc_chunk_exp(
+        frg0,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        pair_batch,
+        emu_batch,
+        degree2,
+        degree1,
+    )
+    _disc_chunk_exp(
+        frg1,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        pair_ci * 2 + 1 >= ld_chunks - 1,
+        pair_batch,
+        emu_batch,
+        degree2,
+        degree1,
+    )
+    _disc_chunk_pair_convert_store(
+        frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
+    )
+    return p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
+
+
+def fa4_disc_resident_chunk16_store(
+    frg: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    ci: int,
+    ld_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
+) -> Float32:
+    """One Rep16-stored chunk of the mixed resident PASS2 (the odd chunk at
+    the 3/4 split and the chunks past it): the exp, the convert and store
+    and the row-sum fold; the releases are the caller's
+    (``fa4_disc_resident_release``)."""
+    _disc_chunk_exp(
+        frg,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        ci >= ld_chunks - 1,
+        pair_batch,
+        emu_batch,
+        degree2,
+        degree1,
+    )
+    _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
+    return _disc_chunk_rowsum(frg)
+
+
+def fa4_disc_resident_release(
+    pfor_ptr_stage: object,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> None:
+    """A staged-P release of the mixed resident PASS2 (the fence and one
+    arrival): at the 3/4 split on ``pfor``, after the last chunk on ``pfor2``."""
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+
+
+def fa4_disc_resident_finish16(
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> None:
+    """The last chunk's staged-P release of ``fa4_disc_resident_chunk16``."""
     cute.arch.fence_view_async_tmem_store()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
         mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    return p_sum
 
 
 def fa4_disc_exp_convert_store_sload16_pair_pipe(
@@ -4493,17 +4506,28 @@ def fa4_split_partial_store(
             .get_slice(tidx)
             .partition_S(tOtO1_i[(None, None), None])
         )
-    for i in range(head_dim // corr_tile_size):
-        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
-        reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
-        cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
-        if tOtO1_t2r is not None:
-            reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
-            cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
-            reg0.store(reg0.load() * w0 + reg1.load() * w1)
-        elif w0 is not None:
-            reg0.store(reg0.load() * w0)
-        cute.autovec_copy(reg0, tOgP_t2r[None, 0, 0, i])
+    # The TMEM loads of a batch of chunks go out before the batch's global
+    # stores (the stores would otherwise serialize the next chunk's load
+    # behind them); at most 64 fp32 registers of fragments per batch.
+    chunks = head_dim // corr_tile_size
+    batch = max(1, min(chunks, 64 // (corr_tile_size * (2 if tOtO1_t2r else 1))))
+    for first in range(0, chunks, batch):
+        loaded = []
+        for i in range(first, min(chunks, first + batch)):
+            reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+            reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+            cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
+            reg1 = None
+            if tOtO1_t2r is not None:
+                reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+                cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
+            loaded.append((i, reg0, reg1))
+        for i, reg0, reg1 in loaded:
+            if reg1 is not None:
+                reg0.store(reg0.load() * w0 + reg1.load() * w1)
+            elif w0 is not None:
+                reg0.store(reg0.load() * w0)
+            cute.autovec_copy(reg0, tOgP_t2r[None, 0, 0, i])
 
 
 @dsl_user_op
@@ -4530,18 +4554,32 @@ def fa4_split_merge_store(
         flash_pvt, tOtO, (gO, *partials), tidx, head_dim, corr_tile_size, o_dtype
     )
     tOgO_t2r, *tOgP_t2r = gmem
-    for i in range(head_dim // corr_tile_size):
-        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
-        acc = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
-        cute.autovec_copy(tOgP_t2r[0][None, 0, 0, i], acc)
-        acc.store(acc.load() * weights[0])
-        for j in range(1, len(partials)):
-            part = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
-            cute.autovec_copy(tOgP_t2r[j][None, 0, 0, i], part)
-            acc.store(acc.load() + part.load() * weights[j])
-        out = cute.make_rmem_tensor(reg_src.shape, o_dtype)
-        out.store(acc.load().to(o_dtype))
-        cute.autovec_copy(out, tOgO_t2r[None, 0, 0, i])
+    # Every partial's loads of a batch of chunks go out before the batch's
+    # arithmetic and output stores: the loads of one chunk are independent,
+    # and a store to the output (whose aliasing with the workspace the
+    # compiler cannot rule out) would otherwise hold the next chunk's loads
+    # back, one L2 round trip per chunk. At most 64 fp32 registers of
+    # fragments per batch; the per-element sum order is the split order.
+    chunks = head_dim // corr_tile_size
+    batch = max(1, min(chunks, 64 // (corr_tile_size * len(partials))))
+    for first in range(0, chunks, batch):
+        loaded = []
+        for i in range(first, min(chunks, first + batch)):
+            reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+            parts = []
+            for j in range(len(partials)):
+                part = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+                cute.autovec_copy(tOgP_t2r[j][None, 0, 0, i], part)
+                parts.append(part)
+            loaded.append((i, reg_src, parts))
+        for i, reg_src, parts in loaded:
+            acc = parts[0]
+            acc.store(acc.load() * weights[0])
+            for j in range(1, len(partials)):
+                acc.store(acc.load() + parts[j].load() * weights[j])
+            out = cute.make_rmem_tensor(reg_src.shape, o_dtype)
+            out.store(acc.load().to(o_dtype))
+            cute.autovec_copy(out, tOgO_t2r[None, 0, 0, i])
 
 
 @dsl_user_op
