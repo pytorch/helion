@@ -1916,6 +1916,7 @@ class CuteBackend(Backend):
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_fragment_cta_topk",
                 "cute_selection_algorithm",
                 "cute_radix_threads",
                 "cute_radix_candidate_key_cache",
