@@ -23,6 +23,14 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 
+# How long a SIGKILLed worker may take to exit before it counts as unreapable.
+# A worker killed mid-kernel exits only once the driver has torn down its
+# context, which for a hung or minutes-long kernel takes seconds: a 5 second
+# window turned the fourth benchmark timeout of a sweep's swiglu search (a
+# one-CTA tile of 8M elements) into a fatal BenchmarkWorkerUnkillable that
+# discarded the whole autotune.
+_REAP_TIMEOUT_SECONDS = 60.0
+
 
 def _set_pdeathsig() -> None:
     """SIGTERM the child if the parent dies (Linux only, best-effort)."""
@@ -246,15 +254,16 @@ class BenchmarkWorker:
             with contextlib.suppress(Exception):
                 signal_process_tree(process, signal.SIGKILL)
             with contextlib.suppress(Exception):
-                process.join(timeout=5)
+                process.join(timeout=_REAP_TIMEOUT_SECONDS)
         if connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()
         if process is not None and process.is_alive():
             if self._fatal_error is None:
                 self._fatal_error = (
-                    f"benchmark worker pid {process.pid} did not exit within 5 seconds "
-                    "after SIGKILL; refusing to launch another worker"
+                    f"benchmark worker pid {process.pid} did not exit within "
+                    f"{_REAP_TIMEOUT_SECONDS:g} seconds after SIGKILL; refusing to "
+                    "launch another worker"
                 )
             return
         self._process = None
