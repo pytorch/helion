@@ -1282,3 +1282,364 @@ def test_register_and_cursor_walks_agree_at_two_words() -> None:
     assert torch.equal(out_c, out_r)
     assert torch.equal(lse_c, lse_r)
     _assert_close(out_c, lse_c, ref_out, ref_lse)
+
+
+# -- (x) the list walk on the single-tile body's cooperative pair above 128 ---
+
+
+def _assert_pair_list_walk(code: str) -> None:
+    """The fused flex kernel on ``ws_2cta``: the pair's two table rows, the
+    per-stream cursors over their union and the per-tile status."""
+    assert "'kind': 'helion_flash'" in code
+    assert "'use_2cta_instrs': True" in code
+    # The item's bitmask words from the host table (one word per list) or,
+    # past one word, the cursor walk over it; every stream its own cursor.
+    assert "_flash_mFlexWords = " in code
+    assert (
+        "flash_flex_remk0 = flash_flex_u0" in code
+        and "flash_flex_rems0 = flash_flex_u0" in code
+    ) or ("flash_flex_cwk = " in code and "flash_flex_cws = " in code)
+    assert "flash_flex_status = cutlass.Int32(" in code
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "mask_name", "q_seq", "kv_seq"),
+    [
+        pytest.param(256, torch.bfloat16, "noop", 1024, 1024, id="d256-noop"),
+        pytest.param(256, torch.bfloat16, "causal", 1024, 1024, id="d256-causal"),
+        pytest.param(256, torch.float16, "causal", 1024, 1024, id="d256-causal-fp16"),
+        pytest.param(256, torch.bfloat16, "sliding", 2048, 2048, id="d256-sliding"),
+        pytest.param(256, torch.bfloat16, "hide", 1024, 1024, id="d256-empty-rows"),
+        pytest.param(256, torch.bfloat16, "causal", 1024, 2048, id="d256-cross"),
+        pytest.param(192, torch.bfloat16, "sliding", 1024, 1024, id="d192-sliding"),
+        pytest.param(144, torch.bfloat16, "causal", 1024, 1024, id="d144-causal"),
+        pytest.param(160, torch.bfloat16, "causal", 512, 512, id="d160-causal"),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_above_128(
+    head_dim: int,
+    dtype: torch.dtype,
+    mask_name: str,
+    q_seq: int,
+    kv_seq: int,
+) -> None:
+    """Above value width 128 the BlockMask list walk runs on the single-tile
+    body's cooperative pair: the all-full walk, partial diagonal tiles (the
+    mask hook per score chunk), absent tiles (the zero P tile of the sliding
+    window), rows no key reaches (zero output, ``-inf`` LSE), differing Q
+    and KV lengths, and the value widths the 64-column drain does not tile
+    (144 / 160)."""
+    masks: dict[str, Callable[..., Any]] = {
+        "noop": lambda b, h, q_idx, kv_idx: q_idx >= 0,
+        "causal": _causal,
+        "sliding": _sliding_causal(256),
+        "hide": _hide_first_rows(300),
+    }
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, head_dim, dtype)
+    block_mask = _block_mask(masks[mask_name], 2, 4, q_seq, kv_seq)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    _assert_pair_list_walk(code)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "q_seq", "kv_seq", "kv_heads", "mask_name", "mods_name"),
+    [
+        pytest.param(256, torch.bfloat16, 1024, 1024, 2, "causal", None, id="d256-gqa"),
+        pytest.param(
+            256, torch.bfloat16, 1152, 1152, None, "causal", None, id="d256-odd-tiles"
+        ),
+        pytest.param(
+            256, torch.bfloat16, 1500, 1536, None, "causal", None, id="d256-ragged-rows"
+        ),
+        pytest.param(
+            256, torch.bfloat16, 1024, 1088, None, "noop", None, id="d256-kv-tail-full"
+        ),
+        pytest.param(
+            256, torch.bfloat16, 1088, 1088, None, "causal", None, id="d256-kv-tail"
+        ),
+        pytest.param(
+            256, torch.bfloat16, 1024, 1024, None, "causal", "rel_bias", id="d256-score"
+        ),
+        pytest.param(
+            192,
+            torch.float16,
+            1500,
+            1088,
+            2,
+            "sliding",
+            "column",
+            id="d192-ragged-gqa-score-fp16",
+        ),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_envelopes(
+    head_dim: int,
+    dtype: torch.dtype,
+    q_seq: int,
+    kv_seq: int,
+    kv_heads: int | None,
+    mask_name: str,
+    mods_name: str | None,
+) -> None:
+    """The pair hosts the rest of the list walk's envelope: grouped-query
+    heads (K/V at ``bh // kv_group``), a ragged query length (an odd tile
+    count's dead second tile, a half-live tile's guarded O / LSE rows), a
+    ragged KV length (the tail mask on the last tile, in the full list under
+    a noop mask), and the score region (natural units on every live tile)."""
+    masks: dict[str, Callable[..., Any]] = {
+        "noop": noop_mask,
+        "causal": _causal,
+        "sliding": _sliding_causal(256),
+    }
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, head_dim, dtype, kv_heads=kv_heads)
+    block_mask = _block_mask(masks[mask_name], 2, 4, q_seq, kv_seq)
+    mods = None
+    if mods_name == "rel_bias":
+        table = torch.randn(q_seq + kv_seq, dtype=torch.float32, device=DEVICE)
+        mods = _rel_bias_mods(table, q_seq)
+    elif mods_name == "column":
+        table = torch.randn(kv_seq, dtype=dtype, device=DEVICE)
+        mods = _column_table_mods(table)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, mods=mods, enable_gqa=kv_heads is not None
+    )
+    _assert_pair_list_walk(code)
+    assert ("flash_bh // 2" in code) == (kv_heads is not None)
+    assert ("if flash_local_tidx < flash_live_rows:" in code) == (q_seq % 256 != 0)
+    assert ("_flash_last_tile = " in code) == (kv_seq % 128 != 0)
+    assert ("flash_flex0s_" in code) == (mods is not None)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(("q_seq", "kv_seq"), [(1024, 1024), (1152, 1088)])
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_single_row_items(
+    q_seq: int, kv_seq: int
+) -> None:
+    """A 256-row BlockMask: one table row per pair item, both CTAs walk the
+    same lists (and a ragged pair / KV tail on top)."""
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, 256, torch.bfloat16)
+    block_mask = _block_mask(_causal, 2, 4, q_seq, kv_seq, block_size=(256, 128))
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    _assert_pair_list_walk(code)
+    assert "flash_flex_pm_0 = flash_flex_p0_0" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "q_seq", "kv_seq", "mask_name"),
+    [
+        pytest.param(1, 1, 16384, 16384, "sliding", id="s16384-sliding-4-words"),
+        pytest.param(1, 2, 12288, 12288, "causal", id="s12288-causal-3-words"),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_cursor_walk(
+    batch: int, heads: int, q_seq: int, kv_seq: int, mask_name: str
+) -> None:
+    """Past the two-word register bitmask the pair walks the host words
+    table through per-stream cursors (the K and V TMA streams and the
+    softmax each keep their own): the item header, the current words of
+    the CTA's own stage, the per-step scan."""
+    masks: dict[str, Callable[..., Any]] = {
+        "causal": _causal,
+        "sliding": _sliding_causal(1024),
+    }
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, 256, torch.bfloat16)
+    block_mask = _block_mask(masks[mask_name], batch, heads, q_seq, kv_seq)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    assert "'kind': 'helion_flash'" in code
+    assert "'use_2cta_instrs': True" in code
+    assert "_flash_mFlexWords = " in code
+    assert (
+        "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])" in code
+    )
+    for stream in ("k", "v", "s"):
+        # (One past the walk's first word: ``hiw + 1`` descending, ``low - 1``
+        # ascending.)
+        assert f"flash_flex_cw{stream} = flash_flex_" in code
+        assert f"flash_flex_wp0{stream} = cutlass.Int32(_flash_mFlexWords[" in code
+    assert "flash_flex_wpms = cutlass.Int32(cutlass.select_(" in code
+    assert "flash_flex_rems0" not in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "kv_heads"),
+    [
+        pytest.param(1024, 1024, 4, id="plain"),
+        pytest.param(1024, 1024, 2, id="gqa"),
+        pytest.param(1152, 1152, 4, id="ragged"),
+        pytest.param(1024, 512, 4, id="cross"),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_transposed_views(
+    q_seq: int, kv_seq: int, kv_heads: int
+) -> None:
+    """``[B, S, H, D].transpose(1, 2)`` operands on the pair: rank-4 TMA
+    maps over the recorded strides, the output tile addressed by head and
+    batch; bitwise the contiguous pair kernel at the same configuration."""
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, 256, torch.bfloat16, kv_heads=kv_heads)
+    block_mask = _block_mask(_causal, 2, 4, q_seq, kv_seq)
+    enable_gqa = kv_heads != 4
+    code_c, out_c, lse_c, _, _ = _run(q, k, v, block_mask, enable_gqa=enable_gqa)
+    _assert_rank3_maps(code_c)
+    _assert_pair_list_walk(code_c)
+    qt, kt, vt = (_as_bshd(t) for t in (q, k, v))
+    code, out, lse, ref_out, ref_lse = _run(
+        qt, kt, vt, block_mask, enable_gqa=enable_gqa
+    )
+    _assert_rank4_maps(code, kv_group=4 // kv_heads)
+    _assert_pair_list_walk(code)
+    assert (
+        "[None, None, None, flash_q_mma_tile * 2, 0, flash_head, flash_batch]" in code
+    )
+    assert torch.equal(out, out_c) and torch.equal(lse, lse_c)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_reads_an_aux_table() -> None:
+    """A mask over a closure table (Longformer's global rows / columns): the
+    pair's mask hook gathers the table through the CTA-wide aux binding."""
+    is_global = torch.zeros(1024, dtype=torch.bool, device=DEVICE)
+    is_global[::129] = True
+    helion_mask, torch_mask = _global_window_masks(is_global, 128)
+    q, k, v = _qkv(2, 4, 1024, 1024, 256, torch.bfloat16)
+    block_mask = _block_mask(torch_mask, 2, 4, 1024, 1024)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, kernel_mask_mod=helion_mask
+    )
+    _assert_pair_list_walk(code)
+    assert "_flash_aux0 = " in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_two_word_bitmask() -> None:
+    """64 KV tiles: two words per list, the host words table's cursor walk
+    (the one-word items read their four words into registers)."""
+    q, k, v = _qkv(1, 1, 8192, 8192, 256, torch.bfloat16)
+    block_mask = _block_mask(_sliding_causal(1024), 1, 1, 8192, 8192)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    _assert_pair_list_walk(code)
+    assert (
+        "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])" in code
+    )
+    assert "flash_flex_cws = " in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "block_size", "mask_name"),
+    [
+        pytest.param(8500, 8500, 128, "causal", id="ragged-m-and-kv"),
+        pytest.param(12288, 12288, (256, 128), "causal", id="256-row-tables"),
+        pytest.param(8704, 8644, (256, 128), "sliding", id="256-row-tables-ragged-kv"),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_cursor_walk_envelopes(
+    q_seq: int, kv_seq: int, block_size: int | tuple[int, int], mask_name: str
+) -> None:
+    """The cursor walk's envelopes on the pair (past the two-word register
+    bitmask): a ragged query length (the last pair's half-live tile and its
+    dead twin) with a ragged KV length (the tail mask on the last tile), and
+    256-row tables (one row per pair item) through the cursor, with a ragged
+    KV length on top."""
+    masks: dict[str, Callable[..., Any]] = {
+        "causal": _causal,
+        "sliding": _sliding_causal(1024),
+    }
+    q, k, v = _qkv(1, 2, q_seq, kv_seq, 256, torch.bfloat16)
+    block_mask = _block_mask(
+        masks[mask_name], 1, 2, q_seq, kv_seq, block_size=block_size
+    )
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    assert "'kind': 'helion_flash'" in code
+    assert "'use_2cta_instrs': True" in code
+    assert "_flash_mFlexWords = " in code
+    assert (
+        "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])" in code
+    )
+    assert ("if flash_local_tidx < flash_live_rows:" in code) == (q_seq % 256 != 0)
+    assert ("_flash_last_tile = " in code) == (kv_seq % 128 != 0)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {cute_flash.FLASH_FLEX_MASK_FORM_KEY: "element"}, id="mask-element"
+        ),
+        pytest.param({cute_flash.FLASH_PACKED_REDUCE_KEY: True}, id="packed-reduce"),
+        pytest.param(
+            {
+                cute_flash.FLASH_FLEX_MASK_FORM_KEY: "element",
+                cute_flash.FLASH_PACKED_REDUCE_KEY: True,
+            },
+            id="both",
+        ),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_searched_knobs(
+    overrides: dict[str, object],
+) -> None:
+    """The pair walk's searched knobs beyond the defaults: the per-element
+    mask form and the packed row reduce, alone and together."""
+    q, k, v = _qkv(2, 4, 1024, 1024, 256, torch.bfloat16)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask, overrides=overrides)
+    _assert_pair_list_walk(code)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "kv_heads", "mask_name"),
+    [
+        pytest.param(128, 1024, 4, "causal", id="one-tile-dead-rank"),
+        pytest.param(64, 512, 4, "noop", id="half-tile-dead-rank"),
+        pytest.param(1152, 1152, 2, "causal", id="gqa-dead-tile"),
+        pytest.param(1500, 1536, 2, "sliding", id="gqa-half-live-tile"),
+    ],
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_list_walk_on_the_cooperative_pair_short_and_grouped_queries(
+    q_seq: int, kv_seq: int, kv_heads: int, mask_name: str
+) -> None:
+    """A query length of one tile or less: one pair per head whose rank 1 is
+    fully dead (it still runs the cluster's handshakes beside the live rank,
+    and the half tile's rows are guarded); grouped-query heads with a ragged
+    query length (the dead or half-live tile beside K/V at ``bh //
+    kv_group``)."""
+    masks: dict[str, Callable[..., Any]] = {
+        "noop": noop_mask,
+        "causal": _causal,
+        "sliding": _sliding_causal(256),
+    }
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, 256, torch.bfloat16, kv_heads=kv_heads)
+    block_mask = _block_mask(masks[mask_name], 2, 4, q_seq, kv_seq)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, enable_gqa=kv_heads != 4
+    )
+    _assert_pair_list_walk(code)
+    assert ("flash_bh // 2" in code) == (kv_heads != 4)
+    assert "if flash_local_tidx < flash_live_rows:" in code
+    assert f"'total_tiles': {2 * 4 * -(-q_seq // 256)}," in code
+    _assert_close(out, lse, ref_out, ref_lse)

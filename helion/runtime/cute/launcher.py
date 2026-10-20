@@ -81,6 +81,7 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .occupancy import get_max_active_clusters
 from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
@@ -331,6 +332,7 @@ def _append_cute_wrapper_plan(
     plan: dict[str, object],
     num_sm: int | None = None,
     schema_key: Sequence[tuple[object, ...]] | None = None,
+    device: torch.device | None = None,
 ) -> None:
     descriptor_identity = plan.get("wrapped_grouped_descriptors")
     descriptors = (
@@ -870,7 +872,12 @@ def _append_cute_wrapper_plan(
         use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
         use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
         use_clc_scheduler = bool(plan.get("use_clc_scheduler"))
-        cluster_m = 2 if use_2cta_instrs or use_cga2_local_cta else 1
+        # The cooperative pair's cluster holds ``pair_cluster`` MMA pairs
+        # (two pairs share every K/V tile by TMA multicast across the pairs).
+        pair_cluster = plan_int("pair_cluster", default=1) if use_2cta_instrs else 1
+        cluster_m = (
+            2 * pair_cluster if use_2cta_instrs else 2 if use_cga2_local_cta else 1
+        )
         # KV tile width. 128 is the historical fixed value; a wider tile
         # amortizes the per-tile softmax correction over more columns, which is
         # where FA4's tuned plans get their edge on sm_103.
@@ -982,6 +989,12 @@ def _append_cute_wrapper_plan(
         majk = "cute.nvgpu.OperandMajorMode.K"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
         cg = "cute.nvgpu.tcgen05.CtaGroup.TWO" if use_2cta_instrs else cg1
+        # K/V multicast across the two pairs of a four-CTA cluster.
+        kv_op = (
+            f"cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp({cg})"
+            if pair_cluster > 1
+            else "_flash_op"
+        )
         sel = "cute.select"
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
@@ -991,7 +1004,7 @@ def _append_cute_wrapper_plan(
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb_o})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
-            f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
+            f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({cluster_m}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
             # the device-body kv_stage + the SharedStorage MemRange depths.
@@ -1032,8 +1045,8 @@ def _append_cute_wrapper_plan(
             f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
             f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg})",
             f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
-            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
-            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B({kv_op}, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B({kv_op}, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape)",
             f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
             f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
         ]
@@ -1216,6 +1229,19 @@ def _append_cute_wrapper_plan(
             assert num_sm is not None and num_sm > 0
             ctas_per_sm = max(1, plan_int("persistent_ctas_per_sm", 1))
             max_ctas = ((num_sm * ctas_per_sm) // cluster_m) * cluster_m
+            if cluster_m > 2:
+                # ``num_sm // cluster_m`` is exact for the CTA pair (every
+                # TPC holds one) but over-counts the two-pair cluster: a
+                # cluster lives inside one GPC and the GPCs hold uneven TPC
+                # counts (a B200's 148 SMs hold 33 four-CTA clusters, not
+                # 37), and the surplus persistent clusters form a second
+                # hardware wave. The driver's count sizes the grid where the
+                # device is known (the SM-count model stays the fallback).
+                max_ctas = min(
+                    max_ctas,
+                    _cute_persistent_cluster_ctas(device, cluster_m, num_sm)
+                    * ctas_per_sm,
+                )
             grid_cap = min(total_tiles * kv_split * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
         elif plan.get("topology") == "fa4":
@@ -1226,6 +1252,11 @@ def _append_cute_wrapper_plan(
             body.append(
                 f"    grid_x = cutlass.Int32({total_tiles * kv_split * cluster_m})"
             )
+        elif use_2cta_instrs:
+            # The single-tile body's cooperative pair: ``cluster_m`` CTAs per
+            # work item (the flex walk's ragged last pair has a dead second
+            # tile the default 128-row root grid does not count).
+            body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
         elif q_tile_m != 128:
             # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
             # default 128-row root grid.
@@ -2747,6 +2778,7 @@ def _create_cute_wrapper(
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
     num_sm: int | None = None,
+    device: torch.device | None = None,
 ) -> object:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass
@@ -2930,7 +2962,12 @@ def _create_cute_wrapper(
         )
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(
-            body, call_args, plan, num_sm=num_sm, schema_key=schema_key
+            body,
+            call_args,
+            plan,
+            num_sm=num_sm,
+            schema_key=schema_key,
+            device=device,
         )
     gathered_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
@@ -3367,18 +3404,65 @@ def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
     return " ".join(tokens)
 
 
-def _cute_num_sm_from_arch_args(arch_args: tuple[object, ...] | None) -> int | None:
+def _cute_device_from_arch_args(
+    arch_args: tuple[object, ...] | None,
+) -> torch.device | None:
+    """The CUDA device of the launch's first tensor argument (``None`` off GPU)."""
     if arch_args is None:
         return None
     for arg in arch_args:
         if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
-            cache_key = (arg.device.type, arg.device.index)
-            cached = _CUTE_NUM_SM_CACHE.get(cache_key)
-            if cached is None:
-                cached = get_num_sm(arg.device)
-                _CUTE_NUM_SM_CACHE[cache_key] = cached
-            return cached
+            return arg.device
     return None
+
+
+def _cute_num_sm_from_arch_args(arch_args: tuple[object, ...] | None) -> int | None:
+    device = _cute_device_from_arch_args(arch_args)
+    if device is None:
+        return None
+    cache_key = (device.type, device.index)
+    cached = _CUTE_NUM_SM_CACHE.get(cache_key)
+    if cached is None:
+        cached = get_num_sm(device)
+        _CUTE_NUM_SM_CACHE[cache_key] = cached
+    return cached
+
+
+def _cute_persistent_cluster_ctas(
+    device: torch.device | None, cluster_size: int, num_sm: int
+) -> int:
+    """CTAs of a persistent one-CTA-per-SM cluster grid the device co-schedules.
+
+    The driver's co-resident cluster count (``get_max_active_clusters``, a
+    CUDA context query) where the device is known; ``num_sm // cluster_size``
+    clusters otherwise (CPU renders, tests without a device).
+    """
+    if device is None or device.type != "cuda":
+        return (num_sm // cluster_size) * cluster_size
+    return get_max_active_clusters(device, cluster_size) * cluster_size
+
+
+def _cute_resident_clusters(
+    cluster_shape: object, device: torch.device | None
+) -> int | None:
+    """The co-resident cluster count a wrapper of ``cluster_shape`` bakes in.
+
+    Clusters above two CTAs take their persistent grid from the driver's
+    count (``_cute_persistent_cluster_ctas``), which varies with the GPC
+    floorsweeping of same-SM-count devices, so the compiled-launcher keys
+    carry it; ``None`` for the single CTA, the pair and CPU builds (their
+    keys are unchanged).
+    """
+    if device is None or device.type != "cuda":
+        return None
+    if not isinstance(cluster_shape, (tuple, list)):
+        return None
+    cluster_size = 1
+    for extent in cluster_shape:
+        cluster_size *= int(cast("int", extent))
+    if cluster_size <= 2:
+        return None
+    return get_max_active_clusters(device, cluster_size)
 
 
 def _cute_compiled_launcher_discriminator(
@@ -3386,15 +3470,20 @@ def _cute_compiled_launcher_discriminator(
     block: tuple[int, int, int],
     compile_options: str | None,
     arch_args: tuple[object, ...] | None,
+    cluster_shape: object = None,
 ) -> tuple[tuple[object, ...], str, int | None]:
     merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
+    resident_clusters = _cute_resident_clusters(
+        cluster_shape, _cute_device_from_arch_args(arch_args)
+    )
     return (
         (
             schema_key,
             block,
             merged_compile_options,
             num_sm,
+            *(() if resident_clusters is None else (resident_clusters,)),
         ),
         merged_compile_options,
         num_sm,
@@ -3415,11 +3504,15 @@ def _get_compiled_cute_launcher(
     # than replace because other flags (e.g. ``--generate-line-info`` when
     # ``tcgen05_cubin_lineinfo`` is True) can already be in
     # ``compile_options``.
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
     cache_key, compile_options, num_sm = _cute_compiled_launcher_discriminator(
         schema_key,
         block,
         compile_options,
         arch_args,
+        cluster_shape,
     )
     try:
         # pyrefly: ignore [missing-attribute]
@@ -3438,10 +3531,14 @@ def _get_compiled_cute_launcher(
         repr(plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
     )
-    cluster_shape = getattr(
-        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    device = _cute_device_from_arch_args(arch_args)
+    jit_func = _create_cute_wrapper(
+        cute_kernel,
+        schema_key,
+        block,
+        num_sm=num_sm,
+        device=device,
     )
-    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block, num_sm=num_sm)
     disk_cache_key = _cute_disk_cache_key(
         cute_kernel,
         schema_key,
@@ -3450,6 +3547,7 @@ def _get_compiled_cute_launcher(
         cluster_shape,
         compile_options,
         num_sm,
+        resident_clusters=_cute_resident_clusters(cluster_shape, device),
     )
     launcher = _CompiledCuteLauncher(
         jit_func, compile_options, cache_key=disk_cache_key
@@ -3487,6 +3585,7 @@ def _cute_disk_cache_key(
     cluster_shape: object,
     compile_options: str | None,
     num_sm: int | None = None,
+    resident_clusters: int | None = None,
 ) -> str | None:
     """Compute a stable cross-process key for the on-disk CuTe compile cache.
 
@@ -3511,6 +3610,11 @@ def _cute_disk_cache_key(
     grid clamp.  It is included unconditionally to match the in-memory cache
     key; for non-persistent kernels num_sm does not affect codegen, so it only
     costs an occasional cross-GPU miss, never a wrong-kernel reload.
+    ``resident_clusters`` is the driver's co-resident cluster count a wrapper
+    with a cluster above two CTAs bakes into that clamp instead
+    (``_cute_resident_clusters``): it varies with the GPC floorsweeping of
+    same-SM-count devices, so it joins the key where it is not ``None`` (the
+    other kernels' keys are unchanged).
     """
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
@@ -3558,6 +3662,7 @@ def _cute_disk_cache_key(
             cutlass_version,
             num_sm,
             _cute_use_pdl(cute_kernel),
+            *(() if resident_clusters is None else (resident_clusters,)),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -7856,6 +7961,7 @@ def _cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        getattr(cast("Any", cute_kernel), "_helion_cute_cluster_shape", None),
     )[0]
     if discriminator != entry.compiled_discriminator:
         return None
@@ -7881,6 +7987,7 @@ def _set_cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        getattr(cast("Any", cute_kernel), "_helion_cute_cluster_shape", None),
     )[0]
     cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
         arg_guard=arg_guard,

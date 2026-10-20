@@ -213,9 +213,13 @@ def _build_flex_item_tables(
     heads: int,
     num_pairs: int,
     num_kv: int,
+    group: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The item order and the per-item bitmask words (see ``flex_item_table``
-    and ``flex_item_words``), built together from one pass over the tables."""
+    and ``flex_item_words``), built together from one pass over the tables.
+    ``group`` > 0 orders the items longest-first within groups of that many
+    consecutive batch-heads (the launch group whose K/V stay in L2), the
+    groups in order; 0 is one group over every batch-head."""
     # Every op below has a static shape (no ``nonzero`` / ``.item()``), so
     # the build is legal inside a CUDA-graph capture.
     assert q_block in (128, 256)
@@ -266,6 +270,11 @@ def _build_flex_item_tables(
     words = rows[b_index][:, h_index].reshape(-1)
     # Longest-first, stable: equal counts keep the ``(bh, pair)`` order.
     order = torch.sort(count, descending=True, stable=True).indices
+    if group > 0:
+        # Then by launch group of ``group`` batch-heads (stable: the
+        # longest-first order holds within each group).
+        groups = torch.div(order, num_pairs * group, rounding_mode="floor")
+        order = order[torch.sort(groups, stable=True).indices]
     return order.to(torch.int32), words.contiguous()
 
 
@@ -288,11 +297,20 @@ def _flex_item_tables(
         tuple(sorted(kwargs.items())),
         tuple((table.data_ptr(), table._version) for table in tables),
     )
-    cached = _FLEX_ITEM_TABLE_CACHE.get(part_cnt)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    built = _build_flex_item_tables(*tables, **kwargs)
-    _FLEX_ITEM_TABLE_CACHE[part_cnt] = (key, built)
+    # One entry per geometry under the tables' version (the item order's
+    # launch group differs from the words table's call): a single slot
+    # thrashed between the two calls of one launch and rebuilt both tables
+    # every call.
+    cached: tuple[object, dict[object, tuple[torch.Tensor, torch.Tensor]]] | None = (
+        _FLEX_ITEM_TABLE_CACHE.get(part_cnt)
+    )
+    if cached is None or cached[0] != key[1]:
+        cached = (key[1], {})
+        _FLEX_ITEM_TABLE_CACHE[part_cnt] = cached
+    built = cached[1].get(key[0])
+    if built is None:
+        built = _build_flex_item_tables(*tables, **kwargs)
+        cached[1][key[0]] = built
     return built
 
 
@@ -348,8 +366,11 @@ def flex_item_table(
     heads: int,
     num_pairs: int,
     num_kv: int,
+    group: int = 0,
 ) -> torch.Tensor:
-    """Work-item order of the persistent flex list walk.
+    """Work-item order of the persistent flex list walk (and of the
+    single-tile body's cooperative pair: ``group`` batch-heads per launch
+    group, longest-first inside each).
 
     The tables are the BlockMask's ``(Bm, Hm, R)`` counts and ``(Bm, Hm, R,
     L)`` tile-id lists (partial and full).  The result is an ``int32``
@@ -372,4 +393,5 @@ def flex_item_table(
         heads=heads,
         num_pairs=num_pairs,
         num_kv=num_kv,
+        group=group,
     )[0]

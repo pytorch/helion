@@ -22,6 +22,7 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
+from helion._compiler.cute.attention_plan import flash_pair_head_dims_supported
 from helion._testing import patch_cute_mma_support
 import helion.language as hl
 
@@ -163,7 +164,10 @@ def test_head_dim_pairs() -> None:
     assert flash_head_dims_supported(192, 128)
     assert flash_head_dims_supported(64, 64)
     assert flash_head_dims_supported(128, 128)
-    assert not flash_head_dims_supported(192, 192)
+    # Symmetric 192 is a single-tile-body width, not a pair-body one.
+    assert flash_head_dims_supported(192, 192)
+    assert not flash_pair_head_dims_supported(192, 192)
+    assert flash_pair_head_dims_supported(192, 128)
     assert not flash_head_dims_supported(128, 64)
     assert not flash_head_dims_supported(256, 128)
 
@@ -192,13 +196,19 @@ def test_detector_keeps_the_symmetric_surface_unchanged() -> None:
 @pytest.mark.parametrize(
     ("head_dim", "head_dim_v", "seq"),
     (
-        pytest.param(192, 192, 512, id="192-192-no-tmem-room"),
         pytest.param(128, 64, 512, id="128-64-unsupported-pair"),
         pytest.param(192, 128, 384, id="192-128-odd-kv-tiles"),
     ),
 )
 def test_detector_rejects_other_pairs(head_dim: int, head_dim_v: int, seq: int) -> None:
     assert _cpu_surface(head_dim, head_dim_v, seq) == (False, None, None)
+
+
+def test_detector_admits_symmetric_192_on_the_single_tile_body() -> None:
+    """Two 192-wide accumulators do not fit the pair body's TMEM; the width
+    is hosted by the single-query-tile body instead (one score buffer per
+    stage, one accumulator), so the surface opens as a symmetric width."""
+    assert _cpu_surface(192, 192, 512) == (True, 192, None)
 
 
 # --------------------------------------------------------------------------

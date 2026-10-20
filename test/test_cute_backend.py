@@ -10578,11 +10578,13 @@ class TestCuteBackend(TestCase):
         family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
         # The row programs are searched only on small grids of a known
-        # batch; this 512-tile surface of an unknown batch leaves them out.
+        # batch; this 512-tile surface of an unknown batch leaves them out,
+        # as does the single-tile body's cooperative pair (a family of the
+        # value widths above 128).
         self.assertEqual(
             set(family.search_choices or ()),
             set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
-            - {"fa4_2cta_causal", "row_mma", "fa4_alt"},
+            - {"fa4_2cta_causal", "row_mma", "fa4_alt", "ws_2cta"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -10707,18 +10709,23 @@ class TestCuteBackend(TestCase):
             ),
             # the alternating-warpgroup family is a head_dim-128 body
             "fa4_alt": ("fa4", False, False, False, False, False, False, False),
+            # the single-tile body's cooperative pair (cta_group::2 atoms)
+            "ws_2cta": ("ws_overlap", False, False, True, False, False, False, False),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
         with patch.dict(os.environ, {}, clear=True):
             for family_name, expected in expected_flags.items():
                 with self.subTest(family=family_name):
+                    # (The pair is a family of the value widths above 128
+                    # with the standard dense output.)
                     cfg = resolve_flash_config(
-                        128 if family_name == "fa4_alt" else 64,
+                        {"fa4_alt": 128, "ws_2cta": 256}.get(family_name, 64),
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,
                         is_causal="causal" in family_name,
+                        standard_dense_output=family_name == "ws_2cta",
                     )
                     self.assertEqual(cfg.pipeline_family, family_name)
                     self.assertEqual(

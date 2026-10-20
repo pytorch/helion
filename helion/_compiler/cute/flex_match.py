@@ -45,6 +45,7 @@ from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexKvWalk
 from .attention_plan import FlexRegion
 from .attention_plan import flash_head_dims_supported
+from .attention_plan import flash_pair_head_dims_supported
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -842,6 +843,35 @@ class _Body(NamedTuple):
     exp_base: str
     regions: _Regions
     role_placeholders: tuple[int, int, int]
+
+
+def single_tile_pair_walk_decline(match: FlexMatch) -> str | None:
+    """Why the single-tile body's cooperative pair cannot host this flex
+    envelope, or ``None``.
+
+    Within the pair body's value width (``flash_pair_head_dims_supported``)
+    the fa4 pair body hosts every envelope and nothing is declined here.
+    Above it the BlockMask list walk runs on the ws_2cta pair, which takes
+    the symmetric widths, 128- or 256-row tables and at least two KV tiles
+    -- ragged lengths, grouped-query heads, the score region, the host
+    words table's cursor walk (long KV lengths) and strided operands
+    (rank-4 TMA maps) included; the trivial (table-less) walk and the
+    asymmetric widths still take the generic lowering.
+    """
+    plan = match.plan
+    walk = plan.kv_walk
+    assert walk is not None
+    if flash_pair_head_dims_supported(match.head_dim, match.head_dim_v):
+        return None
+    if match.head_dim != match.head_dim_v:
+        return "flex: asymmetric head dims above the pair body's width"
+    if walk.trivial:
+        return "flex: the trivial walk above the pair body's width"
+    if walk.q_block not in (128, 256):
+        return "flex: the single-tile pair walks 128- or 256-row tables"
+    if match.num_kv < 2:
+        return "flex: the single-tile pair needs at least two KV tiles"
+    return None
 
 
 def match_flex_envelope(
@@ -2285,7 +2315,7 @@ def _assemble(
         scale_arg=part_body.scale_symbol,
         scale_peeled=part_body.scale_peeled,
     )
-    return FlexMatch(
+    match = FlexMatch(
         plan=plan,
         b_block_id=ctx.b_id,
         h_block_id=ctx.h_id,
@@ -2332,6 +2362,11 @@ def _assemble(
         v_strides=v_strides,
         o_strides=o_strides,
     )
+    reason = single_tile_pair_walk_decline(match)
+    if reason is not None:
+        ctx.decline(reason)
+        return None
+    return match
 
 
 def _phi_chain(

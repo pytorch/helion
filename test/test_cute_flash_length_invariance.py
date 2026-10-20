@@ -1852,7 +1852,11 @@ def test_direct_output_kv_depth_fixed_override_remains_legal(
             (2, 3, 4),
             id="d64-ws",
         ),
-        pytest.param(128, "ws_overlap", (2, 3), (2,), id="d128-ws"),
+        # (The one-deep ring stays legal at the measured widths so a config
+        # carried over from a width or shape where it is the resolved value
+        # normalizes -- the resolver clamps it to the band -- but it is not
+        # searched there.)
+        pytest.param(128, "ws_overlap", (1, 2, 3), (2,), id="d128-ws"),
         pytest.param(
             64,
             "fa4_deep_1cta",
@@ -1996,6 +2000,9 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
         cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
         cute_flash.FLASH_ROWMAX_KEY: "software",
         cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
+        # The cooperative pair's cluster size (``ws_2cta``, a family of the
+        # value widths above 128): one pair per cluster off the pair.
+        cute_flash.FLASH_PAIR_CLUSTER_KEY: 1,
     }
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
@@ -2039,8 +2046,9 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # (``cute_flash_s_resident``, live only on list-walk plans without a
     # score region); the two-warpgroup body measures both of its O epilogues
     # (``cute_flash_epi_stg``).
-    # Resident-only coordinates add exactly three inactive singletons; keep
-    # the upstream bound on all other values and round-trip every value below.
+    # Resident-only coordinates add exactly three inactive singletons and
+    # the pair's cluster size one more; keep the upstream bound on all other
+    # values and round-trip every value below.
     assert len(active_values) - len(resident_defaults) <= 80
     for key, value in active_values:
         requested = {**base, key: value}
