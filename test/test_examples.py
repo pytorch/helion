@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import math
 import typing
 import unittest
@@ -2079,6 +2080,34 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="grouped_gemm_jagged_persistent",
+        )
+
+    def test_grouped_gemm_jagged_moe(self):
+        # One weight matrix per group. Uneven groups: an empty one, and ones
+        # that start and end inside a row tile.
+        torch.manual_seed(0)
+        K, N = 64, 64
+        sizes = [33, 0, 64, 31]
+        dtype = torch.bfloat16
+        A_packed = torch.randn(sum(sizes), K, device=DEVICE, dtype=dtype)
+        B = torch.randn(len(sizes), K, N, device=DEVICE, dtype=dtype)
+        starts = [0]
+        for m in sizes:
+            starts.append(starts[-1] + m)
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+
+        expected = torch.cat(
+            [
+                A_packed[s:e] @ B[g]
+                for g, (s, e) in enumerate(itertools.pairwise(starts))
+            ]
+        )
+
+        check_example(
+            "grouped_gemm",
+            (A_packed, B, group_offsets),
+            expected,
+            fn_name="grouped_gemm_jagged_moe",
         )
 
     def test_geglu(self):
