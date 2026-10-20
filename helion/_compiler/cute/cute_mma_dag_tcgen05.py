@@ -76,6 +76,7 @@ import contextlib
 import dataclasses
 import itertools
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -783,6 +784,30 @@ def _seed_choices(
     yield from itertools.product(*ladders)
 
 
+def tcgen05_persistent_ctas(
+    facts: CuteMmaDagFacts, sizes: Mapping[int, int], stages: int
+) -> int:
+    """The CTAs per SM a persistent launch of the tcgen05 config should
+    run: the shared- and tensor-memory occupancy of one CTA (capped at the
+    knob's largest choice), 0 when the grid would not fill two waves of
+    them (nothing to amortize)."""
+    from .cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
+
+    resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
+    smem = tcgen05_smem_bytes(facts, resolved, stages, True)
+    tmem = tcgen05_tmem_cols(tcgen05_slot_columns(facts, resolved))
+    ctas = mma_dag_ctas_per_sm(
+        smem, facts.smem_capacity, tmem, max(MMA_DAG_PERSISTENT_CHOICES)
+    )
+    grid = facts.grid_blocks
+    for axis, size in zip(facts.axes, resolved, strict=True):
+        if axis.kind == AXIS_ROOT:
+            grid *= axis.extent // size
+    if not facts.sm_count or grid < 2 * ctas * facts.sm_count:
+        return 0
+    return ctas
+
+
 def tcgen05_seed_configs(
     facts: CuteMmaDagFacts,
 ) -> list[tuple[dict[int, int], int, int]]:
@@ -1138,6 +1163,8 @@ class Tcgen05Plan:
     epilogue_staging_offset: int
     tmem_cols: int
     smem_bytes: int
+    # The epilogue staging tile's size (it starts at epilogue_staging_offset).
+    epilogue_staging_bytes: int = 0
     # Region programs (``cute_mma_dag_tcgen05_regions``).
     regions: bool = False
     ring_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
@@ -1189,6 +1216,7 @@ def plan_tcgen05(
     store_mode: str,
     pass_warps: bool = False,
     loads_mode: str = MMA_DAG_LOADS_TMA,
+    persistent: bool = False,
 ) -> Tcgen05Plan:
     """The tcgen05 plan for the resolved ``sizes`` (the config passed
     :func:`tcgen05_config_reason`)."""
@@ -1469,7 +1497,14 @@ def plan_tcgen05(
         default=0,
     )
     if epilogue_staging <= fixed_offset:
-        epilogue_staging_offset = 0
+        # A persistent launch prefetches the next tile's first ring slot under
+        # this epilogue: the staging tile overlays the ring's last bytes, so
+        # the slot's leading TMA boxes can land while it is read.
+        epilogue_staging_offset = (
+            (fixed_offset - epilogue_staging) // SLAB_ALIGNMENT * SLAB_ALIGNMENT
+            if persistent
+            else 0
+        )
     else:
         epilogue_staging_offset = fixed_offset + fixed
         fixed += epilogue_staging
@@ -1502,6 +1537,7 @@ def plan_tcgen05(
         staged_stores=tuple(staged),
         staging_offsets=staging_offsets,
         epilogue_staging_offset=epilogue_staging_offset,
+        epilogue_staging_bytes=epilogue_staging,
         tmem_cols=tcgen05_tmem_cols(column),
         smem_bytes=fixed_offset + fixed,
         store_tma=store_tma,
@@ -1563,8 +1599,24 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
     else:
         emitter = _Tcgen05Emitter(cg, plan)
     source = emitter.render()
-    for statement in ast.parse(textwrap.dedent(source)).body:
-        cg.add_statement(statement)
+    if plan.persistent:
+        # The generic persistent program ids wrap the body in the tile loop:
+        # the barrier / tensor-memory setup goes ahead of it (the preamble)
+        # and the dealloc after it (a post-loop statement).
+        lines = source.split("\n")
+        setup = "\n".join(lines[: emitter.setup_end])
+        body = "\n".join(lines[emitter.setup_end : emitter.teardown_start])
+        teardown = "\n".join(lines[emitter.teardown_start :])
+        df.preamble.extend(ast.parse(textwrap.dedent(setup)).body)
+        for statement in ast.parse(textwrap.dedent(body)).body:
+            cg.add_statement(statement)
+        post_loop = ast.parse(textwrap.dedent(teardown)).body
+        for statement in post_loop:
+            cg.add_statement(statement)
+        df.cute_state.register_tcgen05_post_loop_stmts(post_loop)
+    else:
+        for statement in ast.parse(textwrap.dedent(source)).body:
+            cg.add_statement(statement)
     if tc.tma:
         wrapper: dict[str, object] = {"kind": TMA_KIND, "tma_count": len(tc.tma)}
         for spec in tc.tma:
@@ -1757,11 +1809,23 @@ class _Tcgen05Emitter(_Emitter):
         # ``in_loop`` form and hoists its side loads through ``prefetched``.
         self.values = {}
         self.raw_stages = {}
+        # Line indices splitting a persistent launch's render into the
+        # once-per-CTA setup, the tile body and the teardown.
+        self.setup_end = 0
+        self.teardown_start = 0
         # The in-place pass being rendered: its row-only values, one row per
         # lane (node -> register), and the packet rounds' row names -> the
         # first lane holding their rows and the chunks per row.
         self.row_lanes: dict[Node, str] = {}
         self.round_of: dict[str, tuple[int, int]] = {}
+        # A persistent launch that issues the next tile's first ring slots
+        # under this tile's epilogue (``plan_cross_tile``): the ring phase
+        # base (iterations of the CTA's earlier tiles), the next tile's
+        # virtual program id, and each tile coordinate name -> its value at
+        # the next tile.
+        self.phase_base: str | None = None
+        self.next_pid: str | None = None
+        self.next_coords: dict[str, str] = {}
         self.hoists = []
         self.name_depth = {}
         self.stored_storages = {
@@ -3465,7 +3529,9 @@ class _Tcgen05Emitter(_Emitter):
                     self.emit(f"md_cb{index} = (md_lane // 16) * {slot.cols // 2}")
         if 128 in heights:
             self.emit("md_row128 = (md_warp % 4) * 32 + md_lane")
-        self.define_axis_bases()
+        persistent = plan.persistent > 0
+        if not persistent:
+            self.define_axis_bases()
         self.emit(
             f"md_smem = cute.arch.alloc_smem(cutlass.Uint8, {self.smem_bytes}, alignment={SLAB_ALIGNMENT})"
         )
@@ -3494,24 +3560,7 @@ class _Tcgen05Emitter(_Emitter):
             self.emit(
                 f"md_free = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
             )
-        with self.nest("if md_tidx == 0:"):
-            for stage in range(tc.stages):
-                self.emit(f"{_PRIMS}.mbarrier_init(md_full + {stage}, 1)")
-                if tc.pass_warps:
-                    self.emit(
-                        f"{_PRIMS}.mbarrier_init(md_pass + {stage}, {32 * TCGEN05_EPILOGUE_WARPS})"
-                    )
-                    self.emit(f"{_PRIMS}.mbarrier_init(md_free + {stage}, 1)")
-            for name in ("md_accb", "md_efull", "md_eacc"):
-                self.emit(f"{_PRIMS}.mbarrier_init({name}, 1)")
-            if general:
-                self.emit(f"{_PRIMS}.mbarrier_init(md_stepb, 1)")
-            self.emit(f"{_PRIMS}.fence_mbarrier_init()")
-            if tc.pass_warps:
-                # Every slot starts free: its first tile has no earlier reader.
-                for stage in range(tc.stages):
-                    self.emit(f"{_PRIMS}.mbarrier_arrive(md_free + {stage})")
-            self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+        self.emit_barrier_init()
         with self.nest("if md_warp == 0:"):
             self.emit(
                 f"{_PRIMS}.tcgen05_alloc(md_tslot, {tc.tmem_cols}, group={_PRIMS}.CTAGroup.CTA_1)"
@@ -3526,20 +3575,21 @@ class _Tcgen05Emitter(_Emitter):
                 f"md_acc{index} = cutlass.inttoptr(md_tmem + {slot.column}, "
                 f"{_RT}.TMEM_SPACE, cutlass.Float32)"
             )
+        if persistent:
+            # Everything above runs once per CTA, ahead of the tile loop;
+            # the tile's coordinates and bases start its body.
+            self.emit_instr_descs()
+            if self.plan_cross_tile():
+                self.emit(f"{self.phase_base} = cutlass.Int32(0)")
+            self.setup_end = len(self.lines)
+            self.define_axis_bases()
         self.define_bases()
         for access in program.accesses:
             self.tensor_names[access.node] = self.df.tensor_arg(
                 access.fake, prefer_name=access.name
             ).name
-        dtype = "cutlass.BFloat16" if self.kind == "bf16" else "cutlass.Float16"
-        for dot in program.dots:
-            index = self.dot_index[dot.node]
-            self.emit(
-                f"md_idesc{index} = {_PRIMS}.Tcgen05InstrDesc.build(c_dtype=cutlass.Float32, "
-                f"a_dtype={dtype}, b_dtype={dtype}, n_dim={plan.size(dot.cols)}, "
-                f"m_dim={plan.size(dot.rows)}, a_major={int(not operand_k_major(dot.a))}, "
-                f"b_major={int(not operand_k_major(dot.b))})"
-            )
+        if not persistent:
+            self.emit_instr_descs()
         self.define_iteration_bases(in_loop=False)
         self.emit_carry_init()
         begin, end, trip_static = self.loop_bounds()
@@ -3607,8 +3657,16 @@ class _Tcgen05Emitter(_Emitter):
         if tc.tma:
             # The first ``S - 1`` iterations' tiles (the first iteration's
             # with a single slot) and the epilogue tiles land during the
-            # carry seed.
-            with self.nest("if md_warp == 0:"), self.nest(f"if {_PRIMS}.elect_sync():"):
+            # carry seed.  Under a cross-tile prefetch only the CTA's first
+            # tile issues them here: its predecessor issued every later
+            # tile's.
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest(f"if {self.phase_base} == 0:")
+                if self.phase_base is not None
+                else _NoNest(),
+            ):
                 for spec in tc.tma:
                     self.emit(f"{_PRIMS}.prefetch_tensormap({spec.param}.get_ptr())")
                 if tc.tx_bytes:
@@ -3673,11 +3731,34 @@ class _Tcgen05Emitter(_Emitter):
             with guard:
                 self.emit(f"{_RT}.mbar_wait(md_accb, ({end} - {begin} - 1) & 1)")
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)")
+        if self.phase_base is not None:
+            # Every MMA of this tile completed, so every ring slot is free:
+            # the next tile's leading slots go out now, under the epilogue
+            # (the boxes overlapping its staging tile after its reads).
+            self.emit(f"md_npid = {self.next_pid}")
+            self.emit_next_tile_issue(begin, end, early=True)
         # The epilogue's derived values load their tile inputs themselves.
         self.derived_words = {}
         self.emit_epilogue()
+        if persistent and tc.store_tma:
+            # The next tile reuses the staging tiles the TMA stores read.
+            with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
+                self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(0)")
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)")
         self.emit(self.sync)
+        if persistent:
+            # Every barrier is drained here (each TMA landed and was waited,
+            # each commit waited): re-arm them at phase zero so the next tile
+            # runs the same phases as a fresh CTA, then publish the inits.
+            # A cross-tile prefetch leaves the ring's full barriers armed
+            # for the next tile (their phases run on from the iteration
+            # count) and issues its boxes the staging tile held.
+            self.emit_barrier_init(ring=self.phase_base is None)
+            if self.phase_base is not None:
+                self.emit_next_tile_issue(begin, end, early=False)
+                self.emit(f"{self.phase_base} = {self.phase_base} + ({end} - {begin})")
+            self.emit(self.sync)
+            self.teardown_start = len(self.lines)
         with self.nest("if md_warp == 0:"):
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
@@ -3685,12 +3766,164 @@ class _Tcgen05Emitter(_Emitter):
             self.emit(
                 f"{_PRIMS}.tcgen05_dealloc(md_acc0, {tc.tmem_cols}, group={_PRIMS}.CTAGroup.CTA_1)"
             )
-        if tc.store_tma:
+        if tc.store_tma and not persistent:
             # The TMA stores complete before the kernel ends.
             with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
                 self.emit(f"{_PRIMS}.cp_async_bulk_wait_group(0)")
         assert plan.threads == 32 * tc.warps
         return "\n".join(self.lines) + "\n"
+
+    def plan_cross_tile(self) -> bool:
+        """Whether this persistent launch issues the next tile's leading ring
+        slots under the epilogue (and set up the phase base and the next
+        tile's coordinates): a single static-trip TMA ring without pass
+        warps, epilogue tiles or TMA stores, over the generic
+        persistent_interleaved program ids (their mixed-radix decomposition
+        of ``virtual_pid + grid`` gives the next tile)."""
+        from ..program_id import PersistentInterleavedProgramIDs
+
+        tc = self.tc
+        pid = self.df.pid
+        _begin, _end, trip = self.loop_bounds()
+        if (
+            not tc.tma
+            or not tc.tx_bytes
+            or tc.pass_warps
+            or self.general_loop
+            or tc.epilogue_tx_bytes
+            or tc.store_tma
+            or not trip
+            or not isinstance(pid, PersistentInterleavedProgramIDs)
+            or self.df.config.get("xcd_remap", False)
+        ):
+            return False
+        infos = pid.pid_info
+        counts = [f"({info.num_pids_expr(is_device=True)})" for info in infos[:-1]]
+        nxt = f"({pid.virtual_pid_var} + {pid.grid_size_expr})"
+        coords: dict[str, str] = {}
+        for i, info in enumerate(infos):
+            value = nxt
+            if i:
+                value = f"({value}) // ({' * '.join(counts[:i])})"
+            if i + 1 < len(infos):
+                value = f"({value}) % ({counts[i]})"
+            if info.block_size_var != "1":
+                value = f"({value}) * {info.block_size_var}"
+            coords[self.cg.tile_begin_var(info.block_id)] = value
+        for axis in self.program.axes:
+            if axis.kind in (AXIS_ROOT, AXIS_LEAD):
+                begin = self.cg.tile_begin_var(axis.block_id)
+                if begin not in coords:
+                    return False
+                coords[self.axis_base(axis)] = coords[begin]
+        self.phase_base = "md_ib"
+        self.next_pid = nxt
+        self.next_coords = coords
+        return True
+
+    def next_tile(self, text: str) -> str:
+        """``text`` (a TMA coordinate) at the next tile's coordinates."""
+        names = sorted(self.next_coords, key=len, reverse=True)
+        pattern = r"\b(" + "|".join(re.escape(name) for name in names) + r")\b"
+        return re.sub(pattern, lambda m: f"({self.next_coords[m.group(0)]})", text)
+
+    def emit_next_tile_issue(self, begin: str, end: str, *, early: bool) -> None:
+        """One elected thread: the next tile's first ``max(S - 1, 1)`` ring
+        slots -- ``early`` (right after this tile's drain) arms each slot's
+        full barrier and issues the boxes clear of the epilogue staging tile
+        in every slot; otherwise (behind the epilogue's staging reads) the
+        rest."""
+        from ..program_id import PersistentProgramIDs
+
+        tc = self.tc
+        pid = self.df.pid
+        assert isinstance(pid, PersistentProgramIDs)
+        _begin, _end, trip = self.loop_bounds()
+        assert trip
+        staging = (
+            tc.epilogue_staging_offset,
+            tc.epilogue_staging_offset + tc.epilogue_staging_bytes,
+        )
+        ring = tc.stages * tc.stage_bytes
+
+        def clear(offset: int, size: int) -> bool:
+            if not tc.epilogue_staging_bytes or staging[0] >= ring:
+                return True
+            return all(
+                slot * tc.stage_bytes + offset + size <= staging[0]
+                or slot * tc.stage_bytes + offset >= staging[1]
+                for slot in range(tc.stages)
+            )
+
+        specs = [t.tma or t.raw_tma for t in tc.loop_tiles]
+        with (
+            self.nest("if md_warp == 0:"),
+            self.nest(f"if {_PRIMS}.elect_sync():"),
+            self.nest(f"if md_npid < {pid.total_pids_var}:"),
+        ):
+            for ahead in range(min(max(tc.stages - 1, 1), trip)):
+                stage = (
+                    f"({self.phase_base} + ({end} - {begin}) + {ahead}) % {tc.stages}"
+                )
+                if early:
+                    self.emit(
+                        f"{_PRIMS}.mbarrier_arrive_expect_tx(md_full + ({stage}), {tc.tx_bytes})"
+                    )
+                value = f"({begin} + {ahead})" if ahead else begin
+                for spec in specs:
+                    if spec is None:
+                        continue
+                    for slab in range(spec.slabs):
+                        offset = spec.offset + slab * spec.slab_bytes
+                        if clear(offset, spec.slab_bytes) != early:
+                            continue
+                        dst = f"md_smem + (({stage}) * {tc.stage_bytes} + {offset})"
+                        coords = ", ".join(
+                            self.next_tile(c)
+                            for c in self.tma_coords(spec, value, slab)
+                        )
+                        self.emit(
+                            f"{_PRIMS}.cp_async_bulk_tensor_shared_cta_global({dst}, "
+                            f"{spec.param}.get_ptr(), [{coords}], md_full + ({stage}))"
+                        )
+
+    def emit_barrier_init(self, ring: bool = True) -> None:
+        """Thread 0 initializes every mbarrier of the program (and frees the
+        pass warps' ring slots; ``ring=False`` leaves the ring's full
+        barriers alone), fenced for the async proxy."""
+        tc = self.tc
+        with self.nest("if md_tidx == 0:"):
+            for stage in range(tc.stages):
+                if ring:
+                    self.emit(f"{_PRIMS}.mbarrier_init(md_full + {stage}, 1)")
+                if tc.pass_warps:
+                    self.emit(
+                        f"{_PRIMS}.mbarrier_init(md_pass + {stage}, {32 * TCGEN05_EPILOGUE_WARPS})"
+                    )
+                    self.emit(f"{_PRIMS}.mbarrier_init(md_free + {stage}, 1)")
+            for name in ("md_accb", "md_efull", "md_eacc"):
+                self.emit(f"{_PRIMS}.mbarrier_init({name}, 1)")
+            if self.general_loop:
+                self.emit(f"{_PRIMS}.mbarrier_init(md_stepb, 1)")
+            self.emit(f"{_PRIMS}.fence_mbarrier_init()")
+            if tc.pass_warps:
+                # Every slot starts free: its first tile has no earlier reader.
+                for stage in range(tc.stages):
+                    self.emit(f"{_PRIMS}.mbarrier_arrive(md_free + {stage})")
+            self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+
+    def emit_instr_descs(self) -> None:
+        """The tcgen05 instruction descriptor of every dot."""
+        plan, program = self.plan, self.program
+        dtype = "cutlass.BFloat16" if self.kind == "bf16" else "cutlass.Float16"
+        for dot in program.dots:
+            index = self.dot_index[dot.node]
+            self.emit(
+                f"md_idesc{index} = {_PRIMS}.Tcgen05InstrDesc.build(c_dtype=cutlass.Float32, "
+                f"a_dtype={dtype}, b_dtype={dtype}, n_dim={plan.size(dot.cols)}, "
+                f"m_dim={plan.size(dot.rows)}, a_major={int(not operand_k_major(dot.a))}, "
+                f"b_major={int(not operand_k_major(dot.b))})"
+            )
 
     def pass_tiles(self) -> list[Tcgen05Tile]:
         """The loop operand tiles rewritten by a pass."""
@@ -3773,8 +4006,11 @@ class _Tcgen05Emitter(_Emitter):
         if program.loop_axis is not None:
             step = self.plan.size(program.loop_axis)
             self.emit(f"{self.axis_base(program.loop_axis)} = {loop} * {step}")
-        self.emit(f"md_stage = {offset} % {tc.stages}")
-        self.emit(f"md_round = ({offset} // {tc.stages}) & 1")
+        # The ring's full barriers count the CTA's iterations across its
+        # tiles under a cross-tile prefetch (``phase_base``).
+        ring = offset if self.phase_base is None else f"({self.phase_base} + {offset})"
+        self.emit(f"md_stage = {ring} % {tc.stages}")
+        self.emit(f"md_round = ({ring} // {tc.stages}) & 1")
         return offset
 
     def emit_iteration(self, begin: str, end: str) -> None:  # type: ignore[override]

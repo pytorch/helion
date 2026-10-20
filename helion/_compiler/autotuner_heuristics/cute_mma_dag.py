@@ -18,6 +18,7 @@ from ..cute.cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
+from ..cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_DIRECT
 from ..cute.cute_mma_dag import MMA_DAG_STORE_KEY
@@ -112,6 +113,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         facts = spec.cute_mma_dag_facts
         if facts is None or spec.cute_mma_dag is None:
             return None
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_persistent_ctas
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 
         block_ids = spec.block_sizes.valid_block_ids()
@@ -200,7 +202,36 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         MMA_DAG_PASS_WARPS_ON,
                     ),
                 )
-        for mode, (sizes, warps, stages), exchange, pass_warps in ranked:
+        # The top tensor-memory seed again as a persistent launch at its
+        # occupancy (the per-CTA setup paid once and no relaunch between a
+        # CTA's tiles: b8 h80 mamba2 chunk state 161 -> 154 us), behind it,
+        # and at one stage, whose occupancy a streaming program may want
+        # over the ring (that kernel: four CTAs of one 128-deep stage per SM
+        # against two of two stages).
+        persistent: dict[int, int] = {}
+        if tensor_memory and facts.tcgen05 is not None and not facts.tcgen05.regions:
+            top = (
+                MMA_DAG_TCGEN05,
+                tensor_memory[0][1],
+                MMA_DAG_EXCHANGE_AUTO,
+                MMA_DAG_PASS_WARPS_OFF,
+            )
+            sizes, warps, stages = top[1]
+            at = ranked.index(top) + 1
+            for depth in dict.fromkeys((stages, 1)):
+                if (
+                    mma_dag_config_reason(facts, sizes, warps, depth, MMA_DAG_TCGEN05)
+                    is not None
+                ):
+                    continue
+                ctas = tcgen05_persistent_ctas(facts, sizes, depth)
+                if ctas:
+                    ranked.insert(at, (top[0], (sizes, warps, depth), *top[2:]))
+                    persistent[at] = ctas
+                    at += 1
+        for index, (mode, (sizes, warps, stages), exchange, pass_warps) in enumerate(
+            ranked
+        ):
             block_sizes = list(default_sizes)
             for block_id, size in sizes.items():
                 if block_id in block_ids:
@@ -218,6 +249,8 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             }
             if exchange != MMA_DAG_EXCHANGE_AUTO:
                 config[MMA_DAG_EXCHANGE_KEY] = exchange
+            if index in persistent:
+                config[MMA_DAG_PERSISTENT_KEY] = persistent[index]
             seeds.append(Config.from_dict(config))
         return seeds or None
 
