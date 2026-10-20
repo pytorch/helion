@@ -358,6 +358,84 @@ def _cute_index_override(state: CodegenState, block_id: int) -> str | None:
     return override.get(_cute_remap_block_id(state, block_id))
 
 
+def _cute_rolled_replica(state: CodegenState, block_id: int) -> str | None:
+    """The index variable of the chunk lane loop standing in for a rolled
+    reduction block outside the reduction's own loop on the current grid
+    (``_cute_make_rolled_replica``), or None."""
+    grid_state = state.codegen.current_grid_state
+    if grid_state is None or not grid_state.rolled_reduction_replicas:
+        return None
+    return grid_state.rolled_reduction_replicas.get(
+        _cute_remap_block_id(state, block_id)
+    )
+
+
+def _cute_make_rolled_replica(
+    state: CodegenState, size: object, used_block_ids: set[int]
+) -> int | None:
+    """Give a full-slice access over a rolled reduction's extent, outside that
+    reduction's loop, its own lane loop over the block.
+
+    The rolled strategy walks its block in chunks of its thread count inside
+    ``for roffset``: the block's index exists only there, and a statement
+    after the loop spanning the whole block (the zero store of a dQ row next
+    to the row's ``sum(o * do)`` at head dim 128, where the two share the
+    block of that extent) had no coordinate for it.  The replica registers,
+    once per block and grid, a synthetic lane loop with the reduction's
+    thread geometry -- ``index = thread_idx()[axis] + lane * threads`` over
+    ``numel / threads`` lanes -- and the lane distribution places only the
+    statements reading it inside, as it does for any other full-slice block.
+    Only a block whose extent the threads divide qualifies: the thread count
+    is a power of two, so that is every power-of-two extent, and the device
+    IR attaches a store over any other extent to a replay of the rolled loop
+    (which walks the tail chunk with the loop's own bound), so no such store
+    reaches here and the replica needs no mask.  Returns the block id it
+    stands for, or None when no unused rolled block of that static extent
+    qualifies at the grid level (the caller then raises as before).
+    """
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+    env = CompileEnvironment.current()
+    grid_state = state.codegen.current_grid_state
+    if grid_state is None:
+        return None
+    fn = state.device_function
+    for block_id in _matching_block_ids(env, size):
+        if block_id in used_block_ids:
+            continue
+        if _cute_rolled_replica(state, block_id) is not None:
+            return block_id
+        strategy = fn.tile_strategy.block_id_to_strategy.get_any(block_id)
+        if (
+            not isinstance(strategy, LoopedReductionStrategy)
+            or strategy._thread_count <= 0
+            or strategy._cute_reduction_vec_width != 1
+            or not strategy._claims_thread_axis()
+        ):
+            continue
+        numel = env.block_sizes[block_id].numel
+        if isinstance(numel, sympy.Integer):
+            numel = int(numel)
+        if not isinstance(numel, int) or numel <= 0:
+            continue
+        threads = strategy._thread_count
+        if numel % threads:
+            continue
+        axis = strategy._get_thread_axis()
+        lane_var = fn.new_var(f"synthetic_lane_{block_id}")
+        index_var = fn.new_var(f"rindex_lane_{block_id}")
+        grid_state.add_lane_loop(block_id, lane_var, numel // threads)
+        grid_state.lane_setup_statements.append(
+            statement_from_string(
+                f"{index_var} = cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+                f" + cutlass.Int32({lane_var}) * {threads}"
+            )
+        )
+        grid_state.rolled_reduction_replicas[block_id] = index_var
+        return block_id
+    return None
+
+
 def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     if (override := _cute_index_override(state, block_id)) is not None:
         return override
@@ -368,18 +446,42 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     grid_state = state.codegen.current_grid_state
     if grid_state is not None and block_id in grid_state.block_ids:
         return grid_state.strategy.index_var(block_id)
+    if (replica := _cute_rolled_replica(state, block_id)) is not None:
+        return replica
     return None
 
 
 def _cute_resolve_active_slice_block_id(
-    state: CodegenState, size: object, used_block_ids: set[int]
+    state: CodegenState,
+    size: object,
+    used_block_ids: set[int],
+    *,
+    tile_block_ids: frozenset[int] | set[int] = frozenset(),
 ) -> int | None:
-    """Resolve the same slice axis for pointer arithmetic and atomic ownership."""
+    """Resolve the same slice axis for pointer arithmetic and atomic ownership.
+
+    A block no other position of the subscript indexes comes first.  Failing
+    that, a block another SLICE position already took may be returned: two
+    slices of one tensor whose extents coincide share the reduction block of
+    that extent (a matmul operand's K and N at 128), and the consumer handles
+    the pair (the matmul's operand index override).  A block a TILE position
+    took (``tile_block_ids``) never is: the tile's block coordinates the
+    thread's row, so a slice bound to it would run along the diagonal.  With
+    the batch extent equal to the head dim (``static_shapes``) and the
+    slice's own block's index not active at the store (a rolled reduction's
+    lives only inside its loop; a persistent one's lanes closed before the
+    store), the batch tile's block was the one active candidate and was
+    returned here: the store took the batch tile's index as its column and
+    wrote one element per row, silently.  With no candidate the caller
+    falls back (a chunk lane loop for a rolled reduction's block) or rejects
+    the site ("indexing dimension is not active in this scope").
+    """
     env = CompileEnvironment.current()
     active_candidates = [
         block_id
         for block_id in _matching_block_ids(env, size)
-        if _cute_active_index_var(state, block_id) is not None
+        if block_id not in tile_block_ids
+        and _cute_active_index_var(state, block_id) is not None
     ]
     active_unused_candidates = [
         block_id for block_id in active_candidates if block_id not in used_block_ids
@@ -665,6 +767,8 @@ def _cute_index_exprs(
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and block_id in grid_state.block_ids:
             return grid_state.strategy.index_var(block_id)
+        if (replica := _cute_rolled_replica(state, block_id)) is not None:
+            return replica
         return None
 
     def index_var_for_block_id(block_id: int, size: object) -> str:
@@ -707,6 +811,9 @@ def _cute_index_exprs(
         if isinstance(idx, torch.SymInt)
         if (block_id := env.get_block_id(idx)) is not None
     }
+    # The blocks the tile positions take: never a slice's (see
+    # ``_cute_resolve_active_slice_block_id``).
+    tile_block_ids = set(used_block_ids)
     result = []
     tensor_dim = 0
     for pos, idx in enumerate(subscript):
@@ -741,6 +848,7 @@ def _cute_index_exprs(
             continue
         if tile_info is not None and tile_info.block_size is not None:
             used_block_ids.add(tile_info.block_id)
+            tile_block_ids.add(tile_info.block_id)
             result.append(tile_with_offset_index_expr(tile_info))
             tensor_dim += 1
             continue
@@ -777,7 +885,7 @@ def _cute_index_exprs(
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
             dim_size = tensor.shape[tensor_dim]
             block_id = _cute_resolve_active_slice_block_id(
-                state, dim_size, used_block_ids
+                state, dim_size, used_block_ids, tile_block_ids=tile_block_ids
             )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
@@ -790,6 +898,16 @@ def _cute_index_exprs(
                 dim_size, 1
             ):
                 result.append(inactive_singleton_slice_expr)
+                tensor_dim += 1
+                continue
+            # The slice's block is a rolled reduction's and its loop is not
+            # open here: stand a chunk lane loop in for it.
+            block_id = _cute_make_rolled_replica(state, dim_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                result.append(idx_var)
                 tensor_dim += 1
                 continue
             if inactive_slice_expr is None:
@@ -816,7 +934,7 @@ def _cute_index_exprs(
             start = idx.start if idx.start is not None else 0
             step = idx.step if idx.step is not None else 1
             block_id = _cute_resolve_active_slice_block_id(
-                state, slice_size, used_block_ids
+                state, slice_size, used_block_ids, tile_block_ids=tile_block_ids
             )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
@@ -1808,6 +1926,8 @@ def _cute_combined_mask(
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and block_id in grid_state.block_ids:
             return grid_state.strategy.index_var(block_id)
+        if (replica := _cute_rolled_replica(state, block_id)) is not None:
+            return replica
         return None
 
     def active_local_coord(block_id: int) -> str | None:
