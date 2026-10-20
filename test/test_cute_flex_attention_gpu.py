@@ -357,7 +357,9 @@ def _assert_list_walk(code: str, *, mask: bool, score: bool) -> None:
     words by default, or rebuilt from the count tables), the per-step status
     and the hooks the plan's regions call for."""
     assert "_flash_mFlexWords = " in code or "_flash_mFlexPartCnt = " in code
-    assert "flash_flex_u0 = " in code
+    # The union of the item's lists: register words, or the cursor walk's
+    # header (two words or more).
+    assert "flash_flex_u0 = " in code or "flash_flex_total = " in code
     assert "flash_flex_status = " in code
     assert ("flash_flex_needs_mask" in code) == mask
     assert ("flash_flex0s_" in code) == score
@@ -559,14 +561,22 @@ def test_column_table_vector_loads(dtype: torch.dtype, lanes: int) -> None:
 @onlyBackends(["cute"])
 def test_kv_length_over_32_tiles_uses_two_bitmask_words() -> None:
     """``N = 4352`` (34 KV tiles): the per-row tile bitmasks span two 32-bit
-    words (the word-select chains of the walk step and the status test)."""
+    words. The host words table is walked through the cursor (the header's
+    population and word range, one word at a time); the device-built
+    register masks (still searched at two words) keep the word-select
+    chains of the walk step and the status test. Both agree bitwise."""
     q, k, v = _qkv(1, 2, 4352, 4352, 64, torch.bfloat16)
     block_mask = _block_mask(_sliding_causal(1024), 1, 2, 4352, 4352)
     code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
     _assert_list_walk(code, mask=True, score=False)
-    assert "flash_flex_u1 = " in code
-    assert "flash_flex_rem1 = flash_flex_u1" in code
+    _assert_cursor_walk(code)
     _assert_close(out, lse, ref_out, ref_lse)
+    code_r, out_r, lse_r, _, _ = _run(
+        q, k, v, block_mask, overrides={cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False}
+    )
+    assert "flash_flex_u1 = " in code_r
+    assert "flash_flex_rem1 = flash_flex_u1" in code_r
+    assert torch.equal(out_r, out) and torch.equal(lse_r, lse)
 
 
 # -- (vi) rows without a visible key -------------------------------------------
@@ -1073,3 +1083,202 @@ def test_mla_pair_list_walk_uneven_ring_against_the_aux_tables(
     assert ("flex_aux_bytes=" in code) == (aux_budget > 0)
     _assert_close(out, lse, ref_out, ref_lse)
     _assert_close_to_fp32(out, q, k, v, block_mask, torch_mod=mods[1])
+
+
+# -- (xvi) long KV lengths: the cursor walk over the words table -----------------
+
+
+def _assert_cursor_walk(code: str) -> None:
+    """From two bitmask words on the roles walk the host words table through
+    a cursor: no per-word registers or select chains (code independent of
+    the KV length)."""
+    assert (
+        "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])" in code
+    )
+    assert "while flash_flex_rem == 0 and flash_flex_cw" in code
+    assert "flash_flex_rem1" not in code and "flash_flex_u0" not in code
+
+
+def _half_rows_causal(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    """Causal, but only the first 128 rows of every 256-row pair see keys:
+    every pair's second stage is dead (the dead-stage split fires)."""
+    return (q_idx % 256 < 128) & (q_idx >= kv_idx)
+
+
+def _global_tile_and_window(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    """The first KV tile plus a causal window: every item's union has empty
+    words between its two runs (the cursor's hole scan)."""
+    return (kv_idx < 128) | ((q_idx >= kv_idx) & (q_idx - kv_idx <= 640))
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "mask_mod", "overrides"),
+    [
+        (16384, 16384, _sliding_causal(1024), {}),
+        (16384, 16384, _causal, {cute_flash.FLASH_KV_SPLIT_KEY: 2}),
+        (
+            16384,
+            16384,
+            _sliding_causal(1024),
+            {cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "ascending"},
+        ),
+        (4160, 16384, _causal, {}),
+        (
+            16384,
+            16384,
+            _half_rows_causal,
+            {
+                cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+                cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+            },
+        ),
+        (
+            16384,
+            16384,
+            _half_rows_causal,
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 2,
+                cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+                cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+            },
+        ),
+        (16384, 16384, _global_tile_and_window, {}),
+        (
+            16384,
+            16384,
+            _global_tile_and_window,
+            {
+                cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "ascending",
+                cute_flash.FLASH_KV_SPLIT_KEY: 2,
+            },
+        ),
+    ],
+    ids=[
+        "window",
+        "split_kv",
+        "ascending",
+        "ragged_m",
+        "dead_split",
+        "dead_split_split_kv",
+        "hole",
+        "hole_ascending_split_kv",
+    ],
+)
+def test_long_kv_cursor_walk(
+    q_seq: int, kv_seq: int, mask_mod: Callable[..., Any], overrides: dict[str, object]
+) -> None:
+    """16K keys (four bitmask words): the descending and ascending cursor
+    walks, the split-KV slice, a ragged query length, the dead-stage split
+    (alone and under the split-KV walk) and a union with empty words
+    between its runs (the hole scan, descending and ascending under the
+    split-KV walk) match the eager reference; the render carries no
+    per-word state."""
+    q, k, v = _qkv(1, 2, q_seq, kv_seq, 64, torch.bfloat16)
+    block_mask = _block_mask(mask_mod, 1, 2, q_seq, kv_seq)
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask, overrides=overrides)
+    _assert_cursor_walk(code)
+    _assert_list_walk(code, mask=True, score=False)
+    if overrides.get(cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY):
+        assert "flash_flex_split = cutlass.Int32(" in code
+    if overrides.get(cute_flash.FLASH_KV_SPLIT_KEY, 1) > 1:
+        # The slice's leading tiles go whole words at a time.
+        assert "flash_flex_left = flash_flex_lo" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+def test_long_kv_cursor_walk_two_list_rows() -> None:
+    """A 256-row BlockMask at 16K: one row (two lists) per pair item, the
+    cursor's union over ``[partial, full]`` only."""
+    q, k, v = _qkv(1, 2, 16384, 16384, 64, torch.bfloat16)
+    block_mask = _block_mask(
+        _sliding_causal(1024), 1, 2, 16384, 16384, block_size=(256, 128)
+    )
+    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
+    _assert_cursor_walk(code)
+    assert "flash_flex_rem = flash_flex_wp0 | flash_flex_wf0\n" in code
+    assert "flash_flex_wp1" not in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 128,
+        },
+        {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 32,
+        },
+    ],
+    ids=["coalesce", "prefetch"],
+)
+def test_long_kv_cursor_peek(overrides: dict[str, object]) -> None:
+    """A per-key table score_mod at 16K whose hook issues the next tile's
+    table rows ahead: the peek scans the cursor's words on temporaries."""
+    q, k, v = _qkv(1, 2, 16384, 16384, 64, torch.bfloat16)
+    table = torch.randn(16384, dtype=torch.bfloat16, device=DEVICE)
+    block_mask = _block_mask(_sliding_causal(1024), 1, 2, 16384, 16384)
+    code, out, lse, ref_out, ref_lse = _run(
+        q, k, v, block_mask, mods=_column_table_mods(table), overrides=overrides
+    )
+    _assert_cursor_walk(code)
+    assert "flash_flex_pkw = flash_flex_cw" in code
+    assert "flash_kv_peek = cutlass.Int32(cutlass.select_(flash_flex_prem != 0" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(("seq", "words"), [(2048, 1), (8320, 3)])
+def test_item_words_build_is_cuda_graph_capturable(seq: int, words: int) -> None:
+    """The host words table is rebuilt inside every captured launch (no
+    cache under capture): its build must issue device kernels only (no
+    host constant copied to the device); the replay reproduces the eager
+    result bitwise, with the register walk (one word) and the cursor."""
+    q, k, v = _qkv(1, 2, seq, seq, 64, torch.bfloat16)
+    block_mask = _block_mask(_sliding_causal(1024), 1, 2, seq, seq)
+    args = _kernel_args(
+        q, k, v, _identity, block_mask, scale=1.0 / math.sqrt(64), enable_gqa=False
+    )
+    bound = _flex_kernel().bind(args)
+    config = helion.Config(
+        **{**bound.config_spec.default_config().config, **FLEX_CONFIG}
+    )
+    bound.set_config(config)
+    code = bound.to_code(config)
+    assert "_helion_flash_flex_item_words(" in code
+    assert ("flash_flex_total = " in code) == (words > 1)
+    eager_out, eager_lse = bound(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = bound(*args)
+    for _ in range(2):
+        out.fill_(0)
+        lse.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager_out)
+        assert torch.equal(lse, eager_lse)
+
+
+@onlyBackends(["cute"])
+def test_register_and_cursor_walks_agree_at_two_words() -> None:
+    """8K keys (two words): the device-built register masks
+    (``cute_flash_flex_item_words=False``, still searched there) and the
+    cursor walk over the host words give the same bits."""
+    q, k, v = _qkv(1, 2, 8192, 8192, 64, torch.bfloat16)
+    block_mask = _block_mask(_sliding_causal(2048), 1, 2, 8192, 8192)
+    code_r, out_r, lse_r, ref_out, ref_lse = _run(
+        q, k, v, block_mask, overrides={cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False}
+    )
+    assert "flash_flex_rem1" in code_r and "flash_flex_cw" not in code_r
+    code_c, out_c, lse_c, _, _ = _run(q, k, v, block_mask)
+    _assert_cursor_walk(code_c)
+    assert torch.equal(out_c, out_r)
+    assert torch.equal(lse_c, lse_r)
+    _assert_close(out_c, lse_c, ref_out, ref_lse)

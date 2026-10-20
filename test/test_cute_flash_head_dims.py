@@ -503,9 +503,12 @@ def test_flex_render_staged_store_covers_the_tile(
 
 class TestRenderPins(TestCase):
     """The 64 and 128 renders of the flex list walk: the device body is
-    byte-identical to the commit before the head-dim widening (the journal
-    was first written there; it was re-pinned when the example kernel took
-    V's head dim for its accumulator and output, which changed host lines
+    byte-identical to the commit before the head-dim widening except for two
+    later, intended changes (the journal was first written there; it was
+    re-pinned when the example kernel took V's head dim for its accumulator
+    and output, which changed host lines, and again when the list walk's
+    PASS2 call was emitted once instead of once per tile kind, which
+    collapsed four ``if flash_flex_needs_mask`` branches)
     only)."""
 
     def test_render_d64_unchanged(self) -> None:

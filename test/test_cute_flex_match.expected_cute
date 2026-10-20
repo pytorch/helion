@@ -410,10 +410,7 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
                         flash_s_corr_prod_phase ^= 1
                 flash_p_sum = cutlass.Float32(0.0)
                 if flash_flex_status != 0:
-                    if flash_flex_needs_mask:
-                        flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld0, tLDtS0, tLDcS, flash_tiled_st0, tSTtS0, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 0, flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
-                    else:
-                        flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld0, tLDtS0, tLDcS, flash_tiled_st0, tSTtS0, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 0, flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
+                    flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld0, tLDtS0, tLDcS, flash_tiled_st0, tSTtS0, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 0, flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
                 else:
                     flash_p_sum = _helion_flash_rt.fa4_disc_zero_store(flash_tiled_st0, tSTtS0, tSTcS, flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS)
                 flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
@@ -551,10 +548,7 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
                         flash_s_corr_prod_phase ^= 1
                 flash_p_sum = cutlass.Float32(0.0)
                 if flash_flex_status != 0:
-                    if flash_flex_needs_mask:
-                        flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld1, tLDtS1, tLDcS, flash_tiled_st1, tSTtS1, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 2, flash_pfor_ptr + 1, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
-                    else:
-                        flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld1, tLDtS1, tLDcS, flash_tiled_st1, tSTtS1, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 2, flash_pfor_ptr + 1, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
+                    flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store_pipe(flash_tiled_ld1, tLDtS1, tLDcS, flash_tiled_st1, tSTtS1, tSTcS, _flash_scale_log2, flash_minus_max_scale, 16, 4, 2, flash_pfor_ptr + 1, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, 2, cutlass.Float16)
                 else:
                     flash_p_sum = _helion_flash_rt.fa4_disc_zero_store(flash_tiled_st1, tSTtS1, tSTcS, flash_pfor_ptr + 1, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS)
                 flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum

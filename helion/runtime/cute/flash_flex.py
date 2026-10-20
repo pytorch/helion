@@ -102,34 +102,104 @@ def flex_split_workspace(
     return cached
 
 
+def flex_mask_words(num_kv: int) -> int:
+    """32-bit words of a KV tile bitmask over ``num_kv`` tiles."""
+    return -(-num_kv // 32)
+
+
+# Per-item header of the words table when the device walks the words with a
+# cursor (two words or more): ``[union popcount, highest non-empty union
+# word, lowest non-empty union word, stage presence flags]``. A one-word
+# mask keeps the header-less rows (the words are registers there).
+FLEX_WORDS_HEADER = 4
+
+
+def flex_words_header(num_kv: int) -> int:
+    """Length of the per-item header of ``flex_item_words`` rows (0 or
+    ``FLEX_WORDS_HEADER``); the device body applies the same rule."""
+    return FLEX_WORDS_HEADER if flex_mask_words(num_kv) >= 2 else 0
+
+
+# Transient budget of the row-chunked table builds (the int64 scatter
+# targets of ``_dense_tiles``): a long sequence with many heads would
+# otherwise materialise gigabytes at once.
+_FLEX_BUILD_CHUNK_BYTES = 64 << 20
+
+
 def _dense_tiles(count: torch.Tensor, index: torch.Tensor, num_kv: int) -> torch.Tensor:
     """``(Bm, Hm, R, num_kv)`` int8 membership of one BlockMask list."""
     length = index.shape[-1]
-    valid = (
-        torch.arange(length, device=index.device, dtype=torch.int64)
-        < count.to(torch.int64)[..., None]
-    )
-    # Out-of-range entries past the count (and any stray id) land in a
-    # scratch column that is dropped.
-    target = torch.where(valid, index.to(torch.int64).clamp_(0, num_kv), num_kv)
+    flat_index = index.reshape(-1, length)
+    flat_count = count.reshape(-1)
     dense = torch.zeros(
-        (*index.shape[:-1], num_kv + 1), dtype=torch.int8, device=index.device
+        (flat_index.shape[0], num_kv + 1), dtype=torch.int8, device=index.device
     )
-    dense.scatter_(-1, target, 1)
-    return dense[..., :num_kv]
+    rows_per_chunk = max(1, _FLEX_BUILD_CHUNK_BYTES // (8 * max(length, 1)))
+    for start in range(0, flat_index.shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, flat_index.shape[0])
+        chunk = flat_index[start:stop]
+        valid = (
+            torch.arange(length, device=index.device, dtype=torch.int64)
+            < flat_count[start:stop].to(torch.int64)[:, None]
+        )
+        # Out-of-range entries past the count (and any stray id) land in a
+        # scratch column that is dropped.
+        target = torch.where(valid, chunk.to(torch.int64).clamp_(0, num_kv), num_kv)
+        dense[start:stop].scatter_(-1, target, 1)
+    return dense[:, :num_kv].reshape(*index.shape[:-1], num_kv)
 
 
 def _pack_tile_words(dense: torch.Tensor, num_kv: int) -> torch.Tensor:
     """``(..., words)`` int32 bitmask words of a ``(..., num_kv)`` 0/1
     membership: tile ``t`` is bit ``t & 31`` of word ``t >> 5`` (the device
-    walk's ``_flash_flex_mask_build`` layout)."""
-    words = -(-num_kv // 32)
-    padded = torch.nn.functional.pad(dense.to(torch.int64), (0, words * 32 - num_kv))
-    shifts = torch.arange(32, device=dense.device, dtype=torch.int64)
-    packed = (padded.reshape(*dense.shape[:-1], words, 32) << shifts).sum(dim=-1)
-    # Two's complement: bit 31 set is a negative int32.
-    packed = torch.where(packed >= 1 << 31, packed - (1 << 32), packed)
-    return packed.to(torch.int32)
+    walk's ``_flash_flex_mask_build`` layout). Packed a byte at a time (one
+    transient byte per tile) and viewed as little-endian int32 words."""
+    words = flex_mask_words(num_kv)
+    padded = torch.nn.functional.pad(dense.to(torch.uint8), (0, words * 32 - num_kv))
+    # The bit weights are built on the device (``arange`` is a kernel): a
+    # host-side constant would be a pageable copy with a stream sync, which
+    # is not permitted while a CUDA graph is being captured (the tables are
+    # rebuilt on every call under capture).
+    shifts = torch.arange(8, device=dense.device, dtype=torch.uint8)
+    bits = torch.ones((), device=dense.device, dtype=torch.uint8) << shifts
+    packed = (padded.reshape(*dense.shape[:-1], words * 4, 8) * bits).sum(
+        dim=-1, dtype=torch.uint8
+    )
+    return packed.contiguous().view(torch.int32)
+
+
+def _words_header(
+    words: torch.Tensor, count: torch.Tensor, stage_lists: int
+) -> torch.Tensor:
+    """``(..., FLEX_WORDS_HEADER)`` int32 header of ``(..., lists, W)`` words:
+    the union popcount (``count``), the highest and lowest non-empty union
+    word (``-1`` / ``0`` for an empty item) and a bit per stage that has
+    any tile (``stage_lists`` lists per stage)."""
+    union = words[..., 0, :]
+    for index in range(1, words.shape[-2]):
+        union = union | words[..., index, :]
+    nonzero = union != 0
+    any_word = nonzero.any(dim=-1)
+    num_words = nonzero.shape[-1]
+    lowest = nonzero.to(torch.int32).argmax(dim=-1).to(torch.int32)
+    highest = (
+        num_words - 1 - nonzero.flip(-1).to(torch.int32).argmax(dim=-1).to(torch.int32)
+    )
+    stages = words.shape[-2] // stage_lists
+    flags = torch.zeros(count.shape, dtype=torch.int32, device=count.device)
+    for stage in range(stages):
+        lists = words[..., stage * stage_lists : (stage + 1) * stage_lists, :]
+        present = (lists != 0).any(dim=-1).any(dim=-1)
+        flags = flags | (present.to(torch.int32) << stage)
+    return torch.stack(
+        [
+            count.to(torch.int32),
+            torch.where(any_word, highest, torch.full_like(highest, -1)),
+            torch.where(any_word, lowest, torch.zeros_like(lowest)),
+            flags,
+        ],
+        dim=-1,
+    ).to(torch.int32)
 
 
 def _build_flex_item_tables(
@@ -178,6 +248,13 @@ def _build_flex_item_tables(
         )
     count = pair_union.to(torch.int32).sum(dim=-1)
     words = _pack_tile_words(per_pair, num_kv)  # (Bm, Hm, pairs, lists, W)
+    lists = words.shape[-2]
+    rows = words.reshape(*words.shape[:-2], lists * words.shape[-1])
+    if flex_words_header(num_kv):
+        # The cursor walk's per-item header ahead of the words (two lists,
+        # partial and full, per stage).
+        header = _words_header(words, count, 2)
+        rows = torch.cat([header, rows], dim=-1)
     # Broadcast tables (``Bm`` / ``Hm`` of 1, or any divisor) index with
     # ``b % Bm`` / ``h % Hm`` like the device body.
     b_index = torch.arange(batch, device=count.device) % table_batch
@@ -186,7 +263,7 @@ def _build_flex_item_tables(
     # Flat: the device indexes it linearly (``item * stride + word``); a 2-D
     # CuTe tensor would resolve a linear index through its column-major
     # layout instead.
-    words = words[b_index][:, h_index].reshape(-1)
+    words = rows[b_index][:, h_index].reshape(-1)
     # Longest-first, stable: equal counts keep the ``(bh, pair)`` order.
     order = torch.sort(count, descending=True, stable=True).indices
     return order.to(torch.int32), words.contiguous()
@@ -234,9 +311,11 @@ def flex_item_words(
     """Per-item KV tile bitmasks of the flex list walk
     (``cute_flash_flex_item_words``).
 
-    A flat ``int32`` table of ``batch * heads * num_pairs`` rows of ``lists *
-    words`` entries (row ``bh * num_pairs + pair`` at ``row * lists * words``);
-    ``words = ceil(num_kv / 32)``; the lists are
+    A flat ``int32`` table of ``batch * heads * num_pairs`` rows of
+    ``flex_words_header(num_kv) + lists * words`` entries (row ``bh *
+    num_pairs + pair``; the header, present from two words on, is the
+    cursor walk's ``[union popcount, highest word, lowest word, stage
+    flags]``); ``words = ceil(num_kv / 32)``; the lists are
     ``[partial, full]`` of the pair's row for a 256-row BlockMask and
     ``[partial(2p), full(2p), partial(2p+1), full(2p+1)]`` for a 128-row one
     (a ragged last pair's missing row: zero words).  Tile ``t`` is bit

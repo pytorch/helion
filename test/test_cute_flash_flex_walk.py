@@ -175,7 +175,11 @@ def _render(
     plan: AttentionScorePlan,
     *,
     has_lse: bool = True,
+    words_table: bool = False,
+    kv_split: int | None = None,
 ) -> str:
+    """``words_table``: bind the host words table (``cute_flash_flex_item_words``)
+    like codegen does, which selects the cursor walk from two words on."""
     q_seq = plan.q_seq if plan.q_seq is not None else 2048
     kv_seq = plan.kv_seq if plan.kv_seq is not None else 2048
     body = cute_flash.emit_flash_fa4_device_body(
@@ -191,6 +195,10 @@ def _render(
         score_plan=plan,
         num_heads=NUM_HEADS if plan.is_flex else None,
         flex_item_table="flex_items" if plan.is_flex else None,
+        flex_words_table="flex_words" if words_table else None,
+        flex_words_pairs=-(-q_seq // 256) if words_table else None,
+        kv_split=kv_split,
+        flex_split_arg="flash_split_ws" if kv_split else None,
     )
     return "\n".join(ast.unparse(stmt) for stmt in body)
 
@@ -1595,10 +1603,10 @@ def test_ragged_kv_length_masks_the_last_tile_in_whichever_list(
     for stage, role in _softmax_roles(_roles(src)).items():
         loop = _softmax_loop(role)
         assert needs_mask in loop
-        # PASS1 and PASS2 both branch on it; the masked PASS1 runs the tail
-        # mask ahead of the mask hook and stores the chunk back; the dense
-        # branch keeps the balanced row max without a store.
-        assert loop.count("if flash_flex_needs_mask:") == 2
+        # PASS1 branches on it (the masked PASS1 runs the tail mask ahead of
+        # the mask hook and stores the chunk back; the dense branch keeps the
+        # balanced row max without a store); PASS2 is one call for both.
+        assert loop.count("if flash_flex_needs_mask:") == 1
         masked = loop.split("else:")[0]
         tail = "_helion_flash_rt.mask_r2p_sm100_rank1(flash_disc_frg, _flash_kv_tail_cols - flash_ci * 16)"
         assert loop.count(tail) == 1
@@ -1625,7 +1633,7 @@ def test_mask_region_alone_selects_the_masked_body_on_partial_tiles() -> None:
     for stage, role in _softmax_roles(_roles(src)).items():
         loop = _softmax_loop(role)
         assert "flash_flex_needs_mask = flash_flex_status == 2" in loop
-        assert loop.count("if flash_flex_needs_mask:") == 2
+        assert loop.count("if flash_flex_needs_mask:") == 1
         assert f"'flex hook stage={stage} score=False mask=True tail=False" in loop
         assert "mask_r2p_sm100_rank1" not in loop
         # Full tiles: the dense passes, no hook, no store-back.
@@ -2344,6 +2352,7 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
 ) -> None:
     from helion.runtime.cute.flash_flex import flex_item_table
     from helion.runtime.cute.flash_flex import flex_item_words
+    from helion.runtime.cute.flash_flex import flex_words_header
 
     batch, heads = 2, 4
     generator = torch.Generator().manual_seed(q_block + rows + num_kv)
@@ -2371,10 +2380,14 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
     flat = flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs)
     nwords = -(-num_kv // 32)
     lists = 2 if q_block == 256 else 4
+    # From two words on, the cursor walk's per-item header leads the row:
+    # [union popcount, highest non-empty union word, lowest one, stage flags].
+    header = flex_words_header(num_kv)
+    assert header == (4 if nwords >= 2 else 0)
     assert flat.dtype == torch.int32
-    assert flat.shape == (batch * heads * num_pairs * lists * nwords,)
+    assert flat.shape == (batch * heads * num_pairs * (header + lists * nwords),)
     assert flat.is_contiguous()
-    words = flat.view(batch * heads * num_pairs, lists * nwords)
+    words = flat.view(batch * heads * num_pairs, header + lists * nwords)
 
     def bit(word: int, tile: int) -> int:
         return ((word & 0xFFFFFFFF) >> (tile & 31)) & 1
@@ -2392,6 +2405,8 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
                         (partial, 2 * pair + 1),
                         (full, 2 * pair + 1),
                     ]
+                union = [0] * num_kv
+                stage_any = [0, 0]
                 for index, (member, table_row) in enumerate(members):
                     for tile in range(num_kv):
                         expect = (
@@ -2403,13 +2418,23 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
                             if table_row < rows
                             else 0
                         )
-                        assert bit(row[index * nwords + tile // 32], tile) == expect, (
-                            b,
-                            h,
-                            pair,
-                            index,
-                            tile,
-                        )
+                        assert (
+                            bit(row[header + index * nwords + tile // 32], tile)
+                            == expect
+                        ), (b, h, pair, index, tile)
+                        union[tile] |= expect
+                        stage_any[index // 2 if lists == 4 else 0] |= expect
+                if header:
+                    present = [
+                        w for w in range(nwords) if any(union[w * 32 : w * 32 + 32])
+                    ]
+                    expect_header = [
+                        sum(union),
+                        max(present) if present else -1,
+                        min(present) if present else 0,
+                        stage_any[0] | (stage_any[1] << 1),
+                    ]
+                    assert row[:header] == expect_header, (b, h, pair, row[:header])
     # Built together with the item order and cached with it: the same
     # tensors return the same tables; an in-place write rebuilds both.
     order = flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs)
@@ -2808,3 +2833,343 @@ def test_persistence_stays_pinned_off_for_interval_plans_and_is_on_by_default_fo
         ).persistent
         is True
     )
+
+
+# --------------------------------------------------------------------------
+# The cursor walk over the host words table (two words or more)
+# --------------------------------------------------------------------------
+
+
+def _digits_normalised(src: str) -> str:
+    return re.sub(r"\d+", "N", src)
+
+
+def _load_role(roles: dict[str, str]) -> str:
+    return next(block for block in roles.values() if "flash_kv_first" in block)
+
+
+def _cursor_render(
+    num_kv: int, config: dict[str, object] | None = None, **plan_kwargs: object
+) -> str:
+    cfg = _resolve({**BODY, **(config or {})}, num_kv=num_kv)
+    plan = _flex_plan(q_seq=2048, kv_seq=num_kv * 128, **plan_kwargs)  # pyrefly: ignore[bad-argument-type]
+    return _render(cfg, plan, words_table=True, kv_split=cfg.kv_split)
+
+
+def test_one_word_masks_keep_the_register_walk_over_the_words_table() -> None:
+    """Up to 32 KV tiles the words table is read into registers as before:
+    the header-less rows, ``flash_flex_u0``, no cursor."""
+    src = _cursor_render(16)
+    setup = _roles(src)["setup"]
+    assert "_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)]" in setup
+    assert (
+        "flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0"
+        in setup
+    )
+    assert "flash_flex_cw" not in src and "flash_flex_total" not in src
+
+
+def test_cursor_walk_reads_the_item_header_and_scans_the_words() -> None:
+    """From two words on every walking role moves a cursor over the item's
+    words: the setup reads the header (population, highest and lowest word),
+    the roles load the four list words of the current word when the union
+    word is exhausted, take the highest set bit and read the status off the
+    current words; no per-word registers or select chains."""
+    src = _cursor_render(65)  # three words (svg-temporal s8320)
+    roles = _roles(src)
+    setup = roles["setup"]
+    assert (
+        "flash_flex_wrow = (flash_bh * cutlass.Int32(8) + flash_m_pair) * cutlass.Int32(16)"
+        in setup
+    )
+    assert (
+        "flash_flex_total = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow])" in setup
+    )
+    assert (
+        "flash_flex_hiw = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])"
+        in setup
+    )
+    assert (
+        "flash_flex_low = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])"
+        in setup
+    )
+    assert "flash_flex_wbase = flash_flex_wrow + cutlass.Int32(4)" in setup
+    assert (
+        "flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_total)" in setup
+    )
+    for marker in (
+        "flash_flex_u0",
+        "flash_flex_p0_0",
+        "flash_flex_rem0",
+        "flash_flex_kvword",
+        "popc(",
+    ):
+        assert marker not in src, marker
+    softmax0 = next(b for n, b in roles.items() if "warp_idx < 4" in n)
+    loop = _softmax_loop(softmax0)
+    assert "flash_flex_cw = flash_flex_hiw + cutlass.Int32(1)" in softmax0
+    assert "while flash_flex_rem == 0 and flash_flex_cw > flash_flex_low:" in loop
+    assert "flash_flex_cw = flash_flex_cw - cutlass.Int32(1)" in loop
+    for index in range(4):
+        assert (
+            f"_flash_mFlexWords[flash_flex_wbase + cutlass.Int32({index * 3}) + flash_flex_cw]"
+            in loop
+        )
+    assert (
+        "flash_flex_rem = flash_flex_wp0 | flash_flex_wf0 | flash_flex_wp1 | flash_flex_wf1"
+        in loop
+    )
+    assert (
+        "flash_kv = cutlass.Int32(cutlass.select_(flash_flex_rem != 0, flash_flex_cw * "
+        "cutlass.Int32(32) + cutlass.Int32(31) - cutlass.Int32(cute.arch.clz(flash_flex_rem)), "
+        "cutlass.Int32(0)))"
+    ) in loop
+    # A fake step (nothing left) carries a zero bit: absent for every test.
+    assert (
+        "flash_flex_kvbit = cutlass.Int32(cutlass.select_(flash_flex_rem != 0, cutlass.Int32(1) << (flash_kv & cutlass.Int32(31)), cutlass.Int32(0)))"
+        in loop
+    )
+    assert (
+        "flash_flex_status = cutlass.Int32(cutlass.select_(flash_flex_wp0 & flash_flex_kvbit != 0, cutlass.Int32(2)"
+        in loop
+    )
+    softmax1 = next(b for n, b in roles.items() if "warp_idx < 8" in n)
+    assert (
+        "cutlass.select_(flash_flex_wp1 & flash_flex_kvbit != 0, cutlass.Int32(2)"
+        in _softmax_loop(softmax1)
+    )
+    load = _load_role(roles)
+    assert "flash_kv_first = cutlass.Int32(cutlass.select_(flash_flex_rem != 0" in load
+    assert "flash_kv_next = cutlass.Int32(cutlass.select_(flash_flex_rem != 0" in load
+    # The MMA warp walks too when it skips absent stages.
+    skip = _cursor_render(65, {cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True})
+    mma = _mma_block(skip)
+    assert (
+        mma.count("flash_kv_mma = cutlass.Int32(cutlass.select_(flash_flex_rem != 0")
+        == 2
+    )
+    assert (
+        "flash_flex_pv_live0 = cute.arch.make_warp_uniform(cutlass.Int32("
+        "(flash_flex_wp0 | flash_flex_wf0) & flash_flex_kvbit != 0))"
+    ) in mma
+
+
+def test_cursor_walk_code_does_not_grow_with_the_kv_length() -> None:
+    """16K and 128K keys (4 and 32 words) render the same code up to the
+    numeric literals (strides, counts): no register set or select chain
+    scales with the length."""
+    short = _cursor_render(128)
+    long = _cursor_render(1024)
+    assert short.count("\n") == long.count("\n")
+    assert _digits_normalised(short) == _digits_normalised(long)
+    # The mask markers of a dense 128K causal item fit the same budget.
+    assert "flash_flex_rem1" not in long and "flash_flex_u1" not in long
+
+
+def test_cursor_walk_ascending_order_scans_up_and_takes_the_lowest_bit() -> None:
+    src = _cursor_render(65, {cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "ascending"})
+    loop = _softmax_loop(next(b for n, b in _roles(src).items() if "warp_idx < 4" in n))
+    assert "flash_flex_cw = flash_flex_low - cutlass.Int32(1)" in src
+    assert "while flash_flex_rem == 0 and flash_flex_cw < flash_flex_hiw:" in loop
+    assert "flash_flex_cw = flash_flex_cw + cutlass.Int32(1)" in loop
+    assert "cute.arch.clz(flash_flex_rem & cutlass.Int32(0) - flash_flex_rem)" in loop
+
+
+def test_cursor_walk_peeks_the_next_tile_on_temporaries() -> None:
+    """The hook prefetch's peek scans ahead on copies of the cursor (the
+    stub hook here prefetches nothing, so the lines are checked directly)."""
+    lines = cute_flash._flash_flex_cursor_peek_lines(
+        "", "flash_kv_peek", words=3, lists=4, descending=True
+    )
+    assert lines[0] == "flash_flex_pkw = flash_flex_cw"
+    assert lines[1] == "flash_flex_prem = flash_flex_rem"
+    assert (
+        lines[2]
+        == "while (flash_flex_prem == 0) and (flash_flex_pkw > flash_flex_low):"
+    )
+    assert lines[3] == "    flash_flex_pkw = flash_flex_pkw - cutlass.Int32(1)"
+    assert lines[4].startswith(
+        "    flash_flex_prem = cutlass.Int32(_flash_mFlexWords[flash_flex_wbase + cutlass.Int32(0) + flash_flex_pkw]) | "
+    )
+    assert lines[4].count("_flash_mFlexWords[") == 4
+    assert lines[5].startswith(
+        "flash_kv_peek = cutlass.Int32(cutlass.select_(flash_flex_prem != 0, flash_flex_pkw * cutlass.Int32(32)"
+    )
+    assert "flash_flex_cw" not in "".join(lines[1:])
+    ascending = cute_flash._flash_flex_cursor_peek_lines(
+        "", "flash_kv_peek", words=3, lists=2, descending=False
+    )
+    assert "flash_flex_pkw < flash_flex_hiw" in ascending[2]
+    assert ascending[4].count("_flash_mFlexWords[") == 2
+
+
+def test_cursor_walk_split_kv_drops_the_leading_tiles() -> None:
+    """The split-KV walk slices the item by rank: the setup derives the
+    slice from the header's population and every role's cursor consumes
+    the ``lo`` tiles ahead of it at the top of the item."""
+    src = _cursor_render(65, {cute_flash.FLASH_KV_SPLIT_KEY: 2})
+    roles = _roles(src)
+    setup = roles["setup"]
+    # (``ast.unparse`` drops the parentheses: ``+`` binds tighter than ``>>``.)
+    assert (
+        "flash_flex_per = flash_flex_total + cutlass.Int32(1) >> cutlass.Int32(1)"
+        in setup
+    )
+    assert (
+        "flash_flex_lo = cutlass.min(flash_flex_total, flash_kv_split_id * flash_flex_per)"
+        in setup
+    )
+    assert (
+        "flash_flex_cnt = cutlass.min(flash_flex_total - flash_flex_lo, flash_flex_per)"
+        in setup
+    )
+    assert (
+        "flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_cnt)" in setup
+    )
+    assert "flash_flex_k0" not in src and "flash_flex_keep" not in src
+    softmax = [
+        b for n, b in roles.items() if "warp_idx < 4" in n or "warp_idx < 8" in n
+    ]
+    assert len(softmax) == 2
+    for block in (_load_role(roles), *softmax):
+        # The leading tiles go whole words at a time by population, the
+        # last word bit by bit (O(words + 32), not O(lo)).
+        assert "flash_flex_left = flash_flex_lo" in block
+        assert "while flash_flex_left > 0:" in block
+        assert "flash_flex_wc = cutlass.Int32(cute.arch.popc(flash_flex_rem))" in block
+        assert "if flash_flex_wc <= flash_flex_left:" in block
+        assert "for flash_flex_i in cutlass.range(flash_flex_left, unroll=1):" in block
+        assert "cutlass.range(flash_flex_lo" not in block
+
+
+def test_cursor_walk_dead_split_reads_the_stage_flags() -> None:
+    """The dead-stage split decides from the header's stage flags (one CTA
+    per item) or from a pass of the cursor over the slice (split-KV); the
+    MMA warp's per-stage presence comes off the cursor's words."""
+    dead = {
+        cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+        cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+    }
+    src = _cursor_render(65, dead, mask_region=object())
+    setup = _roles(src)["setup"]
+    assert (
+        "flash_flex_flags = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])"
+        in setup
+    )
+    assert (
+        "flash_flex_split = cutlass.Int32(flash_flex_flags & cutlass.Int32(2) == 0) & "
+        "cutlass.Int32(flash_num_active_kv >= 2)"
+    ) in setup
+    mma = _mma_block(src)
+    assert (
+        "flash_flex_n0b = cutlass.Int32((flash_flex_wp0 | flash_flex_wf0) & flash_flex_kvbit != 0)"
+        in mma
+    )
+    assert (
+        "flash_flex_n1b = cutlass.Int32((flash_flex_wp1 | flash_flex_wf1) & flash_flex_kvbit != 0)"
+        in mma
+    )
+    assert (
+        "flash_flex_status_alt = cutlass.Int32(cutlass.select_(flash_flex_wp0 & flash_flex_kvbit != 0"
+        in src
+    )
+    split = _cursor_render(
+        65, {**dead, cute_flash.FLASH_KV_SPLIT_KEY: 2}, mask_region=object()
+    )
+    setup = _roles(split)["setup"]
+    assert "flash_flex_flags" not in setup
+    # The slice is scanned whole words at a time (the stage's bits against
+    # the word's remaining union), the last word bit by bit.
+    assert "flash_flex_left = flash_flex_cnt" in setup
+    assert "cutlass.range(flash_flex_cnt" not in setup
+    assert (
+        "flash_flex_any1 = flash_flex_any1 | cutlass.Int32((flash_flex_wp1 | flash_flex_wf1) & flash_flex_rem != 0)"
+        in setup
+    )
+    assert (
+        "flash_flex_any1 = flash_flex_any1 | cutlass.Int32((flash_flex_wp1 | flash_flex_wf1) & flash_flex_kvbit != 0)"
+        in setup
+    )
+    assert (
+        "flash_flex_split = cutlass.Int32(flash_flex_any1 == 0) & cutlass.Int32(flash_num_active_kv >= 2)"
+        in setup
+    )
+
+
+def test_register_words_are_pinned_off_past_two_words() -> None:
+    """``cute_flash_flex_item_words`` is searched (both values) up to two
+    words and pinned on beyond: the device-built register masks would grow
+    with the KV length."""
+    key = cute_flash.FLASH_FLEX_ITEM_WORDS_KEY
+    for num_kv, choices in (
+        (16, (False, True)),
+        (64, (False, True)),
+        (65, (True,)),
+        (1024, (True,)),
+    ):
+        with patch.dict(os.environ, {}, clear=True):
+            fragments = cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                num_kv,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=True,
+                score_modifier_kinds=(FLEX_SCORE_KIND,),
+                standard_dense_output=False,
+                standard_causal_output=False,
+            )
+        fragment = fragments[key]
+        active = (
+            fragment.choices
+            if fragment.search_choices is None
+            else fragment.search_choices
+        )  # pyrefly: ignore[missing-attribute]
+        assert set(active) == set(choices), (num_kv, fragment)
+    assert _resolve({**BODY, key: False}, num_kv=64).flex_item_words is False
+    assert _resolve({**BODY, key: False}, num_kv=65).flex_item_words is True
+
+
+# --------------------------------------------------------------------------
+# One PASS2 per step when the masked cadence inherits; the long-walk seed
+# --------------------------------------------------------------------------
+
+
+def test_masked_and_full_tiles_share_one_pass2_when_the_cadence_inherits() -> None:
+    """The masked PASS1 stores the masked scores back, so PASS2 is the same
+    call for both kinds of tile: it is emitted once after the PASS1 branch
+    (two inlined copies doubled the softmax loop's hot code; ~1% on causal
+    128K hd128). The resolver pins the masked cadence to ``inherit`` on the
+    list walk, so the two calls are always equal there; the dedupe compares
+    the rendered calls so a future distinct masked cadence keeps both."""
+    src = _render(_resolve(BODY), _flex_plan(mask_region=object()))
+    for name in ("warp_idx < 4", "warp_idx < 8"):
+        loop = _softmax_loop(next(b for n, b in _roles(src).items() if name in n))
+        assert (
+            loop.count("flash_p_sum = _helion_flash_rt.fa4_disc_exp_convert_store") == 1
+        )
+        assert loop.count("if flash_flex_needs_mask:") == 1  # PASS1 only
+        # The masked branch still runs its own PASS1 (the hook + store-back).
+        assert "flash_tiled_score_st" in loop
+
+
+def test_long_walk_seed_is_in_the_list_walk_population() -> None:
+    """The causal 128K hd128 winner's structure (one CTA per pair item, a
+    two-slot ring, the 16/2 cadence, Rep16 loads/stores, 168/80/32
+    registers, ascending order) is a seed of every list-walk search."""
+    seeds = _flex_seeds(1024)
+    long = [
+        cfg
+        for cfg in seeds
+        if not cfg.persistent
+        and cfg.kv_stage == 2
+        and cfg.e2e_schedule == "16/2"
+        and cfg.s_load_repetition == 16
+        and cfg.p_store_repetition == 16
+        and cfg.causal_kv_order == "ascending"
+        and (cfg.softmax_regs, cfg.corr_regs, cfg.other_regs) == (168, 80, 32)
+    ]
+    assert len(long) == 1, [
+        (cfg.persistent, cfg.kv_stage, cfg.e2e_schedule) for cfg in seeds
+    ]
+    assert long[0].disc_pipe_depth == 1 and long[0].split_p_arrive
+    assert long[0].rescale_threshold == 8.0 and long[0].exp2_packet == "4x2"
