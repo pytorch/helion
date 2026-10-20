@@ -785,3 +785,6 @@ def register_compiler_coverage_groups(
     register_fragment_scan_exports_coverage(env, device_ir)
     register_fragment_warp_producer_regions_coverage(env, device_ir)
     register_radix_selection_coverage(env, device_ir)
+    from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
+
+    register_mxfp8_epilogue_coverage(env)
