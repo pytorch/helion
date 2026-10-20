@@ -91,16 +91,24 @@ def _replay_bundle(bundle: HandoffBundle, cwd: Path) -> None:
 
 
 def test_fp8_reference_tolerances() -> None:
+    """The bundle applies the autotuner's fp8 rule: exact bytes under the
+    'bitwise' mode (or explicit zero tolerances), the default tolerances on
+    top of one dequantized ulp under the default 'ulp' mode."""
     inputs = (torch.ones(8),)
     output = torch.ones(8).to(torch.float8_e4m3fn)
-    assert _tolerances(helion.Settings(), output, inputs, inputs) == (0.0, 0.0)
+    bitwise = helion.Settings(autotune_fp8_accuracy="bitwise")
+    assert _tolerances(bitwise, output, inputs, inputs) == (0.0, 0.0)
+    assert _tolerances(helion.Settings(), output, inputs, inputs) == (0.01, 0.01)
+    assert _tolerances(
+        helion.Settings(autotune_baseline_atol=0.0, autotune_baseline_rtol=0.0),
+        output,
+        inputs,
+        inputs,
+    ) == (0.0, 0.0)
     assert _tolerances(
         helion.Settings(autotune_baseline_atol=0.02), output, inputs, inputs
     ) == (0.02, 0.01)
-    assert _tolerances(helion.Settings(), output, inputs, (inputs[0] + 1,)) == (
-        0.01,
-        0.01,
-    )
+    assert _tolerances(bitwise, output, inputs, (inputs[0] + 1,)) == (0.01, 0.01)
 
 
 def test_agent_rejects_non_source_replacements_before_writing(tmp_path: Path) -> None:

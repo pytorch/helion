@@ -2211,6 +2211,17 @@ class CuteBackend(Backend):
         # the autotuner has to compile + benchmark each config inline.
         return False
 
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        # A SIMT default config can run 1000x slower than the kernel's best
+        # (an fp8 attention default at 1.5-11 s per launch): the timer's
+        # five-launch estimate plus its warmup then exceeds the benchmark
+        # timeout, the default and every seed are dropped, and the search
+        # ends in NoConfigFound. A launch that already exceeds the timing
+        # window is its own sample (the regular path times one repetition of
+        # such a kernel too), so probing first costs nothing in precision and
+        # keeps a slow seed inside the timeout.
+        return True
+
     def supports_parallel_render(self) -> bool:
         # Code generation only reads the device facts the render pool
         # captures (the MMA-support probe's current device, device properties

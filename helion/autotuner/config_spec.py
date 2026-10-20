@@ -9156,7 +9156,21 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
-    pass
+    # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
+    # a loop whose region stores and then re-reads the same storage: Triton's
+    # warp specialization splits such a body across partitions and the
+    # re-read observes stale memory.  The slot stays, so the config shape
+    # does not depend on the analysis, but its value is pinned to None.
+    pinned: bool = False
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if self.pinned:
+            return EnumFragment((None,))
+        return super()._fragment(base)
+
+    def _normalize(self, name: str, value: object) -> bool | None:
+        value = super()._normalize(name, value)
+        return None if self.pinned else value
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):
