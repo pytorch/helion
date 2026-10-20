@@ -544,3 +544,44 @@ def test_source_policy_variants_canonicalize_for_ws_overlap() -> None:
     assert resolved.sp_row_sum == "fragment"
     assert resolved.softmax_setup == "shared"
     assert resolved.epi_tma_setup == "shared"
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "family", "kv_stage"),
+    (
+        pytest.param(80, torch.bfloat16, False, "fa4", 9, id="d80-dense-depth9"),
+        pytest.param(96, torch.float16, True, "fa4", 7, id="d96-causal-depth7"),
+        pytest.param(32, torch.bfloat16, False, "fa4_deep_1cta", 4, id="d32-deep-1cta"),
+        pytest.param(112, torch.bfloat16, False, "ws_overlap", 2, id="d112-ws-overlap"),
+        pytest.param(80, torch.float16, False, "fa4_local_tma", 6, id="d80-local-tma"),
+        pytest.param(48, torch.bfloat16, True, "fa4", 12, id="d48-causal-depth12"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_head_dims_beyond_64_and_128_match_sdpa(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    family: str,
+    kv_stage: int,
+) -> None:
+    """Every multiple of 16 up to 128 is a fused head dim: exact SMEM tiles
+    (the swizzle the width admits), exact MMA extents, ``head_dim`` TMEM
+    output columns; the direct-store ring depth follows the byte model."""
+    _code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+            cute_flash.FLASH_KV_STAGE_KEY: kv_stage,
+        },
+    )
+    assert resolved.pipeline_family == family
+    assert resolved.kv_stage == kv_stage
+    assert resolved.corr_tile_size in (8, 16, 32, 64)
+    assert head_dim % resolved.corr_tile_size == 0

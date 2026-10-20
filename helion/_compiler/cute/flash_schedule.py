@@ -296,11 +296,38 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
         if spec.stage_output and not spec.output_over_query
         else 0
     )
-    # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
-    return q_bytes + kv_bytes + output_bytes + 3072 + spec.aux_smem_bytes
+    return q_bytes + kv_bytes + output_bytes + fa4_header_bytes(spec)
 
 
 _ALT_OVERHEAD_BYTES = 3072
+# The runtime SharedStorage (``_flash_runtime.flash_fa4_shared_storage``)
+# declares its scalars ahead of the 1024-byte aligned tiles: the Q / score /
+# P-chunk / output / epilogue / aux mbarriers, the two statistics handshake
+# rings, the TMEM holding word and the 2-ring x 2-slot x 128-thread fp32
+# scale transport (2308 bytes), plus two 8-byte mbarriers per K/V ring stage
+# (one ring aliased, two separate). The flex hook's staged regions follow at
+# 16-byte alignment and ``sQ`` rounds the whole header up to 1024.
+_FA4_HEADER_FIXED_BYTES = 2308
+_FA4_STAGE_BARRIER_BYTES = 16
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def fa4_header_bytes(spec: FlashScheduleSpec) -> int:
+    """Bytes ahead of the tiles in the FA4 SharedStorage at ``spec``'s depth.
+
+    3072 up to 47 aliased (23 separate) ring stages; one more kilobyte per
+    further 64 (32) stages, so the depth caps of the narrow widths stay
+    inside the carveout.
+    """
+    rings = 2 if spec.separate_kv else 1
+    barrier_bytes = _round_up(
+        _FA4_HEADER_FIXED_BYTES + _FA4_STAGE_BARRIER_BYTES * rings * spec.kv_depth,
+        16,
+    )
+    return _round_up(barrier_bytes + spec.aux_smem_bytes, 1024)
 
 
 def _alt_tmem_columns(spec: FlashScheduleSpec) -> int:
@@ -790,7 +817,14 @@ def max_fa4_kv_depth(
         bytes_per_stage = _k_tile_bytes(spec) + _v_tile_bytes(spec)
     else:
         bytes_per_stage = _kv_slot_bytes(spec)
-    return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+    depth = max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+    # The header grows with the depth (a barrier pair per stage), so the
+    # zero-depth estimate is an upper bound: step down until the layout fits.
+    while depth > 0 and not fa4_schedule_fits(
+        dataclasses.replace(spec, kv_depth=depth), limits
+    ):
+        depth -= 1
+    return depth
 
 
 def _output_tile(spec: FlashScheduleSpec, cta_rank: int, query_slot: int) -> int:
@@ -831,7 +865,8 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     """
     if not flash_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
         raise FlashScheduleError(
-            "FA4 schedule requires head_dim 64 or 128, or the 192/128 pair"
+            "FA4 schedule requires a symmetric head_dim that is a multiple of "
+            "16 up to 128, or the 192/128 pair"
         )
     if spec.head_dim_v is not None and spec.head_dim_v != spec.head_dim:
         if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
