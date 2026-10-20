@@ -118,6 +118,11 @@ def make_mxfp8_entry(plan: Mapping[str, object]) -> object:
             fused_scales=bool(plan.get("fused_scales", False)),
             sf_tma=bool(plan.get("sf_tma", False)),
             sf_inplace=bool(plan.get("sf_inplace", False)),
+            accumulator_stages=cast("int", plan.get("accumulator_stages", 1)),
+            prefetch_output_registers=cast(
+                "bool", plan.get("prefetch_output_registers", False)
+            ),
+            tma_output=cast("bool", plan.get("tma_output", False)),
             compact_m=bool(plan.get("compact_m", False)),
             logical_m_per_cta=_plan_int(plan, "logical_m_per_cta", 128),
             lhs_scale_row_stride=_plan_int(

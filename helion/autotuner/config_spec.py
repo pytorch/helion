@@ -1605,6 +1605,7 @@ class ConfigSpec:
         self.cute_mxfp8_sf_tma_available = False
         self.cute_mxfp8_problem_shape: tuple[int, int, int] | None = None
         self.cute_mxfp8_output_element_size = 0
+        self.cute_mxfp8_tma_output_available = False
         self.cute_mxfp8_mma_available = False
         self.cute_mxfp8_partition_key: str | None = None
         self.cute_proven_bounds_enabled = False
@@ -6212,6 +6213,7 @@ class ConfigSpec:
                 mxfp8=self.cute_mxfp8_mma_available,
                 fused_scales_available=self.cute_mxfp8_fused_scales_available,
                 sf_tma_available=self.cute_mxfp8_sf_tma_available,
+                tma_output_available=self.cute_mxfp8_tma_output_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -7836,6 +7838,9 @@ class ConfigSpec:
                             else (False,)
                             if key in ("cute_scaled_sf_tma", "cute_scaled_sf_inplace")
                             and not self.cute_mxfp8_sf_tma_available
+                            else ("default",)
+                            if key == "cute_scaled_epilogue_mode"
+                            and not self.cute_mxfp8_tma_output_available
                             else tuple(value for value in choices if value != 64)
                             if self.cute_mxfp8_mma_available
                             and key == "cute_scaled_tile_k"

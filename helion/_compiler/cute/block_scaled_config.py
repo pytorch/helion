@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from math import gcd
+
 from ...exc import InvalidConfig
 
 BLOCK_SCALED_CHOICES: dict[str, tuple[object, ...]] = {
@@ -20,9 +22,16 @@ MXFP8_CONFIG_KEYS = frozenset(
         "cute_scaled_compact_m",
         "cute_scaled_sf_tma",
         "cute_scaled_sf_inplace",
+        "cute_scaled_epilogue_mode",
     }
 )
 BLOCK_SCALED_CONFIG_KEYS = frozenset(BLOCK_SCALED_CHOICES) | MXFP8_CONFIG_KEYS
+MXFP8_EPILOGUE_MODES = {
+    "default": (1, False, False),
+    "tma_staged_2": (2, False, True),
+    "tma_prefetch_1": (1, True, True),
+    "tma_prefetch_2": (2, True, True),
+}
 
 
 def block_scaled_choices(*, mxfp8: bool = False) -> dict[str, tuple[object, ...]]:
@@ -37,7 +46,42 @@ def block_scaled_choices(*, mxfp8: bool = False) -> dict[str, tuple[object, ...]
         choices["cute_scaled_compact_m"] = (False, True)
         choices["cute_scaled_sf_tma"] = (False, True)
         choices["cute_scaled_sf_inplace"] = (False, True)
+        choices["cute_scaled_epilogue_mode"] = tuple(MXFP8_EPILOGUE_MODES)
     return choices
+
+
+def mxfp8_epilogue_parameters(mode: str) -> tuple[int, bool, bool]:
+    """Return accumulator banks, complete register preload and TMA output."""
+    return MXFP8_EPILOGUE_MODES[mode]
+
+
+def mxfp8_epilogue_supported(
+    mode: str,
+    bn: int,
+    bk: int,
+    logical_m: int,
+    *,
+    swap_ab: bool,
+    fused_scales: bool,
+    tma_output_available: bool,
+) -> bool:
+    """Keep the output descriptor and all accumulator/scale banks legal."""
+    if mode == "default":
+        return True
+    if type(mode) is not str or mode not in MXFP8_EPILOGUE_MODES:
+        return False
+    accumulator_stages, prefetch, _tma = mxfp8_epilogue_parameters(mode)
+    scale_columns = (1 + (bn + 127) // 128) * bk // 32
+    return (
+        tma_output_available
+        and fused_scales
+        and logical_m == 128
+        and not swap_ab
+        and bn >= 32
+        and bn % 32 == 0
+        and (not prefetch or bn <= 224)
+        and bn * accumulator_stages + scale_columns <= 512
+    )
 
 
 def block_scaled_workspace_shape(
@@ -69,6 +113,7 @@ def mxfp8_shared_memory_bytes(
     compact_m: bool,
     sf_tma: bool,
     sf_inplace: bool = False,
+    epilogue_mode: str = "default",
 ) -> int:
     """Account for native scales, optional raw words and the aliased A tail."""
     rows = logical_m if compact_m and logical_m < 128 and runtime_m > 1 else 128
@@ -76,10 +121,15 @@ def mxfp8_shared_memory_bytes(
     stage_bytes = (rows + bn // cluster_m) * bk + scales * (
         2 if sf_tma and not sf_inplace else 1
     )
+    _accumulator_stages, _prefetch, tma_output = mxfp8_epilogue_parameters(
+        epilogue_mode
+    )
+    output_stages = 2 if tma_output else 1
+    epi_n = min(gcd(bn, 64), 32) if tma_output else min(bn, 64)
     return (
         stage_bytes * stages
         + (128 - rows) * 128
-        + 128 * min(bn, 64) * output_element_size
+        + output_stages * 128 * epi_n * output_element_size
         + 2048
     )
 
@@ -93,6 +143,7 @@ def normalize_block_scaled_config(
     mxfp8: bool = False,
     fused_scales_available: bool = False,
     sf_tma_available: bool = False,
+    tma_output_available: bool = False,
 ) -> None:
     selected = BLOCK_SCALED_CONFIG_KEYS.intersection(config)
     if not available:
@@ -114,7 +165,10 @@ def normalize_block_scaled_config(
                 raise InvalidConfig(f"{key} must be one of {choices}")
     if not mxfp8 and MXFP8_CONFIG_KEYS.intersection(config):
         if (
-            any(config.get(key) not in (None, False, 128) for key in MXFP8_CONFIG_KEYS)
+            any(
+                config.get(key) not in (None, False, 128, "default")
+                for key in MXFP8_CONFIG_KEYS
+            )
             and not fix_invalid
         ):
             raise InvalidConfig("fused scales require a proved MXFP8 contraction")
@@ -186,3 +240,36 @@ def normalize_block_scaled_config(
             config["cute_scaled_sf_inplace"] = False
     if mxfp8 and config.get("cute_scaled_tile_m") == 128:
         config["cute_scaled_compact_m"] = False
+    if mxfp8 and config["cute_scaled_mma"] is not True:
+        config["cute_scaled_epilogue_mode"] = "default"
+    if mxfp8:
+        mode = config["cute_scaled_epilogue_mode"]
+        tile_n = config["cute_scaled_tile_n"]
+        tile_k = config["cute_scaled_tile_k"]
+        logical_m = config["cute_scaled_tile_m"]
+        swap_ab = config["cute_scaled_swap_ab"]
+        fused_scales = config["cute_scaled_fused_scales"]
+        # The typed scalar choices were validated above before any repair.
+        assert isinstance(mode, str)
+        assert isinstance(tile_n, int)
+        assert isinstance(tile_k, int)
+        assert isinstance(logical_m, int)
+        assert isinstance(swap_ab, bool)
+        assert isinstance(fused_scales, bool)
+        if not mxfp8_epilogue_supported(
+            mode,
+            tile_n,
+            tile_k,
+            logical_m,
+            swap_ab=swap_ab,
+            fused_scales=fused_scales,
+            tma_output_available=tma_output_available,
+        ):
+            if fix_invalid:
+                config["cute_scaled_epilogue_mode"] = "default"
+            else:
+                raise InvalidConfig(
+                    "TMA epilogues require a proved BF16 row-major output, fused "
+                    "MXFP8, unswapped logical M128, complete 32-column packets and "
+                    "disjoint accumulator/scale TMEM banks within 512 columns"
+                )
