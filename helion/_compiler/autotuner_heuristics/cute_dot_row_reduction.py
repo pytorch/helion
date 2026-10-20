@@ -102,8 +102,16 @@ class CuteDotRowReductionHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        if spec.cute_flash_search_enabled or not spec.supports_config_key(
-            "num_threads"
+        # The seed shapes the generic SIMT lowering's thread layout; a kernel
+        # a tensor-core family owns (the flash surface, the mma-dag owner, the
+        # tcgen05 K-loop family) seeds and defaults through that family, and
+        # a partial num_threads seed beside its seeds would only add a config
+        # the family's knobs do not describe.
+        if (
+            spec.cute_flash_search_enabled
+            or spec.cute_mma_dag is not None
+            or spec.cute_tcgen05_search_enabled
+            or not spec.supports_config_key("num_threads")
         ):
             return None
         host = device_ir.host_function

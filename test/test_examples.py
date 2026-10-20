@@ -32,7 +32,6 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
@@ -50,11 +49,6 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_cudnn_fp32_precision: str = "none"
 _orig_float32_matmul_precision: str = "none"
-
-_CUTE_LINEAR_ATTN_SKIP = (
-    "[C, C] intra-chunk tiles (causal mask, q @ k^T, hl.zeros([t, C, C])) bind "
-    "one block id to two axes; cute's SIMT lowering has one lane per block id"
-)
 
 
 def _compile_only(
@@ -3247,70 +3241,60 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 

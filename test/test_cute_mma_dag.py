@@ -31,6 +31,7 @@ from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 import helion
 from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
 from helion._compiler.cute import cute_mma_dag as dag
+from helion._compiler.cute.cute_mma_dag_codegen import _float_literal
 from helion._compiler.cute.cute_mma_dag_codegen import _Layout
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
@@ -433,6 +434,26 @@ def _bind_dqk(gated: bool = False, **shape: int) -> BoundKernel:
     return _bind(
         "chunk_bwd_dqk_helion",
         (t["q"], t["q"], t["v"], gcs, gl, t["h"], t["v"], t["dh"], gated, 0.125),
+    )
+
+
+def _bind_dqkg(
+    *, diag: bool = False, compute_dg: bool = True, **shape: int
+) -> BoundKernel:
+    """``chunk_bwd_dqkg_scalar_helion`` in its scalar-decay or anchored
+    (per-channel) mode, with or without the gate gradient."""
+    t = _tensors3(**shape)
+    bhn, c, d = t["q"].shape
+    k = torch.empty_like(t["q"])
+    do = torch.empty_like(t["v"])
+    if diag:
+        gcs = torch.empty((bhn, c, d), dtype=torch.float32, device=CPU_DEVICE)
+        gl = None
+    else:
+        gcs, gl = t["gcs"], t["gl"]
+    return _bind(
+        "chunk_bwd_dqkg_scalar_helion",
+        (t["q"], k, t["v"], gcs, t["h"], do, t["dh"], gl, diag, compute_dg, 0.125),
     )
 
 
@@ -1287,13 +1308,20 @@ def test_engine_kernels_pin_their_admission() -> None:
         "chunk_bwd_wy_dL_delta_helion": _bind_wy_dl,
         "chunk_bwd_dk_delta_helion": _bind_dk,
         "chunk_fwd_wy_delta_helion": _bind_wy,
+        "chunk_fwd_wy_delta_helion[diag_anchored]": _bind_wy_anchored,
         **{name: functools.partial(_bind, name, args) for name, args in other.items()},
     }
+    # (dwk's epilogue reads the column sum of its own fragment beside the
+    # fragment -- ``dgc_pos + is_last * dgc_last[:, None, :]`` -- admitted
+    # since the vector reads; its GPU numerics are covered by
+    # ``test_kda_kernels_match_the_triton_backend``.  dqkg with the gate
+    # gradient ends in ``hl.cumsum(dg_raw + is_last[None, :, None] *
+    # dg_last[:, None, :], reverse=True)``: a scan whose value reads a
+    # vector, admitted since the scan step collects them -- see
+    # ``test_dqkg_with_the_gate_gradient_is_a_scan_program``.)
     declined = {
-        "chunk_bwd_state_dwk_kda_helion",
         "chunk_bwd_gram2_kda_helion",
         "chunk_fwd_A_diag_anchored_helion",
-        "chunk_bwd_dqkg_scalar_helion",
         "chunk_cumsum_gc_helion",
     }
     verdicts = {}
@@ -3227,6 +3255,22 @@ def _bind_wy(gated: bool = False, **shape: int) -> BoundKernel:
     return _bind(
         "chunk_fwd_wy_delta_helion",
         (t["q"], t["v"], beta, gcs, None, None, gated, False),
+    )
+
+
+def _bind_wy_anchored(**shape: int) -> BoundKernel:
+    """The kda (``diag_anchored``) WY transform: the gram ``Akk`` arrives
+    from memory, the per-channel decay ``g_cs`` is a ``[C, D]`` tile and the
+    state key ``k_state_out`` is written beside ``w``."""
+    t = _tensors3(**shape)
+    bhn, c, d = t["q"].shape
+    f32 = torch.float32
+    beta = torch.empty((bhn, c), dtype=f32, device=CPU_DEVICE)
+    gc = torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE)
+    akk = torch.empty((bhn, c, c), dtype=torch.bfloat16, device=CPU_DEVICE)
+    return _bind(
+        "chunk_fwd_wy_delta_helion",
+        (t["q"], t["v"], beta, gc, akk, torch.empty_like(t["q"]), False, True),
     )
 
 
@@ -6178,8 +6222,12 @@ def test_a_16_bit_matmul_is_a_dot_rounded_where_it_is_read() -> None:
     assert SIMT_FALLBACK not in body
     assert f"{RT}.mma_bf16(" in body
     slot = dot.slot
-    rounds = re.findall(rf"= cutlass\.BFloat16\(md_c{slot}_\d+_\d+_\d\)", body)
+    # (The read's ``.to(float32)`` rounds and widens the register in one
+    # FMA-pipe conversion, ``round_bf16_f32``: the bits of the DSL's
+    # ``Float32(BFloat16(x))`` casts without the conversion unit.)
+    rounds = re.findall(rf"= {RT}\.round_bf16_f32\(md_c{slot}_\d+_\d+_\d\)", body)
     assert len(rounds) == len(set(rounds)) == dag.mma_dag_frag_regs(64, 128, 4)
+    assert "cutlass.BFloat16(" not in body
     assert f"{RT}.ldg_s32(" in body
     (column_base,) = (
         axis for axis in program.axes if axis.block_id == dot.cols.block_id
@@ -6372,3 +6420,1491 @@ def test_a_varying_bound_without_an_operand_pass_refuses_partial_trips() -> None
     assert dag.mma_dag_config_reason(facts, {0: 128, 1: 64, 2: 64}, 4, 2) is None
     with bound.env, pytest.raises(InvalidConfig):
         bound.config_spec.normalized_config(_config(16, 64, 64, warps=4, stages=2))
+
+
+# Loop-less programs: one GEMM over staged tiles with a fused epilogue
+# --------------------------------------------------------------------------
+
+
+def _head_sum_logits_batched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+) -> torch.Tensor:
+    """The indexer's decode form: the heads folded into one ``torch.matmul``
+    (an ``aten.bmm`` whose batch dim is the one-row ``tile_m``), relu, the
+    per-head weight, summed over the heads (the fragment rows), masked to
+    the row's window and stored -- no device loop at all."""
+    M, N = q.size(0), k.size(0)
+    hl.specialize(q.size(1))
+    hl.specialize(q.size(2))
+    out = torch.empty([M, N], dtype=torch.float32, device=q.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        kt = k[tile_n, :].transpose(0, 1)
+        score = torch.matmul(q[tile_m, :, :], kt).to(torch.float32)
+        acc = (torch.relu(score) * w[tile_m, :][:, :, None]).sum(dim=1)
+        in_window = (tile_n.index[None, :] >= ks[tile_m][:, None]) & (
+            tile_n.index[None, :] < ke[tile_m][:, None]
+        )
+        out[tile_m, tile_n] = torch.where(in_window, acc, float("-inf"))
+    return out
+
+
+def _loop_less_dot_stored(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """One ``hl.dot`` over two whole-extent operands of a one-row batch
+    tile, its fp32 product stored: a root region of one dot and one store."""
+    BH, N = a.size(0), b.size(2)
+    hl.specialize(a.size(1))
+    hl.specialize(a.size(2))
+    out = torch.empty([BH, a.size(1), N], dtype=torch.float32, device=a.device)
+    for tile_bh, tile_n in hl.tile([BH, N], block_size=[1, None]):
+        out[tile_bh, :, tile_n] = hl.dot(a[tile_bh, :, :], b[tile_bh, :, tile_n])
+    return out
+
+
+def test_a_loop_less_batched_matmul_program_is_admitted_on_the_warp_emitter() -> None:
+    # No device loop: the ``aten.bmm`` over ``q[tile_m, :, :]`` (a leading
+    # tile and two rdims) and the lead-broadcast ``kt`` is the program's one
+    # dot, the head sum a column-vector reduction of it, the masked store a
+    # vector store.  Everything runs in the root region, staged once per
+    # CTA; the tensor-memory renderers fail closed.
+    args = _head_sum_inputs(h=32)
+    bound = _bind_fn(_head_sum_logits_batched, args)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None and spec.cute_mma_dag_facts is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    facts = spec.cute_mma_dag_facts
+    assert facts.loops == () and facts.tcgen05 is None
+    assert sorted((a.kind, a.extent) for a in facts.axes) == [
+        ("lead", 256),
+        ("rdim", 32),
+        ("rdim", 128),
+        ("root", 512),
+    ]
+    program = _program(bound)
+    assert program.loops == () and program.loop_node is None
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.bmm.default
+    assert dag.rounded_dot_dtype(dot.node) is torch.bfloat16
+    assert (dot.rows.kind, dot.rows.extent) == ("rdim", 32)
+    assert (dot.cols.kind, dot.cols.extent) == ("root", 512)
+    assert (dot.k.kind, dot.k.extent) == ("rdim", 128)
+    # The broadcast views are squeezed off the B operand: a plain
+    # transposed load (K along the shared tile's columns).
+    assert dot.b.kind == "load" and dot.b.swap and not dot.b.trans
+    assert dot.b.value.target is torch.ops.aten.permute.default
+    assert not dot.a.pointwise and not dot.b.pointwise
+    (reduce,) = program.reduces
+    assert reduce.orient == "cols" and reduce.frag is dot.node
+    assert len(program.vec_stores) == 1 and not program.stores
+    # Admission leaves the block-size fragments alone.
+    with patch.object(CuteMmaDagHeuristic, "_facts", return_value=None):
+        plain = _bind_fn(_head_sum_logits_batched, args).config_spec
+    assert _block_bounds(spec) == _block_bounds(plain)
+    # The promoted default is the warp seed at the largest root tile.
+    default = spec.default_config().config
+    assert default["cute_mma_dag"] == "warp" and default["block_sizes"] == [1, 128]
+    source = _source(bound, _config(1, 128, warps=8, stages=4))
+    body = _kernel_body(source)
+    assert SIMT_FALLBACK not in source and "tcgen05" not in body
+    assert "block=(256, 1, 1)" in source
+    assert "for md_i" not in body and "md_stage" not in body
+    # q (32x128 bf16, 8 KB) and k (128x128 bf16, 32 KB) staged once: 2 + 8
+    # packets per thread, one group, one wait, then the eight K steps over
+    # the 32x128 fragment (eight warps: one m atom by four n atoms each).
+    assert body.count(f"{RT}.cp_async_16(") == 10
+    assert body.count("cute.arch.cp_async_commit_group()") == 1
+    assert body.count("cute.arch.cp_async_wait_group(0)") == 1
+    assert body.count(f"{RT}.mma_bf16(") == 32
+    assert body.count(f"{RT}.ldmatrix_x4(") == 24
+    # The rounded score (``round_bf16_f32`` of the fp32 register), relu, the
+    # per-head weight, the head sum across the octet and the two warp rows,
+    # the masked vector store.
+    assert f"{RT}.round_bf16_f32(md_c0_" in body
+    assert "cutlass.BFloat16(md_c0_" not in body
+    assert f"{RT}.octet_sum(" in body and f"{RT}.ldg_s32(" in body
+    assert f"{RT}.stg_f32(" in body and f"{RT}.stg_v4_b32(" not in body
+    # The example kernel is the same program.
+    example = importlib.import_module("examples.sparse_attn_indexer")
+    example_bound = _bind_fn(example.mqa_logits_decode.fn, args)
+    assert example_bound.config_spec.cute_mma_dag is not None
+    assert example_bound.config_spec.default_config().config["cute_mma_dag"] == "warp"
+
+
+def test_loop_less_seeds_and_normalization_pin_the_inert_stage_depth() -> None:
+    # Nothing rides a cp.async ring without a loop: one seed per tile at
+    # the default depth, and normalization pins any requested depth to it.
+    bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+    spec = bound.config_spec
+    seeds = [c for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")]
+    assert seeds and all(c.config["cute_mma_dag"] == "warp" for c in seeds)
+    assert {c.config["cute_mma_dag_stages"] for c in seeds} == {
+        dag.MMA_DAG_DEFAULT_STAGES
+    }
+    # One seed per tile (the top seed's occupancy-hint twin repeats its tile
+    # with ``cute_min_blocks_per_mp``).
+    plain = [c for c in seeds if c.config.get("cute_min_blocks_per_mp", 0) != 1]
+    tiles = [cast("list[int]", c.config["block_sizes"]) for c in plain]
+    assert len(tiles) == len({tuple(t) for t in tiles})
+    with bound.env:
+        normalized = spec.normalized_config(_config(1, 64, warps=4, stages=2))
+    assert normalized.config["cute_mma_dag_stages"] == dag.MMA_DAG_DEFAULT_STAGES
+    assert normalized.config["cute_mma_dag"] == "warp"
+    with bound.env, pytest.raises(InvalidConfig, match="tcgen05"):
+        spec.normalized_config(
+            helion.Config(
+                block_sizes=[1, 64],
+                cute_mma_dag="tcgen05",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=2,
+            )
+        )
+
+
+def _loop_less_dot_scanned(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    reverse: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
+    """The dot's fp32 product summed down (up) its rows: ``hl.cumsum`` of a
+    fragment, a scan step in the root region."""
+    BH, N = a.size(0), b.size(2)
+    hl.specialize(a.size(1))
+    hl.specialize(a.size(2))
+    out = torch.empty([BH, a.size(1), N], dtype=torch.float32, device=a.device)
+    for tile_bh, tile_n in hl.tile([BH, N], block_size=[1, None]):
+        acc = hl.dot(a[tile_bh, :, :], b[tile_bh, :, tile_n]) * 0.5
+        out[tile_bh, :, tile_n] = hl.cumsum(acc, dim=1, reverse=reverse)
+    return out
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+def test_a_cumsum_of_a_fragment_is_a_scan_step(reverse: bool) -> None:
+    # The combine function of ``hl.cumsum`` is a HelperFunction graph the
+    # structural gate used to refuse; the scan is a prefix sum of the
+    # fragment down (up) its rows: octet shuffles per column register, the
+    # halves and atoms chained, the two warps along M meeting in the
+    # scratch tile.  Tensor memory fails closed.
+    a = torch.empty((16, 32, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((16, 128, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_loop_less_dot_scanned, (a, b, reverse))
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    program = _program(bound)
+    (dot,) = program.dots
+    (scan,) = program.scans
+    assert scan.frag is dot.node and scan.reverse is reverse
+    assert scan.orient == "rows" and scan.slot == dot.slot
+    (store,) = program.stores
+    assert store.frag is scan.node
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.scans == ((dot.slot, "rows"),)
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=4)))
+    assert SIMT_FALLBACK not in body and "for md_i" not in body
+    shuffle = f"{RT}.{'shfl_down_add_f32' if reverse else 'shfl_up_add_f32'}("
+    other = f"{RT}.{'shfl_up_add_f32' if reverse else 'shfl_down_add_f32'}("
+    # A 32x64 fragment over four warps is two warps along M by two along
+    # N: per column register (four n atoms x two) one m atom of two halves,
+    # three shuffle adds each, and the cross-warp prefix through the
+    # scratch tile (one total per warp per column: 2 x 64 fp32).
+    assert body.count(shuffle) == 8 * 2 * 3 and other not in body
+    edge = "md_c" if reverse else "28 + md_c"
+    assert body.count("cute.arch.shuffle_sync(md_sc") == 8 * 2
+    assert f", {edge}, mask=4294967295, mask_and_clamp=31)" in body
+    assert body.count(f"{RT}.sts_f32(md_rv + (md_L0_wmi * 64 + ") == 8
+    assert body.count(f"{RT}.lds_f32(md_rv + (") == 16
+    assert ("if md_L0_wmi < " if reverse else "if md_L0_wmi > ") in body
+    assert "md_rv = md_s0 + " in body
+    assert body.count("cute.arch.barrier()") == 3
+    # The scan overwrote the dot's slot after reading it.
+    assert body.rindex(shuffle) < body.index("md_c0_0_0_0 = md_sc")
+
+
+def test_a_loop_less_dot_with_a_fragment_store_is_admitted() -> None:
+    a = torch.empty((16, 32, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((16, 128, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_loop_less_dot_stored, (a, b))
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    program = _program(bound)
+    assert program.loops == ()
+    (dot,) = program.dots
+    assert dot.node.target is not torch.ops.aten.bmm.default
+    (store,) = program.stores
+    assert store.region == "epilogue" and store.frag is dot.node
+    # ``block_size=[1, None]`` pins the batch tile: one tunable block size.
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=4)))
+    assert SIMT_FALLBACK not in body and "for md_i" not in body
+    # A 32x64 fragment over four warps: one m atom by four n atoms, eight
+    # K steps.
+    assert body.count(f"{RT}.mma_bf16(") == 32
+    assert body.count("cute.arch.cp_async_commit_group()") == 1
+
+
+def _k_loop_dot_scanned(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    reverse: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
+    """The running prefix sum down (up) the rows of a K-loop accumulator,
+    stored every iteration: ``hl.cumsum`` of the carry, a scan step inside
+    the loop whose input (the carry) stays live past it."""
+    M, K = a.size()
+    N = b.size(1)
+    hl.specialize(N)
+    out = torch.empty([M, N], dtype=torch.float32, device=a.device)
+    for tile_m in hl.tile(M):
+        acc = hl.zeros([tile_m, N], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, :], acc=acc)
+            out[tile_m, :] = hl.cumsum(acc, dim=0, reverse=reverse)
+    return out
+
+
+def _inner_loop_dot_scanned(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """The loop-less scan's program under an inner tile loop over N: the
+    dot, the scan taking over its slot and the store, all in the loop."""
+    BH, N = a.size(0), b.size(2)
+    hl.specialize(a.size(1))
+    hl.specialize(a.size(2))
+    out = torch.empty([BH, a.size(1), N], dtype=torch.float32, device=a.device)
+    for tile_bh in hl.tile(BH, block_size=1):
+        for tile_n in hl.tile(N):
+            acc = hl.dot(a[tile_bh, :, :], b[tile_bh, :, tile_n]) * 0.5
+            out[tile_bh, :, tile_n] = hl.cumsum(acc, dim=1)
+    return out
+
+
+def _loop_less_dot_scanned_and_stored(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scanned value is stored too: the scan's input stays live past
+    it, so the scan gets a slot of its own."""
+    BH, N = a.size(0), b.size(2)
+    hl.specialize(a.size(1))
+    hl.specialize(a.size(2))
+    out = torch.empty([BH, a.size(1), N], dtype=torch.float32, device=a.device)
+    out2 = torch.empty([BH, a.size(1), N], dtype=torch.float32, device=a.device)
+    for tile_bh, tile_n in hl.tile([BH, N], block_size=[1, None]):
+        acc = hl.dot(a[tile_bh, :, :], b[tile_bh, :, tile_n]) * 0.5
+        out[tile_bh, :, tile_n] = hl.cumsum(acc, dim=1)
+        out2[tile_bh, :, tile_n] = acc
+    return out, out2
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+def test_a_cumsum_inside_a_loop_is_a_scan_step_of_the_loop(reverse: bool) -> None:
+    # The scan of the K-loop carry is a step of the loop's region (the
+    # loop-body dispatch used to have no Scan branch and the compile
+    # failed): the carry stays live, so the scan writes a slot of its own
+    # (same shape), and its cross-warp exchange sits inside the iteration
+    # behind two barriers like a reduction's.
+    a = torch.empty((256, 512), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((512, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_k_loop_dot_scanned, (a, b, reverse))
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    program = _program(bound)
+    (dot,) = program.dots
+    (scan,) = program.scans
+    (loop,) = program.loops
+    assert scan.loop == loop.index == dot.loop
+    assert scan.frag is dot.node and scan.reverse is reverse
+    assert scan.slot != dot.slot
+    assert program.slots[scan.slot] == program.slots[dot.slot]
+    (store,) = program.stores
+    assert store.frag is scan.node and store.loop == loop.index
+    body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    loop_body = _loop_and_after(body)
+    shuffle = f"{RT}.{'shfl_down_add_f32' if reverse else 'shfl_up_add_f32'}("
+    other = f"{RT}.{'shfl_up_add_f32' if reverse else 'shfl_down_add_f32'}("
+    # A 64x64 fragment over four warps along M (one m atom of two halves by
+    # eight n atoms each): per column register three shuffle adds per
+    # half, one total per warp per column through the scratch tile, read
+    # back for the four warps.
+    assert loop_body.count(shuffle) == 16 * 2 * 3 and other not in body
+    assert loop_body.count(f"{RT}.sts_f32(md_rv + (md_L0_wmi * 64 + ") == 16
+    assert loop_body.count(f"{RT}.lds_f32(md_rv + (") == 64
+    # The iteration barrier and the exchange's two.
+    assert loop_body.count("cute.arch.barrier()") == 3
+    # The accumulator registers survive the scan; the store reads the
+    # scan's.
+    assert "md_c0_0_0_0 = md_sc" not in body
+    assert "md_c1_0_0_0 = md_sc" in loop_body
+    assert loop_body.index(f"{RT}.mma_bf16(") < loop_body.index(shuffle)
+    assert loop_body.index("md_c1_0_0_0 = md_sc") < loop_body.index(
+        f"{RT}.stg_v2_f32(md_lb, md_c1_0_0_0, md_c1_0_0_1)"
+    )
+
+
+def test_a_cumsum_inside_an_inner_tile_loop_takes_over_the_dots_slot() -> None:
+    a = torch.empty((16, 32, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((16, 128, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_inner_loop_dot_scanned, (a, b))
+    program = _program(bound)
+    (dot,) = program.dots
+    (scan,) = program.scans
+    (loop,) = program.loops
+    assert scan.loop == loop.index == dot.loop and scan.slot == dot.slot
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=4)))
+    assert SIMT_FALLBACK not in body
+    loop_body = _loop_and_after(body)
+    # 32x64 over two warps along M by two along N: eight column registers
+    # of one m atom each.
+    assert loop_body.count(f"{RT}.shfl_up_add_f32(") == 8 * 2 * 3
+    assert loop_body.rindex(f"{RT}.shfl_up_add_f32(") < loop_body.index(
+        "md_c0_0_0_0 = md_sc"
+    )
+
+
+def test_a_cumsum_of_a_live_fragment_gets_its_own_slot() -> None:
+    a = torch.empty((16, 32, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((16, 128, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_loop_less_dot_scanned_and_stored, (a, b))
+    program = _program(bound)
+    (dot,) = program.dots
+    (scan,) = program.scans
+    assert scan.slot != dot.slot
+    assert program.slots[scan.slot] == program.slots[dot.slot]
+    assert {store.frag for store in program.stores} == {dot.node, scan.node}
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=4)))
+    assert SIMT_FALLBACK not in body
+    assert "md_c0_0_0_0 = md_sc" not in body and "md_c1_0_0_0 = md_sc" in body
+
+
+def _loop_less_dot_scanned_with_a_vector(
+    a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """dqkg's tail in miniature: the column sums of the fragment folded
+    into its last row under an iota mask, then the reverse prefix sum --
+    the scan's value reads a vector (the reduction) beside the fragment."""
+    BH, N = a.size(0), b.size(2)
+    M = hl.specialize(a.size(1))
+    hl.specialize(a.size(2))
+    out = torch.empty([BH, M, N], dtype=torch.float32, device=a.device)
+    for tile_bh, tile_n in hl.tile([BH, N], block_size=[1, None]):
+        acc = hl.dot(a[tile_bh, :, :], b[tile_bh, :, tile_n])
+        last = acc.sum(dim=1)
+        idx = hl.arange(M)
+        is_last = (idx == M - 1).float()
+        out[tile_bh, :, tile_n] = hl.cumsum(
+            acc + is_last[None, :, None] * last[:, None, :], dim=1, reverse=True
+        )
+    return out
+
+
+def test_a_cumsum_whose_value_reads_a_vector_is_a_scan_step() -> None:
+    # The scan step collects the vectors its value reads like a reduction
+    # does (``check_vecs``: defined in an enclosing region, varying along
+    # one of the slot's dims); the emitter evaluates the value over the
+    # input fragment's registers, so a vector of the fragment's own family
+    # resolves to its register at the element's column (no relayout).
+    a = torch.empty((16, 32, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((16, 128, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_loop_less_dot_scanned_with_a_vector, (a, b))
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    program = _program(bound)
+    (dot,) = program.dots
+    (reduce,) = program.reduces
+    (scan,) = program.scans
+    assert reduce.frag is dot.node and reduce.orient == "cols"
+    assert scan.frag is dot.node and scan.reverse
+    # The reduction read the dot before the scan: the scan's input stays
+    # live past the reduction only, so the scan takes over the dot's slot.
+    assert scan.slot == dot.slot
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=4)))
+    assert SIMT_FALLBACK not in body
+    # A 32x64 fragment over two warps along M by two along N: eight column
+    # registers of two halves, three shuffle adds each; the column sums go
+    # through ``octet_sum`` and the two warps along M meet in the scratch.
+    assert body.count(f"{RT}.shfl_down_add_f32(") == 8 * 2 * 3
+    assert f"{RT}.octet_sum(" in body
+    assert "md_fv" not in body and "md_rt" not in body
+    # The scan's value multiplies the mask by the vector's own register
+    # (``md_r<slot>_<atom>_<half>``) at the element's column.
+    assert re.search(r"\* md_r\d+_\d+_\d+\b", body)
+
+
+@pytest.mark.parametrize("diag", (False, True))
+def test_dqkg_with_the_gate_gradient_is_a_scan_program(diag: bool) -> None:
+    # ``chunk_bwd_dqkg_scalar_helion(compute_dg=True)`` (simple_gla /
+    # retention / full_gla training backward): the in-loop ``dh_h_acc +=
+    # (h * dh).sum(-1)``, the epilogue ``dg_last = exp_gl * dh_h_acc +
+    # (dk_state * k).sum(1)`` and the reverse cumsum of ``dg_raw +
+    # is_last[None, :, None] * dg_last[:, None, :]`` -- a scan whose value
+    # reads a vector of another fragment's family (relaid through the
+    # scratch at the scan fragment's columns).  Warp mode only: tensor
+    # memory fails closed on scans.
+    bound = _bind_dqkg(diag=diag)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    program = _program(bound)
+    (scan,) = program.scans
+    assert scan.reverse and scan.orient == "rows" and scan.loop == -1
+    assert len(program.dots) == 5 and len(program.reduces) == 2
+    assert len(program.vec_ops) == 3 and len(program.stores) == 3
+    assert [store.frag for store in program.stores].count(scan.node) == 1
+    (dg_store,) = [store for store in program.stores if store.frag is scan.node]
+    assert dg_store.access.dtype == torch.float32
+    assert spec.cute_mma_dag_facts is not None
+    assert spec.cute_mma_dag_facts.scans == ((scan.slot, "rows"),)
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=8, stages=2)))
+    assert SIMT_FALLBACK not in body
+    # A [64, 64] fragment over eight warps: four atoms per warp, two halves
+    # each, three shuffle adds per column register.
+    assert body.count(f"{RT}.shfl_down_add_f32(") == 4 * 4 * 3
+    assert f"{RT}.shfl_up_add_f32(" not in body
+    # dg_last follows the [tile_d, tile_dv] family of the loop's reduction:
+    # relaid through the scratch into the scan fragment's column positions.
+    assert re.search(rf"md_fv\d*_0 = {RT}\.lds_f32\(md_rv", body)
+    # The default stays off on the CPU stub (no promoted seed there); the
+    # scan program's seeds are all warp seeds.
+    with bound.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds and all(s.config["cute_mma_dag"] == "warp" for s in seeds)
+
+
+def test_the_se_block_forward_is_a_loop_less_program() -> None:
+    # The loop-less gate admits ``x[tile_m, :] @ w[:, :]`` with its sigmoid
+    # and scaled-store epilogue (examples/se_block.py's forward before it
+    # tiled the reduction): an fp16 ``aten.mm`` over the whole reduction,
+    # one derived value, two epilogue stores.
+    # The promoted default is warp at the catalog's small shape; at the
+    # larger ones no warp tile fits (w alone is 512 KB and up), so there
+    # are no seeds and the default stays off.
+    from test.test_cute_full_slice_matmul import _se_block_full_slice_fwd
+
+    def bind(m: int, n: int) -> BoundKernel:
+        x = torch.empty((m, n), dtype=torch.float16, device=CPU_DEVICE)
+        w = torch.empty((n, n), dtype=torch.float16, device=CPU_DEVICE)
+        # The structural policy's full-slice stripmine would hand the
+        # contraction a K loop (the tcgen05 K-loop family); this pins the
+        # un-rewritten loop-less body the mma-dag owner claims.
+        return helion.kernel(
+            _se_block_full_slice_fwd,
+            backend="cute",
+            static_shapes=True,
+            cute_full_slice_matmul_tiling=False,
+        ).bind((x, w))  # type: ignore[arg-type]
+
+    bound = bind(256, 128)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None and spec.cute_mma_dag_facts is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    facts = spec.cute_mma_dag_facts
+    assert facts.loops == () and facts.tcgen05 is None
+    assert sorted((a.kind, a.extent) for a in facts.axes) == [
+        ("rdim", 128),
+        ("root", 256),
+    ]
+    program = _program(bound)
+    assert program.loops == ()
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.mm.default
+    assert dag.rounded_dot_dtype(dot.node) is torch.float16
+    (derived,) = program.derived
+    assert [store.frag for store in program.stores] == [dot.node, derived.node]
+    assert all(store.region == "epilogue" for store in program.stores)
+    default = spec.default_config().config
+    assert default["cute_mma_dag"] == "warp" and default["block_sizes"] == [128]
+    body = _kernel_body(_source(bound, _config(128, warps=8, stages=4)))
+    assert SIMT_FALLBACK not in body and "for md_i" not in body
+    # x (128x128 fp16) and w (128x128 fp16) staged once; eight warps over
+    # the 128x128 fragment, eight K steps.
+    assert body.count(f"{RT}.cp_async_16(") == 16
+    assert body.count("cute.arch.cp_async_commit_group()") == 1
+    assert body.count(f"{RT}.mma_f16(") == 128
+    for m, n in ((1024, 512), (4096, 1024)):
+        spec = bind(m, n).config_spec
+        assert spec.cute_mma_dag is not None
+        assert not [
+            c for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+        ]
+        assert spec.default_config().config["cute_mma_dag"] == "off"
+
+
+# Vectors beside fragments, loaded seeds, 16-bit derived values, fp32 matmuls
+# --------------------------------------------------------------------------
+
+
+def _bind_dwk(*, d: int = 64, dv: int = 64) -> BoundKernel:
+    """kda's parallel state adjoint: its epilogue combines the fragment
+    ``dgc_pos`` with ``dgc_last``, the column sum of the same fragment plus
+    the loop-carried row reduction ``delast``, under the ``is_last`` row
+    mask."""
+    bh, n, c = 2, 8, 64
+    bf16, f32 = torch.bfloat16, torch.float32
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    return _bind(
+        "chunk_bwd_state_dwk_kda_helion",
+        (
+            e(bh, n, c, d),
+            e(bh, n, c, d, dtype=f32),
+            e(bh, n, d, dv),
+            e(bh, n, c, dv),
+            e(bh, n, c, dv, dtype=f32),
+            e(bh, n, d, dv, dtype=f32),
+        ),
+    )
+
+
+def test_dwk_reads_the_column_sum_of_its_fragment_beside_it() -> None:
+    # ``dgc_s = dgc_pos + is_last * dgc_last[:, None, :]``: the store value
+    # combines the derived fragment ``dk_scaled * k_scaled`` with a vector
+    # (``delast * elast`` relaid from the loop's row vector plus the
+    # fragment's column sum).  The vector's family follows the ``[bk, bv]``
+    # loop fragment's warp grid, not the ``[C, bk]`` epilogue fragment's, so
+    # the store relays it through the scratch tile at the register's
+    # column (``md_fv_*``); the vector op before it relays the column sum
+    # into the row vector's layout (``md_rt_*``).
+    bound = _bind_dwk()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    program = _program(bound)
+    assert [type(step).__name__ for step in program.body] == [
+        "Derived",
+        "Loop",
+        "Store",
+        "Derived",
+        "Store",
+        "Derived",
+        "VecOp",
+        "Derived",
+        "Reduce",
+        "VecOp",
+        "Store",
+    ]
+    assert [slot.orient for slot in program.vec_slots] == ["rows", "rows", "cols"]
+    assert all(program.vec_frag_slots[s] for s in range(len(program.vec_slots)))
+    (loop,) = program.loops
+    assert len(loop.vec_carries) == 1 and not loop.vec_carries[0].identity
+    body = _kernel_body(_source(bound, _config(1, 64, 32, warps=8, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_bf16(" in body
+    epilogue = body[body.rindex("for md_i in cutlass.range(") :]
+    assert "md_rt_0_0 = " in epilogue
+    relaid = re.findall(r"(md_fv_\d+) = _helion_mma_dag\.lds_f32\(md_rv", epilogue)
+    assert relaid and len(relaid) == len(set(relaid))
+    # The relayout's reads come after the owning lanes' writes and a
+    # barrier, with another barrier before the scratch is reused; the
+    # masked store (``is_last * dgc_last``) consumes the temporaries.
+    writes = epilogue.rindex(f"{RT}.sts_f32(md_rv")
+    first = epilogue.index("md_fv_0 = ")
+    assert writes < first
+    assert epilogue.count("cute.arch.barrier()", writes, first) == 1
+    assert epilogue.count("cute.arch.barrier()", first) >= 1
+    assert re.search(r"= md_v_\d+ \* md_fv_0\b", epilogue)
+
+
+def test_a_vector_inside_an_operand_chain_is_not_mine() -> None:
+    # The operand passes evaluate per tile element, not per fragment
+    # register: a dot operand reading a vector (``(acc * rowsum).to(bf16)``)
+    # declines, while the same value stored is admitted.
+    bf16, f32 = torch.bfloat16, torch.float32
+    b, m, k, n, p = 4, 64, 128, 32, 16
+    a = torch.empty((b, m, k), dtype=bf16, device=CPU_DEVICE)
+    w = torch.empty((b, k, n), dtype=bf16, device=CPU_DEVICE)
+    c = torch.empty((b, n, p), dtype=bf16, device=CPU_DEVICE)
+    scaled = torch.empty((b, m, n), dtype=f32, device=CPU_DEVICE)
+    out = torch.empty((b, m, p), dtype=f32, device=CPU_DEVICE)
+    bound = _bind_fn(_row_scaled_stored, (a, w, scaled))
+    program = _program(bound)
+    assert [type(step).__name__ for step in program.body] == [
+        "Loop",
+        "Reduce",
+        "Store",
+    ]
+    bound = _bind_fn(_row_scaled_operand, (a, w, c, out))
+    with bound.env, bound.host_function:
+        assert dag.match_mma_dag(bound.host_function.device_ir.graphs) is None
+    assert bound.config_spec.cute_mma_dag is None
+
+
+def _row_scaled_stored(
+    a: torch.Tensor, w: torch.Tensor, scaled: torch.Tensor
+) -> torch.Tensor:
+    b, m, k = a.shape
+    for tile_b in hl.tile(b, block_size=1):
+        acc = hl.zeros([tile_b, m, w.size(2)], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_b, :, tile_k], w[tile_b, tile_k, :], acc=acc)
+        rowsum = torch.sum(acc, dim=-1)
+        scaled[tile_b, :, :] = acc * rowsum[:, :, None]
+    return scaled
+
+
+def _row_scaled_operand(
+    a: torch.Tensor, w: torch.Tensor, c: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    b, m, k = a.shape
+    for tile_b in hl.tile(b, block_size=1):
+        acc = hl.zeros([tile_b, m, w.size(2)], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_b, :, tile_k], w[tile_b, tile_k, :], acc=acc)
+        rowsum = torch.sum(acc, dim=-1)
+        lhs = (acc * rowsum[:, :, None]).to(torch.bfloat16)
+        out[tile_b, :, :] = hl.dot(lhs, c[tile_b, :, :])
+    return out
+
+
+def test_anchored_wy_seeds_the_neumann_chain_from_the_loaded_gram() -> None:
+    # The kda WY transform: ``A = -(beta * Akk[b])`` and ``T = eye + A`` are
+    # pointwise chains over the loaded gram (not over the kk loop's
+    # accumulator, as in the gdn variant), so both carries are seeded from
+    # the tile's pairs loaded at the fragment coordinates and the chain
+    # evaluated per register; ``k_state_out = k * exp2(gc[C-1] - gc)`` is a
+    # derived value over two loaded tiles stored from the loop body.
+    bound = _bind_wy_anchored()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    program = _program(bound)
+    assert [type(step).__name__ for step in program.body] == [
+        "Loop",
+        "Store",
+        "Loop",
+        "Loop",
+    ]
+    chain = program.loops[0]
+    assert len(chain.carries) == 2
+    for carry in chain.carries:
+        assert carry.init is not None and carry.init.name == "Akk"
+        assert carry.init_frag is None and carry.init_value is not None
+    assert [len(carry.init_aux) for carry in chain.carries] == [1, 1]
+    assert [store.access.name for store in program.stores] == [
+        "A_inv",
+        "k_state_out",
+        "w",
+        "u",
+    ]
+    assert [store.source for store in program.stores] == [
+        "epilogue",
+        "body",
+        "body",
+        "body",
+    ]
+    assert [(len(d.frags), len(d.loads)) for d in program.derived] == [(0, 2), (0, 2)]
+    body = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_tf32(" in body
+    seed = body[: body.index("for md_i in cutlass.range(")]
+    # Each carry's 64x64 tile over 128 lanes: 16 bf16 pairs per lane.
+    assert seed.count(f"{RT}.unpack_bf16x2({RT}.ldg_b32(") == 32
+    assert "cute.arch.add_packed_f32x2(" in seed
+    assert f"{RT}.mma_" not in seed
+
+
+def _se_block_module() -> object:
+    return importlib.import_module("examples.se_block")
+
+
+def _bind_se_block(name: str, *, precision: str | None = None) -> BoundKernel:
+    m, n = 256, 128
+    f16 = torch.float16
+    x = torch.empty((m, n), dtype=f16, device=CPU_DEVICE)
+    w = torch.empty((n, n), dtype=f16, device=CPU_DEVICE)
+    args: tuple[object, ...] = (x, x, w, x) if name == "se_block_bwd_dx" else (x, x, x)
+    settings = {} if precision is None else {"dot_precision": precision}
+    fn = getattr(_se_block_module(), name).fn
+    return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # type: ignore[arg-type]
+
+
+def test_fp32_matmuls_are_tf32_dots_under_the_default_precision() -> None:
+    # ``acc += a @ b`` of fp32 tiles is traced as ``aten.addmm``: a tf32 dot
+    # with the accumulator leading, like Triton's ``tl.dot`` runs the same
+    # source; ``"ieee"`` keeps the exact lowering.  dw's A operand is the
+    # widened transposed half tile, its B the derived ``2 * g * x * s *
+    # (1 - s)`` fragment; dx's pre-seed ``acc += 2.0 * grad_out * s`` is a
+    # half-typed derived value (torch promotion) seeding the carry.
+    dw = _bind_se_block("se_block_bwd_dw")
+    assert dw.config_spec.cute_mma_dag is not None
+    program = _program(dw)
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.addmm.default
+    with dw.env:
+        # (The dtype query reads the dot precision off the environment.)
+        assert dag.mm_dot_dtype(dot.node) is torch.float32
+        assert dag.rounded_dot_dtype(dot.node) is None
+    assert dot.a.dtype == dot.b.dtype == torch.float32
+    assert dot.acc_frag is not None and dot.slot == dot.acc_slot
+    assert (dot.a.kind, dot.a.pointwise, dot.a.trans) == ("load", True, True)
+    assert dot.b.kind == "frag"
+    assert (
+        _bind_se_block("se_block_bwd_dw", precision="ieee").config_spec.cute_mma_dag
+        is None
+    )
+    dx = _bind_se_block("se_block_bwd_dx")
+    assert dx.config_spec.cute_mma_dag is not None
+    program = _program(dx)
+    (dot,) = program.dots
+    assert (dot.a.kind, dot.b.kind, dot.b.pointwise) == ("frag", "load", True)
+    (loop,) = program.loops
+    (carry,) = loop.carries
+    assert carry.init is None and carry.init_value is not None
+    seed = carry.init_frag
+    assert seed is not None and seed.meta["val"].dtype == torch.float16
+    assert program.frag_regions[seed] == -1
+    body = _kernel_body(_source(dx, _config(64, 64, 64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_tf32(" in body
+    slot = program.frag_slots[seed]
+    # The half-typed value's rounded elements are widened into its fp32
+    # registers, and the carry's seed reads them re-typed.
+    assert re.search(rf"md_c{slot}_\d+_\d+_\d = cutlass\.Float32\(", body)
+    assert re.search(rf"= cutlass\.Float16\(md_c{slot}_\d+_\d+_\d\)", body)
+
+
+# --------------------------------------------------------------------------
+# Non-finite constants beside a fragment
+# --------------------------------------------------------------------------
+
+
+def _masked_neg_inf_stored(
+    a: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``where(mask, acc, -inf)`` over the finished accumulator: the
+    ``hl.full`` fill beside the fragment is a non-finite constant."""
+    b, m, k = a.shape
+    for tile_b in hl.tile(b, block_size=1):
+        acc = hl.zeros([tile_b, m, w.size(2)], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_b, :, tile_k], w[tile_b, tile_k, :], acc=acc)
+        rows = hl.arange(m)
+        cols = hl.arange(w.size(2))
+        mask = rows[:, None] >= cols[None, :]
+        out[tile_b, :, :] = torch.where(
+            mask[None, :, :],
+            acc,
+            hl.full([tile_b, m, w.size(2)], float("-inf"), dtype=torch.float32),
+        )
+    return out
+
+
+def _masked_neg_inf_inputs() -> tuple[torch.Tensor, ...]:
+    bf16, f32 = torch.bfloat16, torch.float32
+    b, m, k, n = 4, 64, 128, 64
+    a = torch.empty((b, m, k), dtype=bf16, device=CPU_DEVICE)
+    w = torch.empty((b, k, n), dtype=bf16, device=CPU_DEVICE)
+    out = torch.empty((b, m, n), dtype=f32, device=CPU_DEVICE)
+    return a, w, out
+
+
+@pytest.mark.parametrize(
+    ("value", "literal"),
+    (
+        (float("-inf"), "float('-inf')"),
+        (float("inf"), "float('inf')"),
+        (float("nan"), "float('nan')"),
+        (-2.5, "-2.5"),
+        (0.0, "0.0"),
+    ),
+    ids=("neg_inf", "inf", "nan", "finite", "zero"),
+)
+def test_float_literals_spell_non_finite_values_as_calls(
+    value: float, literal: str
+) -> None:
+    # ``repr(float("inf"))`` is the bare name ``inf``, undefined in the
+    # generated module: the DSL source spells it as a ``float(...)`` call.
+    assert _float_literal(value) == literal
+
+
+def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:
+    # ``where(mask, acc, hl.full(..., float("-inf")))`` after the K loop:
+    # the fill is a uniform constant read beside the fragment (admitted on
+    # both modes) and renders as ``cutlass.Float32(float('-inf'))`` -- a
+    # bare ``cutlass.Float32(-inf)`` fails the DSL compile with a NameError.
+    bound = _bind_fn(_masked_neg_inf_stored, _masked_neg_inf_inputs())
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    program = _program(bound)
+    assert [type(step).__name__ for step in program.body] == ["Loop", "Store"]
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_bf16(" in body
+    assert "cutlass.Float32(float('-inf'))" in body
+    assert "Float32(-inf)" not in body
+    assert "Float32(inf)" not in body
+
+
+# --------------------------------------------------------------------------
+# Ragged root tiles: a fragment past the axis extent
+# --------------------------------------------------------------------------
+
+
+def _ragged_rows_summed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``(a @ b + 1).sum(0)`` over the rows of one root tile (the rows fit
+    one tile): the sum's input is masked to zero past the row extent by
+    the frontend's ``_mask_to`` (the add's masked value is one, not zero),
+    the result a vector along N."""
+    M, N = a.size(0), b.size(1)
+    hl.specialize(a.size(1))
+    out = torch.empty([N], dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        s = hl.dot(a[tile_m, :], b[:, tile_n])
+        out[tile_n] = (s + 1.0).sum(dim=0)
+    return out
+
+
+def _ragged_cols_summed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``(a @ b + 1).sum(1)`` per row over the whole ``b``: a vector along
+    the (ragged) rows, stored under the row guard."""
+    M = a.size(0)
+    hl.specialize(a.size(1))
+    hl.specialize(b.size(1))
+    out = torch.empty([M], dtype=torch.float32, device=a.device)
+    for tile_m in hl.tile(M):
+        s = hl.dot(a[tile_m, :], b[:, :])
+        out[tile_m] = (s + 1.0).sum(dim=1)
+    return out
+
+
+def _ragged_dot_stored(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``out[tile_m, tile_n] = a[tile_m, :] @ b[:, tile_n]`` into a given
+    output (a transposed one makes ``tile_m`` its contiguous dim)."""
+    M, N = a.size(0), b.size(1)
+    hl.specialize(a.size(1))
+    for tile_m, tile_n in hl.tile([M, N]):
+        out[tile_m, tile_n] = hl.dot(a[tile_m, :], b[:, tile_n])
+    return out
+
+
+def _ragged_inputs(m: int, k: int = 64, n: int = 256) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.empty((m, k), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((k, n), dtype=torch.bfloat16, device=CPU_DEVICE),
+    )
+
+
+def test_a_root_tile_past_a_small_extent_runs_the_warp_path() -> None:
+    # The indexer's logits at M = 8: the 16-row MMA atom overshoots the
+    # rows.  The row axis may run ragged (it is never a dot K, never the
+    # contiguous dim of a 2-D access), the config rule admits the tile on
+    # the warp path only, the seeds walk the padded tile, and the block-size
+    # search reaches it (the dag owner raises the row block's ceiling from
+    # the extent to the 16-row atom).
+    bound = _bind_fn(_head_sum_logits, _head_sum_inputs(m=8))
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    assert sorted((a.kind, a.extent, a.ragged) for a in facts.axes) == [
+        ("rdim", 128, False),
+        ("root", 8, True),
+        ("root", 512, False),
+    ]
+    sizes = {facts.axes[0].block_id: 16, facts.axes[1].block_id: 128}
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 2) is None
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 2, "tcgen05") == (
+        "block size 16 must divide the extent 8 of tile axis 0"
+    )
+    assert dag.mma_dag_seed_ladder(facts.axes[0]) == [16]
+    assert dag.mma_dag_seed_ladder(facts.axes[1]) == [16, 32, 64, 128]
+    assert dag.mma_dag_cta_count(facts, [16, 128, 128]) == 4
+    assert dag.mma_dag_cta_count(facts, [16, 64, 128]) == 8
+    seeds = [
+        c.config for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+    ]
+    assert seeds and {cast("list[int]", c["block_sizes"])[0] for c in seeds} == {16}
+    assert spec.block_sizes[0].max_size == 16
+    body = _kernel_body(_source(bound, _config(16, 128, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body and f"{RT}.mma_bf16(" in body
+    # q's 16-row tile: the packets of the rows past 8 read nothing (both
+    # rounds of the staging, in the prologue and in the loop); k's tile
+    # along N stays whole.
+    assert (
+        "md_zf = cutlass.Int32(16) if md_a0 + md_pr16 < 8 else cutlass.Int32(0)" in body
+    )
+    assert "if md_a0 + (8 + md_pr16) < 8 else cutlass.Int32(0)" in body
+    assert body.count(f"{RT}.cp_async_16_zfill(") == 4
+    assert body.count(f"{RT}.cp_async_16(") == 16
+    # The per-row weight and the window bounds load zero past the extent.
+    assert (
+        "md_ok = cutlass.Int32(1) if md_a0 + md_L0_rowl < 8 else cutlass.Int32(0)"
+        in body
+    )
+    assert body.count(f"{RT}.ldg_f32_pred(") == 2 and f"{RT}.ldg_f32(" not in body
+    assert body.count(f"{RT}.ldg_s32_pred(") == 4 and f"{RT}.ldg_s32(" not in body
+    # The pair stores of each fragment row are guarded by its coordinate.
+    assert body.count("if md_a0 + md_L0_rowl < 8:") == 4
+    assert body.count("if md_a0 + (md_L0_rowl + 8) < 8:") == 4
+    assert body.count(f"{RT}.stg_v2_f32(") == 8
+
+
+def test_a_one_row_tile_is_computed_at_the_mma_atom() -> None:
+    # M = 1: the frontend resolves a tile over an extent of one to one row
+    # whatever the config says, so the warp path pads the fragment to the
+    # 16-row atom itself; the block divides the extent, so the guards test
+    # the coordinate against the block alone.
+    bound = _bind_fn(_head_sum_logits, _head_sum_inputs(m=1))
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.axes[0].ragged
+    assert dag.mma_dag_padded_sizes(facts, [1, 128, 128]) == [16, 128, 128]
+    assert dag.mma_dag_padded_sizes(facts, [16, 128, 128]) == [16, 128, 128]
+    assert dag.mma_dag_config_reason(facts, {0: 1, 1: 128}, 4, 2) is None
+    assert dag.mma_dag_seed_ladder(facts.axes[0]) == [16]
+    source = _source(bound, _config(16, 128, warps=4, stages=2))
+    body = _kernel_body(source)
+    assert "(4,)," in source.split("_launcher(")[-1]
+    assert "md_zf = cutlass.Int32(16) if md_pr16 < 1 else cutlass.Int32(0)" in body
+    assert "if 8 + md_pr16 < 1 else cutlass.Int32(0)" in body
+    assert body.count("if md_L0_rowl < 1:") == 4
+    assert body.count("if md_L0_rowl + 8 < 1:") == 4
+    assert "md_ok = cutlass.Int32(1) if md_L0_rowl < 1 else cutlass.Int32(0)" in body
+    assert "md_a0 + md_L0_rowl" not in body
+
+
+def test_a_block_below_the_atom_guards_against_the_block_and_the_extent() -> None:
+    # M = 24 under blocks of 8: three CTAs each compute the 16-row atom and
+    # own eight rows; the guard tests the block, and (24 % 8 == 0) only the
+    # block.  Under blocks of 16 the second CTA holds rows 24..31: the
+    # guard tests the extent.
+    bound = _bind_fn(_head_sum_logits, _head_sum_inputs(m=24))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.axes[0].ragged
+    assert dag.mma_dag_seed_ladder(facts.axes[0]) == [32]
+    assert dag.mma_dag_padded_sizes(facts, [8, 128, 128]) == [16, 128, 128]
+    assert dag.mma_dag_cta_count(facts, [8, 128, 128]) == 12
+    assert dag.mma_dag_cta_count(facts, [16, 128, 128]) == 8
+    with patch.object(
+        importlib.import_module("helion._compat"),
+        "_min_dot_size",
+        lambda *args: (1, 1, 16),
+    ):
+        bound = _bind_fn(_head_sum_logits, _head_sum_inputs(m=24))
+        body = _kernel_body(_source(bound, _config(8, 128, warps=4, stages=2)))
+    assert "md_zf = cutlass.Int32(16) if md_pr16 < 8 else cutlass.Int32(0)" in body
+    assert body.count("if md_L0_rowl < 8:") == 4
+    assert body.count("if md_L0_rowl + 8 < 8:") == 4
+    body = _kernel_body(_source(bound, _config(16, 128, warps=4, stages=2)))
+    assert (
+        "md_zf = cutlass.Int32(16) if md_a0 + md_pr16 < 24 else cutlass.Int32(0)"
+        in body
+    )
+    assert body.count("if md_a0 + md_L0_rowl < 24:") == 4
+
+
+def test_a_reduction_over_ragged_rows_masks_them_to_the_fill() -> None:
+    # The frontend's ``_mask_to`` ahead of the row sum is no longer an
+    # identity: the elements of the rows past the extent take the fill (a
+    # select per register), and the vector store along N is unguarded.
+    from helion.language import _tracing_ops
+
+    bound = _bind_fn(_ragged_rows_summed, _ragged_inputs(m=8))
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    assert sorted((a.kind, a.extent, a.ragged) for a in facts.axes) == [
+        ("rdim", 64, False),
+        ("root", 8, True),
+        ("root", 256, False),
+    ]
+    program = _program(bound)
+    (reduce,) = program.reduces
+    assert reduce.orient == "cols"
+    assert reduce.value.target is _tracing_ops._mask_to
+    assert reduce.value.args[1] == 0
+    body = _kernel_body(_source(bound, _config(16, 128, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    # a's 16x64 tile: eight chunks per row, one round of packets.
+    assert (
+        "md_zf = cutlass.Int32(16) if md_a0 + md_pr8 < 8 else cutlass.Int32(0)" in body
+    )
+    assert body.count(f"{RT}.cp_async_16_zfill(") == 1
+    selects = re.findall(
+        r"md_v(?:_\d+)? = md_v(?:_\d+)? if md_a0 \+ (?:md_L0_rowl|\(md_L0_rowl \+ 8\)) "
+        r"< 8 else cutlass\.Float32\(0\.0\)",
+        body,
+    )
+    assert len(selects) == dag.mma_dag_frag_regs(16, 128, 4)
+    assert f"{RT}.octet_sum(" in body
+    tail = body.split(f"{RT}.octet_sum(")[-1]
+    assert tail.count(f"{RT}.stg_f32(") == 8 and "if md_a0" not in tail
+
+
+def test_a_vector_along_ragged_rows_is_stored_under_the_row_guard() -> None:
+    # ``(a @ b + 1).sum(1)`` with M = 24 under 32-row tiles (one CTA) and
+    # 16-row tiles (the second CTA's vector has eight rows past the
+    # extent): the vector store along the rows is guarded by its row.
+    a, b = _ragged_inputs(m=24, n=128)
+    bound = helion.kernel(
+        _ragged_cols_summed,  # type: ignore[arg-type]
+        backend="cute",
+        static_shapes=True,
+        cute_full_slice_matmul_tiling=False,
+    ).bind((a, b))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    assert sorted((a.kind, a.extent, a.ragged) for a in facts.axes) == [
+        ("rdim", 64, False),
+        ("rdim", 128, False),
+        ("root", 24, True),
+    ]
+    program = _program(bound)
+    (reduce,) = program.reduces
+    assert reduce.orient == "rows"
+    for bm in (32, 16):
+        body = _kernel_body(_source(bound, _config(bm, warps=4, stages=2)))
+        assert SIMT_FALLBACK not in body
+        # a's tile (eight chunks per row): 32 rows take two rounds of 128
+        # packets, 16 rows one; b's whole 64x128 tile stays unguarded.
+        assert (
+            "md_zf = cutlass.Int32(16) if md_a0 + md_pr8 < 24 else cutlass.Int32(0)"
+            in body
+        )
+        assert ("if md_a0 + (16 + md_pr8) < 24 else cutlass.Int32(0)" in body) == (
+            bm == 32
+        )
+        assert body.count(f"{RT}.cp_async_16_zfill(") == bm // 16
+        assert body.count(f"{RT}.cp_async_16(") == 64 * 128 * 2 // 16 // 128
+        selects = re.findall(
+            r" if md_a0 \+ .* < 24 else cutlass\.Float32\(0\.0\)", body
+        )
+        assert len(selects) == dag.mma_dag_frag_regs(bm, 128, 4)
+        assert f"{RT}.lane_group_sum(" in body
+        stores = body[body.index(f"{RT}.lane_group_sum(") :]
+        assert re.search(
+            r"if md_a0 \+ md_L0_rowl < 24:\n\s+_helion_mma_dag\.stg_f32\(md_lb, ",
+            stores,
+        )
+        assert re.search(
+            r"if md_a0 \+ \(md_L0_rowl \+ 8\) < 24:\n\s+_helion_mma_dag\.stg_f32\(",
+            stores,
+        )
+        # One store per fragment row the lane owns (rows g / g + 8 of each
+        # atom row of its warp's share).
+        wm, _wn = cast("tuple[int, int]", warp_mma_warp_layout(bm, 128, 4))
+        assert stores.count(f"{RT}.stg_f32(") == 2 * (bm // wm // 16)
+
+
+def test_a_ragged_axis_on_a_contiguous_dim_keeps_whole_tiles() -> None:
+    # The output transposed: ``tile_m`` is its contiguous dim, whose
+    # 16-byte packets and pairs would straddle the extent -- the axis may
+    # not run ragged, so a 16-row tile over M = 8 is refused as before.
+    a, b = _ragged_inputs(m=8)
+    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()
+    bound = _bind_fn(_ragged_dot_stored, (a, b, out))
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    assert sorted((a.kind, a.extent, a.ragged) for a in facts.axes) == [
+        ("rdim", 64, False),
+        ("root", 8, False),
+        ("root", 256, False),
+    ]
+    assert dag.mma_dag_seed_ladder(facts.axes[0]) == []
+    assert dag.mma_dag_config_reason(facts, {0: 16, 2: 128}, 4, 2) == (
+        "block size 16 must divide the extent 8 of tile axis 0"
+    )
+    with bound.env, pytest.raises(InvalidConfig, match="must divide the extent 8"):
+        spec.normalized_config(_config(16, 128, warps=4, stages=2))
+    # The same store into a row-major output: the rows may run ragged.
+    out = torch.empty((8, 256), dtype=torch.float32, device=CPU_DEVICE)
+    facts = _bind_fn(_ragged_dot_stored, (a, b, out)).config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.axes[0].ragged
+
+
+def test_the_matmul_block_size_overshoot_is_a_backend_capability() -> None:
+    # The frontend asks the backend whether its matmul lowering pads a
+    # small output dim instead of testing the backend's name: Triton pads
+    # (``tl.dot`` over a masked tile), TileIR never had the overshoot, and
+    # cute does not pad wholesale -- its ordinary lowerings read and write
+    # exactly the extent, and a backend-wide ceiling moved the seeds of
+    # kernels the ragged warp path never covers (the gdn recurrence's
+    # dstate tile, the collective tf32 jagged kernels).  The ragged tile is
+    # the dag owner's: its facts registration raises the ceiling of a
+    # ragged root axis to its MMA atom, and only there.
+    from helion._compiler.cute.backend import CuteBackend
+    from helion._compiler.triton.backend import TileIRBackend
+    from helion._compiler.triton.backend import TritonBackend
+
+    assert not CuteBackend().pads_small_matmul_dims
+    assert TritonBackend().pads_small_matmul_dims
+    assert not TileIRBackend().pads_small_matmul_dims
+    spec = _bind_fn(_head_sum_logits, _head_sum_inputs(m=8)).config_spec
+    m_spec, n_spec = spec.block_sizes
+    assert (m_spec.dim_max_size, m_spec.max_size) == (8, 16)
+    assert n_spec.max_size == 512
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    assert dag.mma_dag_ragged_ceilings(facts) == {m_spec.block_id: 16}
+    # The fragment's own default stays clamped to the extent (the promoted
+    # warp seed is what carries the padded tile into the default config).
+    assert m_spec._fragment(spec).default() == 8
+    # Without the dag owner the ceiling is the extent, as on every other
+    # cute kernel.
+    with patch.object(CuteMmaDagHeuristic, "_facts", return_value=None):
+        plain = _bind_fn(_head_sum_logits, _head_sum_inputs(m=8)).config_spec
+    assert [b.max_size for b in plain.block_sizes] == [8, 512]
+    # A root axis the ragged rules refuse (the contiguous dim of the
+    # transposed output) keeps the extent's ceiling under the dag owner.
+    a, b = _ragged_inputs(m=8)
+    out = torch.empty((256, 8), dtype=torch.float32, device=CPU_DEVICE).t()
+    spec = _bind_fn(_ragged_dot_stored, (a, b, out)).config_spec
+    assert spec.cute_mma_dag_facts is not None
+    assert spec.block_sizes[0].max_size == 8
+    # A ragged extent at or above its atom already admits it (24 under 32).
+    spec = _bind_fn(_head_sum_logits, _head_sum_inputs(m=24)).config_spec
+    assert (spec.block_sizes[0].dim_max_size, spec.block_sizes[0].max_size) == (
+        32,
+        32,
+    )
+    # A dim at or above the old overshoot keeps its own ceiling.
+    spec = _bind_fn(_head_sum_logits, _head_sum_inputs(m=256)).config_spec
+    assert spec.block_sizes[0].max_size == 256
+
+
+# Pass chains: a pointwise operand over loaded tiles written by a derived pass
+# --------------------------------------------------------------------------
+
+
+def _half_chain_operand(
+    g: torch.Tensor, x: torch.Tensor, s: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """A 16-bit A operand that is a pass chain: ``2 * g * x * (1 - s)`` over
+    three bf16 tiles stays bf16-typed (torch promotion) and feeds a bf16
+    ``hl.dot``; squeeze db's ``grad_d`` chain spelled as an ``hl.dot`` (its
+    own ``torch.addmm`` form is ``_accumulating_addmm``).  The B operand's
+    scale keeps the tensor-core K-loop family (direct loads only) from
+    claiming the contraction."""
+    m, k = g.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=g.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            lhs = (
+                2.0 * g[tile_m, tile_k] * x[tile_m, tile_k] * (1.0 - s[tile_m, tile_k])
+            )
+            acc = hl.dot(lhs, w[tile_k, tile_n] * 0.5, acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def _half_chain_inputs() -> tuple[torch.Tensor, ...]:
+    bf16 = torch.bfloat16
+    g = torch.empty((256, 128), dtype=bf16, device=CPU_DEVICE)
+    w = torch.empty((128, 128), dtype=bf16, device=CPU_DEVICE)
+    return g, g, g, w
+
+
+def _bind_half_chain() -> BoundKernel:
+    return _bind_fn(_half_chain_operand, _half_chain_inputs())
+
+
+def _accumulating_addmm(
+    grad_out: torch.Tensor, x: torch.Tensor, d: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """squeeze_and_excitation_net's ``bwd_db`` body: ``acc = torch.addmm(acc,
+    c[tile_m, tile_k].T, grad_d)`` -- a half ``addmm`` into an fp32
+    accumulator (the ``hl.dot(a, b, acc=acc)`` contract), its B operand the
+    half chain ``grad_out * x * d * (1 - d)``, its A operand a transposed
+    half tile."""
+    m, n = grad_out.size()
+    k = c.size(1)
+    grad_b = torch.empty([k, n], dtype=grad_out.dtype, device=grad_out.device)
+    for tile_k, tile_n in hl.tile([k, n]):
+        acc = hl.zeros([tile_k, tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            grad_d = (
+                grad_out[tile_m, tile_n]
+                * x[tile_m, tile_n]
+                * d[tile_m, tile_n]
+                * (1.0 - d[tile_m, tile_n])
+            )
+            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
+        grad_b[tile_k, tile_n] = acc
+    return grad_b
+
+
+def _half_accumulating_addmm(
+    grad_out: torch.Tensor, x: torch.Tensor, d: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """The same body accumulating in half precision: every ``addmm`` rounds
+    the running sum, which no fp32-accumulating dot models."""
+    m, n = grad_out.size()
+    k = c.size(1)
+    grad_b = torch.empty([k, n], dtype=grad_out.dtype, device=grad_out.device)
+    for tile_k, tile_n in hl.tile([k, n]):
+        acc = hl.zeros([tile_k, tile_n], dtype=torch.float16)
+        for tile_m in hl.tile(m):
+            grad_d = grad_out[tile_m, tile_n] * x[tile_m, tile_n] * d[tile_m, tile_n]
+            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
+        grad_b[tile_k, tile_n] = acc
+    return grad_b
+
+
+def _accumulating_addmm_inputs() -> tuple[torch.Tensor, ...]:
+    f16 = torch.float16
+    grad_out = torch.empty((1024, 512), dtype=f16, device=CPU_DEVICE)
+    c = torch.empty((1024, 256), dtype=f16, device=CPU_DEVICE)
+    return grad_out, grad_out, grad_out, c
+
+
+def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
+    # ``acc = torch.addmm(acc, a16, b16)`` is the tiled-GEMM idiom Triton
+    # lowers to ``tl.dot(a, b, acc)``: fp32 products into the fp32
+    # accumulator, no rounding -- what ``hl.dot(a16, b16, acc=acc)`` spells.
+    # Its operands here are the ones the tensor-core K-loop family declines
+    # (a computed B tile), so the kernel ran SIMT or collective warp MMA.
+    bound = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
+    spec = bound.config_spec
+    assert spec.cute_tcgen05_search_enabled is False
+    assert spec.cute_mma_dag is not None
+    assert "tcgen05" in spec.cute_mma_dag.choices
+    program = _program(bound)
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.addmm.default
+    with bound.env:
+        assert dag.accumulating_addmm_dtype(dot.node) is torch.float16
+        assert dag.mm_dot_dtype(dot.node) is None
+        assert dag.rounded_dot_dtype(dot.node) is None
+    assert dot.node.meta["val"].dtype == torch.float32
+    assert dot.a.dtype == dot.b.dtype == torch.float16
+    # The accumulator leads: the dot accumulates in place into its slot.
+    assert dot.acc is not None and dot.acc_frag is not None
+    assert dot.slot == dot.acc_slot
+    # A: the transposed half tile ``c[tile_m, tile_k].T`` (K along the
+    # staged tile's rows); B: the half chain, a pass chain.
+    assert (dot.a.kind, dot.a.pointwise, dot.a.swap, dot.a.trans) == (
+        "load",
+        False,
+        True,
+        True,
+    )
+    chain_root = program.chain_root(dot.b)
+    assert dot.b.kind == "frag" and chain_root is not None
+    assert [access.name for access in program.chain_loads(chain_root)] == [
+        "grad_out",
+        "x",
+        "d",
+    ]
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.pass_chains == 1
+    body = _kernel_body(_source(bound, _config(32, 32, 64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_f16" in body
+    assert "ldmatrix" in body
+    # The seeds lead with the owner's modes (the promoted default).
+    seeds = [c.config for c in spec.compiler_seed_configs]
+    assert seeds and seeds[0].get("cute_mma_dag") in ("warp", "tcgen05")
+    # A half accumulator rounds the running sum: not a dot of this owner.
+    half = _bind_fn(_half_accumulating_addmm, _accumulating_addmm_inputs())
+    assert half.config_spec.cute_mma_dag is None
+    host = half.host_function
+    assert host is not None
+    with half.env, host:
+        nodes = [
+            node
+            for info in host.device_ir.graphs
+            for node in info.graph.nodes
+            if node.target is torch.ops.aten.addmm.default
+        ]
+        (node,) = nodes
+        assert dag.accumulating_addmm_dtype(node) is None
+        assert not dag._is_dot(node)
+
+
+def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:
+    # se_block dx's A operand ``2 * g * x * s * (1 - s)`` is three derived
+    # steps over three loaded tiles (``s`` read twice) that nothing but the
+    # dot reads: a pass chain, the subject of ``cute_mma_dag_derived``.  The
+    # loaded B operand is not one; the knob's first choice (the default)
+    # keeps the register-direct derived fragment and its exchange tile.
+    dx = _bind_se_block("se_block_bwd_dx")
+    program = _program(dx)
+    (dot,) = program.dots
+    root = program.chain_root(dot.a)
+    assert root is not None and program.chain_root(dot.b) is None
+    chain = program.pass_chains[root]
+    assert chain[-1].node is root
+    assert [len(step.frags) for step in chain] == [0, 1, 1]
+    assert [access.name for access in program.chain_loads(root)] == [
+        "grad_out",
+        "x",
+        "s",
+    ]
+    facts = dx.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.pass_chains == 1
+    assert [tile.pass_ring for tile in facts.tiles].count(True) == 1
+    spec = dx.config_spec
+    assert spec.cute_mma_dag_derived is not None
+    assert spec.cute_mma_dag_derived.choices == ("exchange", "pass")
+    assert spec.default_config().config["cute_mma_dag_derived"] == "exchange"
+    # dw's B operand (the same chain feeding B) and a bf16-typed chain
+    # feeding a 16-bit dot are pass chains as well.
+    for bound, role in (
+        (_bind_se_block("se_block_bwd_dw"), "b"),
+        (_bind_half_chain(), "a"),
+    ):
+        program = _program(bound)
+        (dot,) = program.dots
+        assert program.chain_root(getattr(dot, role)) is not None
+        assert bound.config_spec.cute_mma_dag_facts.pass_chains == 1  # type: ignore[union-attr]
+    # The seeds compare the two routes at the first tile of each mode: the
+    # pass variant follows the first seed (the promoted default stays).
+    seeds = [
+        c.config
+        for c in dx.config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag") in ("warp", "tcgen05")
+    ]
+    routes = [(c["cute_mma_dag"], c["cute_mma_dag_derived"]) for c in seeds]
+    first_tc = routes.index(("tcgen05", "exchange"))
+    assert routes[first_tc + 1] == ("tcgen05", "pass")
+    assert seeds[first_tc]["block_sizes"] == seeds[first_tc + 1]["block_sizes"]
+    first_warp = routes.index(("warp", "exchange"))
+    assert routes[first_warp + 1] == ("warp", "pass")
+    assert (
+        routes.count(("tcgen05", "pass")) == 1 and routes.count(("warp", "pass")) == 1
+    )
+
+
+def test_the_derived_route_has_no_subject_without_a_pass_chain() -> None:
+    # fwd_h's derived values read fragments: no pass chain, so the knob is
+    # pinned to its first choice (one autotune identity), and a chain whose
+    # sources the lanes load (not provably 16-byte aligned) keeps the
+    # exchange route at codegen rather than failing.
+    bound = _bind_fwd(d=64, dv=64)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.pass_chains == 0
+    assert not _program(bound).pass_chains
+    with bound.env:
+        pinned = bound.config_spec.normalized_config(
+            _config(64, 64, warps=4, stages=2, cute_mma_dag_derived="pass")
+        )
+    assert pinned.config["cute_mma_dag_derived"] == "exchange"
+    dx = _bind_se_block("se_block_bwd_dx")
+    with dx.env:
+        kept = dx.config_spec.normalized_config(
+            _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_derived="pass")
+        )
+        off = dx.config_spec.normalized_config(
+            helion.Config(
+                block_sizes=[64, 64, 64],
+                cute_mma_dag="off",
+                cute_mma_dag_derived="pass",
+            )
+        )
+    assert kept.config["cute_mma_dag_derived"] == "pass"
+    assert off.config["cute_mma_dag_derived"] == "exchange"
+    program = _program(dx)
+    (dot,) = program.dots
+    root = program.chain_root(dot.a)
+    assert root is not None
+    with patch.object(dag, "async_tile_reason", return_value="unaligned"):
+        plan = _plan_of(dx, kept)
+    (planned,) = plan.program.dots
+    # (The layout solver's route for the fragment: an exchange tile or a
+    # register route, never the pass.)
+    assert plan.route(planned, planned.a) != dag.ROUTE_DERIVED
+    assert not plan.absorbed
+    plan = _plan_of(dx, kept)
+    (planned,) = plan.program.dots
+    assert plan.route(planned, planned.a) == dag.ROUTE_DERIVED
+    assert len(plan.absorbed) == 3
+
+
+def test_the_derived_pass_writes_the_operand_tile_from_the_staged_sources() -> None:
+    # The warp emitter under ``pass``: no chain registers, no exchange tile;
+    # behind the iteration barrier every thread loads its eight-element
+    # groups of the three staged source tiles as 16-byte packets, evaluates
+    # the chain in fp32 (packed f32x2 muls) and writes two fp32 packets per
+    # group into the single-copy A tile, then one barrier ahead of the
+    # ``ldmatrix`` reads -- the exchange route's barrier count and shared
+    # memory, a third of its shared-memory instructions.
+    dx = _bind_se_block("se_block_bwd_dx")
+    program = _program(dx)
+    (dot,) = program.dots
+    root = program.chain_root(dot.a)
+    assert root is not None
+    slot = program.frag_slots[root]
+    exchange_body = _kernel_body(_source(dx, _config(64, 64, 64, warps=8, stages=2)))
+    pass_body = _kernel_body(
+        _source(dx, _config(64, 64, 64, warps=8, stages=2, cute_mma_dag_derived="pass"))
+    )
+    exchange, passed = _loop_and_after(exchange_body), _loop_and_after(pass_body)
+    assert SIMT_FALLBACK not in pass_body
+    assert f"{RT}.mma_tf32(" in passed
+    # The exchange route: the chain's registers, written into ``md_x0``.
+    assert re.search(rf"md_c{slot}_\d+_\d+_\d = ", exchange)
+    assert f"{RT}.sts_v2_f32(md_x0" in exchange
+    assert exchange.count(f"{RT}.lds_b32(md_d") == 32
+    # The pass route: the same shared memory, one 16-byte load per source and
+    # group (64x64 / 8 groups over 256 threads: two per thread), two fp32
+    # packets per group, no fragment of the chain.
+    assert "md_x0" not in pass_body
+    assert not re.search(rf"md_c{slot}_", passed)
+    assert passed.count(f"{RT}.lds_v4_b32(md_d") == 6
+    assert passed.count(f"{RT}.sts_v4_f32(md_t0 + ") == 4
+    assert passed.count("cute.arch.barrier()") == exchange.count("cute.arch.barrier()")
+    assert _smem_bytes(pass_body) == _smem_bytes(exchange_body)
+    assert "md_t0 = md_s0 + 0" in pass_body
+    # Order: refill issue, the pass, its barrier, the operand reads.
+    refill = passed.index("cute.arch.cp_async_commit_group()")
+    first_pass_store = passed.index(f"{RT}.sts_v4_f32(md_t0 + ")
+    barrier = passed.index("cute.arch.barrier()", first_pass_store)
+    assert (
+        refill < first_pass_store < barrier < passed.index(f"{RT}.ldmatrix_x4(md_t0 + ")
+    )
+    # A chain over fp32 math rounds nowhere: the sources are widened exactly
+    # (``unpack_f16x2``) and the operand tile holds fp32 values.
+    assert f"{RT}.unpack_f16x2(" in passed
+    assert f"{RT}.pack_f16x2(" not in passed
+
+
+def _smem_bytes(body: str) -> int:
+    match = re.search(r"alloc_smem\(cutlass\.Uint8, (\d+)", body)
+    assert match is not None
+    return int(match.group(1))
+
+
+def test_a_half_typed_pass_chain_packs_its_operand_tile_once() -> None:
+    # A bf16-typed chain ``2 * g * x * (1 - s)`` (torch promotion) feeding
+    # a bf16 dot: the pass evaluates it as the SIMT lowering does and packs
+    # eight elements into one 16-byte packet of the 16-bit A tile (one
+    # rounding, ``pack_bf16x2``); the exchange route rounds the same values
+    # into the fragment registers.
+    bound = _bind_half_chain()
+    program = _program(bound)
+    (dot,) = program.dots
+    assert dot.a.kind == "frag" and dot.a.dtype == torch.bfloat16
+    assert program.chain_root(dot.a) is not None
+    body = _kernel_body(
+        _source(
+            bound, _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_derived="pass")
+        )
+    )
+    loop = _loop_and_after(body)
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_bf16(" in loop
+    assert loop.count(f"{RT}.sts_v4_b32(md_t0 + ") == 4
+    assert f"{RT}.pack_bf16x2(" in loop
+    assert f"{RT}.ldmatrix_x4(md_t0 + " in loop
+    # (The exchange route feeds this straight bf16 A fragment from its
+    # registers -- the identity repack -- so no tile is written for it; the
+    # B tile's in-place pass packs its own packets on both routes.)
+    exchange = _loop_and_after(
+        _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    )
+    root = program.chain_root(dot.a)
+    assert root is not None
+    slot = program.frag_slots[root]
+    assert re.search(rf"md_c{slot}_\d+_\d+_\d = ", exchange)
+    assert not re.search(rf"md_c{slot}_", loop)
+    assert f"{RT}.sts_v4_b32(md_t0 + " not in exchange

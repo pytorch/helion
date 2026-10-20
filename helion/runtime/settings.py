@@ -657,6 +657,9 @@ class _Settings:
             _env_get_bool, "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS", False
         )
     )
+    cute_graph_cse: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
+    )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -905,6 +908,14 @@ class Settings(_Settings):
             "If True, flatten proven FP32 joint jagged/feature reductions and "
             "independent fresh-output stores on CuTe. Defaults to "
             "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS (False)."
+        ),
+        "cute_graph_cse": (
+            "If True (the default), merge duplicate reductions and the pure "
+            "chains between them in the traced device IR before CuTe code "
+            "generation (one amax/exp/sum per operand for a softmax and a "
+            "log_softmax of it). Results are bitwise unchanged; set False "
+            "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
+            "regression against the traced graph."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "
