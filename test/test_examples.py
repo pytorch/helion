@@ -1284,7 +1284,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
+    @skipIfPallas("masked indirect store is unsupported by one-hot and DMA lowering")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
 
@@ -1300,13 +1300,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         helion_kernel_args = mod.moe_matmul_ogs_helion_kernel_args_gen(
             A, W, top1_expert_per_token
         )
-        check_example(
-            "moe_matmul_ogs",
-            helion_kernel_args,
-            mod.moe_matmul_ogs_reference(*args),
-            block_sizes=[16, 16, 16],
-            skip_accuracy=True,  # TODO(yf225): fix unstable numerics
-        )
+        expected = mod.moe_matmul_ogs_reference(*args)
+        # A 64-row token tile is larger than any expert's ~33 tokens, so each
+        # expert's first tile also holds padding rows that alias its first token.
+        for block_sizes in ([16, 16, 16], [64, 16, 16]):
+            check_example(
+                "moe_matmul_ogs",
+                helion_kernel_args,
+                expected,
+                block_sizes=block_sizes,
+            )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
