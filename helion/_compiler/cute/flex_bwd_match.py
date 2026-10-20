@@ -95,7 +95,98 @@ _aten = torch.ops.aten
 _prims = torch.ops.prims
 
 # Head-dim pairs the fused backward body hosts (the FA4 1-CTA structure).
-FLEX_BWD_HEAD_DIMS = frozenset({(64, 64), (128, 128)})
+# Head dims (D of Q / K / dK / dQ, Dv of V / dO / dV) the fused backward
+# supports: multiples of 16 whose accumulators fit the 512 TMEM columns (see
+# :func:`flex_bwd_tmem_plan`); the shared-memory tiles pad to 64-column
+# atoms and the MMAs run the exact extents.
+FLEX_BWD_HEAD_DIM_STEP = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexBwdTmemPlan:
+    """The TMEM column plan of a flex backward kernel (512 columns x 128
+    lanes). S and dP are 128 columns each, P (bf16 pairs, 64 columns) is
+    packed into S's columns, dV is Dv wide, dK and dQ D wide.
+
+    ``plain``: S@0, dP@128, then dV, dK, dQ at 32-aligned offsets.
+    ``alias_dp``: dQ aliases dP's columns (the dQ MMA runs after the dS pass
+    read dP; the next dP MMA waits for the reduce warps to drain dQ);
+    D <= 128.
+    ``alias_s`` (D == 192 only): dP@64 overlaps S's upper half (the dP MMA
+    waits on the ``s_read`` barrier until both softmax halves read S out; P
+    packs into S's lower 64 columns, the upper half's store after ``s_read``
+    too), dQ runs as three 64-column chunk MMAs through the dP slots after
+    the dS pass (``dq_chunk_cols``: the next S waits for the first two
+    drains, dP for the third), dV and dK follow at 192. The MMA warp issues
+    dK before the next S there, so a single Q stage suffices.
+    """
+
+    mode: str
+    dp_off: int
+    dv_off: int
+    dk_off: int
+    dq_off: int
+
+    @property
+    def dq_alias(self) -> bool:
+        return self.mode != "plain"
+
+    @property
+    def p_cols(self) -> tuple[int, int]:
+        """TMEM column of each softmax half's packed P (32 columns each)."""
+        return (0, 32) if self.mode == "alias_s" else (0, 64)
+
+    @property
+    def dq_chunk_cols(self) -> tuple[int, int, int]:
+        """alias_s: the TMEM column of each 64-wide dQ chunk -- the dP slot
+        above S's upper half, the one on it, and the first again (reused
+        once its chunk drained)."""
+        assert self.mode == "alias_s"
+        return (self.dp_off + 64, self.dp_off, self.dp_off + 64)
+
+    @property
+    def p_offsets(self) -> tuple[int, ...]:
+        """TMEM column of each 16-wide K block of P for the dV MMA."""
+        if self.mode == "alias_s":
+            return tuple(k * 8 for k in range(8))
+        return tuple((k // 4) * 64 + (k % 4) * 8 for k in range(8))
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def flex_bwd_tmem_plan(head_dim: int, head_dim_v: int) -> FlexBwdTmemPlan | None:
+    """See :class:`FlexBwdTmemPlan` (None: the accumulators do not fit)."""
+    dv_off = 256
+    dk_off = dv_off + _round_up(head_dim_v, 32)
+    dq_off = dk_off + _round_up(head_dim, 32)
+    if dq_off + head_dim <= 512:
+        return FlexBwdTmemPlan("plain", 128, dv_off, dk_off, dq_off)
+    if head_dim <= 128 and dk_off + head_dim <= 512:
+        return FlexBwdTmemPlan("alias_dp", 128, dv_off, dk_off, 128)
+    # alias_s is the D == 192 plan (its dQ runs as three 64-column chunks
+    # through the dP slots, see the emitter); Dv is bounded by dK's columns.
+    dv_off = 192
+    dk_off = dv_off + _round_up(head_dim_v, 32)
+    if head_dim == 192 and dk_off + head_dim <= 512:
+        return FlexBwdTmemPlan("alias_s", 64, dv_off, dk_off, 0)
+    return None
+
+
+def flex_bwd_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
+    """Whether the fused backward handles the (D, Dv) pair: multiples of 16
+    with both at most 128 (every such pair has a plain or alias_dp TMEM plan
+    and fits shared memory), or the MLA pair (192, 128) (the alias_s plan).
+    Other pairs with a TMEM plan on paper (D > 128 with a small Dv, Dv up to
+    256) are not emitted: their tiles do not fit shared memory."""
+    step = FLEX_BWD_HEAD_DIM_STEP
+    if head_dim % step or head_dim_v % step or head_dim < step or head_dim_v < step:
+        return False
+    if head_dim <= 128 and head_dim_v <= 128:
+        return flex_bwd_tmem_plan(head_dim, head_dim_v) is not None
+    return (head_dim, head_dim_v) == (192, 128)
+
 
 log = logging.getLogger(__name__)
 
@@ -1696,7 +1787,7 @@ def _assemble(
             )
             return None
         operand_strides.append(strides)
-    if (head_dim, head_dim_v) not in FLEX_BWD_HEAD_DIMS:
+    if not flex_bwd_head_dims_supported(head_dim, head_dim_v):
         ctx.decline(f"flex_bwd: unsupported head dims ({head_dim}, {head_dim_v})")
         return None
     if full_inner.q_len != q_seq:
@@ -1849,6 +1940,16 @@ def _assemble(
         lse_prescaled=part_body.lse_prescaled,
         strides=tuple(operand_strides),
     )
+    # The storage must fit this device's shared memory in the emitter's most
+    # frugal configuration (plain rings, 4 dQ boxes, the smallest step table),
+    # else the kernel has no fused path and the generic one cannot take it.
+    from .cute_flash_bwd_flex import flex_bwd_smem_fits
+
+    if not flex_bwd_smem_fits(plan, ctx.env.device):
+        ctx.decline(
+            f"flex_bwd: head dims ({head_dim}, {head_dim_v}) do not fit shared memory"
+        )
+        return None
     assert ctx.kv_id is not None
     return FlexBwdMatch(
         plan=plan,
@@ -1923,9 +2024,12 @@ def _accumulators_threaded(
 
 
 __all__ = [
-    "FLEX_BWD_HEAD_DIMS",
+    "FLEX_BWD_HEAD_DIM_STEP",
     "FlexBwdMatch",
     "FlexBwdPlan",
+    "FlexBwdTmemPlan",
     "FlexBwdWalk",
+    "flex_bwd_head_dims_supported",
+    "flex_bwd_tmem_plan",
     "match_flex_attention_bwd",
 ]

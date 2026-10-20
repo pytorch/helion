@@ -376,6 +376,8 @@ def flash_bwd_shared_storage(
     stage_lse: bool = True,
     stage_delta: bool = True,
     flex_aux_bytes: int = 0,
+    head_dim_v: int | None = None,
+    flex_mbars: int = 8,
 ) -> type:
     """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
 
@@ -401,8 +403,14 @@ def flash_bwd_shared_storage(
     rides the MMA). ``flex_aux_bytes`` > 0 adds the flex hook's staged aux
     tables (``sFlexAux``, see ``flex_aux_smem_layout``), declared before the
     1024-aligned tiles so a small region lives in the alignment padding.
+    ``head_dim_v`` (default ``head_dim``) is the column count of the dO / V
+    tiles (the value head dim); Q / K use ``head_dim``. ``flex_mbars`` is the
+    flex walk's barrier block (``flex_mbar``): table_full[2] (0, 1),
+    table_empty[2] (2, 3), sds_free (4), tile_issued (5), s_read (6), then the
+    second dQ-chunk pair full (7) / empty (8) of the chunked alias_s drain.
     """
     steps_entries = max(steps, 1)
+    head_dim_v = head_dim if head_dim_v is None else head_dim_v
     assert dq_boxes in (4, 8), dq_boxes
     lse_entries = 2 * 128 if stage_lse else 1
     delta_entries = 2 * 128 if stage_delta else 1
@@ -426,8 +434,9 @@ def flash_bwd_shared_storage(
             dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-            # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
-            flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
+            # flex list walk: table_full[2], table_empty[2], sds_free, tile_issued,
+            # s_read, dQ chunk-1 full / empty (see the docstring)
+            flex_mbar: cute.struct.MemRange[cutlass.Int64, flex_mbars]
             tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_holding_buf: cutlass.Int32
             mma_base: cute.struct.MemRange[cutlass.Int32, 8]
@@ -442,13 +451,13 @@ def flash_bwd_shared_storage(
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
             sdO: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
+                cute.struct.MemRange[dtype, 128 * head_dim_v * do_stage], 1024
             ]
             sK: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+                cute.struct.MemRange[dtype, 128 * head_dim_v * kv_stage], 1024
             ]
             sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
             sdQaccum: cute.struct.Align[
@@ -478,10 +487,12 @@ def flash_bwd_shared_storage(
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-        # the step's dK MMA (the last reader of the dS staging) complete
+        # the step's last reader of the dS staging complete (the dK MMA, or
+        # the last dQ chunk of the chunked alias_s schedule)
         dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-        # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
-        flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
+        # flex list walk: table_full[2], table_empty[2], sds_free, tile_issued,
+        # s_read, dQ chunk-1 full / empty (see the docstring)
+        flex_mbar: cute.struct.MemRange[cutlass.Int64, flex_mbars]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         # MMA operand start addresses, re-read with ld.volatile per iteration
@@ -499,13 +510,13 @@ def flash_bwd_shared_storage(
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
         sdO: cute.struct.Align[
-            cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
+            cute.struct.MemRange[dtype, 128 * head_dim_v * do_stage], 1024
         ]
         sK: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
         ]
         sV: cute.struct.Align[
-            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            cute.struct.MemRange[dtype, 128 * head_dim_v * kv_stage], 1024
         ]
         sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
         # dQ drain staging for the 2D TMA tensor reduce-add: 8 x (32 x 32) fp32

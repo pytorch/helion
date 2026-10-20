@@ -735,9 +735,24 @@ def _fbwd_epilogue_block(
     dkv_wait: str,
     v_empty_expr: str,
     gm_expr: str | None = None,
+    cols: int | None = None,
+    thr_mma: str = "fbwd_tst",
+    slots: int | None = None,
+    stage_buf: str | None = None,
 ) -> str:
     """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> a free
     smem buffer as (128, 64) SWIZZLE_128B boxes -> one TMA store per box.
+    ``stage_buf`` overrides the staging buffer (the persistent flex alias_s
+    walk stages dV through the dO slot, see the flex emitter).
+
+    ``d`` is the accumulator's TMEM width (the MMA's N, a multiple of 64 in
+    the padded flex plan); ``cols`` (default ``d``, a multiple of 16) the
+    columns the tensor has: a partial last box is stored after its last
+    chunk and the TMA unit clips the columns past the tensor extent.
+    ``thr_mma`` is the thread MMA whose accumulator partition the TMEM tile
+    follows (its N is ``d``); ``slots`` the (128, 64) boxes the staging
+    buffer holds: a tile with more boxes than slots reuses them in order,
+    waiting for the store that read the slot before overwriting it.
 
     dV (h=0) stages through this tile's V operand slot (free once dP(n-1)
     retired, i.e. at dv_done) and hands the slot back to the load warp with an
@@ -745,12 +760,33 @@ def _fbwd_epilogue_block(
     completed; dK (h=1) stages through sdS (free after the tail dQ, i.e. at
     dkv_done), so K/Kt can be released by the MMA warp at the tail and the next
     tile's K loads overlap the epilogue."""
-    buf = "sV" if h == 0 else "sdS"
+    buf = stage_buf or ("sV" if h == 0 else "sdS")
     tma = "_fbwd_tma_dv" if h == 0 else "_fbwd_tma_dk"
     gm = ("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") if gm_expr is None else gm_expr
     warp_lo = 4 if h == 0 else 8
+    cols = d if cols is None else cols
+    assert cols % 16 == 0 and cols <= d, (cols, d)
+    n_chunks = cols // 16
+    n_boxes = -(-n_chunks // 4)
+    slots = n_boxes if slots is None else slots
+
+    def slot(c: int) -> int:
+        return (c // 4) % slots
+
+    def reuse_wait(c: int) -> str:
+        # The slot's earlier box: its TMA store must have read the staging
+        # before the warps overwrite it (the issuing warp waits, then the
+        # group syncs).
+        if c % 4 != 0 or c // 4 < slots:
+            return ""
+        return f"""
+        if warp_idx == {warp_lo}:
+            cute.arch.cp_async_bulk_wait_group({slots - 1}, read=True)
+        _helion_flash_rt.named_barrier_wait_unaligned({5 + h}, 128)"""
+
     chunks = "".join(
-        (
+        reuse_wait(c)
+        + (
             f"""
         fbwd_row64 = cute.make_rmem_tensor(cute.make_layout(64), {io_dtype})"""
             if c % 4 == 0
@@ -764,17 +800,17 @@ def _fbwd_epilogue_block(
         fbwd_rego.store(fbwd_reg.load().to({io_dtype}))"""
         + (
             f"""
-        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, fbwd_epi_slot0 + {c // 4}])
+        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, fbwd_epi_slot0 + {slot(c)}])
         cute.arch.fence_view_async_shared()
         _helion_flash_rt.named_barrier_wait_unaligned({5 + h}, 128)
         if warp_idx == {warp_lo}:
-            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, fbwd_epi_slot0 + {c // 4}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
+            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, fbwd_epi_slot0 + {slot(c)}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
             cute.copy({tma}, tEPIsS{c // 4}, tEPIgS{c // 4})
             cute.arch.cp_async_bulk_commit_group()"""
-            if c % 4 == 3
+            if c % 4 == 3 or c == n_chunks - 1
             else ""
         )
-        for c in range(d // 16)
+        for c in range(n_chunks)
     )
     hs = (
         """
@@ -792,8 +828,8 @@ def _fbwd_epilogue_block(
     )
     done_ptr = "fbwd_dv_done_ptr" if h == 0 else "fbwd_dkv_done_ptr"
     return f"""        _helion_flash_rt.mbar_spin_wait({done_ptr}, {dkv_wait}, 10000000)
-        fbwd_dkv_shape = fbwd_tst.partition_shape_C(({rows}, {d}))
-        tDKV_frag = fbwd_tst.make_fragment_C(fbwd_dkv_shape)
+        fbwd_dkv_shape = {thr_mma}.partition_shape_C(({rows}, {d}))
+        tDKV_frag = {thr_mma}.make_fragment_C(fbwd_dkv_shape)
         tEPI_t = cute.make_tensor(fbwd_tmem_ptr + {epi_off}, tDKV_frag.layout)
         fbwd_epi_tiler = ((cute.size(tEPI_t, mode=[0, 0]), cute.size(tEPI_t, mode=[0, 1])),)
         tEPI_epi = cute.zipped_divide(tEPI_t, fbwd_epi_tiler)
@@ -802,7 +838,7 @@ def _fbwd_epilogue_block(
         fbwd_thr_epi_ld = fbwd_tiled_epi_ld.get_slice(fbwd_local_tidx)
         tEPItT = fbwd_thr_epi_ld.partition_S(tEPI_epi)
         fbwd_cepi = cute.make_identity_tensor(({rows}, {d}))
-        fbwd_c_epi = cute.zipped_divide(fbwd_tst.partition_C(fbwd_cepi), fbwd_epi_tiler)
+        fbwd_c_epi = cute.zipped_divide({thr_mma}.partition_C(fbwd_cepi), fbwd_epi_tiler)
         tEPIcC = fbwd_thr_epi_ld.partition_D(fbwd_c_epi)
         # Epilogue: the tile is staged through the (now free) {buf} operand buffer
         # as (128, 64) SWIZZLE_128B boxes -- 16 columns per t2r chunk, one row
@@ -2675,7 +2711,7 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     from .flex_bwd_match import match_flex_attention_bwd
     from .flex_match import FLEX_PLAN_ENABLED
 
-    if not FLEX_PLAN_ENABLED:
+    if not FLEX_PLAN_ENABLED or not _flash_bwd_gate_enabled():
         return False
     if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 3:
         return False
@@ -2690,8 +2726,11 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         return False
     from .cute_flash_bwd_flex import additive_bias_region
     from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
+    from .cute_flash_bwd_flex import fbwd_table_step_choices
     from .cute_flash_bwd_flex import fbwd_tile_group_choices
+    from .flex_bwd_match import flex_bwd_tmem_plan
 
+    tmem = flex_bwd_tmem_plan(match.plan.head_dim, match.plan.head_dim_v)
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=False,
@@ -2700,7 +2739,9 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         tile_groups=fbwd_tile_group_choices(match.plan),
         fast_math=bool(env.settings.fast_math),
         aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
-        ds_tmem_allowed=match.plan.head_dim == 64,
+        # dS^T through TMEM needs dQ's own columns (the plain TMEM plan).
+        ds_tmem_allowed=tmem is not None and tmem.mode == "plain",
+        table_step_choices=fbwd_table_step_choices(match.plan, env.device),
         has_mask=match.plan.mask_region is not None,
         has_score=match.plan.score_region is not None,
         additive_bias=additive_bias_region(match.plan) is not None,

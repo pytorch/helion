@@ -1490,17 +1490,33 @@ def _append_cute_wrapper_plan(
         dk_idx = plan_int("dk_idx")
         dv_idx = plan_int("dv_idx")
         hd = plan_int("head_dim")
+        # The value head dim: dO / V / dV tiles, the dP MMA's K extent and the
+        # dV MMA's N extent (Q / K / dK / dQ use ``hd``).
+        hd_v = plan_int("head_dim_v", hd)
+        # Shared-memory tiles and TMA boxes are whole SWIZZLE_128B atoms: the
+        # head dims padded to multiples of 64 columns (the TMA unit zero-fills
+        # the columns past the tensor extent and clips the stores); the MMAs
+        # that take N from the head dim get exact-width instruction
+        # descriptors from the ``_x`` tiled MMAs.
+        hd_p = -(-hd // 64) * 64
+        hd_v_p = -(-hd_v // 64) * 64
+        # The dQ MMA's N: the whole (padded) head dim, or one 64-column chunk
+        # when the flex walk drains dQ chunk by chunk (its K^T operand layout
+        # and fragments then carry a 3-wide N mode; the body offsets them).
+        dq_n = plan_optional_int("flex_dq_chunk") or hd_p
         tq = plan_int("total_q_rows")
         tk = plan_int("total_kv_rows")
         q_stage = plan_int("q_stage")
         do_stage = plan_int("do_stage")
         kv_stage = plan_int("kv_stage", 1)
-        epi_stages = hd // 64 * kv_stage
+        epi_stages = max(hd_p, hd_v_p) // 64 * kv_stage
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
         bw = "cutlass.utils.blackwell_helpers"
-        ssd = f"(128, 128, {hd})"
-        tsd = f"(128, {hd}, 128)"
+        ssd = f"(128, 128, {hd_p})"
+        ssd_v = f"(128, 128, {hd_v_p})"
+        tsd = f"(128, {hd_p}, 128)"
+        tsd_v = f"(128, {hd_v_p}, 128)"
         majk = "cute.nvgpu.OperandMajorMode.K"
         majmn = "cute.nvgpu.OperandMajorMode.MN"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
@@ -1517,22 +1533,32 @@ def _append_cute_wrapper_plan(
             bh_q = plan_int("flex_bh_q")
             bh_k = plan_int("flex_bh_k")
             q_sdb = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
+            do_sdb = f"cute.make_layout(({flex_seq_q}, {hd_v}, {bh_q}), stride=({hd_v}, 1, {flex_seq_q * hd_v}))"
             k_sdb = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+            v_sdb = f"cute.make_layout(({seq_k}, {hd_v}, {bh_k}), stride=({hd_v}, 1, {seq_k * hd_v}))"
             dq2_layout = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
-            dkv_layout = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+            dk_sdb = k_sdb
+            dv_sdb = v_sdb
         else:
             q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+            do_sdb = (
+                f"cute.make_layout(({tq}, {hd_v}, 1), stride=({hd_v}, 1, {tq * hd_v}))"
+            )
             k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+            v_sdb = (
+                f"cute.make_layout(({tk}, {hd_v}, 1), stride=({hd_v}, 1, {tk * hd_v}))"
+            )
             dq2_layout = f"cute.make_layout(({tq}, {hd}), stride=({hd}, 1))"
-            dkv_layout = f"cute.make_layout(({tk}, {hd}), stride=({hd}, 1))"
+            dk_sdb = f"cute.make_layout(({tk}, {hd}), stride=({hd}, 1))"
+            dv_sdb = f"cute.make_layout(({tk}, {hd_v}), stride=({hd_v}, 1))"
         # One map per operand: the flex walk's strided operands (a
         # ``[B, S, H, D]`` transpose, a packed-QKV slice) take rank-4
         # (seq, D, H, B) maps over their real strides (unit inner stride, the
         # rest 16-byte aligned); the device body indexes them by head and
         # batch. dQ, LSE and delta stay contiguous.
-        q_layout = do_layout = q_sdb
-        k_layout = v_layout = k_sdb
-        dk_layout = dv_layout = dkv_layout
+        q_layout, do_layout = q_sdb, do_sdb
+        k_layout, v_layout = k_sdb, v_sdb
+        dk_layout, dv_layout = dk_sdb, dv_sdb
         if flex_strides is not None:
             assert flex_seq_q is not None and seq_k is not None
             assert isinstance(flex_strides, (list, tuple))
@@ -1544,37 +1570,39 @@ def _append_cute_wrapper_plan(
             )
             q_layout = _flex_rank4_layout(flex_seq_q, hd, flex_heads, flex_batch, q_st)
             do_layout = _flex_rank4_layout(
-                flex_seq_q, hd, flex_heads, flex_batch, do_st
+                flex_seq_q, hd_v, flex_heads, flex_batch, do_st
             )
             k_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, k_st)
-            v_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, v_st)
+            v_layout = _flex_rank4_layout(seq_k, hd_v, flex_kv_heads, flex_batch, v_st)
             dk_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, dk_st)
-            dv_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, dv_st)
+            dv_layout = _flex_rank4_layout(
+                seq_k, hd_v, flex_kv_heads, flex_batch, dv_st
+            )
         fbwd_lines = [
             f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_layout})",
             f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_layout})",
             f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {v_layout})",
             f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {do_layout})",
             f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
-            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
-            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
-            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_v_p}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_p}))",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {dq_n}))",
             "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
             f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
-            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd_v}, {dtype}, {kv_stage})",
             f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {q_stage})",
-            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {do_stage})",
-            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
-            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, {do_stage})",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd_v}, {dtype}, {do_stage})",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd_v}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd_v}, {dtype}, {do_stage})",
             f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_dsk_mma, {tsd}, {dtype}, {q_stage})",
             f"_fbwd_dsnk = {bw}.make_smem_layout_a(_fbwd_dsk_mma, {tsd}, {dtype}, 1)",
             f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {tsd}, {dtype}, 1)",
             f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {tsd}, {dtype}, {kv_stage})",
             "_fbwd_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cute.nvgpu.tcgen05.CtaGroup.ONE)",
             f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
-            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd_v}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
             f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
-            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd_v}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
             f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
@@ -1587,6 +1615,30 @@ def _append_cute_wrapper_plan(
             "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
             "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         ]
+        exact_mmas: list[str] = []
+        if hd_v != hd_v_p:
+            exact_mmas.append("_fbwd_ts_mma_x")
+            fbwd_lines.append(
+                f"_fbwd_ts_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+            )
+        if hd != hd_p:
+            exact_mmas += ["_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"]
+            fbwd_lines += [
+                f"_fbwd_dsk_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+                f"_fbwd_dq_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            ]
+        if plan.get("flex_ds_tmem_dk"):
+            # dS^T through TMEM feeds the dK MMA (A from TMEM, B = Q^T MN-major)
+            # with its own N = D atom; the exact-N descriptor twin at padded D.
+            exact_mmas.append("_fbwd_dskts_mma")
+            fbwd_lines.append(
+                f"_fbwd_dskts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_p}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+            )
+            if hd != hd_p:
+                exact_mmas.append("_fbwd_dskts_mma_x")
+                fbwd_lines.append(
+                    f"_fbwd_dskts_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+                )
         aug_stages = plan_optional_int("flex_aug_stages") or 0
         if aug_stages:
             # The flex walk's statistics slices: one (128 x 16) B-operand
@@ -1635,6 +1687,7 @@ def _append_cute_wrapper_plan(
                 "_fbwd_mdKt",
             ]
         )
+        call_args.extend(exact_mmas)
         if aug_stages:
             call_args.extend(["_fbwd_augl", "_fbwd_kaugl"])
         return

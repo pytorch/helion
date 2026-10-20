@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -19,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import noop_mask
 
@@ -26,11 +28,13 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 from test._cute_aux import _cpu_codegen
 
+import helion
 from helion._compiler.cute import flex_match
 from helion._compiler.cute.backend import _attention_config_envelope_ok
 from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
 from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
 from helion._compiler.cute.cute_flash_bwd_flex import fbwd_aux_smem_candidates
+from helion._compiler.cute.cute_flash_bwd_flex import fbwd_table_step_choices
 from helion._compiler.cute.flex_bwd_match import FlexBwdMatch
 from helion._compiler.cute.flex_bwd_match import match_flex_attention_bwd
 from helion._testing import EXAMPLES_DIR
@@ -97,17 +101,19 @@ def _args(
     *,
     block_size: int | tuple[int, int] = 128,
     scale: float = 0.125,
+    block_mask: BlockMask | None = None,
 ) -> tuple[Any, ...]:
     q_seq, kv_seq = t["q"].shape[2], t["k"].shape[2]
-    block_mask = create_block_mask(
-        mask_mod or noop_mask,
-        None,
-        None,
-        q_seq,
-        kv_seq,
-        device=str(_CPU),
-        BLOCK_SIZE=block_size,
-    )
+    if block_mask is None:
+        block_mask = create_block_mask(
+            mask_mod or noop_mask,
+            None,
+            None,
+            q_seq,
+            kv_seq,
+            device=str(_CPU),
+            BLOCK_SIZE=block_size,
+        )
     return _example().flex_attention_backward_args(
         t["q"],
         t["k"],
@@ -169,6 +175,64 @@ def _match_or_fail(bound: BoundKernel) -> FlexBwdMatch:
 
 def _causal(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> torch.Tensor:
     return q_idx >= kv_idx
+
+
+def _causal_block_mask(q_seq: int, kv_seq: int, block: int = 128) -> BlockMask:
+    """``create_block_mask(_causal)`` from the block indices alone (the dense
+    mask it would materialize does not fit for a 128K problem): KV block
+    ``j`` is full for Q block ``i > j`` and partial on the diagonal."""
+    nq, nk = -(-q_seq // block), -(-kv_seq // block)
+    qi = torch.arange(nq)[:, None]
+    kj = torch.arange(nk)[None, :]
+
+    def lists(keep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        count = keep.sum(1).to(torch.int32)
+        # Kept blocks first, ascending.
+        index = torch.argsort(~keep, dim=1, stable=True).to(torch.int32)
+        return count[None, None], index[None, None]
+
+    part_cnt, part_idx = lists(qi == kj)
+    full_cnt, full_idx = lists(qi > kj)
+    return BlockMask.from_kv_blocks(
+        part_cnt,
+        part_idx,
+        full_cnt,
+        full_idx,
+        BLOCK_SIZE=(block, block),
+        mask_mod=_causal,
+        seq_lengths=(q_seq, kv_seq),
+    )
+
+
+def _long_tensors(
+    heads: int, kv_heads: int, seq: int, head_dim: int
+) -> dict[str, torch.Tensor]:
+    """Uninitialized (the values never matter here) tensors of a long problem."""
+    dtype = torch.bfloat16
+    return {
+        "q": torch.empty(1, heads, seq, head_dim, dtype=dtype),
+        "k": torch.empty(1, kv_heads, seq, head_dim, dtype=dtype),
+        "v": torch.empty(1, kv_heads, seq, head_dim, dtype=dtype),
+        "do": torch.empty(1, heads, seq, head_dim, dtype=dtype),
+        "lse": torch.empty(1, heads, seq, dtype=torch.float32),
+        "out": torch.empty(1, heads, seq, head_dim, dtype=dtype),
+    }
+
+
+def _render(bound: BoundKernel, **overrides: object) -> str:
+    config = bound.config_spec.default_config()
+    if overrides:
+        config = helion.Config(**{**config.config, **overrides})
+    with _as_sm100():
+        return bound.to_code(config)
+
+
+def _fit(plan: Any, **kwargs: Any) -> Any:
+    smem = _fit_smem_budget(
+        plan, stats_mma=False, raw_score=False, device=_CPU, **kwargs
+    )
+    assert smem is not None
+    return smem
 
 
 def _targets(graph: torch.fx.Graph) -> set[object]:
@@ -340,14 +404,323 @@ def test_ragged_lengths_match() -> None:
     assert match.plan.num_q_tiles == 2 and match.plan.num_kv_tiles == 3
 
 
-def test_declines_head_dim_192() -> None:
-    t = _tensors(head_dim=192)
-    t["v"] = torch.randn(2, 4, 512, 128, dtype=torch.bfloat16)
-    t["do"] = torch.randn(2, 4, 512, 128, dtype=torch.bfloat16)
-    t["out"] = torch.randn(2, 4, 512, 128, dtype=torch.bfloat16)
+def _tensors_dv(
+    head_dim: int, head_dim_v: int, **kwargs: Any
+) -> dict[str, torch.Tensor]:
+    """``_tensors`` with a separate value head dim (V / dO / O columns)."""
+    t = _tensors(head_dim=head_dim, **kwargs)
+    kv_heads, kv_seq = t["k"].shape[1], t["k"].shape[2]
+    batch, heads, q_seq = t["q"].shape[0], t["q"].shape[1], t["q"].shape[2]
+    t["v"] = torch.randn(batch, kv_heads, kv_seq, head_dim_v, dtype=torch.bfloat16)
+    t["do"] = torch.randn(batch, heads, q_seq, head_dim_v, dtype=torch.bfloat16)
+    t["out"] = torch.randn(batch, heads, q_seq, head_dim_v, dtype=torch.bfloat16)
+    return t
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v"),
+    [
+        (192, 192),
+        (72, 64),
+        (64, 8),
+        # TMEM plans on paper whose tiles do not fit shared memory.
+        (160, 160),
+        (144, 144),
+        (96, 160),
+        (80, 144),
+        (64, 256),
+        (176, 128),
+        (256, 256),
+    ],
+)
+def test_declines_unsupported_head_dims(head_dim: int, head_dim_v: int) -> None:
+    """Pairs whose accumulators do not fit TMEM, whose tiles do not fit shared
+    memory, or widths that are not multiples of 16 are declined by the
+    matcher (nothing admitted can fail in the emitter)."""
     reasons: list[str] = []
-    assert _match(_bind(_args(t, _causal)), reasons) is None
+    assert (
+        _match(_bind(_args(_tensors_dv(head_dim, head_dim_v), _causal)), reasons)
+        is None
+    )
     assert any("head dims" in r for r in reasons), reasons
+
+
+def test_head_dim_192_128_matches() -> None:
+    match = _match_or_fail(_bind(_args(_tensors_dv(192, 128), _causal)))
+    assert (match.plan.head_dim, match.plan.head_dim_v) == (192, 128)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v", "exact"),
+    [(64, 128, False), (96, 64, True), (32, 48, True)],
+)
+def test_ds_tmem_dk_mma_has_its_own_width(
+    head_dim: int, head_dim_v: int, exact: bool
+) -> None:
+    """dS^T through TMEM at D != Dv: the dK MMA takes a dK-shaped TS atom
+    (N = D) instead of the dV MMA's (N = Dv); its descriptor comes from the
+    exact-N twin when D is padded."""
+    bound = _bind(_args(_tensors_dv(head_dim, head_dim_v), _causal))
+    code = _render(bound, cute_flash_bwd_ds_tmem=1)
+    op = "_fbwd_dskts_mma_x" if exact else "_fbwd_dskts_mma"
+    assert f"declare_ptx_idesc({op}.op, 'helion_fbwd_dskts_idesc')" in code
+    assert "tTSrDS = fbwd_dskts.make_fragment_A(tDS)" in code
+    assert "tTSrQt = fbwd_dskts.make_fragment_B(sQt)" in code
+    assert code.count("'helion_fbwd_dskts_idesc', zero_init=fbwd_dk_zero") == 2
+    assert "'flex_ds_tmem_dk': True" in code
+    # With D == Dv the dV MMA's atom still serves.
+    same = _render(
+        _bind(_args(_tensors(head_dim=64), _causal)), cute_flash_bwd_ds_tmem=1
+    )
+    assert (
+        "_fbwd_dskts" not in same and "tTSrDS = fbwd_tst.make_fragment_A(tDS)" in same
+    )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v", "chunks"), [(96, 64, 3), (80, 64, 3)]
+)
+def test_dq_drain_loads_only_stored_chunks(
+    head_dim: int, head_dim_v: int, chunks: int
+) -> None:
+    """Plain plans whose padded dQ partition would reach past TMEM column 512
+    load only the ceil(D / 32) chunks the drain stores."""
+    code = _render_plan(_tensors_dv(head_dim, head_dim_v))
+    assert "tDQ_t = cute.make_tensor(fbwd_tmem_ptr + 416, " in code
+    assert (
+        f"for fbwd_c in cutlass.range_constexpr({chunks}):\n"
+        "                cute.copy(fbwd_tiled_dq_ld, tRDtDQ[None, fbwd_c, None, None], tRDrDQ[None, fbwd_c, None, None])"
+        in code
+    )
+    assert "cute.copy(fbwd_tiled_dq_ld, tRDtDQ, tRDrDQ)" not in code
+
+
+# -- head dims: padded smem tiles, exact MMA extents, TMEM plans -------------
+
+
+def _render_plan(t: dict[str, torch.Tensor]) -> str:
+    code = _render(_bind(_args(t, _causal)))
+    assert "fbwd_sSteps" in code
+    return code
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v", "expect"),
+    [
+        (
+            96,
+            96,
+            {
+                "storage": "flash_bwd_shared_storage(128, 2, 1, 1, cutlass.BFloat16, 4, 8, 0, True, True, 0)",
+                "tmem": (128, 256, 352, 128),
+                "k_caps": ("k_tiles=6", "k_tiles=6"),
+                "exact_mmas": ("_fbwd_ts_mma_x", "_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"),
+                "dq_boxes": 3,
+                "epi_chunks": (6, 6),
+            },
+        ),
+        (
+            80,
+            80,
+            {
+                "storage": "flash_bwd_shared_storage(128, 2, 1, 1, cutlass.BFloat16, 4, 8, 0, True, True, 0)",
+                "tmem": (128, 256, 352, 128),
+                "k_caps": ("k_tiles=5", "k_tiles=5"),
+                "exact_mmas": ("_fbwd_ts_mma_x", "_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"),
+                "dq_boxes": 3,
+                "epi_chunks": (5, 5),
+            },
+        ),
+        (
+            32,
+            32,
+            {
+                "storage": "flash_bwd_shared_storage(64, 4, 4, 1, cutlass.BFloat16, 4, 8, 0, True, True, 0)",
+                "tmem": (128, 256, 288, 320),
+                "k_caps": ("k_tiles=2", "k_tiles=2"),
+                "exact_mmas": ("_fbwd_ts_mma_x", "_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"),
+                "dq_boxes": 1,
+                "epi_chunks": (2, 2),
+            },
+        ),
+        (
+            64,
+            128,
+            {
+                "storage": "flash_bwd_shared_storage(64, 4, 1, 1, cutlass.BFloat16, 4, 8, 0, True, True, 0, head_dim_v=128)",
+                "tmem": (128, 256, 384, 448),
+                "k_caps": (),
+                "exact_mmas": (),
+                "dq_boxes": 2,
+                "epi_chunks": (8, 4),
+            },
+        ),
+        (
+            192,
+            128,
+            {
+                "storage": "flash_bwd_shared_storage(192, 1, 1, 1, cutlass.BFloat16, 4, 8, 0, True, True, 0, head_dim_v=128, flex_mbars=9)",
+                "tmem": (64, 192, 320, 0),
+                "k_caps": (),
+                "exact_mmas": (),
+                # dQ runs as three 64-column chunk MMAs (TMEM slots 128 / 64 /
+                # 128, K^T offset by whole atoms) drained one by one.
+                "dq_boxes": None,
+                "dq_chunks": ((128, 0), (64, 1024), (128, 2048)),
+                "epi_chunks": (8, 12),
+            },
+        ),
+    ],
+)
+def test_head_dim_render_plan(
+    head_dim: int, head_dim_v: int, expect: dict[str, Any]
+) -> None:
+    """The smem storage (padded widths, ring depths that fit), the TMEM plan
+    (dP / dV / dK / dQ column offsets), the exact K-tile caps of the S / dP
+    MMAs, the exact-N instruction-descriptor MMAs, the dQ drain's 32-column
+    box count and the dV / dK epilogue's 16-column chunk counts."""
+    code = _render_plan(_tensors_dv(head_dim, head_dim_v))
+    assert expect["storage"] in code
+    dp_off, dv_off, dk_off, dq_off = expect["tmem"]
+    assert f"tdP_t = cute.make_tensor(fbwd_tmem_ptr + {dp_off}, " in code
+    assert f"tDV_t = cute.make_tensor(fbwd_tmem_ptr + {dv_off}, " in code
+    assert f"tDK_t = cute.make_tensor(fbwd_tmem_ptr + {dk_off}, " in code
+    assert f"tDQ_t = cute.make_tensor(fbwd_tmem_ptr + {dq_off}, " in code
+    s_lines = [
+        line for line in code.splitlines() if "gemm_ptx_dyn_qk(fbwd_s_addr" in line
+    ]
+    dp_lines = [
+        line for line in code.splitlines() if "gemm_ptx_dyn_qk(fbwd_dp_addr" in line
+    ]
+    assert len(s_lines) == 2 and len(dp_lines) == 2
+    if expect["k_caps"]:
+        s_cap, dp_cap = expect["k_caps"]
+        assert all(line.rstrip().endswith(f"{s_cap})") for line in s_lines), s_lines
+        assert all(line.rstrip().endswith(f"{dp_cap})") for line in dp_lines), dp_lines
+    else:
+        assert not any("k_tiles" in line for line in s_lines + dp_lines)
+    for name in ("_fbwd_ts_mma_x", "_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"):
+        assert (name in code) == (name in expect["exact_mmas"]), name
+    if expect["dq_boxes"] is not None:
+        assert f"for fbwd_c in cutlass.range_constexpr({expect['dq_boxes']}):" in code
+    else:
+        for col, kt_off in expect["dq_chunks"]:
+            assert (
+                f"gemm_ptx_dyn_qk(fbwd_dqa_addr + {col}, fbwd_st_dsmn, fbwd_dsmn_base, "
+                f"tDQrDS[None, None, None, 0].layout, fbwd_st_kt + {kt_off}, " in code
+            )
+        reduce = code.split("if warp_idx < 4:")[1].split("if (warp_idx >= 4)")[0]
+        # Chunks 0 and 2 share the original barrier pair, chunk 1 has its own
+        # (flex_mbar slots 7 / 8).
+        assert reduce.count("mbar_spin_wait(fbwd_dq_full_ptr") == 2
+        assert reduce.count("mbar_spin_wait(fbwd_dq_full_b_ptr") == 1
+        assert reduce.count("cute.copy(fbwd_tiled_dq_ld, tRDtDQ_B, tRDrDQ)") == 1
+        assert "fbwd_dq_full_b_ptr = storage.flex_mbar.data_ptr() + 7" in code
+        assert "fbwd_dq_empty_b_ptr = storage.flex_mbar.data_ptr() + 8" in code
+        assert "'flex_dq_chunk': 64" in code
+        # The MMA warp: per loop step chunk 2 issues once chunk 0 drained
+        # (ahead of S, so its drain overlaps the S MMA and the S read), S
+        # waits for chunk 1's drain and dP for chunk 2's; the tail drains 0
+        # and 1 before its chunk 2; chunk commits to match.
+        mma = code.split("if warp_idx == 12:")[1].split("if warp_idx < 4:")[0]
+        assert mma.count("mbar_spin_wait(fbwd_dq_empty_ptr") == 3
+        assert mma.count("mbar_spin_wait(fbwd_dq_empty_b_ptr") == 2
+        assert mma.count("commit(fbwd_dq_full_ptr)") == 4
+        assert mma.count("commit(fbwd_dq_full_b_ptr)") == 2
+        head, loop = mma.split("for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):")
+        # A one-tile CTA keeps the plain prologue: dO and V awaited, then S0
+        # (the persistent walk's order is pinned separately).
+        assert (
+            head.index("fbwd_doe = fbwd_do_cons.wait_and_advance()")
+            < head.index("fbwd_ve = fbwd_v_cons.wait_and_advance()")
+            < head.index("gemm_ptx_dyn_qk(fbwd_s_addr")
+            < head.index("gemm_ptx_dyn_qk(fbwd_dp_addr")
+        )
+        chunk2 = loop.index("fbwd_st_kt + 2048")
+        s_issue = loop.index("gemm_ptx_dyn_qk(fbwd_s_addr")
+        dp_issue = loop.index("gemm_ptx_dyn_qk(fbwd_dp_addr")
+        empty_waits = [
+            i
+            for i in range(len(loop))
+            if loop.startswith("mbar_spin_wait(fbwd_dq_empty", i)
+        ]
+        # Loop: 0 (before chunk 2), 1 (before S), 2 (before dP); tail: 0, 1
+        # (before its chunk 2).
+        assert len(empty_waits) == 5
+        assert (
+            empty_waits[0]
+            < chunk2
+            < empty_waits[1]
+            < s_issue
+            < empty_waits[2]
+            < dp_issue
+        )
+        # The dS staging's last reader is chunk 2: the staging-free barrier
+        # (dk_done) commits right after it, not after dK.
+        dk_done = loop.index("commit(fbwd_dk_done_ptr)")
+        assert chunk2 < dk_done < empty_waits[1]
+        assert (
+            loop.index("helion_fbwd_dsk_idesc")
+            < loop.index("fbwd_st_kt + 1024")
+            < dk_done
+        )
+    # Epilogue chunks per warpgroup: dV (h=0) then dK (h=1), in emission order.
+    chunk_counts = []
+    for block in code.split("fbwd_dkv_shape = ")[1:]:
+        body = block.split("fbwd_zrow = ")[0]
+        chunk_counts.append(body.count("cute.copy(fbwd_tiled_epi_ld, tEPItT[None, "))
+    assert tuple(c for c in chunk_counts if c) == expect["epi_chunks"], chunk_counts
+    assert ("fbwd_sread_ptr" in code) == (dq_off == 0)
+
+
+def test_head_dim_192_persistent_tile_boundary_order() -> None:
+    """The persistent alias_s walk's tile boundary: the TMA warp issues the
+    first step's Q and dO before K and V (their stages free before K's; V's
+    frees last, after the dV epilogue), and the MMA warp puts S0 in the pipe
+    before it waits for dO, V and the previous tile's chunk-2 drain."""
+    bound = _bind(_args(_tensors_dv(192, 128), _causal))
+    code = _render(bound, cute_flash_bwd_persistent=1)
+    assert "fbwd_clc_hw" in code
+    # The single dO slot doubles as the dV staging (V is released by the MMA
+    # warp after the last dP), so the stages free as V, Q, K, dO: the TMA
+    # warp issues the first step's loads in that order (Q first: S0's).
+    tma = code.split("if warp_idx == 13:")[1].split("if warp_idx == 12:")[0]
+    assert (
+        tma.index("cute.copy(_fbwd_tma_q,")
+        < tma.index("cute.copy(_fbwd_tma_v,")
+        < tma.index("cute.copy(_fbwd_tma_k,")
+        < tma.index("cute.copy(_fbwd_tma_do,")
+    )
+    mma = code.split("if warp_idx == 12:")[1].split("if warp_idx < 4:")[0]
+    head, loop = mma.split("for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):")
+    assert (
+        head.index("gemm_ptx_dyn_qk(fbwd_s_addr")
+        < head.index("fbwd_doe = fbwd_do_cons.wait_and_advance()")
+        < head.index("fbwd_ve = fbwd_v_cons.wait_and_advance()")
+        < head.index("mbar_spin_wait(fbwd_dq_empty_ptr")
+        < head.index("mbar_spin_wait(fbwd_sread_ptr")
+        < head.index("gemm_ptx_dyn_qk(fbwd_dp_addr")
+    )
+    # The tile's last dO is handed back by the dV epilogue (it stages through
+    # the slot); every other dO by the MMA warp. V is released once the last
+    # dV is in the pipe (after dv_done's commit, before the tail).
+    assert "if fbwd_steps > 1:\n                    fbwd_doe.release()" in head
+    assert (
+        "if fbwd_i + 2 < fbwd_steps:\n                        fbwd_doe.release()"
+        in loop
+    )
+    assert mma.count("fbwd_ve.release()") == 1
+    assert (
+        loop.index("commit(fbwd_dv_done_ptr)")
+        < loop.index("fbwd_ve.release()")
+        < loop.rindex("helion_fbwd_dsk_idesc")
+    )
+    wg0 = code.split("if (warp_idx >= 4) & (warp_idx < 8):")[1].split(
+        "if (warp_idx >= 8)"
+    )[0]
+    assert "fbwd_sEpi = storage.sdO.get_tensor(_fbwd_epil.outer" in wg0
+    assert "fbwd_kv_empty_ptr = storage.do_mbar_ptr.data_ptr() + 1" in wg0
+    assert "storage.sV.get_tensor(_fbwd_epil" not in code
 
 
 def test_q_block_256_pads_the_step_table() -> None:
@@ -360,6 +733,92 @@ def test_q_block_256_pads_the_step_table() -> None:
     assert plan.walk.q_block == 256
     assert plan.num_q_tiles == 3 and plan.num_q_tiles_padded == 4
     assert plan.max_steps == plan.group * 4
+
+
+# -- the step table: one table per walk, or chunks of it ---------------------
+
+
+def test_whole_walk_in_one_table_by_default() -> None:
+    # 512 rows, 4 Q tiles, one q head per kv head: 4 steps per KV tile.
+    t = _tensors()
+    bound = _bind(_args(t, _causal))
+    plan = _match_or_fail(bound).plan
+    assert plan.max_steps == 4
+    smem = _fit(plan)
+    assert smem.table_steps == plan.max_steps
+    assert _fit(plan, persistent=True).table_steps == plan.max_steps
+    code = _render(bound)
+    assert "flash_bwd_shared_storage(64, 4, 4, 1, cutlass.BFloat16, 4, 8," in code
+    assert "fbwd_nchunks" not in code and "named_barrier_wait_unaligned(7" not in code
+    # No cap below the walk: the knob is not searched.
+    assert fbwd_table_step_choices(plan, _CPU) == (0,)
+    assert "cute_flash_bwd_table_steps" not in bound.config_spec._flat_fields()
+    # An explicit cap below the walk chunks it: a 3-step table, every role
+    # wrapped in the chunk loop with the 448-thread boundary barrier.
+    assert _fit(plan, table_cap=3).table_steps == 3
+    chunked = _render(bound, cute_flash_bwd_table_steps=3)
+    assert "flash_bwd_shared_storage(64, 4, 4, 1, cutlass.BFloat16, 3, 8," in chunked
+    assert chunked.count("fbwd_nchunks = (fbwd_steps + 2) // 3") == 5
+    assert chunked.count("named_barrier_wait_unaligned(7, 448)") == 10
+    assert "if fbwd_chunk == fbwd_nchunks - 1:" in chunked
+    assert "if (fbwd_i > 0) | (fbwd_chunk > 0):" in chunked
+    # Persistent: the double buffer holds two 3-step tables and the length
+    # words; the readers load the list counts for the chunk fills.
+    persistent = _render(
+        bound, cute_flash_bwd_table_steps=3, cute_flash_bwd_persistent=1
+    )
+    assert "flash_bwd_shared_storage(64, 4, 4, 1, cutlass.BFloat16, 8, 8," in persistent
+    assert "fbwd_sSteps[6 + fbwd_tbuf]" in persistent
+    assert "if (fbwd_i == 0) & (fbwd_chunk == 0) & (fbwd_nz_it > 0):" in persistent
+    assert persistent.count("_fbwd_full_cnt[fbwd_tb, fbwd_th0, fbwd_n_tile]") == 5
+
+
+def test_table_caps_below_the_walk_are_searched() -> None:
+    # 8 q heads per kv head, 128 Q tiles: 1024 steps per KV tile.
+    t = _long_tensors(8, 1, 16384, 64)
+    bound = _bind(_args(t, _causal, block_mask=_causal_block_mask(16384, 16384)))
+    plan = _match_or_fail(bound).plan
+    assert plan.max_steps == 1024 and _fit(plan).table_steps == 1024
+    assert fbwd_table_step_choices(plan, _CPU) == (0, 512)
+    fields = bound.config_spec._flat_fields()
+    assert fields["cute_flash_bwd_table_steps"].choices == (0, 512)
+    assert bound.config_spec.default_config().config["cute_flash_bwd_table_steps"] == 0
+    assert _fit(plan, table_cap=512).table_steps == 512
+    assert "fbwd_nchunks = (fbwd_steps + 511) // 512" in _render(
+        bound, cute_flash_bwd_table_steps=512
+    )
+
+
+@pytest.mark.parametrize(
+    ("heads", "seq", "head_dim"), [(8, 131072, 128), (8, 131072, 64), (4, 262144, 128)]
+)
+def test_long_walk_chunks_the_step_table(heads: int, seq: int, head_dim: int) -> None:
+    # Group-8 (or 4) GQA at 128K (256K) tokens: 8192 steps per KV tile, twice
+    # what the shared memory holds; the walk runs in chunks instead of
+    # declining (the old bound was ~4266 steps at head dim 128).
+    t = _long_tensors(heads, 1, seq, head_dim)
+    bound = _bind(_args(t, _causal, block_mask=_causal_block_mask(seq, seq)))
+    plan = _match_or_fail(bound).plan
+    assert plan.max_steps == 8192
+    smem = _fit(plan)
+    assert 1024 <= smem.table_steps < plan.max_steps and smem.table_steps % 32 == 0
+    assert smem.dq_boxes == 4
+    code = _render(bound)
+    assert (
+        f"fbwd_nchunks = (fbwd_steps + {smem.table_steps - 1}) // {smem.table_steps}"
+        in code
+    )
+    assert "named_barrier_wait_unaligned(7, 448)" in code
+    # The persistent walk's double buffer halves the chunk.
+    smem_p = _fit(plan, persistent=True)
+    assert 1024 <= smem_p.table_steps <= smem.table_steps // 2 + 32
+    persistent = _render(bound, cute_flash_bwd_persistent=1)
+    assert f"fbwd_sSteps[{2 * smem_p.table_steps} + fbwd_tbuf]" in persistent
+    assert "fbwd_tissued_ptr" in persistent
+    # Caps at or above the automatic table (2112 steps per persistent buffer)
+    # would render the automatic plan: not offered.
+    assert fbwd_table_step_choices(plan, _CPU) == (0, 512, 1024, 2048)
+    assert smem_p.table_steps > 2048
 
 
 def test_declines_dk_store_with_another_factor(tmp_path: pathlib.Path) -> None:
@@ -379,6 +838,18 @@ def test_declines_dk_store_with_another_factor(tmp_path: pathlib.Path) -> None:
     reasons: list[str] = []
     assert _match(bound, reasons) is None
     assert any("dK store factor" in r for r in reasons), reasons
+
+
+def test_env_kill_switch_covers_the_flex_backward() -> None:
+    # HELION_CUTE_FLASH_BWD=0 disables the dense fused backward; the flex
+    # backward surface and its loop detector honour it too.
+    t = _tensors()
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH_BWD": "0"}):
+        bound = _bind(_args(t, _causal))
+        assert not bound.config_spec.cute_flash_bwd_search_enabled
+        assert "cute_flash_bwd_regs" not in bound.config_spec._flat_fields()
+    bound = _bind(_args(t, _causal))
+    assert bound.config_spec.cute_flash_bwd_search_enabled
 
 
 def test_declines_kv_block_other_than_128() -> None:
