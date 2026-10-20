@@ -21,6 +21,8 @@ from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..host_function import HostFunction
 from ..indexing_strategy import subscript_tile_info
+from .block_scaled_config import mxfp8_epilogue_parameters
+from .block_scaled_config import mxfp8_epilogue_supported
 from .block_scaled_config import mxfp8_shared_memory_bytes
 from .block_scaled_mma import BlockScaledMmaPlan
 from .block_scaled_mma import PreparedOperand
@@ -451,6 +453,25 @@ def _sf_tma_eligible(match: Mxfp8Match) -> bool:
     return True
 
 
+def _tma_output_eligible(match: Mxfp8Match) -> bool:
+    """Prove the two coordinate axes and the BF16 row-major tensor map."""
+    output = match.output
+    if output.ndim != 2:
+        return False
+    resolve = _metadata_resolver(CompileEnvironment.current())
+    row_stride, column_stride = map(resolve, output.stride())
+    return (
+        output.dtype == torch.bfloat16
+        and match.scale_a.dtype == match.scale_b.dtype == torch.int32
+        and match.m > 1
+        and match.n > 1
+        and column_stride == 1
+        and row_stride is not None
+        and row_stride >= match.n
+        and row_stride % 8 == 0
+    )
+
+
 def expose_mxfp8(device_ir: DeviceIR) -> bool:
     match = _match_mxfp8(device_ir.graphs, device_ir)
     if match is None:
@@ -465,6 +486,7 @@ def expose_mxfp8(device_ir: DeviceIR) -> bool:
     spec.cute_mxfp8_sf_tma_available = _sf_tma_eligible(match)
     spec.cute_mxfp8_problem_shape = (match.m, match.n, match.k)
     spec.cute_mxfp8_output_element_size = match.output.element_size()
+    spec.cute_mxfp8_tma_output_available = _tma_output_eligible(match)
     return True
 
 
@@ -527,6 +549,9 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
     compact_m = df.config.get("cute_scaled_compact_m", False)
     sf_tma = df.config.get("cute_scaled_sf_tma", False)
     sf_inplace = df.config.get("cute_scaled_sf_inplace", False)
+    epilogue_mode = df.config.get("cute_scaled_epilogue_mode", "default")
+    if not isinstance(epilogue_mode, str):
+        return None
     if fused_scales and not (match.scale_a.dtype == match.scale_b.dtype == torch.int32):
         return None
     if type(sf_tma) is not bool or (
@@ -561,6 +586,19 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         return None
     runtime_m = n if swap_ab else m
     compact = compact_m and logical_m_per_cta < 128 and runtime_m > 1
+    if not mxfp8_epilogue_supported(
+        epilogue_mode,
+        bn,
+        bk,
+        logical_m_per_cta,
+        swap_ab=swap_ab,
+        fused_scales=fused_scales,
+        tma_output_available=_tma_output_eligible(match),
+    ):
+        return None
+    accumulator_stages, prefetch_output_registers, tma_output = (
+        mxfp8_epilogue_parameters(epilogue_mode)
+    )
     if (
         mxfp8_shared_memory_bytes(
             runtime_m,
@@ -573,6 +611,7 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
             compact_m=compact,
             sf_tma=sf_tma,
             sf_inplace=sf_inplace,
+            epilogue_mode=epilogue_mode,
         )
         > 232448
     ):
@@ -625,4 +664,7 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         compact_m,
         sf_tma,
         sf_inplace,
+        accumulator_stages,
+        prefetch_output_registers,
+        tma_output,
     )

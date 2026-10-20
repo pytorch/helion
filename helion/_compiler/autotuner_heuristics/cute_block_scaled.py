@@ -314,6 +314,30 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
                     )
                     if seed not in seeds:
                         seeds.append(seed)
+            # Preserve the legal seed prefix and expose the six-stage compact
+            # SF pipeline for both scheduler choices. The resource filter
+            # below decides legality independently of workload dimensions.
+            for persistent in (False, True):
+                seed = Config.from_dict(
+                    base
+                    | {
+                        "cute_scaled_mma": True,
+                        "cute_collective_mma": False,
+                        "cute_scaled_fused_scales": True,
+                        "cute_scaled_sf_tma": True,
+                        "cute_scaled_sf_inplace": True,
+                        "cute_scaled_tile_m": 64,
+                        "cute_scaled_tile_n": 32,
+                        "cute_scaled_tile_k": 256,
+                        "cute_scaled_stages": 6,
+                        "cute_scaled_cluster_m": 1,
+                        "cute_scaled_swap_ab": True,
+                        "cute_scaled_compact_m": True,
+                        "cute_scaled_persistent": persistent,
+                    }
+                )
+                if seed not in seeds:
+                    seeds.append(seed)
         if env.config_spec.cute_mxfp8_mma_available:
             from ..cute.block_scaled_config import mxfp8_shared_memory_bytes
 
@@ -339,4 +363,72 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
                 )
                 <= 232448
             ]
+        if env.config_spec.cute_mxfp8_tma_output_available:
+            from ..cute.block_scaled_config import MXFP8_EPILOGUE_MODES
+            from ..cute.block_scaled_config import mxfp8_epilogue_supported
+            from ..cute.block_scaled_config import mxfp8_shared_memory_bytes
+
+            shape = env.config_spec.cute_mxfp8_problem_shape
+            assert shape is not None
+            m, n, _k = shape
+            candidates = [seed.config for seed in seeds]
+            sf_modes = [(False, False)]
+            if env.config_spec.cute_mxfp8_sf_tma_available:
+                sf_modes += [(True, False), (True, True)]
+            candidates += [
+                base
+                | {
+                    "cute_scaled_mma": True,
+                    "cute_collective_mma": False,
+                    "cute_scaled_fused_scales": True,
+                    "cute_scaled_compact_m": False,
+                    "cute_scaled_cluster_m": 2,
+                    "cute_scaled_tile_n": 224,
+                    "cute_scaled_tile_k": 128,
+                    "cute_scaled_stages": 6,
+                    "cute_scaled_tile_m": 128,
+                    "cute_scaled_swap_ab": False,
+                    "cute_scaled_persistent": persistent,
+                    "cute_scaled_sf_tma": sf_tma,
+                    "cute_scaled_sf_inplace": sf_inplace,
+                }
+                for persistent in (True, False)
+                for sf_tma, sf_inplace in sf_modes
+            ]
+            # Add joint pipeline/store choices after every existing legal seed.
+            # Admission follows output metadata, packet and resource proofs;
+            # problem dimensions select no geometry or algorithm.
+            for candidate in candidates:
+                for mode in tuple(MXFP8_EPILOGUE_MODES)[1:]:
+                    if not mxfp8_epilogue_supported(
+                        mode,
+                        _seed_geometry_int(candidate, "cute_scaled_tile_n"),
+                        _seed_geometry_int(candidate, "cute_scaled_tile_k"),
+                        _seed_geometry_int(candidate, "cute_scaled_tile_m", 128),
+                        swap_ab=bool(candidate.get("cute_scaled_swap_ab", False)),
+                        fused_scales=bool(
+                            candidate.get("cute_scaled_fused_scales", False)
+                        ),
+                        tma_output_available=True,
+                    ):
+                        continue
+                    smem = mxfp8_shared_memory_bytes(
+                        m,
+                        _seed_geometry_int(candidate, "cute_scaled_tile_m", 128),
+                        _seed_geometry_int(candidate, "cute_scaled_tile_n"),
+                        _seed_geometry_int(candidate, "cute_scaled_tile_k"),
+                        _seed_geometry_int(candidate, "cute_scaled_stages"),
+                        _seed_geometry_int(candidate, "cute_scaled_cluster_m"),
+                        env.config_spec.cute_mxfp8_output_element_size,
+                        compact_m=False,
+                        sf_tma=bool(candidate.get("cute_scaled_sf_tma", False)),
+                        sf_inplace=bool(candidate.get("cute_scaled_sf_inplace", False)),
+                        epilogue_mode=mode,
+                    )
+                    if smem <= 232448:
+                        seed = Config.from_dict(
+                            candidate | {"cute_scaled_epilogue_mode": mode}
+                        )
+                        if seed not in seeds:
+                            seeds.append(seed)
         return seeds
