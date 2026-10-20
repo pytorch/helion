@@ -46,7 +46,14 @@ def test_mn_seeds_preserve_old_prefix_normalize_and_reach_native_source(
     m: int, groups: int, n: int, k: int
 ) -> None:
     args = _args(m, groups, n, k)
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
+    with (
+        _forbid_cuda_work(),
+        _target(),
+        _mock_cuda_unavailable(),
+        patch.object(
+            heuristics, "_tcgen05_grouped_prefix_adaptive_n_seeds", return_value=[]
+        ),
+    ):
         with patch.object(
             heuristics, "_tcgen05_grouped_mn_device_tile_seeds", return_value=[]
         ):
