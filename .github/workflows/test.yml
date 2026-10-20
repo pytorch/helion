@@ -50,11 +50,8 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
 
-    # Ref-eager is a known-flaky shard: its intermittent "node down" worker
-    # crashes are an OSDC GPU-runner container infra issue (identical on a10g
-    # and h100, never on bare-metal; confirmed not OOM, not any test, not
-    # cross-worker), reported to the runner admins. Until that is fixed, keep it
-    # from blocking the rest of the matrix.
+    # Keep ref-eager non-blocking while its intermittent worker exits are
+    # investigated. A worker exit alone does not identify an infrastructure error.
     continue-on-error: ${{ matrix.ref-eager }}
 
     defaults:
@@ -417,6 +414,9 @@ jobs:
           # (the default 60s is too tight for the slowest eager reference pass).
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then
             TIMEOUT=300
+            # Dump stacks before pytest-timeout exits the worker. Its normal
+            # timeout report can be lost with xdist's captured worker output.
+            EXTRA_FLAGS="$EXTRA_FLAGS -o faulthandler_timeout=120 --durations=20"
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
           # JAX and TorchTPU initialize the TPU runtime differently. Run the
