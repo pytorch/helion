@@ -74,7 +74,7 @@ class TestCuteFullSliceMatmulThreads(TestCase):
             with self.subTest(fn=fn.name):
                 code, out = code_and_output(fn, (x, rhs), block_sizes=[32])
                 torch.testing.assert_close(out, x @ w, rtol=1e-3, atol=1e-3)
-                self.assertIn("mm_fold_k", code)
+                self.assertIn("_cute_fold_dot", code)
                 # The fold covers the whole K per output element, so K runs
                 # on one thread and the 32 rows and 16 columns keep theirs.
                 self.assertIn("block=(16, 32, 1)", code)

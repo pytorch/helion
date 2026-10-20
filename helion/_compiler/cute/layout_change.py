@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
 from ...language import _decorators
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -84,8 +85,19 @@ def _(state: CodegenState) -> ast.AST:
     fn = state.device_function
     dtype_str = backend.dtype_str(input_val.dtype)
 
-    # Compute shared memory size — must cover the full tile
+    # Compute shared memory size — must cover the full tile.  Every launch
+    # thread writes one slot, so the tile has to be exactly one scalar per
+    # thread; anything else would index past the buffer (or leave slots no
+    # thread wrote) and silently permute garbage.
     tile_numel = src_layout.tile_numel()
+    dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+    total_threads = dims[0] * dims[1] * dims[2]
+    if tile_numel != total_threads:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"layout change of a {tile_numel}-element tile in a "
+            f"{total_threads}-thread block",
+        )
 
     # Allocate shared memory buffer
     smem_ptr_var = fn.new_var("layout_change_smem_ptr", dce=True)
@@ -107,7 +119,6 @@ def _(state: CodegenState) -> ast.AST:
     # Compute flat smem offsets using layout strides.  The thread index uses
     # the kernel's physical thread-block dims (not the layout's 1D thread_shape)
     # so all (x, y, z) threads get unique offsets in ND kernels.
-    dims = DeviceFunction.current().tile_strategy.thread_block_dims()
     axis_sizes = {axis: dim for axis, dim in enumerate(dims) if dim > 1}
     thread_expr: str = backend.thread_linear_index_expr(axis_sizes)  # type: ignore[assignment]
     src_offset = _flat_offset_expr(thread_expr, src_layout)

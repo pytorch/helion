@@ -70,6 +70,7 @@ from .._compiler.cute.aux_tensor import (
     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
 )
 from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
+from .._compiler.cute.aux_tensor import host_function_tcgen05_aux_loads_on_every_store
 from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
@@ -2686,6 +2687,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
                         self.host_function
                     )
+                )
+                # ``pre_acc_wait`` renders only where every store chain has
+                # per-subtile auxiliary loads (or the shared fanout epilogue
+                # merges the chains); the strict normalizer and the seeds
+                # read this proof so a two-output kernel whose first output
+                # is aux-free never samples the placement into a codegen
+                # refusal.
+                self.env.config_spec.cute_tcgen05_aux_loads_on_every_store = (
+                    host_function_tcgen05_aux_loads_on_every_store(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)

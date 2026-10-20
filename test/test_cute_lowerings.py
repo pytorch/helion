@@ -24646,8 +24646,8 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
 
     def test_synthetic_lane_k_addmm_of_grid_indexed_loads(self) -> None:
         """K split across synthetic lanes with grid-indexed operand loads: the
-        synthetic-lane fold cannot re-read the rank-reducing loads, the serial
-        load-view lowering folds the full K instead."""
+        synthetic-lane fold re-reads the rank-reducing loads through the grid
+        index's own expression (``_cute_fold_scalar_index``)."""
 
         @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
         def grid_addmm(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor):
@@ -24661,7 +24661,7 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
         c = torch.randn(2, 32, 64, device=DEVICE)
         code, out = code_and_output(grid_addmm, (x, y, c))
         self.assertIn("synthetic_lane", code)
-        self.assertIn("serial_k", code)
+        self.assertIn("_cute_fold_dot", code)
         torch.testing.assert_close(out, c + x @ y, rtol=1e-4, atol=1e-4)
 
     def test_serial_k_mm_stops_at_a_non_power_of_two_k(self) -> None:
@@ -25094,7 +25094,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         # D is split threads x synthetic lanes, so the bmm folds K itself by
         # re-reading both (permuted) operands; tile_kv is the fourth
         # thread-parallel dim and runs as a lane loop, not thread axis 3.
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         self.assertNotIn("thread_idx()[3]", code)
         # The transposes only feed the bmm (the hoisted one through the loop
         # argument), so neither is shuffled through shared memory inside the
@@ -25111,7 +25111,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         code, out = code_and_output(
             _cute_bmm_sliced_k_fold, (q, k), block_sizes=[32, 32]
         )
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         torch.testing.assert_close(
             out,
             torch.einsum("qhd,khd->hqk", q[:, :, 8:40], k[:, :, 8:40]),
@@ -25132,7 +25132,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         q.copy_(torch.randn(L, H, D, device=DEVICE))
         k = torch.randn(L, H, D, device=DEVICE, dtype=torch.bfloat16)
         code, out = code_and_output(_cute_bmm_fold_int64, (q, k), block_sizes=[32, 32])
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         # The bf16 bmm rounds its result to bf16 before the float cast.
         torch.testing.assert_close(
             out,

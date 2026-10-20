@@ -4459,9 +4459,19 @@ class TestMatmulFacts(TestCase):
             {axis.block_id for axis in region.loop_axes}
             for region in fact.pipelined_regions
         ]
-        self.assertTrue(
-            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
-        )
+        # ``out[batch, :, tile_q, :]`` partitions the fresh output by the
+        # query tile, so the CuTe backend promotes that tile into the launch
+        # grid (promote_partitioned_output_axis); the key loop then nests
+        # directly under the grid.  Triton keeps both as nested loop axes.
+        if query_block_id in spec.grid_block_ids:
+            self.assertTrue(any(key_block_id in axes for axes in nested_axes))
+        else:
+            self.assertTrue(
+                any(
+                    {query_block_id, key_block_id}.issubset(axes)
+                    for axes in nested_axes
+                )
+            )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
@@ -12047,3 +12057,77 @@ def test_cute_row_hints_preserve_fixed_leading_axis(
             spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
             == 1
         )
+
+
+def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
+    """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
+    the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
+    so the row statistics and the ``p @ v`` running sum stay in registers."""
+    from examples.fp8_attention import fp8_attention_kernel
+
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    kernel = helion.kernel(
+        fp8_attention_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    batch, heads, seq_len, head_dim = 1, 4, 256, 64
+    q = torch.empty((batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn)
+    v = torch.empty((batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, (q, q, v, batch, heads))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        assert CuteDotRowReductionHeuristic.is_eligible(bound.env, device_ir)
+        seed = CuteDotRowReductionHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        spec = bound.config_spec
+        key_tile = next(
+            graph.block_ids[0]
+            for graph in device_ir.graphs
+            if type(graph).__name__ == "ForLoopGraphInfo" and len(graph.block_ids) == 1
+        )
+        slot = [item.block_id for item in spec.num_threads].index(key_tile)
+        assert seed["num_threads"][slot] == 1
+        assert sum(seed["num_threads"]) == 1
+        assert "cute_dot_row_reduction" in spec.autotuner_heuristics
+        assert spec.default_config()["num_threads"] == seed["num_threads"]
+        code = bound.to_code(spec.default_config())
+        # The key tile runs as a per-thread lane loop: the row max and sum
+        # accumulate in registers instead of block-wide grouped reductions.
+        assert "qk_max_lane_acc" in code
+        assert "l_ij_lane_acc" in code
+
+
+def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
+    """A dot whose N axis is only stored (no reduction over it) gets no seed."""
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        batch_heads, seq_len, _ = q.shape
+        out = torch.empty(
+            [batch_heads, seq_len, seq_len], dtype=torch.float32, device=q.device
+        )
+        for bh in hl.grid(batch_heads):
+            for tile_m in hl.tile(seq_len):
+                q_tile = q[bh, tile_m, :]
+                for tile_n in hl.tile(seq_len):
+                    k_tile = k[bh, tile_n, :]
+                    out[bh, tile_m, tile_n] = hl.dot(q_tile, k_tile.transpose(0, 1))
+        return out
+
+    q = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(scores, (q, q))
+        assert bound.host_function is not None
+        assert not CuteDotRowReductionHeuristic.is_eligible(
+            bound.env, bound.host_function.device_ir
+        )
+        assert "cute_dot_row_reduction" not in bound.config_spec.autotuner_heuristics
