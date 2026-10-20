@@ -526,6 +526,17 @@ class ProgramIDs(abc.ABC):
                 *wrapped_body,
             ]
 
+        # One-shot teardown registered by the body's lowering (a tensor
+        # memory dealloc) runs once, after the tile loop.
+        cute_state = device_function.cute_state
+        post_loop: list[ast.stmt] = []
+        if cute_state.has_tcgen05_post_loop_marks:
+            statements = cast("list[ast.stmt]", wrapped_body)
+            post_loop = [s for s in statements if cute_state.is_tcgen05_post_loop(s)]
+            wrapped_body = [
+                s for s in statements if not cute_state.is_tcgen05_post_loop(s)
+            ]
+
         # Create the persistent loop that wraps the entire body
         persistent_loop = create(
             ast.For,
@@ -535,7 +546,7 @@ class ProgramIDs(abc.ABC):
             orelse=[],
             type_comment=None,
         )
-        return [persistent_loop]
+        return [persistent_loop, *post_loop]
 
     @property
     def virtual_program_id(self) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
@@ -178,6 +179,53 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         bound.set_config(config)
         out = bound(a, b)
         torch.testing.assert_close(out, torch.matmul(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_m_major_lhs_uses_the_tma_pipeline_and_direct_entry_seed(self) -> None:
+        """``x.T @ y`` stages its M-major A through TMA like a row-major A.
+
+        It used to keep the scalar SMEM producer and lose the row-major GEMM's
+        seeds, so its default config ran ~250x slower than the same GEMM on a
+        row-major copy of ``x.T``.
+        """
+        x = torch.randn([2048, 1024], device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn([2048, 1024], device=DEVICE, dtype=torch.bfloat16)
+        a = x.T
+        bound = _ordinary_gemm.bind((a, b))
+        spec = bound.config_spec
+        row_major_spec = _ordinary_gemm.bind((a.contiguous(), b)).config_spec
+        self.assertEqual(
+            spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+            row_major_spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+        )
+        self.assertEqual(spec.default_config(), row_major_spec.default_config())
+        a_major = re.compile(
+            r"make_trivial_tiled_mma\([^,]+, [^,]+, cute\.nvgpu\.OperandMajorMode\.MN"
+        )
+        for config in (spec.default_config(), helion.Config(block_sizes=[128, 64, 64])):
+            self.assertRegex(bound.to_triton_code(config), a_major)
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
+            )
+
+    def test_k_major_b_block_n8_short_k_is_refused(self) -> None:
+        """An 8-row stage of 32-byte K-major B rows cannot be one TMA box.
+
+        CuTe splits it into one bulk copy per row at 32-byte shared offsets,
+        which faults with a sticky misaligned-address error. The config must be
+        refused at codegen instead (a wider K tile keeps the same B layout).
+        """
+        a = torch.randn([256, 256], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([256, 256], device=DEVICE, dtype=torch.float16).T
+        bound = _ordinary_gemm.bind((a, b))
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "block_n=8"):
+            bound.to_triton_code(helion.Config(block_sizes=[64, 8, 16]))
+        config = helion.Config(block_sizes=[64, 8, 32])
+        self.assertIn("tcgen05", bound.to_triton_code(config))
+        bound.set_config(config)
+        torch.testing.assert_close(
+            bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
+        )
 
     def test_reshape_view_lhs_keeps_direct_entry_seed(self) -> None:
         """A pointer-preserving host view keeps the direct-entry seed.

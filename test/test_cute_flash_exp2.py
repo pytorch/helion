@@ -1311,6 +1311,7 @@ def test_serial_disc_forwards_degree2_to_chunk_math(degree2: bool | None) -> Non
         patch.object(_flash_runtime.cute, "make_rmem_tensor"),
         patch.object(_flash_runtime.cute, "copy"),
         patch.object(_flash_runtime.cute.arch, "fence_view_async_tmem_store"),
+        patch.object(_flash_runtime, "tcgen05_fence_before_thread_sync"),
         patch.object(_flash_runtime, "_disc_chunk_exp") as chunk_exp,
         patch.object(_flash_runtime, "_disc_chunk_convert_store"),
         patch.object(_flash_runtime, "_disc_chunk_rowsum", return_value=1.0),
@@ -4396,9 +4397,10 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    # 33 on this surface: the hillclimb's 29 plus main's explicit
-    # standard/resident lowering seeds.
-    assert len(dense_seeds[False]) == len(dense_seeds[True]) == 33
+    # 34 on this surface: the hillclimb's 29 plus main's explicit
+    # standard/resident lowering seeds, plus the single-tile issue-stream
+    # seed (the ws body's load warp and extra K ring slot).
+    assert len(dense_seeds[False]) == len(dense_seeds[True]) == 34
     for cadence in ("16/6", "16/8", "8/2"):
         matches = _seed_values(
             dense_seeds[False],
@@ -4423,7 +4425,9 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 14
+    # (plus the single-tile issue-stream seed on the causal ws body: load warp,
+    # mask phases and the extra K ring slot: 14 -> 15.)
+    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 15
     split = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
@@ -4502,7 +4506,8 @@ def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
         )
         for fast_math in (False, True)
     }
-    assert len(pruned_seeds[False]) == len(pruned_seeds[True]) == 10
+    # 11: the 10 plus the same issue-stream ws_overlap seed (load warp + slot).
+    assert len(pruned_seeds[False]) == len(pruned_seeds[True]) == 11
     variant = _seed_values(
         pruned_seeds[False],
         **{

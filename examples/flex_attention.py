@@ -61,10 +61,13 @@ def helion_flex_attention_kernel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, H, M, D = query.size()
     D = hl.specialize(D)
-    assert key.size() == value.size()
+    # The V/O head dim may differ from the Q/K head dim (the MLA prefill pair
+    # 192/128): the accumulator and the output take V's width.
+    Dv = hl.specialize(value.size(-1))
     Bk, Hk, N, Dk = key.size()
     assert Bk == B
     assert Dk == D
+    assert value.size()[:3] == key.size()[:3]
     if enable_gqa:
         assert H % Hk == 0
     else:
@@ -81,7 +84,13 @@ def helion_flex_attention_kernel(
     # dims): index them modulo their own sizes, like FlexAttention's
     # ``sparse_idx_z = off_z % SPARSE_Z``.
     table_batch, table_heads, _ = block_mask_kv_num_blocks.size()
-    out = torch.empty_like(query)
+    # The output keeps the query's memory layout (a transposed or packed
+    # query gives a transposed output, like ``empty_like``); a V/O width
+    # other than the Q/K width gets a dense output of its own.
+    if Dv == D:
+        out = torch.empty_like(query)
+    else:
+        out = torch.empty((B, H, M, Dv), dtype=query.dtype, device=query.device)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
     log_2_e = 1.44269504
     block_m = hl.register_block_size(min(256, block_mask_m))
@@ -92,7 +101,7 @@ def helion_flex_attention_kernel(
     for tile_b, tile_h, tile_m in hl.tile([B, H, M], block_size=[1, 1, block_m]):
         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_m, D], dtype=torch.float32)
+        acc = hl.zeros([tile_m, Dv], dtype=torch.float32)
         q_i = query[tile_b.begin, tile_h.begin, tile_m, :]
 
         sparse_row = tile_m.begin // block_mask_m
@@ -295,22 +304,24 @@ def _flex_attention_bwd_preprocess(
     (fp32) and the forward's natural-log LSE in the exp2 base, ``lse2 = lse *
     log2(e)``, with a row that saw no key (``lse == -inf``) mapped to 0 so the
     main kernel's ``score * log2(e) - lse2`` stays finite (its P is 0 anyway:
-    every score of such a row is masked)."""
-    head_dim = hl.specialize(o_in.size(-1))
-    o = o_in.reshape(-1, head_dim)
-    do = do_in.reshape(-1, head_dim)
-    lse = lse_in.reshape(-1)
-    total = o.size(0)
-    delta = torch.empty(total, device=o.device, dtype=torch.float32)
-    lse2 = torch.empty(total, device=o.device, dtype=torch.float32)
+    every score of such a row is masked).
+
+    ``o_in`` / ``do_in`` are indexed as the ``[B, H, M, D]`` views they are
+    (a ``[B, S, H, D]`` allocation's transpose included): a row-flattening
+    reshape would copy such views on the host before every backward."""
+    B, H, M, _ = o_in.size()
+    delta = torch.empty((B, H, M), device=o_in.device, dtype=torch.float32)
+    lse2 = torch.empty((B, H, M), device=o_in.device, dtype=torch.float32)
     log_2_e = 1.44269504
-    for tile in hl.tile(total):
-        delta[tile] = torch.sum(
-            o[tile, :].to(torch.float32) * do[tile, :].to(torch.float32), dim=-1
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o_in[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do_in[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        lse_rows = lse_in[tile_b, tile_h, tile_m]
+        lse2[tile_b, tile_h, tile_m] = (
+            torch.where(lse_rows == float("-inf"), 0.0, lse_rows) * log_2_e
         )
-        lse_row = lse[tile]
-        lse2[tile] = torch.where(lse_row == float("-inf"), 0.0, lse_row) * log_2_e
-    return delta.reshape(o_in.size()[:-1]), lse2.reshape(o_in.size()[:-1])
+    return delta, lse2
 
 
 def _gradient_accuracy_check(actual: object, expected: object) -> None:

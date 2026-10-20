@@ -23,6 +23,7 @@ import helion
 from helion._testing import TestCase
 from helion._utils import counters
 from helion.autotuner.base_search import BaseAutotuner
+from helion.autotuner.benchmark_provider import _searching_candidates
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -303,6 +304,75 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         self.assertEqual(
             len(list((self.cache_root / "generated_code").rglob("*.json"))), 3
         )
+
+    def test_source_cache_hit_ignores_primed_code_outside_search(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            bound.prime_rendered_code(config, "# unused worker source")
+            with patch.object(
+                bound, "to_triton_code", side_effect=AssertionError("source cache miss")
+            ):
+                bound.set_config(config)
+        self.assertEqual(sources, [sources[0], sources[0]])
+        self.assertTrue(bound.has_compiled_config(config))
+
+    def test_primed_config_rerenders_before_persisting(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            worker_source = sources[0] + "\n# rendered in worker\n"
+            bound.prime_rendered_code(config, worker_source)
+            with patch.object(
+                bound, "to_triton_code", wraps=bound.to_triton_code
+            ) as render:
+                with _searching_candidates():
+                    measured = bound.compile_config(config)
+                    self.assertIs(bound.compile_config(config), measured)
+                render.assert_not_called()
+                bound.set_config(config)
+                render.assert_called_once()
+                bound.set_config(config)
+                render.assert_called_once()
+        self.assertEqual(sources, [sources[0], worker_source, sources[0]])
+
+    def test_failed_parent_render_retries_before_loading_cached_source(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            worker_source = sources[0] + "\n# rendered in worker\n"
+            bound.prime_rendered_code(config, worker_source)
+            with _searching_candidates():
+                bound.compile_config(config)
+            with (
+                patch.object(
+                    bound, "to_triton_code", side_effect=RuntimeError("render failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "render failed"),
+            ):
+                bound.set_config(config)
+            self.assertFalse(bound.has_compiled_config(config))
+            with patch.object(
+                bound, "to_triton_code", wraps=bound.to_triton_code
+            ) as render:
+                bound.set_config(config)
+                render.assert_called_once()
+        self.assertEqual(sources, [sources[0], worker_source, sources[0]])
 
     def test_search_seed_does_not_change_source_key(self) -> None:
         first = _bound(torch.ones(16), autotune_random_seed=1)

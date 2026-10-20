@@ -6035,7 +6035,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_accepts_extra_knobs(self) -> None:
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_CONFIG_KEYS)
-        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 17)
+        # 18 with the single-tile cooperative pair (``ws_2cta``: two 128-row
+        # query tiles of one batch head on a 2-CTA tcgen05 MMA, legal at the
+        # head dims above 128 and on request on the flex list walk).
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 18)
         self.assertEqual(
             set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
             {

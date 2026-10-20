@@ -186,11 +186,24 @@ def _persistent_vec_alignment_prepared_guard(
         if signature is None:
             continue
         residue = cast("tuple[int, object, object]", signature)[0]
-        namespace[f"extract_{index}"] = extract
-        checks.append(
-            f"extract_{index}(args).data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}"
-        )
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
+        checks.append(f"{source}.data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}")
     return eval(f"lambda args: {' and '.join(checks) or 'True'}", namespace)
+
+
+def _prepared_guard_source(
+    namespace: dict[str, object],
+    name: str,
+    extract: Callable[[Sequence[object]], Hashable],
+) -> str:
+    """The expression a generated prepared guard reads a source through:
+    ``args[i]`` for a plain argument (the extractor carries its index), else
+    a call of the extractor bound into ``namespace``."""
+    index = getattr(extract, "_helion_arg_index", None)
+    if type(index) is int:
+        return f"args[{index}]"
+    namespace[name] = extract
+    return f"{name}(args)"
 
 
 def register_persistent_vec_alignment_specializations(
@@ -528,10 +541,10 @@ def _tensor_storage_disjoint_prepared_guard(
     namespace: dict[str, object] = {}
     lines = ["def guard(args):"]
     for index, extract in enumerate(source_extractors):
-        namespace[f"extract_{index}"] = extract
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
         lines.extend(
             (
-                f"    storage_{index} = extract_{index}(args).untyped_storage()",
+                f"    storage_{index} = {source}.untyped_storage()",
                 f"    start_{index} = storage_{index}.data_ptr()",
                 f"    end_{index} = start_{index} + storage_{index}.nbytes()",
             )
@@ -5537,9 +5550,9 @@ def _cute_vector_load_ctx(
             # (e.g. ``numel`` not a multiple of V), the masked-tail iter
             # could load garbage in some lanes.  Gate the per-element mask
             # path correctly by requiring ``numel % V == 0`` so partial-vec
-            # straddles are impossible.
-            numel = env.block_sizes[inner_block_id].numel
-            if not env.known_multiple(numel, vec_width):
+            # straddles are impossible.  A jagged axis has no static extent
+            # and stays scalar.
+            if not env.block_sizes[inner_block_id].known_multiple(vec_width):
                 return None
         if not _cute_tile_packet_is_aligned(
             env, tensor, stride1_tensor_dim, vec_width, flat=flat_multi

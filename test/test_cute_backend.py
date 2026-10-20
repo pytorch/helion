@@ -44,6 +44,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -10577,11 +10578,13 @@ class TestCuteBackend(TestCase):
         family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
         # The row programs are searched only on small grids of a known
-        # batch; this 512-tile surface of an unknown batch leaves them out.
+        # batch; this 512-tile surface of an unknown batch leaves them out,
+        # as does the single-tile body's cooperative pair (a family of the
+        # value widths above 128).
         self.assertEqual(
             set(family.search_choices or ()),
             set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
-            - {"fa4_2cta_causal", "row_mma", "fa4_alt"},
+            - {"fa4_2cta_causal", "row_mma", "fa4_alt", "ws_2cta"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -10706,18 +10709,23 @@ class TestCuteBackend(TestCase):
             ),
             # the alternating-warpgroup family is a head_dim-128 body
             "fa4_alt": ("fa4", False, False, False, False, False, False, False),
+            # the single-tile body's cooperative pair (cta_group::2 atoms)
+            "ws_2cta": ("ws_overlap", False, False, True, False, False, False, False),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
         with patch.dict(os.environ, {}, clear=True):
             for family_name, expected in expected_flags.items():
                 with self.subTest(family=family_name):
+                    # (The pair is a family of the value widths above 128
+                    # with the standard dense output.)
                     cfg = resolve_flash_config(
-                        128 if family_name == "fa4_alt" else 64,
+                        {"fa4_alt": 128, "ws_2cta": 256}.get(family_name, 64),
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,
                         is_causal="causal" in family_name,
+                        standard_dense_output=family_name == "ws_2cta",
                     )
                     self.assertEqual(cfg.pipeline_family, family_name)
                     self.assertEqual(
@@ -18868,6 +18876,7 @@ def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 class TestCuteConfigValuePriors(TestCase):
     """The cute backend supplies per-key value priors (the learned distribution
     used by generic kernels. Flash attention instead builds structural coverage
@@ -18973,10 +18982,11 @@ class TestCuteConfigValuePriors(TestCase):
 class TestCuteBackendRequirements(TestCase):
     """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
-    This module is ``importorskip``-gated on cutlass, so the environment under
-    test already satisfies the requirements (the gate must pass here).
+    An environment that runs the cute backend's tests (HELION_BACKEND=cute)
+    must satisfy the requirements; importing cutlass alone does not imply it.
     """
 
+    @onlyBackends(["cute"])
     def test_requirements_satisfied_in_this_environment(self) -> None:
         from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
@@ -19006,11 +19016,13 @@ class TestCuteBackendRequirements(TestCase):
             )
         self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
+    @onlyBackends(["cute"])
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
 
         check_cute_backend_requirements()  # must not raise in this environment
 
+    @onlyBackends(["cute"])
     def test_validate_environment_passes(self) -> None:
         from helion._compiler.backend import CuteBackend
 

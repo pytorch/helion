@@ -70,6 +70,7 @@ from helion.autotuner.local_cache import _cute_flash_search_policy_hash
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
+from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
 from helion.autotuner.surrogate_pattern_search import (
     flash_terminal_measurement_is_valid,
 )
@@ -2347,11 +2348,16 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         lane = metrics["leaf_results"][0]["pipeline_lanes"][0]
         self.assertTrue(lane["conditional_required"])
         self.assertEqual(lane["conditional_candidate_ids"], [])
-        self.assertFalse(lane["complete"])
-        self.assertFalse(metrics["completed"])
+        # The alias is not a new candidate; with nothing unmeasured in reach
+        # the lane counts as exhausted and the phase completes.
+        self.assertTrue(lane["conditional_exhausted"])
+        self.assertTrue(lane["complete"])
+        self.assertTrue(metrics["completed"])
         self.assertEqual(metrics["candidate_count"], 0)
 
-    def test_lfbo_flash_alias_collapsed_exact_space_uses_raw_initial_budget(self):
+    def test_lfbo_flash_alias_collapsed_exact_space_uses_the_raw_enumeration_floor(
+        self,
+    ):
         initial = PopulationMember(
             fn=lambda: None,
             perfs=[1.0],
@@ -2422,8 +2428,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         metrics = search._autotune_metrics.search_phase_metrics
         _assert_phase_config_manifest(self, metrics)
         self.assertTrue(metrics["exact_space_exhausted"])
-        self.assertEqual(metrics["exact_space_raw_budget"], 7)
-        exact_space.assert_called_once_with(7)
+        # (The enumeration budget floors at the raw-product floor: a space this
+        # small is enumerated whatever the initial population size.)
+        self.assertEqual(
+            metrics["exact_space_raw_budget"], max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7)
+        )
+        exact_space.assert_called_once_with(max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7))
         self.assertEqual(metrics["qualification_passes_planned"], 0)
         leaf_metric = metrics["leaf_results"][0]
         self.assertTrue(leaf_metric["space_exhausted"])
@@ -3238,7 +3248,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertEqual(search.population[0], winning_child)
         metrics = search._autotune_metrics.search_phase_metrics
         self.assertEqual(metrics["phase"], "cute_flash_structural_qualification_v24")
-        self.assertEqual(metrics["cute_flash_lane_policy_version"], 16)
+        self.assertEqual(metrics["cute_flash_lane_policy_version"], 17)
         self.assertTrue(metrics["completed"])
         self.assertEqual(metrics["qualification_rounds"], 2)
         self.assertEqual(metrics["qualification_rounds_started"], 2)
@@ -3447,6 +3457,100 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         ]
         self.assertEqual(len(unrestricted), 1)
         self.assertEqual(unrestricted[0]["family"], "fa4_clc")
+
+    def test_lfbo_flash_qualification_skips_family_without_a_measured_member(self):
+        """A family whose every member fails has no family probe start; the
+        remaining families and the unrestricted path still probe."""
+        families = ("fa4", "fa4_2cta", "ws_overlap", "fa4_clc", "fa4_tma_4d")
+        failing = "fa4_tma_4d"
+
+        def member(family: str, wait_hint: int) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda: None,
+                perfs=[],
+                flat_values=[family, wait_hint],
+                config=helion.Config(
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family=family,
+                    cute_flash_exp2_packet="1x1",
+                    cute_flash_wait_hint=wait_hint,
+                ),
+                status="ok",
+            )
+
+        perfs = dict(zip(families, (1.0, 1.1, 1.2, 4.0, 5.0), strict=True))
+        initial = [member(family, index) for index, family in enumerate(families)]
+        leaves = [flash_structural_leaf_from_config(m.config.config) for m in initial]
+        assert all(leaf is not None for leaf in leaves)
+        next_hint = iter(range(100, 1000))
+
+        def measure(item: PopulationMember) -> None:
+            family = item.config.config["cute_flash_pipeline_family"]
+            if family == failing:
+                item.status = "error"
+                item.perfs = [math.inf]
+            else:
+                item.perfs = [perfs[family]]
+
+        for item in initial:
+            measure(item)
+
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.config_spec = _cute_flash_test_config_spec()
+        search.copies = 14
+        search._flash_promoted_path_limit = 14
+        search._flash_family_probe_path_limit = 6
+        search.num_neighbors = 300
+        search.num_neighbors_cap = -1
+        search.max_generations = 20
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search.population = list(initial)
+        search.initial_population = len(search.population)
+        search.train_x = []
+        search.train_y = []
+        search._train_members = []
+        search.polish_rounds = 0
+        search.train_configs = []
+        search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
+        search.config_gen = SimpleNamespace(
+            encode_config=lambda flat: flat,
+            flash_structural_leaf_catalog=lambda: leaves,
+            flash_low_confound_schedule_anchor_configs=list,
+            flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
+            flash_clc_lane_catalog=dict,
+            flash_exact_effective_search_space_configs=lambda _limit: None,
+        )
+        search.set_generation = Mock()
+        search._budgeted_range = lambda *args: range(*args)
+        search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
+        search.rebenchmark_population = Mock()
+        search._fit_surrogate = Mock()
+
+        def search_path(_index, current, _visited, _constraints, **kwargs):
+            leaf = kwargs.get("required_leaf")
+            family = (
+                current.config.config["cute_flash_pipeline_family"]
+                if leaf is None
+                else leaf.pipeline_family
+            )
+            return iter(((current, member(family, next(next_hint))),))
+
+        def benchmark(members, *, desc):
+            for item in members:
+                measure(item)
+
+        search._pruned_pattern_search_from = search_path
+        search.benchmark_population = benchmark
+
+        search._run_flash_structural_qualification({item.config for item in initial})
+        metrics = search._autotune_metrics.search_phase_metrics
+        self.assertTrue(metrics["family_probe_required"])
+        self.assertEqual(metrics["family_probe_path_limit"], 6)
+        probed = [path["family"] for path in metrics["family_probe_paths"]]
+        self.assertEqual(len(probed), 5)
+        self.assertNotIn(failing, probed)
 
     def test_lfbo_flash_qualification_finishes_round_before_budget_stops_next(self):
         def member(perf: float | None, wait_hint: int) -> PopulationMember:
@@ -3765,6 +3869,93 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             qualified[canonical_config_id(synthesized.config)]["selection_perf"],
             1.2,
         )
+
+    def test_lfbo_flash_lane_without_reachable_candidates_counts_as_exhausted(
+        self,
+    ):
+        # A surface too large to enumerate: the lane's measured witness has no
+        # unmeasured neighbor within the conditional search's reach. The lane
+        # used to stay incomplete ("required CuTe flash structural
+        # qualification did not complete") although every reachable config
+        # was measured; it now counts as exhausted and the phase completes.
+        stage_key = "cute_flash_kv_stage"
+        witness = PopulationMember(
+            fn=lambda: None,
+            perfs=[1.0],
+            flat_values=[2, 0],
+            config=helion.Config(
+                block_sizes=[1, 128, 128],
+                cute_flash_pipeline_family="fa4",
+                cute_flash_exp2_packet="1x1",
+                cute_flash_kv_stage=2,
+                cute_flash_wait_hint=0,
+            ),
+            status="ok",
+        )
+        leaf = flash_structural_leaf_from_config(witness.config.config)
+        assert leaf is not None
+
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.config_spec = _cute_flash_test_config_spec()
+        search.config_gen = SimpleNamespace(
+            encode_config=lambda flat: flat,
+            flash_structural_leaf_catalog=lambda: [leaf],
+            flash_low_confound_schedule_anchor_configs=list,
+            flash_clc_lane_catalog=dict,
+            flash_exact_effective_search_space_configs=lambda _limit: None,
+        )
+        search.copies = 5
+        search.num_neighbors = 300
+        search.num_neighbors_cap = -1
+        search.max_generations = 20
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search.population = [witness]
+        search.initial_population = len(search.population)
+        search.train_x = []
+        search.train_y = []
+        search._train_members = []
+        search.polish_rounds = 0
+        search.train_configs = []
+        search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
+        search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
+        search._pruned_pattern_search_from = lambda *_args, **_kwargs: iter(())
+        conditional_searches: list[tuple[tuple[tuple[str, object], ...], int]] = []
+
+        def no_reachable_candidate(members, _leaf, constraints, _known, limit):
+            conditional_searches.append((constraints, limit))
+            ranked = sorted(members, key=search._flash_member_rank_key)
+            return (ranked[0] if ranked else None, [], {"attempts": []})
+
+        search._flash_conditional_parent_candidates = no_reachable_candidate
+        search._budgeted_range = lambda *args: range(*args)
+        search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
+        search.set_generation = Mock()
+        search.rebenchmark_population = Mock()
+        search._fit_surrogate = Mock()
+        search.benchmark_population = Mock(
+            side_effect=AssertionError("nothing is left to measure")
+        )
+
+        self.assertEqual(
+            search._run_flash_structural_qualification({witness.config}), 2
+        )
+        metrics = search._autotune_metrics.search_phase_metrics
+        self.assertTrue(metrics["completed"])
+        self.assertFalse(metrics["exact_space_enumerated"])
+        self.assertEqual(len(conditional_searches), 1)
+        self.assertEqual(conditional_searches[0][0][-1], (stage_key, 2))
+        leaf_result = metrics["leaf_results"][0]
+        self.assertTrue(leaf_result["complete"])
+        lane = leaf_result["pipeline_lanes"][0]
+        self.assertTrue(lane["witness_succeeded"])
+        self.assertTrue(lane["conditional_required"])
+        self.assertEqual(lane["conditional_candidate_ids"], [])
+        self.assertTrue(lane["conditional_exhausted"])
+        self.assertFalse(lane["terminal_failure_exhausted"])
+        self.assertTrue(lane["complete"])
+        search.benchmark_population.assert_not_called()
 
     def test_lfbo_flash_failed_existing_lane_uses_catalog_witness(self):
         stage_key = "cute_flash_kv_stage"
@@ -7046,7 +7237,12 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             compiler_seed_timeout_retry_repetitions=(
                 compiler_seed_timeout_retry_repetitions
             ),
-            backend=SimpleNamespace(config_value_priors_version=1),
+            backend=SimpleNamespace(
+                config_value_priors_version=1,
+                # Like the CuTe backend: no precompile pool, so the cache
+                # policy reports no precompile mode.
+                supports_precompile=lambda: False,
+            ),
             backend_name="cute",
             cute_flash_search_enabled=True,
         )
@@ -7130,7 +7326,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert isinstance(random_algorithm, dict)
         self.assertEqual(
             full_algorithm["cute_flash_lane_policy_version"],
-            16,
+            17,
         )
         self.assertEqual(
             full_algorithm["cute_flash_terminal_coordinate_refinement"],
@@ -7180,7 +7376,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search._cute_flash_lane_policy_enabled = True
         cute_flash_policy = search._algorithm_cache_policy()
         self.assertEqual(cute_flash_policy["lfbo_version"], 3)
-        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 16)
+        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_starting_path_limit"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_family_probe_path_limit"], 18)
         self.assertEqual(cute_flash_policy["cute_flash_maximum_path_capacity"], 18)
@@ -7236,7 +7432,6 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                 )
             ),
             self._search(best_of_k=2),
-            self._search(precompile_jobs=2),
             self._search(with_torch_compile_fusion=True),
         )
         self.assertTrue(all(self._hash(variant) != baseline for variant in variants))
@@ -7245,6 +7440,13 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         self.assertEqual(
             self._hash(self._search(random_seed=1)),
             self._hash(self._search(random_seed=2)),
+        )
+
+    def test_precompile_parallelism_does_not_change_policy(self) -> None:
+        # Precompile processes or render workers change no result.
+        self.assertEqual(
+            self._hash(self._search()),
+            self._hash(self._search(precompile_jobs=2)),
         )
 
     def test_seed_configs_and_best_available_limits_change_policy(self) -> None:
