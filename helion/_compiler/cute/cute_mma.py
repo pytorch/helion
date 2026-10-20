@@ -3174,6 +3174,20 @@ class _MmaOperandAnalysis:
     rhs: _MmaOperandInfo
 
     @property
+    def lhs_tma_major_supported(self) -> bool:
+        """Whether the tcgen05 TMA pipeline can stage A in its storage order.
+
+        A K-major (row-major) A always can; an M-major A (``x.T``) only in a
+        plain rank-2 GEMM, mirroring ``_emit_mma_pipeline``'s gate.
+        """
+        return self.lhs.matrix_major == "row" or (
+            self.lhs.matrix_major == "col"
+            and not self.has_leading_passthrough
+            and self.lhs.logical_fake.ndim == 2
+            and self.rhs.logical_fake.ndim == 2
+        )
+
+    @property
     def supports_role_local_n_edge_tma(self) -> bool:
         """Whether rank-2 layouts support the partial-N role-local TMA path."""
         return (
@@ -4166,7 +4180,7 @@ def analyze_cute_mma_node(
         operands=operands,
         output_store_analysis=output_store_analysis,
         explicit_epi_tile_compatible=(
-            operands.lhs.matrix_major == "row"
+            operands.lhs_tma_major_supported
             and operands.rhs.matrix_major in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
@@ -7694,10 +7708,21 @@ def _emit_mma_pipeline(
     ) or (input_dtype == torch.float32 and cute_fp32_dot_uses_tf32())
     _lhs_major = lhs_operand.matrix_major
     _rhs_major = rhs_operand.matrix_major
-    # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
-    # layout Helion emits expects the standard row-major A. Only B's major
-    # mode is made layout-aware here.
-    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
+    # A is K-major when its (M, K) storage is K-contiguous (row-major) and
+    # M-major when M-contiguous (column-major, e.g. ``x.T``). The grouped
+    # schedules stage the original A as a K-major operand, so an M-major A is
+    # staged through TMA only for the plain 2-D GEMM.
+    plain_gemm = (
+        grouped_mode is None
+        and not row_union_requested
+        and lhs_fake.ndim == 2
+        and rhs_fake.ndim == 2
+        and not (analysis is not None and analysis.has_leading_passthrough)
+    )
+    tcgen05_use_tma_a = _dtype_tma_ok and (
+        _lhs_major == "row" or (_lhs_major == "col" and plain_gemm)
+    )
+    tcgen05_a_k_major = _lhs_major == "row"
     tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
     # The wrapper constructs an A/B descriptor pair. Keep both scalar
     # producers if either descriptor's alignment is unproved; this also
@@ -8035,7 +8060,9 @@ def _emit_mma_pipeline(
         output_column_major = True
     # N,M orientation computes C.T = B @ A.T. Therefore the original grouped
     # B becomes physical operand A, while packed A becomes physical operand B.
-    tcgen05_mma_a_k_major = not tcgen05_nm_orientation or tcgen05_b_k_major
+    tcgen05_mma_a_k_major = (
+        tcgen05_b_k_major if tcgen05_nm_orientation else tcgen05_a_k_major
+    )
     tcgen05_mma_b_k_major = True if tcgen05_nm_orientation else tcgen05_b_k_major
     worklist_profile = None
     tcgen05_worklist_source_m_tile: int | None = None
@@ -8150,6 +8177,21 @@ def _emit_mma_pipeline(
             mma_impl = "universal"
         else:
             input_dtype_str = "cutlass.TFloat32"
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_b
+        and tcgen05_mma_b_k_major
+        and tcgen05_mma_bn == 8
+        and bk * input_dtype.itemsize == 32
+    ):
+        # CuTe cannot fold an 8-row stage of 32-byte K-major B rows into one
+        # TMA box: it issues one bulk copy per row at 32-byte shared offsets,
+        # and the TMA unit faults on the unaligned destination (a sticky
+        # misaligned-address error that also kills an in-process autotune).
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 K-major B TMA with block_n=8 needs block_k * itemsize >= 64",
+        )
     if (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -8987,6 +9029,8 @@ def _emit_mma_pipeline(
         mma_impl != "tcgen05"
         or tcgen05_is_two_cta
         or not tcgen05_use_tma_pipeline
+        # The G4 envelope was proven with the row-major (K-major) A layout.
+        or not tcgen05_a_k_major
         or not tcgen05_static_full_tiles
         or not tcgen05_use_tma_store_epilogue
     ):
@@ -12085,6 +12129,16 @@ def _emit_mma_pipeline(
                 and c_input_aux_tensor_descriptors
                 and aux_single_store_value
             )
+            if aux_productive_body_gate_open and not tcgen05_pid_is_persistent:
+                # Only the persistent program's role-local whiles emit the aux
+                # producer body; without it the epilogue's consumer_wait on
+                # the aux ring never completes (the kernel hangs).
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "a tcgen05 aux producer warp (tcgen05_warp_spec_c_input_warps"
+                    "=1 or the aux-TMA store warp) requires a persistent "
+                    "tcgen05 pid_type",
+                )
             if (
                 tcgen05_aux_tma_requested
                 and all_aux_tensor_descriptors

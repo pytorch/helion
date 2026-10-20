@@ -127,7 +127,7 @@ def analyze_pipeline_smem_facts(
         or operands.lhs.source_fake.dtype
         not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
-        or operands.lhs.matrix_major != "row"
+        or not operands.lhs_tma_major_supported
         or operands.rhs.matrix_major not in ("row", "col")
         or candidate.output_store_analysis is None
         or candidate.requires_accumulator_seed
