@@ -84,6 +84,8 @@ class BlockScaledMmaPlan:
     logical_m_per_cta: int = 128
     swap_ab: bool = False
     compact_m: bool = False
+    sf_tma: bool = False
+    sf_inplace: bool = False
 
     @property
     def workspace_bytes(self) -> int:
@@ -691,6 +693,8 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         wrapper_plan["logical_m_per_cta"] = plan.logical_m_per_cta
         wrapper_plan["swap_ab"] = plan.swap_ab
         wrapper_plan["compact_m"] = plan.compact_m
+        wrapper_plan["sf_tma"] = plan.sf_tma
+        wrapper_plan["sf_inplace"] = plan.sf_inplace
         if plan.fused_scales:
             for side, operand in (("lhs", plan.lhs), ("rhs", plan.rhs)):
                 row_stride, column_stride = operand.source.scale.stride()
