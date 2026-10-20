@@ -767,12 +767,14 @@ class CompileEnvironment:
         has_direct_source = source is not None and _is_supported_tensor_input_source(
             source
         )
-        # The 16-byte base-address requirement belongs to CUDA TMA. Other
-        # tensor-descriptor backends retain their existing legality checks and
-        # must not acquire a CUDA-specific runtime specialization.
+        # Triton tensor descriptors need a 16-byte aligned base on CUDA (TMA)
+        # and on XPU, where a descriptor over a misaligned base reads from
+        # the address rounded down.  Other tensor-descriptor backends retain
+        # their existing legality checks and must not acquire this runtime
+        # specialization.
         alignment_source = (
             self.tensor_descriptor_alignment_source(fake_tensor)
-            if self.backend_name == "triton" and self.device.type == "cuda"
+            if self.backend_name == "triton" and self.device.type in ("cuda", "xpu")
             else None
         )
         if alignment_source is not None:

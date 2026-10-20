@@ -8,6 +8,7 @@ import torch
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_host_tensor_descriptor
+from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -16,6 +17,7 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -592,6 +594,51 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             pointer_copy_view(unaligned), unaligned.view(16, 128)
         )
         self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
+
+    @skipIfFn(
+        lambda: not supports_tensor_descriptor(),
+        "Tensor descriptor support is required",
+    )
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_tensor_descriptor_alignment_specialization(self):
+        """A device descriptor over an input, or over a view of one, specializes
+        the bound kernel on the input's 16-byte base alignment."""
+        config = helion.Config(block_sizes=[16, 16], indexing="tensor_descriptor")
+
+        @helion.kernel(autotune_effort="none", static_shapes=True, config=config)
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True, config=config)
+        def copy_view(x: torch.Tensor) -> torch.Tensor:
+            view = x.view(16, 128)
+            out = torch.empty_like(view)
+            for tile in hl.tile(view.size()):
+                out[tile] = view[tile]
+            return out
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        storage = torch.randn(32 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(32, 64)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+
+        for kernel, name, expected in (
+            (copy, "x", lambda t: t),
+            (copy_view, "view", lambda t: t.view(16, 128)),
+        ):
+            descriptor = f"make_tensor_descriptor({name},"
+            aligned_code, aligned_result = code_and_output(kernel, (aligned,))
+            torch.testing.assert_close(aligned_result, expected(aligned))
+            self.assertIn(descriptor, aligned_code)
+            aligned_bound = kernel.bind((aligned,))
+
+            unaligned_code, unaligned_result = code_and_output(kernel, (unaligned,))
+            torch.testing.assert_close(unaligned_result, expected(unaligned))
+            self.assertNotIn(descriptor, unaligned_code)
+            self.assertIsNot(aligned_bound, kernel.bind((unaligned,)))
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_dynamic_output_falls_back(self):
