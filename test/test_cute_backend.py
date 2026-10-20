@@ -16821,6 +16821,7 @@ class TestCuteBackend(TestCase):
     def test_grouped_device_split_cluster_bound_uses_source_profile(self) -> None:
         launcher = importlib.import_module("helion.runtime.cute.launcher")
         common_plan = {
+            "orientation": "nm",
             "group_count": 8,
             "m_size": 2048,
             "n_size": 512,
