@@ -2071,6 +2071,8 @@ class _Tcgen05Emitter(_Emitter):
                     value = f"({loop_value}) * {self.plan.size(axis)}"
                 else:
                     value = self.axis_base(axis)
+                if subscript.offset is not None:
+                    value = f"{value} + {self.uniform(subscript.offset, {})}"
             if position == spec.slab_dim and slab:
                 value = f"{value} + {slab * spec.slab_elems}"
             coords.append(f"cutlass.Int32({value})")
@@ -3419,11 +3421,11 @@ class _Tcgen05Emitter(_Emitter):
         self.epilogue_sites_in_loop = (
             bool(self.epilogue_sites) and not general and bool(trip_static)
         )
-        for index in range(len(self.epilogue_sites)):
-            self.emit(f"md_ex{index} = cutlass.Float32(0.0)")
+        for index, (node, _coords) in enumerate(self.epilogue_sites):
+            self.emit(f"md_ex{index} = {self.zero(self.accesses[node].dtype)}")
         if self.prefetched:
-            for register in self.prefetched.values():
-                self.emit(f"{register} = cutlass.Float32(0.0)")
+            for (node, _coords), register in self.prefetched.items():
+                self.emit(f"{register} = {self.zero(self.accesses[node].dtype)}")
             with (
                 self.nest(f"if {end} > {begin}:") if trip_static is None else _NoNest()
             ):
@@ -3438,8 +3440,10 @@ class _Tcgen05Emitter(_Emitter):
                         self.emit_line_prefetch(value)
         self.discover_tables()
         if self.table_regs:
-            for register in (*self.table_regs.values(), *self.table_loads.values()):
+            for register in self.table_regs.values():
                 self.emit(f"{register} = cutlass.Float32(0.0)")
+            for (node, _coords), register in self.table_loads.items():
+                self.emit(f"{register} = {self.zero(self.accesses[node].dtype)}")
             with (
                 self.nest(f"if {end} > {begin}:") if trip_static is None else _NoNest()
             ):

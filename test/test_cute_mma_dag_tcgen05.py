@@ -1222,6 +1222,63 @@ def test_a_program_that_loads_a_tensor_it_stores_is_not_mine_either() -> None:
     assert bound.config_spec.cute_mma_dag_facts is None
 
 
+def _chunk_state_inputs(seqlen: int = 512) -> tuple[torch.Tensor, ...]:
+    # examples/mamba2_chunk_state.py: batch 2, 8 heads in 2 groups, chunk
+    # 128, headdim 64, dstate 64.
+    bf16 = torch.bfloat16
+    nchunks = (seqlen + 127) // 128
+    return (
+        torch.empty((2, seqlen, 2, 64), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, seqlen, 8, 64), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, 8, nchunks, 128), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, 8, nchunks, 128), dtype=bf16, device=CPU_DEVICE),
+    )
+
+
+def test_chunk_offset_tiles_and_lead_tile_begins_are_admitted() -> None:
+    # ``x[tile_b.begin, tile_k.index + tile_c.begin * chunk, tile_h.begin,
+    # tile_m]``: the leading tiles' begins are scalar coordinates and the
+    # chunk offset rides the loop tile, in the TMA coordinates and in the
+    # byte bases of the side loads.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.default_config().config["cute_mma_dag"] == "tcgen05"
+    body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=2)))
+    # The x box at (m, h, k + 128 * c, b) and the B box at (n, k + 128 * c, b).
+    assert re.search(
+        r"\[cutlass\.Int32\(md_a\d\), cutlass\.Int32\(tile_offset_\d\), "
+        r"cutlass\.Int32\(0 \* 128 \+ 128 \* tile_offset_\d\)",
+        body,
+    ), body
+    assert body.count("128 * tile_offset_") >= 4, body
+    warp = _kernel_body(
+        _source(
+            bound,
+            helion.Config(
+                block_sizes=[64, 64, 64],
+                cute_mma_dag="warp",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=2,
+            ),
+        )
+    )
+    assert re.search(r"md_base = x\.iterator\.toint\(\) .*128 \* tile_offset_", warp)
+
+
+def test_an_offset_tile_that_can_leave_the_tensor_is_not_mine() -> None:
+    # seqlen 500: the last chunk's tile reads rows 384..511 of a 500-row x,
+    # which the masked scalar lowering zero-fills.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(
+        helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs(seqlen=500)
+    )
+    assert bound.config_spec.cute_mma_dag is None
+
+
 # --------------------------------------------------------------------------
 # Region programs
 # --------------------------------------------------------------------------
