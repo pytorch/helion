@@ -25,6 +25,7 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import PatternSearch
+from helion.autotuner import base_search as base_search_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -638,6 +639,230 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
         ):
             self.assertIs(search.final_rebenchmark_best(member_b), member_a)
+
+    def _spread_search(
+        self,
+    ) -> tuple[PopulationBasedSearch, list[PopulationMember]]:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 1.0
+        members = [
+            PopulationMember(
+                lambda: None, [perf], (), helion.Config(num_warps=warps), status="ok"
+            )
+            for perf, warps in ((1.0, 1), (1.2, 2), (2.0, 4), (5.0, 8))
+        ]
+        search._benchmarked_members = {member.config: member for member in members}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search.population = [members[0]]
+        return search, members
+
+    def test_final_rebenchmark_shortlist_is_sized_to_the_search_spread(
+        self,
+    ) -> None:
+        search, members = self._spread_search()
+        best, near, far, farther = members
+        seen: list[list[PopulationMember]] = []
+
+        def fake_rebenchmark(
+            finalists: list[PopulationMember], **_kwargs: object
+        ) -> None:
+            seen.append(list(finalists))
+            for member in finalists:
+                member.perfs.append(member.perfs[0])
+
+        with (
+            clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED="1"),
+            patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
+        ):
+            # 1.5x of the best search reading keeps 1.0 and 1.2; 2.0 and 5.0
+            # cannot overturn the ranking and are not re-timed.
+            self.assertIs(search.final_rebenchmark_best(best), best)
+            self.assertEqual(seen.pop(), [best, near])
+            # inf keeps the whole top_k.
+            with clean_final_rebenchmark_env(
+                HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED="1",
+                HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD="inf",
+            ):
+                search.final_rebenchmark_best(best)
+            self.assertEqual(seen.pop(), [best, near, far, farther])
+            # A pinned seed defends its title whatever its search reading.
+            search.pin_finalist_config(farther.config)
+            search._pinned_finalist_members = {farther.config: farther}
+            search.final_rebenchmark_best(best)
+            self.assertEqual(seen.pop(), [farther, best, near])
+            # The incumbent survives too.
+            search._pinned_finalist_configs = set()
+            search._pinned_finalist_members = {}
+            search.final_rebenchmark_best(farther)
+            self.assertEqual(seen.pop(), [best, near, farther])
+            # Nothing within the spread of the incumbent: no re-timing at all.
+            search._benchmarked_members = {best.config: best, farther.config: farther}
+            self.assertIs(search.final_rebenchmark_best(best), best)
+            self.assertEqual(seen, [])
+
+    def test_final_rebenchmark_max_spread_env(self) -> None:
+        search, _members = self._spread_search()
+        with clean_final_rebenchmark_env():
+            self.assertEqual(search._final_rebenchmark_max_spread(), 1.5)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD="3"
+        ):
+            self.assertEqual(search._final_rebenchmark_max_spread(), 3.0)
+        for invalid in ("0.5", "nan", "wide"):
+            with clean_final_rebenchmark_env(
+                HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD=invalid
+            ):
+                self.assertEqual(search._final_rebenchmark_max_spread(), 1.5)
+        # The full-effort final selection does not read it.
+        self.assertIn(
+            "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD",
+            base_search_module._FINAL_SELECTION_IGNORED_ENVS,
+        )
+
+    def _isolation_search(
+        self,
+    ) -> tuple[PopulationBasedSearch, LocalBenchmarkProvider, list[dict[str, object]]]:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 0.05
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.mutated_arg_indices = []
+        # The worker measurer names its L2 regime from the backend's timer
+        # (``_subprocess_benchmark_uses_wall_clock``): no backend, event timer.
+        provider.config_spec = SimpleNamespace(backend=None)
+        calls: list[dict[str, object]] = []
+
+        def benchmark_isolated(
+            fns: list[Callable[[], object]], **kwargs: object
+        ) -> list[float]:
+            calls.append({"count": len(fns), **kwargs})
+            return [0.04 for _ in fns]
+
+        provider.benchmark_isolated = benchmark_isolated  # pyrefly: ignore[bad-assignment]
+        provider.release_private_argument_copies = Mock()  # pyrefly: ignore[bad-assignment]
+        search.benchmark_provider = provider
+        return search, provider, calls
+
+    def test_isolated_final_rebenchmark_times_finalists_in_one_worker(self) -> None:
+        # Candidate-private isolation reads private argument copies in the
+        # long-lived worker (one steady window per finalist, the regime of
+        # the full-effort final selection) instead of spawning a process per
+        # finalist; the copies are released once the batch is done.
+        search, provider, calls = self._isolation_search()
+        members = [
+            PopulationMember(lambda: None, [0.05], (), helion.Config(num_warps=4)),
+            PopulationMember(lambda: None, [0.06], (), helion.Config(num_warps=8)),
+        ]
+        with (
+            patch.object(
+                LocalBenchmarkProvider,
+                "steady_window_benchmark_available",
+                return_value=True,
+            ),
+            patch.object(
+                LocalBenchmarkProvider,
+                "private_argument_copies_affordable",
+                return_value=True,
+            ) as affordable,
+        ):
+            search.rebenchmark(
+                members,
+                desc="Final verification top 2 configs",
+                target_ms=1000.0,
+                use_isolated=True,
+                confirm_suspicious=False,
+                use_interleaved=False,
+                candidate_private_args=True,
+            )
+        affordable.assert_called_once_with(2)
+        self.assertEqual([call_["count"] for call_ in calls], [1, 1])
+        self.assertEqual([call_["args_slots"] for call_ in calls], [[0], [1]])
+        self.assertEqual([call_["rep"] for call_ in calls], [1000, 1000])
+        self.assertEqual([call_["warmup"] for call_ in calls], [1, 1])
+        self.assertTrue(all("fresh_process" not in call_ for call_ in calls))
+        self.assertTrue(
+            all(call_["desc"] == "Final verification top 2 configs" for call_ in calls)
+        )
+        self.assertTrue(all(call_["timeout"] >= 30.0 for call_ in calls))  # pyrefly: ignore[unsupported-operation]
+        self.assertEqual([member.perf for member in members], [0.04, 0.04])
+        provider.release_private_argument_copies.assert_called_once_with()  # pyrefly: ignore[missing-attribute]
+
+    def test_isolated_final_rebenchmark_spawns_fresh_processes_when_copies_do_not_fit(
+        self,
+    ) -> None:
+        search, provider, calls = self._isolation_search()
+        members = [
+            PopulationMember(lambda: None, [0.05], (), helion.Config(num_warps=4)),
+            PopulationMember(lambda: None, [0.06], (), helion.Config(num_warps=8)),
+        ]
+        with (
+            patch.object(
+                LocalBenchmarkProvider,
+                "steady_window_benchmark_available",
+                return_value=True,
+            ),
+            patch.object(
+                LocalBenchmarkProvider,
+                "private_argument_copies_affordable",
+                return_value=False,
+            ),
+        ):
+            search.rebenchmark(
+                members,
+                target_ms=1000.0,
+                use_isolated=True,
+                confirm_suspicious=False,
+                use_interleaved=False,
+                candidate_private_args=True,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["count"], 2)
+        self.assertTrue(calls[0]["fresh_process"])
+        self.assertNotIn("args_slots", calls[0])
+        provider.release_private_argument_copies.assert_not_called()  # pyrefly: ignore[missing-attribute]
+
+    def test_isolated_final_rebenchmark_falls_back_when_worker_becomes_unloadable(
+        self,
+    ) -> None:
+        # A wrapper the worker cannot load disables it mid-batch: the batch
+        # reports no isolated timings so every finalist is timed in-process.
+        search, provider, calls = self._isolation_search()
+        members = [
+            PopulationMember(lambda: None, [0.05], (), helion.Config(num_warps=4)),
+            PopulationMember(lambda: None, [0.06], (), helion.Config(num_warps=8)),
+        ]
+        with (
+            patch.object(
+                LocalBenchmarkProvider,
+                "steady_window_benchmark_available",
+                side_effect=[True, False],
+            ),
+            patch.object(
+                LocalBenchmarkProvider,
+                "private_argument_copies_affordable",
+                return_value=True,
+            ),
+        ):
+            self.assertIsNone(
+                search._isolated_rebenchmark_results(
+                    members, rep=1000, desc="d", candidate_private_args=True
+                )
+            )
+        self.assertEqual(len(calls), 1)
+        provider.release_private_argument_copies.assert_called_once_with()  # pyrefly: ignore[missing-attribute]
 
     def test_rebenchmark_repeat_for_target_ms(self) -> None:
         self.assertEqual(PopulationBasedSearch._repeat_for_target_ms(200.0, 100.0), 3)
