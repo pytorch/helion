@@ -3,16 +3,68 @@ from __future__ import annotations
 import contextlib
 import io
 import math
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
 from helion._testing import onlyBackends
 import helion.language as hl
+
+
+def _run_disabled_ref_case(
+    interpret: str, *, setup_failure: bool = False
+) -> tuple[unittest.TestResult, list[str]]:
+    events: list[str] = []
+
+    class SetupProbe(unittest.TestCase):
+        def setUp(self) -> None:
+            super().setUp()
+            events.append("setup")
+            if setup_failure:
+                raise RuntimeError("setup failed")
+
+        def test_body(self) -> None:
+            events.append("body")
+
+        def tearDown(self) -> None:
+            events.append("teardown")
+            super().tearDown()
+
+    class DisabledCase(RefEagerTestDisabled, SetupProbe):
+        pass
+
+    result = unittest.TestResult()
+    with patch.dict(os.environ, {"HELION_INTERPRET": interpret}):
+        DisabledCase("test_body").run(result)
+    return result, events
+
+
+class TestRefEagerTestDisabled(TestCase):
+    def test_normal_mode_runs_setup_body_and_teardown(self) -> None:
+        result, events = _run_disabled_ref_case("0")
+        self.assertTrue(result.wasSuccessful())
+        self.assertFalse(result.skipped)
+        self.assertEqual(events, ["setup", "body", "teardown"])
+
+    def test_reference_mode_skips_before_setup(self) -> None:
+        result, events = _run_disabled_ref_case("1")
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(len(result.skipped), 1)
+        self.assertEqual(events, [])
+
+    def test_normal_mode_reports_setup_errors(self) -> None:
+        result, events = _run_disabled_ref_case("0", setup_failure=True)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("setup failed", result.errors[0][1])
+        self.assertFalse(result.skipped)
+        self.assertEqual(events, ["setup"])
 
 
 @onlyBackends(["triton", "cute"])

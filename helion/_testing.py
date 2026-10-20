@@ -1819,9 +1819,9 @@ class RefEagerTestDisabled:
 
     def setUp(self) -> None:
         """Skip test if ref eager mode is enabled."""
-        super().setUp()  # type: ignore[misc]
         if os.environ.get("HELION_INTERPRET") == "1":
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
+        super().setUp()  # type: ignore[misc]
 
 
 class TestCase(unittest.TestCase):
