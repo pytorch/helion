@@ -191,35 +191,35 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
         _helion_flash_ptx.declare_ptx_idesc(_flash_pv_mma.op, 'helion_flash_pv_mma_idesc')
         flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
         flash_grid_dim = cutlass.Int32(cute.arch.grid_dim()[0])
+        flash_item = flash_tile_id
+        if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+            flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
+        flash_m_pair = flash_item & cutlass.Int32(3)
+        flash_bh = flash_item >> 2
+        flash_m_tile0 = flash_m_pair * 2
+        flash_m_tile1 = flash_m_tile0 + 1
+        flash_q_mma_tile0 = flash_m_tile0
+        flash_q_mma_tile1 = flash_m_tile1
+        flash_flex_b = flash_bh // _flash_heads
+        flash_flex_h = flash_bh % _flash_heads
+        flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
+        flash_flex_p0_0 = cutlass.Int32(0)
+        flash_flex_f0_0 = cutlass.Int32(255)
+        flash_flex_p1_0 = cutlass.Int32(0)
+        flash_flex_f1_0 = cutlass.Int32(255)
+        if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+            flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+            flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+            flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+            flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+        flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
+        flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
+        flash_q0_full = flash_q_cons.wait_and_advance()
+        flash_k0_full = flash_kv_cons.wait_and_advance()
+        _helion_flash_ptx.gemm_ptx_precomputed_qk(flash_s0_addr, _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, flash_k0_full.index].iterator), flash_k_smem_base, tSrK[None, None, None, 0].layout, 'helion_flash_q_smem_desc', 'helion_flash_qk_mma_idesc', smem_offset=-1024, zero_init=True)
+        with cute.arch.elect_one():
+            cute_tcgen05_flash.commit(flash_s_full_ptr + 0)
         while flash_tile_id < 32:
-            flash_item = flash_tile_id
-            if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
-                flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_id])
-            flash_m_pair = flash_item & cutlass.Int32(3)
-            flash_bh = flash_item >> 2
-            flash_m_tile0 = flash_m_pair * 2
-            flash_m_tile1 = flash_m_tile0 + 1
-            flash_q_mma_tile0 = flash_m_tile0
-            flash_q_mma_tile1 = flash_m_tile1
-            flash_flex_b = flash_bh // _flash_heads
-            flash_flex_h = flash_bh % _flash_heads
-            flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
-            flash_flex_p0_0 = cutlass.Int32(0)
-            flash_flex_f0_0 = cutlass.Int32(255)
-            flash_flex_p1_0 = cutlass.Int32(0)
-            flash_flex_f1_0 = cutlass.Int32(255)
-            if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
-                flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
-                flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
-                flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
-                flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
-            flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
-            flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
-            flash_q0_full = flash_q_cons.wait_and_advance()
-            flash_k0_full = flash_kv_cons.wait_and_advance()
-            _helion_flash_ptx.gemm_ptx_precomputed_qk(flash_s0_addr, _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, flash_k0_full.index].iterator), flash_k_smem_base, tSrK[None, None, None, 0].layout, 'helion_flash_q_smem_desc', 'helion_flash_qk_mma_idesc', smem_offset=-1024, zero_init=True)
-            with cute.arch.elect_one():
-                cute_tcgen05_flash.commit(flash_s_full_ptr + 0)
             flash_q1_full = flash_q_cons.wait_and_advance()
             _helion_flash_ptx.gemm_ptx_precomputed_qk(flash_s1_addr, _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, flash_k0_full.index].iterator), flash_k_smem_base, tSrK[None, None, None, 0].layout, 'helion_flash_q_smem_desc', 'helion_flash_qk_mma_idesc', smem_offset=1024, zero_init=True)
             with cute.arch.elect_one():
@@ -230,6 +230,7 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             for flash_i in cutlass.range(flash_num_active_kv - 1, unroll=1):
                 flash_v_full = flash_kv_cons.wait_and_advance()
                 _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase, 10000000)
+                _helion_flash_rt.tcgen05_fence_after_thread_sync()
                 _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(flash_o0_addr, flash_s0_addr, _helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, flash_v_full.index].iterator), flash_v_smem_base, tOrP0[None, None, None, 0].layout, tOrV[None, None, None, 0].layout, 'helion_flash_pv_mma_idesc', zero_init=flash_o_zero0, wait_hint=10000000)
                 flash_o_zero0 = cutlass.Boolean(False)
                 flash_k_full = flash_kv_cons.wait_and_advance()
@@ -237,6 +238,7 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
                 with cute.arch.elect_one():
                     cute_tcgen05_flash.commit(flash_s_full_ptr + 0)
                 _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase, 10000000)
+                _helion_flash_rt.tcgen05_fence_after_thread_sync()
                 _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(flash_o1_addr, flash_s1_addr, _helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, flash_v_full.index].iterator), flash_v_smem_base, tOrP1[None, None, None, 0].layout, tOrV[None, None, None, 0].layout, 'helion_flash_pv_mma_idesc', zero_init=flash_o_zero1, wait_hint=10000000)
                 flash_o_zero1 = cutlass.Boolean(False)
                 flash_v_full.release()
@@ -249,16 +251,48 @@ def _helion_helion_flex_attention_kernel(query, key, value, out, block_mask_kv_n
             flash_q1_full.release()
             flash_v_full = flash_kv_cons.wait_and_advance()
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase, 10000000)
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(flash_o0_addr, flash_s0_addr, _helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, flash_v_full.index].iterator), flash_v_smem_base, tOrP0[None, None, None, 0].layout, tOrV[None, None, None, 0].layout, 'helion_flash_pv_mma_idesc', zero_init=flash_o_zero0, wait_hint=10000000)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(flash_o_full_ptr + 0)
+            flash_tile_next = flash_tile_id + flash_grid_dim
+            if flash_tile_next < 32:
+                flash_item = flash_tile_next
+                if _flash_flex_hflags & cutlass.Int32(2) == cutlass.Int32(0):
+                    flash_item = cutlass.Int32(_flash_mFlexItems[flash_tile_next])
+                flash_m_pair = flash_item & cutlass.Int32(3)
+                flash_bh = flash_item >> 2
+                flash_m_tile0 = flash_m_pair * 2
+                flash_m_tile1 = flash_m_tile0 + 1
+                flash_q_mma_tile0 = flash_m_tile0
+                flash_q_mma_tile1 = flash_m_tile1
+                flash_flex_b = flash_bh // _flash_heads
+                flash_flex_h = flash_bh % _flash_heads
+                flash_flex_wrow = (flash_bh * cutlass.Int32(4) + flash_m_pair) * cutlass.Int32(4)
+                flash_flex_p0_0 = cutlass.Int32(0)
+                flash_flex_f0_0 = cutlass.Int32(255)
+                flash_flex_p1_0 = cutlass.Int32(0)
+                flash_flex_f1_0 = cutlass.Int32(255)
+                if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):
+                    flash_flex_p0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(0)])
+                    flash_flex_f0_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(1)])
+                    flash_flex_p1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(2)])
+                    flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])
+                flash_flex_u0 = flash_flex_p0_0 | flash_flex_f0_0 | flash_flex_p1_0 | flash_flex_f1_0
+                flash_num_active_kv = cutlass.max(cutlass.Int32(1), cutlass.Int32(cute.arch.popc(flash_flex_u0)))
+                flash_q0_full = flash_q_cons.wait_and_advance()
+                flash_k0_full = flash_kv_cons.wait_and_advance()
+                _helion_flash_ptx.gemm_ptx_precomputed_qk(flash_s0_addr, _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, flash_k0_full.index].iterator), flash_k_smem_base, tSrK[None, None, None, 0].layout, 'helion_flash_q_smem_desc', 'helion_flash_qk_mma_idesc', smem_offset=-1024, zero_init=True)
+                with cute.arch.elect_one():
+                    cute_tcgen05_flash.commit(flash_s_full_ptr + 0)
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase, 10000000)
+            _helion_flash_rt.tcgen05_fence_after_thread_sync()
             _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(flash_o1_addr, flash_s1_addr, _helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, flash_v_full.index].iterator), flash_v_smem_base, tOrP1[None, None, None, 0].layout, tOrV[None, None, None, 0].layout, 'helion_flash_pv_mma_idesc', zero_init=flash_o_zero1, wait_hint=10000000)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(flash_o_full_ptr + 1)
             flash_v_full.release()
             flash_pfor_phase ^= 1
-            flash_tile_id = flash_tile_id + flash_grid_dim
+            flash_tile_id = flash_tile_next
         flash_tmem.relinquish_alloc_permit()
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         flash_tmem.free(flash_tmem_ptr)

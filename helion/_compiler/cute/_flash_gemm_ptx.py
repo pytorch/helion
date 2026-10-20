@@ -818,6 +818,9 @@ def _ptx_parity_wait(
         f"@P{tag} bra DONE{tag}; \n\t"
         f"bra     LAB_WAIT{tag}; \n\t"
         f"DONE{tag}: \n\t"
+        # The P tile behind the barrier was written by ``tcgen05.st``: the
+        # MMAs that follow are ordered after the wait by this fence.
+        "tcgen05.fence::after_thread_sync; \n\t"
     )
 
 
@@ -889,6 +892,7 @@ def gemm_ptx_precomputed_pv_ts(
             "@P1 bra DONE; \n\t"
             "bra     LAB_WAIT; \n\t"
             "DONE: \n\t"
+            "tcgen05.fence::after_thread_sync; \n\t"
         )
     else:
         assert mbar_mid_ptrs is None, "mbar_mid_ptrs needs the final-quarter mbar_ptr"
@@ -1141,6 +1145,7 @@ def gemm_ptx_partial(
                 "@P1 bra DONE; \n\t"
                 "bra     LAB_WAIT; \n\t"
                 "DONE: \n\t"
+                "tcgen05.fence::after_thread_sync; \n\t"
             )
         else:
             mbar_wait_str = ""

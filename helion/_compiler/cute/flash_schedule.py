@@ -110,6 +110,18 @@ class FlashScheduleSpec:
     # Q, and a non-persistent CTA loads no further Q tile, so both Q stages
     # are dead by then. Needs ``stage_output``; no bytes for the staged tiles.
     output_over_query: bool = False
+    # Staged output tiles per CTA (``cute_flash_o_stage``): None stages one
+    # tile per query slot; 1 shares one tile between the slots (the second
+    # slot's staging waits for the first slot's store to drain), which frees
+    # a tile of shared memory for the K/V ring.
+    output_tiles: int | None = None
+
+
+def _output_tile_count(spec: FlashScheduleSpec) -> int:
+    """Staged output tiles of one CTA (``output_tiles`` or one per slot)."""
+    if spec.output_tiles is None:
+        return spec.query_slots_per_cta
+    return spec.output_tiles
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,7 +304,7 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
         kv_bytes = _aliased_kv_ring_bytes(spec)
     output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
     output_bytes = (
-        spec.query_slots_per_cta * output_tile_bytes
+        _output_tile_count(spec) * output_tile_bytes
         if spec.stage_output and not spec.output_over_query
         else 0
     )
@@ -969,9 +981,15 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     v_offset = k_offset + (kv_ring_bytes if spec.separate_kv else 0)
     output_offset = q_bytes + (2 if spec.separate_kv else 1) * kv_ring_bytes
     overhead_offset = output_offset + (
-        spec.query_slots_per_cta * output_tile_bytes
+        _output_tile_count(spec) * output_tile_bytes
         if spec.stage_output and not spec.output_over_query
         else 0
+    )
+    # One staged output tile shared by the query slots: their regions alias
+    # and the schedule orders slot 1's staging after slot 0's store (and the
+    # next item's slot 0 after slot 1's store).
+    shared_output_tile = (
+        spec.stage_output and _output_tile_count(spec) < spec.query_slots_per_cta
     )
     if spec.output_over_query:
         # The staged output tiles alias the (dead) Q stages from offset 0.
@@ -1221,6 +1239,18 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     ),
                 ]
             )
+            if shared_output_tile:
+                # The shared tile: slot ``slot``'s staging waits for the
+                # previous slot's store to leave it (slot 0: the previous
+                # item's last slot).
+                previous_slot = (slot - 1) % spec.query_slots_per_cta
+                edges.append(
+                    FlashEdge(
+                        _node_name("output_store", rank, previous_slot),
+                        output_stage,
+                        iteration_delta=1 if slot == 0 else 0,
+                    )
+                )
             if not spec.final_only_stat_handoff:
                 stat_release_slot = slot
                 stat_release_delta = spec.stat_depth
@@ -1423,14 +1453,17 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_stage_r{rank}_q{slot}",
                         FlashMemorySpace.SMEM,
-                        output_offset + slot * output_tile_bytes,
+                        output_offset
+                        + (slot % _output_tile_count(spec)) * output_tile_bytes,
                         output_tile_bytes,
                         1024,
                         FlashVisibility.CTA_PRIVATE,
                         output_stage,
                         (output_store,),
                         alias_group=(
-                            None
+                            f"o_stage_shared_r{rank}"
+                            if shared_output_tile
+                            else None
                             if q_alias_group is None
                             else q_alias_group.format(rank=rank)
                         ),

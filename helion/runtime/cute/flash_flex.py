@@ -75,21 +75,46 @@ def flex_bwd_walk_scratch(
     return cached
 
 
+def flex_tail_base(
+    total_tiles: int, num_sm: int, tail_split: int, tail_items_ws: int
+) -> int:
+    """The first tail unit of the tail split (``cute_flash_flex_tail_split``)
+    for a grid of ``total_tiles`` one-item units on a device of ``num_sm``
+    SMs: the full waves' ``waves * num_sm`` units run unsplit, the last
+    partial wave's items as ``tail_split`` units each, when there is at
+    least one full wave, the tail is not empty, the workspace holds the tail
+    (``tail_items_ws`` items) and the split tail fits one wave of SMs.
+    Otherwise ``total_tiles``: no unit is split.  Launch-time arithmetic
+    (the launcher passes the result as a runtime argument), so the same
+    compiled kernel follows the device it runs on."""
+    if num_sm <= 0 or tail_split <= 1:
+        return total_tiles
+    waves_full, tail_items = divmod(total_tiles, num_sm)
+    if (
+        waves_full >= 1
+        and 0 < tail_items <= tail_items_ws
+        and tail_items * tail_split <= num_sm
+    ):
+        return waves_full * num_sm
+    return total_tiles
+
+
 def flex_split_workspace_elems(
-    items: int, splits: int, head_dim_v: int
+    items: int, splits: int, head_dim_v: int, banks: int = 1
 ) -> tuple[int, int, int]:
     """Element counts of the three regions of the split-KV workspace: the
     fp32 partial output tiles, the fp32 row-statistics tiles and the int32
-    arrival counters (in that order, all 4-byte elements)."""
+    arrival counters (in that order, all 4-byte elements); ``banks`` counter
+    banks (the tail split keeps its generation words in a second one)."""
     return (
         items * splits * 2 * 128 * head_dim_v,
         items * splits * 2 * 128 * 2,
-        items * 2 * 4,
+        items * 2 * 4 * banks,
     )
 
 
 def flex_split_workspace(
-    like: torch.Tensor, *, items: int, splits: int, head_dim_v: int
+    like: torch.Tensor, *, items: int, splits: int, head_dim_v: int, banks: int = 1
 ) -> torch.Tensor:
     """Workspace of the split-KV list walk (``cute_flash_kv_split``).
 
@@ -109,10 +134,11 @@ def flex_split_workspace(
     zeroing becomes a memset node) and is not cached. The partial region
     holds no state across launches (uninitialized memory is only ever read
     after the writing split's release), the counters do (each returns to
-    zero before its launch ends).
+    zero before its launch ends; the tail split's generation words, a
+    second bank, only ever count up and are compared for a change).
     """
     partial_elems, stat_elems, counter_elems = flex_split_workspace_elems(
-        items, splits, head_dim_v
+        items, splits, head_dim_v, banks
     )
 
     def build() -> torch.Tensor:
@@ -133,7 +159,7 @@ def flex_split_workspace(
         stream = torch._C._cuda_getCurrentRawStream(like.device.index)
     else:
         stream = None
-    key = (like.device, stream, items, splits, head_dim_v)
+    key = (like.device, stream, items, splits, head_dim_v, banks)
     cached = _FLEX_SPLIT_WORKSPACE_CACHE.get(key)
     if cached is None:
         cached = build()

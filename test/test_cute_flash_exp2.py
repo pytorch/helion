@@ -1311,6 +1311,7 @@ def test_serial_disc_forwards_degree2_to_chunk_math(degree2: bool | None) -> Non
         patch.object(_flash_runtime.cute, "make_rmem_tensor"),
         patch.object(_flash_runtime.cute, "copy"),
         patch.object(_flash_runtime.cute.arch, "fence_view_async_tmem_store"),
+        patch.object(_flash_runtime, "tcgen05_fence_before_thread_sync"),
         patch.object(_flash_runtime, "_disc_chunk_exp") as chunk_exp,
         patch.object(_flash_runtime, "_disc_chunk_convert_store"),
         patch.object(_flash_runtime, "_disc_chunk_rowsum", return_value=1.0),
