@@ -1005,3 +1005,50 @@ def test_access_pointer_widths() -> None:
     assert _access("_cute_store_u32_vec(p, vals)") == ("p", 4)
     assert _access("_cute_store_u16x8_l2_evict_last(p, vals)") == ("p", 8)
     assert _access("cute.arch.atomic_add(p, v)") is None
+
+
+@skipUnlessBackends(["cute"])
+def test_register_tile_seed_is_the_default_config() -> None:
+    # The autotune-off default is the stride-aware layout the seed describes:
+    # the stride-1 dv axis on vectorized lanes (8 threads x 4 fp32), the
+    # strided D reduction on the remaining threads, instead of the base
+    # default's reduction on the fastest thread index.
+    bound, _arguments = _bind()
+    spec = bound.config_spec
+    assert "cute_register_tile" in spec.autotuner_heuristics
+    assert spec.compiler_default_config is not None
+    default = spec.default_config()
+    (reduction,) = [
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    ]
+    (dv,) = spec.block_sizes.valid_block_ids()
+    thread_ids = spec.num_threads.valid_block_ids()
+    vector_ids = spec.cute_vector_widths.valid_block_ids()
+    num_threads = default.config["num_threads"]
+    vector_widths = default.config["cute_vector_widths"]
+    assert default.config["block_sizes"] == [32]
+    assert default.config["reduction_loops"] == [None]
+    assert num_threads[thread_ids.index(dv)] == 8
+    assert num_threads[thread_ids.index(reduction)] == 8
+    assert vector_widths[vector_ids.index(dv)] == 4
+    code = bound.to_code(default)
+    assert COLUMN_REDUCE in code
+    assert "block=(8, 8, 1)" in code
+
+
+@skipUnlessBackends(["cute"])
+def test_default_stays_the_base_config_without_the_register_tile_shape() -> None:
+    # A dv extent the vector tile does not divide has no register-tile
+    # geometry: nothing is promoted, the base default stands.
+    state = torch.empty((BH, D, 48), dtype=torch.float32)
+    arguments = (
+        torch.empty((BH, D), dtype=torch.float32),
+        torch.empty((BH, D), dtype=torch.float32),
+        torch.empty((BH, 48), dtype=torch.float32),
+        state,
+        torch.empty((BH,), dtype=torch.float32),
+    )
+    bound, _arguments = _bind(arguments)
+    spec = bound.config_spec
+    assert "cute_register_tile" not in spec.autotuner_heuristics
+    assert spec.compiler_default_config is None

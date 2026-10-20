@@ -129,6 +129,8 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
@@ -235,6 +237,7 @@ from .tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
@@ -456,6 +459,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_c_stages",
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+    TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
@@ -563,6 +567,12 @@ class CuteTcgen05Config:
         # Separate device launches may own independent native contractions.
         # They share pipeline knobs, but never a single matrix-axis projection.
         self.materialized_matmul_block_ids: tuple[tuple[int, int, int], ...] = ()
+        # The launch (root) index each triple above belongs to.  Materialized
+        # fission plans place one GEMM per region, so the indices are simply
+        # ``0, 1, ...``; barrier phases may interleave plain SIMT launches
+        # between the GEMM phases, and the per-region pipeline knobs index by
+        # position in ``materialized_matmul_block_ids``, not by launch.
+        self._materialized_matmul_region_indices: tuple[int, ...] = ()
         self.materialized_matmul_shapes: tuple[tuple[int, int, int], ...] = ()
         self.materialized_pipeline_facts: tuple[
             Tcgen05PipelineSmemFacts | None, ...
@@ -583,6 +593,12 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # Every analyzed store chain loads an auxiliary operand
+        # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
+        # proof that ``pre_acc_wait`` renders on the plain (non-fanout)
+        # epilogue, where the store lowering refuses the placement at an
+        # aux-free store.
+        self.aux_loads_on_every_store: bool = False
         # Row-vector aux rows of the analyzed stores (``aux_tensor``): the SMEM
         # model of the ``pre_acc_wait`` row stages the seeds request.
         self.rowvec_aux_facts: Tcgen05RowvecAuxFacts | None = None
@@ -721,6 +737,17 @@ class CuteTcgen05Config:
         ):
             return None
         return self.config_spec.block_sizes.block_id_to_index(block_id)
+
+    @property
+    def materialized_matmul_region_indices(self) -> tuple[int, ...]:
+        """Launch index of each ``materialized_matmul_block_ids`` triple."""
+        if self._materialized_matmul_region_indices:
+            return self._materialized_matmul_region_indices
+        return tuple(range(len(self.materialized_matmul_block_ids)))
+
+    @materialized_matmul_region_indices.setter
+    def materialized_matmul_region_indices(self, value: tuple[int, ...]) -> None:
+        self._materialized_matmul_region_indices = tuple(value)
 
     def register_mma_analysis(
         self,
@@ -4139,6 +4166,29 @@ class CuteTcgen05Config:
             return
         if fix_invalid:
             config.pop(FANOUT_CONFIG_KEY, None)
+            # The repaired config has to be a fixed point of strict
+            # normalization: ``before_store`` is legal only beside the shared
+            # fanout just dropped, so it leaves with it (the autotuner's
+            # neighbour canonicalization repairs once, then validates).
+            if config.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "before_store":
+                config.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY)
+            # Likewise ``pre_acc_wait`` where only the fanout admitted it (an
+            # aux-free store), and the fragment hoist that needs the
+            # placement: a hoist witness whose neighbour moved to a schedule
+            # the fanout refuses otherwise reaches the render worker and is
+            # refused there.
+            if (
+                config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                and not self.pre_acc_wait_admissible(config)
+            ):
+                config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+                )
+            if config.get(
+                TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+            ) is True and not self.aux_fragment_hoist_admissible(config):
+                config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
         else:
             raise InvalidConfig(
                 f"{FANOUT_CONFIG_KEY}={value!r} requires a proved equal-layout "
@@ -5230,6 +5280,11 @@ class CuteTcgen05Config:
             dtype_bytes=output_itemsize,
             c_stages=c_stages,
         )
+        # One C ring per output store: two fresh outputs of one accumulator
+        # (``se_block_fwd``'s ``s`` and ``out``) allocate two rings, with or
+        # without the shared fanout epilogue.
+        if facts is not None:
+            c_bytes *= max(facts.output_count, 1)
         return (
             ab_bytes
             + c_bytes
@@ -5694,6 +5749,221 @@ class CuteTcgen05Config:
             acc_stages=self._config_acc_stages(config),
         ):
             config["tcgen05_c_stages"] = 2
+
+    def pre_acc_wait_admissible(self, config: dict[str, object]) -> bool:
+        """Whether the store lowering renders ``pre_acc_wait`` for ``config``.
+
+        Mirrors ``memory_ops``: the placement needs per-subtile auxiliary
+        loads at every store it reaches -- every analyzed store chain loads
+        an auxiliary operand (``aux_loads_on_every_store``), or the shared
+        fanout epilogue (``tcgen05_epilogue_fanout='shared'``) merges each
+        proved pair into one chain that does, with the pair's reads provably
+        safe ahead of the accumulator wait (``pre_wait_aux_safe``).
+        """
+        if self.aux_loads_on_every_store:
+            return True
+        return (
+            config.get(FANOUT_CONFIG_KEY, "off") == "shared"
+            and self.pre_acc_wait_admissible_via_fanout()
+        )
+
+    def pre_acc_wait_admissible_via_fanout(self) -> bool:
+        """Whether the shared fanout epilogue would legalize ``pre_acc_wait``.
+
+        Every proved pair must merge into a chain with auxiliary loads whose
+        reads are safe ahead of the accumulator wait.
+        """
+        plans = self.epilogue_fanout_plans
+        return bool(plans) and all(
+            plan.pre_wait_aux_safe
+            and any(chain.auxiliary_tensor_loads for chain in plan.chains)
+            for plan in plans
+        )
+
+    def aux_fragment_hoist_admissible(self, config: dict[str, object]) -> bool:
+        """Whether ``tcgen05_aux_fragment_hoist=True`` is legal for ``config``.
+
+        The hoist reads an exact-shape auxiliary tile into registers before
+        the accumulator wait, so it needs such an operand
+        (``exact_shape_aux_kernel_detected``: rank-2, the output's shape and
+        dtype), the ``pre_acc_wait`` placement, the SIMT aux load path and
+        the normal TMA-store epilogue, and a per-thread fragment within
+        ``TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD`` (a CTA pair's
+        epilogue owns half of the pair tile's rows per CTA; the store
+        lowering re-checks the budget against its actual lifecycle).
+
+        The store lowering renders the hoist only on the static-full
+        TMA-store epilogue; this mirrors that from the config. The tile must
+        divide the compile-time static extents (``_static_full_tiles``: the
+        edge-tile TMA-store families and the predicated SIMT store take no
+        hoist), and a clustered config must run the tcgen05 CTA pair
+        (``_config_is_two_cta_mma``): the clustered single-CTA family
+        (16-bit ``bm=128`` with ``tcgen05_cluster_m=2``) has no role-local
+        TMA-store epilogue. A fragment whose thread spans several rows (an
+        epilogue tile narrower than the 128-lane TMEM datapath, e.g.
+        ``bm=64``) is legal: the lowering re-lays each subtile's slice onto
+        the accumulator carrier's profile.
+        """
+        facts = self.rowvec_aux_facts
+        if (
+            not self.search_enabled
+            or not self.exact_shape_aux_kernel_detected
+            or facts is None
+        ):
+            return False
+        if (
+            config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            or config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT)
+            != TCGEN05_AUX_LOAD_MODE_SIMT
+            or config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+            != TCGEN05_C_STORE_MODE_NORMAL
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        ):
+            return False
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return False
+        block_sizes, m_index, n_index, k_index = config_view
+        bm = block_sizes[m_index]
+        bn = block_sizes[n_index]
+        bk = block_sizes[k_index]
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        if not (
+            isinstance(bm, int)
+            and isinstance(bn, int)
+            and isinstance(bk, int)
+            and bm > 0
+            and bn > 0
+            and bk > 0
+            and cluster_m in (1, 2)
+        ):
+            return False
+        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk):
+            return False
+        is_two_cta = self._config_is_two_cta_mma(config, bm=bm, cluster_m=cluster_m)
+        if cluster_m == 2 and not is_two_cta:
+            return False
+        rows = bm // 2 if is_two_cta else bm
+        return (
+            rows > 0
+            and tcgen05_aux_fragment_bytes_per_thread(
+                bm=rows,
+                bn=bn,
+                itemsize=facts.output_itemsize,
+                epi_warps=self._config_epi_warps(config),
+            )
+            <= TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
+        )
+
+    def _static_full_tiles(self, *, bm: int, bn: int, bk: int) -> bool:
+        """Whole tiles of the compile-time static problem on every axis.
+
+        The config-level form of ``cute_mma._mma_tiles_are_static_full``:
+        False (nothing proved) without compile-time static extents.
+        """
+        extents = self.matmul_compile_time_static_extents
+        if extents is None:
+            return False
+        m, n, k = extents
+        return (
+            isinstance(m, int)
+            and isinstance(n, int)
+            and isinstance(k, int)
+            and m % bm == 0
+            and n % bn == 0
+            and k % bk == 0
+        )
+
+    def _config_is_two_cta_mma(
+        self, config: dict[str, object], *, bm: int, cluster_m: int
+    ) -> bool:
+        """Whether ``config`` runs the tcgen05 CTA-pair MMA.
+
+        Mirrors ``cute_mma._tcgen05_use_2cta_instrs``: ``tcgen05_cluster_m=2``
+        with the ``bm=256`` pair tile, the fp8 small-grid ``bm=128`` tile, or
+        an explicit ``tcgen05_cta_group='two'``. Any other clustered config is
+        the clustered single-CTA (CtaGroup.ONE) family.
+        """
+        if cluster_m != 2:
+            return False
+        if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") == "two":
+            return True
+        if bm == TCGEN05_TWO_CTA_BLOCK_M:
+            return True
+        return (
+            bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            and self.matmul_input_dtype == torch.float8_e4m3fn
+        )
+
+    def _fix_multi_output_ring_search_config(self, config: dict[str, object]) -> None:
+        """Shallow a multi-output sample's rings to the whole static arena.
+
+        The single-output gates above calibrate AB + one C ring; a kernel
+        with several output stores allocates one C ring per output
+        (``Tcgen05RowvecAuxFacts.output_count``), so a sample they admit can
+        still overflow (128x128x64 fp16 with two outputs: ab=6 + c=4 is
+        192 KiB + 64 KiB). Judge the sample's final rings with
+        ``default_layout_smem_fits`` (which charges every ring) and take the
+        deepest AB ring that fits, at the sampled C depth first and at the
+        shallow C ring otherwise. Without a recorded SMEM budget nothing is
+        proved and the sample is left alone.
+        """
+        facts = self.rowvec_aux_facts
+        if (
+            not self.search_enabled
+            or self.ab_stages_three_search_constraints is None
+            or facts is None
+            or facts.output_count < 2
+        ):
+            return
+        if config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        ) != Tcgen05LayoutStrategy.DEFAULT.value or config.get(
+            TCGEN05_GROUPED_MODE_CONFIG_KEY
+        ):
+            return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+        bm = block_sizes[m_index]
+        bn = block_sizes[n_index]
+        bk = block_sizes[k_index]
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        ab_stages = config.get("tcgen05_ab_stages", 2)
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if not all(
+            isinstance(value, int) and value > 0
+            for value in (bm, bn, bk, cluster_m, ab_stages, c_stages)
+        ) or cluster_m not in (1, 2):
+            return
+        stage_rows = self._store_lowering_stages_rows(config)
+        epi_warps = self._config_epi_warps(config)
+        acc_stages = self._config_acc_stages(config)
+
+        def fits(ab: int, c: int) -> bool:
+            return self.default_layout_smem_fits(
+                bm=cast("int", bm),
+                bn=cast("int", bn),
+                bk=cast("int", bk),
+                cluster_m=cast("int", cluster_m),
+                ab_stages=ab,
+                c_stages=c,
+                stage_rows=stage_rows,
+                epi_warps=epi_warps,
+                acc_stages=acc_stages,
+            )
+
+        if fits(cast("int", ab_stages), cast("int", c_stages)):
+            return
+        for c in dict.fromkeys((cast("int", c_stages), 2)):
+            for ab in range(cast("int", ab_stages), 0, -1):
+                if fits(ab, c):
+                    config["tcgen05_ab_stages"] = ab
+                    config["tcgen05_c_stages"] = c
+                    return
 
     def _fix_rowvec_stage_search_config(self, config: dict[str, object]) -> None:
         """Demote a sampled ``pre_acc_wait`` whose row stages overflow SMEM.
@@ -6880,11 +7150,20 @@ class CuteTcgen05Config:
         paired_search = self.paired_pipeline_search_enabled() or bool(
             self.materialized_matmul_block_ids
         )
+        # Clustered and two-CTA tcgen05 codegen run under a persistent launch
+        # (``tcgen05_cluster_m > 1`` is refused for ``pid_type="flat"``).  On
+        # a flat-only surface -- ordered barrier phases, a fission plan whose
+        # shapes vetoed the persistent walks -- those coordinates, and the
+        # per-region pipeline knobs whose schedule requires them, would only
+        # be sampled to fail, so the search surface withholds them.
+        flat_only = for_search and all(
+            pid_type == "flat" for pid_type in self.allowed_pid_types
+        )
         if (
             paired_search
             or self.full_tile_added_pairing
             or self.n_edge_cluster_schedule_facts is not None
-        ):
+        ) and not flat_only:
             cluster_m_choices = tuple(dict.fromkeys((*cluster_m_choices, 2)))
         # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
         # of the 2-CTA A multicast) is searchable on every cluster_m=2
@@ -6973,7 +7252,7 @@ class CuteTcgen05Config:
         fragments: dict[str, ConfigSpecFragment] = {
             TCGEN05_CTA_GROUP_CONFIG_KEY: EnumFragment(
                 TCGEN05_CTA_GROUP_CHOICES
-                if not for_search or paired_search
+                if not for_search or (paired_search and not flat_only)
                 else ("auto",)
             ),
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
@@ -7118,26 +7397,47 @@ class CuteTcgen05Config:
             )
             fragments[WARP_MMA_FAMILY_KEY] = EnumFragment(families)
             fragments[WARP_MMA_WARPS_KEY] = EnumFragment(WARP_MMA_WARP_CHOICES)
-        if len(self.materialized_matmul_block_ids) >= 2:
+        region_launches = len(self.materialized_matmul_block_ids) >= 2 and not flat_only
+        if region_launches:
             fragments["tcgen05_region_ab_stages"] = ListOf(
                 IntegerFragment(0, 16, 0), len(self.materialized_matmul_block_ids)
             )
             fragments["tcgen05_region_c_stages"] = ListOf(
                 EnumFragment((0, 2, 4)), len(self.materialized_matmul_block_ids)
             )
-        if (
-            len(self.materialized_matmul_block_ids) >= 2
-            or self.materialized_operand_pdl_roots is not None
-        ):
+        if region_launches or self.materialized_operand_pdl_roots is not None:
             fragments["tcgen05_materialized_pdl"] = BooleanFragment()
-        if (
-            self.aux_kernel_detected
-            or self.epilogue_fanout_search_enabled
-            or not for_search
-        ):
+        # Every aux kernel's surface carries the placement key, so a supplied
+        # ``post_acc_wait`` survives the flat round trip of a coverage
+        # transfer (the carriers of other coverage groups are normalized
+        # configs and always hold it). ``pre_acc_wait`` is sampled only where
+        # some config can render it: every store chain loads an auxiliary
+        # operand, or the shared fanout epilogue (searched) merges an
+        # aux-free chain with one that does. An aux kernel whose first output
+        # is aux-free and has no fanout surface would only sample the
+        # placement into a repair, so its coordinate collapses to the
+        # default rather than leaving the surface.
+        if self.aux_kernel_detected or not for_search:
+            pre_acc_wait_sampled = (
+                self.aux_loads_on_every_store
+                or (
+                    self.epilogue_fanout_search_enabled
+                    and self.pre_acc_wait_admissible_via_fanout()
+                )
+                or not for_search
+            )
             fragments[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = EnumFragment(
                 TCGEN05_AUX_LOAD_PLACEMENTS
+                if pre_acc_wait_sampled
+                else (TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,)
             )
+        # The whole-fragment register hoist of an exact-shape auxiliary tile
+        # exists only on kernels with such an operand (validation and search
+        # surface alike: other kernels' configs keep their keys); its
+        # per-config legality (placement, store protocol, register budget) is
+        # the strict normalizer's (``aux_fragment_hoist_admissible``).
+        if self.exact_shape_aux_kernel_detected:
+            fragments[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = BooleanFragment()
         if not for_search:
             fragments["tcgen05_grouped_worklist_orientation"] = EnumFragment(
                 ("nm", "mn")
@@ -7730,11 +8030,60 @@ class CuteTcgen05Config:
             aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
             and not self.aux_kernel_detected
         ):
+            # No auxiliary loads anywhere: the placement is never offered to
+            # this kernel's search (``optional_fragments``), so an explicit or
+            # recorded ``pre_acc_wait`` is a config error under both
+            # normalization modes, not a sample to repair.
             raise InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
                 f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the kernel has "
                 "no per-subtile auxiliary loads to place"
             )
+        if (
+            aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and not self.pre_acc_wait_admissible(config)
+        ):
+            # Some store chain has no per-subtile auxiliary loads and no
+            # shared fanout merges it with one that has: the store lowering
+            # refuses the placement at that store. The search offers the
+            # placement here (the fanout can admit it), so a sampled one is
+            # repaired to the default; an explicit one is refused here rather
+            # than after a compile.
+            if fix_invalid:
+                config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+                )
+                aux_load_placement = TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            else:
+                raise InvalidConfig(
+                    f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: a store of "
+                    "the kernel has no per-subtile auxiliary loads to place "
+                    "(every store chain must load an auxiliary operand, or "
+                    f"{FANOUT_CONFIG_KEY}='shared' must merge the chains)"
+                )
+        hoist = config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY, False)
+        if hoist is not False and hoist is not True:
+            if fix_invalid:
+                config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY} must be a boolean, "
+                    f"got {hoist!r}"
+                )
+        elif hoist and not self.aux_fragment_hoist_admissible(config):
+            if fix_invalid:
+                config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True requires an "
+                    "exact-shape auxiliary operand, "
+                    f"{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}, the SIMT aux "
+                    "load mode, the normal TMA store and a tile fragment of at "
+                    f"most {TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD} "
+                    "bytes per epilogue thread"
+                )
         if (
             aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
             and config.get(
@@ -8169,6 +8518,10 @@ class CuteTcgen05Config:
         # demote it where the stage does not fit (the seeds' gate, applied to
         # the projection).
         self._fix_rowvec_stage_search_config(config)
+        # A kernel with several output stores keeps one C ring per output;
+        # judge the final rings against the whole arena and shallow them
+        # where the extra rings overflow.
+        self._fix_multi_output_ring_search_config(config)
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)

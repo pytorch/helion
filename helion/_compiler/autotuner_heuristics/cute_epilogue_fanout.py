@@ -16,11 +16,17 @@ from ..cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from ..cute.epilogue_fanout import FANOUT_MODES
 from ..cute.epilogue_fanout import prove_paired_fanout
 from ..cute.epilogue_fanout import schedule_supported
+from ..cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ...autotuner.config_spec import ConfigSpec
     from ..compile_environment import CompileEnvironment
+    from ..cute.epilogue_fanout import PairedFanoutPlan
+    from ..cute.tcgen05_config import CuteTcgen05Config
     from ..device_ir import DeviceIR
 
 
@@ -102,6 +108,13 @@ def register_epilogue_fanout_coverage(
         return m * n, tuple(blocks), stages
 
     carriers.sort(key=rank, reverse=True)
+    if not carriers:
+        # The ordinary seed builders cover single-output GEMMs (the pipeline
+        # and full-tile facts need one store) and the machine-filling 256x256
+        # CTA pairs, which the fanout does not admit at that width; a
+        # two-output kernel with more 128x128 tiles than SMs therefore has no
+        # carrier although its fanout is proved. Build one from the geometry.
+        carriers = _synthesized_fanout_carriers(spec, state, plans)
     if not carriers:
         return
 
@@ -205,6 +218,202 @@ def _register_materialized_aux_coverage(env: CompileEnvironment) -> None:
             ),
             dependencies=(
                 CoverageDependency("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"),
+            ),
+        )
+    )
+
+
+def _synthesized_fanout_carriers(
+    spec: ConfigSpec, state: CuteTcgen05Config, plans: Sequence[PairedFanoutPlan]
+) -> list[Config]:
+    """One-CTA full-tile carriers for a proved fanout no compiler seed carries.
+
+    Geometry only: the 128x128 one-CTA tile (whole tiles of the fanout's
+    output), the narrowest 16-bit-friendly K tile the search admits (64, then
+    128), persistent interleaved role-local warps, and the deepest AB ring
+    the whole static arena -- both outputs' C rings -- fits next to the deep
+    C ring; the shallow-C twin keeps that depth so the pair differs in
+    ``tcgen05_c_stages`` alone, as the seed-derived carriers do. Each carrier
+    passes the same schedule, fanout-admission and strict-normalization
+    checks as a seed-derived one.
+    """
+    extents = state.matmul_compile_time_static_extents
+    fragments = state._matmul_block_fragments()
+    if (
+        extents is None
+        or fragments is None
+        or any(value is None or value <= 0 for value in extents)
+    ):
+        return []
+    m, n, k = extents
+    assert m is not None and n is not None and k is not None
+    bm_fragment, bn_fragment, bk_fragment = fragments
+    bm, bn = 128, 128
+    if (
+        m % bm
+        or n % bn
+        or not bm_fragment.low <= bm <= bm_fragment.high
+        or not bn_fragment.low <= bn <= bn_fragment.high
+    ):
+        return []
+    bk = next(
+        (
+            value
+            for value in (64, 128)
+            if k % value == 0 and bk_fragment.low <= value <= bk_fragment.high
+        ),
+        None,
+    )
+    if bk is None:
+        return []
+    blocks = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+    if blocks is None:
+        return []
+    ceiling = min(
+        k // bk, state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+    )
+    ab_stages = next(
+        (
+            depth
+            for depth in range(ceiling, 0, -1)
+            if state.default_layout_smem_fits(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=1,
+                ab_stages=depth,
+                c_stages=4,
+                stage_rows=False,
+            )
+        ),
+        None,
+    )
+    if ab_stages is None:
+        return []
+    candidate = Config(
+        block_sizes=blocks,
+        pid_type="persistent_interleaved",
+        tcgen05_cta_group="auto",
+        tcgen05_cluster_m=1,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=ab_stages,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=4,
+        tcgen05_num_epi_warps=4,
+        tcgen05_persistence_model="static_persistent",
+        tcgen05_strategy="role_local_monolithic",
+        tcgen05_layout_strategy="default",
+    )
+    try:
+        spec.normalize(candidate)
+    except InvalidConfig:
+        return []
+    if not schedule_supported(candidate.config):
+        return []
+    carriers: list[Config] = []
+    for stages in (4, 2):
+        trial = Config.from_dict(
+            deepcopy(candidate.config)
+            | {"tcgen05_c_stages": stages, FANOUT_CONFIG_KEY: "shared"}
+        )
+        if not state.epilogue_fanout_config_supported(trial.config):
+            continue
+        try:
+            spec.normalize(trial)
+        except InvalidConfig:
+            continue
+        trial.config.pop(FANOUT_CONFIG_KEY)
+        if trial not in carriers:
+            carriers.append(trial)
+    return carriers
+
+
+def register_aux_fragment_hoist_coverage(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> None:
+    """Additive coverage for the pre-wait whole-fragment auxiliary hoist.
+
+    ``tcgen05_aux_fragment_hoist`` acts on kernels with an exact-shape
+    auxiliary operand. Its carriers take the ``pre_acc_wait`` placement the
+    hoist requires: where every store loads an auxiliary operand, the
+    ordinary compiler seeds that the fanout schedule predicate accepts (the
+    hoist shares that store protocol); where an aux-free store needs the
+    shared fanout to admit the placement, the fanout group's own carriers
+    with the fanout on, declared as the dependency. Witnesses pair each
+    carrier with the hoist off and on, so the search measures the hoist
+    against the same rings.
+    """
+    spec = env.config_spec
+    state = spec._cute_tcgen05_config
+    if (
+        device_ir.host_function is None
+        or not state.search_enabled
+        or not state.exact_shape_aux_kernel_detected
+    ):
+        return
+    needs_fanout = not state.aux_loads_on_every_store
+    sources: list[Config] = []
+    if needs_fanout:
+        groups = [
+            g for g in spec.compiler_coverage_groups if g.key == FANOUT_CONFIG_KEY
+        ]
+        if not groups:
+            return
+        for witness in groups[0].witnesses:
+            carrier = witness.carrier
+            if carrier not in sources:
+                sources.append(carrier)
+    else:
+        for seed in spec.compiler_seed_configs:
+            candidate = Config.from_dict(deepcopy(seed.config))
+            try:
+                spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            if schedule_supported(candidate.config) and candidate not in sources:
+                sources.append(candidate)
+    carriers: list[Config] = []
+    for source in sources:
+        values: dict[str, object] = {
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: TCGEN05_AUX_LOAD_PLACEMENTS[1],
+            TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY: True,
+        }
+        if needs_fanout:
+            values[FANOUT_CONFIG_KEY] = "shared"
+        trial = Config.from_dict(deepcopy(source.config) | values)
+        if not state.aux_fragment_hoist_admissible(trial.config):
+            continue
+        try:
+            spec.normalize(trial)
+        except InvalidConfig:
+            continue
+        trial.config.pop(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY)
+        if trial not in carriers:
+            carriers.append(trial)
+        if len(carriers) == 2:
+            break
+    if not carriers:
+        return
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            mechanism="cute.aux_fragment_hoist",
+            version=1,
+            key=TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
+            domain=(False, True),
+            legacy=False,
+            witnesses=tuple(
+                CoverageWitness(carrier, mode)
+                for carrier in carriers
+                for mode in (False, True)
+            ),
+            dependencies=(
+                (
+                    CoverageDependency(
+                        "cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"
+                    ),
+                )
+                if needs_fanout
+                else ()
             ),
         )
     )

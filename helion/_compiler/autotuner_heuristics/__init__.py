@@ -63,6 +63,8 @@ from .cute import grouped_row_union_cluster4_carrier
 from .cute import grouped_row_union_paired_clc_carrier
 from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
+from .cute_dot_row_reduction import CuteDotRowReductionHeuristic
+from .cute_epilogue_fanout import register_aux_fragment_hoist_coverage
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuristic
 from .cute_fragment_atomic_aggregation import (
@@ -201,6 +203,9 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
+        # First: its promoted default yields to any later promoted family
+        # (flash, collective GEMM) that claims the same kernel.
+        CuteDotRowReductionHeuristic,
         CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
@@ -546,6 +551,7 @@ def register_compiler_coverage_groups(
         return
     register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
+    register_aux_fragment_hoist_coverage(env, device_ir)
     register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)
     deep_configs = grouped_full_coverage_configs(env, device_ir, block_k=128)

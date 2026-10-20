@@ -2502,6 +2502,7 @@ class CuteBackend(Backend):
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
+            "_cute_fold_dot": "from helion._compiler.cute.fold_helpers import fold_dot as _cute_fold_dot",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_float4_e2m1fn_x16_dot_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_dot_float32 as _cute_float4_e2m1fn_x16_dot_float32",

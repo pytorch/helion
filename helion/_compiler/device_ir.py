@@ -3613,6 +3613,20 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.collective_matmul import collective_knobs_apply
+            from .cute.collective_matmul import has_k_loop_less_matmul
+
+            env = CompileEnvironment.current()
+            # Knobs no contraction can act on leave the search surface: the
+            # collective marker needs an addmm/dot site with a tiled or a
+            # short full-slice K, and the epilogue store split does not
+            # survive a matmul on the direct/serial path.
+            config_spec.cute_collective_knobs_enabled = collective_knobs_apply(
+                env, device_ir
+            )
+            if has_k_loop_less_matmul(env, device_ir):
+                config_spec.epilogue_subtile_candidate_enabled = False
 
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
@@ -3936,6 +3950,21 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     from .cute.materialized_mma import enable_materialized_mma_search
 
                     enable_materialized_mma_search(
+                        env,
+                        device_ir,
+                        planning_results,
+                        search_candidates,
+                        mma_nodes={
+                            id(candidate): node
+                            for candidate, _lhs, _rhs, node in mma_candidates
+                        },
+                    )
+                elif env.has_barrier and len(device_ir.root_ids) > 1:
+                    # Several GEMM shapes split by ``hl.barrier()``: each phase
+                    # is its own ordered launch, so each GEMM plans per phase.
+                    from .cute.materialized_mma import enable_phase_mma_search
+
+                    enable_phase_mma_search(
                         env,
                         device_ir,
                         planning_results,

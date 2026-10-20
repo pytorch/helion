@@ -31,7 +31,6 @@ import os
 import re
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
@@ -340,15 +339,16 @@ def test_single_thread_reductions_claim_no_thread_axis() -> None:
 
 
 @skipUnlessBackends(["cute"])
-def test_second_matmul_contraction_reaches_the_lane_scheduler() -> None:
+def test_second_matmul_contraction_folds_per_thread_in_the_key_lane_loop() -> None:
     """A RoPE side matmul adds a fifth reduction dim (64); with the single
     thread dims out of the way the four axes are not exhausted any more and
-    codegen reaches the lane-split scheduler, which declines the side
-    matmul's serial K fold (a loop, not a straight-line assignment) inside the
-    key lane loop.  Pins where the limitation now lies."""
+    codegen reaches the lane-split scheduler.  The side matmul's K axis sits
+    on the key lane loop: the per-thread K fold (``fold_dot``) accumulates it
+    in registers instead of declining the staged lane schedule."""
     q, k, v, qr, kr = _attention_inputs("cpu", 128, 128, 128, 64, 64)
-    with pytest.raises(helion.exc.BackendUnsupported, match="staged lane schedule"):
-        _cpu_render(_attention_rope, (q, k, v, qr, kr), block_sizes=[1, 128, 128])
+    code = _cpu_render(_attention_rope, (q, k, v, qr, kr), block_sizes=[1, 128, 128])
+    assert "_cute_fold_dot(" in code
+    assert "staged lane schedule" not in code
 
 
 @onlyBackends(["cute"])
@@ -374,6 +374,21 @@ class TestCuteSingleThreadReduction(TestCase):
 
     def test_slice_store_single_thread_reduction_matches_cat(self) -> None:
         self._check(256, 128, 256)
+
+    def test_rope_side_matmul_lane_fold_matches_reference(self) -> None:
+        q, k, v, qr, kr = _attention_inputs(DEVICE, 128, 128, 128, 64, 64)
+        _code, out = code_and_output(
+            _attention_rope, (q, k, v, qr, kr), block_sizes=[1, 128, 128]
+        )
+        scale = 1.0 / math.sqrt(q.size(-1) + qr.size(-1))
+        scores = (q.float() @ k.float().transpose(-1, -2)) * scale
+        scores = scores + (qr.float() @ kr.float().transpose(-1, -2)) * scale
+        causal = torch.ones(
+            q.size(-2), k.size(-2), dtype=torch.bool, device=q.device
+        ).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+        expected = torch.softmax(scores, dim=-1) @ v.float()
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
     def test_slice_store_single_thread_reduction_ragged(self) -> None:
         self._check(64, 33, 257)

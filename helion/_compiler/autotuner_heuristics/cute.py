@@ -30,6 +30,7 @@ from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import load as language_load
+from ...language.memory_ops import store as language_store
 from ...language.scan_ops import _associative_scan
 from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
@@ -110,8 +111,13 @@ from ..cute.tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
 from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from ..loop_dependency_checker import _storage_ids
+from ..loop_dependency_checker import graph_memory_access_storage_ids
+from ..loop_dependency_checker import intra_loop_raw_reread_block_ids
+from ..utils import compute_slice_size
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
+from .common import op_name_parts
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -998,6 +1004,81 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         return seeds
 
 
+def _access_spans_block(
+    env: CompileEnvironment, node: torch.fx.Node, block_id: int
+) -> bool:
+    """Whether a load / store indexes the whole extent of ``block_id`` on some
+    dimension: a slice of the block's size, or the block's tile symbol."""
+    tensor = node.args[0] if node.args else None
+    fake = tensor.meta.get("val") if isinstance(tensor, torch.fx.Node) else None
+    indices = node.args[1] if len(node.args) > 1 else None
+    block = env.block_sizes[block_id]
+    if (
+        not isinstance(fake, torch.Tensor)
+        or not isinstance(indices, (list, tuple))
+        or not isinstance(block.size, (int, torch.SymInt))
+    ):
+        return False
+    symbol = _symint_sympy_expr(block.var)
+    dim = 0
+    for item in indices:
+        if item is None:
+            continue
+        if isinstance(item, slice):
+            if dim < fake.ndim and env.known_equal(
+                compute_slice_size(item, fake.shape[dim]), block.size
+            ):
+                return True
+        else:
+            value = item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+            if isinstance(value, torch.SymInt) and _symint_sympy_expr(value) == symbol:
+                return True
+        dim += 1
+    return False
+
+
+def _register_tile_lane_split_orders_memory(
+    env: CompileEnvironment, device_ir: DeviceIR, reduction_block_id: int
+) -> bool:
+    """Whether the body's memory accesses need an order across threads.
+
+    The register tile's lane split orders nothing: a thread barrier has no
+    place in a body a later pass rewrites (the lane-reduce placeholder), the
+    RAW barrier the IR marks cannot be predicated into an owner thread, and
+    no lane's load may move above another lane's store.  Two shapes need such
+    an order: a store the same loop region reads back (``out[tile] = ...;
+    other[tile] = out[tile] * 2``), and a tensor both loaded and stored
+    through an access that does not span the reduction block -- replicated
+    on every reduction thread, so one thread's store races another's load
+    (``out[tile] += x[:, tile].sum(0)``).  A read-modify-write whose every
+    access spans the reduction block keeps each element in one thread (the
+    in-place recurrent step) and needs none.
+    """
+    graphs = device_ir.graphs
+    if intra_loop_raw_reread_block_ids(
+        graphs, device_ir.root_ids, device_ir.grid_block_ids
+    ):
+        return True
+    shared: set[int] = set()
+    for root_id in device_ir.root_ids:
+        reads, writes = graph_memory_access_storage_ids(graphs, root_id)
+        shared |= reads & writes
+    if not shared:
+        return False
+    for info in graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                language_load,
+                language_store,
+            ):
+                continue
+            if _storage_ids(graphs, info.graph_id, node.args[0]) & shared and not (
+                _access_spans_block(env, node, reduction_block_id)
+            ):
+                return True
+    return False
+
+
 class CuteRegisterTileHeuristic(AutotunerHeuristic):
     """Seed a per-thread register tile for a reduction over a vectorized tile.
 
@@ -1016,10 +1097,27 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
     over a serial device-loop axis of a kernel without reduction loops (for
     ``cute_vloop_sink``): this seed needs exactly one reduction loop, so no
     kernel is eligible for both and the seeds need no precedence.
+
+    The seed is also the autotune-off default: it is the SIMT reduction layout
+    read off the operand strides (the stride-1 axis on the vectorized lanes,
+    the reduction axis on the remaining threads), whereas the base default
+    walks the strided axis with the fastest thread index -- a warp reading
+    fp32 words 512 B apart, 8-13x slower on the fused linear-attention step
+    (124 us vs 14.5 us at [512, 128, 128]) and the same on every
+    ``x[i, :, tile].sum(0)``-shaped kernel. The lowering keeps it safe: a body
+    the two-pass schedule cannot place regenerates with the rolled lane
+    nesting (``RegisterTileUnsupported``), and a lane axis that is not the
+    tensor's stride-1 dim loads scalars.  A body whose memory accesses the
+    lane split would have to order across threads (a store the loop reads
+    back, or a tensor loaded and stored through an access replicated on the
+    reduction threads) gets no seed at all: no pass can place that order
+    next to the lane-reduce placeholder, so the seed would not compile as
+    the default either (``_register_tile_lane_split_orders_memory``).
     """
 
     name = "cute_register_tile"
     backend = "cute"
+    promote_seed_to_default = True
     VECTOR_THREADS = 8
 
     @classmethod
@@ -1033,6 +1131,8 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
             return None
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         if rl_spec.block_id not in spec.cute_register_tile_reduction_blocks:
+            return None
+        if _register_tile_lane_split_orders_memory(env, device_ir, rl_spec.block_id):
             return None
         max_threads = spec.max_reduction_threads
         size_hint = rl_spec.size_hint
@@ -2494,7 +2594,18 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
         }
         axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
-        singleton_axes = set(blocks) - axis_ids
+        # Grid axes of roots that hold no contraction (a pointwise phase beside
+        # the GEMM phases of a barrier kernel) are not part of the collective
+        # geometry: the seeds leave them at their fragment defaults rather than
+        # vetoing the family because another root tiles its own axes.
+        contraction_roots = {tuple(root) for _fact, root, _k, _factor in sites}
+        free_axes = {
+            block_id
+            for root in device_ir.grid_block_ids
+            if tuple(root) not in contraction_roots
+            for block_id in root
+        } - axis_ids
+        singleton_axes = set(blocks) - axis_ids - free_axes
         if any(blocks[block_id].max_size != 1 for block_id in singleton_axes):
             return []
         fp32_inputs = any(
@@ -2543,6 +2654,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 for block_id, value in zip((m, n, k), (128 // bn, bn, 1), strict=True)
             }
             values.update(dict.fromkeys(singleton_axes, 1))
+            values.update(
+                (block_id, fragments[block_id].default()) for block_id in free_axes
+            )
             threads.update(dict.fromkeys(singleton_axes, 0))
             if not all(
                 fragments[block_id].low <= value <= fragments[block_id].high
@@ -4115,6 +4229,64 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
             return None
 
 
+def _rolled_row_sweeps(device_ir: DeviceIR) -> list[frozenset[str]]:
+    """Op-name parts of every reduction-loop sweep over the row, in order.
+
+    A ``reduction_loops`` row kernel lowers to one sweep per reduction plus
+    one for a row-shaped consumer (softmax's normalize-and-store sweep), so
+    the sweep list is the kernel's structure as the rolled lowering passes
+    see it: which collectives exist and whether a row sweep follows them.
+    """
+    from ..device_ir import ReductionLoopGraphInfo
+
+    return [
+        frozenset().union(
+            *(
+                op_name_parts(node.target)
+                for node in graph_info.graph.nodes
+                if node.op == "call_function"
+            )
+        )
+        for graph_info in device_ir.graphs
+        if isinstance(graph_info, ReductionLoopGraphInfo)
+    ]
+
+
+def _rolled_scalar_row_output(sweeps: list[frozenset[str]]) -> bool:
+    """No sweep stores a row: every row output is a scalar epilogue value.
+
+    ``cute_scalar_epilogue`` (one owner for the scalar epilogue) and
+    ``cute_register_row`` (whose lowering declines when a later sweep reads
+    the register cache) only act on this shape; seeding them elsewhere only
+    duplicates configs.
+    """
+    return bool(sweeps) and not any("store" in ops for ops in sweeps)
+
+
+def _rolled_online_pair_seedable(
+    env: CompileEnvironment, sweeps: list[frozenset[str]]
+) -> bool:
+    """Whether ``cute_cluster_warp_online`` can pay off on this kernel.
+
+    The rolled pair needs a max sweep followed by a sweep summing the
+    exponential of ``x - max``.  Under exact numerics that sum sweep must
+    also be the last one: a later sweep recomputing ``exp2`` in the global
+    frame (softmax's normalize) shares sweep B's exponentials in the
+    two-exchange form (same expression, same frame), and the single
+    exchange would un-share them -- one extra ``MUFU.EX2`` per element for
+    one saved cluster round trip, measured at -26% on a 4096x32768 fp16
+    softmax (B200).  Under fast_math the pair caches sweep B's exponentials
+    and the later sweep reuses them, so every shape qualifies.
+    """
+    for index, ops in enumerate(sweeps):
+        if "amax" not in ops:
+            continue
+        for later in range(index + 1, len(sweeps)):
+            if "sum" in sweeps[later] and {"exp", "exp2"} & sweeps[later]:
+                return env.settings.fast_math or later == len(sweeps) - 1
+    return False
+
+
 class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
     """Vectorized cluster seeds for static row reductions with a padded tail.
 
@@ -4163,6 +4335,9 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         if vec <= 1 or extent % vec:
             return []
         row_block = spec.block_sizes[0].block_id
+        sweeps = _rolled_row_sweeps(device_ir)
+        scalar_row = _rolled_scalar_row_output(sweeps)
+        online_pair = _rolled_online_pair_seedable(env, sweeps)
         seeds: list[Config] = []
         for threads in (256, 128, 512):
             cluster = min(16, max(2, next_power_of_2(-(-extent // (threads * 64)))))
@@ -4195,8 +4370,8 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
                             ),
                             "cute_reduction_reloads": ["register"],
                             "cute_cluster_n": cluster,
-                            "cute_cluster_warp_online": True,
-                            "cute_scalar_epilogue": True,
+                            "cute_cluster_warp_online": online_pair,
+                            "cute_scalar_epilogue": scalar_row,
                             "cute_min_blocks_per_mp": 3
                             if elements > 64
                             else max(1, 768 // threads),
@@ -4209,10 +4384,17 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
             )
             for seed in seeds
         ]
-        register_rows = [
-            Config.from_dict(deepcopy(seed.config) | {"cute_register_row": True})
-            for seed in seeds
-        ]
+        # The register-row lowering (and the scalar epilogue's kept inputs)
+        # only act when no later sweep consumes the row; elsewhere these
+        # copies would render the very same kernel as their parents.
+        register_rows = (
+            [
+                Config.from_dict(deepcopy(seed.config) | {"cute_register_row": True})
+                for seed in seeds
+            ]
+            if scalar_row
+            else []
+        )
         kept_inputs = [
             Config.from_dict(
                 deepcopy(seed.config) | {"cute_scalar_epilogue_keep_inputs": True}
@@ -4221,7 +4403,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         ]
         native_redux = [
             Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
-            for seed in [*register_rows, *kept_inputs]
+            for seed in ([*register_rows, *kept_inputs] or seeds)
         ]
         return dedupe_configs(
             [*seeds, *independent, *register_rows, *kept_inputs, *native_redux]

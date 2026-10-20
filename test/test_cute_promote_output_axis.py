@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
+import math
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -10,6 +10,9 @@ from examples.jagged_dense_bmm import jagged_dense_bmm
 from examples.moe_matmul_ogs import moe_matmul_ogs
 import pytest
 import torch
+
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
@@ -258,16 +261,16 @@ def _dynamic_columns(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
 
 
 def _bind(kernel: Kernel[torch.Tensor], *args: object) -> BoundKernel[torch.Tensor]:
-    """Trace and generate source on CPU; no CUDA allocation or launch occurs."""
-    with ExitStack() as stack:
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", (10, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        return kernel._bind_isolated(tuple(args))
+    """Trace and generate source on CPU; no CUDA allocation or launch occurs.
+
+    ``_mock_cuda_unavailable`` models one target whatever the host holds: the
+    structural detectors read the process's device (``get_cute_mma_support``
+    behind the flash search surface), so on a Blackwell host the fp8 attention
+    kernel below would otherwise bind to the fused flash surface, whose
+    normalization pins the block sizes these renders assert.
+    """
+    with _mock_cuda_unavailable():
+        return _cpu_bind(kernel, tuple(args))
 
 
 def _input() -> torch.Tensor:
@@ -610,3 +613,139 @@ def test_grouped_gemm_segmented_rows_use_masked_grid(static_shapes: bool) -> Non
     ast.parse(code)
     assert "for tile_offset_1 in range" not in code
     assert "for tile_offset_2 in range" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scalar_prelude_rows(x: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty_like(x)
+    scale = 1.0 / math.sqrt(float(columns))
+    for batch in hl.grid(batches):
+        for row in hl.tile(rows):
+            out[batch, row, :] = x[batch, row, :] * scale
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _unlisted_prelude_rows(x: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty_like(x)
+    scale = max(columns, 1) * 0.5
+    for batch in hl.grid(batches):
+        for row in hl.tile(rows):
+            out[batch, row, :] = x[batch, row, :] * scale
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _dot_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty([batches, rows, w.size(1)], dtype=x.dtype, device=x.device)
+    for batch in hl.grid(batches):
+        for row in hl.tile(rows):
+            out[batch, row, :] = hl.dot(x[batch, row, :], w[:, :])
+    return out
+
+
+def test_pure_scalar_prelude_keeps_fresh_output() -> None:
+    """``1.0 / math.sqrt(float(columns))`` computes a host scalar from shape
+    metadata; the row tile (a non-final subscript position) is promoted."""
+    bound = _bind(_scalar_prelude_rows, torch.empty((3, 64, 32), device=CPU_DEVICE))
+    assert _host(bound).device_ir.grid_block_ids == [[0, 1]]
+    code = bound.to_code(bound.config_spec.default_config())
+    ast.parse(code)
+    assert "for tile_offset_1 in range" not in code
+    assert "tile_offset_1 = pid_1 * _BLOCK_SIZE_1" in code
+
+
+def test_unlisted_prelude_call_declines() -> None:
+    """``max`` is outside the pure scalar whitelist (it is admitted only by
+    the ``integer_metadata_calls`` proof): the freshness proof declines."""
+    bound = _bind(_unlisted_prelude_rows, torch.empty((3, 64, 32), device=CPU_DEVICE))
+    assert _host(bound).device_ir.grid_block_ids == [[0]]
+
+
+def test_dot_body_promotes_the_row_tile() -> None:
+    bound = _bind(
+        _dot_rows,
+        torch.empty((3, 64, 32), device=CPU_DEVICE),
+        torch.empty((32, 16), device=CPU_DEVICE),
+    )
+    assert _host(bound).device_ir.grid_block_ids == [[0, 1]]
+    ast.parse(bound.to_code(bound.config_spec.default_config()))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _inner_gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty_like(x)
+    for batch in hl.grid(batches):
+        for row in hl.tile(rows):
+            column_idx = idx[batch, :]
+            out[batch, row, column_idx] = x[batch, row, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _outer_gather_columns(x: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    batches, rows, columns = x.shape
+    out = torch.empty_like(x)
+    for batch in hl.grid(batches):
+        for row, column in hl.tile([rows, columns]):
+            out[batch, perm[row], column] = x[batch, row, column]
+    return out
+
+
+def test_gather_after_the_promoted_tile_declines() -> None:
+    """``out[batch, row, idx[batch, :]]``: the mixed-radix partition proof
+    needs every position after the row tile in range, which a gather does
+    not establish (out-of-range values could alias two row tiles), so the
+    row tile stays a serial loop."""
+    bound = _bind(
+        _inner_gather_rows,
+        torch.empty((3, 64, 32), device=CPU_DEVICE),
+        torch.zeros((3, 32), dtype=torch.int64, device=CPU_DEVICE),
+    )
+    assert _host(bound).device_ir.grid_block_ids == [[0]]
+
+
+def test_gather_before_the_promoted_tile_still_promotes() -> None:
+    """``out[batch, perm[row], column]``: the column tile's residue modulo
+    the row width identifies it whatever the gathered row index is."""
+    bound = _bind(
+        _outer_gather_columns,
+        torch.empty((3, 64, 32), device=CPU_DEVICE),
+        torch.zeros((64,), dtype=torch.int64, device=CPU_DEVICE),
+    )
+    assert _host(bound).device_ir.grid_block_ids == [[0, 2]]
+    ast.parse(bound.to_code(bound.config_spec.default_config()))
+
+
+def test_fp8_attention_promotes_its_query_tile() -> None:
+    """``hl.grid(bh) { hl.tile(m) {...} }`` with a ``math.sqrt``/``float``
+    prelude, ``hl.dot`` bodies and a 4-D fp8 store ``out[b, h, tile_m, :]``
+    (the promoted tile at position 2 of a contiguous allocation whose
+    unbacked strides are spelled ``Max(1, u)``) launches one CTA per
+    (batch-head, query tile)."""
+    from examples.fp8_attention import fp8_attention_kernel
+
+    kernel = helion.kernel(
+        fp8_attention_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    batch, heads, seq_len, head_dim = 1, 4, 256, 64
+    q = torch.empty(
+        (batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn, device=CPU_DEVICE
+    )
+    v = torch.empty(
+        (batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn, device=CPU_DEVICE
+    )
+    bound = _bind(kernel, q, q, v, batch, heads)
+    assert _host(bound).device_ir.grid_block_ids == [[0, 1]]
+    code = bound.to_code(helion.Config(block_sizes=[32, 32], num_threads=[0, 1, 0]))
+    ast.parse(code)
+    assert "for tile_offset_1 in range" not in code
+    # 4 batch-heads x 8 query tiles of 32 rows.
+    assert "(32,)" in code
