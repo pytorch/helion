@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from rich.console import Console
 from rich.progress import BarColumn
 from rich.progress import MofNCompleteColumn
 from rich.progress import Progress
@@ -62,11 +63,20 @@ def iter_with_progress(
     if description is None:
         description = "Progress"
 
+    # Render to stderr so redirected stdout (logs, pipes, file captures)
+    # stays clean, and skip the bar entirely on non-interactive consoles
+    # (CI runners, `python x.py > out.log`) where nobody can watch it.
+    console = Console(stderr=True)
+    if not (console.is_terminal or console.is_jupyter):
+        yield from iterable
+        return
+
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         TextColumn("[bold blue]{task.percentage:>3.0f}%"),
         BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
         MofNCompleteColumn(),
         SpeedColumn(),
+        console=console,
     ) as progress:
         yield from progress.track(iterable, total=total, description=description)
