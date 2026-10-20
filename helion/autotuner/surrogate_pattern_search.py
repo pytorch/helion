@@ -3161,9 +3161,11 @@ class LFBOPatternSearch(PatternSearch):
         family_probe_path_limit = getattr(
             self, "_flash_family_probe_path_limit", len(family_probe_paths)
         )
-        if family_probe_required and len(family_probe_paths) != family_probe_path_limit:
+        # The limit is the catalog's capacity: a family (or compound leaf) whose
+        # measured members all failed at this shape has no probe start.
+        if family_probe_required and len(family_probe_paths) > family_probe_path_limit:
             raise AssertionError(
-                "family probe path count does not match the live structural catalog"
+                "family probe paths exceed the live structural catalog capacity"
             )
         family_probe_metrics: list[dict[str, object]] = []
         family_probe_generators = []
