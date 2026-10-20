@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 import torch
+from torch.nn.attention.flex_attention import _create_empty_block_mask
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.attention.flex_attention import noop_mask
@@ -322,10 +323,15 @@ def _run(
     kernel_mask_mod: Callable[..., Any] | None = None,
     overrides: dict[str, object] | None = None,
     extra_config: dict[str, object] | None = None,
+    config: dict[str, object] | None = None,
+    scale: float | None = None,
 ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The fused kernel at ``FLEX_CONFIG`` (``overrides`` / ``extra_config`` on top) and the
-    eager reference: ``(code, out, lse, ref_out, ref_lse)``."""
-    scale = 1.0 / math.sqrt(q.size(-1))
+    """The fused kernel at ``FLEX_CONFIG`` (``overrides`` / ``extra_config`` on top;
+    ``config`` replaces the whole configuration) and the eager reference:
+    ``(code, out, lse, ref_out, ref_lse)``.  ``scale`` defaults to
+    ``1/sqrt(D)``."""
+    if scale is None:
+        scale = 1.0 / math.sqrt(q.size(-1))
     helion_mod, torch_mod = mods if mods is not None else (_identity, None)
     args = _kernel_args(
         q,
@@ -337,7 +343,8 @@ def _run(
         enable_gqa=enable_gqa,
         mask_mod=kernel_mask_mod,
     )
-    config = {**FLEX_CONFIG, **(overrides or {}), **(extra_config or {})}
+    if config is None:
+        config = {**FLEX_CONFIG, **(overrides or {}), **(extra_config or {})}
     code, (out, lse) = code_and_output(_flex_kernel(), args, **config)
     ref_out, ref_lse = flex_attention(
         q,
@@ -431,23 +438,6 @@ def test_noop_block_mask_matches_the_dense_kernel(
     else:
         torch.testing.assert_close(out, dense_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, dense_lse * math.log(2.0), atol=1e-4, rtol=1e-5)
-
-
-@onlyBackends(["cute"])
-def test_block_mask_none_is_the_trivial_dense_walk() -> None:
-    """``block_mask=None`` (``_create_empty_block_mask``: one KV block over
-    the whole sequence) is a trivial walk: the same body over every tile
-    (a constant full status) and no table reads."""
-    from torch.nn.attention.flex_attention import _create_empty_block_mask
-
-    q, k, v = _qkv(2, 4, 256, 256, 64, torch.bfloat16)
-    block_mask = _create_empty_block_mask(q, k)
-    code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
-    _assert_no_table_reads(code)
-    assert "flash_flex_needs_mask" not in code
-    _assert_close(out, lse, ref_out, ref_lse)
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    torch.testing.assert_close(out, expected, atol=3e-2, rtol=2e-2)
 
 
 # -- (ii), (iii) mask_mods ------------------------------------------------------
@@ -1790,3 +1780,256 @@ def test_pair_issue_knobs_on_the_list_walk(
     assert "flash_kv = flash_m_tile + flash_active_kv" not in code
     _assert_close(out, lse, ref_out, ref_lse)
     assert torch.equal(out, out_off) and torch.equal(lse, lse_off)
+
+
+# -- the dense flex plan: torch's empty BlockMask on the dense bodies ----------
+#
+# ``_create_empty_block_mask`` with the identity ``score_mod`` is dense attention
+# dressed as flex: the matcher records the plan as ``flex_dense`` and it takes
+# the dense attention surface (the persistent fa4 / ws_overlap bodies, the row
+# programs on small grids) instead of the list-walk body.  The runtime scale and
+# the natural-log LSE are still the flex kernel's.
+
+
+def _dense_flex_config(**knobs: object) -> dict[str, object]:
+    """A dense-surface configuration of the flex kernel's two tiles."""
+    return {"block_sizes": [128, 128], **knobs}
+
+
+_DENSE_PERSISTENT_FA4 = _dense_flex_config(
+    **{
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+    }
+)
+
+
+def _assert_dense_body(code: str, *, persistent: bool | None = None) -> None:
+    """The render is a dense body: no per-tile status, no mask hook, no
+    table reads, no host-built item order."""
+    _assert_no_table_reads(code)
+    assert "flash_flex_status" not in code
+    assert "flash_flex_needs_mask" not in code
+    assert "_flash_mFlexItems" not in code
+    if persistent is not None:
+        assert f"'persistent': {persistent}" in code
+
+
+def _run_dense(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    config: dict[str, object],
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The fused kernel under torch's empty BlockMask at ``config`` and the
+    eager reference: ``(code, out, lse, ref_out, ref_lse)``."""
+    block_mask = _create_empty_block_mask(q, k)
+    return _run(
+        q,
+        k,
+        v,
+        block_mask,
+        enable_gqa=enable_gqa,
+        config=config,
+        scale=scale,
+    )
+
+
+@onlyBackends(["cute"])
+def test_block_mask_none_is_the_dense_flex_plan() -> None:
+    """``block_mask=None`` (``_create_empty_block_mask``: one KV block over
+    the whole sequence, ``noop_mask``) with the identity ``score_mod`` is
+    the dense flex plan: the dense fa4 body (no per-tile status, no table
+    reads), bitwise the dense attention kernel at the same configuration at
+    head dim 64 (the runtime scale ``1/8`` folds exactly), the base-2 LSE
+    converted to the natural log."""
+    q, k, v = _qkv(2, 4, 256, 256, 64, torch.bfloat16)
+    config = {**DENSE_CONFIG, "block_sizes": [128, 128]}
+    code, out, lse, ref_out, ref_lse = _run_dense(q, k, v, config)
+    _assert_dense_body(code, persistent=False)
+    assert "'topology': 'fa4'" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=2e-2)
+    dense_code, (dense_out, dense_lse) = code_and_output(
+        _dense_attention, (q, k, v), **DENSE_CONFIG
+    )
+    assert "flash_flex" not in dense_code
+    assert torch.equal(out, dense_out)
+    torch.testing.assert_close(lse, dense_lse * math.log(2.0), atol=1e-4, rtol=1e-5)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("row_warps", "row_tile_m", "dtype", "kv_heads"),
+    [
+        (4, 8, torch.bfloat16, None),
+        (2, 16, torch.float16, None),
+        (8, 8, torch.bfloat16, None),
+        (4, 8, torch.bfloat16, 2),
+    ],
+)
+def test_dense_flex_plan_runs_the_row_programs(
+    row_warps: int, row_tile_m: int, dtype: torch.dtype, kv_heads: int | None
+) -> None:
+    """The campaign's (1, 4, 256, 64) cell on the row programs (``row_mma``,
+    the small-grid family the dense surface searches): the kernel reads the
+    runtime scale as a scalar parameter, writes the natural-log LSE, and the
+    BlockMask tables leave the kernel signature."""
+    q, k, v = _qkv(1, 4, 256, 256, 64, dtype, kv_heads=kv_heads)
+    config = _dense_flex_config(
+        **{
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "row_mma",
+            cute_flash.FLASH_ROW_WARPS_KEY: row_warps,
+            cute_flash.FLASH_ROW_TILE_M_KEY: row_tile_m,
+        }
+    )
+    code, out, lse, ref_out, ref_lse = _run_dense(
+        q, k, v, config, enable_gqa=kv_heads is not None
+    )
+    _assert_dense_body(code)
+    assert "'kind': 'helion_flash_row_mma'" in code
+    assert f"'row_warps': {row_warps}, 'row_tile_m': {row_tile_m}" in code
+    assert (
+        "rm_scale = cutlass.Float32(scale) * cutlass.Float32(1.4426950408889634)"
+        in code
+    )
+    assert (
+        "def _helion_helion_flex_attention_kernel(query, key, value, out, lse, scale):"
+        in code
+    )
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("family", "persistent", "shape", "dtype", "kv_heads"),
+    [
+        ("fa4", True, (2, 4, 1024, 64), torch.bfloat16, None),
+        ("fa4", True, (2, 4, 1024, 64), torch.bfloat16, 2),
+        ("ws_overlap", True, (2, 4, 1024, 64), torch.bfloat16, None),
+        # Three KV tiles: no fa4 pair; the single-tile ws body walks them.
+        ("ws_overlap", False, (2, 4, 384, 64), torch.bfloat16, None),
+        ("fa4_alt", True, (2, 4, 2048, 128), torch.float16, None),
+        ("fa4_deep_1cta", True, (2, 4, 2048, 128), torch.bfloat16, None),
+    ],
+    ids=lambda value: str(value).replace(" ", ""),
+)
+def test_dense_flex_plan_runs_the_dense_tcgen05_bodies(
+    family: str,
+    persistent: bool,
+    shape: tuple[int, int, int, int],
+    dtype: torch.dtype,
+    kv_heads: int | None,
+) -> None:
+    """The dense flex plan on the dense surface's tcgen05 families (the
+    persistent fa4 pair body, ws_overlap, fa4_alt, the deep ring), with the
+    dense work-item order (no host-built item table) and the runtime scale
+    derived by the launcher."""
+    batch, heads, seq, head_dim = shape
+    q, k, v = _qkv(batch, heads, seq, seq, head_dim, dtype, kv_heads=kv_heads)
+    config = _dense_flex_config(
+        **{
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+            cute_flash.FLASH_PERSISTENT_KEY: persistent,
+        }
+    )
+    code, out, lse, ref_out, ref_lse = _run_dense(
+        q, k, v, config, enable_gqa=kv_heads is not None
+    )
+    _assert_dense_body(code, persistent=persistent)
+    assert "'scale_idx'" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+# The campaign's (2, 16, 2048, 128) bf16 flex winner (wave 4, dense flex plan):
+# the alternating family's persistent body with the pair body's shared staged
+# output tile requested.
+_DENSE_ALT_SHARED_TILE_WINNER = _dense_flex_config(
+    **{
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_alt",
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+        cute_flash.FLASH_KV_STAGE_KEY: 3,
+        cute_flash.FLASH_S_STAGE_KEY: 2,
+        cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/6",
+        cute_flash.FLASH_E2E_OFFSET_KEY: 13,
+        cute_flash.FLASH_E2E_OFFSET0_KEY: 13,
+        cute_flash.FLASH_EXP2_PACKET_KEY: "8x1",
+        cute_flash.FLASH_ROWMAX_KEY: "software",
+        cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+        cute_flash.FLASH_DISC_PIPE_KEY: 1,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 32.0,
+        cute_flash.FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+        cute_flash.FLASH_CORR_TILE_SIZE_KEY: 8,
+        cute_flash.FLASH_EPI_TMA_KEY: True,
+        cute_flash.FLASH_O_STAGE_KEY: 1,
+        cute_flash.FLASH_P_STORE_REP_KEY: 16,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_MMA_INTERLEAVE_KEY: True,
+        cute_flash.FLASH_PACKED_REDUCE_KEY: True,
+        cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2",
+        cute_flash.FLASH_SOFTMAX_REGS_KEY: 192,
+        cute_flash.FLASH_CORR_REGS_KEY: 64,
+        cute_flash.FLASH_OTHER_REGS_KEY: 64,
+    }
+)
+
+
+@onlyBackends(["cute"])
+def test_dense_flex_plan_alternating_body_shared_output_tile_request() -> None:
+    """The campaign's (2, 16, 2048, 128) bf16 winner: the dense flex plan on
+    the alternating family with the pair body's shared staged output tile
+    requested (``cute_flash_o_stage`` = 1).  The family stages each item's
+    output through its own Q stage, so the request used to reach the host
+    launcher alone (a one-tile ``_flash_osl`` whose stage 1 was tile 0: the
+    next item's Q), and the third item of every persistent CTA -- 148 of 512
+    tiles, batch 1 heads 2-11 -- read a clobbered Q.  The request now resolves
+    to the two-tile body: the output matches eager FlexAttention at the
+    catalog's tolerance and is bitwise the two-tile run's."""
+    q, k, v = _qkv(2, 16, 2048, 2048, 128, torch.bfloat16)
+    code, out, lse, ref_out, ref_lse = _run_dense(
+        q, k, v, _DENSE_ALT_SHARED_TILE_WINNER
+    )
+    _assert_dense_body(code, persistent=True)
+    assert "_helion_flash_alt_rt.flash_fa4_alt_shared_storage(" in code
+    assert "'o_stage'" not in code
+    _assert_close(out, lse, ref_out, ref_lse)
+    torch.testing.assert_close(out, ref_out.to(out.dtype), atol=1e-1, rtol=1e-2)
+    two_tiles = {**_DENSE_ALT_SHARED_TILE_WINNER, cute_flash.FLASH_O_STAGE_KEY: 2}
+    two_code, two_out, two_lse, _, _ = _run_dense(q, k, v, two_tiles)
+    assert two_code == code
+    assert torch.equal(out, two_out)
+    assert torch.equal(lse, two_lse)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "config",
+    [
+        _dense_flex_config(
+            **{
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "row_mma",
+                cute_flash.FLASH_ROW_WARPS_KEY: 4,
+                cute_flash.FLASH_ROW_TILE_M_KEY: 8,
+            }
+        ),
+        _DENSE_PERSISTENT_FA4,
+    ],
+    ids=("row_mma", "fa4_persistent"),
+)
+def test_dense_flex_plan_honours_the_runtime_scale(config: dict[str, object]) -> None:
+    """``scale`` is a runtime kernel argument (floats key by type): the row
+    programs read it as a scalar parameter, the tcgen05 bodies through the
+    launcher's ``_flash_scale_log2``; a scale other than ``1/sqrt(D)``
+    changes the output the way eager FlexAttention's does."""
+    q, k, v = _qkv(1, 4, 256, 256, 64, torch.bfloat16)
+    code, out, lse, ref_out, ref_lse = _run_dense(q, k, v, config, scale=0.3)
+    _assert_dense_body(code)
+    _assert_close(out, lse, ref_out, ref_lse)
+    # The default-scale output is a different tensor: the scale was applied.
+    _, out_default, _, _, _ = _run_dense(q, k, v, config)
+    assert not torch.allclose(out, out_default, atol=1e-2, rtol=1e-2)
