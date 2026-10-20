@@ -861,7 +861,8 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
             assert generation.flash_structural_coverage_uncovered_values() == []
             # The seeds carry the fact-based defaults (canonicalized per
             # body): the stream at every seed whose body holds it, the roll
-            # for the large hook; the pass-2c walk seeds roll explicitly.
+            # for the large hook; the pass-2c walk seeds and the mid-length
+            # grouped-query walk roll explicitly.
             seeds = spec.autotune_seed_configs()
             assert seeds
             widths = {
@@ -874,7 +875,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
                 if seed.config.get(cute_flash.FLASH_E2E_SCHEDULE_KEY) == "8/2"
                 and seed.config.get(cute_flash.FLASH_SOFTMAX_REGION_KEY) == "shared"
             ]
-            assert len(p2c) == 2
+            assert len(p2c) == 3
             assert {
                 seed.config.get(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY) for seed in p2c
             } == {True}
@@ -2619,7 +2620,41 @@ def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
     assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is flat
     assert flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is order
     full_cnt[0, 0, 0] = 0
-    assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is not flat
+    rebuilt = flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs)
+    assert rebuilt is not flat
+    # The last lookup is memoized on the tables' identities and versions and
+    # the geometry (the launch's three host calls hit it): the same call
+    # returns the rebuilt tables; another geometry gets its own entry and
+    # the first one comes back from the keyed cache; a copy of a table is
+    # another object (its own entry, served again on its own repeat); an
+    # in-place write misses again.
+    assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is rebuilt
+    grouped = flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs, group=1)
+    assert grouped is not flex_item_table(
+        part_cnt, part_idx, full_cnt, full_idx, **kwargs
+    )
+    assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is rebuilt
+    assert (
+        flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs, group=1)
+        is grouped
+    )
+    copy_cnt = full_cnt.clone()
+    copied = flex_item_words(part_cnt, part_idx, copy_cnt, full_idx, **kwargs)
+    assert copied is not rebuilt
+    assert flex_item_words(part_cnt, part_idx, copy_cnt, full_idx, **kwargs) is copied
+    part_cnt[0, 0, 0] = part_cnt[0, 0, 0]  # a write bumps the version counter
+    assert (
+        flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is not rebuilt
+    )
+    # Inference tensors are rebuilt on every call and never memoized.
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    with torch.inference_mode():
+        inf = (part_cnt.clone(), part_idx.clone(), full_cnt.clone(), full_idx.clone())
+    assert all(t.is_inference() for t in inf)
+    first = flex_item_words(*inf, **kwargs)
+    assert flex_item_words(*inf, **kwargs) is not first
+    assert flex_item_flags(*inf, **kwargs) == 0
 
 
 def _flex_tables_from_dense(

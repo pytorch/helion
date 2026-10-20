@@ -186,11 +186,24 @@ def _persistent_vec_alignment_prepared_guard(
         if signature is None:
             continue
         residue = cast("tuple[int, object, object]", signature)[0]
-        namespace[f"extract_{index}"] = extract
-        checks.append(
-            f"extract_{index}(args).data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}"
-        )
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
+        checks.append(f"{source}.data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}")
     return eval(f"lambda args: {' and '.join(checks) or 'True'}", namespace)
+
+
+def _prepared_guard_source(
+    namespace: dict[str, object],
+    name: str,
+    extract: Callable[[Sequence[object]], Hashable],
+) -> str:
+    """The expression a generated prepared guard reads a source through:
+    ``args[i]`` for a plain argument (the extractor carries its index), else
+    a call of the extractor bound into ``namespace``."""
+    index = getattr(extract, "_helion_arg_index", None)
+    if type(index) is int:
+        return f"args[{index}]"
+    namespace[name] = extract
+    return f"{name}(args)"
 
 
 def register_persistent_vec_alignment_specializations(
@@ -528,10 +541,10 @@ def _tensor_storage_disjoint_prepared_guard(
     namespace: dict[str, object] = {}
     lines = ["def guard(args):"]
     for index, extract in enumerate(source_extractors):
-        namespace[f"extract_{index}"] = extract
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
         lines.extend(
             (
-                f"    storage_{index} = extract_{index}(args).untyped_storage()",
+                f"    storage_{index} = {source}.untyped_storage()",
                 f"    start_{index} = storage_{index}.data_ptr()",
                 f"    end_{index} = start_{index} + storage_{index}.nbytes()",
             )

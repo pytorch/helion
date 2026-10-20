@@ -18,6 +18,9 @@ workspace and arrival counters (``cute_flash_kv_split``).
 
 from __future__ import annotations
 
+from typing import cast
+import weakref
+
 import torch
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -27,6 +30,16 @@ from torch.utils.weak import WeakIdKeyDictionary
 # exactly like ``document_tile_bounds`` / ``row_bound_work_table``. Inference
 # tensors carry no version counter and are never cached.
 _FLEX_ITEM_TABLE_CACHE: WeakIdKeyDictionary = WeakIdKeyDictionary()
+# The last lookup of ``_flex_item_tables``: the launch's three host calls (the
+# item order, the words, the flags) ask for the same tables with the same
+# geometry back to back, and a steady workload asks again on the next call.
+# Weak references to the four tables (an identity test, never a dead id
+# reuse), their version counters and the geometry decide; a miss falls back
+# to the keyed cache below.  Cleared by ``_flex_item_tables`` itself when the
+# tables are rebuilt uncached (inference tensors, graph capture).
+_FLEX_LAST_LOOKUP: list[
+    tuple[tuple[weakref.ref, ...], tuple[int, ...], tuple[object, ...], object] | None
+] = [None]
 
 
 # Split-KV workspaces per (device, stream, items, splits, head dim): the
@@ -409,6 +422,42 @@ def _flex_tables_uncached(tables: tuple[torch.Tensor, ...]) -> bool:
     )
 
 
+def _flex_table_versions(
+    tables: tuple[torch.Tensor, ...],
+) -> tuple[int, ...] | None:
+    """The tables' version counters, None for inference tensors (which
+    track none and are rebuilt on every call)."""
+    try:
+        return tuple(table._version for table in tables)
+    except RuntimeError:
+        return None
+
+
+def _flex_last_lookup(
+    tables: tuple[torch.Tensor, ...], geometry: tuple[object, ...]
+) -> tuple[tuple[int, ...], _FlexItemTables] | None:
+    """The last lookup's entry when it is these very tables (identity),
+    unchanged (versions) and this geometry, outside a graph capture; the
+    launch's three host calls (order, words, flags) take it back to back."""
+    last = _FLEX_LAST_LOOKUP[0]
+    if last is None or last[2] != geometry:
+        return None
+    refs = last[0]
+    if (
+        refs[0]() is not tables[0]
+        or refs[1]() is not tables[1]
+        or refs[2]() is not tables[2]
+        or refs[3]() is not tables[3]
+    ):
+        return None
+    versions = _flex_table_versions(tables)
+    if versions is None or versions != last[1]:
+        return None
+    if tables[0].is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    return versions, cast("_FlexItemTables", last[3])
+
+
 def _flex_item_tables(
     part_cnt: torch.Tensor,
     part_idx: torch.Tensor,
@@ -426,6 +475,28 @@ def _flex_item_tables(
     four tables' pointers and version counters (rebuilt on every call under
     CUDA-graph capture and for inference tensors, without the flag bits)."""
     tables = (part_cnt, part_idx, full_cnt, full_idx)
+    # The last lookup, before anything else: four identity tests, four version
+    # reads and the geometry (a graph capture is checked first: its replay
+    # must rebuild from the tables it reads, never serve a cached entry).
+    geometry = (q_block, batch, heads, num_pairs, num_kv, group)
+    hit = _flex_last_lookup(tables, geometry)
+    if hit is not None:
+        return hit[1]
+    versions = _flex_table_versions(tables)
+    if versions is None:
+        # Inference tensors track no version counter: rebuilt on every call,
+        # without the flag bits, as ``_flex_tables_uncached`` says.
+        return _FlexItemTables(
+            *_build_flex_item_tables(
+                *tables,
+                q_block=q_block,
+                batch=batch,
+                heads=heads,
+                num_pairs=num_pairs,
+                num_kv=num_kv,
+                group=group,
+            )
+        )
     kwargs = {
         "q_block": q_block,
         "batch": batch,
@@ -456,6 +527,12 @@ def _flex_item_tables(
             *_build_flex_item_tables(*tables, flag_bits=True, **kwargs)
         )
         cached[1][key[0]] = built
+    _FLEX_LAST_LOOKUP[0] = (
+        tuple(weakref.ref(table) for table in tables),
+        versions,
+        geometry,
+        built,
+    )
     return built
 
 
@@ -650,17 +727,21 @@ def flex_item_flags(
     there, by the words and order arguments): the device loads the tables.
     """
     tables = (part_cnt, part_idx, full_cnt, full_idx)
-    if _flex_tables_uncached(tables):
+    hit = _flex_last_lookup(tables, (q_block, batch, heads, num_pairs, num_kv, group))
+    if hit is not None:
+        entry = hit[1]
+    elif _flex_tables_uncached(tables):
         return 0
-    entry = _flex_item_tables(
-        *tables,
-        q_block=q_block,
-        batch=batch,
-        heads=heads,
-        num_pairs=num_pairs,
-        num_kv=num_kv,
-        group=group,
-    )
+    else:
+        entry = _flex_item_tables(
+            *tables,
+            q_block=q_block,
+            batch=batch,
+            heads=heads,
+            num_pairs=num_pairs,
+            num_kv=num_kv,
+            group=group,
+        )
     if entry.flags is None:
         assert entry.flag_bits is not None
         entry.flags = _flex_flags_from_bits(entry.flag_bits)

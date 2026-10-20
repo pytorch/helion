@@ -8144,8 +8144,14 @@ def _flash_role_chain_default(*, hd: int, is_causal: bool, role_map: str) -> boo
 def _flash_seed_block_sizes(
     block_size_targets: Sequence[int],
 ) -> list[int] | None:
+    """The seeds' block sizes: the 128-row query tile and the 128-column KV
+    tile behind any unit batch / head tiles ((1, 128, 128) on the attention
+    kernels; (128, 128) on the flex kernel, whose batch / head axes are fixed
+    outside the search), None for any other surface (no seeds)."""
     targets = tuple(block_size_targets)
-    if targets != _FLASH_SEED_BLOCK_SIZE_TARGETS:
+    if targets[-2:] != _FLASH_SEED_BLOCK_SIZE_TARGETS[-2:] or any(
+        target != 1 for target in targets[:-2]
+    ):
         return None
     return [*targets]
 
@@ -10375,6 +10381,35 @@ def flash_attention_seed_configs(
             FLASH_CORR_TILE_SIZE_KEY: 8,
             FLASH_RESCALE_CHUNK_COLS_KEY: 16,
         }
+        # The mid-length grouped-query walk (the 2026-10-16 campaign's pass-3
+        # gqa-causal-bshd winner: b4 h32 kv8 s4096 hd128, 32 KV tiles per
+        # item): the persistent walk with the shared softmax region and the
+        # rolled chunk loop, the 8/2 cadence on 8x1 packets with the two-deep
+        # PASS2 pipe, Rep32 S loads, the descending order, a three-slot ring
+        # with two output tiles, 184/64/40 registers and 8-row correction
+        # tiles, without the hooked PASS1's all-kept vote.  Pinned on the cell
+        # it runs 0.628 ms where the nearest seed above (the p2c walk's
+        # persistent twin) runs 0.655 and the per-family default 0.661 (GPU 6,
+        # 2026-10-18); the two cold searches that lacked it ended at 0.646 /
+        # 0.654.
+        flex_mid_walk = {
+            **flex_fa4_structure,
+            FLASH_FLEX_HOOK_FAST_FULL_KEY: False,
+            FLASH_KV_STAGE_KEY: min(3, list_kv_stage_cap),
+            FLASH_O_STAGE_KEY: 2,
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+            FLASH_E2E_OFFSET_KEY: 0,
+            FLASH_E2E_OFFSET0_KEY: 1,
+            FLASH_EXP2_PACKET_KEY: "8x1",
+            FLASH_SOFTMAX_REGION_KEY: "shared",
+            FLASH_FLEX_ROLLED_CHUNKS_KEY: True,
+            FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_SOFTMAX_REGS_KEY: 184,
+            FLASH_CORR_REGS_KEY: 64,
+            FLASH_OTHER_REGS_KEY: 40,
+            FLASH_CORR_TILE_SIZE_KEY: 8,
+        }
         source_variants += (
             (
                 FLASH_E2E_SCHEDULE_KEY,
@@ -10393,6 +10428,7 @@ def flash_attention_seed_configs(
             (FLASH_PERSISTENT_KEY, False, flex_p2c_walk),
             (FLASH_PERSISTENT_KEY, True, flex_p2c_walk),
             (FLASH_PERSISTENT_KEY, False, flex_w_walk),
+            (FLASH_SOFTMAX_REGION_KEY, "shared", flex_mid_walk),
         )
         if not has_score_modifiers:
             # A score region runs the hook on every tile; the resident PASS2
@@ -10439,6 +10475,10 @@ def flash_attention_seed_configs(
         ):
             small_grid[FLASH_WS_ONE_PASS_KEY] = True
         source_variants += ((FLASH_Q_TILE_M_KEY, 64, small_grid),)
+    # The bodies that state the hooked PASS1's all-kept vote keep it below
+    # (every seed carries the fragment default; the campaign bodies that do
+    # not state it are switched on there).
+    vote_stated_seeds: list[Config] = []
     for key, value, dependencies in source_variants:
         fragment = fragments[key]
         assert isinstance(fragment, EnumFragment)
@@ -10450,7 +10490,10 @@ def flash_attention_seed_configs(
         if value not in active:
             continue
         values = {**base_values, **dependencies, key: value}
-        seeds.append(_flash_config_with_values(block_sizes, values))
+        seed = _flash_config_with_values(block_sizes, values)
+        seeds.append(seed)
+        if FLASH_FLEX_HOOK_FAST_FULL_KEY in dependencies:
+            vote_stated_seeds.append(seed)
 
     # These lowerings interact with row reduction and pipeline depth. Marginal
     # coverage of each field does not give their combination a starting point.
@@ -10608,11 +10651,14 @@ def flash_attention_seed_configs(
                     # structure seeds carry it on (a ragged query length's
                     # last q-block, the kept side of a window edge; the
                     # search keeps the off value); the target policy's
-                    # measured seeds and the per-family defaults keep
-                    # theirs.
+                    # measured seeds, the per-family defaults and a body
+                    # that states the knob (the mid-length walk measured
+                    # without the vote) keep theirs.
                     **(
                         {}
-                        if seed in target_seeds or seed in family_default_seeds
+                        if seed in target_seeds
+                        or seed in family_default_seeds
+                        or seed in vote_stated_seeds
                         else {FLASH_FLEX_HOOK_FAST_FULL_KEY: True}
                     ),
                     # A seed that asks for the rolled chunk loop keeps it
