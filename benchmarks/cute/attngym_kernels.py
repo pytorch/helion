@@ -54,7 +54,7 @@ _BASELINE_KWARGS: dict[str, object] = {
     # the softcap transform's tanh takes tanh.approx.f32; the Triton backend
     # takes the approximate divide (fast_dividef, div.approx.ftz.f32) for the
     # output normalization and Inductor's use_fast_math (flush-to-zero exp;
-    # exp2 keeps libdevice).
+    # exp2 keeps libdevice, or tl.math.exp2 on XPU).
     "fast_math": True,
     "autotune_baseline_fn": _shared_baseline,
     "autotune_baseline_atol": 5e-2,

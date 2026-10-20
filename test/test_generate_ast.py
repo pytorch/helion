@@ -470,6 +470,35 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
                 result, torch.div(x, y, rounding_mode="trunc"), atol=1.0, rtol=0
             )
 
+    @skipIfRefEager("codegen pins")
+    def test_fast_math_exp2(self):
+        """On XPU, ``fast_math`` lowers exp2 to ``tl.math.exp2`` on the Triton
+        backend; other devices, and kernels without the setting, keep
+        ``libdevice.exp2``."""
+
+        def exp2_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = torch.exp2(x[tile_m, :])
+            return out
+
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(256, 64, device=DEVICE, dtype=dtype) * 8
+            for fast_math, lowering in (
+                (True, "tl_math.exp2(" if DEVICE.type == "xpu" else "libdevice.exp2("),
+                (False, "libdevice.exp2("),
+            ):
+                kernel = helion.kernel(
+                    config=helion.Config(block_sizes=[32]),
+                    static_shapes=True,
+                    fast_math=fast_math,
+                )(exp2_kernel)
+                code, result = code_and_output(kernel, (x,))
+                if _get_backend() == "triton":
+                    self.assertIn(lowering, code)
+                torch.testing.assert_close(result, torch.exp2(x))
+
 
 if __name__ == "__main__":
     unittest.main()

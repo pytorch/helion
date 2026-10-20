@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import torch
+from torch._inductor import config as inductor_config
 from torch._inductor.codegen.triton import TritonOverrides
+from torch._inductor.codegen.triton import maybe_upcast_float32
 from torch._inductor.codegen.triton import triton_compute_type
 from torch._inductor.virtualized import V
 
 from ...language._decorators import is_api_func
+from ..compile_environment import CompileEnvironment
 from ..inductor_lowering_extra import keeps_negative_nan_literal
 
 # Tile API functions that always produce non-negative integer values.
@@ -114,6 +117,24 @@ class HelionTritonOverrides(TritonOverrides):
                 f".to({triton_type}, bitcast=True)"
             )
         return TritonOverrides._shaped_constant(value, dtype, shape)
+
+    @staticmethod
+    @maybe_upcast_float32()
+    def exp2(x: str) -> str:
+        """``tl.math.exp2`` on XPU under fast_math.
+
+        On XPU ``libdevice.exp2`` is the software ``__imf_exp2f`` (<= 0.7 ulp)
+        while ``tl.math.exp2`` is the hardware exp2 (<= 1.7 ulp).  On CUDA
+        ``libdevice.exp2`` already compiles to ``ex2.approx.ftz.f32`` and on
+        ROCm it keeps ocml's subnormal handling, so other devices are left
+        alone.
+        """
+        if (
+            inductor_config.use_fast_math
+            and CompileEnvironment.current().device.type == "xpu"
+        ):
+            return f"tl_math.exp2({x})"
+        return f"libdevice.exp2({x})"
 
     @staticmethod
     def _can_simplify_div() -> bool:

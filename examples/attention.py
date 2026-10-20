@@ -185,7 +185,8 @@ def _baseline_unless_tpu(fn: Callable[..., Any]) -> Callable[..., Any] | None:
 # packets, an approximation of ex2.approx, only under this setting; the Triton
 # backend takes the approximate divide (fast_dividef, div.approx.ftz.f32) for
 # the output normalization and Inductor's use_fast_math (torch.exp lowers to
-# the flush-to-zero tl.math.exp; exp2 keeps libdevice).
+# the flush-to-zero tl.math.exp; exp2 keeps libdevice, except on XPU, where it
+# lowers to tl.math.exp2).
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
