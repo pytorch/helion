@@ -158,7 +158,7 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
     result: dict[str, Callable] = {
         name: (lambda fn=fn: fn) for name, fn in case.baselines.items()
     }
-    if not any("compile" in n for n in result):
+    if case.auto_compile and not any("compile" in n for n in result):
         result["torch.compile"] = lambda: torch.compile(baseline, fullgraph=True)
     module = case.module
     forward = case.mode == "forward"
