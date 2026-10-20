@@ -540,8 +540,13 @@ def flash_bwd_shared_storage(
         # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
         clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
-        sLSE: cute.struct.MemRange[cutlass.Float32, lse_entries]
-        sDelta: cute.struct.MemRange[cutlass.Float32, delta_entries]
+        # 16-byte aligned (explicitly: the compute warps read LSE / Delta as
+        # 128-bit vectors; a 4-byte-aligned start costs an extra load and a
+        # register shuffle per vector).
+        sLSE: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, lse_entries], 16]
+        sDelta: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, delta_entries], 16
+        ]
         # The flex hook's staged aux tables (see the forward's sFlexAux).
         sFlexAux: cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
@@ -654,6 +659,69 @@ def flash_bwd_flex_pair_shared_storage(
         sP: p_field
 
     return SharedStoragePair
+
+
+def flash_bwd_flex_2cta_shared_storage(
+    dtype: object = cutlass.Float16,
+    steps: int = 0,
+    bit_words: int = 1,
+) -> type:
+    """SharedStorage of the 2-CTA flex backward at head dim 128 (per CTA;
+    ``cute_flash_bwd_flex_2cta``): the dense 2-CTA kernel's operand halves
+    (see ``flash_bwd_2cta_shared_storage``) plus the ``steps``-entry flex
+    step table and the merged walk's scratch (the 16 warp counts of its
+    ballot scans, the three membership bitmaps of ``bit_words`` words each);
+    the dQ drain keeps the dense kernel's four (32 x 32) fp32 boxes (one per
+    reduce warp), so the table takes what the 227 KB leave (64-128 steps)."""
+    steps_entries = max(steps, 1)
+    bits_entries = 3 * max(bit_words, 1)
+    half = 64 * 128
+
+    @cute.struct
+    class SharedStorageFlex2cta:
+        sSteps: cute.struct.MemRange[cutlass.Int32, steps_entries]
+        sScan: cute.struct.MemRange[cutlass.Int32, 16]
+        sBits: cute.struct.MemRange[cutlass.Int32, bits_entries]
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        kt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_tmem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_smem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        s_read_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # 16-byte aligned: the compute warps read LSE / Delta as 128-bit
+        # vectors (a 4-byte-aligned start costs an extra load and a register
+        # shuffle per vector).
+        sLSE: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
+        sDelta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdOt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdO: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sQt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
+        sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
+        sKt: cute.struct.Align[cute.struct.MemRange[dtype, half * 2], 1024]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sdSx: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 128], 1024]
+        sdQaccum: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, 4 * 1024], 1024
+        ]
+
+    return SharedStorageFlex2cta
 
 
 @dsl_user_op
@@ -915,8 +983,9 @@ def flash_bwd_2cta_shared_storage(
         # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
         clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
-        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
-        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        # 16-byte aligned (explicitly; see flash_bwd_shared_storage).
+        sLSE: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
+        sDelta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2 * 128], 16]
         sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
         sdOt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
         sdO: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]

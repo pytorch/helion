@@ -19,12 +19,16 @@ FlexAttention semantics) within bf16 tolerance:
   dS^T through TMEM, the polynomial exp2 share, the per-element mask form, hook
   group widths, register splits, the KV-fastest block order, the gathered aux
   table staged in shared memory;
-* repeated launches give stable gradients.
+* repeated launches give stable gradients;
+* the 2-CTA pair kernel (head dim 128) against the 1-CTA kernel on dense and
+  masked merged walks, chunked tables included, and at q_seq 64K with
+  identical pair lists and a 32-step table (the refill's bitmap barrier).
 """
 
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -141,6 +145,7 @@ def _run(
     block_size: int | tuple[int, int] = 128,
     mask_dims: tuple[int | None, int | None] = (None, None),
     capture: bool = False,
+    reference: bool = True,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
     (``config_overrides``: knob values on top of it; ``table_steps``: a
@@ -150,7 +155,9 @@ def _run(
     ``mask_dims``: the BlockMask's (B, H) dims (``None`` broadcasts); a
     ``mask_mod`` reading ``b`` / ``h`` needs them. ``capture``: after the
     eager launches, capture one launch into a CUDA graph and return the
-    gradients its replay produces.
+    gradients its replay produces. ``reference=False`` (long sequences,
+    whose fp32 score matrices do not fit): the forward O / LSE come from the
+    fused forward instead and the reference gradients are empty.
 
     ``layout``: ``bhsd`` (contiguous), ``bshd`` (``[B, S, H, D]`` allocations
     viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
@@ -175,9 +182,6 @@ def _run(
     else:
         assert layout == "bhsd"
     scale = 1.0 / math.sqrt(d)
-    ref_dq, ref_dk, ref_dv, out, lse = _reference_grads(
-        q, k, v, do, ref_score_mod or score_mod, mask_mod, scale
-    )
     block_mask = create_block_mask(
         mask_mod if mask_mod is not None else noop_mask,
         mask_dims[0],
@@ -187,6 +191,14 @@ def _run(
         device=str(DEVICE),
         BLOCK_SIZE=block_size,
     )
+    if reference:
+        ref_dq, ref_dk, ref_dv, out, lse = _reference_grads(
+            q, k, v, do, ref_score_mod or score_mod, mask_mod, scale
+        )
+        ref: tuple[torch.Tensor, ...] = (ref_dq, ref_dk, ref_dv)
+    else:
+        out, lse = _fused_forward(q, k, v, score_mod, block_mask, scale, hq != hkv)
+        ref = ()
     kernel = flex_example.helion_flex_attention_backward_kernel
     args = flex_example.flex_attention_backward_args(
         q,
@@ -261,7 +273,46 @@ def _run(
             grad.zero_()
         graph.replay()
         torch.cuda.synchronize()
-    return got, (ref_dq, ref_dk, ref_dv), code
+    return got, ref, code
+
+
+def _fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    score_mod: Callable[..., torch.Tensor],
+    block_mask: object,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """O and the natural-log LSE from the example's fused forward, pinned to
+    its default config (the reference's fp32 score matrix does not fit at
+    long sequences)."""
+    full_num = block_mask.full_kv_num_blocks  # type: ignore[attr-defined]
+    full_idx = block_mask.full_kv_indices  # type: ignore[attr-defined]
+    if full_num is None or full_idx is None:
+        full_num = flex_example._zero_block_table_like(block_mask.kv_num_blocks)  # type: ignore[attr-defined]
+        full_idx = flex_example._zero_block_table_like(block_mask.kv_indices)  # type: ignore[attr-defined]
+    args = (
+        q,
+        k,
+        v,
+        score_mod,
+        block_mask.kv_num_blocks,  # type: ignore[attr-defined]
+        block_mask.kv_indices,  # type: ignore[attr-defined]
+        full_num,
+        full_idx,
+        block_mask.mask_mod,  # type: ignore[attr-defined]
+        block_mask.BLOCK_SIZE[0],  # type: ignore[attr-defined]
+        block_mask.BLOCK_SIZE[1],  # type: ignore[attr-defined]
+        scale,
+        enable_gqa,
+    )
+    fwd = flex_example.helion_flex_attention_kernel
+    bound = fwd.bind(args)
+    bound.set_config(bound.config_spec.default_config())
+    out, lse = fwd(*args)
+    return out, lse
 
 
 def _as_bshd(t: torch.Tensor) -> torch.Tensor:
@@ -1093,3 +1144,288 @@ def test_transposed_o_and_do_preprocess_is_bitwise() -> None:
     expected = (o.float() * do.float()).sum(-1)
     torch.testing.assert_close(delta_c, expected, atol=1e-2, rtol=1e-3)
     assert torch.all(lse2_c[0, 0, :7] == 0)
+
+
+# -- the 2-CTA kernel (head dim 128) -------------------------------------------
+
+
+def _assert_pair_gradients(
+    got2: tuple[torch.Tensor, ...], got1: tuple[torch.Tensor, ...]
+) -> None:
+    """The pair kernel against the 1-CTA kernel on the same inputs: dK / dV
+    bitwise on the even KV tiles' rows (the same per-step products
+    accumulated in the same order; the odd tiles' rows follow the merged
+    walk's order and are compared within rounding), dQ within one bf16 ulp
+    at the peak (the wrapper's bf16 cast of fp32 sums that associate
+    differently: one K = 256 MMA against two partials added by the
+    reduce-add) and identical almost everywhere (mean difference below 1e-6
+    of the peak)."""
+    dq2, dk2, dv2 = got2
+    dq1, dk1, dv1 = got1
+    for name, a, b in (("dk", dk2, dk1), ("dv", dv2, dv1)):
+        even = a.view(*a.shape[:2], -1, 256, a.shape[-1])[:, :, :, :128]
+        even_c = b.view(*b.shape[:2], -1, 256, b.shape[-1])[:, :, :, :128]
+        assert torch.equal(even, even_c), f"{name}: even KV tiles differ"
+        peak = max(b.float().abs().max().item(), 1e-6)
+        assert (a.float() - b.float()).abs().max().item() / peak < 2**-8, name
+    peak = max(dq1.float().abs().max().item(), 1e-6)
+    diff = (dq2.float() - dq1.float()).abs()
+    assert diff.max().item() / peak <= 2**-8, "dq: more than one bf16 ulp at peak"
+    assert diff.mean().item() / peak < 1e-6, "dq: differs beyond isolated roundings"
+
+
+def _run_pair(**kwargs: object) -> tuple[tuple[torch.Tensor, ...], ...]:
+    """The 2-CTA and the 1-CTA kernel on the same inputs (``kwargs`` of
+    :func:`_run` plus ``overrides`` on top of both), and the reference."""
+    overrides = dict(kwargs.pop("overrides", {}))  # type: ignore[arg-type]
+    got2, ref, code2 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    assert "cta_group=2" in code2
+    got1, _, code1 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 0, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" not in code1
+    return got2, got1, ref
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("b", "hq", "hkv", "m", "n", "overrides"),
+    [
+        (1, 2, 2, 512, 512, {}),
+        (1, 4, 2, 512, 512, {}),
+        (2, 2, 2, 256, 1024, {}),
+        (1, 2, 2, 1000, 512, {}),
+        (1, 1, 1, 2048, 2048, {}),
+        (1, 2, 2, 512, 768, {"cute_flash_bwd_exp2_f32": 0}),
+        (2, 4, 2, 384, 512, {"cute_flash_bwd_tile_group": 2}),
+        (1, 2, 2, 512, 512, {"cute_flash_bwd_regs": "88/168/88"}),
+    ],
+    ids=[
+        "dense",
+        "gqa",
+        "cross_m_lt_n",
+        "ragged_m",
+        "long_walk",
+        "exp2_f16x2",
+        "tile_group",
+        "regs",
+    ],
+)
+def test_two_cta_dense_matches_the_single_cta(
+    b: int, hq: int, hkv: int, m: int, n: int, overrides: dict[str, object]
+) -> None:
+    """The cluster pair (one 256-row KV tile, dQ reduce-added once per 256
+    KV rows) on full-table walks: dK / dV bitwise the 1-CTA kernel's (the
+    same per-step products in the same order), dQ within rounding (one
+    K=256 accumulation instead of two fp32 partial adds)."""
+    got2, got1, ref = _run_pair(
+        b=b, hq=hq, hkv=hkv, m=m, n=n, d=128, overrides=overrides
+    )
+    _assert_pair_gradients(got2, got1)
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_repeated_launches_are_stable() -> None:
+    got2, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=128,
+        repeats=50,
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_knob_keeps_the_single_cta_where_not_legal() -> None:
+    """Outside the pair's envelope the knob renders the 1-CTA kernel: head
+    dim 64, an odd KV tile count."""
+    for kwargs in (
+        {"b": 1, "hq": 2, "hkv": 2, "m": 256, "n": 256, "d": 64},
+        {"b": 1, "hq": 2, "hkv": 2, "m": 256, "n": 384, "d": 128},
+    ):
+        got, ref, code = _run(
+            config_overrides={"cute_flash_bwd_two_cta": 1},
+            **kwargs,  # type: ignore[arg-type]
+        )
+        assert "flash_bwd_flex_2cta_shared_storage" not in code
+        _assert_close(got, ref)
+
+
+def _doc_blocks(b, h, q_idx, kv_idx):
+    # Block-diagonal documents of 384 rows: the two KV tiles of a pair fall in
+    # different documents at every odd pair, so the merged walk has steps one
+    # CTA never attends (its absent flag) and steps only the odd tile lists.
+    return (q_idx // 384) == (kv_idx // 384)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("b", "hq", "hkv", "m", "n", "mask_mod", "kwargs"),
+    [
+        (2, 2, 2, 512, 512, _causal, {}),
+        (1, 2, 2, 512, 512, _window64, {}),
+        (1, 4, 2, 512, 512, _causal, {}),
+        (1, 2, 2, 1000, 512, _causal, {}),
+        (1, 2, 2, 768, 768, _doc_blocks, {}),
+        (1, 2, 2, 256, 512, _prefix_only, {}),
+        (1, 2, 2, 512, 512, _causal, {"dtype": torch.float16}),
+        (1, 4, 2, 8192, 1024, _causal, {"table_steps": 64}),
+        (1, 2, 2, 2048, 512, _causal, {"table_steps": 5}),
+        (1, 16, 2, 32768, 256, _causal, {}),
+        (
+            1,
+            2,
+            2,
+            512,
+            512,
+            _window64,
+            {"config_overrides": {"cute_flash_bwd_mask_form": "element"}},
+        ),
+    ],
+    ids=[
+        "causal",
+        "sliding_window",
+        "gqa_causal",
+        "ragged_causal",
+        "documents",
+        "empty_tiles",
+        "causal_fp16",
+        "chunked_gqa",
+        "chunked_odd",
+        "chunked_gqa8_natural",
+        "element_mask",
+    ],
+)
+def test_two_cta_masked_walks(
+    b: int, hq: int, hkv: int, m: int, n: int, mask_mod, kwargs: dict[str, object]
+) -> None:
+    """The merged pair walk: the pair's two KV tiles list different Q blocks
+    (causal diagonals, window edges, document boundaries, empty tiles); each
+    CTA walks the union with its own masked / absent flags; walks longer
+    than the table run in several chunks (the forced caps give up to four
+    chunks per tile; 8 q heads x 256 Q tiles overflow the table on their
+    own)."""
+    overrides = dict(kwargs.pop("config_overrides", {}))  # type: ignore[arg-type]
+    got2, ref, code2 = _run(
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=128,
+        mask_mod=mask_mod,
+        config_overrides={"cute_flash_bwd_two_cta": 1, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    if "table_steps" in kwargs:
+        assert "fbwd_nchunks" in code2
+    got1, _, _ = _run(
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=128,
+        mask_mod=mask_mod,
+        config_overrides={"cute_flash_bwd_two_cta": 0, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    _assert_pair_gradients(got2, got1)
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_identical_pair_lists_long_q() -> None:
+    """The merged-walk fill at a long Q with IDENTICAL pair lists and a small
+    table. Causal at q_seq 64K: the odd tile's lists are a subset of the
+    even tile's, so no head runs the L1-only section (the only barriers
+    between a head's L0 fill and the next head's bitmap clear); the bitmap
+    words span two warps (16 words per bitmap plus the sentinel), and a
+    32-step table has every refill fill one warp's worth of entries while
+    the other 13 warps run ahead to the next head. Without a barrier before
+    the clear, rank 1 read a cleared bitmap and wrote the entry as absent:
+    the odd tile dropped the step (dq / dk / dv off by 3-15% of the peak on
+    every launch, two launches disagreeing). The pair kernel against the
+    1-CTA kernel: even tiles bitwise, the rest within rounding, and two
+    launches of the pair agree bitwise on dK / dV (the pair's own
+    accumulations are deterministic; dQ's TMA reduce-adds are not)."""
+    kw: dict[str, object] = {
+        "b": 1,
+        "hq": 16,
+        "hkv": 2,
+        "m": 65536,
+        "n": 16384,
+        "d": 128,
+        "mask_mod": _causal,
+        "reference": False,
+        "table_steps": 32,
+    }
+    got2, _, code2 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+        **kw,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    assert "fbwd_nchunks = (fbwd_steps + 31) // 32" in code2
+    # 512 Q blocks + the sentinel: 17 words per bitmap (51 words cleared per
+    # head of the prologue); every refill copies its 32 entries out of the
+    # walk scratch right after the working warps' barrier.
+    assert "for fbwd_wb in cutlass.range(0, 51, 512, unroll=1):" in code2
+    assert re.search(
+        r"named_barrier_wait_unaligned\(7, 448\)\n\s+"
+        r"for fbwd_ib in cutlass\.range\(0, fbwd_csteps, 448, unroll=1\):",
+        code2,
+    )
+    got2b, _, _ = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+        **kw,  # type: ignore[arg-type]
+    )
+    got1, _, code1 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 0},
+        **kw,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" not in code1
+    _assert_pair_gradients(got2, got1)
+    for name, a, b in (("dk", got2[1], got2b[1]), ("dv", got2[2], got2b[2])):
+        assert torch.equal(a, b), f"{name}: two launches of the pair kernel differ"
+
+
+@_gpu_test
+def test_two_cta_softcap_jacobian() -> None:
+    """A score_mod with a Jacobian region on the merged walk: the hooks run
+    per CTA on its own rows and the absent steps zero P and dS."""
+    cap = 20.0
+
+    def softcap(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1 - t * t)
+
+    got2, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=128,
+        score_mod=softcap,
+        score_mod_bwd=softcap_bwd,
+        mask_mod=_causal,
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    assert "fbwd_spre" in code
+    _assert_close(got2, ref)
