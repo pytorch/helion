@@ -77,9 +77,25 @@ class Sm100BlockScaledGemm:
         round_dtypes: tuple[type[cutlass.Numeric], ...] = (),
         *,
         operand_format: str = "nvfp4",
+        fused_scales: bool = False,
+        compact_m: bool = False,
+        logical_m_per_cta: int = 128,
+        lhs_scale_row_stride: int = 1,
+        lhs_scale_column_stride: int = 0,
+        rhs_scale_row_stride: int = 1,
+        rhs_scale_column_stride: int = 0,
     ) -> None:
         assert operand_format in ("nvfp4", "mxfp8")
         self.operand_format = operand_format
+        self.fused_scales = fused_scales
+        self.compact_m = compact_m and logical_m_per_cta < 128 and m > 1
+        self.logical_m_per_cta = logical_m_per_cta
+        assert logical_m_per_cta in (32, 64, 128)
+        assert fused_scales or logical_m_per_cta == 128
+        self.lhs_scale_row_stride = lhs_scale_row_stride
+        self.lhs_scale_column_stride = lhs_scale_column_stride
+        self.rhs_scale_row_stride = rhs_scale_row_stride
+        self.rhs_scale_column_stride = rhs_scale_column_stride
         self.operand_dtype = (
             cutlass.Float4E2M1FN if operand_format == "nvfp4" else cutlass.Float8E4M3FN
         )
@@ -90,15 +106,18 @@ class Sm100BlockScaledGemm:
         self.mma_k = 64 if operand_format == "nvfp4" else 32
         self.scale_chunk_k = 4 * self.scale_vector_size
         assert m > 0 and n > 0 and k > 0 and k % self.scale_vector_size == 0
-        assert bn in ((64, 128, 256) if operand_format == "mxfp8" else (128, 256))
+        assert bn in (
+            (16, 32, 64, 128, 224, 256) if operand_format == "mxfp8" else (128, 256)
+        )
         assert bk in (64, 128, 256)
         assert bk % self.scale_chunk_k == 0
-        assert stages in (2, 3, 4, 5) and cluster_m in (1, 2)
+        assert stages in (2, 3, 4, 5, 6, 8, 10, 12) and cluster_m in (1, 2)
         self.m, self.n, self.k = m, n, k
         self.mp, self.np, self.kp = block_scaled_workspace_shape(m, n, k, bn, bk)
         self.bm, self.bn, self.bk = 128 * cluster_m, bn, bk
         self.sf_n_chunks = (bn + 127) // 128
         self.stages = stages
+        self.epi_n = min(bn, 64)
         self.cluster_m = cluster_m
         self.round_dtypes = round_dtypes
         self.group = tcgen05.CtaGroup.ONE if cluster_m == 1 else tcgen05.CtaGroup.TWO
@@ -111,7 +130,9 @@ class Sm100BlockScaledGemm:
         self.sa_offset = self.qb_offset + self.qb_bytes
         self.sb_offset = self.sa_offset + self.sa_bytes
         self.workspace_bytes = self.sb_offset + self.sb_bytes
-        self.m_tiles = (m + self.bm - 1) // self.bm
+        self.m_tiles = (m + self.logical_m_per_cta * cluster_m - 1) // (
+            self.logical_m_per_cta * cluster_m
+        )
         self.n_tiles = (n + bn - 1) // bn
         self.tile_count = self.m_tiles * self.n_tiles
         self.clusters = (
@@ -184,6 +205,30 @@ class Sm100BlockScaledGemm:
         self._launch(qa, qb, sa, sb, output, alpha, stream)
 
     @cute.jit
+    def mxfp8_packed(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        output: cute.Tensor,
+        alpha: cutlass.Float32,
+        stream: CUstream,
+    ) -> None:
+        assert self.operand_format == "mxfp8" and self.fused_scales
+        a_strides = cast("tuple[int | cutlass.Int64, int | cutlass.Int64]", a.stride)
+        b_strides = cast("tuple[int | cutlass.Int64, int | cutlass.Int64]", b.stride)
+        qa = cute.make_tensor(
+            cute.recast_ptr(a.iterator, dtype=self.operand_dtype),
+            cute.make_layout((self.m, self.k, 1), stride=(*a_strides, 0)),
+        )
+        qb = cute.make_tensor(
+            cute.recast_ptr(b.iterator, dtype=self.operand_dtype),
+            cute.make_layout((self.n, self.k, 1), stride=(*b_strides, 0)),
+        )
+        self._launch(qa, qb, sa, sb, output, alpha, stream)
+
+    @cute.jit
     def _launch(
         self,
         qa: cute.Tensor,
@@ -225,14 +270,42 @@ class Sm100BlockScaledGemm:
         )
         assert cute.cosize(sal) == cute.cosize(sa_window) * 2 * self.stages
         assert cute.cosize(sbl) == cute.cosize(sb_window) * 2 * self.stages
-        a_atom, a_tma = cute.nvgpu.make_tiled_tma_atom_A(
-            cpasync.CopyBulkTensorTileG2SOp(self.group),
-            qa,
-            cute.slice_(al, (None, None, None, 0)),
-            self.tile,
-            mma,
-            cluster.shape,
-        )
+        if cutlass.const_expr(self.compact_m):
+            # Valid MMA rows occupy one logical stage. The remaining rows of
+            # the physical MMA view are dead output lanes and overlap the next
+            # stage; cosize keeps an explicit tail allocation for its final read.
+            strides = (
+                al.outer.stride[0],
+                al.outer.stride[1],
+                (al.outer.stride[2][0], self.logical_m_per_cta * 128),
+                self.logical_m_per_cta * self.bk,
+            )
+            al = cute.make_composed_layout(
+                al.inner, 0, cute.make_layout(al.outer.shape, stride=strides)
+            )
+            load_layout = cute.make_composed_layout(
+                al.inner,
+                0,
+                cute.make_layout(
+                    (self.logical_m_per_cta, (128, self.bk // 128), 1),
+                    stride=(128, (1, self.logical_m_per_cta * 128), 0),
+                ),
+            )
+            a_atom, a_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(self.group),
+                qa,
+                load_layout,
+                (self.logical_m_per_cta, self.bk, 1),
+            )
+        else:
+            a_atom, a_tma = cute.nvgpu.make_tiled_tma_atom_A(
+                cpasync.CopyBulkTensorTileG2SOp(self.group),
+                qa,
+                cute.slice_(al, (None, None, None, 0)),
+                self.tile,
+                mma,
+                cluster.shape,
+            )
         b_atom, b_tma = cute.nvgpu.make_tiled_tma_atom_B(
             cpasync.CopyBulkTensorTileG2SOp(self.group),
             qb,
@@ -269,23 +342,31 @@ class Sm100BlockScaledGemm:
                     ),
                 ),
             )
-        sa_atom, sa_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(self.group),
-            sa,
-            sa_window,
-            sa_window.shape,
-        )
-        sb_atom, sb_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(self.group),
-            sb,
-            sb_window,
-            sb_window.shape,
-        )
+        if cutlass.const_expr(self.fused_scales):
+            sa_atom, sa_tma = a_atom, sa
+            sb_atom, sb_tma = b_atom, sb
+        else:
+            sa_atom, sa_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(self.group),
+                sa,
+                sa_window,
+                sa_window.shape,
+            )
+            sb_atom, sb_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(self.group),
+                sb,
+                sb_window,
+                sb_window.shape,
+            )
         self.tx_bytes = self.cluster_m * (
-            cute.size_in_bytes(self.operand_dtype, al) // self.stages
+            (
+                self.logical_m_per_cta * self.bk
+                if self.compact_m
+                else cute.size_in_bytes(self.operand_dtype, al) // self.stages
+            )
             + cute.size_in_bytes(self.operand_dtype, bl) // self.stages
-            + cute.cosize(sal) // self.stages
-            + cute.cosize(sbl) // self.stages
+            + (0 if self.fused_scales else cute.cosize(sal) // self.stages)
+            + (0 if self.fused_scales else cute.cosize(sbl) // self.stages)
         )
         self.kernel(
             output,
@@ -306,7 +387,7 @@ class Sm100BlockScaledGemm:
             sbl,
         ).launch(
             grid=(self.clusters * self.cluster_m, 1, 1),
-            block=(192, 1, 1),
+            block=(224 if self.fused_scales else 192, 1, 1),
             cluster=(self.cluster_m, 1, 1),
             stream=stream,
         )
@@ -355,6 +436,21 @@ class Sm100BlockScaledGemm:
         a = cute.make_tensor(
             cute.recast_ptr(ap, al.inner, dtype=self.operand_dtype), al.outer
         )
+        if cutlass.const_expr(self.compact_m):
+            a_load = cute.make_tensor(
+                cute.recast_ptr(ap, al.inner, dtype=self.operand_dtype),
+                cute.make_layout(
+                    (self.logical_m_per_cta, (128, self.bk // 128), 1, self.stages),
+                    stride=(
+                        128,
+                        (1, self.logical_m_per_cta * 128),
+                        0,
+                        self.logical_m_per_cta * self.bk,
+                    ),
+                ),
+            )
+        else:
+            a_load = a
         b = cute.make_tensor(
             cute.recast_ptr(bp, bl.inner, dtype=self.operand_dtype), bl.outer
         )
@@ -383,6 +479,22 @@ class Sm100BlockScaledGemm:
             cta_layout_vmnk=cluster,
             defer_sync=True,
         )
+        if cutlass.const_expr(self.fused_scales):
+            sf_barriers = cute.arch.alloc_smem(
+                cutlass.Int64, 2 * self.stages, alignment=8
+            )
+            sf_pipe = pipeline.PipelineAsyncUmma.create(
+                num_stages=self.stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 32 * self.cluster_m
+                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                barrier_storage=sf_barriers,
+                cta_layout_vmnk=cluster,
+                defer_sync=True,
+            )
+        else:
+            sf_pipe = None
         c_pipe = pipeline.PipelineUmmaAsync.create(
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
@@ -395,7 +507,9 @@ class Sm100BlockScaledGemm:
         )
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster, is_relaxed=True)
         allocator = utils.TmemAllocator(
-            barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=192),
+            barrier_for_retrieve=pipeline.NamedBarrier(
+                barrier_id=1, num_threads=224 if self.fused_scales else 192
+            ),
             is_two_cta=self.cluster_m == 2,
         )
         c_layout = mma.make_fragment_C(mma.partition_shape_C((self.bm, self.bn))).layout
@@ -440,8 +554,9 @@ class Sm100BlockScaledGemm:
         if warp == 5:
             cpasync.prefetch_descriptor(a_atom)
             cpasync.prefetch_descriptor(b_atom)
-            cpasync.prefetch_descriptor(sa_atom)
-            cpasync.prefetch_descriptor(sb_atom)
+            if cutlass.const_expr(not self.fused_scales):
+                cpasync.prefetch_descriptor(sa_atom)
+                cpasync.prefetch_descriptor(sb_atom)
             state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.stages
             )
@@ -451,31 +566,50 @@ class Sm100BlockScaledGemm:
             ):
                 mi = tile_index // self.n_tiles
                 ni = tile_index % self.n_tiles
-                ga = thread_mma.partition_A(
-                    cute.local_tile(
-                        a_tma[None, None, 0], (self.bm, self.bk), (mi, None)
+                if cutlass.const_expr(self.compact_m):
+                    ga = cute.local_tile(
+                        a_tma,
+                        (self.logical_m_per_cta, self.bk, 1),
+                        (mi * self.cluster_m + v, None, 0),
                     )
-                )
+                else:
+                    ga = thread_mma.partition_A(
+                        cute.local_tile(
+                            cute.domain_offset(
+                                (
+                                    mi * self.logical_m_per_cta * self.cluster_m
+                                    + v * (self.logical_m_per_cta - 128),
+                                    0,
+                                ),
+                                a_tma[None, None, 0],
+                            ),
+                            (self.bm, self.bk),
+                            (0, None),
+                        )
+                    )
                 gb = thread_mma.partition_B(
                     cute.local_tile(
                         b_tma[None, None, 0], (self.bn, self.bk), (ni, None)
                     )
                 )
-                gsa = cute.local_tile(
-                    sa_tma,
-                    (256, self.bk // self.scale_chunk_k, 1),
-                    (0, None, mi * self.cluster_m + v),
-                )
-                gsb = cute.local_tile(
-                    sb_tma,
-                    (256, self.bk // self.scale_chunk_k, self.sf_n_chunks),
-                    (0, None, ni // 2 if cutlass.const_expr(self.bn == 64) else ni),
-                )
+                if cutlass.const_expr(not self.fused_scales):
+                    gsa = cute.local_tile(
+                        sa_tma,
+                        (256, self.bk // self.scale_chunk_k, 1),
+                        (0, None, mi * self.cluster_m + v),
+                    )
+                    gsb = cute.local_tile(
+                        sb_tma,
+                        (256, self.bk // self.scale_chunk_k, self.sf_n_chunks),
+                        (0, None, ni // 2 if cutlass.const_expr(self.bn == 64) else ni),
+                    )
+                else:
+                    gsa, gsb = None, None
                 da, ga = cpasync.tma_partition(
                     a_atom,
                     0,
                     cute.make_layout(1),
-                    cute.group_modes(a, 0, 3),
+                    cute.group_modes(a_load, 0, 3),
                     cute.group_modes(ga, 0, 3),
                 )
                 db, gb = cpasync.tma_partition(
@@ -485,20 +619,24 @@ class Sm100BlockScaledGemm:
                     cute.group_modes(b, 0, 3),
                     cute.group_modes(gb, 0, 3),
                 )
-                dsa, gsa = cpasync.tma_partition(
-                    sa_atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sa_chunks, 0, 3),
-                    cute.group_modes(gsa, 0, 3),
-                )
-                dsb, gsb = cpasync.tma_partition(
-                    sb_atom,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sb_chunks, 0, 3),
-                    cute.group_modes(gsb, 0, 3),
-                )
+                if cutlass.const_expr(not self.fused_scales):
+                    assert gsa is not None and gsb is not None
+                    dsa, gsa = cpasync.tma_partition(
+                        sa_atom,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sa_chunks, 0, 3),
+                        cute.group_modes(gsa, 0, 3),
+                    )
+                    dsb, gsb = cpasync.tma_partition(
+                        sb_atom,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sb_chunks, 0, 3),
+                        cute.group_modes(gsb, 0, 3),
+                    )
+                else:
+                    dsa, dsb = None, None
                 for ki in cutlass.range(self.kp // self.bk, unroll=1):
                     ab_pipe.producer_acquire(state)
                     barrier = ab_pipe.producer_get_barrier(state)
@@ -508,18 +646,21 @@ class Sm100BlockScaledGemm:
                     cute.copy(
                         b_atom, gb[None, ki], db[None, state.index], tma_bar_ptr=barrier
                     )
-                    cute.copy(
-                        sa_atom,
-                        gsa[None, ki],
-                        dsa[None, state.index],
-                        tma_bar_ptr=barrier,
-                    )
-                    cute.copy(
-                        sb_atom,
-                        gsb[None, ki],
-                        dsb[None, state.index],
-                        tma_bar_ptr=barrier,
-                    )
+                    if cutlass.const_expr(not self.fused_scales):
+                        assert gsa is not None and gsb is not None
+                        assert dsa is not None and dsb is not None
+                        cute.copy(
+                            sa_atom,
+                            gsa[None, ki],
+                            dsa[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
+                        cute.copy(
+                            sb_atom,
+                            gsb[None, ki],
+                            dsb[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
                     ab_pipe.producer_commit(state)
                     state.advance()
             ab_pipe.producer_tail(state)
@@ -553,6 +694,9 @@ class Sm100BlockScaledGemm:
                     mma.set(tcgen05.Field.ACCUMULATE, False)
                     for _ki in cutlass.range(self.kp // self.bk, unroll=1):
                         ab_pipe.consumer_wait(state)
+                        if cutlass.const_expr(self.fused_scales):
+                            assert sf_pipe is not None
+                            sf_pipe.consumer_wait(state)
                         _scale_copy(sa, tsa, state.index, self.group)
                         _scale_copy(sb, tsb, state.index, self.group)
                         for kk in cutlass.range_constexpr(self.bk // self.mma_k):
@@ -567,28 +711,118 @@ class Sm100BlockScaledGemm:
                             )
                             mma.set(tcgen05.Field.ACCUMULATE, True)
                         ab_pipe.consumer_release(state)
+                        if cutlass.const_expr(self.fused_scales):
+                            assert sf_pipe is not None
+                            sf_pipe.consumer_release(state)
                         state.advance()
                     c_pipe.producer_commit(cstate)
                     cstate.advance()
                 c_pipe.producer_tail(cstate)
+        if cutlass.const_expr(self.fused_scales):
+            if warp == 6:
+                lane = tid % 32
+                raw_sa = cute.recast_ptr(sa_tma.iterator, dtype=cutlass.Int32)
+                raw_sb = cute.recast_ptr(sb_tma.iterator, dtype=cutlass.Int32)
+                dst_sa = cute.recast_ptr(sap, dtype=cutlass.Int32)
+                dst_sb = cute.recast_ptr(sbp, dtype=cutlass.Int32)
+                state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.stages
+                )
+                for tile_index in cutlass.range(
+                    first_tile, self.tile_count, tile_stride, unroll=1
+                ):
+                    mi = tile_index // self.n_tiles
+                    ni = tile_index % self.n_tiles
+                    m_start = (
+                        mi * self.logical_m_per_cta * self.cluster_m
+                        + v * self.logical_m_per_cta
+                    )
+                    n_start = (
+                        (ni // 2 * 128)
+                        if cutlass.const_expr(self.bn == 64)
+                        else ni * self.bn
+                    )
+                    for ki in cutlass.range(self.kp // self.bk, unroll=1):
+                        assert sf_pipe is not None
+                        sf_pipe.producer_acquire(state)
+                        for chunk in cutlass.range_constexpr(self.bk // 128):
+                            word_k = ki * (self.bk // 128) + chunk
+                            for segment in cutlass.range_constexpr(4):
+                                row = lane + segment * 32
+                                gm = m_start + row
+                                value = cutlass.Int32(0)
+                                if (
+                                    gm < self.m
+                                    and row < self.logical_m_per_cta
+                                    and word_k < (self.k + 127) // 128
+                                ):
+                                    value = raw_sa[
+                                        cutlass.Int64(gm) * self.lhs_scale_row_stride
+                                        + cutlass.Int64(word_k)
+                                        * self.lhs_scale_column_stride
+                                    ]
+                                if cutlass.const_expr(self.k % 128 != 0):
+                                    if word_k == self.k // 128:
+                                        value = value & (
+                                            (1 << ((self.k % 128) // 32 * 8)) - 1
+                                        )
+                                dst_sa[
+                                    state.index * (128 * (self.bk // 128))
+                                    + chunk * 128
+                                    + lane * 4
+                                    + segment
+                                ] = value
+                            for n_chunk in cutlass.range_constexpr(self.sf_n_chunks):
+                                for segment in cutlass.range_constexpr(4):
+                                    row = lane + segment * 32
+                                    gn = n_start + n_chunk * 128 + row
+                                    value = cutlass.Int32(0)
+                                    if gn < self.n and word_k < (self.k + 127) // 128:
+                                        value = raw_sb[
+                                            cutlass.Int64(gn)
+                                            * self.rhs_scale_row_stride
+                                            + cutlass.Int64(word_k)
+                                            * self.rhs_scale_column_stride
+                                        ]
+                                    if cutlass.const_expr(self.k % 128 != 0):
+                                        if word_k == self.k // 128:
+                                            value = value & (
+                                                (1 << ((self.k % 128) // 32 * 8)) - 1
+                                            )
+                                    dst_sb[
+                                        state.index
+                                        * (128 * (self.bk // 128) * self.sf_n_chunks)
+                                        + n_chunk * (128 * (self.bk // 128))
+                                        + chunk * 128
+                                        + lane * 4
+                                        + segment
+                                    ] = value
+                        cute.arch.fence_view_async_shared()
+                        assert sf_pipe is not None
+                        sf_pipe.producer_commit(state)
+                        state.advance()
+                assert sf_pipe is not None
+                sf_pipe.producer_tail(state)
         if warp < 4:
             epi_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
-            cp = cute.arch.alloc_smem(output.element_type, 128 * 64, alignment=128)
+            cp = cute.arch.alloc_smem(
+                output.element_type, 128 * self.epi_n, alignment=128
+            )
             cl = cute.make_composed_layout(
                 cute.make_swizzle(3, 3, 3),
                 0,
-                cute.make_layout((128, 64), stride=(64, 1)),
+                cute.make_layout((128, self.epi_n), stride=(self.epi_n, 1)),
             )
             shared_c = cute.make_tensor(cp, cl)
             c_tiles = cute.local_tile(
-                transform_partitioned_tensor_layout(acc), (128, 64), (0, None)
+                transform_partitioned_tensor_layout(acc), (128, self.epi_n), (0, None)
             )
             atom = blackwell_helpers.get_tmem_load_op(
                 (128, self.bn, self.bk),
                 LayoutEnum.ROW_MAJOR,
                 output.element_type,
                 cutlass.Float32,
-                (128, 64),
+                (128, self.epi_n),
                 self.cluster_m == 2,
             )
             copy = tcgen05.make_tmem_copy(atom, c_tiles[None, None, 0])
@@ -603,10 +837,15 @@ class Sm100BlockScaledGemm:
             for tile_index in cutlass.range(
                 first_tile, self.tile_count, tile_stride, unroll=1
             ):
-                m_start = tile_index // self.n_tiles * self.bm + v * 128
+                m_start = (
+                    tile_index // self.n_tiles * self.logical_m_per_cta * self.cluster_m
+                    + v * self.logical_m_per_cta
+                )
                 n_start = tile_index % self.n_tiles * self.bn
                 c_pipe.consumer_wait(cstate)
-                for ni in cutlass.range(self.bn // 64, unroll=1):
+                for ni in cutlass.range(
+                    (self.bn + self.epi_n - 1) // self.epi_n, unroll=1
+                ):
                     cute.copy(copy, thread.partition_S(c_tiles[None, None, ni]), regs)
                     rounded = regs.load() * alpha
                     for round_index in cutlass.range_constexpr(len(self.round_dtypes)):
@@ -614,13 +853,18 @@ class Sm100BlockScaledGemm:
                     narrowed.store(rounded.to(output.element_type))
                     cute.autovec_copy(narrowed, destination)
                     epi_barrier.arrive_and_wait()
-                    for vi in cutlass.range_constexpr(8):
+                    for vi in cutlass.range_constexpr(self.epi_n // 8):
                         flat = (tid + vi * 128) * 8
-                        row = flat // 64
-                        col = flat % 64
+                        row = flat // self.epi_n
+                        col = flat % self.epi_n
                         gm = m_start + row
-                        gn = n_start + ni * 64 + col
-                        if gm < self.m and gn < self.n:
+                        gn = n_start + ni * self.epi_n + col
+                        if (
+                            gm < self.m
+                            and gn < self.n
+                            and row < self.logical_m_per_cta
+                            and ni * self.epi_n + col < self.bn
+                        ):
                             address = (
                                 cutlass.Int64(gm) * output_strides[0]
                                 + cutlass.Int64(gn) * output_strides[1]
@@ -628,6 +872,7 @@ class Sm100BlockScaledGemm:
                             if (
                                 cutlass.const_expr(output_pointer.alignment >= 16)
                                 and gn + 7 < self.n
+                                and ni * self.epi_n + col + 7 < self.bn
                                 and address % 8 == 0
                                 and output_strides[1] == 1
                             ):
@@ -646,7 +891,10 @@ class Sm100BlockScaledGemm:
                                 cute.copy(store_atom, src, dst)
                             else:
                                 for tail in cutlass.range_constexpr(8):
-                                    if gn + tail < self.n:
+                                    if (
+                                        gn + tail < self.n
+                                        and ni * self.epi_n + col + tail < self.bn
+                                    ):
                                         output[
                                             cutlass.Int64(gm), cutlass.Int64(gn) + tail
                                         ] = shared_c[row, col + tail]

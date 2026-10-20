@@ -558,9 +558,13 @@ def _append_cute_wrapper_plan(
     if kind == "block_scaled_mma":
         if (
             plan_int("bn")
-            not in ((64, 128, 256) if plan.get("format") == "mxfp8" else (128, 256))
+            not in (
+                (16, 32, 64, 128, 224, 256)
+                if plan.get("format") == "mxfp8"
+                else (128, 256)
+            )
             or plan_int("bk") not in (64, 128, 256)
-            or plan_int("stages") not in (2, 3, 4, 5)
+            or plan_int("stages") not in (2, 3, 4, 5, 6, 8, 10, 12)
             or plan_int("cluster_m") not in (1, 2)
             or any(plan_int(key) <= 0 for key in ("m", "n", "k", "workspace_bytes"))
             or plan_int("k") % 16

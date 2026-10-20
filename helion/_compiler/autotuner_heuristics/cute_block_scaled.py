@@ -6,9 +6,20 @@ from ...runtime.config import Config
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
+
+
+def _seed_geometry_int(
+    values: Mapping[str, object], key: str, default: int | None = None
+) -> int:
+    """Read the integer geometry constructed by this compiler seed family."""
+    value = values[key] if default is None else values.get(key, default)
+    assert type(value) is int
+    return value
 
 
 class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
@@ -52,6 +63,8 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
         if not cls.is_eligible(env, device_ir):
             return []
         base = env.config_spec._base_default_config().config
+        if (partition_key := env.config_spec.cute_mxfp8_partition_key) is not None:
+            base[partition_key] = 1
         variants = (
             (
                 (1, 128, 128, 2, True),
@@ -76,7 +89,7 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
                 (2, 256, 256, 4, False),
             )
         )
-        return [
+        seeds = [
             Config.from_dict(
                 base
                 | {
@@ -91,3 +104,72 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
             )
             for cluster, n, k, stages, persistent in variants
         ]
+        if env.config_spec.cute_mxfp8_fused_scales_available:
+            fused_variants = (
+                (2, 32, 256, 4, 64, True),
+                (1, 32, 256, 4, 64, True),
+                (2, 16, 256, 4, 64, True),
+                (1, 16, 256, 4, 64, True),
+                (1, 32, 256, 4, 128, True),
+                (2, 32, 256, 5, 64, True),
+                (2, 224, 128, 6, 128, False),
+                (2, 128, 256, 4, 128, False),
+                (1, 128, 128, 8, 64, False),
+            )
+            seeds = [
+                Config.from_dict(seed.config | {"cute_scaled_fused_scales": True})
+                for seed in seeds
+            ] + seeds
+            seeds = [
+                Config.from_dict(
+                    base
+                    | {
+                        "cute_scaled_mma": True,
+                        "cute_collective_mma": False,
+                        "cute_scaled_fused_scales": True,
+                        "cute_scaled_cluster_m": cluster,
+                        "cute_scaled_tile_n": n,
+                        "cute_scaled_tile_k": k,
+                        "cute_scaled_stages": stages,
+                        "cute_scaled_tile_m": m,
+                        "cute_scaled_swap_ab": swap,
+                        "cute_scaled_persistent": True,
+                    }
+                )
+                for cluster, n, k, stages, m, swap in fused_variants
+            ] + seeds
+            compact_seeds = [
+                Config.from_dict(seed.config | {"cute_scaled_compact_m": True})
+                for seed in seeds
+                if seed.config.get("cute_scaled_fused_scales") is True
+                and _seed_geometry_int(seed.config, "cute_scaled_tile_m", 128) < 128
+            ]
+            compact_variants = (
+                (1, 16, 256, 2, 32),
+                (2, 16, 256, 4, 32),
+                (1, 16, 128, 8, 32),
+                (2, 16, 128, 12, 64),
+                (1, 32, 128, 8, 64),
+                (2, 32, 128, 12, 64),
+            )
+            compact_seeds += [
+                Config.from_dict(
+                    base
+                    | {
+                        "cute_scaled_mma": True,
+                        "cute_collective_mma": False,
+                        "cute_scaled_fused_scales": True,
+                        "cute_scaled_compact_m": True,
+                        "cute_scaled_cluster_m": cluster,
+                        "cute_scaled_tile_n": n,
+                        "cute_scaled_tile_k": k,
+                        "cute_scaled_stages": stages,
+                        "cute_scaled_tile_m": m,
+                        "cute_scaled_swap_ab": True,
+                        "cute_scaled_persistent": True,
+                    }
+                )
+                for cluster, n, k, stages, m in compact_variants
+            ]
+            seeds = compact_seeds + seeds
+        return seeds

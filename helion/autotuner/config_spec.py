@@ -1601,7 +1601,9 @@ class ConfigSpec:
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
         self.cute_scaled_mma_available = False
+        self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_mma_available = False
+        self.cute_mxfp8_partition_key: str | None = None
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_warp_aggregated_atomics_enabled = False
@@ -5335,6 +5337,11 @@ class ConfigSpec:
             or config.get("pid_type", self.allowed_pid_types[0]) != "flat"
         ):
             return
+        key = self.cute_mxfp8_partition_key
+        if key is not None and (
+            type(config.get(key)) is not int or config.get(key) != 1
+        ):
+            raise InvalidConfig(f"native complete MXFP8 reduction requires {key}=1")
         fields = self._flat_fields()
         for key in _CUTE_MXFP8_ROOT_LOWERING_KEYS.intersection(config):
             if key in self.user_defined_tunables:
@@ -6200,6 +6207,7 @@ class ConfigSpec:
                 capability=self.target_device_capability,
                 fix_invalid=_fix_invalid,
                 mxfp8=self.cute_mxfp8_mma_available,
+                fused_scales_available=self.cute_mxfp8_fused_scales_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -7818,7 +7826,10 @@ class ConfigSpec:
                     (
                         key,
                         EnumFragment(
-                            choices=tuple(value for value in choices if value != 64)
+                            choices=(False,)
+                            if key == "cute_scaled_fused_scales"
+                            and not self.cute_mxfp8_fused_scales_available
+                            else tuple(value for value in choices if value != 64)
                             if self.cute_mxfp8_mma_available
                             and key == "cute_scaled_tile_k"
                             else choices

@@ -80,9 +80,15 @@ class BlockScaledMmaPlan:
     num_sm: int
     format: str = "nvfp4"
     rhs_transposed: bool = False
+    fused_scales: bool = False
+    logical_m_per_cta: int = 128
+    swap_ab: bool = False
+    compact_m: bool = False
 
     @property
     def workspace_bytes(self) -> int:
+        if self.fused_scales:
+            return 1
         padded_m, padded_n, padded_k = block_scaled_workspace_shape(
             self.m, self.n, self.k, self.bn, self.bk
         )
@@ -681,6 +687,19 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
     if plan.format == "mxfp8":
         wrapper_plan["format"] = plan.format
         wrapper_plan["rhs_transposed"] = plan.rhs_transposed
+        wrapper_plan["fused_scales"] = plan.fused_scales
+        wrapper_plan["logical_m_per_cta"] = plan.logical_m_per_cta
+        wrapper_plan["swap_ab"] = plan.swap_ab
+        wrapper_plan["compact_m"] = plan.compact_m
+        if plan.fused_scales:
+            for side, operand in (("lhs", plan.lhs), ("rhs", plan.rhs)):
+                row_stride, column_stride = operand.source.scale.stride()
+                wrapper_plan[side + "_scale_row_stride"] = (
+                    CompileEnvironment.current().size_hint(row_stride)
+                )
+                wrapper_plan[side + "_scale_column_stride"] = (
+                    CompileEnvironment.current().size_hint(column_stride)
+                )
     if alpha.isidentifier():
         wrapper_plan["scale_name"] = alpha
     else:
