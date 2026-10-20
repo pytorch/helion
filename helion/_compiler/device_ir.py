@@ -3628,6 +3628,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             if has_k_loop_less_matmul(env, device_ir):
                 config_spec.epilogue_subtile_candidate_enabled = False
 
+        env = CompileEnvironment.current()
+        if env.backend.name == "cute" and env.settings.cute_graph_cse:
+            # Duplicate pure nodes (the second amax/exp/sum of a softmax and
+            # log_softmax over one operand) would each roll into their own
+            # sweep and exchange below; merge them while every graph is still
+            # the traced one.  ``cute_graph_cse=False`` (HELION_CUTE_GRAPH_CSE=0)
+            # keeps the traced graph, to bisect a structural matcher against it.
+            from .cute.graph_cse import cse_device_ir
+
+            cse_device_ir(device_ir)
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.

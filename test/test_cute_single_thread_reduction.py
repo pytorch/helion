@@ -442,7 +442,16 @@ class TestCuteSingleThreadReduction(TestCase):
             x = torch.randn(m, k, device=DEVICE)
             w = torch.randn(k, n, device=DEVICE)
             with self.subTest(m=m, k=k, n=n):
-                code, out = code_and_output(_full_slice_matmul, (x, w))
+                # The loop-less mma-dag owner claims this body where its tiles
+                # fit (an fp32 ``@`` on tf32 MMAs under the default
+                # ``dot_precision``); the launch pin is about the SIMT lane
+                # scheduler's default, so the owner is withheld here.
+                _full_slice_matmul.reset()
+                with patch(
+                    "helion._compiler.cute.cute_mma_dag.match_mma_dag",
+                    return_value=None,
+                ):
+                    code, out = code_and_output(_full_slice_matmul, (x, w))
                 torch.testing.assert_close(out, x @ w, rtol=1e-4, atol=1e-4)
                 launched, rows = _root_launch_threads(code)
                 self.assertEqual(launched, rows, code)
