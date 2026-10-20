@@ -203,7 +203,7 @@ jobs:
     if: ${{ github.event.inputs.run_xpu == 'true' }}
     with:
       max-runners: 1
-      kernels: "gemm"
+      kernels: ${{ github.event.inputs.kernels }}
 
   run-xpu:
     needs: gen-matrix-xpu
