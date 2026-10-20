@@ -53,6 +53,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -2581,6 +2582,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cutlass = pytest.importorskip("cutlass")
