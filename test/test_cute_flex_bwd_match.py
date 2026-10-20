@@ -29,6 +29,7 @@ pytest.importorskip("cutlass.cute")
 from test._cute_aux import _cpu_codegen
 
 import helion
+from helion._compiler.cute import flex_bwd_match as flex_bwd_match_module
 from helion._compiler.cute import flex_match
 from helion._compiler.cute.backend import _attention_config_envelope_ok
 from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
@@ -36,6 +37,7 @@ from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
 from helion._compiler.cute.cute_flash_bwd_flex import fbwd_aux_smem_candidates
 from helion._compiler.cute.cute_flash_bwd_flex import fbwd_table_step_choices
 from helion._compiler.cute.flex_bwd_match import FlexBwdMatch
+from helion._compiler.cute.flex_bwd_match import flex_bwd_tmem_plan
 from helion._compiler.cute.flex_bwd_match import match_flex_attention_bwd
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     import pathlib
+    from pathlib import Path
 
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
@@ -430,7 +433,7 @@ def _tensors_dv(
         (80, 144),
         (64, 256),
         (176, 128),
-        (256, 256),
+        (256, 192),
     ],
 )
 def test_declines_unsupported_head_dims(head_dim: int, head_dim_v: int) -> None:
@@ -448,6 +451,220 @@ def test_declines_unsupported_head_dims(head_dim: int, head_dim_v: int) -> None:
 def test_head_dim_192_128_matches() -> None:
     match = _match_or_fail(_bind(_args(_tensors_dv(192, 128), _causal)))
     assert (match.plan.head_dim, match.plan.head_dim_v) == (192, 128)
+
+
+def test_head_dim_256_pair_matches() -> None:
+    """(256, 256) takes the 2-CTA pair plan; the matcher also captured the
+    forward-frame regions its dQ clusters render."""
+    match = _match_or_fail(_bind(_args(_tensors_dv(256, 256), _causal)))
+    plan = match.plan
+    assert (plan.head_dim, plan.head_dim_v) == (256, 256)
+    tmem = flex_bwd_tmem_plan(256, 256)
+    assert tmem is not None and tmem.mode == "pair"
+    assert plan.regions_q_captured
+    assert plan.mask_region_q is not None and plan.score_region_q is None
+    assert plan.mask_region is not None
+
+
+@pytest.mark.skipif(
+    os.environ.get("HELION_TEST_PAIR_PTX") != "1",
+    reason="2-3 minutes: compiles the pair kernel through the CuTe DSL and "
+    "assembles its PTX; set HELION_TEST_PAIR_PTX=1",
+)
+def test_head_dim_256_pair_assembles_without_gpu(tmp_path: Path) -> None:
+    """The ptxas rule the DSL hides ("NVVM backend compilation failed" is all
+    it says): one cta_group per kernel. Compile the pair kernel through the
+    DSL on the CPU, keep the PTX and assemble it with nvJitLink, which
+    reports ptxas's own message (the mixed cta_group::1 / ::2 rejection,
+    for one)."""
+    t = _tensors_dv(256, 256, batch=1, heads=2, q_seq=256, kv_seq=256)
+    args = _args(t, _causal)
+    bound = _bind(args)
+    code = _render(bound)
+    assert "fbwd_is_dq" in code
+    path = tmp_path / "pair_256.py"
+    path.write_text(code)
+    namespace: dict[str, object] = {}
+    exec(compile(code, str(path), "exec"), namespace)
+    host = namespace["helion_flex_attention_backward_kernel"]
+    with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_100a"}), _as_sm100():
+        host(*args, _launcher=_ptx_dump_launcher(tmp_path))  # pyrefly: ignore[not-callable]
+    ptx_files = sorted(tmp_path.glob("*.ptx"))
+    assert ptx_files, list(tmp_path.iterdir())
+    assert_ptx_assembles(ptx_files[-1].read_bytes())
+
+
+def _ptx_dump_launcher(dump_dir: Path) -> Callable[..., None]:
+    """A compile-only launcher (``test_cute_flash_gated._compile_only_launcher``
+    with the DSL's ``--keep-ptx`` into ``dump_dir``: the keep / dump settings
+    are per-compile options, the environment variables are read at import)."""
+
+    def launcher(
+        cute_kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
+    ) -> None:
+        import importlib
+
+        import cutlass.cute as cute
+
+        from helion.runtime.cute import launcher as cute_launcher
+
+        cuda_driver = importlib.import_module("cuda.bindings.driver")
+        block = kwargs.pop("block", (256, 1, 1))
+        assert isinstance(block, tuple)
+        with patch.object(
+            cute_launcher, "_validate_cute_launcher_tensor", lambda arg: None
+        ):
+            launch = cute_launcher._build_cute_schema_and_args(
+                cute_kernel, tuple(args), (int(grid[0]), 1, 1)
+            )
+        jit_func = cute_launcher._create_cute_wrapper(
+            cute_kernel, launch.schema, block, num_sm=148
+        )
+        cute.compile(
+            jit_func,
+            *launch.launch_args,
+            cuda_driver.CUstream(0),
+            options=f"--keep-ptx --dump-dir={dump_dir}",
+        )
+
+    return launcher
+
+
+def assert_ptx_assembles(ptx: bytes) -> None:
+    """Assemble ``ptx`` for sm_100a with nvJitLink and fail with ptxas's
+    error log when it is rejected."""
+    from cuda.bindings import nvjitlink
+
+    handle = nvjitlink.create(2, ["-arch=sm_100a", "-O3"])
+    try:
+        nvjitlink.add_data(handle, nvjitlink.InputType.PTX, ptx, len(ptx), "k.ptx")
+        nvjitlink.complete(handle)
+    except Exception as error:
+        size = nvjitlink.get_error_log_size(handle)
+        log = bytearray(size)
+        if size:
+            nvjitlink.get_error_log(handle, log)
+        raise AssertionError(
+            f"ptxas rejected the PTX: {log.decode(errors='replace')}"
+        ) from error
+    finally:
+        nvjitlink.destroy(handle)
+
+
+def test_head_dim_256_pair_render() -> None:
+    """The pair kernel's shape: (2, 1, 1) clusters, the dK/dV clusters (one
+    per KV block) and the dQ clusters (one per Q block of every batch-head,
+    Q-major, their KV lists derived on the host from the Q-side tables),
+    alternating in launch order when their counts are equal and otherwise
+    the dK/dV range first, the roles' TMEM plans (dK/dV: dK 0, dV 128,
+    S 256 / 384, dP 320 / 448 by step parity; dQ: S^T 0 / 128, dP^T 64 /
+    192, the accumulator 256), every MMA a pair MMA with its own
+    instruction-descriptor register per role, and the dQ clusters' hooks in
+    the forward frame (the Q tile is their item-level row tile, the KV tile
+    the per-step one)."""
+    code = _render_plan(_tensors_dv(256, 256))
+    assert "_helion_cute_cluster_shape = (2, 1, 1)" in code
+    # 32 KV-block clusters + 32 Q-block clusters: four CTAs per KV block,
+    # the roles interleaved.
+    assert "[0] * 4,)" in code
+    assert (
+        "fbwd_is_dq = cute.arch.make_warp_uniform(fbwd_cluster % 2) >= cutlass.Int32(1)"
+        in code
+    )
+    assert "fbwd_tile_id = fbwd_cluster // 2" in code
+    assert "fbwd_qtile = fbwd_cluster // 2" in code
+    assert "fbwd_bhq_t = fbwd_qt_id // 4" in code
+    # 16 Q blocks against 32 KV blocks: the dQ clusters follow the dK/dV
+    # range (still four CTAs per KV block, the last 16 clusters empty).
+    ragged = _render_plan(_tensors_dv(256, 256, q_seq=256, kv_seq=512))
+    assert "[0] * 4,)" in ragged
+    assert (
+        "fbwd_is_dq = cute.arch.make_warp_uniform(fbwd_cluster // 32) >= cutlass.Int32(1)"
+        in ragged
+    )
+    assert "fbwd_tile_id = cutlass.min(fbwd_cluster, cutlass.Int32(31))" in ragged
+    assert "fbwd_qtile = fbwd_cluster - 32" in ragged
+    # The derived KV-side lists: one host statement ahead of the launch
+    # builds the tuple, the four extra arguments index it.
+    build = "fbwd_kv_tables = _helion_flash_flex_bwd_kv_tables("
+    assert code.count(build) == 1 and "q_blocks=4, kv_blocks=4)" in code
+    assert code.index(build) < code.index("_launcher(")
+    for index in range(4):
+        assert f"fbwd_kv_tables[{index}]" in code
+    assert (
+        "fbwd_cfq = cutlass.Int32(_fbwd_kv_full_cnt[fbwd_tb_q, fbwd_th_q, fbwd_qrow])"
+        in code
+    )
+    assert "flash_bwd_flex_pair_shared_storage(cutlass.BFloat16, " in code
+    for off, name in ((256, "tS_t"), (320, "tdP_t"), (128, "tDV_t"), (0, "tDK_t")):
+        assert f"{name} = cute.make_tensor(fbwd_tmem_ptr + {off}, " in code, name
+    assert "tS_t = cute.make_tensor(fbwd_tmem_ptr + 0, " in code
+    assert "tdP_t = cute.make_tensor(fbwd_tmem_ptr + 64, " in code
+    assert code.count("tDQ_t = cute.make_tensor(fbwd_tmem_ptr + 256, ") == 2
+    # The step-parity S / dP buffers of both roles.
+    for off in (256, 0):
+        assert (
+            f"tSb_t = cute.make_tensor(fbwd_tmem_ptr + {off} + 128 * fbwd_b, " in code
+        )
+    assert "mbarrier_init(fbwd_stq_empty_ptr + fbwd_bi, 16)" in code
+    # dK/dV role: S(0) before the loop, then dP(i) / S(i+1) / dV(i) / dK(i);
+    # dQ role: S^T(i) / dP^T(i) / dQ(i-1) and the tail dQ, accumulating.
+    gemms = [line for line in code.splitlines() if "gemm_ptx_dyn_qk(" in line]
+    assert len(gemms) == 9 and all("cta_group=2" in line for line in gemms)
+    assert "cta_group=1" not in code and "CtaGroup.ONE" not in code
+    assert "fbwd_j = fbwd_steps - 1" in code
+    assert code.count("zero_init=fbwd_dq_zero") == 2
+    assert "num_stages=2" in code and "fbwd_st_kt2 + 2048 * fbwd_kte.index" in code
+    # The dK/dV clusters' P has its own staging buffer (the storage fits
+    # exactly up to 128 step-table entries): the dS write waits for the
+    # previous dK (sds_free), the P write for the previous dV (pv_done); one
+    # LSE / delta staging copy per parity behind a 256-thread barrier.
+    assert "flash_bwd_flex_pair_shared_storage(cutlass.BFloat16, 4, True)" in code
+    assert "fbwd_sP = storage.sP.get_tensor(" in code
+    assert (
+        "fbwd_st_p = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 7)"
+        in code
+    )
+    assert "mbarrier_init(fbwd_pv_done_ptr, 1)" in code
+    assert code.count("mbar_spin_wait(fbwd_pv_done_ptr, fbwd_i - 1 & 1, 10000000)") == 2
+    assert code.count("named_barrier_wait_unaligned(3, 256)") == 2
+    assert "named_barrier_wait_unaligned(4, 128)" not in code
+    assert code.count("fbwd_sLSE.iterator + (128 - fbwd_par + 0 + fbwd_stat_j)") == 1
+    # Past 128 entries P shares the dS buffer again (the dS write then waits
+    # for the dV MMA) and the LSE / delta staging keeps one copy per parity.
+    long = _render_plan(
+        _tensors_dv(256, 256, batch=1, heads=1, q_seq=32768, kv_seq=32768)
+    )
+    assert "flash_bwd_flex_pair_shared_storage(cutlass.BFloat16, 256, False)" in long
+    assert "fbwd_sP = fbwd_sdS_nk" in long and "storage.sP" not in long
+    assert long.count("mbar_spin_wait(fbwd_pv_done_ptr, fbwd_i & 1, 10000000)") == 2
+    assert long.count("named_barrier_wait_unaligned(3, 256)") == 2
+    for name in (
+        "helion_fbwd_ss_idesc",
+        "helion_fbwd_pv_idesc",
+        "helion_fbwdq_ss_idesc",
+        "helion_fbwdq_pv_idesc",
+    ):
+        mma = "ss" if "ss" in name else "pv"
+        assert code.count(f"declare_ptx_idesc(_fbwd_{mma}_mma.op, '{name}')") == 1
+    # The dQ clusters: the tile's LSE / delta per row once, dS staged
+    # K-major, the accumulator drained once per tile through the K / V
+    # tiles as (32 x 16) boxes.
+    assert "fbwd_lse_frg.fill(_fbwd_mLSE[fbwd_bhq_t * 512 + fbwd_qrow_t])" in code
+    assert "mbar_spin_wait(fbwd_dv_done_ptr, 0, 10000000)" in code
+    assert "fbwd_gdq[None, None, fbwd_gdq_row, fbwd_my_c0 + 7]" in code
+    assert "fbwd_sdq16b[None, None, fbwd_slot0 + 7]" in code
+    # No persistent walk, statistics MMAs, staged aux tables or chunked
+    # table on the pair plan.
+    fields = _bind(_args(_tensors_dv(256, 256), _causal)).config_spec._flat_fields()
+    assert fields["cute_flash_bwd_persistent"].choices == (0,)
+    for knob in (
+        "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_ds_tmem",
+        "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_aux_smem",
+    ):
+        assert knob not in fields, knob
 
 
 @pytest.mark.parametrize(
@@ -1041,6 +1258,45 @@ def test_expanded_operands_decline() -> None:
         "with non-zero 16-byte aligned outer strides"
     )
     assert not bound.config_spec.cute_flash_bwd_search_enabled
+
+
+def test_head_dim_256_pair_declines_strided_operands() -> None:
+    """The pair kernel's maps are the contiguous (seq, D, B*H) ones: at head
+    dim 256 the ``[B, S, H, D]`` views the rank-4 maps serve elsewhere leave
+    the fused path."""
+    bound = _bind(_args(_transposed_tensors(head_dim=256), _causal))
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == "flex_bwd: the pair kernel takes contiguous operands only"
+    assert not bound.config_spec.cute_flash_bwd_search_enabled
+
+
+def test_head_dim_256_pair_declines_without_forward_frame_regions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pair kernel's dQ clusters render the hooks in the forward frame;
+    when that second capture fails (the first, in the transposed frame,
+    succeeded) the pair plan is declined rather than rendered without
+    them."""
+    original = flex_bwd_match_module._capture_bwd_regions
+    frames: list[tuple[object, object]] = []
+
+    def forward_frame_capture_fails(ctx, *args: object, **kwargs: object) -> object:
+        # The matcher swaps the axis roles for the forward-frame capture.
+        frame = (ctx.m_id, ctx.kv_id)
+        if frames and frame == frames[0][::-1]:
+            return None
+        frames.append(frame)
+        return original(ctx, *args, **kwargs)
+
+    monkeypatch.setattr(
+        flex_bwd_match_module, "_capture_bwd_regions", forward_frame_capture_fails
+    )
+    bound = _bind(_args(_tensors_dv(256, 256), _causal))
+    reasons: list[str] = []
+    assert _match(bound, reasons) is None
+    assert reasons[0] == "flex_bwd: the pair kernel needs the forward-frame regions"
+    assert frames and not bound.config_spec.cute_flash_bwd_search_enabled
 
 
 def _without_source_comments(code: str) -> str:

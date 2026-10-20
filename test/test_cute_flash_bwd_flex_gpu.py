@@ -100,9 +100,15 @@ def _reference_grads(
                 s = (qf @ kf.T) * scale
                 s = score_mod(s, b_t, h_t, q_idx, kv_idx)
                 if mask_mod is not None:
-                    s = torch.where(mask_mod(b_t, h_t, q_idx, kv_idx), s, float("-inf"))
-                p = torch.softmax(s, dim=-1)
-                p = torch.nan_to_num(p, nan=0.0)
+                    keep = mask_mod(b_t, h_t, q_idx, kv_idx)
+                    s = torch.where(keep, s, float("-inf"))
+                    # A fully masked row attends nothing: zero output and
+                    # zero gradients (not the NaNs of an all -inf softmax).
+                    row_valid = keep.any(dim=-1, keepdim=True)
+                    s = torch.where(row_valid, s, 0.0)
+                    p = torch.where(row_valid, torch.softmax(s, dim=-1), 0.0)
+                else:
+                    p = torch.softmax(s, dim=-1)
                 o = p @ vf
                 gq, gk, gv = torch.autograd.grad(o, (qf, kf, vf), do[b, h].float())
             dq[b, h] = gq
@@ -133,11 +139,18 @@ def _run(
     dtype: torch.dtype = torch.bfloat16,
     table_steps: int = 0,
     block_size: int | tuple[int, int] = 128,
+    mask_dims: tuple[int | None, int | None] = (None, None),
+    capture: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
     (``config_overrides``: knob values on top of it; ``table_steps``: a
     step-table cap, forced even when the shape is too small to offer it) and
     return the gradients, the fp32 reference gradients and the generated code.
+
+    ``mask_dims``: the BlockMask's (B, H) dims (``None`` broadcasts); a
+    ``mask_mod`` reading ``b`` / ``h`` needs them. ``capture``: after the
+    eager launches, capture one launch into a CUDA graph and return the
+    gradients its replay produces.
 
     ``layout``: ``bhsd`` (contiguous), ``bshd`` (``[B, S, H, D]`` allocations
     viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
@@ -167,8 +180,8 @@ def _run(
     )
     block_mask = create_block_mask(
         mask_mod if mask_mod is not None else noop_mask,
-        None,
-        None,
+        mask_dims[0],
+        mask_dims[1],
         m,
         n,
         device=str(DEVICE),
@@ -211,9 +224,9 @@ def _run(
     pre = flex_example._flex_attention_bwd_preprocess
     pre_bound = pre.bind((out, do, lse))
     pre_bound.set_config(pre_bound.config_spec.default_config())
-    got = None
-    for _ in range(repeats):
-        got = flex_example.helion_flex_attention_backward(
+
+    def launch() -> tuple[torch.Tensor, ...]:
+        return flex_example.helion_flex_attention_backward(
             q,
             k,
             v,
@@ -226,8 +239,28 @@ def _run(
             scale=scale,
             enable_gqa=hq != hkv,
         )
+
+    got = None
+    for _ in range(repeats):
+        got = launch()
     assert got is not None
     torch.cuda.synchronize()
+    if capture:
+        # The eager launches above warmed the kernel up; the capture records
+        # the host-side table derivation and the launch, the replay reruns
+        # them into the graph's output tensors.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            launch()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = launch()
+        for grad in got:
+            grad.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
     return got, (ref_dq, ref_dk, ref_dv), code
 
 
@@ -728,6 +761,195 @@ def test_softcap_jacobian_head_dims(d: int, dv: int, dtype: torch.dtype) -> None
         dtype=dtype,
     )
     assert "fbwd_spre" in code
+    _assert_close(got, ref)
+
+
+@pytest.mark.parametrize(
+    ("hq", "hkv", "m", "n", "score"),
+    [
+        (2, 2, 256, 256, None),
+        (4, 2, 320, 256, None),
+        (2, 2, 256, 320, "alibi"),
+        (2, 2, 512, 512, "softcap"),
+    ],
+)
+@_gpu_test
+def test_head_dim_256_pair(
+    hq: int, hkv: int, m: int, n: int, score: str | None
+) -> None:
+    """The 2-CTA pair kernel (dK/dV and dQ cluster roles) at head dim 256:
+    causal, GQA, ragged M / N, an additive score_mod with coordinates (the
+    dQ clusters render the hooks in the forward frame) and a softcap
+    score_mod with its Jacobian."""
+    kw: dict[str, object] = {}
+    if score == "alibi":
+
+        def alibi(score, b, h, q_idx, kv_idx):
+            slope = 0.05 * (h + 1).to(torch.float32)
+            return score - slope * (q_idx - kv_idx).abs().to(torch.float32)
+
+        kw["score_mod"] = alibi
+    elif score == "softcap":
+        cap = 20.0
+
+        def softcap(score, b, h, q_idx, kv_idx):
+            return cap * torch.tanh(score / cap)
+
+        def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+            t = torch.tanh(score / cap)
+            return grad * (1.0 - t * t)
+
+        kw["score_mod"] = softcap
+        kw["score_mod_bwd"] = softcap_bwd
+    got, ref, code = _run(b=1, hq=hq, hkv=hkv, m=m, n=n, d=256, mask_mod=_causal, **kw)  # pyrefly: ignore[bad-argument-type]
+    assert "fbwd_is_dq" in code and "_helion_cute_cluster_shape = (2, 1, 1)" in code
+    _assert_close(got, ref)
+
+
+@pytest.mark.parametrize("bias_fold", [1, 0])
+@_gpu_test
+def test_head_dim_256_pair_table_bias(bias_fold: int) -> None:
+    """An additive table bias on the pair kernel: the dK/dV clusters fold it
+    into the LSE term (``bias_fold``) or evaluate it as a score hook, the dQ
+    clusters gather the table in the forward frame."""
+    bias = torch.randn((4, 1279), device=DEVICE, dtype=torch.float32)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        import helion.language as hl
+
+        return score + hl.load(bias, [h, q_idx - kv_idx + 639])
+
+    def ref_score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[h, q_idx - kv_idx + 639]
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=384,
+        n=256,
+        d=256,
+        score_mod=score_mod,
+        mask_mod=_causal,
+        ref_score_mod=ref_score_mod,
+        config_overrides={"cute_flash_bwd_bias_fold": bias_fold},
+    )
+    assert "fbwd_is_dq" in code and "_flash_aux0" in code
+    assert ("fbwd_lse_fold" in code) == bool(bias_fold)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_fp16_gqa_softcap() -> None:
+    """fp16 operands, grouped-query heads and a score_mod with its Jacobian
+    on both roles of the pair kernel."""
+    cap = 30.0
+
+    def softcap(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1.0 - t * t)
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=256,
+        n=384,
+        d=256,
+        score_mod=softcap,
+        score_mod_bwd=softcap_bwd,
+        mask_mod=_causal,
+        dtype=torch.float16,
+    )
+    assert "fbwd_is_dq" in code and "cutlass.Float16" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_dense() -> None:
+    """No mask: every KV block's full list, both roles on unmasked steps."""
+    got, ref, code = _run(b=1, hq=2, hkv=2, m=512, n=512, d=256)
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+def _batch_head_window(b, h, q_idx, kv_idx):
+    """Causal with a window that depends on the batch and the head: every
+    (b, h) of the BlockMask has its own tables."""
+    return (q_idx >= kv_idx) & (q_idx - kv_idx <= 64 + 128 * h + 192 * b)
+
+
+@_gpu_test
+def test_head_dim_256_pair_batch_head_tables() -> None:
+    """A BlockMask with (B, H) tables: the dK/dV clusters index them with the
+    KV-side (b, h), the dQ clusters with the Q-side (b, h) of their batch-head
+    (and the derived KV lists are per (b, h, Q block))."""
+    got, ref, code = _run(
+        b=2,
+        hq=4,
+        hkv=4,
+        m=512,
+        n=512,
+        d=256,
+        mask_mod=_batch_head_window,
+        mask_dims=(2, 4),
+    )
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_gqa_ragged_n_head_tables() -> None:
+    """Grouped-query heads (two Q heads per KV head, per-head tables) with
+    N > M (KV blocks past the causal frontier attended by no Q block; the
+    dQ clusters' lists stop early)."""
+
+    def head_causal(b, h, q_idx, kv_idx):
+        return kv_idx <= q_idx + 128 * h
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=384,
+        n=640,
+        d=256,
+        mask_mod=head_causal,
+        mask_dims=(None, 4),
+    )
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_fully_masked_q_block() -> None:
+    """A Q block no KV block attends to: its dQ cluster walks zero steps (dQ
+    stays the zero initialization) and no dK/dV cluster visits it."""
+
+    def skip_block_one(b, h, q_idx, kv_idx):
+        return (q_idx // 128 != 1) & (q_idx >= kv_idx)
+
+    got, ref, code = _run(
+        b=1, hq=2, hkv=2, m=512, n=512, d=256, mask_mod=skip_block_one
+    )
+    assert "fbwd_is_dq" in code
+    assert torch.count_nonzero(got[0][:, :, 128:256]) == 0
+    assert torch.count_nonzero(got[0][:, :, :128]) > 0
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_capture_replay() -> None:
+    """The pair kernel under CUDA-graph capture: the host-side derivation of
+    the dQ clusters' KV lists is captured with the launch (static shapes,
+    built once per launch) and the replay reproduces the gradients."""
+    got, ref, code = _run(
+        b=1, hq=2, hkv=2, m=384, n=384, d=256, mask_mod=_causal, capture=True
+    )
+    assert "fbwd_is_dq" in code
     _assert_close(got, ref)
 
 

@@ -1899,6 +1899,7 @@ class ConfigSpec:
         self.cute_flash_bwd_search_enabled: bool = False
         self._cute_flash_bwd_aux_smem_candidates: tuple[int, ...] = ()
         self._cute_flash_bwd_ds_tmem_allowed: bool = False
+        self._cute_flash_bwd_stats_mma_allowed: bool = True
         self._cute_flash_bwd_has_mask: bool = True
         self._cute_flash_bwd_has_hook: bool = True
         self._cute_flash_bwd_additive_bias: bool = True
@@ -3399,6 +3400,7 @@ class ConfigSpec:
         fast_math: bool = False,
         aux_smem_candidates: Sequence[int] = (),
         ds_tmem_allowed: bool = False,
+        stats_mma_allowed: bool = True,
         has_mask: bool = True,
         has_score: bool = True,
         additive_bias: bool = True,
@@ -3420,6 +3422,7 @@ class ConfigSpec:
         self._cute_flash_bwd_fast_math = fast_math
         self._cute_flash_bwd_aux_smem_candidates = tuple(aux_smem_candidates)
         self._cute_flash_bwd_ds_tmem_allowed = ds_tmem_allowed
+        self._cute_flash_bwd_stats_mma_allowed = stats_mma_allowed
         # Which hook knobs have an effect: the mask form needs a mask region,
         # the hook group width / pin a hook at all, the fold an additive bias.
         self._cute_flash_bwd_has_mask = has_mask
@@ -7215,9 +7218,13 @@ class ConfigSpec:
                     fields["cute_flash_bwd_tile_group"] = EnumFragment(
                         choices=self._cute_flash_bwd_tile_groups
                     )
-                    # Per-column LSE / delta terms through K-slice MMAs instead of
-                    # broadcast smem loads in the compute passes (see _fit_smem_budget).
-                    fields["cute_flash_bwd_stats_mma"] = EnumFragment(choices=(0, 1))
+                    if self._cute_flash_bwd_stats_mma_allowed:
+                        # Per-column LSE / delta terms through K-slice MMAs
+                        # instead of broadcast smem loads in the compute passes
+                        # (see _fit_smem_budget; not on the 2-CTA pair plan).
+                        fields["cute_flash_bwd_stats_mma"] = EnumFragment(
+                            choices=(0, 1)
+                        )
                     from .._compiler.cute.cute_flash import flash_flex_aux_smem_choices
 
                     aux_choices = flash_flex_aux_smem_choices(
