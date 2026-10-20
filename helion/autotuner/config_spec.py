@@ -6594,7 +6594,7 @@ class ConfigSpec:
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
             )
-            if "flat" not in self.allowed_pid_types:
+            if self.allowed_pid_types[0] != "flat":
                 # ``Config.pid_type`` falls back to ``flat`` for a missing key,
                 # so a persistent choice is not an implicit default.
                 preserve_keys = {*preserve_keys, "pid_type"}
@@ -7663,11 +7663,12 @@ class ConfigSpec:
             if (
                 self.supports_config_key("pid_type")
                 and "pid_type" not in fields
-                and "flat" not in self.allowed_pid_types
+                and self.allowed_pid_types[0] != "flat"
             ):
                 # SIMT normally omits this coordinate and defaults to flat.
                 # Barriers require a persistent launch in the reference and in
-                # every candidate, including after a flatten/unflatten round trip.
+                # every candidate, including after a flatten/unflatten round trip;
+                # CuTe may also search their ordered ``flat`` phase launches.
                 fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             if self.cross_loop_pipeline is not None:
                 fields["cross_loop_pipeline"] = self.cross_loop_pipeline
