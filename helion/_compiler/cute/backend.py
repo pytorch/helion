@@ -2221,7 +2221,15 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        return config_spec.cute_flash_search_enabled or bool(config_spec.matmul_facts)
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        """Avoid repeated multi-second probes of scalar matmul candidates."""
+        return bool(config_spec.matmul_facts)
+
+    def default_autotune_cudagraph(self, config_spec: ConfigSpec) -> bool:
+        """Exclude Python dispatch from timings of compiled matmul candidates."""
+        return bool(config_spec.matmul_facts)
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

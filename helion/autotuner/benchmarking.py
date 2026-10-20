@@ -885,6 +885,24 @@ def do_bench(
     :param pre_warmed: Skip the setup launch when the caller has already run
         and synchronized this exact benchmark callable.
     """
+    if (
+        default_cudagraph
+        and grad_to_none is None
+        and _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=True)
+    ):
+        reason = _cudagraph_unavailable_reason()
+        if reason is None:
+            return do_bench_cuda_graph(
+                fn,
+                warmup=warmup,
+                rep=rep,
+                quantiles=quantiles,
+                return_mode=return_mode,
+                process_group_name=process_group_name,
+                fixed_repetitions=fixed_repetitions,
+                probe_long_kernel=probe_long_kernel,
+                pre_warmed=pre_warmed,
+            )
     from triton import runtime
     from triton.testing import _summarize_statistics
 
@@ -1058,6 +1076,7 @@ def do_bench_cuda_graph(
     process_group_name: str | None = None,
     *,
     fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
     pre_warmed: bool = False,
     reset: Callable[[], None] | None = None,
     phase: Callable[[str], None] | None = None,
@@ -1125,7 +1144,16 @@ def do_bench_cuda_graph(
         phase("warmup")
     if fixed_repetitions is None:
         began = time.perf_counter()
-        sample()
+        first_sample = sample()
+        if probe_long_kernel:
+            first_sample = sync_object(first_sample, process_group_name)
+            if first_sample >= max(warmup, rep):
+                if phase is not None:
+                    phase("measure")
+                return cast(
+                    "float | tuple[float, ...]",
+                    _summarize_statistics([first_sample], quantiles, return_mode),
+                )
         # Count complete replays, including cache clearing and synchronization,
         # to avoid excessive sampling work for microsecond kernels.
         iteration_ms = sync_object(

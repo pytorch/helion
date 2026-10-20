@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -40,12 +41,20 @@ class TestFreshFinalistProcess(unittest.TestCase):
             torch.save((torch.zeros(1),), args_path)
             provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
             provider.settings = Settings(autotune_benchmark_subprocess=True)
+            provider.config_spec = SimpleNamespace(
+                cute_flash_search_enabled=False,
+                backend=SimpleNamespace(
+                    probe_long_autotune_kernels=lambda _spec: False,
+                    default_autotune_cudagraph=lambda _spec: False,
+                ),
+            )
             provider.log = Mock()
             provider._autotune_metrics = AutotuneMetrics()
             provider._precompile_args_path = str(args_path)
             provider._subprocess_wrapper_unloadable = False
             provider._benchmark_worker = None
             workers: list[BenchmarkWorker] = []
+            job_policies: list[tuple[object, object]] = []
 
             def new_worker(*, device: int | None) -> BenchmarkWorker:
                 worker = BenchmarkWorker(device=device)
@@ -55,6 +64,9 @@ class TestFreshFinalistProcess(unittest.TestCase):
             def cpu_job(
                 fn_spec: bool, args_path: str, **kwargs: object
             ) -> _UpdateCachedArgument:
+                job_policies.append(
+                    (kwargs["probe_long_kernel"], kwargs["default_cudagraph"])
+                )
                 return _UpdateCachedArgument(args_path, fn_spec)
 
             stack.enter_context(
@@ -68,9 +80,6 @@ class TestFreshFinalistProcess(unittest.TestCase):
                     "_subprocess_benchmark_uses_wall_clock",
                     return_value=False,
                 )
-            )
-            stack.enter_context(
-                patch.object(provider, "_probe_long_kernel", return_value=False)
             )
             stack.enter_context(
                 patch(
@@ -104,6 +113,9 @@ class TestFreshFinalistProcess(unittest.TestCase):
                 self.assertIsNone(provider._benchmark_worker)
                 self.assertTrue(all(not worker.alive() for worker in workers))
                 self.assertEqual(len(workers), 2 if fail_first else 3)
+                self.assertEqual(
+                    job_policies, [(False, False)] * (2 if fail_first else 4)
+                )
                 (unchanged,) = torch.load(args_path, weights_only=True)
                 self.assertEqual(float(unchanged.item()), 0.0)
             finally:

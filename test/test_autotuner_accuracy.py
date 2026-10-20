@@ -994,6 +994,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 get_do_bench=lambda: None,
                 classify_autotune_exception=lambda error: None,
                 probe_long_autotune_kernels=lambda _config_spec: False,
+                default_autotune_cudagraph=lambda _config_spec: False,
             ),
         )
         kernel = SimpleNamespace(
@@ -1219,7 +1220,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             patch(
                 "helion.autotuner.benchmark_provider.do_bench",
                 return_value=1.25,
-            ),
+            ) as benchmark,
             patch.object(
                 search.benchmark_provider, "_clear_jit_fast_path_caches"
             ) as clear,
@@ -1228,6 +1229,9 @@ class TestAutotuneIgnoreErrors(TestCase):
             result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
 
         self.assertEqual(result, 1.25)
+        benchmark.assert_called_once()
+        self.assertIs(benchmark.call_args.kwargs["probe_long_kernel"], False)
+        self.assertIs(benchmark.call_args.kwargs["default_cudagraph"], False)
         clear.assert_called_once_with(compiled_fn)
 
     def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
