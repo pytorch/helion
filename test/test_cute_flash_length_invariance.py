@@ -2158,9 +2158,11 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # hooked PASS1's all-kept fast path one more (87), the tail split's
     # singleton one more (88), the shared staged output tile's singleton
     # (``cute_flash_o_stage``, live only on the one-CTA fa4 pair's TMA
-    # epilogue) one more (89). Keep the upstream bound on all other values
-    # and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 89
+    # epilogue) one more (89), the tensor bias's staging singleton
+    # (``cute_flash_bias_stage``, live only on dense fa4 plans with one
+    # tensor bias) one more (90). Keep the upstream bound on all other
+    # values and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 90
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(

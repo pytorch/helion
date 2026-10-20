@@ -203,6 +203,13 @@ class AttentionScorePlan:
     # the Q/K width the softmax scale is derived from); ``None`` is the
     # symmetric case.
     head_dim_v: int | None = None
+    # V's layout: ``False`` is the canonical ``v[b, tile_n, :]`` tile (rows of
+    # values, the head dim contiguous: an MN-major tcgen05 B operand); ``True``
+    # is the pre-transposed ``v[b, :, tile_n]`` tile (the KV axis contiguous:
+    # a K-major B operand, the only layout 8-bit tcgen05 operands take, and
+    # an admissible one for 16-bit operands). An operand fact the matcher
+    # records; a body that does not host it declines the plan.
+    v_k_major: bool = False
     # Flex envelope (``FLEX_SCORE_KIND``): Q and K/V lengths (they may differ
     # and need not be multiples of 128), the BlockMask walk and the captured
     # score_mod / mask_mod regions. ``scale_peeled`` records whether the
@@ -220,10 +227,32 @@ class AttentionScorePlan:
     host_scalars: tuple[str, ...] = ()
     scale_arg: str | None = None
     scale_peeled: bool = True
+    # The flex envelope that is dense attention (``flex_match`` records it):
+    # the trivial walk (one KV block covering the sequence, the tables never
+    # read) with neither a mask region (torch's ``noop_mask``, a constant-true
+    # predicate the matcher drops) nor a score region (the identity
+    # ``score_mod``, the scale peeled), over the dense surface's geometry
+    # (``q_seq == kv_seq``, a multiple of the 128-row tile, symmetric head
+    # dims, contiguous operands).  Every query row attends every key, so the
+    # plan takes the dense surface -- its families (the persistent fa4 /
+    # ws_overlap bodies, the row programs on small grids), seeds and knobs --
+    # instead of the list-walk body; the operands, the LSE and the runtime
+    # scale stay the flex envelope's (``is_flex`` holds, ``flex_envelope``
+    # does not).  The BlockMask tables are read by neither body: like the
+    # trivial walk, the plan relies on FlexAttention's contract that a mask's
+    # tables describe its ``mask_mod``.
+    flex_dense: bool = False
 
     @property
     def is_flex(self) -> bool:
         return self.kv_walk is not None
+
+    @property
+    def flex_envelope(self) -> bool:
+        """A flex plan that needs the flex body: a BlockMask list walk, a
+        mask region or a score region (``flex_dense`` plans run the dense
+        bodies)."""
+        return self.is_flex and not self.flex_dense
 
     @property
     def has_list_walk(self) -> bool:
@@ -253,7 +282,9 @@ class AttentionScorePlan:
 
     @property
     def modifier_kinds(self) -> tuple[str, ...]:
-        if self.is_flex:
+        # A dense flex plan is the dense plan to every surface and body
+        # (the flex kind names the list-walk / hook category).
+        if self.flex_envelope:
             return (FLEX_SCORE_KIND,)
         if not self.modifiers:
             return (DENSE_SCORE_KIND,)

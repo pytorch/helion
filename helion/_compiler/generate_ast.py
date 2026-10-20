@@ -429,6 +429,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_recurrence_warp_dv4",
                     "gdn_recurrence_sm100",
                     "helion_flash_bwd",
+                    "helion_flash_bwd_row_mma",
                     "gathered_mma_tma",
                     "block_scaled_mma",
                     "helion_mma_dag_tma",

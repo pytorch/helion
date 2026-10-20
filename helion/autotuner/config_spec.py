@@ -76,6 +76,19 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILIES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILY_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FlashBwdRowFacts
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_legalize
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from .._compiler.cute.cute_mma_dag import AXIS_LEAD
 from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
@@ -1069,6 +1082,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
         "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1331,6 +1348,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
         "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1969,6 +1990,9 @@ class ConfigSpec:
         self._cute_flash_bwd_flex: bool = False
         self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
         self._cute_flash_bwd_fast_math: bool = False
+        # The dense backward's register-MMA row family: the plan facts that
+        # legalize its knobs (None off the dense bwd surface).
+        self._cute_flash_bwd_row_facts: FlashBwdRowFacts | None = None
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # A compiler may request complete initial coverage of its normalized
@@ -3062,7 +3086,15 @@ class ConfigSpec:
         renders that table, so it reads 0 (the search's caps are the 1-CTA
         kernel's, mostly far above the pair's 64-128 steps). Where the pair
         kernel is not legal the knob renders the 1-CTA kernel, whose knobs
-        all apply: the knob itself reads 0 there."""
+        all apply: the knob itself reads 0 there.
+
+        The dense surface's register-MMA row family (``cute_flash_bwd_family``
+        = "row_mma") is legalized first: its three row knobs read their
+        defaults off the family, and an illegal triple on it moves to the
+        nearest legal one or back to the tcgen05 family (see
+        ``cute_flash_bwd_row_mma.flash_bwd_row_legalize``)."""
+        if self.cute_flash_bwd_search_enabled and not self._cute_flash_bwd_flex:
+            flash_bwd_row_legalize(self._cute_flash_bwd_row_facts, config)
         if not (self.cute_flash_bwd_search_enabled and self._cute_flash_bwd_flex):
             return
         # The first-step order knob reads "auto" wherever it has no effect
@@ -3114,13 +3146,26 @@ class ConfigSpec:
         two measured register splits (the compute warpgroups spill below 152
         registers; the MMA and load warps hold their rings at 88 or 104), so
         a cold search starts from both families instead of finding the pair
-        by chance."""
-        if not (
-            self.backend_name == "cute"
-            and self.cute_flash_bwd_search_enabled
-            and self._cute_flash_bwd_flex
-            and self._cute_flash_bwd_two_cta_allowed
+        by chance.
+
+        The dense surface seeds its register-MMA row family on small grids
+        (``cute_flash_bwd_family`` = "row_mma" over the default row knobs:
+        see ``cute_flash_bwd_row_mma``) for the same reason."""
+        if not (self.backend_name == "cute" and self.cute_flash_bwd_search_enabled):
+            return []
+        row_facts = self._cute_flash_bwd_row_facts
+        if (
+            not self._cute_flash_bwd_flex
+            and row_facts is not None
+            and flash_bwd_row_search_grid(row_facts)
         ):
+            seed = self.default_config()
+            seed.config[FLASH_BWD_FAMILY_KEY] = FLASH_BWD_ROW_FAMILY
+            self.normalize(seed, _fix_invalid=True)
+            if seed.config.get(FLASH_BWD_FAMILY_KEY) == FLASH_BWD_ROW_FAMILY:
+                return [seed]
+            return []
+        if not (self._cute_flash_bwd_flex and self._cute_flash_bwd_two_cta_allowed):
             return []
         # Two register splits: the cold autotunes of the 32K / 128K causal
         # cells pick 88/168/88 (the dQ-reduce and load warps at 88, the
@@ -3703,6 +3748,7 @@ class ConfigSpec:
         additive_bias: bool = True,
         table_step_choices: Sequence[int] = (0,),
         two_cta_table_steps: int = 0,
+        row_mma_facts: FlashBwdRowFacts | None = None,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3712,9 +3758,14 @@ class ConfigSpec:
         problem shape supports 256-row cluster KV tiles;
         ``two_cta_table_steps`` is the flex pair kernel's automatic step
         table (``cute_flash_bwd_table_steps`` caps at or above it render it;
-        see ``_normalize_cute_flash_bwd``).
+        see ``_normalize_cute_flash_bwd``). ``row_mma_facts`` (the dense
+        surface) carries the plan facts of the register-MMA row family
+        (``cute_flash_bwd_family`` = "row_mma"; see
+        ``cute_flash_bwd_row_mma``): its knobs are offered where the facts
+        admit the family and searched / seeded on small grids.
         """
         self.cute_flash_bwd_search_enabled = True
+        self._cute_flash_bwd_row_facts = row_mma_facts
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
         self._cute_flash_bwd_two_cta_table_steps = (
@@ -7686,6 +7737,33 @@ class ConfigSpec:
                 fields["cute_flash_bwd_exp2_f32"] = EnumFragment(
                     choices=(1, 0) if self._cute_flash_bwd_flex else (0, 1)
                 )
+                row_facts = self._cute_flash_bwd_row_facts
+                if (
+                    not self._cute_flash_bwd_flex
+                    and row_facts is not None
+                    and row_facts.admitted
+                ):
+                    # The register-MMA row programs (cute_flash_bwd_row_mma):
+                    # searched beside the tcgen05 family where its grid is
+                    # small, legal everywhere the knobs divide the shape.
+                    row_search = flash_bwd_row_search_grid(row_facts)
+                    fields[FLASH_BWD_FAMILY_KEY] = EnumFragment(
+                        choices=FLASH_BWD_FAMILIES,
+                        search_choices=(
+                            FLASH_BWD_FAMILIES
+                            if row_search
+                            else (FLASH_BWD_FA4_FAMILY,)
+                        ),
+                    )
+                    for key, choices in (
+                        (FLASH_BWD_ROW_KV_KEY, FLASH_BWD_ROW_KV_CHOICES),
+                        (FLASH_BWD_ROW_Q_SPLIT_KEY, FLASH_BWD_ROW_Q_SPLIT_CHOICES),
+                        (FLASH_BWD_ROW_Q_CHUNK_KEY, FLASH_BWD_ROW_Q_CHUNK_CHOICES),
+                    ):
+                        fields[key] = EnumFragment(
+                            choices=choices,
+                            search_choices=choices if row_search else choices[:1],
+                        )
                 if self._cute_flash_bwd_flex:
                     if self._cute_flash_bwd_has_mask:
                         # How the mask_mod predicate reaches the -inf select of

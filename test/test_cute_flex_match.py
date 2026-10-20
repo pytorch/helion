@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1243,3 +1244,321 @@ def test_long_kv_render_does_not_grow_with_the_sequence() -> None:
     assert "flash_flex_rem1" not in long
     # The words argument carries the header: 4 + 4 * words entries per item.
     assert "_helion_flash_flex_item_words(" in long
+
+
+# -- the dense flex plan ------------------------------------------------------
+#
+# torch's empty BlockMask (``_create_empty_block_mask``: one KV block over the
+# whole sequence, ``noop_mask``) with the identity ``score_mod`` is dense
+# attention dressed as flex.  The matcher records it as ``flex_dense`` on the
+# dense surface's geometry; the surface, the resolver and the bodies then treat
+# the plan as the dense attention plan (its families, seeds and knobs), while
+# the operands, the LSE and the runtime scale stay the flex envelope's.
+
+
+def _empty_mask_args(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    score_mod: Callable[..., Any] = _identity,
+    enable_gqa: bool = False,
+) -> tuple[Any, ...]:
+    return _flex_args(
+        q, k, v, score_mod, _create_empty_block_mask(q, k), enable_gqa=enable_gqa
+    )
+
+
+def test_empty_block_mask_is_the_dense_flex_plan() -> None:
+    q, k, v = _qkv()
+    plan = _match_or_fail(_bind(_flex_kernel(), _empty_mask_args(q, k, v))).plan
+    assert plan.is_flex and plan.flex_dense and not plan.flex_envelope
+    assert not plan.has_list_walk
+    assert not plan.flex_has_mask_region and not plan.flex_has_score_region
+    # Every surface and body sees the dense plan.
+    assert plan.modifier_kinds == ("dense",)
+    assert plan.has_lowering()
+    assert cute_flash.flash_tmem_rowmax_score_plan_supported(plan)
+    # The runtime scale and the natural-log LSE stay the envelope's.
+    assert plan.scale_arg is not None and plan.scale_peeled
+    assert plan.lse_scale == pytest.approx(0.6931471805599453)
+
+
+def test_all_full_noop_block_mask_is_a_list_walk_not_a_dense_plan() -> None:
+    """A real 128-block BlockMask walks its tables (the data decide which
+    tiles are visible), even when every block happens to be full."""
+    q, k, v = _qkv()
+    dense = create_block_mask(noop_mask, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU)
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, dense))
+    plan = _match_or_fail(bound).plan
+    assert plan.has_list_walk and not plan.flex_dense and plan.flex_envelope
+    assert plan.modifier_kinds == ("flex",)
+
+
+def test_dense_flex_plan_admits_grouped_query_heads() -> None:
+    q, k, v = _qkv(kv_heads=2)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v, enable_gqa=True))
+    plan = _match_or_fail(bound).plan
+    assert plan.flex_dense and plan.kv_group == 2
+
+
+def _tanh_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    return torch.tanh(score)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["mask_region", "score_region", "ragged_length", "unequal_lengths", "strided"],
+)
+def test_dense_flex_plan_fails_closed_off_the_dense_geometry(case: str) -> None:
+    """Trivial walks that are not dense attention on the dense geometry keep
+    the flex envelope (the body that hosts them today): a mask region on the
+    one block, a score region, a length that is not a multiple of the
+    128-row tile, unequal Q / K/V lengths, strided operands."""
+    if case == "mask_region":
+        q, k, v = _qkv(q_seq=64, kv_seq=64)
+        block_mask = create_block_mask(
+            _causal, 2, 4, 64, 64, BLOCK_SIZE=128, device=_CPU
+        )
+        args = _flex_args(q, k, v, _identity, block_mask)
+    elif case == "score_region":
+        q, k, v = _qkv()
+        args = _empty_mask_args(q, k, v, score_mod=_tanh_mod)
+    elif case == "ragged_length":
+        q, k, v = _qkv(q_seq=1088, kv_seq=1088)
+        args = _empty_mask_args(q, k, v)
+    elif case == "unequal_lengths":
+        q, k, v = _qkv(q_seq=1024, kv_seq=2048)
+        args = _empty_mask_args(q, k, v)
+    else:
+        q = _transposed(2, 4, 1024, 64)
+        k = _transposed(2, 4, 1024, 64)
+        v = _transposed(2, 4, 1024, 64)
+        args = _empty_mask_args(q, k, v)
+    plan = _match_or_fail(_bind(_flex_kernel(), args)).plan
+    assert plan.is_flex and not plan.has_list_walk
+    assert not plan.flex_dense and plan.flex_envelope
+    assert plan.modifier_kinds == ("flex",)
+    assert plan.flex_has_mask_region == (case == "mask_region")
+    assert plan.flex_has_score_region == (case == "score_region")
+
+
+@functools.cache
+def _attention_kernel() -> Kernel:
+    module = import_path(EXAMPLES_DIR / "attention.py")
+    return _cute_kernel(module.attention)
+
+
+def _bind_dense_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> BoundKernel:
+    with _as_sm100(flex=False):
+        return _attention_kernel()._bind_isolated((q, k, v))
+
+
+def _flash_choices(spec: Any) -> dict[str, tuple[object, ...]]:
+    """The searched values of every flash knob of a surface."""
+    with patch.dict(os.environ, {}, clear=True):
+        fragments = spec._cute_flash_autotune_fragments()
+    return {
+        key: tuple(
+            getattr(fragment, "search_choices", None)
+            or getattr(fragment, "choices", ())
+        )
+        for key, fragment in fragments.items()
+    }
+
+
+def _seeded_families(spec: Any) -> set[tuple[object, object]]:
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = spec.compiler_seed_configs or ()
+    return {
+        (
+            seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY),
+            seed.config.get(cute_flash.FLASH_PERSISTENT_KEY),
+        )
+        for seed in seeds
+    }
+
+
+def test_dense_flex_plan_takes_the_dense_surface() -> None:
+    """At the campaign's (1, 4, 256, 64) cell the dense flex plan gets the
+    dense attention kernel's surface: the dense facts, every family of the
+    dense surface (the row programs on this small grid, the persistent fa4
+    bodies), the same searched values knob for knob, the dense seeds (a row
+    program among them), a complete coverage design and every seed
+    transferring."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_score_modifier_kinds == ("dense",)
+    assert not spec._cute_flash_has_list_walk
+    assert not spec._cute_flash_flex_trivial_walk
+    assert not spec._cute_flash_flex_has_mask_region
+    assert not spec._cute_flash_flex_has_score_region
+    assert not spec._cute_flash_has_score_modifiers
+    assert spec._cute_flash_plain_row_body
+    assert spec._cute_flash_tmem_rowmax_compatible
+    # The LSE output and the runtime scale: no standard output-only lowering.
+    assert not spec._cute_flash_standard_dense_output
+    assert not spec._cute_flash_supports_tensor_4d_tma
+    assert spec._cute_flash_block_size_targets == {0: 128, 1: 128}
+    assert (spec._cute_flash_num_kv, spec._cute_flash_num_bh) == (2, 4)
+    choices = _flash_choices(spec)
+    families = choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert "row_mma" in families and "fa4" in families and "ws_overlap" in families
+    assert set(choices[cute_flash.FLASH_PERSISTENT_KEY]) == {True, False}
+    assert set(choices[cute_flash.FLASH_ROW_WARPS_KEY]) == {2, 4, 8}
+    # Knob for knob the dense attention kernel's search at the same cell,
+    # less the 4-D TMA families: the attention example's reshape-view
+    # operands prove them, the flex emitter reads its 4-D operands directly.
+    dense = _bind_dense_attention(q, k, v).config_spec
+    assert dense._cute_flash_score_modifier_kinds == ("dense",)
+    dense_choices = _flash_choices(dense)
+    assert "fa4_tma_4d" in dense_choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert families == tuple(
+        family
+        for family in dense_choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+        if not str(family).endswith("_tma_4d")
+    )
+    assert {
+        key: value
+        for key, value in choices.items()
+        if key != cute_flash.FLASH_PIPELINE_FAMILY_KEY
+    } == {
+        key: value
+        for key, value in dense_choices.items()
+        if key != cute_flash.FLASH_PIPELINE_FAMILY_KEY
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = list(spec.compiler_seed_configs or ())
+    assert seeds
+    assert all(seed.config["block_sizes"] == [128, 128] for seed in seeds)
+    families_seeded = _seeded_families(spec)
+    assert ("row_mma", False) in families_seeded
+    assert ("fa4", True) in families_seeded
+    assert families_seeded == {
+        seeded
+        for seeded in _seeded_families(dense)
+        if not str(seeded[0]).endswith("_tma_4d")
+    }
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    with patch.dict(os.environ, {}, clear=True):
+        generation = ConfigGeneration(spec)
+        generation.validate_flash_structural_coverage()
+        assert generation.flash_structural_coverage_uncovered_values() == []
+        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        messages: list[str] = []
+        pairs = generation.seed_flat_config_pairs(messages.append)
+    assert not messages
+    # Every seed transfers (two of the dense surface's seeds may fold into
+    # one flat config on this small grid, as on the attention example's).
+    assert len(pairs) >= len(seeds) - 1
+
+
+_FLEX_BODY_MARKERS = (
+    "flash_flex_status",
+    "_flash_mFlexPartCnt",
+    "_flash_mFlexFullIdx",
+    "flash_flex_needs_mask",
+    "_flash_mFlexItems",
+    "flash_flex_cp0",
+)
+
+
+def _seed_of(spec: Any, family: str, persistent: bool) -> helion.Config:
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = spec.compiler_seed_configs or ()
+    return next(
+        seed
+        for seed in seeds
+        if seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY) == family
+        and seed.config.get(cute_flash.FLASH_PERSISTENT_KEY) is persistent
+    )
+
+
+def test_dense_flex_plan_renders_the_dense_bodies() -> None:
+    """The dense flex plan renders the dense bodies: the persistent fa4 pair
+    body (the default) and the persistent ws_overlap body, with none of the
+    list-walk / hook markers, and the runtime scale handed to the launcher
+    (``scale_idx``: ``_flash_scale_log2 = _flash_scale * log2(e)``)."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    spec = bound.config_spec
+    default = spec.default_config()
+    assert default.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+    assert default.config[cute_flash.FLASH_PERSISTENT_KEY] is True
+    with _as_sm100(flex=True):
+        code = bound.to_code(default)
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash"
+    assert (plan["topology"], plan["persistent"]) == ("fa4", True)
+    assert plan["scale_peeled"] is True
+    assert "scale_idx" in plan and "lse_idx" in plan
+    assert (plan["seq"], plan["batch"], plan["head_dim"]) == (256, 4, 64)
+    host = "\n".join(_host_lines(plan))
+    assert (
+        "_flash_scale_log2 = _flash_scale * cutlass.Float32(1.4426950408889634)" in host
+    )
+    with _as_sm100(flex=True):
+        code = bound.to_code(_seed_of(spec, "ws_overlap", True))
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert (plan["topology"], plan["persistent"]) == ("ws_overlap", True)
+    assert "scale_idx" in plan
+
+
+def test_dense_flex_plan_renders_the_row_programs_with_the_runtime_scale() -> None:
+    """The row programs (``row_mma``) host the dense flex plan: the kernel
+    reads the runtime scale as a scalar parameter (``rm_scale = scale *
+    log2(e)``, the tcgen05 wrapper's derivation) instead of baking the
+    plan's multiplier, writes the natural-log LSE, and the never-read
+    BlockMask tables leave the kernel signature."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    seed = _seed_of(bound.config_spec, "row_mma", False)
+    with _as_sm100(flex=True):
+        code = bound.to_code(seed)
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash_row_mma"
+    assert (plan["row_warps"], plan["row_tile_m"]) == (4, 8)
+    # The operand names resolve to launcher argument positions; the LSE is
+    # among them.
+    assert "lse_idx" in plan
+    assert (
+        "rm_scale = cutlass.Float32(scale) * cutlass.Float32(1.4426950408889634)"
+        in code
+    )
+    assert "rm_scale = cutlass.Float32(1.44269504)" not in code
+    (kernel_def,) = [
+        line
+        for line in code.splitlines()
+        if line.startswith("def _helion_helion_flex_attention_kernel(")
+    ]
+    assert kernel_def == (
+        "def _helion_helion_flex_attention_kernel(query, key, value, out, lse, scale):"
+    )
+
+
+def test_trivial_walk_with_a_mask_region_keeps_the_flex_surface() -> None:
+    """``M == N == 64`` under a causal BlockMask: the one 128-wide block
+    covers the sequence (a trivial walk) but the mask region runs on it, so
+    the plan keeps the flex envelope's surface and body (the trivial-walk
+    pins: no persistent list walk, no row programs)."""
+    q, k, v = _qkv(q_seq=64, kv_seq=64)
+    block_mask = create_block_mask(_causal, 2, 4, 64, 64, BLOCK_SIZE=128, device=_CPU)
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    spec = bound.config_spec
+    assert spec._cute_flash_score_modifier_kinds == ("flex",)
+    assert spec._cute_flash_flex_trivial_walk and not spec._cute_flash_has_list_walk
+    assert spec._cute_flash_flex_has_mask_region
+    choices = _flash_choices(spec)
+    assert choices[cute_flash.FLASH_PERSISTENT_KEY] == (False,)
+    assert "row_mma" not in choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    with _as_sm100(flex=True):
+        code = bound.to_code(spec.default_config())
+    assert "flash_flex_needs_mask" in code and "flash_flex_status" in code
