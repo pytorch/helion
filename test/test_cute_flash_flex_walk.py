@@ -55,13 +55,21 @@ def _stub_render_flex_hook(
     with_score: bool,
     with_mask: bool,
     tail_mask: bool,
+    fast_full: bool = False,
     **_: object,
 ) -> cute_flash.FlexHookCode:
     """A marker hook: these tests check the emitter's slots and walk, not the
     renderer (whose own tests use real regions); the plans here carry
     stand-in regions. The marker is a bare string literal (it survives
-    ``ast.unparse``; a comment would not) plus the KV tail mask."""
+    ``ast.unparse``; a comment would not) plus the KV tail mask.  With
+    ``fast_full`` on a mask-only hook the stub also hands back a stand-in
+    keep word (one chunk-class line and its name), as the renderer does for
+    a bitmask-form mask region without chunk loads."""
     pad = " " * indent
+    chunk_words = mask_word = ""
+    if fast_full and with_mask and not with_score:
+        mask_word = f"flash_flex{stage}m_w0"
+        chunk_words = f"{pad}{mask_word} = cutlass.Int32(stub_word({chunk_expr}))\n"
     marker = (
         f"flex hook stage={stage} score={with_score} mask={with_mask} "
         f"tail={tail_mask} m={m_tile_expr} kv={kv_tile_expr} "
@@ -74,7 +82,11 @@ def _stub_render_flex_hook(
             f"_flash_kv_tail_cols - {chunk_expr} * {chunk_cols})\n"
         )
     return cute_flash.FlexHookCode(
-        item_prelude="", tile_prologue="", chunk_body="".join(lines)
+        item_prelude="",
+        tile_prologue="",
+        chunk_body="".join(lines),
+        chunk_words=chunk_words,
+        mask_word=mask_word,
     )
 
 
@@ -845,16 +857,27 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
             assert generation.flash_structural_coverage_uncovered_values() == []
             # The seeds carry the fact-based defaults (canonicalized per
             # body): the stream at every seed whose body holds it, the roll
-            # for the large hook.
+            # for the large hook; the pass-2c walk seeds roll explicitly.
             seeds = spec.autotune_seed_configs()
             assert seeds
             widths = {
                 seed.config.get(cute_flash.FLASH_FLEX_COALESCE_KEY) for seed in seeds
             }
             assert max(expected) in widths and None not in widths
+            p2c = [
+                seed
+                for seed in seeds
+                if seed.config.get(cute_flash.FLASH_E2E_SCHEDULE_KEY) == "8/2"
+                and seed.config.get(cute_flash.FLASH_SOFTMAX_REGION_KEY) == "shared"
+            ]
+            assert len(p2c) == 2
+            assert {
+                seed.config.get(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY) for seed in p2c
+            } == {True}
             rolls = {
                 seed.config.get(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY)
                 for seed in seeds
+                if seed not in p2c
             }
             assert rolls == {hook_ops >= 16}
 
@@ -3441,6 +3464,63 @@ def test_long_walk_seed_is_in_the_list_walk_population() -> None:
     assert (shared.e2e_offset0, shared.e2e_offset) == (2, 2)
 
 
+def test_pass2c_walk_seed_is_in_the_list_walk_population() -> None:
+    """The pass-2c causal 128K hd128 winner's structure (a three-slot ring,
+    the 8/2 cadence, Rep16 loads/stores, the shared softmax region, the
+    rolled chunk loop, 184/88/32 registers, 16-row correction tiles) is a
+    seed of every list-walk search, once per pair item and once persistent
+    (the sliding-window winner's walk form)."""
+    seeds = _flex_seeds(1024)
+    p2c = [
+        cfg
+        for cfg in seeds
+        if cfg.kv_stage == 3
+        and cfg.e2e_schedule == "8/2"
+        and cfg.s_load_repetition == 16
+        and cfg.p_store_repetition == 16
+        and cfg.softmax_region == "shared"
+        and cfg.flex_rolled_chunks
+        and (cfg.softmax_regs, cfg.corr_regs, cfg.other_regs) == (184, 88, 32)
+    ]
+    assert sorted(cfg.persistent for cfg in p2c) == [False, True], [
+        (cfg.persistent, cfg.kv_stage, cfg.e2e_schedule, cfg.softmax_region)
+        for cfg in seeds
+    ]
+    for cfg in p2c:
+        assert cfg.disc_pipe_depth == 1 and cfg.split_p_arrive
+        assert cfg.rescale_threshold == 8.0 and cfg.exp2_packet == "4x2"
+        assert cfg.corr_tile_size == 16 and cfg.causal_kv_order == "ascending"
+        # One region runs one exp cadence: stage 0's offset follows stage 1's.
+        assert (cfg.e2e_offset0, cfg.e2e_offset) == (1, 1)
+
+
+def test_w_walk_seed_is_in_the_list_walk_population() -> None:
+    """The shared-region autotune's causal 128K hd128 winner (a three-slot
+    ring, the 16/6 cadence with 4x1 packets, Rep16 loads/stores, the shared
+    softmax region, 152/88/56 registers, the descending order, a 32 rescale
+    threshold) is a seed of every list-walk search, once per pair item."""
+    seeds = _flex_seeds(1024)
+    w = [
+        cfg
+        for cfg in seeds
+        if cfg.kv_stage == 3
+        and cfg.e2e_schedule == "16/6"
+        and cfg.s_load_repetition == 16
+        and cfg.p_store_repetition == 16
+        and cfg.softmax_region == "shared"
+        and (cfg.softmax_regs, cfg.corr_regs, cfg.other_regs) == (152, 88, 56)
+    ]
+    assert [cfg.persistent for cfg in w] == [False], [
+        (cfg.persistent, cfg.kv_stage, cfg.e2e_schedule, cfg.softmax_region)
+        for cfg in seeds
+    ]
+    (cfg,) = w
+    assert cfg.exp2_packet == "4x1" and cfg.disc_pipe_depth == 1
+    assert cfg.split_p_arrive and cfg.rescale_threshold == 32.0
+    assert cfg.causal_kv_order == "descending" and cfg.corr_tile_size == 8
+    assert (cfg.e2e_offset0, cfg.e2e_offset) == (13, 13)
+
+
 # --------------------------------------------------------------------------
 # One softmax region for both query stages (``cute_flash_softmax_region``)
 # --------------------------------------------------------------------------
@@ -3629,3 +3709,129 @@ def test_shared_softmax_region_renders_the_trivial_walk_without_stage_words() ->
         stored = {node.id for node in names if isinstance(node.ctx, ast.Store)}
         loaded = {node.id for node in names if isinstance(node.ctx, ast.Load)}
         assert not {name for name in loaded - stored if name.startswith("flash_flex_")}
+
+
+# --------------------------------------------------------------------------
+# The hooked PASS1's all-kept fast path (``cute_flash_flex_hook_fast_full``)
+# --------------------------------------------------------------------------
+
+
+def test_flex_hook_fast_full_knob_is_legal_on_the_list_walk() -> None:
+    """``cute_flash_flex_hook_fast_full``: appended last; on the list walk
+    (any walk form), off by default and off the list walk."""
+    key = cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    assert _resolve(BODY).flex_hook_fast_full is False
+    assert _resolve({**BODY, key: True}).flex_hook_fast_full is True
+    assert (
+        _resolve({**BODY, key: True}, has_list_walk=False).flex_hook_fast_full is False
+    )
+
+
+def _assert_fast_full_only_inserts(
+    base: str, fast: str, blocks: list[list[str]]
+) -> None:
+    """``fast`` is ``base`` with each block (stripped lines) inserted whole,
+    once, in order; nothing else differs."""
+    fast_lines = [line.strip() for line in fast.splitlines()]
+    base_lines = [line.strip() for line in base.splitlines()]
+    cursor = 0
+    for block in blocks:
+        size = len(block)
+        position = next(
+            i
+            for i in range(cursor, len(fast_lines) - size + 1)
+            if fast_lines[i : i + size] == block
+        )
+        del fast_lines[position : position + size]
+        cursor = position
+    assert fast_lines == base_lines
+
+
+def _fast_full_vote_block(stage: int, lost: str, vote: str) -> list[str]:
+    return [
+        "if flash_flex_needs_mask:",
+        "flash_flex_masked = cutlass.Boolean(False)",
+        "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):",
+        f"flash_flex{stage}m_w0 = cutlass.Int32(stub_word(flash_ci))",
+        f"flash_flex_masked = flash_flex_masked | ({lost.format(stage=stage)})",
+        f"flash_flex_needs_mask = {vote}",
+    ]
+
+
+_FAST_FULL_VOTE = "cutlass.Boolean(cute.arch.vote_any_sync(flash_flex_masked))"
+
+
+def test_flex_hook_fast_full_narrows_needs_mask_by_one_warp_vote_per_tile() -> None:
+    """With the fast path a masked tile's prologue builds every chunk's keep
+    word (index math, no score reads), ORs the chunks a lane loses a column
+    of, and narrows ``flash_flex_needs_mask`` by one warp vote, so a warp
+    whose rows keep the whole tile takes the step's dense path (PASS1 and
+    PASS2 as rendered); nothing else of the render changes (pure insertions,
+    one block per stage, right after the S wait and ahead of the loads), in
+    the two-pass and the resident PASS2 forms; a ragged KV length keeps
+    its last tile on the masked path; a score region keeps the plain hook;
+    the default render is unchanged."""
+    key = cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY
+    plan = _flex_plan(mask_region=object())
+    base = _render(_resolve(BODY), plan)
+    assert "flash_flex_masked" not in base
+    assert _render(_resolve({**BODY, key: False}), plan) == base
+    fast = _render(_resolve({**BODY, key: True}), plan)
+    # (``ast.unparse`` drops the parentheses: ``&`` binds tighter than ``!=``.)
+    lost16 = "flash_flex{stage}m_w0 & cutlass.Int32(65535) != cutlass.Int32(65535)"
+    _assert_fast_full_only_inserts(
+        base,
+        fast,
+        [
+            _fast_full_vote_block(0, lost16, _FAST_FULL_VOTE),
+            _fast_full_vote_block(1, lost16, _FAST_FULL_VOTE),
+        ],
+    )
+    for name in ("warp_idx < 4", "warp_idx < 8"):
+        loop = _softmax_loop(next(b for n, b in _roles(fast).items() if name in n))
+        lines = [line.strip() for line in loop.splitlines()]
+        status = lines.index("flash_flex_needs_mask = flash_flex_status == 2")
+        wait = next(
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("_helion_flash_rt.mbar_spin_wait(flash_s_full_ptr")
+        )
+        vote = lines.index(f"flash_flex_needs_mask = {_FAST_FULL_VOTE}")
+        first_load = next(
+            i for i, line in enumerate(lines) if line.startswith("flash_ld_shape = ")
+        )
+        assert status < wait < vote < first_load
+    # The resident PASS2 form (fused PASS1/PASS2 branches, 32-column chunks).
+    resident_body = {
+        **BODY,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_S_RESIDENT_KEY: True,
+    }
+    resident = _render(_resolve(resident_body), plan)
+    assert "resident" in resident
+    lost32 = "flash_flex{stage}m_w0 != cutlass.Int32(-1)"
+    _assert_fast_full_only_inserts(
+        resident,
+        _render(_resolve({**resident_body, key: True}), plan),
+        [
+            _fast_full_vote_block(0, lost32, _FAST_FULL_VOTE),
+            _fast_full_vote_block(1, lost32, _FAST_FULL_VOTE),
+        ],
+    )
+    # A ragged KV length: the last tile always takes the masked path.
+    tail_plan = _flex_plan(mask_region=object(), kv_seq=2000)
+    tail_vote = f"{_FAST_FULL_VOTE} | (flash_kv == _flash_last_tile)"
+    _assert_fast_full_only_inserts(
+        _render(_resolve(BODY), tail_plan),
+        _render(_resolve({**BODY, key: True}), tail_plan),
+        [
+            _fast_full_vote_block(0, lost16, tail_vote),
+            _fast_full_vote_block(1, lost16, tail_vote),
+        ],
+    )
+    # A score region: no fast path (the hook rewrites every element).
+    score_plan = _flex_plan(mask_region=object(), score_region=object())
+    assert _render(_resolve({**BODY, key: True}), score_plan) == _render(
+        _resolve(BODY), score_plan
+    )

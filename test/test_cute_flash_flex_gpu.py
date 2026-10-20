@@ -127,9 +127,11 @@ def _compile_flex(
     overrides: dict[str, object] | None,
     *,
     expect_in_code: str | None = None,
+    code_sink: list[str] | None = None,
 ) -> tuple[Any, cute_flash.FlashAttentionConfig]:
     """Compile the flex kernel at the default config plus ``overrides``,
-    asserting the surface is the flex plan category and the body the walk."""
+    asserting the surface is the flex plan category and the body the walk
+    (``code_sink`` receives the rendered source)."""
     bound = _flex_kernel().bind(args)
     spec = bound.config_spec
     assert spec.cute_flash_search_enabled
@@ -148,6 +150,8 @@ def _compile_flex(
     assert "flash_flex_status" in code
     if expect_in_code is not None:
         assert expect_in_code in code
+    if code_sink is not None:
+        code_sink.append(code)
     return bound.compile_config(normalized), resolved
 
 
@@ -1752,6 +1756,143 @@ def test_shared_softmax_region_coverage_is_bitwise_the_per_stage_regions(
         assert getattr(resolved, name) == value
     if case == "coalesced_mask":
         assert resolved.flex_coalesce_slots  # the staging ring is in use
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+def _window(width: int) -> Callable[..., Any]:
+    def window(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (q_idx - kv_idx <= width)
+
+    return window
+
+
+def _documents_320(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    # 320-token documents (not a multiple of the tile): every boundary tile
+    # is partial with whole-warp kept rows on one side, but the keep-word
+    # peephole has no lane word for the ``// 320`` equality (element form).
+    return (q_idx // 320) == (kv_idx // 320)
+
+
+# (name: batch, heads, kv_heads, q_seq, kv_seq, mask, config overrides,
+# dtype, whether the knob renders the plain hook: a table gather or a
+# predicate the keep-word peephole does not fold (``// 320``), or no mask).
+_FAST_FULL_CASES: dict[str, tuple[Any, ...]] = {
+    "ragged_causal_2000": (2, 2, 2, 2000, 2000, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_4000": (1, 2, 2, 4000, 4000, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_3001": (1, 2, 2, 3001, 3001, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_fp16": (2, 2, 2, 2000, 2000, _causal, {}, torch.float16, False),
+    "ragged_causal_resident": (
+        2,
+        2,
+        2,
+        2000,
+        2000,
+        _causal,
+        {cute_flash.FLASH_S_RESIDENT_KEY: True, cute_flash.FLASH_S_LOAD_REP_KEY: 32},
+        torch.bfloat16,
+        False,
+    ),
+    "ragged_causal_shared_region": (
+        2,
+        2,
+        2,
+        2000,
+        2000,
+        _causal,
+        {cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        torch.bfloat16,
+        False,
+    ),
+    "causal_diagonal": (2, 2, 2, 2048, 2048, _causal, {}, torch.bfloat16, False),
+    "window_256": (2, 2, 2, 2048, 2048, _window(256), {}, torch.bfloat16, False),
+    "window_512": (2, 2, 2, 2048, 2048, _window(512), {}, torch.bfloat16, False),
+    "window_1024": (2, 2, 2, 2048, 2048, _window(1024), {}, torch.bfloat16, False),
+    "band": (2, 4, 4, 2048, 2048, _band, {}, torch.bfloat16, False),
+    "band_gqa_persistent": (
+        2,
+        8,
+        2,
+        2048,
+        2048,
+        _band,
+        {cute_flash.FLASH_PERSISTENT_KEY: True},
+        torch.bfloat16,
+        False,
+    ),
+    "documents_320": (2, 2, 2, 2048, 2048, _documents_320, {}, torch.bfloat16, True),
+    "documents_table": (2, 2, 2, 2048, 2048, None, {}, torch.bfloat16, True),
+    "whisper_noop_ragged": (
+        2,
+        2,
+        2,
+        448,
+        1500,
+        noop_mask,
+        {},
+        torch.bfloat16,
+        True,
+    ),
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", list(_FAST_FULL_CASES))
+def test_flex_hook_fast_full_is_bitwise_the_plain_hook(case: str) -> None:
+    """``cute_flash_flex_hook_fast_full``: a warp whose rows keep every
+    column of a partial tile takes the step's dense path, which is the same
+    values in the same places: the same output and LSE as the plain hook on
+    ragged causal lengths (every tile of the ragged query row is a partial
+    tile for torch; two-pass, resident and shared-region bodies, fp16), the
+    causal diagonal, sliding windows of three widths, a band, a GQA band on
+    the persistent walk.  Document masks (a table gather, or ``// 320``
+    which the keep-word peephole does not fold) and a mask-less ragged cross
+    attention (Whisper's 448 x 1500) keep the plain hook: the knob renders
+    the same code."""
+    batch, heads, kv_heads, q_seq, kv_seq, mask, base, dtype, plain = _FAST_FULL_CASES[
+        case
+    ]
+    mask_arg: Callable[..., Any] | None = None
+    if mask is None:
+        doc = (torch.arange(q_seq, device=DEVICE) // 320).to(torch.int32)
+
+        def documents_table(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])
+
+        def documents_table_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return doc[q_idx] == doc[kv_idx]
+
+        mask, mask_arg = documents_table_ref, documents_table
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads, dtype=dtype)
+    block_mask = create_block_mask(
+        mask, batch, heads, q_seq, kv_seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(
+        q, k, v, _identity, block_mask, mask_mod=mask_arg, enable_gqa=kv_heads != heads
+    )
+    base = {**base, cute_flash.FLASH_KV_SPLIT_KEY: 1}
+    plain_code: list[str] = []
+    fn, resolved = _compile_flex(args, base, code_sink=plain_code)
+    assert resolved.flex_hook_fast_full is False
+    assert resolved.s_resident is (case == "ragged_causal_resident")
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fast_code: list[str] = []
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY: True},
+        code_sink=fast_code,
+    )
+    assert resolved.flex_hook_fast_full is True
+    vote = "flash_flex_needs_mask = cutlass.Boolean(cute.arch.vote_any_sync(flash_flex_masked))"
+    if plain:
+        assert fast_code == plain_code
+        return
+    assert vote in fast_code[0]
     out, lse = fn(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, out_ref)

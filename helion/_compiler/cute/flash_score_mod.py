@@ -132,6 +132,15 @@ class FlexHookCode(NamedTuple):
     chunk_issue: str = ""
     chunk_consume: str = ""
     coop_slots: int = 0
+    # ``render_flex_hook(fast_full=True)`` on a mask-only hook in the bitmask
+    # form without chunk loads: ``chunk_words`` are the chunk-class lines
+    # that build the mask region's keep word (lane-uniform index math, no
+    # score reads) and ``mask_word`` its name, so the emitter can run them
+    # ahead of the tile over every chunk index and vote once per tile
+    # whether the warp's rows keep the whole tile (the dense PASS1 then
+    # serves it: same scores, no selects, no store-back).  Empty otherwise.
+    chunk_words: str = ""
+    mask_word: str = ""
 
 
 # Item-invariant values held in registers across the KV loop.
@@ -1102,6 +1111,9 @@ class _HookEmitter:
         self.row_coord_expr = row_coord_expr
         self.device_function = device_function
         self.codegen = device_function.codegen
+        # The mask region's final keep word (``render_region(keep_word=True)``
+        # through the peephole), for the all-kept fast path.
+        self.final_mask_word: str | None = None
         self.env = CompileEnvironment.current()
         self.blocks: dict[int, list[str]] = {
             _ITEM: [],
@@ -2416,6 +2428,7 @@ class _HookEmitter:
         if keep_word:
             word = self.mask_word(info, info.output)
             if word is not None and word.expr is not None:
+                self.final_mask_word = word.expr
                 return self.lane_bit(word.expr)
             return self.value(info, info.output)
         for node in info.region.graph.nodes:
@@ -2500,8 +2513,17 @@ def render_flex_hook(
     coop_slots: int = 1,
     aux_smem_staged: frozenset[int] | None = None,
     stage_expr: str | None = None,
+    fast_full: bool = False,
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
+
+    ``fast_full`` (a mask-only hook in the bitmask form whose predicate
+    folds into a keep word built without chunk loads): the hook also returns
+    the keep word's chunk-class lines and name (``FlexHookCode.chunk_words``
+    / ``mask_word``), with which the emitter votes once per tile whether the
+    warp's rows keep the whole tile (a tile torch marked partial only for
+    the rows past a ragged query length, the kept side of a window edge)
+    and serves it with the dense PASS1.
 
     ``mask_form`` selects how the mask region's predicate reaches the
     ``-inf`` select: ``"bitmask"`` folds it into a per-chunk keep word where
@@ -2634,6 +2656,24 @@ def render_flex_hook(
     element_lines = list(emitter.blocks[_ELEMENT])
     if store is not None:
         element_lines.append(store)
+    chunk_words = ""
+    mask_word = ""
+    if (
+        fast_full
+        and keep is not None
+        and score_out is None
+        and emitter.final_mask_word is not None
+        and not any(
+            meta.role == "load"
+            for info in infos
+            if info.tag == "m"
+            for meta in info.nodes.values()
+        )
+    ):
+        # The keep word's chunk-class lines (index math only), for the
+        # emitter's per-tile all-kept vote ahead of the loads.
+        chunk_words = _join_lines(list(emitter.blocks[_CHUNK]))
+        mask_word = emitter.final_mask_word
     if element_lines or emitter.blocks[_GROUP]:
         if emitter.vector_width:
             width = emitter.vector_width
@@ -2692,6 +2732,8 @@ def render_flex_hook(
         _join_lines(_indent_lines(issue_lines, indent)),
         _join_lines(_indent_lines(consume_lines, indent)),
         coop_slots if issue_lines else 0,
+        chunk_words,
+        mask_word,
     )
 
 
