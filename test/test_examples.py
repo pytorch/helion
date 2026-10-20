@@ -3105,8 +3105,22 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_se_block_fwd(self):
-        m, n = 128, 128
+        self._check_se_block_fwd(128, 128)
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
+    def test_se_block_fwd_wide_rows(self):
+        # w is 512 KB at n = 512: the forward tiles the output columns and
+        # the reduction, so no config needs a whole row of w on chip (the
+        # earlier whole-row ``x_tile @ w[:, :]`` ran out of shared memory
+        # under every block size from this width on).
+        self._check_se_block_fwd(256, 512)
+
+    def _check_se_block_fwd(self, m: int, n: int) -> None:
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn([n, n], device=DEVICE, dtype=torch.bfloat16)
 
@@ -3120,7 +3134,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             (expected, None),  # (output, sigmoid)
             fn_name="se_block_fwd",
-            block_sizes=[32],
+            block_sizes=[32, 32, 32],
             num_warps=4,
             num_stages=3,
         )
@@ -3299,6 +3313,63 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    def test_linear_kda_varlen_cuda_graph(self):
+        # The varlen forward reads cu_seqlens on the host only when it first sees
+        # the tensor (its validation and chunk tables are built together, cached
+        # by identity), so a warmed-up forward holds no device-to-host sync and a
+        # CUDA graph captures it; a fresh, malformed vector still raises.
+        import dataclasses
+
+        from examples.linear import linear_attention_harness as harness_mod
+        from examples.linear.example_kda import HARNESS
+
+        self._skip_linear_engine_autotune()
+        torch.manual_seed(42)
+        B, H, T, D, DV = harness_mod.VARLEN_TEST_SHAPE
+        inputs = HARNESS.make_inputs(
+            B,
+            H,
+            T,
+            D,
+            DV,
+            dtype=harness_mod.DTYPE,
+            device=DEVICE,
+            varlen=True,
+            varlen_lengths=harness_mod.VARLEN_TEST_LENGTHS,
+        )
+        C = harness_mod.TEST_C
+        eager = HARNESS.helion_fwd(inputs, C).clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            HARNESS.helion_fwd(inputs, C)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = HARNESS.helion_fwd(inputs, C)
+        captured.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+        cu_seqlens = inputs.preamble["cu_seqlens"]
+
+        def with_cu_seqlens(vector: torch.Tensor) -> torch.Tensor:
+            preamble = {**inputs.preamble, "cu_seqlens": vector}
+            return HARNESS.helion_fwd(dataclasses.replace(inputs, preamble=preamble), C)
+
+        short = cu_seqlens.clone()
+        short[-1] -= 1
+        with pytest.raises(ValueError, match="must end at"):
+            with_cu_seqlens(short)
+        flat = cu_seqlens.clone()
+        flat[1] = flat[2]
+        with pytest.raises(ValueError, match="strictly increase"):
+            with_cu_seqlens(flat)
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 

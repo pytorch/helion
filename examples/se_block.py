@@ -38,16 +38,19 @@ def se_block_fwd(x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
     s = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
-    for tile_m in hl.tile(m):
-        x_tile = x[tile_m, :]  # [tile_m, n]
-        # No tiling for n - load entire n at once since it's small
-        sigmoid_result = torch.sigmoid(
-            x_tile @ w[:, :]
-        )  # [tile_m, n] @ [n, n] = [tile_m, n]
-        s[tile_m, :] = sigmoid_result
+    # Tile the output columns and the reduction: a whole-row ``x_tile @ w``
+    # needs all of w (n * n elements) on chip at once, which exceeds shared
+    # memory from n = 512 on.
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(n):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        # Match the input-dtype matmul result before applying sigmoid.
+        sigmoid_result = torch.sigmoid(acc.to(x.dtype))
+        s[tile_m, tile_n] = sigmoid_result
         # Compute output: 2 * x * sigmoid, cast to input dtype
-        acc = 2.0 * x_tile.to(torch.float32) * sigmoid_result
-        out[tile_m, :] = acc.to(x.dtype)
+        x_tile = x[tile_m, tile_n].to(torch.float32)
+        out[tile_m, tile_n] = (2.0 * x_tile * sigmoid_result).to(x.dtype)
 
     return out, s
 
