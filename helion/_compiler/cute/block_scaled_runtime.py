@@ -959,6 +959,8 @@ class Sm100BlockScaledGemm:
                 else:
                     dsa, dsb = None, None
                 if cutlass.const_expr(self.sf_tma):
+                    assert raw_sa_shared is not None and raw_sb_shared is not None
+                    assert raw_gsa is not None and raw_gsb is not None
                     raw_dsa, raw_gsa = cpasync.tma_partition(
                         sa_atom,
                         0,
