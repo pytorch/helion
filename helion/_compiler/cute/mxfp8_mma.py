@@ -21,6 +21,7 @@ from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..host_function import HostFunction
 from ..indexing_strategy import subscript_tile_info
+from .block_scaled_config import mxfp8_shared_memory_bytes
 from .block_scaled_mma import BlockScaledMmaPlan
 from .block_scaled_mma import PreparedOperand
 from .block_scaled_mma import _metadata_resolver
@@ -426,6 +427,30 @@ def _match_mxfp8(graphs: Sequence[GraphInfo], ir: DeviceIR) -> Mxfp8Match | None
     )
 
 
+def _sf_tma_eligible(match: Mxfp8Match) -> bool:
+    """Tensor-map legality for the canonical packed scale operands.
+
+    Unit row coordinates are restored independently of descriptor bounds.
+    The packed word axis remains non-unit; runtime staging preserves strides
+    while aligning replacement allocations.
+    """
+    if match.scale_a.dtype != torch.int32 or match.scale_b.dtype != torch.int32:
+        return False
+    if (match.k + 127) // 128 <= 1:
+        return False
+    resolve = _metadata_resolver(CompileEnvironment.current())
+    for scale in (match.scale_a, match.scale_b):
+        row_stride, column_stride = tuple(resolve(value) for value in scale.stride())
+        if (
+            row_stride != 1
+            or column_stride is None
+            or not 0 < column_stride * 4 < 1 << 40
+            or column_stride % 4
+        ):
+            return False
+    return True
+
+
 def expose_mxfp8(device_ir: DeviceIR) -> bool:
     match = _match_mxfp8(device_ir.graphs, device_ir)
     if match is None:
@@ -437,6 +462,9 @@ def expose_mxfp8(device_ir: DeviceIR) -> bool:
     spec.cute_mxfp8_fused_scales_available = (
         match.scale_a.dtype == match.scale_b.dtype == torch.int32
     )
+    spec.cute_mxfp8_sf_tma_available = _sf_tma_eligible(match)
+    spec.cute_mxfp8_problem_shape = (match.m, match.n, match.k)
+    spec.cute_mxfp8_output_element_size = match.output.element_size()
     return True
 
 
@@ -497,7 +525,15 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
     logical_m_per_cta = df.config.get("cute_scaled_tile_m", 128)
     swap_ab = df.config.get("cute_scaled_swap_ab", False)
     compact_m = df.config.get("cute_scaled_compact_m", False)
+    sf_tma = df.config.get("cute_scaled_sf_tma", False)
+    sf_inplace = df.config.get("cute_scaled_sf_inplace", False)
     if fused_scales and not (match.scale_a.dtype == match.scale_b.dtype == torch.int32):
+        return None
+    if type(sf_tma) is not bool or (
+        sf_tma and (not fused_scales or not _sf_tma_eligible(match))
+    ):
+        return None
+    if type(sf_inplace) is not bool or (sf_inplace and not sf_tma):
         return None
     bn, bk, stages, cluster, persistent = list(
         starmap(
@@ -512,10 +548,11 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         )
     )
     if (
-        bn not in (16, 32, 64, 128, 224, 256)
+        bn not in (8, 16, 32, 64, 128, 224, 256)
         or bk not in (128, 256)
         or stages not in (2, 3, 4, 5, 6, 8, 10, 12)
         or cluster not in (1, 2)
+        or (bn == 8 and cluster != 1)
         or not isinstance(persistent, bool)
         or logical_m_per_cta not in (32, 64, 128)
         or not isinstance(swap_ab, bool)
@@ -524,16 +561,19 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         return None
     runtime_m = n if swap_ab else m
     compact = compact_m and logical_m_per_cta < 128 and runtime_m > 1
-    a_rows = logical_m_per_cta if compact else 128
-    stage_bytes = (a_rows + bn // cluster) * bk + (
-        128 + ((bn + 127) // 128) * 128
-    ) * bk // 32
-    padding_bytes = (128 - a_rows) * 128 if compact else 0
     if (
-        stage_bytes * stages
-        + padding_bytes
-        + 128 * min(bn, 64) * match.output.element_size()
-        + 2048
+        mxfp8_shared_memory_bytes(
+            runtime_m,
+            logical_m_per_cta,
+            bn,
+            bk,
+            stages,
+            cluster,
+            match.output.element_size(),
+            compact_m=compact,
+            sf_tma=sf_tma,
+            sf_inplace=sf_inplace,
+        )
         > 232448
     ):
         return None
@@ -583,4 +623,6 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         logical_m_per_cta,
         swap_ab,
         compact_m,
+        sf_tma,
+        sf_inplace,
     )
