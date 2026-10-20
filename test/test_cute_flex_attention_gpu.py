@@ -320,9 +320,10 @@ def _run(
     mods: tuple[Callable[..., Any], Callable[..., Any]] | None = None,
     enable_gqa: bool = False,
     kernel_mask_mod: Callable[..., Any] | None = None,
+    overrides: dict[str, object] | None = None,
 ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The fused kernel at ``FLEX_CONFIG`` and the eager reference:
-    ``(code, out, lse, ref_out, ref_lse)``."""
+    """The fused kernel at ``FLEX_CONFIG`` (``overrides`` on top) and the
+    eager reference: ``(code, out, lse, ref_out, ref_lse)``."""
     scale = 1.0 / math.sqrt(q.size(-1))
     helion_mod, torch_mod = mods if mods is not None else (_identity, None)
     args = _kernel_args(
@@ -335,7 +336,9 @@ def _run(
         enable_gqa=enable_gqa,
         mask_mod=kernel_mask_mod,
     )
-    code, (out, lse) = code_and_output(_flex_kernel(), args, **FLEX_CONFIG)
+    code, (out, lse) = code_and_output(
+        _flex_kernel(), args, **{**FLEX_CONFIG, **(overrides or {})}
+    )
     ref_out, ref_lse = flex_attention(
         q,
         k,
@@ -698,4 +701,128 @@ def test_large_grid_broadcast_tables(expanded: bool) -> None:
         assert "flash_flex_b = flash_bh // _flash_heads" in code
     else:
         assert "flash_flex_b = cutlass.Int32(0)" in code
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+# -- (xiii) strided operands ------------------------------------------------------
+
+
+def _as_bshd(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s values in a ``[B, S, H, D]`` allocation viewed ``[B, H, S, D]``
+    (the layout every model produces)."""
+    batch, heads, seq, head_dim = t.shape
+    return (
+        torch.empty(batch, seq, heads, head_dim, dtype=t.dtype, device=t.device)
+        .transpose(1, 2)
+        .copy_(t)
+    )
+
+
+def _assert_rank4_maps(code: str, *, kv_group: int = 1) -> None:
+    """The strided render: rank-4 ``(S, D, H, B)`` TMA maps built from the
+    recorded strides, indexed by head and batch."""
+    assert "'operand_strides': (" in code
+    assert "tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]" in code
+    kv_head = "flash_head" if kv_group == 1 else f"flash_head // {kv_group}"
+    assert f"tKgK = tKgK_kdl[None, None, 0, {kv_head}, flash_batch]" in code
+    assert "tQgQ_qdl[None, None, 0, flash_bh]" not in code
+
+
+def _assert_rank3_maps(code: str) -> None:
+    assert "'operand_strides'" not in code
+    assert "flash_head, flash_batch]" not in code
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "kv_heads", "q_seq", "kv_seq"),
+    [
+        (64, torch.bfloat16, 4, 1024, 1024),
+        (128, torch.float16, 4, 1024, 1024),
+        (64, torch.bfloat16, 2, 1024, 1024),
+        (64, torch.bfloat16, 4, 1024, 512),
+        (64, torch.bfloat16, 4, 1152, 1152),
+    ],
+)
+def test_transposed_views_match_the_contiguous_fused_path(
+    head_dim: int, dtype: torch.dtype, kv_heads: int, q_seq: int, kv_seq: int
+) -> None:
+    """``[B, S, H, D].transpose(1, 2)`` Q/K/V run the fused list walk through
+    rank-4 TMA maps (the O ``empty_like`` keeps the layout): bitwise the
+    contiguous fused result at the same configuration (TMA epilogue), and
+    within tolerance of the eager reference. Covers both dtypes and head
+    dims, grouped heads, ``M != N`` and a ragged query length."""
+    q, k, v = _qkv(2, 4, q_seq, kv_seq, head_dim, dtype, kv_heads=kv_heads)
+    block_mask = _block_mask(_causal, 2, 4, q_seq, kv_seq)
+    enable_gqa = kv_heads != 4
+    code_c, out_c, lse_c, _, _ = _run(q, k, v, block_mask, enable_gqa=enable_gqa)
+    _assert_rank3_maps(code_c)
+    qt, kt, vt = (_as_bshd(t) for t in (q, k, v))
+    assert not qt.is_contiguous()
+    code, out, lse, ref_out, ref_lse = _run(
+        qt, kt, vt, block_mask, enable_gqa=enable_gqa
+    )
+    _assert_rank4_maps(code, kv_group=4 // kv_heads)
+    _assert_list_walk(code, mask=True, score=False)
+    assert out.stride() == qt.stride()
+    assert torch.equal(out, out_c)
+    assert torch.equal(lse, lse_c)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {cute_flash.FLASH_EPI_TMA_KEY: False, cute_flash.FLASH_EPI_STG_KEY: True},
+        {
+            cute_flash.FLASH_EPI_TMA_KEY: False,
+            cute_flash.FLASH_EPI_STG_KEY: True,
+            cute_flash.FLASH_KV_SPLIT_KEY: 2,
+        },
+        {cute_flash.FLASH_KV_SPLIT_KEY: 2},
+        {cute_flash.FLASH_PERSISTENT_KEY: False},
+    ],
+    ids=["staged_store", "split_kv_merge", "split_kv_tma_merge", "non_persistent"],
+)
+def test_transposed_views_every_output_path(overrides: dict[str, object]) -> None:
+    """The staged epilogue store, the split-KV merge store (which addresses
+    O by its strides, through ``_flash_mOt`` with the staged store and
+    ``_flash_mO`` with the TMA epilogue) and the non-persistent grid all
+    write the transposed O bitwise the contiguous run of the same
+    configuration."""
+    q, k, v = _qkv(2, 4, 1152, 1152, 64, torch.bfloat16)
+    block_mask = _block_mask(_sliding_causal(192), 2, 4, 1152, 1152)
+    _, out_c, lse_c, _, _ = _run(q, k, v, block_mask, overrides=overrides)
+    qt, kt, vt = (_as_bshd(t) for t in (q, k, v))
+    code, out, lse, ref_out, ref_lse = _run(qt, kt, vt, block_mask, overrides=overrides)
+    _assert_rank4_maps(code)
+    if overrides.get(cute_flash.FLASH_KV_SPLIT_KEY, 1) > 1:
+        tma = overrides.get(cute_flash.FLASH_EPI_TMA_KEY, True)
+        view = "_flash_mO" if tma else "_flash_mOt"
+        assert (
+            f"flash_split_gO = cute.make_tensor({view}.iterator + cute.assume(flash_batch * "
+            in code
+        )
+    assert torch.equal(out, out_c)
+    assert torch.equal(lse, lse_c)
+    _assert_close(out, lse, ref_out, ref_lse)
+
+
+@onlyBackends(["cute"])
+def test_packed_qkv_slices() -> None:
+    """Q/K/V as head-dim slices of one packed ``[B, S, H, 3 * D]`` buffer
+    (outer strides ``3 * D``): fused, bitwise the contiguous result."""
+    q, k, v = _qkv(2, 4, 1024, 1024, 64, torch.bfloat16)
+    block_mask = _block_mask(_causal, 2, 4, 1024, 1024)
+    _, out_c, lse_c, _, _ = _run(q, k, v, block_mask)
+    qkv = torch.empty(2, 1024, 4, 192, dtype=q.dtype, device=DEVICE)
+    qp = qkv[..., :64].transpose(1, 2).copy_(q)
+    kp = qkv[..., 64:128].transpose(1, 2).copy_(k)
+    vp = qkv[..., 128:].transpose(1, 2).copy_(v)
+    assert qp.stride() == (786432, 192, 768, 1)
+    code, out, lse, ref_out, ref_lse = _run(qp, kp, vp, block_mask)
+    _assert_rank4_maps(code)
+    assert torch.equal(out, out_c)
+    assert torch.equal(lse, lse_c)
     _assert_close(out, lse, ref_out, ref_lse)

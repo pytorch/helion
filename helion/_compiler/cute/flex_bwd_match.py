@@ -45,6 +45,7 @@ emitter passes the renderer the KV tile as ``m_tile_expr`` and the Q tile as
 from __future__ import annotations
 
 import dataclasses
+import logging
 import typing
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -77,6 +78,8 @@ from .flex_match import _strip_new_var
 from .flex_match import _table_lead_index_ok
 from .flex_match import _unit_fixed_block
 from .flex_match import _UnmappedRegionValue
+from .flex_match import contiguous_strides
+from .flex_match import flex_operand_strides
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -93,6 +96,8 @@ _prims = torch.ops.prims
 
 # Head-dim pairs the fused backward body hosts (the FA4 1-CTA structure).
 FLEX_BWD_HEAD_DIMS = frozenset({(64, 64), (128, 128)})
+
+log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,9 +142,32 @@ class FlexBwdPlan:
     # ``exp2(score * c - (lse_safe * c)[None, :])``: the factor ``c`` applied
     # to the natural-unit score and LSE (log2(e) for a natural-log LSE).
     log2_factor: float
+    # The strides of the six ``[B, H, S, D]`` operands in ``(Q, dO, K, V, dK,
+    # dV)`` order (``flex_match.flex_operand_strides`` form; row-major for a
+    # contiguous tensor). ``operand_strides`` is ``None`` when all six are
+    # contiguous (the rank-3 ``(S, D, B*H)`` TMA maps) and this tuple
+    # otherwise (rank-4 ``(S, D, H, B)`` maps built from the strides).
+    strides: tuple[tuple[int, ...], ...]
     # The LSE tensor is already in the exp2 base with no-visible-key rows
     # mapped to 0 (the preprocess kernel's ``lse2``): the body stages it as is.
     lse_prescaled: bool = False
+
+    @property
+    def operand_shapes(self) -> tuple[tuple[int, int, int, int], ...]:
+        q = (self.batch, self.heads, self.q_seq, self.head_dim)
+        do = (self.batch, self.heads, self.q_seq, self.head_dim_v)
+        k = (self.batch, self.kv_heads, self.kv_seq, self.head_dim)
+        v = (self.batch, self.kv_heads, self.kv_seq, self.head_dim_v)
+        return (q, do, k, v, k, v)
+
+    @property
+    def operand_strides(self) -> tuple[tuple[int, ...], ...] | None:
+        if all(
+            strides == contiguous_strides(shape)
+            for strides, shape in zip(self.strides, self.operand_shapes, strict=True)
+        ):
+            return None
+        return self.strides
 
     @property
     def group(self) -> int:
@@ -495,6 +523,15 @@ def _build_with_grad_literal(
 # -- entry ---------------------------------------------------------------------
 
 
+def _host_value_named(ctx: _Ctx, name: str) -> torch.Tensor | None:
+    """The fake value of the host tensor ``name`` (any graph)."""
+    for info in ctx.graphs.values():
+        for node in info.graph.nodes:
+            if _host_tensor_name(node) == name:
+                return _host_tensor_value(node)
+    return None
+
+
 def match_flex_attention_bwd(
     graphs: Iterable[GraphInfo],
     root_grid_ids: Sequence[int],
@@ -507,8 +544,29 @@ def match_flex_attention_bwd(
 
     ``graphs`` are ``device_ir.graphs`` (surface time) or the codegen copies;
     ``root_grid_ids`` is the kernel's single root grid ``(b, hk, kv)``.
-    ``reasons`` collects the first failing condition for diagnostics.
+    ``reasons`` collects the first failing condition for diagnostics; without
+    it the first decline is logged at DEBUG level
+    (``HELION_LOGS=+helion._compiler.cute.flex_bwd_match``).
     """
+    logged = reasons is None and log.isEnabledFor(logging.DEBUG)
+    if logged:
+        reasons = []
+    match = _match_flex_attention_bwd(
+        graphs, root_grid_ids, env=env, host_function=host_function, reasons=reasons
+    )
+    if match is None and logged and reasons:
+        log.debug("flex backward envelope declined: %s", reasons[0])
+    return match
+
+
+def _match_flex_attention_bwd(
+    graphs: Iterable[GraphInfo],
+    root_grid_ids: Sequence[int],
+    *,
+    env: CompileEnvironment,
+    host_function: HostFunction | None,
+    reasons: list[str] | None,
+) -> FlexBwdMatch | None:
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
@@ -1614,10 +1672,30 @@ def _assemble(
     if k_value.dtype != io_dtype or v_value.dtype != io_dtype:
         ctx.decline("flex_bwd: K/V dtype mismatch")
         return None
-    for value in (q_value, k_value, v_value):
-        if not value.is_contiguous():
-            ctx.decline("flex_bwd: Q/K/V must be contiguous")
+    do_value = _host_value_named(ctx, full_body.do_name)
+    if do_value is None or tuple(int(s) for s in do_value.shape) != (
+        batch,
+        heads,
+        q_seq,
+        head_dim_v,
+    ):
+        ctx.decline("flex_bwd: dO shape mismatch")
+        return None
+    operand_strides: list[tuple[int, ...]] = []
+    for label, value in (
+        ("Q", q_value),
+        ("dO", do_value),
+        ("K", k_value),
+        ("V", v_value),
+    ):
+        strides = flex_operand_strides(value)
+        if strides is None:
+            ctx.decline(
+                f"flex_bwd: {label} strides {tuple(value.stride())} are not a "
+                "unit inner stride with non-zero 16-byte aligned outer strides"
+            )
             return None
+        operand_strides.append(strides)
     if (head_dim, head_dim_v) not in FLEX_BWD_HEAD_DIMS:
         ctx.decline(f"flex_bwd: unsupported head dims ({head_dim}, {head_dim_v})")
         return None
@@ -1685,6 +1763,22 @@ def _assemble(
             else:
                 dv_name = name
     assert dk_name is not None and dv_name is not None
+    for label, name, shape in (
+        ("dK", dk_name, (batch, kv_heads, kv_seq, head_dim)),
+        ("dV", dv_name, (batch, kv_heads, kv_seq, head_dim_v)),
+    ):
+        value = _host_value_named(ctx, name)
+        if value is None or tuple(int(s) for s in value.shape) != shape:
+            ctx.decline(f"flex_bwd: {label} shape mismatch")
+            return None
+        strides = flex_operand_strides(value)
+        if strides is None:
+            ctx.decline(
+                f"flex_bwd: {label} strides {tuple(value.stride())} are not a "
+                "unit inner stride with non-zero 16-byte aligned outer strides"
+            )
+            return None
+        operand_strides.append(strides)
     # Closed world of host tensors.
     aux_names = tuple(buffer.name for buffer in part_body.regions.aux)
     allowed = {
@@ -1753,6 +1847,7 @@ def _assemble(
         scale_arg=part_body.scale_symbol,
         log2_factor=part_body.log2_factor,
         lse_prescaled=part_body.lse_prescaled,
+        strides=tuple(operand_strides),
     )
     assert ctx.kv_id is not None
     return FlexBwdMatch(

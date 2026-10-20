@@ -300,6 +300,31 @@ def _tcgen05_grouped_scheduler_mode(
     return mode
 
 
+def _flex_rank4_layout(
+    rows: int,
+    cols: int,
+    heads: int,
+    batch: int,
+    strides: Sequence[int],
+    *,
+    mn_major: bool = False,
+) -> str:
+    """A rank-4 TMA map over a ``[B, H, S, D]`` flex operand's strides
+    (``flex_match.flex_operand_strides`` form): ``(S, D, H, B)``, or
+    ``(D, S, H, B)`` for the MN-major V. The device body indexes the
+    trailing ``(head, batch)`` modes."""
+    batch_stride, head_stride, row_stride, _ = strides
+    if mn_major:
+        return (
+            f"cute.make_layout(({cols}, {rows}, {heads}, {batch}), "
+            f"stride=(1, {row_stride}, {head_stride}, {batch_stride}))"
+        )
+    return (
+        f"cute.make_layout(({rows}, {cols}, {heads}, {batch}), "
+        f"stride=({row_stride}, 1, {head_stride}, {batch_stride}))"
+    )
+
+
 def _append_cute_wrapper_plan(
     body: list[str],
     call_args: list[str],
@@ -882,52 +907,74 @@ def _append_cute_wrapper_plan(
         mma_m = 256 if use_2cta_instrs else q_tile_m
         qkd = f"({mma_m}, {kv_n}, {hd})"
         pvd = f"({mma_m}, {hd_v}, {kv_n})"
-        if use_tensor_4d_tma:
-            # The 4D descriptors describe Q/K/V/O with one head dim and one
-            # sequence length.
-            assert hd_v == hd
-            assert kv_seq == seq
-            bh_stride = seq * hd
-            batch_stride = tensor_4d_heads * bh_stride
-            sdb = (
-                f"cute.make_layout(({seq}, {hd}, {tensor_4d_heads}, "
-                f"{tensor_4d_batch}), stride=({hd}, 1, {bh_stride}, "
-                f"{batch_stride}))"
+        operand_strides = plan.get("operand_strides")
+        if operand_strides is not None:
+            # Strided flex operands: rank-4 (S, D, H, B) maps over the real
+            # [B, H, S, D] strides of each operand (unit inner stride, the
+            # rest 16-byte aligned; ``flex_match.flex_operand_strides``). The
+            # device body indexes them ``[.., head, batch]`` like the dense
+            # 4D family; K/V span their own head count and length.
+            assert use_tensor_4d_tma
+            assert isinstance(operand_strides, (list, tuple))
+            q_st, k_st, v_st, o_st = cast(
+                "tuple[Sequence[int], ...]", tuple(operand_strides)
             )
-            dsb = (
-                f"cute.make_layout(({hd}, {seq}, {tensor_4d_heads}, "
-                f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
-                f"{batch_stride}))"
+            kv_heads = tensor_4d_heads // kv_group
+            sdb = _flex_rank4_layout(seq, hd, tensor_4d_heads, tensor_4d_batch, q_st)
+            sdb_o = _flex_rank4_layout(
+                seq, hd_v, tensor_4d_heads, tensor_4d_batch, o_st
             )
-            sdb_o = sdb
+            sdb_kv = _flex_rank4_layout(kv_seq, hd, kv_heads, tensor_4d_batch, k_st)
+            dsb_kv = _flex_rank4_layout(
+                kv_seq, hd_v, kv_heads, tensor_4d_batch, v_st, mn_major=True
+            )
         else:
-            # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows that
-            # share its view) and the MN-major V are ``hd_v`` wide.
-            sdb = (
-                f"cute.make_layout(({seq}, {hd}, {batch}), "
-                f"stride=({hd}, 1, {seq * hd}))"
-            )
-            sdb_o = (
-                f"cute.make_layout(({seq}, {hd_v}, {batch}), "
-                f"stride=({hd_v}, 1, {seq * hd_v}))"
-            )
-            dsb = (
-                f"cute.make_layout(({hd_v}, {seq}, {batch}), "
-                f"stride=(1, {hd_v}, {seq * hd_v}))"
-            )
-        # K/V layouts span their own (grouped) batch-head count and length.
-        if kv_group == 1 and kv_seq == seq:
-            sdb_kv = sdb
-            dsb_kv = dsb
-        else:
-            sdb_kv = (
-                f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
-                f"stride=({hd}, 1, {kv_seq * hd}))"
-            )
-            dsb_kv = (
-                f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
-                f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
-            )
+            if use_tensor_4d_tma:
+                # The 4D descriptors describe Q/K/V/O with one head dim and
+                # one sequence length.
+                assert hd_v == hd
+                assert kv_seq == seq
+                bh_stride = seq * hd
+                batch_stride = tensor_4d_heads * bh_stride
+                sdb = (
+                    f"cute.make_layout(({seq}, {hd}, {tensor_4d_heads}, "
+                    f"{tensor_4d_batch}), stride=({hd}, 1, {bh_stride}, "
+                    f"{batch_stride}))"
+                )
+                dsb = (
+                    f"cute.make_layout(({hd}, {seq}, {tensor_4d_heads}, "
+                    f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
+                    f"{batch_stride}))"
+                )
+                sdb_o = sdb
+            else:
+                # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows
+                # that share its view) and the MN-major V are ``hd_v`` wide.
+                sdb = (
+                    f"cute.make_layout(({seq}, {hd}, {batch}), "
+                    f"stride=({hd}, 1, {seq * hd}))"
+                )
+                sdb_o = (
+                    f"cute.make_layout(({seq}, {hd_v}, {batch}), "
+                    f"stride=({hd_v}, 1, {seq * hd_v}))"
+                )
+                dsb = (
+                    f"cute.make_layout(({hd_v}, {seq}, {batch}), "
+                    f"stride=(1, {hd_v}, {seq * hd_v}))"
+                )
+            # K/V layouts span their own (grouped) batch-head count and length.
+            if kv_group == 1 and kv_seq == seq:
+                sdb_kv = sdb
+                dsb_kv = dsb
+            else:
+                sdb_kv = (
+                    f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
+                    f"stride=({hd}, 1, {kv_seq * hd}))"
+                )
+                dsb_kv = (
+                    f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
+                    f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
+                )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
         )
@@ -1463,9 +1510,11 @@ def _append_cute_wrapper_plan(
         # clipped on store by the TMA unit; the dense path keeps the flat
         # (rows, D) view (its sequences are multiples of 128).
         flex_seq_q = plan_optional_int("flex_seq_q")
+        flex_strides = plan.get("flex_strides")
+        seq_k = plan_optional_int("flex_seq_k")
         if flex_seq_q is not None:
+            assert seq_k is not None
             bh_q = plan_int("flex_bh_q")
-            seq_k = plan_int("flex_seq_k")
             bh_k = plan_int("flex_bh_k")
             q_sdb = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
             k_sdb = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
@@ -1476,11 +1525,36 @@ def _append_cute_wrapper_plan(
             k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
             dq2_layout = f"cute.make_layout(({tq}, {hd}), stride=({hd}, 1))"
             dkv_layout = f"cute.make_layout(({tk}, {hd}), stride=({hd}, 1))"
+        # One map per operand: the flex walk's strided operands (a
+        # ``[B, S, H, D]`` transpose, a packed-QKV slice) take rank-4
+        # (seq, D, H, B) maps over their real strides (unit inner stride, the
+        # rest 16-byte aligned); the device body indexes them by head and
+        # batch. dQ, LSE and delta stay contiguous.
+        q_layout = do_layout = q_sdb
+        k_layout = v_layout = k_sdb
+        dk_layout = dv_layout = dkv_layout
+        if flex_strides is not None:
+            assert flex_seq_q is not None and seq_k is not None
+            assert isinstance(flex_strides, (list, tuple))
+            flex_batch = plan_int("flex_batch")
+            flex_heads = plan_int("flex_heads")
+            flex_kv_heads = plan_int("flex_kv_heads")
+            q_st, do_st, k_st, v_st, dk_st, dv_st = cast(
+                "tuple[Sequence[int], ...]", tuple(flex_strides)
+            )
+            q_layout = _flex_rank4_layout(flex_seq_q, hd, flex_heads, flex_batch, q_st)
+            do_layout = _flex_rank4_layout(
+                flex_seq_q, hd, flex_heads, flex_batch, do_st
+            )
+            k_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, k_st)
+            v_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, v_st)
+            dk_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, dk_st)
+            dv_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, dv_st)
         fbwd_lines = [
-            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
-            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
-            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
-            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_layout})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_layout})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {v_layout})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {do_layout})",
             f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
             f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
@@ -1507,8 +1581,8 @@ def _append_cute_wrapper_plan(
             f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, {dq2_layout})",
             f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), {plan_optional_int('flex_dq_boxes') or 8})",
             "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
-            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {dkv_layout})",
-            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {dkv_layout})",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {dk_layout})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {dv_layout})",
             f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {epi_stages})",
             "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
             "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
