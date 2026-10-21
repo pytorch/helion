@@ -24,9 +24,11 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
+from helion._compiler.autotuner_heuristics.cute_l2_row_swizzle import row_swizzle_size
 from helion._compiler.autotuner_heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
 )
@@ -54,6 +56,7 @@ pytestmark = skipUnlessBackends(["cute"])
 
 PLACEMENT = TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 HOIST = TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+SWIZZLE = TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 PRE = {PLACEMENT: "pre_acc_wait"}
 SHARED = {FANOUT_CONFIG_KEY: "shared"}
 ON = {HOIST: True}
@@ -496,6 +499,21 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
     single._fix_multi_output_ring_search_config(sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 4)
+    # An explicit config is refused where its two rings provably overflow
+    # (128x128x128: ab=3 is 192 KiB, two 4-stage C rings 64 KiB more -- the
+    # NVVM backend used to reject it after normalization accepted it); the
+    # shallow C ring fits, and the search repairs the same sample to it.
+    deep = base_config(
+        SHARED,
+        block_sizes=[128, 128, 128],
+        tcgen05_ab_stages=3,
+        tcgen05_c_stages=4,
+    )
+    with pytest.raises(InvalidConfig, match="overflows the per-CTA SMEM budget"):
+        normalized(bound, deep)
+    assert normalized(bound, deep | {"tcgen05_c_stages": 2})["tcgen05_c_stages"] == 2
+    repaired = normalized(bound, deep, fix_invalid=True)
+    assert (repaired["tcgen05_ab_stages"], repaired["tcgen05_c_stages"]) == (3, 2)
 
 
 def _group(bound: BoundKernel[Any], key: str) -> Any:
@@ -533,20 +551,148 @@ def test_fanout_and_hoist_coverage_for_a_seedless_two_output_kernel() -> None:
         ("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared")
     ]
     assert [w.value for w in hoist.witnesses] == [False, True, False, True]
-    for carrier in _carriers(hoist):
+    hoist_carriers = _carriers(hoist)
+    for carrier in hoist_carriers:
         assert carrier[FANOUT_CONFIG_KEY] == "shared"
         assert carrier[PLACEMENT] == "pre_acc_wait"
         assert HOIST not in carrier
+    # The hoist group carries two output-tile geometries: the CTA pair the
+    # fanout admits (256x128, the deepest AB ring the two-ring arena fits at
+    # K tile 128: 4 x 48 KiB + 32 KiB) before the fanout group's one-CTA
+    # carrier (its deep-C twin).
+    for carrier in hoist_carriers[:2]:
+        assert carrier["block_sizes"] == [256, 128, 128]
+        assert carrier["tcgen05_cluster_m"] == 2
+        assert carrier["tcgen05_ab_stages"] == 4
+        assert carrier["tcgen05_c_stages"] == 2
+    for carrier in hoist_carriers[2:]:
         assert carrier["block_sizes"] == [128, 128, 64]
-    # Every witness is a complete, strictly valid config.
-    for group in (fanout, hoist):
+        assert carrier["tcgen05_cluster_m"] == 1
+        assert carrier["tcgen05_c_stages"] == 4
+    # The row swizzle rides the hoist carriers: eight N tiles of 128 at
+    # N = 1024, so the row-covering swizzle is 8, declared beside the
+    # legacy 1 with the fanout and the hoist as dependencies.
+    swizzle = _group(bound, SWIZZLE)
+    assert swizzle is not None and swizzle.mechanism == "cute.l2_row_swizzle"
+    assert [(d.mechanism, d.key, d.value) for d in swizzle.dependencies] == [
+        ("cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"),
+        ("cute.aux_fragment_hoist", HOIST, True),
+    ]
+    assert swizzle.domain == (1, 2, 4, 8) and swizzle.legacy == 1
+    assert [w.value for w in swizzle.witnesses] == [1, 8, 1, 8]
+    swizzle_carriers = _carriers(swizzle)
+    for carrier, source in zip(swizzle_carriers, hoist_carriers, strict=True):
+        assert SWIZZLE not in carrier
+        assert carrier.pop(HOIST) is True
+        assert carrier == {k: v for k, v in source.items() if k != SWIZZLE}
+    # Every witness is a complete, strictly valid config that keeps its mode.
+    for group in (fanout, hoist, swizzle):
         for witness in group.witnesses:
-            normalized(bound, dict(witness.carrier.config) | {group.key: witness.value})
+            config = normalized(
+                bound, dict(witness.carrier.config) | {group.key: witness.value}
+            )
+            assert config.get(group.key, group.legacy) == witness.value
     # Geometries no 128x128 tile divides stay carrierless.
     odd = bind(gated_pair, rows=4096 + 64)
     assert not state_of(odd).epilogue_fanout_search_enabled
     assert _group(odd, FANOUT_CONFIG_KEY) is None
     assert _group(odd, HOIST) is None
+
+
+def test_pair_fanout_sample_keeps_its_geometry_in_the_search() -> None:
+    bound = bind(gated_pair)
+    pair = base_config(
+        SHARED,
+        PRE,
+        ON,
+        block_sizes=[256, 128, 128],
+        tcgen05_cluster_m=2,
+        tcgen05_ab_stages=4,
+        tcgen05_c_stages=2,
+        tcgen05_l2_swizzle_size=8,
+    )
+    # Strictly valid, and a fixed point of the search's repairing pass: the
+    # cluster_m=2 projections (the canonical 256x256 tile, the aux-TMA
+    # producer regime) leave a sample whose proved fanout admits its tile
+    # alone, so the pair recipe is a config the search can measure.
+    strict = normalized(bound, pair)
+    repaired = normalized(bound, pair, fix_invalid=True)
+    for config in (strict, repaired):
+        assert config["block_sizes"] == [256, 128, 128]
+        assert config["tcgen05_cluster_m"] == 2
+        assert config["tcgen05_ab_stages"] == 4
+        assert config["tcgen05_c_stages"] == 2
+        assert config["tcgen05_l2_swizzle_size"] == 8
+        assert config[FANOUT_CONFIG_KEY] == "shared"
+        assert config[PLACEMENT] == "pre_acc_wait"
+        assert config[HOIST] is True
+        assert config.get("tcgen05_aux_load_mode", "simt") == "simt"
+        assert config.get("tcgen05_strategy", "role_local_monolithic") == (
+            "role_local_monolithic"
+        )
+    # Without the fanout the same pair sample takes the projections as before.
+    plain = normalized(
+        bound,
+        base_config(
+            block_sizes=[256, 128, 128],
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=4,
+            tcgen05_c_stages=2,
+        ),
+        fix_invalid=True,
+    )
+    assert plain["tcgen05_cluster_m"] == 2
+    assert plain["block_sizes"][:2] == [256, 256]
+    assert plain.get(FANOUT_CONFIG_KEY, "off") == "off"
+
+
+def test_pair_carrier_needs_whole_pair_tiles() -> None:
+    # 4224 rows: whole 128-row tiles but not whole 256-row pair tiles, so the
+    # hoist group keeps its one-CTA C-ring twins and the swizzle group follows.
+    bound = bind(gated_pair, rows=4096 + 128)
+    hoist = _group(bound, HOIST)
+    assert hoist is not None
+    carriers = _carriers(hoist)
+    assert [w.value for w in hoist.witnesses] == [False, True, False, True]
+    assert [c["block_sizes"] for c in carriers] == [[128, 128, 64]] * 4
+    assert [c["tcgen05_c_stages"] for c in carriers] == [4, 4, 2, 2]
+    assert all(c["tcgen05_cluster_m"] == 1 for c in carriers)
+    swizzle = _group(bound, SWIZZLE)
+    assert swizzle is not None
+    assert [w.value for w in swizzle.witnesses] == [1, 8, 1, 8]
+    for carrier in _carriers(swizzle):
+        assert carrier["block_sizes"] == [128, 128, 64]
+        assert carrier[HOIST] is True
+    for group in (hoist, swizzle):
+        for witness in group.witnesses:
+            normalized(bound, dict(witness.carrier.config) | {group.key: witness.value})
+
+
+def test_row_swizzle_is_the_deepest_legal_size_within_one_row_of_n_tiles() -> None:
+    legal = (1, 2, 4, 8)
+    assert row_swizzle_size(8, legal) == 8
+    assert row_swizzle_size(16, legal) == 8
+    assert row_swizzle_size(4, legal) == 4
+    assert row_swizzle_size(3, legal) == 2
+    assert row_swizzle_size(1, legal) == 1
+    # Narrower outputs: the witnesses pair the legacy 1 with the row-covering
+    # swizzle of each carrier's own N tile (four tiles of 128 at N = 512; the
+    # small-grid seeds' narrow N tiles at N = 128), every one strictly valid.
+    for rows, columns in ((1024, 512), (256, 128)):
+        bound = bind(gated_pair, rows=rows, columns=columns)
+        swizzle = _group(bound, SWIZZLE)
+        assert swizzle is not None
+        n_index = state_of(bound)._matmul_block_indices()[1]
+        values = [w.value for w in swizzle.witnesses]
+        assert values[::2] == [1] * (len(values) // 2)
+        for witness in swizzle.witnesses:
+            tiles = columns // witness.carrier.block_sizes[n_index]
+            assert witness.value in (1, row_swizzle_size(tiles, swizzle.domain))
+            config = normalized(
+                bound, dict(witness.carrier.config) | {SWIZZLE: witness.value}
+            )
+            assert config[SWIZZLE] == witness.value
+        assert all(value != 1 for value in values[1::2])
 
 
 def test_hoist_coverage_without_fanout_where_every_store_has_aux() -> None:

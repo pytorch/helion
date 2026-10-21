@@ -167,6 +167,7 @@ from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
 from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
+from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
@@ -576,6 +577,7 @@ def register_compiler_coverage_groups(
     register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
     register_aux_fragment_hoist_coverage(env, device_ir)
+    register_l2_row_swizzle_coverage(env, device_ir)
     register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)
     deep_configs = grouped_full_coverage_configs(env, device_ir, block_k=128)

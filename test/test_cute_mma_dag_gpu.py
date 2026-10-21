@@ -7,20 +7,26 @@ and the stage / store / exchange knobs being pure data movement."""
 
 from __future__ import annotations
 
+import functools
 import importlib
 import importlib.util
+import itertools
 import os
+import re
 import sys
 from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+from helion.runtime.cute import sass_check
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -64,6 +70,11 @@ def _inputs(
         "g_last": _randn(g, bh, n, d, scale=0.1, dtype=f32),
         "g_last_s": _randn(g, bh, n, scale=0.1, dtype=f32),
         "gc": _randn(g, bh, n, c, scale=0.1, dtype=f32),
+        # The anchored (full_gla) mode's per-channel log-decay cumsum: a
+        # non-positive running sum down the chunk.
+        "gc4": (-_randn(g, bh, n, c, d, scale=0.05, dtype=f32).abs())
+        .cumsum(2)
+        .contiguous(),
         "h0": _randn(g, bh, d, dv, dtype=dtype),
         "dh_init": _randn(g, bh, d, dv, dtype=f32),
     }
@@ -95,12 +106,26 @@ def _fwd_args(
         return (t["k"], t["v"], None, h0, None, False, False, False, has_h0)
     if mode == "diag":
         return (t["k"], t["v"], t["g_last"], h0, None, True, False, False, has_h0)
+    if mode == "anchored":
+        return (t["k"], t["v"], t["g_last"], h0, t["gc4"], True, False, True, has_h0)
     return (t["k"], t["v"], t["g_last_s"], h0, t["gc"], True, True, False, has_h0)
 
 
 def _bwd_args(t: dict[str, torch.Tensor], mode: str) -> tuple[object, ...]:
     if mode == "vanilla":
         return (t["k"], t["v"], None, t["dh_init"], None, False, False, False, 0.125)
+    if mode == "anchored":
+        return (
+            t["k"],
+            t["v"],
+            t["g_last"],
+            t["dh_init"],
+            t["gc4"],
+            True,
+            False,
+            True,
+            0.125,
+        )
     if mode == "diag":
         return (
             t["k"],
@@ -225,6 +250,49 @@ def _dstate_args(t: dict[str, torch.Tensor], gated: bool) -> tuple[object, ...]:
     return (t["q"], t["k"], t["w"], t["do"], t["h0"], g_cs, dl, gated, 0.125)
 
 
+def _inputs_varlen4(
+    *,
+    h: int,
+    chunks: tuple[int, ...],
+    d: int,
+    dv: int,
+    dtype: torch.dtype,
+    seed: int = 0,
+) -> dict[str, torch.Tensor]:
+    """The varlen state pass's inputs: chunk-major rows ``h * NT + j``,
+    sequence n owning chunks ``chunk_offsets[n] : chunk_offsets[n + 1]``
+    (``chunks[n]`` of them), scaled like ``_inputs4``."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    c = 64
+    f32 = torch.float32
+    nt = sum(chunks)
+    n = len(chunks)
+    offsets = [0, *itertools.accumulate(chunks)]
+    return {
+        "k": _randn(g, h * nt, c, d, scale=0.05, dtype=dtype),
+        "w": _randn(g, h * nt, c, d, scale=0.05, dtype=dtype),
+        "u": _randn(g, h * nt, c, dv, dtype=dtype),
+        "h0": _randn(g, h * n, d, dv, scale=0.5, dtype=f32),
+        "decay_last": -_randn(g, h * nt, d, scale=0.2, dtype=f32).abs(),
+        "chunk_offsets": torch.tensor(offsets, dtype=torch.int64, device=DEVICE),
+    }
+
+
+def _fwd_h_delta_varlen_args(
+    t: dict[str, torch.Tensor], chunks: tuple[int, ...], h: int
+) -> tuple[object, ...]:
+    return (
+        t["k"],
+        t["w"],
+        t["u"],
+        t["h0"],
+        t["decay_last"],
+        t["chunk_offsets"],
+        sum(chunks),
+        h,
+    )
+
+
 def _inputs_m4(
     *, bhn: int, d: int, dv: int, dtype: torch.dtype, seed: int = 0
 ) -> dict[str, torch.Tensor]:
@@ -338,6 +406,7 @@ _KERNELS = {
     "dqk": "chunk_bwd_dqk_helion",
     "dv": "chunk_bwd_dv_helion",
     "fwd_h_delta": "chunk_fwd_h_delta_helion",
+    "fwd_h_delta_varlen": "chunk_fwd_h_delta_varlen_helion",
     "dstate": "chunk_bwd_dstate_delta_helion",
     "dk": "chunk_bwd_dk_delta_helion",
     "dk_f32": "chunk_bwd_dk_delta_helion",
@@ -608,6 +677,260 @@ def test_delta_register_routes_are_pure_data_movement(kernel: str) -> None:
             assert torch.equal(lhs, rhs)
 
 
+@pytest.mark.parametrize(
+    ("bdv", "warps", "stages"), ((32, 4, 2), (64, 8, 4), (16, 2, 1), (64, 4, 1))
+)
+def test_varlen_state_pass_matches_the_triton_backend(
+    bdv: int, warps: int, stages: int
+) -> None:
+    # chunk_fwd_h_delta_varlen_helion walks ``hl.tile(chunk_offsets[n],
+    # chunk_offsets[n + 1], block_size=1)``: the trip count is a tensor
+    # element read ahead of the loop (5, 1 and 3 chunks per sequence here,
+    # the one-chunk sequence exercising a prologue past the loop's end), and
+    # the final state is stored after the loop.
+    chunks = (5, 1, 3)
+    t = _inputs_varlen4(h=2, chunks=chunks, d=128, dv=64, dtype=torch.bfloat16)
+    args = _fwd_h_delta_varlen_args(t, chunks, 2)
+    fn = _kernel_fn("fwd_h_delta_varlen")
+    source, out = _run_cute(fn, args, _config([bdv], warps, stages))
+    assert source.count(f"{RT}.ldg_s64(") == 2
+    assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in source
+    _assert_close(out, _run_triton(fn, args, [bdv]), scaled=True)
+
+
+def _inputs_varlen_tokens(
+    *, h: int, lens: tuple[int, ...], d: int, dv: int, dtype: torch.dtype, seed: int = 0
+) -> dict[str, object]:
+    """The token-major varlen kernels' inputs: sequences of ``lens`` tokens
+    under one ``cu_seqlens`` (the engine's chunk tables place the chunks;
+    a length that is not a multiple of 64 leaves a ragged last chunk), the
+    per-chunk operands chunk-major, row ``h * NT + j``."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    c = 64
+    f32 = torch.float32
+    total = sum(lens)
+    cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(lens)], dtype=torch.int32, device=DEVICE
+    )
+    _offsets, token_base, valid_len, nt = _engine()._kda_varlen_chunk_tables(
+        cu_seqlens, c, total
+    )
+    hnt = h * nt
+    rows = torch.arange(c, device=DEVICE)
+    strict = (rows[:, None] > rows[None, :]).to(dtype)
+    causal = (rows[:, None] >= rows[None, :]).to(dtype)
+    return {
+        "q": _randn(g, total, h, d, dtype=dtype),
+        "k": _randn(g, total, h, d, dtype=dtype),
+        "v": _randn(g, total, h, dv, dtype=dtype),
+        "beta": torch.sigmoid(_randn(g, total, h, dtype=f32)).to(dtype),
+        "g_cs": -_randn(g, hnt, c, d, scale=0.1, dtype=f32).abs().cumsum(1),
+        "Akk": _randn(g, hnt, c, c, scale=0.3, dtype=dtype) * strict,
+        "v_new": _randn(g, hnt, c, dv, dtype=dtype),
+        "h": _randn(g, hnt, d, dv, scale=0.3, dtype=dtype),
+        "A": _randn(g, hnt, c, c, scale=0.3, dtype=dtype) * causal,
+        "token_base": token_base,
+        "valid_len": valid_len,
+        "hnt": hnt,
+        "total": total,
+    }
+
+
+def _run_backend(
+    fn: Callable[..., object],
+    backend: str,
+    args: tuple[object, ...],
+    outputs: tuple[int, ...],
+    config: helion.Config,
+) -> tuple[str, tuple[torch.Tensor, ...]]:
+    """Run ``fn`` under ``backend`` at ``config``; the kernel writes its
+    outputs into the arguments at ``outputs`` (returned as copies)."""
+    kernel = helion.kernel(fn, backend=backend, static_shapes=True)
+    bound = kernel.bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    compiled = bound.compile_config(normalized)
+    for position in outputs:
+        cast_tensor(args[position]).zero_()
+    compiled(*args)
+    torch.cuda.synchronize()
+    return source, tuple(cast_tensor(args[position]).clone() for position in outputs)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "d", "warps", "stages", "loads"),
+    (
+        ("wy", 64, 4, 2, "lane"),
+        ("wy", 128, 8, 4, "lane"),
+        ("wy", 64, 4, 1, "lane"),
+        ("wy", 32, 4, 2, "tma"),
+        ("wy", 32, 8, 4, "tma"),
+        ("wy", 64, 4, 2, "tma"),
+        ("o_diag", 64, 4, 2, "lane"),
+        ("o_diag", 128, 4, 4, "lane"),
+        ("o_diag", 128, 8, 2, "lane"),
+    ),
+)
+def test_varlen_window_kernels_match_the_triton_backend(
+    kernel: str, d: int, warps: int, stages: int, loads: str
+) -> None:
+    # The token-major kernels of the varlen KDA forward read their q / k / v
+    # / beta rows through ``token_base[j] + hl.arange(C)`` under the
+    # ``hl.arange(C) < valid_len[j]`` mask (a window: rows at a runtime
+    # offset, live below a runtime limit) and o_diag stores its output the
+    # same way.  Sequences of 200, 64 and 150 tokens: ragged last chunks
+    # (8, 64 and 22 live rows), and a last chunk that reaches past the
+    # tensor's end only through its masked rows.  Under the TMA ring
+    # (``loads="tma"``) the windowed k tile keeps its zero-filled packets --
+    # a bulk tensor copy lands its box whole, at no runtime offset and with
+    # no runtime limit -- while the derived g_cs tile (a [64, 32] fp32 box
+    # of 128-byte rows, no window) rides the one tensor map beside them.
+    lens = (200, 64, 150)
+    h = 2
+    t = _inputs_varlen_tokens(h=h, lens=lens, d=d, dv=64, dtype=torch.bfloat16)
+    hnt = cast("int", t["hnt"])
+    e = functools.partial(torch.empty, dtype=torch.bfloat16, device=DEVICE)
+    if kernel == "wy":
+        fn = _engine().chunk_fwd_wy_delta_varlen_helion.fn
+        args = (
+            t["k"],
+            t["v"],
+            t["beta"],
+            t["g_cs"],
+            t["Akk"],
+            t["token_base"],
+            t["valid_len"],
+            e((hnt, 64, d)),
+            e((hnt, 64, 64)),
+            e((hnt, 64, d)),
+        )
+        outputs = (7, 8, 9)
+        # (D == DV rides the value loop on the key loop; else two loops.)
+        block_sizes = [32] if d == 64 else [32, 32]
+    else:
+        fn = _engine().chunk_fwd_o_diag_anchored_varlen_helion.fn
+        total = cast("int", t["total"])
+        args = (
+            t["q"],
+            t["v_new"],
+            t["g_cs"],
+            t["h"],
+            t["A"],
+            t["token_base"],
+            t["valid_len"],
+            e((total, h, 64)),
+            0.125,
+            True,
+        )
+        outputs = (7,)
+        block_sizes = []
+    source, outs = _run_backend(
+        fn,
+        "cute",
+        args,
+        outputs,
+        _config(block_sizes, warps, stages, cute_mma_dag_loads=loads),
+    )
+    assert (
+        f"{RT}.mma_" in source and "_cute_grouped_reduce_shared_two_stage" not in source
+    )
+    assert ("cp_async_bulk_tensor_shared_cta_global" in source) == (loads == "tma")
+    if loads == "tma":
+        assert "'tma_count': 1" in source and "'tma0_elem': 4" in source
+        assert f"{RT}.cp_async_16_zfill(" in source
+    assert source.count(f"{RT}.ldg_s64(") == 2
+    assert (
+        "md_scalar_1 + " in source
+    )  # the window's rows are bounded by the tensor's end
+    _source, refs = _run_backend(
+        fn, "triton", args, outputs, helion.Config(block_sizes=block_sizes)
+    )
+    _assert_close(outs, refs, scaled=True)
+    if kernel == "o_diag":
+        # Rows past a sequence's end are never written: the next sequence's
+        # first tokens keep their values (zero here) under both backends.
+        assert torch.equal(outs[0].eq(0).all(dim=(1, 2)), refs[0].eq(0).all(dim=(1, 2)))
+
+
+def _vector_window_kernel(
+    x: torch.Tensor,
+    beta: torch.Tensor,
+    hmat: torch.Tensor,
+    base_t: torch.Tensor,
+    lim_t: torch.Tensor,
+    out: torch.Tensor,
+    sums: torch.Tensor,
+) -> None:
+    # x [T, H, D]: a row window (the token rows); beta [H, T] and sums [H, T]:
+    # vector windows along the contiguous dim.
+    nt = base_t.size(0)
+    c = hl.specialize(hmat.size(0))
+    for tile_r in hl.tile(out.size(0), block_size=1):
+        j = tile_r.begin % nt
+        head = tile_r.begin // nt
+        idx = hl.arange(c)
+        valid = idx < lim_t[j]
+        xt = torch.where(
+            valid[:, None],
+            hl.load(x, [base_t[j] + idx, head, slice(None)], extra_mask=valid[:, None]),
+            0,
+        )
+        b = torch.where(
+            valid, hl.load(beta, [head, base_t[j] + idx], extra_mask=valid), 0
+        )
+        o = hl.dot((xt.float() * b.float()[:, None]).to(x.dtype), hmat[:, :])
+        out[tile_r.begin, :, :] = o.to(out.dtype)
+        hl.store(sums, [head, base_t[j] + idx], o.sum(dim=-1), extra_mask=valid)
+
+
+@pytest.mark.parametrize(("warps", "stages"), ((4, 2), (8, 1)))
+def test_vector_windows_at_any_stride_match_the_triton_backend(
+    warps: int, stages: int
+) -> None:
+    # A 2-D tile's window must be its rows at a 16-byte multiple of a row
+    # stride (a column window is not admitted: test_cute_mma_dag.py); a
+    # vector's window may sit on the contiguous dim at any offset, its
+    # elements loaded and stored one by one under per-element predicates.
+    # Sequences of 37, 64, 91 and 50 tokens: odd token offsets for the row
+    # window of x (whole 256-byte rows) and for the contiguous beta / sums
+    # windows (2- and 4-byte elements), with ragged chunks of 37, 27 and 50
+    # live rows.
+    lens = (37, 64, 91, 50)
+    h, d, dv, c = 2, 64, 64, 64
+    bf16, f32 = torch.bfloat16, torch.float32
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    total = sum(lens)
+    cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(lens)], dtype=torch.int32, device=DEVICE
+    )
+    _offsets, token_base, valid_len, nt = _engine()._kda_varlen_chunk_tables(
+        cu_seqlens, c, total
+    )
+    assert nt == 5 and token_base.tolist() == [0, 37, 101, 165, 192]
+    args = (
+        _randn(g, total, h, d, dtype=bf16),
+        torch.sigmoid(_randn(g, h, total, dtype=f32)).to(bf16),
+        _randn(g, d, dv, scale=0.3, dtype=bf16),
+        token_base,
+        valid_len,
+        torch.empty(h * nt, c, dv, dtype=bf16, device=DEVICE),
+        torch.empty(h, total, dtype=f32, device=DEVICE),
+    )
+    source, outs = _run_backend(
+        _vector_window_kernel, "cute", args, (5, 6), _config([], warps, stages)
+    )
+    assert (
+        f"{RT}.mma_" in source and "_cute_grouped_reduce_shared_two_stage" not in source
+    )
+    assert f"{RT}.cp_async_16_zfill(" in source  # x: whole rows, zero-filled
+    assert f"{RT}.ldg_bf16_as_f32_pred(" in source  # beta: per element
+    _source, refs = _run_backend(
+        _vector_window_kernel, "triton", args, (5, 6), helion.Config()
+    )
+    _assert_close(outs, refs, scaled=True)
+
+
 @pytest.mark.parametrize("kernel", ("fwd", "bwd"))
 def test_stage_depth_and_store_path_are_pure_data_movement(kernel: str) -> None:
     t = _inputs(bh=2, n=16, d=64, dv=64, dtype=torch.bfloat16, seed=3)
@@ -810,6 +1133,33 @@ def test_packed_pairs_match_the_triton_backend(mode: int) -> None:
         assert torch.equal(out[0], ref[0])
 
 
+def test_anchored_fwd_h_reads_the_decay_row_from_the_ring_slot() -> None:
+    # full_gla's forward state kernel (``diag_anchored``): the chunk's last
+    # decay row ``gc[idx, i_t, C - 1, tile_d]`` is read from the staged
+    # ``gc`` tile's ring slot (``lds_f32``; no global row load on the chain)
+    # and the key's ``.to(bf16)`` under its transpose is folded into the
+    # exchange's pack -- the same bytes: the exchange and pass routes are
+    # bit-equal to each other and track the Triton backend.
+    t = _inputs(bh=2, n=8, d=128, dv=128, dtype=torch.bfloat16, seed=7)
+    args = _fwd_args(t, "anchored", True)
+    fn = _kernel_fn("fwd")
+    outs = []
+    for derived in ("exchange", "pass"):
+        source, out = _run_cute(
+            fn, args, _config([32, 128], 8, 4, cute_mma_dag_derived=derived)
+        )
+        loop = source[source.index("for md_i in cutlass.range(") :]
+        assert f"{RT}.lds_f32(" in loop and f"{RT}.ldg_f32(" not in loop
+        # (No bf16 cast of a computed value; the loaded bf16 halves are
+        # re-typed exactly and their fp32 twins feed the chain.)
+        assert not re.findall(
+            r"cutlass\.BFloat16\((?!md_(?:lo|hi)(?:_\d+)?\))[^)]*\)", loop
+        )
+        outs.append(out[0])
+    assert torch.equal(outs[0], outs[1])
+    _assert_close((outs[0],), _run_triton(fn, args, [32, 128]))
+
+
 def test_unaligned_operand_sources_take_the_synchronous_pass() -> None:
     # A source whose base is 8-byte aligned cannot be staged with 16-byte
     # cp.async packets: the operand goes through the cooperative pass of
@@ -862,7 +1212,7 @@ def test_wy_with_an_unaligned_key_matches_the_triton_backend() -> None:
 # --------------------------------------------------------------------------
 
 
-def _probe_kernels() -> object:
+def _probe_kernels() -> ModuleType:
     return importlib.import_module("test.test_cute_mma_dag")
 
 
@@ -2197,6 +2547,198 @@ def test_anchored_wy_state_key_matches_the_triton_backend() -> None:
         assert torch.equal(lhs, rhs)
 
 
+# The config whose kernel died with CUDA_ERROR_ILLEGAL_INSTRUCTION in the kda
+# forward's cold autotune at (8, 8, 1024, 64, 64): a warp mma_dag whose
+# ``load_eviction_policies`` names "l2_last" at the staged k and v slots.  The
+# emitter once hinted those cp.async packets ``.L2::cache_hint``, which the
+# CuTe DSL's nvJitLink (13.4.46rc1) miscompiles (``emit_issue_tile``).
+_WY_FAULT_CONFIG: dict[str, object] = {
+    "block_sizes": [8, 8],
+    "cute_collective_compute": "warp",
+    "cute_collective_copy": "scalar",
+    "cute_collective_mma": False,
+    "cute_collective_native_seeded": False,
+    "cute_collective_tmem_a": False,
+    "cute_collective_tmem_seed": False,
+    "cute_lane_layouts": ["blocked"] * 5,
+    "cute_min_blocks_per_mp": 0,
+    "cute_mma_dag": "warp",
+    "cute_mma_dag_derived": "exchange",
+    "cute_mma_dag_epilogue": "row",
+    "cute_mma_dag_exchange": "auto",
+    "cute_mma_dag_loads": "tma",
+    "cute_mma_dag_lookahead": "off",
+    "cute_mma_dag_pass_warps": "off",
+    "cute_mma_dag_persistent": 0,
+    "cute_mma_dag_stages": 8,
+    "cute_mma_dag_store": "staged",
+    "cute_mma_dag_warps": 4,
+    "cute_pdl": True,
+    "cute_reduction_reloads": ["auto"],
+    "cute_register_chain": False,
+    "cute_store_policy": "default",
+    "cute_vector_widths": [1] * 5,
+    "load_eviction_policies": ["", "", "l2_last", "", "", "l2_last"],
+    "num_threads": [0, 0, 0],
+}
+
+
+def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> None:
+    # The candidate that died in the kda autotune renders hinted packets
+    # again, behind the launcher's SASS check: on the DSL's current
+    # assembler the check refuses the kernel before any launch (its split
+    # packets read UR0 / UR1, registers no instruction of the kernel
+    # writes: the dropped operand fields that faulted); on an assembler
+    # that encodes it correctly the kernel runs bit-equal to the plain
+    # render and to Triton.  Either way the plain config is untouched.
+    t = _inputs_kda(bh=64, n=16, d=64, dv=64)
+    fn = _kernel_fn("wy_anch")
+    akk = _anchored_gram(t)
+    kso = torch.empty_like(t["k"])
+    args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
+    plain_source, plain = _run_cute(
+        fn,
+        args,
+        helion.Config.from_dict(
+            {**_WY_FAULT_CONFIG, "load_eviction_policies": [""] * 6}
+        ),
+    )
+    assert "cp_async_16_l2" not in plain_source
+    assert "_helion_cute_sass_checks" not in plain_source
+    plain = (*plain, kso.clone())
+    kso = torch.empty_like(t["k"])
+    args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
+    try:
+        hinted_source, hinted = _run_cute(
+            fn, args, helion.Config.from_dict(_WY_FAULT_CONFIG)
+        )
+    except exc.CuteSassCheckFailed as error:
+        assert "hinted_cp_async" in str(error)
+        assert re.search(r"LDGSTS\S* \[R\d+\+UR\d+", str(error)), str(error)
+        assert "which no instruction of the kernel writes" in str(error)
+        assert "assembled by Cuda compilation tools" in str(error)
+        torch.cuda.synchronize()  # the context is intact: nothing launched
+    else:
+        # (k's and v's packets hinted; the derived ring load's tile, "" in
+        # the config, rides a tensor map: the CPU pins hold the counts.)
+        assert hinted_source.count(f"{RT}.cp_async_16_l2(") > 0
+        assert "_helion_cute_sass_checks = ('hinted_cp_async',)" in hinted_source
+        for lhs, rhs in zip((*hinted, kso), plain, strict=True):
+            assert torch.equal(lhs, rhs)
+    kso = torch.empty_like(t["k"])
+    args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
+    ref = (*_run_triton(fn, args, [8, 8]), kso)
+    for lhs, rhs in zip(plain, ref, strict=True):
+        assert torch.equal(lhs, rhs)
+
+
+@pytest.mark.parametrize(
+    ("policies", "words"),
+    (
+        (("l2_last", "l2_last"), ("evict_last",)),
+        (("streaming", "l1_l2_last"), ("evict_first", "evict_last")),
+    ),
+)
+def test_l2_hinted_operand_packets_are_a_pure_cache_hint(
+    policies: tuple[str, str], words: tuple[str, ...]
+) -> None:
+    # ``load_eviction_policies`` on the staged operands' slots (k: 0, q: 1)
+    # puts an L2 cache policy on their cp.async packets: the same bits as
+    # the plain kernel and as Triton over eight launches.  The launcher's
+    # SASS check passed for this kernel (it ran): the indexer decode's
+    # hinted packets are the campaign's winning form.
+    fn = _probe_kernels()._head_sum_logits_batched
+    args = _head_sum_args(m=4, h=32)
+    hinted = [*policies, "", "", "", "", ""]
+    source, out = _run_cute(
+        fn, args, _config([1, 64], 4, 4, load_eviction_policies=hinted)
+    )
+    assert source.count(f"{RT}.cp_async_16_l2(") == 12
+    assert f"{RT}.cp_async_16(" not in source
+    assert "_helion_cute_sass_checks = ('hinted_cp_async',)" in source
+    for word in words:
+        assert f"{RT}.l2_policy_{word}()" in source
+    _, plain = _run_cute(fn, args, _config([1, 64], 4, 4))
+    assert torch.equal(out[0], plain[0])
+    (ref,) = _run_triton(fn, args, [1, 64])
+    assert torch.equal(out[0], ref)
+
+
+def test_l2_hinted_zero_filled_packets_match_torch() -> None:
+    # The ragged root tile's zero-filled packets carry the policy behind
+    # their byte count; integer inputs: exact.
+    fn = _probe_kernels()._ragged_rows_summed
+    a, b = _ragged_sum_args(8)
+    source, (out,) = _run_cute(
+        fn,
+        (a, b),
+        _config([16, 128], 4, 2, load_eviction_policies=["l2_last", "l2_last"]),
+    )
+    assert f"{RT}.cp_async_16_l2_zfill(" in source
+    assert f"{RT}.cp_async_16_zfill(" not in source
+    ref = (a.float() @ b.float() + 1.0).sum(0)
+    assert torch.equal(out, ref)
+
+
+def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs() -> (
+    None
+):
+    # The SASS check read against the assembler's actual output for the
+    # indexer decode program at the tiles the campaign reaches (one, four
+    # and eight warps; 16 / 32 / 64 keys): every uniform register an LDGSTS
+    # names is written by the kernel (the defect's signature is absent),
+    # every LDGSTS keeps its shared address in a vector register (the
+    # conservative form condition), and the hinted kernels run bit-equal
+    # to the plain ones.
+    fn = _probe_kernels()._head_sum_logits_batched
+    args = _head_sum_args(m=1, h=32, n=4096)
+    for block_n, warps in ((16, 1), (16, 4), (32, 4), (32, 8), (64, 4)):
+        hinted = _config(
+            [1, block_n], warps, 4, load_eviction_policies=["l2_last"] * 2 + [""] * 5
+        )
+        kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+        bound = kernel.bind(args)
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(hinted)
+        compiled = bound.compile_config(normalized)
+        (out,) = _tensors(compiled(*args))
+        torch.cuda.synchronize()
+        module = sys.modules[compiled.__module__]
+        cute_kernel = next(
+            value
+            for value in vars(module).values()
+            if getattr(value, "_helion_cute_sass_checks", ())
+        )
+        (launcher,) = cute_kernel._helion_cute_compiled_launchers.values()
+        sass = "\n".join(
+            sass_check.disassemble(blob)
+            for blob in sass_check._cubin_blobs(launcher._compiled.ir_module)
+        )
+        (texts,) = sass_check.functions(sass)
+        ldgsts = [text for text in texts if text.startswith("LDGSTS")]
+        assert ldgsts, (block_n, warps)
+        assert sass_check.unwritten_uniform_register_read(sass) is None, (
+            block_n,
+            warps,
+        )
+        assert sass_check.uniform_shared_address_beside_descriptor(sass) is None, (
+            block_n,
+            warps,
+        )
+        written = sass_check.written_uniform_registers(texts)
+        assert all(
+            ur in written for text in ldgsts for ur in re.findall(r"\bUR\d+\b", text)
+        ), (ldgsts, sorted(written))
+        assert (
+            sass_check.assembler(
+                next(iter(sass_check._cubin_blobs(launcher._compiled.ir_module)))
+            )
+            is not None
+        )
+        _, (plain,) = _run_cute(fn, args, _config([1, block_n], warps, 4))
+        assert torch.equal(out, plain), (block_n, warps)
+
+
 def _se_block() -> ModuleType:
     return importlib.import_module("examples.se_block")
 
@@ -2476,3 +3018,182 @@ def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
     assert rel_l2 < 1e-3, rel_l2
     (triton,) = _run_triton(_half_addmm_db, args, block_sizes)
     _assert_close((out,), (triton,))
+
+
+# --------------------------------------------------------------------------
+# Side loads riding the ring (``cute_mma_dag_aux='ring'``)
+# --------------------------------------------------------------------------
+
+# kernel, decay mode, (n, d, dv), block sizes, warps, stages
+_SIDE_RING_CASES = (
+    ("bwd", "scalar", (16, 64, 64), [32, 64], 4, 4),
+    ("bwd", "scalar", (16, 64, 64), [64, 64], 8, 2),
+    ("bwd", "scalar", (8, 64, 64), [64, 64], 4, 1),
+    ("bwd", "scalar", (5, 64, 64), [32, 32], 2, 8),
+    ("fwd", "scalar", (16, 64, 64), [32, 64], 2, 3),
+    ("fwd", "scalar", (8, 128, 128), [64, 128], 8, 4),
+    # The per-channel decay (``diag``): a vector along a ROOT axis.
+    ("bwd", "diag", (16, 64, 64), [32, 64], 4, 4),
+    ("bwd", "diag", (7, 128, 64), [64, 64], 8, 2),
+    ("fwd", "diag", (8, 64, 128), [64, 64], 4, 2),
+    ("fwd", "diag", (9, 64, 64), [32, 32], 4, 1),
+    # full_gla's anchored mode: the chunk's last decay row is a row of the
+    # staged gc tile -- the ring slot serves it under ``lane``
+    # (``_ring_aliases``), the side tile under ``ring``.
+    ("fwd", "anchored", (8, 128, 128), [32, 128], 8, 4),
+    ("bwd", "anchored", (8, 128, 128), [32, 64], 8, 3),
+    ("bwd", "anchored", (5, 64, 64), [64, 64], 4, 1),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "mode", "shape", "block_sizes", "warps", "stages"),
+    _SIDE_RING_CASES,
+    ids=[
+        f"{k}-{m}-n{s[0]}d{s[1]}dv{s[2]}-{bs[0]}x{bs[1]}w{w}s{st}"
+        for k, m, s, bs, w, st in _SIDE_RING_CASES
+    ],
+)
+def test_side_loads_riding_the_ring_match_the_lane_loads_bitwise(
+    kernel: str,
+    mode: str,
+    shape: tuple[int, int, int],
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+) -> None:
+    # The decay recurrences read a gate row (the operand pass) and a decay
+    # scalar (the carry rescale) -- or a per-channel decay vector along a
+    # ROOT axis (``diag``), or a row of the staged gc tile (``anchored``)
+    # -- per chunk: staged through the aux ring they are the same bytes, so
+    # the outputs are bit-identical to the register prefetch's at every ring
+    # depth (one stage included) and trip count.
+    n, d, dv = shape
+    t = _inputs(bh=2, n=n, d=d, dv=dv, dtype=torch.bfloat16, seed=3)
+    args = _fwd_args(t, mode, True) if kernel == "fwd" else _bwd_args(t, mode)
+    fn = _kernel_fn(kernel)
+    register_source, register = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_aux="register")
+    )
+    ring_source, ring = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_aux="ring")
+    )
+    assert f"{RT}.cp_async_4(" not in register_source
+    assert f"{RT}.cp_async_4(md_aux0" in ring_source
+    assert f"{RT}.lds_f32(md_aux0" in ring_source
+    assert f"{RT}.ldg_f32(" not in ring_source[ring_source.index("for md_i in") :]
+    for lhs, rhs in zip(register, ring, strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(ring, _run_triton(fn, args, block_sizes))
+
+
+def test_side_loads_of_a_loop_whose_ring_stages_nothing_take_the_registers() -> None:
+    # k and v sliced [..., 4:68] out of 80-wide rows: 8-byte-aligned bases
+    # the packets cannot stage, so both operand tiles take the synchronous
+    # pass and the chunk loop has no cp.async ring for an aux ring to ride:
+    # ``ring`` is pinned to the register prefetch (the same code).  With k
+    # alone under-aligned, v's tile rides the ring and the aux copies with
+    # it, beside k's synchronous pass -- bitwise the register form's result.
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=9)
+    g = torch.Generator(device=DEVICE).manual_seed(9)
+    k = _randn(g, 2, 8, 64, 80, dtype=torch.bfloat16)[..., 4:68]
+    v = _randn(g, 2, 8, 64, 80, dtype=torch.bfloat16)[..., 4:68]
+    assert k.data_ptr() % 16 == 8 and v.data_ptr() % 16 == 8
+    fn = _kernel_fn("fwd")
+    for (kk, vv), rides in (((k, v), False), ((k, t["v"]), True)):
+        args = (kk, vv, t["g_last_s"], t["h0"], t["gc"], True, True, False, True)
+        for block_sizes, warps, stages in (([64, 64], 4, 2), ([32, 64], 4, 1)):
+            register_source, register = _run_cute(
+                fn,
+                args,
+                _config(block_sizes, warps, stages, cute_mma_dag_aux="register"),
+            )
+            ring_source, ring = _run_cute(
+                fn,
+                args,
+                _config(block_sizes, warps, stages, cute_mma_dag_aux="ring"),
+            )
+            assert f"{RT}.ldg_b32(" in ring_source
+            assert (f"{RT}.cp_async_4(md_aux0" in ring_source) == rides
+            assert (ring_source == register_source) == (not rides)
+            for lhs, rhs in zip(register, ring, strict=True):
+                assert torch.equal(lhs, rhs)
+            _assert_close(ring, _run_triton(fn, args, block_sizes))
+
+
+# kernel, (n, d, dv) or the varlen chunks, block size, warps, stages
+_SIDE_RING_DELTA_CASES = (
+    ("dstate", (8, 64, 64), [32], 4, 2),
+    ("dstate", (8, 64, 64), [64], 8, 4),
+    ("dstate", (3, 128, 64), [64], 8, 1),
+    ("fwd_h_delta", (8, 64, 64), [64], 4, 2),
+    ("fwd_h_delta", (8, 64, 64), [32], 8, 3),
+    ("fwd_h_delta", (3, 128, 64), [64], 4, 2),
+    ("fwd_h_delta_varlen", (5, 1, 3), [64], 4, 2),
+    ("fwd_h_delta_varlen", (2, 7, 1, 4), [32], 8, 4),
+    ("fwd_h_delta_varlen", (1,), [16], 4, 1),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "shape", "block_sizes", "warps", "stages"),
+    _SIDE_RING_DELTA_CASES,
+    ids=[
+        f"{k}-{'x'.join(map(str, s))}-{bs[0]}w{w}s{st}"
+        for k, s, bs, w, st in _SIDE_RING_DELTA_CASES
+    ],
+)
+def test_side_loads_of_the_delta_rule_recurrences_ride_the_ring_bitwise(
+    kernel: str,
+    shape: tuple[int, ...],
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+) -> None:
+    # The gated delta-rule state passes read a decay scalar and a gate row
+    # per chunk (``dstate`` backward, ``fwd_h_delta`` forward); the varlen
+    # pass a per-channel decay vector under a dynamic trip count (every
+    # ahead-issue of the side tiles guarded against the loop's end, a
+    # one-chunk sequence included).  The ring and the register prefetch
+    # agree bitwise.
+    fn = _kernel_fn(kernel)
+    if kernel == "fwd_h_delta_varlen":
+        t = _inputs_varlen4(
+            h=2, chunks=shape, d=128, dv=64, dtype=torch.bfloat16, seed=5
+        )
+        args = _fwd_h_delta_varlen_args(t, shape, 2)
+    else:
+        n, d, dv = shape
+        t = _inputs4(bh=2, n=n, d=d, dv=dv, dtype=torch.bfloat16, seed=3)
+        args = (_dstate_args if kernel == "dstate" else _fwd_h_delta_args)(t, True)
+    register_source, register = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    ring_source, ring = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_aux="ring")
+    )
+    assert f"{RT}.cp_async_4(" not in register_source
+    assert f"{RT}.cp_async_4(md_aux0" in ring_source
+    for lhs, rhs in zip(register, ring, strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(ring, _run_triton(fn, args, block_sizes), scaled=True)
+
+
+def test_a_side_load_of_a_nested_ring_loop_rides_its_ring() -> None:
+    # The DV tile of the gate vector varies with the inner loop of a nest:
+    # staged in the inner loop's frame, re-primed per outer iteration.
+    fn = _probe_kernels()._inner_varying_gate
+    g = torch.Generator(device=DEVICE).manual_seed(11)
+    do = _randn(g, 4, 64, 128, dtype=torch.bfloat16)
+    h = _randn(g, 4, 128, 128, dtype=torch.bfloat16)
+    gate = _randn(g, 4, 128, dtype=torch.float32)
+    for warps, stages in ((4, 2), (8, 3)):
+        _register_source, register = _run_cute(
+            fn, (do, h, gate), _config([64, 64], warps, stages)
+        )
+        ring_source, ring = _run_cute(
+            fn,
+            (do, h, gate),
+            _config([64, 64], warps, stages, cute_mma_dag_aux="ring"),
+        )
+        assert f"{RT}.cp_async_16(md_aux1" in ring_source
+        assert torch.equal(register[0], ring[0])
+        assert torch.equal(ring[0], _run_triton(fn, (do, h, gate), [64, 64])[0])

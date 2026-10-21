@@ -980,6 +980,12 @@ class CuteDeviceFunctionState:
         # tile element, a widening side load): the pointwise lowering's
         # ``to_dtype(x, float32)`` takes it instead of a cast round trip.
         self.mma_dag_exact_f32: dict[str, str] = {}
+        # SASS-level checks the launcher runs on the compiled kernel before
+        # its first launch (``helion.runtime.cute.sass_check``), declared by
+        # the emitters whose instruction forms the DSL's assembler has
+        # miscompiled (the mma_dag emitter's hinted ``cp.async`` packets);
+        # emitted as the kernel's ``_helion_cute_sass_checks`` attribute.
+        self.sass_checks: tuple[str, ...] = ()
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

@@ -1791,8 +1791,16 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_AUX_KEY
+        from .cute_mma_dag import MMA_DAG_AUX_REGISTER
         from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
+        from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
+        from .cute_mma_dag import MMA_DAG_DERIVED_KEY
+        from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+        from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
         from .cute_mma_dag import MMA_DAG_KEY
+        from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+        from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
         from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
         from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
@@ -1805,7 +1813,13 @@ class CuteBackend(Backend):
         if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
             return True
         # Pre-screen the register / shared-memory budget of the warp-MMA
-        # dataflow owner (``normalize`` repairs or refuses the same configs).
+        # dataflow owner (``normalize`` repairs or refuses the same configs)
+        # under the config's own routes and layouts: the split epilogue
+        # admits the 128-column tensor-memory tiles the row layout's budget
+        # refuses (the indexer's 128 x 128 split at (512, 4096) screened
+        # under the row layout never reached a benchmark), the lookahead
+        # schedule doubles the dot slot, the pass route sizes the chains'
+        # tiles.
         block_sizes = config.config.get("block_sizes")
         if not isinstance(block_sizes, list):
             return True
@@ -1844,6 +1858,21 @@ class CuteBackend(Backend):
                 config.config.get("cute_mma_dag_warps"),
                 config.config.get("cute_mma_dag_stages"),
                 cast("str", mode),
+                cast(
+                    "str",
+                    config.config.get(MMA_DAG_DERIVED_KEY, MMA_DAG_DERIVED_EXCHANGE),
+                ),
+                epilogue=cast(
+                    "str", config.config.get(MMA_DAG_EPILOGUE_KEY, MMA_DAG_EPILOGUE_ROW)
+                ),
+                lookahead=cast(
+                    "str",
+                    config.config.get(MMA_DAG_LOOKAHEAD_KEY, MMA_DAG_LOOKAHEAD_OFF),
+                ),
+                aux=cast(
+                    "str",
+                    config.config.get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER),
+                ),
             )
             is None
         )
@@ -2193,6 +2222,8 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_cluster"
             or key == "cute_mma_dag_split"
             or key == "cute_mma_dag_derived"
+            or key == "cute_mma_dag_epilogue"
+            or key == "cute_mma_dag_lookahead"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )

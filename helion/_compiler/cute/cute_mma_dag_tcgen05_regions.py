@@ -19,18 +19,22 @@ primitives:
   commits and ``mbar_wait(md_cb, (md_cn + 1) & 1)`` waits for the latest.
   At most one commit is outstanding: a batch is issued only after the
   previous one was waited, so the parity never aliases.
+- A *streamed* ring loop (``streamed_ring_loops``: a top-level K loop whose
+  body is one MMA batch accumulating into tensor-memory carries over ring
+  tiles, nothing reading the accumulators) runs as a pipeline instead:
+  every slot has an ``md_empty{L}`` barrier the batch that read it commits
+  to, iteration ``i`` waits for the batch ``stages`` iterations back (not
+  the previous one) before its passes, and warp 0 refills the slot the
+  previous batch read once that batch alone is done -- the passes of one
+  iteration overlap the tensor core's work on the previous.  The loop's
+  commits on ``md_cb`` go unwaited; the loop exit waits on the last slot's
+  ``md_empty`` (one phase outstanding at most) and ``md_cb`` is then exact.
 - Per-loop running counters (``md_rk{L}``: iterations so far, across
   re-entries) give the ring slot, its phase and the staging parity.
 - A fragment chain (a store or reduce value, a derived value, a dot's
   accumulator) may read a vector of the program: a row vector of its
   fragment's row geometry is the thread's own register, anything else is
   relaid through the scratch (``frag_vec``).
-- A *streaming loop* (``streaming_loop``: one batch of dots accumulating
-  in place into the loop's carries over TMA ring tiles, nothing else) is
-  rendered by warp 0 alone: the batch commits to its ring slot's "empty"
-  barrier (``md_empty{L}``), the refill of the slot the previous iteration
-  read waits for that iteration's commit behind this iteration's MMAs, and
-  one commit after the loop serves the epilogue.
 - ``MmaDagPlan.cluster`` > 1 splits a full-slice fragment axis over a
   thread-block cluster (the trailing grid dim is the rank): every base and
   TMA coordinate along the axis starts at the rank's slice, and a row
@@ -57,7 +61,15 @@ from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
 from .cute_mma_dag import MMA_DAG_DERIVED_KEY
+from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from .cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
+from .cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
 from .cute_mma_dag import ROUTE_CONVERT
@@ -111,9 +123,11 @@ from .cute_mma_dag_tcgen05 import Tcgen05Tile
 from .cute_mma_dag_tcgen05 import Tcgen05TileFacts
 from .cute_mma_dag_tcgen05 import TmaSpec
 from .cute_mma_dag_tcgen05 import _align
+from .cute_mma_dag_tcgen05 import _NoNest
 from .cute_mma_dag_tcgen05 import _PassEvaluator
 from .cute_mma_dag_tcgen05 import _Tcgen05Emitter
 from .cute_mma_dag_tcgen05 import _tma_dims
+from .cute_mma_dag_tcgen05 import derived_frag_axes
 from .cute_mma_dag_tcgen05 import derived_items
 from .cute_mma_dag_tcgen05 import epilogue_staged_reason
 from .cute_mma_dag_tcgen05 import produced_nodes
@@ -123,6 +137,8 @@ from .cute_mma_dag_tcgen05 import tcgen05_tmem_cols
 from .cute_warp_mma_gemm import _swizzled_chunk
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -184,18 +200,87 @@ def region_program_reason(program: MmaDagProgram) -> str | None:
     for dot in program.dots:
         if dot.a.dtype != dot.b.dtype or dot.a.dtype not in OPERAND_DTYPES:
             return f"a dot over {dot.a.dtype} x {dot.b.dtype} operands"
-        for operand in (dot.a, dot.b):
-            # MN-major tf32 tiles are read under the 32-byte-unit swizzle
-            # (verified for B operands); an A operand with K along its rows is
-            # not.
-            if operand.dtype == torch.float32 and operand.trans and operand.role == "a":
-                return f"{operand.value.name}: an MN-major tf32 A operand"
+        # (MN-major tf32 tiles -- an operand with K along its rows -- are
+        # read under the 32-byte-unit swizzle on either side: the widened
+        # transposed half tile of se_block dw's A as the fp32 B tiles.  A
+        # tile read K-major by another dot takes that layout for both
+        # readers: ``tile_mn_major``.)
     for step in program.vec_stores:
         slot = program.vec_leaves[step.vec]
         if program.vec_slots[slot].orient == "cols" and (
             program.vec_slots[slot].axis is not None
         ):
             return "a store of a column vector"
+    return None
+
+
+def region_lookahead(program: MmaDagProgram) -> tuple[int, int] | None:
+    """The (loop index, dot slot) ``cute_mma_dag_lookahead='on'`` runs one
+    iteration ahead (None: no subject): the program's one loop, innermost
+    with a TMA ring, whose body is one dot over loaded tiles without an
+    accumulator (a fresh result every iteration, no operand pass) followed
+    by derived values only -- the score of one head and the carry folding
+    it -- with no store, reduction, vector, carry copy or tile input riding
+    the ring in the loop, and the dot's result read nowhere else.  The
+    emitter then alternates the result between two tensor-memory slots and
+    two commit barriers by iteration parity (``emit_lookahead_loop``)."""
+    if len(program.loops) != 1 or not program.loops[0].innermost:
+        return None
+    loop = program.loops[0]
+    if not program.loop_has_ring(loop.index):
+        return None
+    if not loop.steps or not isinstance(loop.steps[0], Dot):
+        return None
+    dot = loop.steps[0]
+    if any(isinstance(step, Dot) for step in loop.steps[1:]):
+        return None
+    if not all(isinstance(step, Derived) for step in loop.steps[1:]):
+        return None
+    if dot.acc is not None or dot.acc_slot is not None or dot.acc_frag is not None:
+        return None
+    for operand in (dot.a, dot.b):
+        load = operand.load
+        if operand.kind == "frag" or load is None:
+            return None
+        if operand.pointwise or load.dtype != operand.dtype:
+            return None
+    if program.vec_slots or program.reduces or program.scans:
+        return None
+    if any(store.loop == loop.index for store in program.stores):
+        return None
+    if copied_carries(program):
+        return None
+    for step in program.derived:
+        if step.loop == loop.index and any(
+            program.ring_derived_load(step, access) for access in step.loads
+        ):
+            return None
+        if dot.node in step.frags and step.loop != loop.index:
+            return None
+    if any(store.frag is dot.node for store in program.stores):
+        return None
+    for other in program.dots:
+        if other is dot:
+            continue
+        if other.acc_frag is dot.node or any(
+            operand.frag is dot.node for operand in (other.a, other.b)
+        ):
+            return None
+    for carry in loop.carries:
+        if carry.init_frag is dot.node or program.resolve(carry.output) is dot.node:
+            return None
+    return loop.index, dot.slot
+
+
+def region_split_reason(program: MmaDagProgram) -> str | None:
+    """Why the split epilogue (``cute_mma_dag_epilogue='split'``: warps 4-7
+    take the second half of every row's columns) has no subject in this
+    region program (None: it has).  A fragment reduction sums a thread's
+    whole row (its lane halves meet by one shuffle) and a vector relayout
+    reads the row's elements through the scratch: both need the row in
+    one warp, so programs with vectors keep the row layout (fail closed)."""
+    if program.vec_slots or program.reduces or program.scans:
+        return "a fragment reduction or a vector of the program needs whole rows"
     return None
 
 
@@ -260,6 +345,27 @@ def tile_key(program: MmaDagProgram, operand: Operand) -> tuple[object, ...]:
     )
 
 
+def tile_mn_major(program: MmaDagProgram, operand: Operand) -> bool:
+    """Whether the shared tile ``operand`` reads is read MN-major by any of
+    its readers.  One tile serves every operand of its key (``tile_key``:
+    dqkg's dA is the K-major A of the dq dot and, transposed, the MN-major
+    A of the dk dot) and has one layout, so a 32-bit tile takes the
+    32-byte-unit swizzle an MN-major tf32 read needs as soon as one reader
+    is MN-major -- a K-major descriptor reads that layout as well
+    (``shared_operand_dots``).  The layout of the first reader alone put
+    dA under the 16-byte-unit swizzle, which the dk dot's MN-major
+    descriptor read as zeros: full_gla's dk lost its intra-chunk term."""
+    # (Keys hold fake tensors: membership compares them by identity, as the
+    # item and consumer maps of ``region_items`` do.)
+    mn_major_keys = {
+        tile_key(program, other)
+        for dot in program.dots
+        for other in (dot.a, dot.b)
+        if not operand_geometry(program, other)[2]
+    }
+    return tile_key(program, operand) in mn_major_keys
+
+
 def register_carries(program: MmaDagProgram) -> tuple[int, ...]:
     """The slots of the loop carries that may live in the epilogue warps'
     registers instead of tensor memory: a carry of one innermost loop whose
@@ -314,6 +420,7 @@ def register_carry_facts(program: MmaDagProgram) -> tuple[RegisterCarryFacts, ..
     result = []
     for slot, loop in sorted(loops.items()):
         live: list[tuple[int, ...]] = []
+        live_frags: list[tuple[tuple[int, int], ...]] = []
         for step in program.derived:
             if loop not in program.enclosing_loops(step.loop) or step.slot == slot:
                 continue
@@ -327,7 +434,21 @@ def register_carry_facts(program: MmaDagProgram) -> tuple[RegisterCarryFacts, ..
                     program.slots[slot][1].index,
                 )
             )
-        result.append(RegisterCarryFacts(slot=slot, live=tuple(live)))
+            live_frags.append(
+                (
+                    *(
+                        (program.slots[s][0].index, program.slots[s][1].index)
+                        for s in slots
+                    ),
+                    (step.rows.index, step.cols.index),
+                    (program.slots[slot][0].index, program.slots[slot][1].index),
+                )
+            )
+        result.append(
+            RegisterCarryFacts(
+                slot=slot, live=tuple(live), live_frags=tuple(live_frags)
+            )
+        )
     return tuple(result)
 
 
@@ -529,7 +650,12 @@ def aux_tile_loads(program: MmaDagProgram) -> list[tuple[Derived, Access]]:
     in the operand's dtype, in the source orientation: wy_dL's ``v`` and
     ``k``, rewritten in place into ``beta * v`` / ``beta * k`` after the
     reads) is read from that operand's tile instead (``aux_shared_operand``)
-    and takes no item."""
+    and takes no item.  A root derived value's tile at the root fragment
+    coordinates (a carry seed ``2 * g * s``, an epilogue mask) is staged
+    the same way, once per CTA with the root group (``root_aux_load``):
+    the per-lane loads of a thread-per-row layout touch one sector per
+    lane per load, eight times the bytes of the 16-byte chunks a staged
+    row is read in."""
     result: list[tuple[Derived, Access]] = []
     seen: set[tuple[Node, int]] = set()
     for derived in program.derived:
@@ -543,6 +669,7 @@ def aux_tile_loads(program: MmaDagProgram) -> list[tuple[Derived, Access]]:
                 and access.tile_dim_strides[1] == 1
                 and (
                     program.ring_derived_load(derived, access)
+                    or root_aux_load(derived, access)
                     or (derived.loop < 0 and not access.loops)
                 )
                 and (access.node, derived.loop) not in seen
@@ -551,6 +678,12 @@ def aux_tile_loads(program: MmaDagProgram) -> list[tuple[Derived, Access]]:
                 seen.add((access.node, derived.loop))
                 result.append((derived, access))
     return result
+
+
+def root_aux_load(derived: Derived, access: Access) -> bool:
+    """A root derived value's 2-D tile input at its own fragment coordinates
+    (both tile dims the value's axes, loop-invariant: one TMA per CTA)."""
+    return derived.loop < 0 and access.tile_dims == (derived.rows, derived.cols)
 
 
 def aux_shared_operand(
@@ -621,6 +754,92 @@ def copied_carries(program: MmaDagProgram) -> list[tuple[Loop, Carry, int]]:
             if source != carry.slot:
                 result.append((loop, carry, source))
     return result
+
+
+def streamed_loop_candidates(program: MmaDagProgram) -> frozenset[int]:
+    """The loops the streamed ring schedule may render (the program-level
+    half of ``streamed_ring_loops``; the plan decides the rest): top-level
+    innermost loops carrying fragments (no vector carries, no carry copied
+    from another slot) whose body is exactly one MMA batch -- dots over
+    load operands or pass chains (``program.pass_chains``) accumulating
+    into their own slots -- and nothing else: no snapshot or body store,
+    reduction, vector op, nested loop or other derived value.  (The plan
+    admits the loop only when the pass route absorbs the chains.)"""
+    copied = {loop.index for loop, _carry, _slot in copied_carries(program)}
+    chain_steps = {
+        step.node for chain in program.pass_chains.values() for step in chain
+    }
+    result = set()
+    for loop in program.loops:
+        index = loop.index
+        if (
+            not loop.innermost
+            or loop.parent >= 0
+            or loop.vec_carries
+            or not loop.carries
+            or index in copied
+            or any(store.loop == index for store in program.stores)
+        ):
+            continue
+        steps = [
+            step
+            for step in loop.steps
+            if not (isinstance(step, Derived) and step.node in chain_steps)
+        ]
+        blocks = region_block_steps(program, steps)
+        if len(blocks) != 1 or blocks[0][0] or not blocks[0][1]:
+            continue
+        if all(
+            dot.loop == index
+            and dot.acc is not None
+            and not dot_prepares(dot)
+            and all(
+                operand.kind == "load" or program.chain_root(operand) is not None
+                for operand in (dot.a, dot.b)
+            )
+            for dot in blocks[0][1]
+        ):
+            result.add(index)
+    return frozenset(result)
+
+
+def streamed_ring_loops(
+    program: MmaDagProgram, tc: Tcgen05Plan, absorbed: Collection[Node]
+) -> frozenset[int]:
+    """The ring loops the emitter streams (see the module doc): the
+    candidates whose ring is TMA-fed, whose every operand tile rides the
+    ring (direct, converted or rewritten in place, or written by the
+    derived pass -- so every derived value of the loop is absorbed), whose
+    accumulators hold tensor-memory columns and whose aux tiles are not
+    rewritten after their reads."""
+    result = set()
+    for loop in program.loops:
+        index = loop.index
+        if (
+            index not in streamed_loop_candidates(program)
+            or not tc.ring_tx.get(index)
+            or not tc.ring_tiles.get(index)
+            or any(tile.rewritten for tile in tc.aux_tiles.get(index, ()))
+        ):
+            continue
+        if any(
+            isinstance(step, Derived) and step.node not in absorbed
+            for step in loop.steps
+        ):
+            continue
+        ok = True
+        for step in loop.steps:
+            if not isinstance(step, Dot):
+                continue
+            if step.slot not in tc.tmem_slots:
+                ok = False
+            for operand in (step.a, step.b):
+                tile = tc.tiles.get((step.node, operand.role))
+                if tile is None or not tile.ring:
+                    ok = False
+        if ok:
+            result.add(index)
+    return frozenset(result)
 
 
 def region_flat(
@@ -953,8 +1172,23 @@ def region_items(
         for step in chain
         for access in step.loads
     }
+    slots_in_tmem = tmem_slots(program)
     for derived, access in aux_tile_loads(program):
         positions = access.tile_positions
+        # A root tile overlays the loop frames (like a root raw tile settled
+        # in the prologue) only when every root value reading it is computed
+        # once, in the prologue segment ahead of every loop, into its
+        # tensor-memory slot; a register-only value is recomputed wherever
+        # it is read (``region_blocks``) and a later segment's reader finds
+        # the frames live, so such a tile lives across the loops.
+        root = derived.loop < 0
+        segment = -1
+        if root and all(
+            segments.get(other.node, -1) == 0 and other.slot in slots_in_tmem
+            for other in program.derived
+            if other.loop < 0 and any(load.node is access.node for load in other.loads)
+        ):
+            segment = 0
         items.append(
             (
                 Tcgen05SmemItem(
@@ -963,9 +1197,8 @@ def region_items(
                     access.dims[positions[0]].index,
                     access.dims[positions[1]].index,
                     access.dtype.itemsize,
-                    # A ring slot per stage in a loop; one fixed copy, live
-                    # across the loops, for the epilogue's tiles.
-                    0 if derived.loop >= 0 else 1,
+                    1 if root else 0,
+                    segment,
                     pass_source=(access.node, derived.loop) in pass_sources,
                 ),
                 (derived, access),
@@ -1006,13 +1239,14 @@ def region_items(
 
 def root_segments(program: MmaDagProgram) -> dict[Node, int]:
     """The root segment (the k-th run of root steps between the loops) of
-    every root dot and root store (by its access node)."""
+    every root dot, root derived value and root store (by its access
+    node)."""
     result: dict[Node, int] = {}
     segment = 0
     for step in program.body:
         if isinstance(step, Loop):
             segment += 1
-        elif isinstance(step, Dot):
+        elif isinstance(step, (Dot, Derived)):
             result[step.node] = segment
         elif isinstance(step, Store):
             result[step.access.node] = segment
@@ -1038,12 +1272,29 @@ class RegionLayout:
     total: int
 
 
+def persistent_items(
+    items: Sequence[Tcgen05SmemItem],
+) -> tuple[Tcgen05SmemItem, ...]:
+    """The region items of a persistent launch (``cute_mma_dag_persistent``
+    on a region program): a root item of one segment lives across the
+    whole tile instead of overlaying the loop frames, because the next
+    tile's ring prologue and root group land in those frames while this
+    tile's root segments still run (``_Tcgen05RegionEmitter.render``)."""
+    return tuple(
+        dataclasses.replace(item, segment=-1)
+        if item.frame < 0 and item.segment >= 0
+        else item
+        for item in items
+    )
+
+
 def region_layout(
     items: Sequence[Tcgen05SmemItem],
     loops: Sequence[LoopFacts],
     resolved: Sequence[int],
     stages: int,
     skip: frozenset[int] = frozenset(),
+    persistent: bool = False,
 ) -> RegionLayout:
     """Frame layout: a loop's items follow the frames of the loops nested
     in it (sibling frames share one extent); a frame's ring (every ring
@@ -1055,7 +1306,15 @@ def region_layout(
     items with a segment are its exchange tiles' batch phases
     (``exchange_phases``): every phase packs from the same offset behind
     the ring, the frame grows by the largest.  The items at the ``skip``
-    indices take no space (offset -1)."""
+    indices take no space (offset -1).  A persistent launch keeps every
+    root item beside the frames (``persistent_items``) and gives the
+    top-level loops disjoint frames: a root ring loop's next-tile prologue
+    lands in its ring slots at the loop's exit
+    (``_Tcgen05RegionEmitter.emit_next_tile_prologue``), while the tile's
+    other top-level loops still run -- and the next tile's earlier loops
+    run ahead of it -- in theirs."""
+    if persistent:
+        items = persistent_items(items)
     children: dict[int, list[int]] = {}
     for index, loop in enumerate(loops):
         children.setdefault(loop.parent, []).append(index)
@@ -1064,9 +1323,15 @@ def region_layout(
     ring_bytes: dict[int, int] = {}
 
     def layout(frame: int, base: int) -> int:
-        offset = max(
-            (layout(child, base) for child in children.get(frame, ())), default=base
-        )
+        if persistent and frame < 0:
+            offset = base
+            for child in children.get(frame, ()):
+                offset = layout(child, offset)
+        else:
+            offset = max(
+                (layout(child, base) for child in children.get(frame, ())),
+                default=base,
+            )
         if frame < 0:
             packs: dict[int, int] = {}
             for index, item in enumerate(items):
@@ -1124,12 +1389,14 @@ def region_aux_skip(
     capacity: int,
     loads: str = MMA_DAG_LOADS_TMA,
     derived: str = MMA_DAG_DERIVED_EXCHANGE,
+    persistent: bool = False,
 ) -> frozenset[int]:
     """The aux items left out of the layout: all of them under the ``lane``
     loads mode; under ``tma`` the largest ring footprints first until the
     layout (with its barriers) fits ``capacity`` (0: unlimited).  The tiles
     a derived pass reads (``pass_source``) stay under the ``pass`` route:
-    a layout that needs them out is over capacity."""
+    a layout that needs them out is over capacity.  ``persistent``: the
+    persistent launch's layout (``persistent_items``)."""
     aux = [index for index, item in enumerate(items) if item.kind == ITEM_AUX]
     if loads != MMA_DAG_LOADS_TMA:
         return frozenset(aux)
@@ -1138,7 +1405,9 @@ def region_aux_skip(
     skip: set[int] = set()
     barriers = 8 * (stages * len(loops) + len(loops) + 2) + 16
     while capacity and aux:
-        layout = region_layout(items, loops, resolved, stages, frozenset(skip))
+        layout = region_layout(
+            items, loops, resolved, stages, frozenset(skip), persistent
+        )
         if layout.total + barriers <= capacity:
             break
         largest = max(
@@ -1150,9 +1419,11 @@ def region_aux_skip(
 
 
 def region_barrier_bytes(tc: Tcgen05Facts, stages: int) -> int:
-    """The mbarriers (one per ring slot, one per staged region, the commit
-    barrier) and the TMEM slot."""
-    return 8 * (stages * tc.ring_loops + tc.staged_regions + 1) + 16
+    """The mbarriers (one per ring slot, one more per slot of a streamed
+    loop, one per staged region, the commit barrier) and the TMEM slot."""
+    return (
+        8 * (stages * (tc.ring_loops + tc.streamed_loops) + tc.staged_regions + 1) + 16
+    )
 
 
 def region_smem_bytes(
@@ -1161,32 +1432,57 @@ def region_smem_bytes(
     stages: int,
     loads: str = MMA_DAG_LOADS_TMA,
     derived: str = MMA_DAG_DERIVED_EXCHANGE,
+    persistent: bool = False,
 ) -> int:
     """The shared memory of the resolved sizes under ``loads`` (``tma``
     keeps the aux tiles that fit, so the ``lane`` footprint is never
     larger and a config is legal under one mode iff under the other) and
     the ``cute_mma_dag_derived`` route ``derived`` (a pass chain's tile
-    is a ring tile under ``pass``)."""
+    is a ring tile under ``pass``); ``persistent``: the persistent launch's
+    layout, whose root items never overlay the frames."""
     tc = facts.tcgen05
     assert tc is not None
     items = derived_items(tc.items, derived)
     skip = region_aux_skip(
-        items, facts.loops, resolved, stages, facts.smem_capacity or 0, loads, derived
+        items,
+        facts.loops,
+        resolved,
+        stages,
+        facts.smem_capacity or 0,
+        loads,
+        derived,
+        persistent,
     )
-    layout = region_layout(items, facts.loops, resolved, stages, skip)
+    layout = region_layout(items, facts.loops, resolved, stages, skip, persistent)
     return layout.total + region_barrier_bytes(tc, stages)
 
 
 def region_tmem_layout(
-    facts: CuteMmaDagFacts, resolved: Sequence[int]
+    facts: CuteMmaDagFacts,
+    resolved: Sequence[int],
+    split: bool = False,
+    lookahead: bool = False,
+    extra_conflicts: Collection[tuple[int, int]] = (),
 ) -> tuple[dict[int, int], int]:
     """TMEM column of every TMEM-resident slot and the columns used: slots
     that are never live together (the planner's live groups, plus the pairs
     the facts name) share columns -- wy's six 64-column slots fit in 192
-    instead of 384, two CTAs per SM instead of one."""
+    instead of 384, two CTAs per SM instead of one.  ``split``: the split
+    epilogue's register budget decides the resident carries; ``lookahead``:
+    the ring loop's dot slot spans twice its columns (its result alternates
+    by iteration parity) and shares them with no other slot;
+    ``extra_conflicts``: the pairs a config's operand routes add
+    (``tmem_route_conflicts``)."""
     tc = facts.tcgen05
     assert tc is not None
     conflicts: set[tuple[int, int]] = set(tc.tmem_conflicts)
+    conflicts.update(extra_conflicts)
+    conflicts.update((b, a) for a, b in extra_conflicts)
+    if lookahead:
+        for other in tc.tmem_slots:
+            if other != tc.lookahead_slot:
+                conflicts.add((tc.lookahead_slot, other))
+                conflicts.add((other, tc.lookahead_slot))
     live_groups = tc.live_groups if tc.live_groups is not None else facts.live_groups
     for group in live_groups:
         for a in group:
@@ -1195,12 +1491,14 @@ def region_tmem_layout(
                     conflicts.add((a, b))
     placed: dict[int, tuple[int, int]] = {}
     total = 0
-    resident = resident_slots(tc, resolved)
+    resident = resident_slots(tc, resolved, split)
     for slot in tc.tmem_slots:
         if slot in resident:
             continue
         _rows, cols = facts.frags[slot]
         width = _align(resolved[cols], TCGEN05_SLOT_ALIGN)
+        if lookahead and slot == tc.lookahead_slot:
+            width *= 2
         busy = sorted(
             span
             for other, span in placed.items()
@@ -1232,8 +1530,241 @@ def region_tmem_layout(
     return {slot: span[0] for slot, span in placed.items()}, total
 
 
-def region_tmem_columns(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> int:
-    return region_tmem_layout(facts, resolved)[1]
+def region_tmem_columns(
+    facts: CuteMmaDagFacts,
+    resolved: Sequence[int],
+    split: bool = False,
+    lookahead: bool = False,
+) -> int:
+    return region_tmem_layout(facts, resolved, split=split, lookahead=lookahead)[1]
+
+
+def region_touched_slots(
+    program: MmaDagProgram,
+) -> tuple[dict[int, set[int]], dict[int, list[int]], Callable[[int], set[int]]]:
+    """Per region (a loop index, -1 the root) the slots it touches -- the
+    dots' results and accumulators, the fragments their operands exchange
+    (a hoisted exchange reads at the root), the derived values' slots and
+    inputs, the stored and reduced fragments, the loop carries and, in the
+    parent, the carry seeds -- with every loop's ancestor chain and
+    ``closure(region)``, the slots touched anywhere in a region's subtree."""
+    touched: dict[int, set[int]] = {}
+    for dot in program.dots:
+        if dot.acc_slot is not None:
+            touched.setdefault(dot.loop, set()).add(dot.acc_slot)
+        touched.setdefault(dot.loop, set()).add(dot.slot)
+        for operand in (dot.a, dot.b):
+            if operand.frag is not None:
+                region = dot.loop
+                if hoisted_exchange_loop(program, dot, operand) is not None:
+                    region = -1
+                touched.setdefault(region, set()).add(program.frag_slots[operand.frag])
+    for derived in program.derived:
+        touched.setdefault(derived.loop, set()).add(derived.slot)
+        touched[derived.loop].update(program.frag_slots[frag] for frag in derived.frags)
+    for store in program.stores:
+        touched.setdefault(store.loop, set()).add(program.frag_slots[store.frag])
+    for reduce in program.reduces:
+        if reduce.frag is not None:
+            touched.setdefault(reduce.loop, set()).add(program.frag_slots[reduce.frag])
+    for loop in program.loops:
+        touched.setdefault(loop.index, set()).update(
+            carry.slot for carry in loop.carries
+        )
+        for carry in loop.carries:
+            if carry.init_frag is not None:
+                # The seed is read at the loop's entry, in the parent region
+                # (the init loads every seed before it writes a carry, so a
+                # seed and the carries it seeds may share columns).
+                touched.setdefault(loop.parent, set()).add(
+                    program.frag_slots[program.resolve(carry.init_frag)]
+                )
+    ancestors: dict[int, list[int]] = {-1: []}
+    for loop in program.loops:
+        chain = [loop.index]
+        parent = loop.parent
+        while parent >= 0:
+            chain.append(parent)
+            parent = program.loops[parent].parent
+        ancestors[loop.index] = chain
+    children: dict[int, list[int]] = {}
+    for loop in program.loops:
+        children.setdefault(loop.parent, []).append(loop.index)
+
+    def closure(region: int) -> set[int]:
+        slots = set(touched.get(region, ()))
+        for child in children.get(region, ()):
+            slots |= closure(child)
+        return slots
+
+    return touched, ancestors, closure
+
+
+def _plain_fragment(operand: Operand) -> bool:
+    """A fragment operand exchanged as the registers (and tensor memory)
+    hold it: no pointwise value over it, no transposed producer folded in,
+    no flipped dot.  (``operand_geometry`` says whether the tensor core
+    reads the tile K-major or MN-major.)"""
+    return (
+        operand.kind == "frag"
+        and operand.frag is not None
+        and not operand.pointwise
+        and not operand.swap
+        and not operand.flip
+    )
+
+
+def tmem_a_slot_rewriters(program: MmaDagProgram, dot: Dot, slot: int) -> list[Dot]:
+    """The dots behind ``dot`` in its region whose result or accumulator is
+    ``slot``: a state read as an A operand and updated in place later in
+    the same loop body (``o = dot(s, w); s = dot(q, k^T, acc=s)``, plain or
+    rescaled).  Such a dot may share ``dot``'s MMA batch
+    (``region_block_steps``: a later dot independent of the pending
+    batch's results joins it) -- its accumulator preparation rewrites the
+    slot ahead of the batch, or its MMA read-modify-writes the slot while
+    the batch runs -- which the exchange schedule never saw (the tile was
+    read ahead of the batch).  Reading the slot from tensor memory needs
+    the slot untouched until ``dot``'s commit is waited, so the A route
+    refuses it.  Every dot behind ``dot`` in the region counts, whichever
+    block the emitter gives the two (the blocks depend on the plan's
+    absorbed derived steps): the next block's work and every batch issue
+    wait the pending commit, so a writer behind one is ordered anyway, and
+    a writer ahead of ``dot`` is its producer (``dot`` reads what it wrote:
+    a later batch).  Dots of other regions never share the batch (a loop's
+    first block, its ring prologue and its exit wait the latest commit).
+    """
+    steps = program.body if dot.loop < 0 else program.loops[dot.loop].steps
+    index = next(i for i, step in enumerate(steps) if step is dot)
+    return [
+        step
+        for step in steps[index + 1 :]
+        if isinstance(step, Dot) and slot in (step.slot, step.acc_slot)
+    ]
+
+
+def tmem_a_candidates(program: MmaDagProgram) -> tuple[tuple[Dot, Operand], ...]:
+    """The ``(dot, A operand)`` pairs whose A operand the tensor core may
+    read from tensor memory instead of an exchange tile (the config-free
+    part; ``plan_tcgen05_regions`` keeps the ones whose slot holds tensor
+    memory at the config): an fp32 (tf32) dot whose A operand is a plain
+    fragment -- a dot result or a carry, no pointwise value over it, read
+    K-major as the registers hold it, so the fragment's accumulator layout
+    in tensor memory is the A operand's (the same fp32 words the exchange
+    tile would carry; the MMA truncates them to tf32 either way) -- in a
+    loop the streamed ring and the lookahead schedule do not take (both
+    issue batches without waiting the previous one's commit, so an operand
+    an earlier batch produced is not final in tensor memory), whose slot
+    no dot behind it in the region writes or accumulates from
+    (``tmem_a_slot_rewriters``: it could do so inside the dot's own
+    batch)."""
+    streamed = streamed_loop_candidates(program)
+    ahead = region_lookahead(program)
+    ahead_loop = ahead[0] if ahead is not None else -1
+    in_tmem = set(tmem_slots(program))
+    found: list[tuple[Dot, Operand]] = []
+    for dot in program.dots:
+        operand = dot.a
+        if dot.transposed or operand.dtype != torch.float32:
+            continue
+        if not _plain_fragment(operand):
+            continue
+        rows, cols, k_major = operand_geometry(program, operand)
+        # The fragment's whole slot is the [M, K] operand: its rows the
+        # dot's M, its columns the dot's K.
+        if not k_major or (rows.index, cols.index) != (dot.rows.index, dot.k.index):
+            continue
+        if dot.loop >= 0 and (dot.loop in streamed or dot.loop == ahead_loop):
+            continue
+        frag = program.resolve(cast("Node", operand.frag))
+        slot = program.frag_slots[frag]
+        if slot not in in_tmem or slot == dot.slot:
+            continue
+        if tmem_a_slot_rewriters(program, dot, slot):
+            continue
+        found.append((dot, operand))
+    return tuple(found)
+
+
+def shared_operand_dots(program: MmaDagProgram) -> tuple[Dot, ...]:
+    """The fp32 dots ``X @ X`` over one plain fragment: the K-major A tile
+    and the MN-major B tile hold the same row-major matrix (the B tile
+    under the 32-byte-unit swizzle, which a K-major descriptor of that
+    layout type reads as well), so the dot exchanges one tile.  Only where
+    no other dot reads either tile (its bytes may be overlaid by another
+    batch phase of the loop)."""
+    consumers: dict[tuple[object, ...], int] = {}
+    for dot in program.dots:
+        for operand in (dot.a, dot.b):
+            if operand.kind == "frag":
+                key = tile_key(program, operand)
+                consumers[key] = consumers.get(key, 0) + 1
+    found: list[Dot] = []
+    for dot in program.dots:
+        a, b = dot.a, dot.b
+        if dot.transposed or a.dtype != torch.float32 or b.dtype != torch.float32:
+            continue
+        if not (_plain_fragment(a) and _plain_fragment(b)):
+            continue
+        a_rows, a_cols, a_k_major = operand_geometry(program, a)
+        b_rows, b_cols, b_k_major = operand_geometry(program, b)
+        if not a_k_major or b_k_major:
+            continue
+        if program.resolve(cast("Node", a.frag)) is not program.resolve(
+            cast("Node", b.frag)
+        ):
+            continue
+        if (a_rows.index, a_cols.index) != (b_rows.index, b_cols.index):
+            continue
+        a_key, b_key = tile_key(program, a), tile_key(program, b)
+        if a_key == b_key or consumers[a_key] != 1 or consumers[b_key] != 1:
+            continue
+        found.append(dot)
+    return tuple(found)
+
+
+def tmem_route_conflicts(
+    program: MmaDagProgram, routed: Sequence[tuple[Dot, int]]
+) -> set[tuple[int, int]]:
+    """The slot pairs that must not share tensor-memory columns when the
+    dots of ``routed`` read the paired slot as their A operand from tensor
+    memory: the slot stays live until the MMA reads it, past the exchange
+    point the planner's liveness assumed -- so it conflicts with the result
+    and accumulator of every dot of its region (the batches reorder a
+    region) and, read inside a loop that does not define it, with every
+    slot touched anywhere in the outermost such loop."""
+    touched, ancestors, closure = region_touched_slots(program)
+    defined: dict[int, int] = {}
+    for dot in program.dots:
+        defined[dot.slot] = dot.loop
+    for derived in program.derived:
+        defined[derived.slot] = derived.loop
+    for loop in program.loops:
+        for carry in loop.carries:
+            defined[carry.slot] = loop.index
+    pairs: set[tuple[int, int]] = set()
+
+    def conflict(a: int, b: int) -> None:
+        if a != b:
+            pairs.add((min(a, b), max(a, b)))
+
+    for dot, slot in routed:
+        for other in program.dots:
+            if other.loop != dot.loop:
+                continue
+            conflict(slot, other.slot)
+            if other.acc_slot is not None:
+                conflict(slot, other.acc_slot)
+        definition = defined.get(slot, -1)
+        holders = {definition, *ancestors[definition]}
+        outermost = None
+        for loop in ancestors[dot.loop]:
+            if loop in holders:
+                break
+            outermost = loop
+        if outermost is not None:
+            for other in closure(outermost):
+                conflict(slot, other)
+    return pairs
 
 
 def tmem_conflicts(program: MmaDagProgram) -> tuple[tuple[int, int], ...]:
@@ -1273,60 +1804,16 @@ def tmem_conflicts(program: MmaDagProgram) -> tuple[tuple[int, int], ...]:
         (loop.index, carry.slot): source
         for loop, carry, source in copied_carries(program)
     }
-    touched: dict[int, set[int]] = {}
     for dot in program.dots:
         if dot.acc_slot is not None:
             conflict(dot.acc_slot, dot.slot)
-            touched.setdefault(dot.loop, set()).add(dot.acc_slot)
-        touched.setdefault(dot.loop, set()).add(dot.slot)
-        for operand in (dot.a, dot.b):
-            if operand.frag is not None:
-                touched.setdefault(exchange_region(dot, operand), set()).add(
-                    program.frag_slots[operand.frag]
-                )
-    for derived in program.derived:
-        touched.setdefault(derived.loop, set()).add(derived.slot)
-        touched[derived.loop].update(program.frag_slots[frag] for frag in derived.frags)
-    for store in program.stores:
-        touched.setdefault(store.loop, set()).add(program.frag_slots[store.frag])
-    for reduce in program.reduces:
-        if reduce.frag is not None:
-            touched.setdefault(reduce.loop, set()).add(program.frag_slots[reduce.frag])
-    for loop in program.loops:
-        touched.setdefault(loop.index, set()).update(
-            carry.slot for carry in loop.carries
-        )
-        for carry in loop.carries:
-            if carry.init_frag is not None:
-                # The seed is read at the loop's entry, in the parent region
-                # (the init loads every seed before it writes a carry, so a
-                # seed and the carries it seeds may share columns).
-                touched.setdefault(loop.parent, set()).add(
-                    program.frag_slots[program.resolve(carry.init_frag)]
-                )
     # A slot defined in one region and read in a loop that does not contain
     # the definition is read again by every iteration of the outermost such
     # loop: live throughout it, so it conflicts with every slot touched
     # anywhere in that loop (the planner's liveness is linear and ends it at
     # the read; pk_h1: a root carry read by an inner loop's dot shared its
     # columns with a fresh dot of the enclosing loop).
-    ancestors: dict[int, list[int]] = {-1: []}
-    for loop in program.loops:
-        chain = [loop.index]
-        parent = loop.parent
-        while parent >= 0:
-            chain.append(parent)
-            parent = program.loops[parent].parent
-        ancestors[loop.index] = chain
-    children: dict[int, list[int]] = {}
-    for loop in program.loops:
-        children.setdefault(loop.parent, []).append(loop.index)
-
-    def closure(region: int) -> set[int]:
-        slots = set(touched.get(region, ()))
-        for child in children.get(region, ()):
-            slots |= closure(child)
-        return slots
+    _touched, ancestors, closure = region_touched_slots(program)
 
     defined: dict[int, int] = {}
     uses: dict[int, set[int]] = {}
@@ -1446,7 +1933,7 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                     elem_bytes=item.elem_bytes,
                     source_bytes=load.dtype.itemsize,
                     region=REGION_LOOP if dot.loop >= 0 else REGION_EPILOGUE,
-                    mn_major=not operand_geometry(program, operand)[2],
+                    mn_major=tile_mn_major(program, operand),
                     passed=operand.pointwise or load.dtype != operand.dtype,
                 )
             )
@@ -1459,7 +1946,7 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
                     cols=item.cols,
                     elem_bytes=item.elem_bytes,
                     region=REGION_LOOP if dot.loop >= 0 else REGION_EPILOGUE,
-                    mn_major=not operand_geometry(program, operand)[2],
+                    mn_major=tile_mn_major(program, operand),
                 )
             )
     derived_cols = tuple(
@@ -1478,6 +1965,20 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
             if operand.load is not None and not program.is_ring(dot, operand)
         }
     )
+    lookahead_loop, lookahead_slot = region_lookahead(program) or (-1, -1)
+    # The persistent tile loop issues the next tile's prologue of every
+    # root ring loop under this tile's epilogue: a root loop whose bounds
+    # are not static (``hl.grid`` over loaded offsets) has no prologue to
+    # issue ahead.
+    persistent_reason = None
+    if any(
+        loop.parent < 0 and not loop.axes and loop.static_trip is None
+        for loop in program.loops
+    ):
+        persistent_reason = (
+            f"{MMA_DAG_PERSISTENT_KEY}: the next tile's ring prologue needs a "
+            "static trip count on the root loops"
+        )
     return Tcgen05Facts(
         tiles=tuple(tiles),
         exchanges=tuple(exchanges),
@@ -1486,6 +1987,7 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         derived_cols=derived_cols,
         general_loop=True,
         regions=True,
+        persistent_reason=persistent_reason,
         live_groups=region_live_slots(program),
         items=items,
         tmem_slots=tmem_slots(program),
@@ -1508,6 +2010,13 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         ring_loops=ring_loops,
         staged_regions=staged_regions,
         aux_items=sum(1 for item in items if item.kind == ITEM_AUX),
+        derived_frags=derived_frag_axes(program),
+        split_epilogue=region_split_reason(program) is None,
+        lookahead_loop=lookahead_loop,
+        lookahead_slot=lookahead_slot,
+        streamed_loops=len(streamed_loop_candidates(program)),
+        tmem_operands=len(tmem_a_candidates(program))
+        + len(shared_operand_dots(program)),
     )
 
 
@@ -1517,12 +2026,21 @@ def region_config_reason(
     stages: int,
     *,
     derived: str = MMA_DAG_DERIVED_EXCHANGE,
+    split: bool = False,
+    lookahead: bool = False,
+    persistent: bool = False,
 ) -> str | None:
     """The region-specific legality of the resolved sizes (the shared tile
     / fragment rules ran already) under the ``cute_mma_dag_derived`` route
-    ``derived``."""
+    ``derived`` (``split``: the split epilogue's resident carries;
+    ``lookahead``: the doubled dot slot; ``persistent``: the persistent
+    launch's layout and its exclusions, ``region_persistent_reason``)."""
     tc = facts.tcgen05
     assert tc is not None
+    if persistent:
+        reason = region_persistent_reason(facts, lookahead=lookahead)
+        if reason is not None:
+            return reason
     # 32-bit MN-major tiles live under the 32-byte-unit swizzle, whose rows
     # are 128 bytes: 32 fp32 columns at least (the planner would decline the
     # config at codegen otherwise, after normalization admitted it).
@@ -1539,18 +2057,43 @@ def region_config_reason(
                 f"an MN-major tf32 tile of {resolved[cols]} columns needs "
                 f"{ATOM_MAX_BYTES}-byte rows ({ATOM_MAX_BYTES // elem_bytes} columns)"
             )
-    columns = region_tmem_columns(facts, resolved)
+    columns = region_tmem_columns(facts, resolved, split=split, lookahead=lookahead)
     if columns > TCGEN05_MAX_TMEM_COLS:
         return (
             f"the fragments need {columns} TMEM columns (limit {TCGEN05_MAX_TMEM_COLS})"
         )
-    smem = region_smem_bytes(facts, resolved, stages, derived=derived)
+    smem = region_smem_bytes(
+        facts, resolved, stages, derived=derived, persistent=persistent
+    )
     if facts.smem_capacity and smem > facts.smem_capacity:
         return (
             f"{stages} tcgen05 stages need {smem} B of shared memory "
-            f"(capacity {facts.smem_capacity})"
+            f"(capacity {facts.smem_capacity}"
+            f"{'; the persistent layout keeps the root items beside the frames and the top-level loops apart' if persistent else ''})"
         )
     return None
+
+
+def region_persistent_reason(
+    facts: CuteMmaDagFacts, *, lookahead: bool = False
+) -> str | None:
+    """Why a region program cannot run as a persistent launch
+    (``cute_mma_dag_persistent``; None: it can, given the shared memory):
+    the tile loop continues every loop's ring / commit counters across the
+    CTA's tiles and issues the next tile's root group and ring prologues
+    under this tile's epilogue, which needs the root ring loops' trip
+    counts static (the prologue of a tile whose bounds are its own loads
+    cannot be issued ahead) and the program-order ring schedules (the
+    lookahead loop's prologue is its own).  The launch's layout keeps the
+    top-level loops' frames apart (``region_layout``); where that does not
+    fit, ``region_config_reason`` refuses the config."""
+    tc = facts.tcgen05
+    assert tc is not None and tc.regions
+    if lookahead:
+        return (
+            f"{MMA_DAG_PERSISTENT_KEY}: the lookahead schedule keeps one tile per CTA"
+        )
+    return tc.persistent_reason
 
 
 # ---------------------------------------------------------------------------
@@ -1568,10 +2111,36 @@ def plan_tcgen05_regions(
     store_mode: str,
     loads_mode: str = MMA_DAG_LOADS_TMA,
     derived_mode: str = MMA_DAG_DERIVED_EXCHANGE,
+    epilogue: str = MMA_DAG_EPILOGUE_ROW,
+    lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
+    exchange_mode: str = MMA_DAG_EXCHANGE_AUTO,
+    persistent: bool = False,
 ) -> Tcgen05Plan:
     env = CompileEnvironment.current()
     tc = facts.tcgen05
     assert tc is not None and tc.regions
+    split = epilogue == MMA_DAG_EPILOGUE_SPLIT
+    if split and (warps != 8 or not tc.split_epilogue):
+        # (``tcgen05_config_reason`` refused the config; fail closed.)
+        raise _decline(f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r} has no subject here")
+    ahead = lookahead == MMA_DAG_LOOKAHEAD_ON
+    if ahead and (tc.lookahead_loop < 0 or stages < 2):
+        raise _decline(f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r} has no subject here")
+    if persistent:
+        # (``region_config_reason`` refused the config; fail closed.)
+        reason = region_persistent_reason(facts, lookahead=ahead)
+        if reason is not None:
+            raise _decline(reason)
+    if ahead and tc.lookahead_loop in streamed_loop_candidates(program):
+        # The two loop schedules are disjoint by construction (the streamed
+        # ring takes a batch accumulating into tensor-memory carries, the
+        # lookahead one fresh dot and the derived values over it); should a
+        # loop ever satisfy both, the streamed ring keeps it and the knob
+        # fails closed.
+        raise _decline(
+            f"{MMA_DAG_LOOKAHEAD_KEY}: loop {tc.lookahead_loop} streams as a K-loop "
+            "ring (the streamed schedule takes it)"
+        )
     # Under the pass route a pass chain's exchange item is a ring tile of
     # its loop (``derived_items``); its payload stays the fragment operand.
     items = [
@@ -1590,9 +2159,36 @@ def plan_tcgen05_regions(
         facts.smem_capacity or 0,
         loads_mode,
         derived_mode,
+        persistent,
     )
+    # The exchange knob's routes: ``auto`` reads the fp32 A operands it can
+    # from tensor memory and exchanges one tile for an ``X @ X`` dot's two
+    # operands (their exchange items leave the layout); ``smem`` keeps every
+    # operand's own shared tile.
+    resident = resident_slots(tc, sizes, split)
+    tmem_routes: dict[tuple[Node, str], int] = {}
+    key_remap: dict[tuple[object, ...], tuple[object, ...]] = {}
+    route_conflicts: set[tuple[int, int]] = set()
+    if exchange_mode == MMA_DAG_EXCHANGE_AUTO:
+        tmem_routes, key_remap, route_conflicts = tmem_operand_routes(
+            program, facts, sizes, routes, resident, split, ahead
+        )
+        routed_keys = {
+            tile_key(program, operand)
+            for dot in program.dots
+            for operand in (dot.a, dot.b)
+            if (dot.node, operand.role) in tmem_routes
+        }
+        dropped_items = {
+            index
+            for index, (item, payload) in enumerate(items)
+            if item.kind == ITEM_EXCHANGE
+            and tile_key(program, cast("tuple[Dot, Operand]", payload)[1])
+            in (routed_keys | set(key_remap))
+        }
+        skip = frozenset(skip | dropped_items)
     layout = region_layout(
-        [item for item, _p in items], facts.loops, sizes, stages, skip
+        [item for item, _p in items], facts.loops, sizes, stages, skip, persistent
     )
     tma: list[TmaSpec] = []
     # One tensor map per (tensor, dims, box, swizzle): the loads of one
@@ -1671,6 +2267,10 @@ def plan_tcgen05_regions(
     for (item, payload), offset in zip(items, layout.offsets, strict=True):
         if item.kind not in (ITEM_TILE, ITEM_EXCHANGE):
             continue
+        if item.kind == ITEM_EXCHANGE and offset < 0:
+            # Left out of the layout: the operand reads tensor memory or
+            # the other operand's tile (``tmem_operand_routes``).
+            continue
         dot, operand = cast("tuple[Dot, Operand]", payload)
         rows_axis, cols_axis, k_major = operand_geometry(program, operand)
         rows, cols = sizes[rows_axis.index], sizes[cols_axis.index]
@@ -1679,9 +2279,10 @@ def plan_tcgen05_regions(
         if atom is None:
             raise _decline(f"operand {operand.value.name} has no swizzled UMMA layout")
         swizzle = _SWIZZLE_BY_ROW_BYTES[atom]
-        if es == 4 and not k_major:
-            # 32-bit MN-major: 128-byte rows under the 32-byte-unit swizzle
-            # (the exchange / widen writes and TMA's s128b_atom_32b boxes).
+        if es == 4 and tile_mn_major(program, operand):
+            # 32-bit MN-major (by any reader of the shared tile): 128-byte
+            # rows under the 32-byte-unit swizzle (the exchange / widen
+            # writes and TMA's s128b_atom_32b boxes).
             if atom != ATOM_MAX_BYTES:
                 raise _decline(
                     f"operand {operand.value.name}: an MN-major tf32 tile needs "
@@ -1737,6 +2338,16 @@ def plan_tcgen05_regions(
             assert load is not None
             if route != ROUTE_SYNC and len(_tma_dims(load)) > TMA_MAX_RANK:
                 route = ROUTE_SYNC
+            if load.windows and route not in (ROUTE_INPLACE, ROUTE_CONVERT):
+                # A windowed tile's box lands the window's whole rows; only
+                # a pass over the landed tile masks the rows at and past the
+                # limit before the MMA reads them (the direct route feeds
+                # them as they land, the sync pass reads global memory past
+                # the window).
+                raise _decline(
+                    f"operand {operand.value.name}: a windowed tile takes an "
+                    f"in-place or convert pass (route {route!r})"
+                )
             if route == ROUTE_INPLACE and es == 4:
                 # The in-place pass rewrites 16-bit pairs.
                 raise _decline(
@@ -1808,7 +2419,10 @@ def plan_tcgen05_regions(
         by_key[key] = tile
     for dot in program.dots:
         for operand in (dot.a, dot.b):
-            tiles[(dot.node, operand.role)] = by_key[tile_key(program, operand)]
+            if (dot.node, operand.role) in tmem_routes:
+                continue
+            key = tile_key(program, operand)
+            tiles[(dot.node, operand.role)] = by_key[key_remap.get(key, key)]
     # The derived values' tile inputs: TMA into the loop ring when the source
     # is aligned and the row has a swizzled layout (the lanes read their
     # chunks conflict-free); otherwise the item stays unused and the lanes
@@ -1856,8 +2470,7 @@ def plan_tcgen05_regions(
                 slabs=(cols * es) // atom,
                 offset=offset,
                 tma=spec,
-                # The epilogue's tiles sit in the fixed region (absolute
-                # offset), issued with the root's staged tiles.
+                # A root tile lands once per CTA with the root group.
                 ring=item.frame >= 0,
             )
         )
@@ -1929,8 +2542,18 @@ def plan_tcgen05_regions(
     # slots never live together (register-only slots take none).
     if tuple(tc.tmem_slots) != tmem_slots(program):
         raise _decline("the tensor-memory slots changed since admission")
-    resident = resident_slots(tc, sizes)
-    tmem_columns, column = region_tmem_layout(facts, sizes)
+    tmem_columns, column = region_tmem_layout(
+        facts, sizes, split=split, lookahead=ahead, extra_conflicts=route_conflicts
+    )
+    for (node, _role), source in tmem_routes.items():
+        # (``tmem_operand_routes`` placed the pair apart; keep it so: the MMA
+        # reads the source columns while it writes the result's.)
+        routed_dot = next(dot for dot in program.dots if dot.node is node)
+        assert source in tmem_columns and routed_dot.slot in tmem_columns
+        assert tmem_columns[source] != tmem_columns[routed_dot.slot], (
+            source,
+            routed_dot.slot,
+        )
     slots: list[SlotGeometry] = []
     for index, (rows_axis, cols_axis) in enumerate(program.slots):
         rows, cols = sizes[rows_axis.index], sizes[cols_axis.index]
@@ -2019,11 +2642,25 @@ def plan_tcgen05_regions(
         )
         for region, group in staged_tiles.items()
     }
-    for frame, aux_group in aux_tiles.items():
-        if frame < 0:
-            staged_tx[frame] = staged_tx.get(frame, 0) + sum(
-                tile.tma.bytes for tile in aux_group if tile.tma is not None
+    if ahead:
+        loop_tiles = ring_tiles.get(tc.lookahead_loop, ())
+        if (
+            not ring_tx.get(tc.lookahead_loop)
+            or any(tile.route != ROUTE_DIRECT for tile in loop_tiles)
+            or aux_tiles.get(tc.lookahead_loop)
+        ):
+            # The schedule refills the slot the waited dot read with the
+            # tile ``stages`` ahead by TMA, with no pass over it.
+            raise _decline(
+                f"{MMA_DAG_LOOKAHEAD_KEY}: the loop's ring tiles need the direct "
+                "TMA route"
             )
+    # The root aux tiles ride the root group (``md_sfr``).
+    root_aux_bytes = sum(
+        tile.tma.bytes for tile in aux_tiles.get(-1, ()) if tile.tma is not None
+    )
+    if root_aux_bytes:
+        staged_tx[-1] = staged_tx.get(-1, 0) + root_aux_bytes
     return Tcgen05Plan(
         warps=warps,
         stages=stages,
@@ -2054,7 +2691,98 @@ def plan_tcgen05_regions(
         scratch_offset=scratch_offset,
         tmem_slots=tuple(slot for slot in tc.tmem_slots if slot not in resident),
         register_carries=resident,
+        split_epilogue=split,
+        lookahead=ahead,
+        lookahead_loop=tc.lookahead_loop if ahead else -1,
+        lookahead_slot=tc.lookahead_slot if ahead else -1,
+        lookahead_width=(
+            _align(sizes[facts.frags[tc.lookahead_slot][1]], TCGEN05_SLOT_ALIGN)
+            if ahead
+            else 0
+        ),
+        tmem_operands=tmem_routes,
     )
+
+
+def tmem_operand_routes(
+    program: MmaDagProgram,
+    facts: CuteMmaDagFacts,
+    sizes: Sequence[int],
+    routes: Mapping[tuple[Node, str], str],
+    resident: Collection[int],
+    split: bool,
+    ahead: bool,
+) -> tuple[
+    dict[tuple[Node, str], int],
+    dict[tuple[object, ...], tuple[object, ...]],
+    set[tuple[int, int]],
+]:
+    """``cute_mma_dag_exchange='auto'`` at one config: the A operands read
+    from tensor memory ((dot node, role) -> fragment slot), the exchange
+    tile keys an ``X @ X`` dot's A operand reads through its B tile (A key
+    -> B key) and the tensor-memory conflicts the routes add.
+
+    A candidate (``tmem_a_candidates``) is routed when its fragment holds
+    tensor memory at the config (not a register carry), the dot's M is 64
+    or 128 rows (the accumulator layouts the A read was verified against),
+    its slot is not the lookahead slot (whose columns alternate) and its
+    operand is not a pass chain's; a tile key is left out of the layout
+    only when every operand reading it is routed.  The routes' conflicts
+    (``tmem_route_conflicts``) must not grow the tensor-memory footprint:
+    where they would, no operand is routed (fail closed to the exchange
+    tiles; the ``X @ X`` sharing needs no columns and stays)."""
+    tc = facts.tcgen05
+    assert tc is not None
+    key_remap: dict[tuple[object, ...], tuple[object, ...]] = {}
+    for dot in shared_operand_dots(program):
+        if ROUTE_DERIVED in (
+            routes.get((dot.node, "a")),
+            routes.get((dot.node, "b")),
+        ):
+            continue
+        key_remap[tile_key(program, dot.a)] = tile_key(program, dot.b)
+    aliases = {(output, carry) for output, carry in tc.tmem_aliases}
+    consumers: dict[tuple[object, ...], list[tuple[Dot, Operand]]] = {}
+    for dot in program.dots:
+        for operand in (dot.a, dot.b):
+            if operand.kind == "frag":
+                consumers.setdefault(tile_key(program, operand), []).append(
+                    (dot, operand)
+                )
+    passing: dict[tuple[Node, str], int] = {}
+    for dot, operand in tmem_a_candidates(program):
+        slot = program.frag_slots[program.resolve(cast("Node", operand.frag))]
+        if (
+            slot in resident
+            or sizes[dot.rows.index] not in (64, 128)
+            or (ahead and slot == tc.lookahead_slot)
+            or routes.get((dot.node, operand.role)) == ROUTE_DERIVED
+            or (dot.slot, slot) in aliases
+            or (slot, dot.slot) in aliases
+            or tile_key(program, operand) in key_remap
+        ):
+            continue
+        passing[(dot.node, operand.role)] = slot
+    tmem_routes: dict[tuple[Node, str], int] = {}
+    for readers in consumers.values():
+        if all((dot.node, operand.role) in passing for dot, operand in readers):
+            for dot, operand in readers:
+                tmem_routes[(dot.node, operand.role)] = passing[
+                    (dot.node, operand.role)
+                ]
+    if not tmem_routes:
+        return {}, key_remap, set()
+    by_node = {dot.node: dot for dot in program.dots}
+    conflicts = tmem_route_conflicts(
+        program, [(by_node[node], slot) for (node, _role), slot in tmem_routes.items()]
+    )
+    plain = region_tmem_layout(facts, sizes, split=split, lookahead=ahead)[1]
+    routed = region_tmem_layout(
+        facts, sizes, split=split, lookahead=ahead, extra_conflicts=conflicts
+    )[1]
+    if routed > plain:
+        return {}, key_remap, set()
+    return tmem_routes, key_remap, conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -2095,6 +2823,9 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # The derived steps the pass-routed operand tiles absorb (never
         # emitted: their values are evaluated inside the derived passes).
         self.absorbed = plan.absorbed
+        # Accumulator pointers standing in for ``md_acc{slot}`` while a
+        # dot is issued (the lookahead dot's half of its slot).
+        self.acc_names: dict[int, str] = {}
         program = self.program
         # Loop carries living in the epilogue registers at this config
         # (``register_carries``, ``resident_slots``): ``md_rc{slot}_{chunk}_{j}``
@@ -2122,64 +2853,43 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             or loop.index in self.tc.staged_tiles
             or any(store.loop == loop.index for store in self.tc.staged_stores)
         }
-        self.streaming_loops = {
-            loop.index for loop in program.loops if self.streaming_loop(loop)
-        }
-
-    def streaming_loop(self, loop: Loop) -> bool:
-        """A loop whose iterations are one batch of dots accumulating in
-        place into this loop's tensor-memory carries over TMA ring tiles,
-        and nothing else (no pass, stage, snapshot, derived value, vector
-        step or carry copy): ``emit_streaming_iteration`` keeps the tensor
-        core fed across iterations instead of waiting for every batch's
-        commit (a GEMM K loop: 0.043 -> 0.021 ms at 2048^3)."""
-        tc, program = self.tc, self.program
-        index = loop.index
-        if (
-            not loop.innermost
-            or index not in self.ring_loops
-            or not tc.ring_tx.get(index)
-            or tc.stages < 2
-            or tc.aux_tiles.get(index)
-            or tc.staged_tiles.get(index)
-            or loop.vec_carries
-            or any(store.loop == index for store in program.stores)
-            or any(step.loop == index for step in program.derived)
-            or any(step.loop == index for step in (*program.reduces, *program.vec_ops))
-            or any(step.loop == index for step in program.vec_stores)
-        ):
-            return False
-        if self.has_passes(tc.ring_tiles.get(index, ())):
-            return False
-        carries = {carry.slot: carry for carry in loop.carries}
-        if not carries or any(slot in self.resident for slot in carries):
-            return False
-        for step in loop.steps:
-            if (
-                not isinstance(step, Dot)
-                or step.acc is None
-                or step.acc_frag is None
-                or step.acc_frag not in loop.carry_placeholders
-                or dot_prepares(step)
-                or self.prepares(step)
-                or step.slot not in carries
-            ):
-                return False
-            for operand in (step.a, step.b):
-                if operand.kind != "load" or not tc.tile(step, operand).ring:
-                    return False
-        # Every carry's loop output is its own dot (no copy at the end).
-        for carry in loop.carries:
-            output = program.resolve(carry.output)
-            if not any(
-                isinstance(step, Dot)
-                and step.node is output
-                and step.slot == carry.slot
-                for step in loop.steps
-            ):
-                return False
-        blocks = region_block_steps(program, loop.steps)
-        return len(blocks) == 1 and not blocks[0][0]
+        # The ring loops rendered as a streamed pipeline (``md_empty{L}``
+        # barriers) and the one whose batch is being emitted.
+        self.streamed = streamed_ring_loops(program, self.tc, self.absorbed)
+        self.streaming: int | None = None
+        # The streamed iteration being emitted has no pass and no aux tile:
+        # warp 0 alone waits for the slot's tile and issues the batch, no
+        # per-iteration CTA barrier (the other warps have nothing to publish).
+        self.streaming_fast = False
+        # A root aux tile was read since the last CTA barrier: a loop's
+        # frame may overlay it, so its tiles are issued behind one.
+        self.root_aux_read = False
+        # The persistent launch (``cute_mma_dag_persistent``): the CTA walks
+        # the tiles of the generic persistent_interleaved program ids; the
+        # loops' ring / commit counters run on across its tiles, ``md_tn``
+        # counts the tiles it finished (the root group's barrier parity),
+        # and under ``cross_tile`` the next tile's root group and root ring
+        # prologues are issued under this tile's epilogue at the next
+        # tile's coordinates (``next_tile``; ``issuing_next`` rewrites the
+        # TMA coordinates while they are).
+        self.persistent = plan.persistent > 0
+        self.cross_tile = False
+        self.issuing_next = False
+        # The next tile's root group goes out as soon as this tile's last
+        # reader of the root group's tiles is done (``root_group_readers``:
+        # a root dot's node once its batch is waited, a root derived
+        # value's once the barrier behind its block passed, a top-level
+        # loop's index once the loop exited), at the root level of the
+        # body; the tile's end issues it otherwise.
+        self.loop_depth = 0
+        self.root_readers_left: set[object] = set()
+        self.root_group_issued = True
+        self.pending_batch_dots: list[Dot] = []
+        # The CTA's first tile issues its own root group behind this root
+        # ring loop's prologue (``root_group_deferral``) rather than ahead
+        # of it, so the loop's first batch is not queued behind tiles it
+        # does not read; None: at the kernel's start.
+        self.root_group_after_loop: int | None = None
 
     # -- naming ---------------------------------------------------------------
 
@@ -2241,20 +2951,41 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
     def emit_dot_mmas(self, dot: Dot, stage: str, accumulate: bool) -> None:  # type: ignore[override]
         """Warp 0: the K / k_elems MMAs of ``dot`` over its tiles (F16 kind
         for 16-bit operands, TF32 for fp32)."""
-        a_tile, b_tile = self.tc.tile(dot, dot.a), self.tc.tile(dot, dot.b)
+        # An A operand routed to tensor memory (``Tcgen05Plan.tmem_operands``)
+        # has no shared tile: the MMA reads the fragment's accumulator
+        # columns, K step by K step (eight fp32 columns each).
+        a_source = self.tc.tmem_operands.get((dot.node, dot.a.role))
+        a_tile = None if a_source is not None else self.tc.tile(dot, dot.a)
+        b_tile = self.tc.tile(dot, dot.b)
         a_major, b_major = self.k_major(dot.a), self.k_major(dot.b)
         index = self.dot_index[dot.node]
-        self.desc(f"md_da{index}", a_tile, stage, a_major)
+        if a_tile is not None:
+            self.desc(f"md_da{index}", a_tile, stage, a_major)
         self.desc(f"md_db{index}", b_tile, stage, b_major)
         kind = "TF32" if dot.a.dtype == torch.float32 else "F16"
         k = self.plan.size(dot.k)
-        for step in range(k // a_tile.k_elems):
+        # (The lookahead dot accumulates into the half of its slot the
+        # issuing iteration's parity names: ``emit_lookahead_mma``.)
+        acc = self.acc_names.get(dot.slot, f"md_acc{dot.slot}")
+        for step in range(k // b_tile.k_elems):
+            if a_tile is not None:
+                a_operand = (
+                    f"md_da{index}.advance_start_address("
+                    f"{a_tile.k_step_offset(step, a_major)})"
+                )
+            else:
+                assert a_source is not None
+                column = self.slot(a_source).column + step * b_tile.k_elems
+                a_operand = (
+                    f"cutlass.inttoptr(md_tmem + {column}, {_RT}.TMEM_SPACE, "
+                    "cutlass.Float32)"
+                )
             with self.nest(f"if {_PRIMS}.elect_sync():"):
                 enable = "True" if accumulate or step else "False"
                 self.emit(
                     f"{_PRIMS}.tcgen05_mma({_PRIMS}.Tcgen05MMAKind.{kind}, {_PRIMS}.CTAGroup.CTA_1, "
-                    f"md_acc{dot.slot}, "
-                    f"md_da{index}.advance_start_address({a_tile.k_step_offset(step, a_major)}), "
+                    f"{acc}, "
+                    f"{a_operand}, "
                     f"md_db{index}.advance_start_address({b_tile.k_step_offset(step, b_major)}), "
                     f"md_idesc{index}, {enable})"
                 )
@@ -2305,9 +3036,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     ]
                     index = f"({packet} + {turn}) % {packets}"
                     chunk = (
-                        f"(md_cb{slot} // 4 + {index})"
-                        if self.half_cols(slot)
-                        else index
+                        f"(md_cb{slot} // 4 + {index})" if self.has_cb(slot) else index
                     )
                 else:
                     words = values[4 * packet : 4 * packet + 4]
@@ -2382,8 +3111,12 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             if guard is None:
                 self.emit(load_line)
             else:
+                # The words the load defines are ``Uint32`` (``_words``):
+                # the join of the guarded and the fall-through path must
+                # agree (``Int32`` here failed the DSL's type join on every
+                # tile with fewer raw packets than threads).
                 for word in words:
-                    self.emit(f"{word} = cutlass.Int32(0)")
+                    self.emit(f"{word} = cutlass.Uint32(0)")
                 with self.nest(f"if {guard}:"):
                     self.emit(load_line)
             states.append(words)
@@ -2867,7 +3600,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
     def epilogue_sync(self) -> str:
         return (
             f"cute.arch.barrier(barrier_id={EPILOGUE_BARRIER_ID}, "
-            f"number_of_threads={32 * TCGEN05_EPILOGUE_WARPS})"
+            f"number_of_threads={32 * self.epilogue_warps})"
         )
 
     # -- derived values' tile inputs ------------------------------------------
@@ -2910,20 +3643,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         if tile is None:
             super().emit_derived_access_prefetch(step, access)
             return
-        if (
-            not tile.ring
-            and tile.owner_key is None
-            and tile.tma is not None
-            and tile.key not in self.settled
-            and self.tc.staged_tx.get(tile.frame)
-        ):
-            # An epilogue tile of the fixed region: its TMA landed on the
-            # root's staged barrier (issued ahead of the loops; a wait on a
-            # completed phase returns at once).
+        if not tile.ring and tile.tma is not None and tile.key not in self.settled:
+            # A root aux tile of its own TMA (the root group, issued at the
+            # kernel's start): the reading threads wait for it once.
             self.emit(
                 f"{_RT}.mbar_wait({self.sf_name(tile.frame)}, {self.staged_phase(tile.frame)})"
             )
             self.settled.add(tile.key)
+            self.root_aux_read = True
         if (
             not tile.ring
             and tile.owner_key is not None
@@ -3006,10 +3733,25 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.emit(f"{_RT}.mbar_wait(md_cb, (md_cn + 1) & 1)")
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)")
         self.waited = True
+        # The batches committed since the last wait are done: their root
+        # dots no longer read the root group's tiles.
+        if not self.root_group_issued:
+            for dot in self.pending_batch_dots:
+                if dot.loop < 0:
+                    self.root_readers_left.discard(dot.node)
+            self.maybe_issue_root_group()
+        self.pending_batch_dots = []
 
     def emit_commit(self) -> None:
         with self.nest(f"if {_PRIMS}.elect_sync():"):
             self.emit(f"{_PRIMS}.tcgen05_commit(md_cb, group={_PRIMS}.CTAGroup.CTA_1)")
+            if self.streaming is not None:
+                # The slot this batch read is free once the batch is done.
+                loop = self.streaming
+                self.emit(
+                    f"{_PRIMS}.tcgen05_commit(md_empty{loop} + md_st{loop}, "
+                    f"group={_PRIMS}.CTAGroup.CTA_1)"
+                )
 
     # -- TMA ------------------------------------------------------------------
 
@@ -3026,7 +3768,13 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             else:
                 axis = subscript.axis
                 assert axis is not None
-                if axis.kind == AXIS_RDIM and not self.is_split_axis(axis):
+                if subscript.window is not None:
+                    # The window's rows: the box lands at the runtime row
+                    # offset (rows past the tensor's end zero-fill; rows at
+                    # and past the limit are masked where the tile is read:
+                    # ``_Evaluator.tile_leaf``).
+                    value = self.scalar_vars[subscript.window.offset.node]
+                elif axis.kind == AXIS_RDIM and not self.is_split_axis(axis):
                     value = "0"
                 elif axis.kind == AXIS_LOOP:
                     offset = self.axis_offset(axis, values[axis.loop])
@@ -3037,6 +3785,9 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     value = f"{value} + {self.uniform(subscript.offset, {})}"
             if position == spec.slab_dim and slab:
                 value = f"{value} + {slab * spec.slab_elems}"
+            if self.issuing_next:
+                # The next tile's coordinates (``next_tile_coords``).
+                value = self.next_tile(value)
             coords.append(f"cutlass.Int32({value})")
         return coords
 
@@ -3086,7 +3837,11 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             )
 
     def staged_phase(self, region: int) -> str:
-        return "0" if region < 0 else f"({self.counter(region)}) & 1"
+        if region < 0:
+            # The root group lands once per tile: a persistent CTA's tiles
+            # alternate its barrier's parity.
+            return "(md_tn & 1)" if self.persistent else "0"
+        return f"({self.counter(region)}) & 1"
 
     # -- settling staged tiles --------------------------------------------------
 
@@ -3245,6 +4000,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 for operand in (dot.a, dot.b):
                     if operand.kind != "frag":
                         continue
+                    if (dot.node, operand.role) in tc.tmem_operands:
+                        continue
                     tile = tc.tile(dot, operand)
                     # (A pass chain's tile is written by its derived pass.)
                     if (
@@ -3259,13 +4016,16 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 self.wait_latest()
             if any(
                 isinstance(step, Store)
-                and step.loop >= 0
-                and staging_copies(program, step) == 1
+                and (
+                    (step.loop >= 0 and staging_copies(program, step) == 1)
+                    or (step.loop < 0 and self.persistent)
+                )
                 for step in work
             ) and self.tma_stores([step for step in work if isinstance(step, Store)]):
                 # A single-buffered loop store: the TMA store of the previous
                 # iteration finishes reading the buffer before any thread
-                # stages into it again.
+                # stages into it again.  A persistent launch's root store:
+                # the previous tile's.
                 self.emit_tma_store_wait(read=True)
                 self.emit(self.sync)
             if first_snapshots or work or exchanges or preps:
@@ -3314,9 +4074,24 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 continue
             # One commit in flight: a batch without epilogue work ahead of
             # it still waits for the previous one (the barrier's parity
-            # tells one phase apart).
-            self.wait_latest()
-            self.emit(self.sync)
+            # tells one phase apart).  A streamed loop's batch waits for
+            # nothing: its slot's ``md_empty`` was waited ahead of the
+            # passes and the loop exit resolves ``md_cb``.
+            if self.streaming is None:
+                self.wait_latest()
+            if not (
+                self.streaming_fast
+                and not (first_snapshots or work or exchanges or preps)
+                and not self.drains
+            ):
+                self.emit(self.sync)
+            if loop is None and not self.root_group_issued:
+                # The barrier passed: this block's root derived values read
+                # the root group's tiles no more.
+                for step in work:
+                    if isinstance(step, Derived):
+                        self.root_readers_left.discard(step.node)
+                self.maybe_issue_root_group()
             with self.nest("if md_warp == 0:"):
                 self.emit(
                     f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
@@ -3325,7 +4100,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     dot.loop
                     for dot in dots
                     for operand in (dot.a, dot.b)
-                    if tc.tile(dot, operand).ring
+                    if (dot.node, operand.role) not in tc.tmem_operands
+                    and tc.tile(dot, operand).ring
                 }
                 for ring_loop in sorted(ring):
                     if ring_loop not in self.ring_waited and tc.ring_tx.get(ring_loop):
@@ -3342,6 +4118,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 self.emit_commit()
             self.emit("md_cn = md_cn + 1")
             self.waited = False
+            self.pending_batch_dots.extend(dots)
             self.flush_drains()
         self.current_blocks = []
 
@@ -3472,6 +4249,11 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         (the warp's rows by shuffles, the epilogue warps through the
         scratch, relaid into the row layout), or of a vector into a scalar."""
         program = self.program
+        if self.split:
+            # (``region_split_reason`` declines programs with reductions.)
+            raise _decline(
+                f"{step.node.name}: a fragment reduction under the split epilogue"
+            )
         if step.vec is not None:
             self.emit_scalar_reduce(step)
             return
@@ -3624,8 +4406,13 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         vslot = program.vec_leaves[leaf]
         vec = program.vec_slots[vslot]
         rows, cols = program.slots[frag_slot]
-        assert vec.axis is not None and rows is not cols
-        along_rows = vec.axis is rows
+        if vec.axis is None:
+            raise _decline(f"vector {leaf.name} has no axis to read beside a fragment")
+        # (Over one axis the dim is positional: the matcher recorded the
+        # broadcast the vector was read with.)
+        along_rows = (
+            program.vec_positions[leaf] == 0 if rows is cols else vec.axis is rows
+        )
         if along_rows and self.vec_row(vslot) == self.row_var(frag_slot):
             return self.vreg(vslot)
         key = (leaf, frag_slot)
@@ -3650,6 +4437,9 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             # vector read under the guard (64-row slots with the guard are
             # never offered this mode); fail closed should one appear.
             raise _decline(f"vector {leaf.name} read inside a row guard")
+        if self.split:
+            # (``region_split_reason`` declines programs with vectors.)
+            raise _decline(f"vector {leaf.name} read under the split epilogue")
         program = self.program
         vslot = program.vec_leaves[leaf]
         axis = program.vec_slots[vslot].axis
@@ -3897,6 +4687,12 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         begin, end, trip = self.loop_bounds(loop)
         var = self.loop_index_var(index)
         ring = index in self.ring_loops
+        if self.root_aux_read:
+            # Every thread's reads of the root aux tiles (a prologue
+            # segment's overlay the frames this loop's tiles land in)
+            # complete before any thread issues them.
+            self.emit(self.sync)
+            self.root_aux_read = False
         pending = self.pending_root_raw()
         # The root raw tiles all convert ahead of the first top-level loop
         # (below); a nested loop never finds one pending (a conversion in a
@@ -3906,12 +4702,20 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             # A root raw tile overlaying this ring (its conversion is the
             # last read of it) settles ahead of the prologue issue.
             self.settle_keys({tile.key for tile in pending}, region)
+        # A root ring loop of a cross-tile persistent launch: only the CTA's
+        # first tile issues its own prologue (the previous tile issued this
+        # one's at its exit, ``emit_next_tile_prologue``).
+        ahead_issued = self.cross_tile and region < 0
         if ring and tc.ring_tx.get(index):
             # The ring prologue: the first ``stages - 1`` iterations' tiles
             # (the first iteration's with a single slot), in flight while
             # the enclosing regions' tiles settle.
             self.wait_latest()
-            with self.nest("if md_warp == 0:"), self.nest(f"if {_PRIMS}.elect_sync():"):
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest("if md_tn == 0:") if ahead_issued else _NoNest(),
+            ):
                 for ahead in range(max(tc.stages - 1, 1)):
                     value = f"({begin} + {ahead})" if ahead else begin
                     values = {**self.values, index: value}
@@ -3921,27 +4725,35 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                         else self.counter(index)
                     )
                     if trip is not None and ahead < trip:
+                        self.emit_slot_free_wait(index, count)
                         self.emit_ring_issue(index, values, count)
                     elif trip is None:
                         with self.nest(f"if {value} < {end}:"):
+                            self.emit_slot_free_wait(index, count)
                             self.emit_ring_issue(index, values, count)
+                if self.root_group_after_loop == index:
+                    # The first tile's root group, behind the prologue it
+                    # does not feed (``root_group_deferral``).
+                    self.emit_tma_group(
+                        [
+                            *tc.staged_tiles.get(-1, ()),
+                            *(
+                                tile
+                                for tile in tc.aux_tiles.get(-1, ())
+                                if tile.tma is not None
+                            ),
+                        ],
+                        {},
+                        self.sf_name(-1),
+                        tc.staged_tx[-1],
+                        "0",
+                    )
         self.settle_tiles(self.loop_consumers(loop), region)
         # The other root raw tiles (read by no dot of this loop: a root dot
         # behind it) overlay the frame this loop's body writes (its refills,
         # staged tiles, staging and exchange tiles): they convert here, with
         # the prologue in flight.
         self.settle_keys({tile.key for tile in self.pending_root_raw()}, region)
-        streaming = index in self.streaming_loops
-        if streaming:
-            # The carries' seeds (tcgen05.st by the epilogue warps) and the
-            # enclosing regions' tensor-memory writes are ordered before
-            # the loop's MMAs once, here, instead of behind a barrier per
-            # iteration; an earlier batch's commit is waited the same way.
-            self.wait_latest()
-            self.emit(
-                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
-            )
-            self.emit(self.sync)
         with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
             self.values[index] = var
             if loop.innermost:
@@ -3951,16 +4763,28 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             if index in self.counted:
                 self.emit(f"{self.counter(index)} = {self.counter(index)} + 1")
             del self.values[index]
-        if streaming:
-            # One commit tracks every MMA of the loop: the epilogue (and a
-            # following loop) waits for it as for any batch.
-            with self.nest("if md_warp == 0:"):
-                self.emit_commit()
-            self.emit("md_cn = md_cn + 1")
-            self.waited = False
         self.forget_iteration_bases(index)
         self.evaluator = _PassEvaluator(self)
         self.waited = False
+        if index in self.streamed:
+            # The loop's batches went unwaited: the last one's slot barrier
+            # (one phase outstanding at most, so its parity cannot alias;
+            # ``md_cb`` could, with up to ``stages`` commits in flight)
+            # says every batch is done, and ``md_cb`` is exact from here.
+            count = self.counter(index)
+            last = f"({count} - 1)"
+            wait = (
+                f"{_RT}.mbar_wait(md_empty{index} + {last} % {tc.stages}, "
+                f"({last} // {tc.stages} + 1) & 1)"
+            )
+            if trip is not None and trip > 0:
+                self.emit(wait)
+            else:
+                with self.nest(f"if {count} > 0:"):
+                    self.emit(wait)
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+            )
         for carry in loop.carries:
             self.defined.add(carry.phi)
         # Exchange tiles written inside the loop of fragments it defines are
@@ -3971,6 +4795,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.written = {key for key in self.written if key in self.root_written}
         self.emit_tma_store_wait(read=True)
         self.emit(self.sync)
+        if ahead_issued and ring and tc.ring_tx.get(index):
+            self.emit_next_tile_prologue(loop, begin, trip)
         if self.pdl and region < 0 and self.last_root_loop(loop):
             # The dependents may launch (their pre-wait prologue overlaps
             # this kernel's epilogue; their wait still covers every write).
@@ -3980,6 +4806,395 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         """Whether ``loop`` is the last top-level loop of the program."""
         loops = [step for step in self.program.body if isinstance(step, Loop)]
         return bool(loops) and loops[-1] is loop
+
+    def emit_next_tile_prologue(self, loop: Loop, begin: str, trip: int | None) -> None:
+        """A cross-tile persistent launch, at a root ring loop's exit: one
+        elected thread issues the next tile's ring prologue (the same
+        ``stages - 1`` leading slots the first tile issued for itself, at
+        the running count -- the ring's phases run on) at the next tile's
+        coordinates, so its boxes land under this tile's epilogue.  Every
+        batch of this loop completed (the slots are free; a streamed loop's
+        slot waits say so too) and no later item of the tile overlays the
+        ring: the root items live beside the frames (``persistent_items``)
+        and the top-level loops' frames are disjoint (``region_layout``),
+        so the tile's later loops and the next tile's earlier ones run
+        beside the landing boxes."""
+        tc = self.tc
+        index = loop.index
+        assert trip is not None and self.next_pid is not None
+        pid = self.df.pid
+        from ..program_id import PersistentProgramIDs
+
+        assert isinstance(pid, PersistentProgramIDs)
+        self.wait_latest()
+        self.issuing_next = True
+        try:
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest(f"if md_npid < {pid.total_pids_var}:"),
+            ):
+                for ahead in range(min(max(tc.stages - 1, 1), trip)):
+                    value = f"({begin} + {ahead})" if ahead else begin
+                    count = (
+                        f"{self.counter(index)} + {ahead}"
+                        if ahead
+                        else self.counter(index)
+                    )
+                    self.emit_slot_free_wait(index, count)
+                    self.emit_ring_issue(index, {**self.values, index: value}, count)
+        finally:
+            self.issuing_next = False
+
+    def emit_next_tile_root_group(self) -> None:
+        """A cross-tile persistent launch, at the tile's end (every read of
+        the root group's tiles done, behind the CTA barrier): one elected
+        thread issues the next tile's root group -- the root staged tiles
+        and root aux tiles -- at the next tile's coordinates on the root
+        barrier's next phase."""
+        tc = self.tc
+        assert self.next_pid is not None
+        pid = self.df.pid
+        from ..program_id import PersistentProgramIDs
+
+        assert isinstance(pid, PersistentProgramIDs)
+        tiles = [
+            *tc.staged_tiles.get(-1, ()),
+            *(tile for tile in tc.aux_tiles.get(-1, ()) if tile.tma is not None),
+        ]
+        self.issuing_next = True
+        try:
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest(f"if md_npid < {pid.total_pids_var}:"),
+            ):
+                self.emit_tma_group(tiles, {}, self.sf_name(-1), tc.staged_tx[-1], "0")
+        finally:
+            self.issuing_next = False
+
+    def root_group_readers(self) -> set[object]:
+        """The events after which the root group's tiles (the root staged
+        tiles and the root aux tiles, TMA'd once per tile) have no reader
+        left in this tile: a root dot reading one (its node, done when its
+        batch is waited), a root derived value whose aux tile is one (its
+        node, done behind its block's barrier), and the top-level loop
+        enclosing any such dot or derived value (``("loop", index)``, done
+        at its exit).  Raw tiles converted at the root settle ahead of the
+        dots reading the converted tile, so the dots cover them."""
+        tc, program = self.tc, self.program
+        root_keys = {tile.key for tile in tc.staged_tiles.get(-1, ())}
+
+        def event(loop: int, node: Node) -> object:
+            if loop < 0:
+                return node
+            while program.loops[loop].parent >= 0:
+                loop = program.loops[loop].parent
+            return ("loop", loop)
+
+        events: set[object] = set()
+        for dot in program.dots:
+            for operand in (dot.a, dot.b):
+                if (dot.node, operand.role) in tc.tmem_operands:
+                    continue
+                if tc.tile(dot, operand).key in root_keys:
+                    events.add(event(dot.loop, dot.node))
+        for derived in program.derived:
+            for access in derived.loads:
+                tile = self.aux_tile(derived, access)
+                if tile is not None and not tile.ring:
+                    events.add(event(derived.loop, derived.node))
+        return events
+
+    def root_group_deferral(self) -> int | None:
+        """The root ring loop behind whose prologue the CTA's first tile
+        issues its own root group (None: at the kernel's start): the first
+        top-level ring loop, when no root step ahead of it and nothing in
+        it reads the root group's tiles (``root_group_readers``) and no
+        root tile is a raw tile converted ahead of the loops.  The first
+        tile's loads of 1024 CTAs queue at the TMA units together: the
+        loop's batch then waits only for the tiles it reads (dqkg at
+        (8, 8, 1024, 64, 64): q / k go behind do / v / h / dh)."""
+        tc, program = self.tc, self.program
+        if any(tile.raw_tma is not None for tile in tc.staged_tiles.get(-1, ())):
+            return None
+        for step in program.body:
+            if isinstance(step, Loop):
+                if (
+                    step.index in self.ring_loops
+                    and tc.ring_tx.get(step.index)
+                    and ("loop", step.index) not in self.root_readers_left
+                ):
+                    return step.index
+                return None
+            if isinstance(step, (Dot, Derived)) and step.node in self.root_readers_left:
+                return None
+        return None
+
+    def maybe_issue_root_group(self, *, final: bool = False) -> None:
+        """Issue the next tile's root group once no reader of this tile's
+        is left (``root_group_readers``), at the root level of the body
+        (``final``: the tile's end, behind its barrier -- every reader is
+        done)."""
+        if self.root_group_issued or (
+            not final and (self.loop_depth or self.root_readers_left)
+        ):
+            return
+        self.emit_next_tile_root_group()
+        self.root_group_issued = True
+
+    def plan_region_cross_tile(self) -> bool:
+        """Whether this persistent launch issues the next tile's root group
+        and root ring prologues under this tile's epilogue (and set up the
+        next tile's program id and coordinates): some root-issued TMA
+        (a root ring loop's ring or the root group) whose coordinates the
+        next tile's are known ahead -- no window offsets or other scalars
+        loaded per tile -- over the generic persistent_interleaved program
+        ids.  Otherwise the tile loop runs with every tile issuing its own
+        loads (the setup is still paid once per CTA)."""
+        tc, program = self.tc, self.program
+        root_rings = [
+            loop.index
+            for loop in program.loops
+            if loop.parent < 0
+            and loop.index in self.ring_loops
+            and tc.ring_tx.get(loop.index)
+        ]
+        if not tc.tma or (not root_rings and not tc.staged_tx.get(-1)):
+            return False
+        if program.scalar_loads or any(
+            access.windows for spec in tc.tma for access in (spec.access,)
+        ):
+            return False
+        planned = self.next_tile_coords()
+        if planned is None:
+            return False
+        self.next_pid, self.next_coords = planned
+        return True
+
+    def emit_lookahead_loop(self, loop: Loop, region: int) -> None:
+        """``cute_mma_dag_lookahead='on'``: the loop's one dot runs one
+        iteration ahead of its epilogue.  Iteration i waits its own dot's
+        commit (issued during iteration i - 1, or ahead of the loop), refills
+        the ring slot that dot read with the tile ``stages`` ahead, issues
+        iteration i + 1's dot into the result slot's other half once the
+        previous epilogue's threads arrived on ``md_lke`` (their reads of
+        that half done), then runs its epilogue over its half while that dot
+        and its commit are in flight -- no CTA barrier in the loop.  Two
+        commit barriers (``md_lkb``, by iteration parity) keep two commits
+        in flight; the running count names each iteration's barrier and
+        phase across every execution of the loop (one commit and one
+        epilogue arrival round per iteration, the tile ``r`` in ring slot
+        ``r % stages`` as always)."""
+        tc, program = self.tc, self.program
+        index = loop.index
+        assert index in self.ring_loops and tc.ring_tx.get(index)
+        dot = loop.steps[0]
+        assert isinstance(dot, Dot) and dot.slot == tc.lookahead_slot
+        work = list(loop.steps[1:])
+        self.emit_loop_carry_init(loop)
+        for carry in loop.carries:
+            self.defined.add(carry.placeholder)
+        begin, end, trip = self.loop_bounds(loop)
+        var = self.loop_index_var(index)
+        counter = self.counter(index)
+        if self.root_aux_read:
+            # Every thread's reads of the root aux tiles (a prologue
+            # segment's overlay the frames this loop's tiles land in)
+            # complete before any thread issues them (``emit_region_loop``).
+            self.emit(self.sync)
+            self.root_aux_read = False
+        pending = self.pending_root_raw()
+        assert region < 0 or not pending
+        if self.ring_under_raw(loop, pending):
+            self.settle_keys({tile.key for tile in pending}, region)
+        # The ring prologue fills every slot: the first ``stages`` tiles.
+        self.wait_latest()
+        with self.nest("if md_warp == 0:"), self.nest(f"if {_PRIMS}.elect_sync():"):
+            for ahead in range(tc.stages):
+                value = f"({begin} + {ahead})" if ahead else begin
+                values = {**self.values, index: value}
+                count = f"{counter} + {ahead}" if ahead else counter
+                if trip is not None and ahead < trip:
+                    self.emit_ring_issue(index, values, count)
+                elif trip is None:
+                    with self.nest(f"if {value} < {end}:"):
+                        self.emit_ring_issue(index, values, count)
+        self.settle_tiles(self.loop_consumers(loop), region)
+        self.settle_keys({tile.key for tile in self.pending_root_raw()}, region)
+        # The first iteration's dot, ahead of the loop (the carry init's
+        # tensor-memory writes are fenced and behind the barrier).
+        self.emit(self.sync)
+        with self.nest("if md_warp == 0:"):
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+            )
+            if trip is None:
+                with self.nest(f"if {begin} < {end}:"):
+                    self.emit_lookahead_mma(dot, counter)
+            elif trip > 0:
+                self.emit_lookahead_mma(dot, counter)
+        self.defined.add(dot.node)
+        with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
+            self.values[index] = var
+            self.enter_iteration(loop)
+            self.ring_waited = set()
+            self.derived_words = {}
+            derived = [
+                step
+                for step in program.derived
+                if step.loop == index and step.loads and step.node not in self.absorbed
+            ]
+            for step in derived:
+                self.emit_derived_prefetch(step)
+            offset = var if begin == "0" else f"({var} - {begin})"
+            if any(
+                self.aux_tile(step, access) is None
+                for step in derived
+                for access in step.loads
+            ):
+                with self.nest(f"if {offset} + 1 < {end} - {begin}:"):
+                    self.emit_region_line_prefetch(
+                        derived, {**self.values, index: f"({var} + 1)"}
+                    )
+            # This iteration's dot (issued one iteration ago) is done.
+            self.emit(f"{_RT}.mbar_wait(md_lkb + {counter} % 2, ({counter} // 2) & 1)")
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+            )
+            # Its ring slot refills with the tile ``stages`` ahead.
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest(f"if {offset} + {tc.stages} < {end} - {begin}:"),
+            ):
+                self.emit_ring_issue(
+                    index,
+                    {**self.values, index: f"({var} + {tc.stages})"},
+                    f"{counter} + {tc.stages}",
+                )
+            # Warp 0: the previous iteration's epilogue finished reading the
+            # half the next dot writes (every epilogue thread arrived on
+            # ``md_lke`` behind its loads; a fresh barrier passes the first
+            # iteration's wait on the odd parity), then the next dot.
+            with self.nest("if md_warp == 0:"):
+                self.emit(f"{_RT}.mbar_wait(md_lke, ({counter} + 1) & 1)")
+                self.emit(
+                    f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+                )
+                with self.nest(f"if {offset} + 1 < {end} - {begin}:"):
+                    self.emit_lookahead_mma(dot, f"{counter} + 1")
+            # The epilogue over this iteration's half (its commit was waited
+            # above; the one in flight is the next iteration's), then every
+            # epilogue thread's arrival behind the block's tensor-memory
+            # fence.
+            self.waited = True
+            self.emit_blocks(self.region_blocks(work), loop)
+            with self.nest("if md_epi:"):
+                self.emit(f"{_PRIMS}.mbarrier_arrive(md_lke)")
+            if self.drains:
+                self.emit(self.sync)
+                self.flush_drains()
+            if index in self.counted:
+                self.emit(f"{counter} = {counter} + 1")
+            del self.values[index]
+        self.forget_iteration_bases(index)
+        self.evaluator = _PassEvaluator(self)
+        # Every lookahead commit was waited at its iteration's top; the
+        # batch barrier saw no commit in the loop.
+        self.waited = True
+        for carry in loop.carries:
+            self.defined.add(carry.phi)
+        self.written = {key for key in self.written if key in self.root_written}
+        self.emit_tma_store_wait(read=True)
+        self.emit(self.sync)
+
+    def emit_lookahead_mma(self, dot: Dot, count: str) -> None:
+        """Warp 0: the lookahead dot of the iteration whose running count is
+        ``count`` -- wait for its ring tile, the MMAs into the result slot's
+        half of the count's parity, the commit on that parity's barrier."""
+        tc = self.tc
+        index = tc.lookahead_loop
+        stage = f"({count}) % {tc.stages}"
+        self.emit(
+            f"{_RT}.mbar_wait(md_full{index} + {stage}, (({count}) // {tc.stages}) & 1)"
+        )
+        column = self.slot(dot.slot).column
+        self.emit(
+            f"md_lka = cutlass.inttoptr(md_tmem + {column} + (({count}) % 2) * "
+            f"{tc.lookahead_width}, {_RT}.TMEM_SPACE, cutlass.Float32)"
+        )
+        self.acc_names[dot.slot] = "md_lka"
+        self.emit_dot_mmas(dot, stage, accumulate=False)
+        del self.acc_names[dot.slot]
+        self.emit_tma_store_wait(read=True)
+        with self.nest(f"if {_PRIMS}.elect_sync():"):
+            self.emit(
+                f"{_PRIMS}.tcgen05_commit(md_lkb + ({count}) % 2, "
+                f"group={_PRIMS}.CTAGroup.CTA_1)"
+            )
+
+    def emit_slot_free_wait(self, loop: int, count: str) -> None:
+        """A streamed loop: before the slot of iteration ``count`` (the
+        running count) is written -- by its TMA or its passes -- the batch
+        that read it last (``stages`` iterations back) has committed to the
+        slot's ``md_empty``; the first round passes on the init arrive."""
+        if loop not in self.streamed:
+            return
+        stages = self.tc.stages
+        self.emit(
+            f"{_RT}.mbar_wait(md_empty{loop} + ({count}) % {stages}, "
+            f"(({count}) // {stages}) & 1)"
+        )
+
+    def emit_streamed_iteration(self, loop: Loop, begin: str, end: str) -> None:
+        """One iteration of a streamed ring loop (``streamed_ring_loops``):
+        wait for the slot's previous reader and its TMA, run the passes,
+        issue the batch (its commit arrives on ``md_cb`` and the slot's
+        ``md_empty``), then warp 0 refills the slot the previous batch read
+        once that batch alone is done.  No thread waits for the previous
+        iteration's batch, so the passes overlap it."""
+        tc = self.tc
+        index = loop.index
+        var = self.loop_index_var(index)
+        stages = tc.stages
+        count = self.counter(index)
+        tiles = tc.ring_tiles.get(index, ())
+        passes = self.has_passes(tiles)
+        # A plain K loop (no pass writes the slot, no aux tile): nothing but
+        # the TMA refill (which waits for the slot's previous reader itself)
+        # touches the slot, so only warp 0 waits for its tile -- in
+        # ``emit_blocks``, ahead of the MMAs -- and no CTA barrier separates
+        # the iterations (a GEMM K loop: 0.043 -> 0.021 ms at 2048^3).
+        self.streaming_fast = not passes and not tc.aux_tiles.get(index)
+        if not self.streaming_fast:
+            self.emit_slot_free_wait(index, count)
+            self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
+            self.ring_waited.add(index)
+        if passes:
+            self.emit_passes(tiles, f"md_st{index}", None, "md_tidx", self.plan.threads)
+        self.streaming = index
+        try:
+            self.emit_segment(loop.steps, loop)
+        finally:
+            self.streaming = None
+            self.streaming_fast = False
+        assert not self.drains
+        # The refill ``stages - 1`` iterations ahead lands in the slot the
+        # previous batch read (this batch's own slot with a single stage):
+        # the issuing thread alone waits for that batch.
+        ahead = max(stages - 1, 1)
+        offset = var if begin == "0" else f"({var} - {begin})"
+        issue = f"{count} + {ahead}"
+        with (
+            self.nest("if md_warp == 0:"),
+            self.nest(f"if {_PRIMS}.elect_sync():"),
+            self.nest(f"if {offset} + {ahead} < {end} - {begin}:"),
+        ):
+            self.emit_slot_free_wait(index, issue)
+            self.emit_ring_issue(
+                index, {**self.values, index: f"({var} + {ahead})"}, issue
+            )
 
     def enter_iteration(self, loop: Loop) -> None:  # type: ignore[override]
         var = self.loop_index_var(loop.index)
@@ -3999,72 +5214,20 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         for tile in self.tc.staged_tiles.get(loop.index, ()):
             self.settled.discard(tile.key)
 
-    def emit_streaming_iteration(
-        self, loop: Loop, begin: str, end: str, trip: int | None
-    ) -> None:
-        """One iteration of a ``streaming_loop``, two warps: warp 0 (the
-        consumer) waits for the iteration's ring slot, issues the batch and
-        commits it to the slot's empty barrier; warp 1 (the producer) waits
-        for the commit of the iteration that read the slot of iteration ``i
-        + stages - 1`` and refills it.  The two chains of waits and issues
-        overlap instead of following each other in one thread.  No other
-        warp takes part: they meet at the barrier after the loop."""
-        tc = self.tc
-        index = loop.index
-        var = self.loop_index_var(index)
-        self.enter_iteration(loop)
-        self.ring_waited = set()
-        dots = [step for step in loop.steps if isinstance(step, Dot)]
-        count = self.counter(index)
-        stages = tc.stages
-        with self.nest("if md_warp == 0:"):
-            self.emit(
-                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
-            )
-            self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
-            for dot in dots:
-                self.emit_dot_mmas(dot, self.stage_expr(index), accumulate=True)
-                self.defined.add(dot.node)
-            with self.nest(f"if {_PRIMS}.elect_sync():"):
-                self.emit(
-                    f"{_PRIMS}.tcgen05_commit(md_empty{index} + md_st{index}, "
-                    f"group={_PRIMS}.CTAGroup.CTA_1)"
-                )
-        ahead = stages - 1
-        offset = var if begin == "0" else f"({var} - {begin})"
-        with (
-            self.nest("if md_warp == 1:"),
-            self.nest(f"if {offset} + {ahead} < {end} - {begin}:"),
-            self.nest(f"if {_PRIMS}.elect_sync():"),
-        ):
-            # The slot of iteration ``count + ahead`` is the one iteration
-            # ``count - 1`` read: its commit's phase is ``(count - 1) //
-            # stages`` (the first use of a slot waits for the phase before a
-            # fresh barrier's, which completes at once).
-            self.emit(
-                f"{_RT}.mbar_wait(md_empty{index} + ({count} + {stages - 1}) % {stages}, "
-                f"(({count} + {stages - 1}) // {stages} + 1) & 1)"
-            )
-            self.emit_ring_issue(
-                index,
-                {**self.values, index: f"({var} + {ahead})"},
-                f"{count} + {ahead}",
-            )
-
     def emit_ring_iteration(
         self, loop: Loop, begin: str, end: str, trip: int | None
     ) -> None:
         tc, program = self.tc, self.program
         index = loop.index
-        if index in self.streaming_loops:
-            self.emit_streaming_iteration(loop, begin, end, trip)
-            return
         var = self.loop_index_var(index)
         self.enter_iteration(loop)
         self.ring_waited = set()
         self.derived_words = {}
         # The back edge may carry the previous iteration's commit.
         self.waited = False
+        if index in self.streamed:
+            self.emit_streamed_iteration(loop, begin, end)
+            return
         derived = [
             step
             for step in program.derived
@@ -4230,6 +5393,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             for operand in (dot.a, dot.b):
                 if hoisted_exchange_loop(program, dot, operand) != loop.index:
                     continue
+                if (dot.node, operand.role) in tc.tmem_operands:
+                    continue
                 tile = tc.tile(dot, operand)
                 if tile.key not in self.written and tile not in tiles:
                     tiles.append(tile)
@@ -4265,16 +5430,43 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 if self.drains:
                     self.emit(self.sync)
                     self.flush_drains()
-                if self.tc.store_tma:
+                if self.tc.store_tma and not (
+                    self.persistent
+                    and all(
+                        store.loop < 0
+                        for store in self.program.stores
+                        if store.access.node in self.tc.store_tma
+                    )
+                ):
                     # The staging buffers may overlay the loop's frames (a
                     # root buffer; a sibling loop's): every TMA store group
                     # issued so far -- behind a batch's commit, or just now
-                    # -- finishes reading before the prologue TMA lands.
+                    # -- finishes reading before the prologue TMA lands.  (A
+                    # persistent launch's root staging lives beside the
+                    # frames, ``persistent_items``: only a loop store's
+                    # buffer can overlay a sibling's frame.)
                     self.emit_tma_store_wait(read=True)
                     self.emit(self.sync)
                 if loop is None:
                     self.emit_hoisted_exchanges(step)
-                self.emit_region_loop(step, region)
+                self.loop_depth += 1
+                try:
+                    if self.tc.lookahead and step.index == self.tc.lookahead_loop:
+                        # (``plan_tcgen05_regions`` declined a streamed
+                        # candidate.)
+                        assert step.index not in self.streamed
+                        self.emit_lookahead_loop(step, region)
+                    else:
+                        self.emit_region_loop(step, region)
+                finally:
+                    self.loop_depth -= 1
+                if loop is None and not self.root_group_issued:
+                    # The loop exited (behind its barrier): its reads of the
+                    # root group's tiles are over once its last batch is.
+                    if ("loop", step.index) in self.root_readers_left:
+                        self.wait_latest()
+                        self.root_readers_left.discard(("loop", step.index))
+                    self.maybe_issue_root_group()
                 continue
             segment.append(step)
         self.emit_segment(segment, loop)
@@ -4286,7 +5478,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.emit("md_tidx, _, _ = cute.arch.thread_idx()")
         self.emit("md_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())")
         self.emit("md_lane = md_tidx % 32")
-        self.emit(f"md_epi = md_warp < {TCGEN05_EPILOGUE_WARPS}")
+        self.emit(f"md_epi = md_warp < {self.epilogue_warps}")
         heights = {slot.rows for slot in tc.slots}
         if 64 in heights:
             self.emit("md_row64 = (md_warp % 4) * 16 + md_lane % 16")
@@ -4295,9 +5487,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 for index in range(len(tc.slots))
             ):
                 self.emit("md_rowok = md_lane < 16")
-            for index, slot in enumerate(tc.slots):
-                if self.half_cols(index):
-                    self.emit(f"md_cb{index} = (md_lane // 16) * {slot.cols // 2}")
+            if not self.split:
+                for index, slot in enumerate(tc.slots):
+                    if self.half_cols(index):
+                        self.emit(f"md_cb{index} = (md_lane // 16) * {slot.cols // 2}")
         if 128 in heights:
             self.emit("md_row128 = (md_warp % 4) * 32 + md_lane")
         if self.fixup:
@@ -4309,23 +5502,40 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             self.emit(f"md_mtile = cutlass.Int32(cute.arch.block_idx()[0]) // {tiles}")
             self.emit(f"md_rows = cutlass.Int32(cute.arch.grid_dim()[0]) // {tiles}")
             self.emit("md_gen = cutlass.Uint32(0)")
-        self.define_axis_bases()
+        if self.split:
+            # This thread's first fragment column: the warp pair's half,
+            # plus the lane half's of a 64-row tile.
+            for index in range(len(tc.slots)):
+                terms = [f"(md_warp // 4) * {self.warp_cols(index)}"]
+                if self.half_cols(index):
+                    terms.append(f"(md_lane // 16) * {self.local_cols(index)}")
+                self.emit(f"md_cb{index} = {' + '.join(terms)}")
+        persistent = self.persistent
+        if not persistent:
+            self.define_axis_bases()
         self.emit(
             f"md_smem = cute.arch.alloc_smem(cutlass.Uint8, {max(self.smem_bytes, 16)}, alignment={SLAB_ALIGNMENT})"
         )
         self.emit("md_s0 = cutlass.Int32(md_smem.toint())")
         self.emit("md_cb = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)")
         barriers = ["md_cb"]
+        if tc.lookahead:
+            # The lookahead loop's two commit barriers (even / odd
+            # iterations): two commits in flight.  ``md_lke``: every epilogue
+            # thread arrives once per iteration when its reads of the dot's
+            # half are done; warp 0 waits on it before the dot two iterations
+            # on overwrites that half (no CTA barrier in the loop).
+            self.emit("md_lkb = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)")
+            self.emit("md_lke = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)")
+            barriers += ["md_lkb + 0", "md_lkb + 1"]
         for loop in self.ring_loops:
             self.emit(
                 f"md_full{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
             )
-        for loop in sorted(self.streaming_loops):
-            # Per-slot "empty" barriers: the batch that read a ring slot
-            # commits to it, the refill of the slot waits for it.
-            self.emit(
-                f"md_empty{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
-            )
+            if loop in self.streamed:
+                self.emit(
+                    f"md_empty{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
+                )
         staged_regions = sorted(region for region, tx in tc.staged_tx.items() if tx)
         for region in staged_regions:
             self.emit(
@@ -4345,16 +5555,26 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         with self.nest("if md_tidx == 0:"):
             for name in barriers:
                 self.emit(f"{_PRIMS}.mbarrier_init({name}, 1)")
+            if tc.lookahead:
+                self.emit(f"{_PRIMS}.mbarrier_init(md_lke, {32 * self.epilogue_warps})")
             for loop in self.ring_loops:
                 for stage in range(tc.stages):
                     self.emit(f"{_PRIMS}.mbarrier_init(md_full{loop} + {stage}, 1)")
-            for loop in sorted(self.streaming_loops):
-                for stage in range(tc.stages):
-                    self.emit(f"{_PRIMS}.mbarrier_init(md_empty{loop} + {stage}, 1)")
+                if loop in self.streamed:
+                    for stage in range(tc.stages):
+                        self.emit(
+                            f"{_PRIMS}.mbarrier_init(md_empty{loop} + {stage}, 1)"
+                        )
             if cluster_reduces:
                 self.emit(f"{_PRIMS}.mbarrier_init(md_clb, 1)")
                 self.emit(f"{_PRIMS}.mbarrier_init(md_clb + 1, 1)")
             self.emit(f"{_PRIMS}.fence_mbarrier_init()")
+            for loop in self.ring_loops:
+                if loop in self.streamed:
+                    # Every slot starts free: its first tile has no earlier
+                    # reader (the first round waits parity 0).
+                    for stage in range(tc.stages):
+                        self.emit(f"{_PRIMS}.mbarrier_arrive(md_empty{loop} + {stage})")
             self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
         with self.nest("if md_warp == 0:"):
             self.emit(
@@ -4374,6 +5594,30 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 f"md_acc{index} = cutlass.inttoptr(md_tmem + {slot.column}, "
                 f"{_RT}.TMEM_SPACE, cutlass.Float32)"
             )
+        if persistent:
+            # Everything above runs once per CTA, ahead of the tile loop
+            # (the generic persistent_interleaved program ids wrap the rest
+            # in it), with the instruction descriptors and the counters: the
+            # loops' ring / commit counters run on across the CTA's tiles
+            # (every wait's parity derives from them), ``md_tn`` counts its
+            # finished tiles (the root group barrier's parity).  The tile's
+            # coordinates, bases and the next tile's program id start its
+            # body.
+            self.emit_instr_descs()
+            self.emit("md_cn = cutlass.Int32(0)")
+            for loop in sorted(self.counted):
+                self.emit(f"{self.counter(loop)} = cutlass.Int32(0)")
+            self.emit("md_tn = cutlass.Int32(0)")
+            self.cross_tile = self.plan_region_cross_tile()
+            if self.cross_tile and tc.staged_tx.get(-1):
+                # (No reader found: the tile's end issues it.)
+                self.root_readers_left = self.root_group_readers() or {"tile end"}
+                self.root_group_issued = False
+                self.root_group_after_loop = self.root_group_deferral()
+            self.setup_end = len(self.lines)
+            self.define_axis_bases()
+            if self.cross_tile:
+                self.emit(f"md_npid = {self.next_pid}")
         for slot in sorted(self.resident):
             # A register carry's row (every thread defines the scalars so the
             # epilogue warps' assignments keep their type across the loops).
@@ -4388,30 +5632,34 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             self.tensor_names[access.node] = self.df.tensor_arg(
                 access.fake, prefer_name=access.name
             ).name
-        for dot in program.dots:
-            index = self.dot_index[dot.node]
-            dtype = _OPERAND_DTYPE_NAMES[dot.a.dtype]
-            self.emit(
-                f"md_idesc{index} = {_PRIMS}.Tcgen05InstrDesc.build(c_dtype=cutlass.Float32, "
-                f"a_dtype={dtype}, b_dtype={dtype}, n_dim={plan.size(dot.cols)}, "
-                f"m_dim={plan.size(dot.rows)}, a_major={int(not self.k_major(dot.a))}, "
-                f"b_major={int(not self.k_major(dot.b))})"
-            )
-        self.emit("md_cn = cutlass.Int32(0)")
-        for loop in sorted(self.counted):
-            self.emit(f"{self.counter(loop)} = cutlass.Int32(0)")
+        if not persistent:
+            self.emit_instr_descs()
+            self.emit("md_cn = cutlass.Int32(0)")
+            for loop in sorted(self.counted):
+                self.emit(f"{self.counter(loop)} = cutlass.Int32(0)")
         for slot in range(len(program.vec_slots)):
             self.emit(f"{self.vreg(slot)} = cutlass.Float32(0.0)")
         self.define_iteration_bases(-1)
         if tc.tma:
-            with self.nest("if md_warp == 0:"), self.nest(f"if {_PRIMS}.elect_sync():"):
+            # Under a cross-tile prefetch only the CTA's first tile issues
+            # its own root group: its predecessor issued every later tile's
+            # (``emit_next_tile_root_group``).
+            with (
+                self.nest("if md_warp == 0:"),
+                self.nest(f"if {_PRIMS}.elect_sync():"),
+                self.nest("if md_tn == 0:") if self.cross_tile else _NoNest(),
+            ):
                 for spec in tc.tma:
                     self.emit(f"{_PRIMS}.prefetch_tensormap({spec.param}.get_ptr())")
-                if tc.staged_tx.get(-1):
+                if tc.staged_tx.get(-1) and self.root_group_after_loop is None:
                     self.emit_tma_group(
                         [
                             *tc.staged_tiles.get(-1, ()),
-                            *(t for t in tc.aux_tiles.get(-1, ()) if not t.ring),
+                            *(
+                                tile
+                                for tile in tc.aux_tiles.get(-1, ())
+                                if tile.tma is not None
+                            ),
                         ],
                         {},
                         self.sf_name(-1),
@@ -4423,11 +5671,34 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         if self.drains:
             self.emit(self.sync)
             self.flush_drains()
-        # The TMA stores complete before the kernel ends.
-        self.emit_tma_store_wait(read=False)
-        self.wait_latest()
-        self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)")
-        self.emit(self.sync)
+        if persistent:
+            # The tile's end: every commit is waited and every thread's
+            # tensor-memory reads are fenced and published, so the next
+            # tile's MMAs may overwrite the columns and its loads may land
+            # in every frame; the next tile's root group goes out here when
+            # no earlier point issued it, and the tile count advances.  The
+            # barriers are never re-armed: each one's phases run on its
+            # counter.  The TMA stores keep reading their staging tiles
+            # into the next tile, which waits for them ahead of its own
+            # stage-in (``emit_blocks``).
+            self.wait_latest()
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
+            )
+            self.emit(self.sync)
+            self.maybe_issue_root_group(final=True)
+            self.emit("md_tn = md_tn + 1")
+            self.teardown_start = len(self.lines)
+            # The TMA stores complete before the kernel ends.
+            self.emit_tma_store_wait(read=False)
+        else:
+            # The TMA stores complete before the kernel ends.
+            self.emit_tma_store_wait(read=False)
+            self.wait_latest()
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
+            )
+            self.emit(self.sync)
         if cluster_reduces:
             # No CTA exits while a peer may still read its exchange buffer.
             self.emit("cute.arch.cluster_arrive()")
@@ -4441,6 +5712,19 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             )
         assert plan.threads == 32 * tc.warps
         return "\n".join(self.lines) + "\n"
+
+    def emit_instr_descs(self) -> None:
+        """The tcgen05 instruction descriptor of every dot (each at its own
+        operand dtype and shared-tile majorness)."""
+        for dot in self.program.dots:
+            index = self.dot_index[dot.node]
+            dtype = _OPERAND_DTYPE_NAMES[dot.a.dtype]
+            self.emit(
+                f"md_idesc{index} = {_PRIMS}.Tcgen05InstrDesc.build(c_dtype=cutlass.Float32, "
+                f"a_dtype={dtype}, b_dtype={dtype}, n_dim={self.plan.size(dot.cols)}, "
+                f"m_dim={self.plan.size(dot.rows)}, a_major={int(not self.k_major(dot.a))}, "
+                f"b_major={int(not self.k_major(dot.b))})"
+            )
 
 
 __all__ = [

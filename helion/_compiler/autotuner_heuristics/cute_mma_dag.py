@@ -8,6 +8,7 @@ from typing import cast
 
 from ...runtime.config import Config
 from ..compile_environment import CompileEnvironment
+from ..cute.cute_mma_dag import AXIS_LOOP
 from ..cute.cute_mma_dag import AXIS_ROOT
 from ..cute.cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute.cute_mma_dag import MMA_DAG_AUX_RING
@@ -16,11 +17,16 @@ from ..cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from ..cute.cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
 from ..cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
 from ..cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
+from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_TMA
+from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
@@ -40,10 +46,12 @@ from ..cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute.cute_mma_dag import CuteMmaDagFacts
 from ..cute.cute_mma_dag import fixup_admitted
 from ..cute.cute_mma_dag import mma_dag_config_reason
+from ..cute.cute_mma_dag import mma_dag_cta_count
 from ..cute.cute_mma_dag import mma_dag_pass_warps_lead
 from ..cute.cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute.cute_mma_dag import mma_dag_seed_configs
 from ..cute.cute_mma_dag import mma_dag_seed_variants
+from ..cute.cutedsl_compat import hinted_cp_async_available
 from .cute_launch_bounds import MIN_BLOCKS_KEY
 from .registry import AutotunerHeuristic
 
@@ -101,7 +109,23 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             program = match_mma_dag(device_ir.graphs)
             if program is None:
                 return None
-            return mma_dag_facts(program)
+            # The facts read the bound inputs' alignment (the side tiles of
+            # the loops whose cp.async ring stages a tile for them:
+            # ``mma_dag_ring_loops``), and seed registration precedes the
+            # runtime's storage snapshot: evaluate the registered,
+            # metadata-only classifiers here and restore the prior snapshot
+            # afterwards (as the tcgen05 facts hook does).  Without a
+            # binding (no runtime values) no base is provably aligned and
+            # the knob is pinned to the lane loads.
+            saved = env.bound_runtime_input_specialization_results
+            try:
+                if env.runtime_arg_values_by_name:
+                    env.snapshot_runtime_input_specialization_results(
+                        env.runtime_arg_values_by_name
+                    )
+                return mma_dag_facts(program)
+            finally:
+                env.bound_runtime_input_specialization_results = saved
 
     @classmethod
     def register_facts(
@@ -126,8 +150,11 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         if facts is None or spec.cute_mma_dag is None:
             return None
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_lookahead_stages
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_persistent_ctas
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_split_seed
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_split_twins
 
         block_ids = spec.block_sizes.valid_block_ids()
         default_sizes = spec.default_config().config.get("block_sizes", [])
@@ -185,6 +212,26 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             or facts.tcgen05.tf32
             or cls.streaming_regions(facts)
         )
+        if (
+            tensor_memory_first
+            and tensor_memory
+            and facts.pass_chains
+            and facts.tcgen05 is not None
+            and bool(facts.loops)
+            and facts.tcgen05.streamed_loops == len(facts.loops)
+        ):
+            # A streamed K-loop program with a pass chain on a grid below 128
+            # CTAs at its top tensor-memory tile pays the tensor-memory setup
+            # (allocation, barriers, the root TMA group) and the chain's
+            # passes for a few iterations: the warp mode leads (se_block at
+            # 256x128: dx warp [16, 16, 32] 2.2 us against tcgen05 4.4-5.1
+            # over its tiles, dw 3.3 against 5.6).
+            sizes = tensor_memory[0][1][0]
+            resolved = [
+                cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))
+            ]
+            if mma_dag_cta_count(facts, resolved) < 128:
+                tensor_memory_first = False
         ranked = [
             (mode, seed, exchange, MMA_DAG_PASS_WARPS_OFF)
             for mode, seed, exchange in (
@@ -222,14 +269,108 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         MMA_DAG_PASS_WARPS_ON,
                     ),
                 )
+        # The split epilogue (``cute_mma_dag_epilogue='split'``, a region
+        # program without reductions): the largest root tile it admits at
+        # eight warps, right behind the first tensor-memory seed -- the
+        # 128 x 128 tile the row layout's register budget refuses (the
+        # sparse-attention indexer's logits: one wave of 128 CTAs, every warp
+        # over half a row).
+        # Ahead of it, the first tensor-memory seed's split twins
+        # (``tcgen05_split_twins``: its tile with the rows doubled and with
+        # the columns doubled at eight warps -- a thread's registers of the
+        # four-warp row layout over twice the tile; the indexer's 64 x 128
+        # split at (512, 4096) runs at Triton's 128-column tile's time).
+        epilogues: dict[int, str] = {}
+        if tensor_memory and facts.tcgen05 is not None and facts.tcgen05.regions:
+            top = (
+                MMA_DAG_TCGEN05,
+                tensor_memory[0][1],
+                MMA_DAG_EXCHANGE_AUTO,
+                MMA_DAG_PASS_WARPS_OFF,
+            )
+            split_seeds = tcgen05_split_twins(facts, tensor_memory[0][1])
+            split_seed = tcgen05_split_seed(facts)
+            if split_seed is not None and split_seed not in split_seeds:
+                split_seeds.append(split_seed)
+            at = ranked.index(top) + 1
+            for seed in split_seeds:
+                ranked.insert(
+                    at,
+                    (
+                        MMA_DAG_TCGEN05,
+                        seed,
+                        MMA_DAG_EXCHANGE_AUTO,
+                        MMA_DAG_PASS_WARPS_OFF,
+                    ),
+                )
+                epilogues[at] = MMA_DAG_EPILOGUE_SPLIT
+                at += 1
+        # The lookahead schedule (``cute_mma_dag_lookahead='on'``: the loop's
+        # dot one iteration ahead of its epilogue, on a doubled slot): the
+        # first tensor-memory seed and the split seeds again, right behind
+        # each, at two stages at least (the next tile lands under the
+        # epilogue) and three where the tile runs one CTA per SM
+        # (``tcgen05_lookahead_stages``: nothing else overlaps the refill).
+        lookaheads: dict[int, str] = {}
+        if (
+            tensor_memory
+            and facts.tcgen05 is not None
+            and facts.tcgen05.lookahead_loop >= 0
+        ):
+            top = (
+                MMA_DAG_TCGEN05,
+                tensor_memory[0][1],
+                MMA_DAG_EXCHANGE_AUTO,
+                MMA_DAG_PASS_WARPS_OFF,
+            )
+            for at in sorted({ranked.index(top), *epilogues}, reverse=True):
+                mode, (sizes, warps, stages), exchange, pass_warps = ranked[at]
+                stages = tcgen05_lookahead_stages(
+                    facts,
+                    sizes,
+                    warps,
+                    stages,
+                    epilogues.get(at) == MMA_DAG_EPILOGUE_SPLIT,
+                )
+                if (
+                    mma_dag_config_reason(
+                        facts,
+                        sizes,
+                        warps,
+                        stages,
+                        MMA_DAG_TCGEN05,
+                        epilogue=epilogues.get(at, MMA_DAG_EPILOGUE_ROW),
+                        lookahead=MMA_DAG_LOOKAHEAD_ON,
+                    )
+                    is not None
+                ):
+                    continue
+                ranked.insert(
+                    at + 1, (mode, (sizes, warps, stages), exchange, pass_warps)
+                )
+                epilogues = {
+                    (key + 1 if key > at else key): value
+                    for key, value in epilogues.items()
+                }
+                if at in epilogues:
+                    epilogues[at + 1] = epilogues[at]
+                lookaheads = {
+                    (key + 1 if key > at else key): value
+                    for key, value in lookaheads.items()
+                }
+                lookaheads[at + 1] = MMA_DAG_LOOKAHEAD_ON
         # The top tensor-memory seed again as a persistent launch at its
         # occupancy (the per-CTA setup paid once and no relaunch between a
         # CTA's tiles: b8 h80 mamba2 chunk state 161 -> 154 us), behind it,
         # and at one stage, whose occupancy a streaming program may want
         # over the ring (that kernel: four CTAs of one 128-deep stage per SM
-        # against two of two stages).
+        # against two of two stages).  A region program's tile loop also
+        # issues the next tile's loads under this tile's epilogue (the
+        # chunked linear-attention dqkg at (8, 8, 1024, 64, 64): every CTA
+        # of the flat launch waited ~40 % of its span on its first TMA);
+        # ``tcgen05_persistent_ctas`` is 0 where its layout does not fit.
         persistent: dict[int, int] = {}
-        if tensor_memory and facts.tcgen05 is not None and not facts.tcgen05.regions:
+        if tensor_memory and facts.tcgen05 is not None:
             top = (
                 MMA_DAG_TCGEN05,
                 tensor_memory[0][1],
@@ -238,16 +379,48 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             )
             sizes, warps, stages = top[1]
             at = ranked.index(top) + 1
-            for depth in dict.fromkeys((stages, 1)):
+            # ... and at one stage over the loop tile doubled (up to the
+            # extent) where that keeps the CTAs per SM: a persistent CTA
+            # walks several tiles, so each tile's loop wants the fewest
+            # iterations its shared memory allows -- one full slot instead
+            # of two half slots saves a barrier round and a commit wait per
+            # tile (dqkg at (8, 8, 1024, 64, 64): [1, 64, 64] at one stage
+            # 19.4 us against [1, 64, 32] at two stages 21.7).
+            doubled = dict(sizes)
+            for axis in facts.axes:
+                size = sizes.get(axis.block_id)
+                if axis.kind == AXIS_LOOP and type(size) is int and size < axis.extent:
+                    doubled[axis.block_id] = min(size * 2, axis.extent)
+            variants: list[tuple[dict[int, int], int]] = [
+                (sizes, depth) for depth in dict.fromkeys((stages, 1))
+            ]
+            if doubled != sizes:
+                variants.append((doubled, 1))
+            top_ctas = 0
+            for variant, depth in variants:
                 if (
-                    mma_dag_config_reason(facts, sizes, warps, depth, MMA_DAG_TCGEN05)
+                    mma_dag_config_reason(facts, variant, warps, depth, MMA_DAG_TCGEN05)
                     is not None
                 ):
                     continue
-                ctas = tcgen05_persistent_ctas(facts, sizes, depth)
+                ctas = tcgen05_persistent_ctas(facts, variant, depth)
+                if variant is sizes:
+                    top_ctas = max(top_ctas, ctas)
+                elif ctas < top_ctas:
+                    continue
                 if ctas:
-                    ranked.insert(at, (top[0], (sizes, warps, depth), *top[2:]))
+                    ranked.insert(at, (top[0], (variant, warps, depth), *top[2:]))
                     persistent[at] = ctas
+                    # (The split / lookahead twins behind the top seed keep
+                    # their entries.)
+                    epilogues = {
+                        (key + 1 if key >= at else key): value
+                        for key, value in epilogues.items()
+                    }
+                    lookaheads = {
+                        (key + 1 if key >= at else key): value
+                        for key, value in lookaheads.items()
+                    }
                     at += 1
         # Pass chains (a dot operand that is a pointwise chain over loaded
         # tiles): the first seed of each mode again with the chain written
@@ -255,6 +428,18 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         # it, so the autotuner compares the two routes at the same tile.
         derived_variants: dict[int, str] = {}
         if facts.pass_chains:
+            # On tensor memory the pass route leads where every loop of the
+            # program streams under it (the K-loop GEMMs with a computed
+            # operand: the chain's tile is a ring slot and the loop never
+            # waits for the previous batch; se_block dx at 1024x512 [64, 64,
+            # 64] 8w s4: pass 9.9 us, exchange 12.0; at 4096x1024 [128,
+            # 128, 64] 8w s2: 67 against 72), the exchange route elsewhere.
+            tc_facts = facts.tcgen05
+            pass_leads = (
+                tc_facts is not None
+                and bool(facts.loops)
+                and tc_facts.streamed_loops == len(facts.loops)
+            )
             seen_modes: set[str] = set()
             at = 0
             while at < len(ranked):
@@ -262,13 +447,155 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 if mode not in seen_modes:
                     seen_modes.add(mode)
                     ranked.insert(at + 1, ranked[at])
-                    derived_variants[at + 1] = MMA_DAG_DERIVED_PASS
+                    twin = at if pass_leads and mode == MMA_DAG_TCGEN05 else at + 1
+                    derived_variants[twin] = MMA_DAG_DERIVED_PASS
                     persistent = {
                         (key + 1 if key > at else key): value
                         for key, value in persistent.items()
                     }
+                    epilogues = {
+                        (key + 1 if key > at else key): value
+                        for key, value in epilogues.items()
+                    }
+                    if at in epilogues:
+                        epilogues[at + 1] = epilogues[at]
+                    lookaheads = {
+                        (key + 1 if key > at else key): value
+                        for key, value in lookaheads.items()
+                    }
+                    if at in lookaheads:
+                        lookaheads[at + 1] = lookaheads[at]
                     at += 1
                 at += 1
+        # The first warp seed again with its side loads riding the ring
+        # (``cute_mma_dag_aux='ring'``), right behind the seed (and its
+        # derived-route twin, when it has one): a serial chunk loop's decay
+        # scalar and gate row are first touched from DRAM every iteration,
+        # which the per-thread loads expose (bwd_dh at (8, 8, 1024, 64, 64):
+        # 19.9 -> 11.1 us on the warp tile; gated fwd_h behind the writer of
+        # its gates in the mamba2 ssd pipeline).  The plain seed stays the
+        # promoted default; the autotuner measures both.  No twin without a
+        # subject (``aux_candidates`` is False when no side load varies with
+        # a loop whose ring stages a tile for the bound inputs).
+        aux_twins: set[int] = set()
+        if facts.aux_candidates:
+            at = next(
+                (i for i, entry in enumerate(ranked) if entry[0] == MMA_DAG_WARP),
+                None,
+            )
+            if at is not None:
+                insert_at = at + 1
+                while insert_at in derived_variants:
+                    insert_at += 1
+                ranked.insert(insert_at, ranked[at])
+                aux_twins.add(insert_at)
+                persistent = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in persistent.items()
+                }
+                derived_variants = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in derived_variants.items()
+                }
+                epilogues = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in epilogues.items()
+                }
+                lookaheads = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in lookaheads.items()
+                }
+        # The first warp seed again with the staged operand tiles' cp.async
+        # packets hinted ``L2::evict_last`` (``load_eviction_policies``
+        # "l2_last" at the staged slots, ``MMA_DAG_L2_HINTS``), right behind
+        # it and its derived-route / side-load twins: the operand tiles of a
+        # cold launch stay partly L2-resident across other traffic behind
+        # the hint (the indexer's decode at s0, B200, campaign protocol: 2.8
+        # -> 2.5 us against Triton's evict_last kernel's 2.4; s1 7.7 -> 7.5).
+        # The plain seed stays the promoted default; the autotuner measures
+        # both.  No twin where the hinted packets cannot
+        # be verified (``hinted_cp_async_available``: the normalizer pins
+        # the slots to "" there, so the twin would be the seed again).
+        # (The occupancy-hint twin below follows it.)
+        hinted: set[int] = set()
+        eviction_length = spec.load_eviction_policies.length
+        if (
+            facts.staged_slots
+            and eviction_length > max(facts.staged_slots)
+            and hinted_cp_async_available()
+        ):
+            at = next(
+                (i for i, entry in enumerate(ranked) if entry[0] == MMA_DAG_WARP),
+                None,
+            )
+            if at is not None:
+                insert_at = at + 1
+                while insert_at in derived_variants or insert_at in aux_twins:
+                    insert_at += 1
+                ranked.insert(insert_at, ranked[at])
+                hinted.add(insert_at)
+                persistent = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in persistent.items()
+                }
+                derived_variants = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in derived_variants.items()
+                }
+                epilogues = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in epilogues.items()
+                }
+                lookaheads = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in lookaheads.items()
+                }
+                aux_twins = {
+                    (key + 1 if key >= insert_at else key) for key in aux_twins
+                }
+        # The first warp seed again with the one-CTA occupancy hint
+        # (``cute_min_blocks_per_mp`` 1), behind its other twins: ptxas
+        # otherwise budgets registers for the CTAs the shared-memory
+        # footprint admits, and a single-wave kernel gains nothing from that
+        # occupancy (chunk_scan at s1, 256 CTAs: 4.22 -> 3.95 us with the
+        # hint on the same tile / warps / stages; the search found it in one
+        # of three cold draws).
+        occupancy: set[int] = set()
+        if spec.supports_config_key(MIN_BLOCKS_KEY):
+            at = next(
+                (i for i, entry in enumerate(ranked) if entry[0] == MMA_DAG_WARP),
+                None,
+            )
+            if at is not None:
+                insert_at = at + 1
+                while (
+                    insert_at in derived_variants
+                    or insert_at in aux_twins
+                    or insert_at in hinted
+                ):
+                    insert_at += 1
+                ranked.insert(insert_at, ranked[at])
+                occupancy.add(insert_at)
+                persistent = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in persistent.items()
+                }
+                derived_variants = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in derived_variants.items()
+                }
+                epilogues = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in epilogues.items()
+                }
+                lookaheads = {
+                    (key + 1 if key >= insert_at else key): value
+                    for key, value in lookaheads.items()
+                }
+                aux_twins = {
+                    (key + 1 if key >= insert_at else key) for key in aux_twins
+                }
+                hinted = {(key + 1 if key >= insert_at else key) for key in hinted}
         for index, (mode, (sizes, warps, stages), exchange, pass_warps) in enumerate(
             ranked
         ):
@@ -294,6 +621,19 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 config[MMA_DAG_EXCHANGE_KEY] = exchange
             if index in persistent:
                 config[MMA_DAG_PERSISTENT_KEY] = persistent[index]
+            if index in epilogues:
+                config[MMA_DAG_EPILOGUE_KEY] = epilogues[index]
+            if index in lookaheads:
+                config[MMA_DAG_LOOKAHEAD_KEY] = lookaheads[index]
+            if index in aux_twins:
+                config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_RING
+            if index in occupancy:
+                config[MIN_BLOCKS_KEY] = 1
+            if index in hinted:
+                policies = [""] * eviction_length
+                for slot in facts.staged_slots:
+                    policies[slot] = "l2_last"
+                config["load_eviction_policies"] = policies
             # A seed slicing the cluster-split axis names its cluster, and
             # launches as a programmatic dependent: the region renderer's
             # prologue (barriers, tensor memory, the cluster sync) then
@@ -324,45 +664,6 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         )
                     continue
             seeds.append(Config.from_dict(config))
-        # The top warp seed's twins sit right behind it and its derived-pass
-        # variant (the two routes stay adjacent at the same tile).
-        top_warp = next(
-            (
-                at
-                for at, seed in enumerate(seeds)
-                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP
-            ),
-            None,
-        )
-        if top_warp is not None:
-            twin_at = top_warp + 1
-            if (
-                twin_at < len(seeds)
-                and seeds[twin_at].config[MMA_DAG_DERIVED_KEY] == MMA_DAG_DERIVED_PASS
-                and seeds[twin_at].config["block_sizes"]
-                == seeds[top_warp].config["block_sizes"]
-            ):
-                twin_at += 1
-            top = seeds[top_warp].config
-            if facts.aux_candidates:
-                # The top warp seed again with the loop-varying side loads
-                # staged through the operand ring (gated fwd_h behind the
-                # writer of its gates in the mamba2 ssd pipeline: the
-                # fresh-line stall of the per-thread loads leaves the serial
-                # chain).
-                ring = {**top, MMA_DAG_AUX_KEY: MMA_DAG_AUX_RING}
-                seeds.insert(twin_at, Config.from_dict(ring))
-                twin_at += 1
-            if spec.supports_config_key(MIN_BLOCKS_KEY):
-                # The top warp seed again with the one-CTA occupancy hint:
-                # ptxas otherwise budgets registers for the CTAs the
-                # shared-memory footprint admits, and a single-wave kernel
-                # gains nothing from that occupancy (chunk_scan at s1, 256
-                # CTAs: 4.22 -> 3.95 us with the hint on the same tile /
-                # warps / stages; the search found it in one of three cold
-                # draws).
-                hinted = {**top, MIN_BLOCKS_KEY: 1}
-                seeds.insert(twin_at, Config.from_dict(hinted))
         return seeds or None
 
     @classmethod
