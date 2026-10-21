@@ -2079,6 +2079,109 @@ class TestAutotuneSeedConfigs(TestCase):
             )
         )
 
+    @onlyBackends("triton")
+    @skipIfRefEager("Requires compiled candidate benchmarks")
+    def test_transferred_seeds_are_measured_selected_and_cached(self) -> None:
+        seeds = [
+            helion.Config(block_sizes=[16, 64], num_warps=8, range_num_stages=[]),
+            helion.Config(block_sizes=[8, 32], num_warps=4, range_num_stages=[]),
+        ]
+        original_seeds = copy.deepcopy(seeds)
+
+        for seed_order in (seeds, list(reversed(seeds))):
+            with (
+                self.subTest(seed_order=seed_order),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+
+                @helion.kernel(
+                    autotune_log_level=0,
+                    autotune_random_seed=3772,
+                    autotune_seed_configs=seed_order,
+                    autotune_precompile=None,
+                    autotune_benchmark_subprocess=False,
+                )
+                def row_sum(x: torch.Tensor) -> torch.Tensor:
+                    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+                    for tile_m in hl.tile(x.size(0)):
+                        acc = hl.zeros([tile_m], dtype=torch.float32)
+                        for tile_n in hl.tile(x.size(1)):
+                            acc += x[tile_m, tile_n].sum(-1)
+                        out[tile_m] = acc
+                    return out
+
+                generator = torch.Generator(device=DEVICE).manual_seed(3772)
+                args = (torch.randn([127, 257], device=DEVICE, generator=generator),)
+                bound = row_sum.bind(args)
+                if not bound.config_spec.range_num_stages:
+                    self.skipTest("range_num_stages is not tunable on this device")
+                measured: list[tuple[helion.Config, float]] = []
+                benchmark = LocalBenchmarkProvider._benchmark_function
+
+                def measured_benchmark(
+                    provider,
+                    config,
+                    fn,
+                    *,
+                    benchmark=benchmark,
+                    measured=measured,
+                    **kwargs,
+                ):
+                    actual = benchmark(provider, config, fn, **kwargs)
+                    measured.append((config, actual))
+                    return actual
+
+                def make_search(bound=bound, args=args):
+                    return PatternSearch(
+                        bound,
+                        args,
+                        max_generations=0,
+                        initial_population=3,
+                        best_available_pad_random=False,
+                        initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                    )
+
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"HELION_CACHE_DIR": directory, "HELION_SKIP_CACHE": "0"},
+                    ),
+                    patch.object(
+                        BaseSearch, "_find_similar_cached_configs", return_value=[]
+                    ),
+                    patch.object(
+                        LocalBenchmarkProvider,
+                        "_benchmark_function",
+                        new=measured_benchmark,
+                    ),
+                ):
+                    search = make_search()
+                    chosen = LocalAutotuneCache(search).autotune(skip_cache=True)
+                    for seed in seeds:
+                        self.assertTrue(
+                            any(
+                                config.block_sizes == seed.block_sizes
+                                and config.num_warps == seed.num_warps
+                                and math.isfinite(perf)
+                                for config, perf in measured
+                            )
+                        )
+                    self.assertEqual(chosen, search.best.config)
+                    self.assertTrue(math.isfinite(search.best.perf))
+                    self.assertEqual(seeds, original_seeds)
+                    self.assertTrue(list(Path(directory).glob("*.best_config")))
+
+                    reload_search = make_search()
+                    with patch.object(
+                        reload_search,
+                        "autotune",
+                        side_effect=AssertionError("cache miss"),
+                    ):
+                        reloaded = LocalAutotuneCache(reload_search).autotune()
+                    self.assertEqual(reloaded, chosen)
+                    bound.set_config(reloaded)
+                    torch.testing.assert_close(bound(*args), args[0].sum(-1))
+
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @onlyBackends(["triton", "cute"])
