@@ -4353,6 +4353,8 @@ def _cute_staged_plan_operands(
             roles = (("lhs_idx", "rhs_idx"), ())
             if plan.get("sf_tma") is True:
                 roles = (("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx"), ())
+            if plan.get("tma_output") is True:
+                roles = (roles[0], ("out_idx",))
         if roles is None:
             continue
         input_keys, output_keys = roles
@@ -4388,6 +4390,14 @@ def _cute_stage_under_aligned_operands(
         for key in ("lhs_scale_idx", "rhs_scale_idx")
         if isinstance(index := plan.get(key), int)
     }
+    tma_output_indices = {
+        index
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "block_scaled_mma"
+        and plan.get("format") == "mxfp8"
+        and plan.get("tma_output") is True
+        and isinstance(index := plan.get("out_idx"), int)
+    }
     for index, is_output in _cute_staged_plan_operands(cute_kernel):
         tensor = args[index]
         if (
@@ -4397,9 +4407,12 @@ def _cute_stage_under_aligned_operands(
             continue
         if staged is None:
             staged = list(args)
-        if index in tma_scale_indices:
+        if index in tma_scale_indices or index in tma_output_indices:
             copy = torch.empty_strided(
-                tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
+                tensor.size(),
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device=tensor.device,
             )
             copy.copy_(tensor)
         else:

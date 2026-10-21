@@ -234,6 +234,7 @@ def test_legal_old_seeds_remain_and_the_proved_sf_pipeline_is_discoverable() -> 
                     seed
                     for seed in normalized
                     if seed.get("cute_scaled_sf_tma") is not True
+                    and seed.get("cute_scaled_epilogue_mode", "default") == "default"
                 ]
             )
             == 49
