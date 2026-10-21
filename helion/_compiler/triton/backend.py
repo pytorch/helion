@@ -172,6 +172,10 @@ class _FirstLaunchFit:
         from triton.runtime.errors import OutOfResources
 
         tried = self.current
+        if tried[1] is not self.compiled:
+            # Another caller may still be loading this candidate. Establish
+            # this call's original error before joining its fit.
+            tried = (self.config, self.compiled, True)
         launch = (triton_kernel, grid, args, num_warps, num_stages, kwargs)
         try:
             return self.launch_as(tried, *launch)
@@ -200,18 +204,23 @@ class _FirstLaunchFit:
                     return self.launch_as(tried, *launch)
                 except OutOfResources as error:
                     last_error = error
-                except Exception:
-                    # The smaller config fails another way; give up on fitting
-                    # and report the original error, as before.
-                    log.debug(
-                        "%s: not fitting the config to this device",
-                        self.bound_kernel.kernel.name,
-                        exc_info=True,
-                    )
-                    with self.lock:
-                        self.current = (self.config, self.compiled, True)
-                        self.attempts = _MAX_DEVICE_FIT_ATTEMPTS
-                    raise first_error from None
+        except Exception:
+            # Every terminal failure restores the original launch, including
+            # exhausted candidates and host code that cannot safely be reused.
+            log.debug(
+                "%s: not fitting the config to this device",
+                self.bound_kernel.kernel.name,
+                exc_info=True,
+            )
+            with self.lock:
+                self.current = (self.config, self.compiled, True)
+                self.attempts = _MAX_DEVICE_FIT_ATTEMPTS
+            raise first_error from None
+        except BaseException:
+            # An interrupted fit can be retried, starting from the original.
+            with self.lock:
+                self.current = (self.config, self.compiled, True)
+            raise
         finally:
             # The errors' tracebacks refer to this frame and its arguments.
             first_error = last_error = None
