@@ -44,7 +44,14 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_balanced_workers import balanced_workers_index_domain
+from ..._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain
 from ..._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_CHOICES
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from ..._compiler.cute.grouped_panel_raster import grouped_device_panel_index_domain
+from ..._compiler.cute.grouped_panel_raster import grouped_panel_ratio_index_domain
 from ..._compiler.cute.grouped_row_union import (
     schedule_by_name as row_union_schedule_by_name,
 )
@@ -57,6 +64,7 @@ from ..._compiler.cute.grouped_worklist import (
     tcgen05_grouped_worklist_compatible_source_m_tiles,
 )
 from ..._compiler.cute.grouped_worklist import validate_tcgen05_grouped_worklist_rows
+from ..._compiler.cute.strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
 from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
@@ -71,6 +79,9 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+)
 from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
@@ -424,6 +435,7 @@ def _append_cute_wrapper_plan(
         rank3_mnl_tensor: bool = False,
         orientation: str = "mn",
         column_major: bool = False,
+        bounded_output_shift: bool = False,
     ) -> None:
         assert len(kernel_args) == 2
         assert orientation in ("mn", "nm")
@@ -486,6 +498,27 @@ def _append_cute_wrapper_plan(
             if worklist_nm_store
             else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
         )
+        gmem_pointer = f"arg{tensor_idx}.iterator"
+        if bounded_output_shift:
+            if not rank3_mnl_tensor or column_major or descriptors is not None:
+                raise exc.BackendUnsupported(
+                    "cute", "bounded D shift requires its proved rank-3 output view"
+                )
+            extra_extent = f"arg{tensor_idx}_shape0 + 1"
+            rank3_gmem_shape = (
+                f"(arg{tensor_idx}_shape1, arg{tensor_idx}_shape0, {extra_extent})"
+                if worklist_nm_store
+                else f"(arg{tensor_idx}_shape0, arg{tensor_idx}_shape1, {extra_extent})"
+            )
+            rank3_gmem_stride = (
+                f"(arg{tensor_idx}_stride1, arg{tensor_idx}_stride0, arg{tensor_idx}_stride0)"
+                if worklist_nm_store
+                else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, arg{tensor_idx}_stride0)"
+            )
+            gmem_pointer = (
+                f"(arg{tensor_idx}.iterator - cutlass.Int64(arg{tensor_idx}_shape0) "
+                f"* cutlass.Int64(arg{tensor_idx}_stride0))"
+            )
         gmem_layout = (
             descriptors.layout(f"arg{tensor_idx}", output=True)
             if descriptors is not None
@@ -507,7 +540,7 @@ def _append_cute_wrapper_plan(
                     (
                         (
                             f"    {gmem_tensor} = cute.make_tensor("
-                            f"arg{tensor_idx}.iterator, "
+                            f"{gmem_pointer}, "
                             "layout=cute.make_layout("
                             f"{gmem_layout}))"
                         ),
@@ -1591,6 +1624,7 @@ def _append_cute_wrapper_plan(
             rank3_mnl_tensor=bool(plan.get("rank3_mnl_tensor")),
             orientation=_tcgen05_plan_orientation(plan),
             column_major=bool(plan.get("d_column_major")),
+            bounded_output_shift=bool(plan.get("bounded_output_shift")),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -1622,6 +1656,7 @@ def _append_cute_wrapper_plan(
             cluster_m=max(1, cluster_m),
             reserved_sms=reserved_sms,
             num_sm_multiplier=plan_int("num_sm_multiplier", 1),
+            cluster_n=cluster_n,
         )
         quota_args = tuple(
             str(arg)
@@ -1764,6 +1799,8 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     fixed_ab_tensormaps = bool(plan.get("fixed_ab_tensormaps"))
     full_allocation_a = bool(plan.get("full_allocation_a"))
+    full_allocation_b = bool(plan.get("full_allocation_b"))
+    full_allocation_b_rank3 = bool(plan.get("full_allocation_b_rank3"))
     fixed_grouped_b_rank3 = bool(plan.get("fixed_grouped_b_rank3"))
     if fixed_grouped_b_rank3 and not fixed_ab_tensormaps:
         raise exc.BackendUnsupported(
@@ -1812,17 +1849,44 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormap_rank2 = (
         dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     )
-    if full_allocation_a and not (
-        swapped_nm
+    immutable_mn_profile = (
+        not swapped_nm
         and dynamic_ab_tensormap_rank2
-        and lhs_rank3_grouped_nt
-        and not shared_rhs
+        and not lhs_rank3_grouped_nt
+        and rhs_rank3_grouped_nt
         and a_k_major
-        and cluster_m == 1
-        and cluster_n == 1
+        and b_k_major
+        and not shared_rhs
+        and cluster_m == 2
+        and cluster_n in (1, 2)
+        and bm in (128, 256)
+        and bn in (128, 192, 224, 256)
+        and plan.get("source_m_tile") == bm
+        and plan.get("device_split_sizes") is True
+        and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+    )
+    if full_allocation_a and not (
+        immutable_mn_profile
+        or (
+            swapped_nm
+            and dynamic_ab_tensormap_rank2
+            and lhs_rank3_grouped_nt
+            and not shared_rhs
+            and a_k_major
+            and ((cluster_m == 1 and bm in (64, 128)) or (cluster_m == 2 and bm == 256))
+            and cluster_n == 1
+        )
     ):
         raise exc.BackendUnsupported(
-            "cute", "full-allocation A requires a K-major grouped ONE-CTA N,M input"
+            "cute", "full-allocation A requires a K-major grouped N,M input"
+        )
+    if full_allocation_b and not immutable_mn_profile:
+        raise exc.BackendUnsupported(
+            "cute", "immutable grouped physical B requires the device M,N profile"
+        )
+    if full_allocation_b_rank3 and not (full_allocation_b and immutable_mn_profile):
+        raise exc.BackendUnsupported(
+            "cute", "rank-3 immutable physical B requires its proved M,N input mode"
         )
     if shared_rhs and (
         not swapped_nm
@@ -1951,6 +2015,9 @@ def _append_cute_wrapper_plan(
             ),
         )
     else:
+        rhs_physical_n = f"arg{rhs_idx}_shape1"
+        if full_allocation_b and not full_allocation_b_rank3:
+            rhs_physical_n = f"arg{rhs_idx}_shape0 * arg{rhs_idx}_shape1"
         lhs_tma_setup = (
             (
                 (
@@ -1978,9 +2045,9 @@ def _append_cute_wrapper_plan(
                 f"arg{rhs_idx}.iterator, "
                 "layout=cute.make_layout("
                 + (
-                    f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2), "
+                    f"({rhs_physical_n}, arg{rhs_idx}_shape2), "
                     f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride2)))"
-                    if dynamic_ab_tensormap_rank2
+                    if dynamic_ab_tensormap_rank2 and not full_allocation_b_rank3
                     else (
                         f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2, "
                         f"arg{rhs_idx}_shape0), "
@@ -3980,6 +4047,7 @@ def _tcgen05_grouped_static_active_clusters(
     cluster_m: int,
     reserved_sms: int,
     num_sm_multiplier: int = 1,
+    cluster_n: int = 1,
 ) -> int:
     if num_sm <= 0:
         raise ValueError("num_sm must be positive")
@@ -3990,7 +4058,7 @@ def _tcgen05_grouped_static_active_clusters(
     if type(num_sm_multiplier) is not int or num_sm_multiplier not in (1, 2):
         raise ValueError("num_sm_multiplier must be one or two")
     active_sms = max(1, num_sm - reserved_sms)
-    return max(1, active_sms * num_sm_multiplier // cluster_m)
+    return max(1, active_sms * num_sm_multiplier // (cluster_m * cluster_n))
 
 
 def _tcgen05_grouped_static_quotas(
@@ -4185,6 +4253,35 @@ def _tcgen05_grouped_static_layout_arg(
 def _tcgen05_grouped_device_source_m_tile_supported(plan: dict[str, object]) -> bool:
     """Admit compact ONE profiles and retain the proved source64 contract."""
     source_m_tile = plan.get("source_m_tile")
+    if plan.get("orientation", "mn") == "mn":
+        return (
+            plan.get("kind") == "tcgen05_grouped_static_persistent"
+            and plan.get("scheduler_mode") == "device_group_search"
+            and source_m_tile in (128, 256)
+            and plan.get("bm") == source_m_tile
+            and plan.get("bn") in (128, 192, 224, 256)
+            and plan.get("cluster_m") == 2
+            and plan.get("cluster_n") in (1, 2)
+            and plan.get("device_split_sizes") is True
+            and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+        )
+    if (
+        type(source_m_tile) is int
+        and source_m_tile == TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+    ):
+        cluster_m = plan.get("cluster_m")
+        return (
+            type(cluster_m) is int
+            and cluster_m in (1, 2)
+            and plan.get("kind") == "tcgen05_grouped_static_persistent"
+            and plan.get("scheduler_mode") == "device_group_search"
+            and plan.get("orientation") == "nm"
+            and plan.get("bm") == 128 * cluster_m
+            and plan.get("bn") == source_m_tile
+            and plan.get("cluster_n") == 1
+            and plan.get("device_split_sizes") is True
+            and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+        )
     if type(source_m_tile) is int and source_m_tile in (8, 16):
         return (
             plan.get("kind") == "tcgen05_grouped_static_persistent"
@@ -4278,7 +4375,9 @@ def _validate_tcgen05_grouped_device_split_sizes(
             "cute",
             f"tcgen05 grouped device {layout_kind} must have shape {expected_shape}",
         )
-    if _tcgen05_plan_orientation(plan) != "nm":
+    if _tcgen05_plan_orientation(
+        plan
+    ) != "nm" and not _tcgen05_grouped_device_source_m_tile_supported(plan):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 grouped device split_sizes requires N,M orientation",
@@ -4320,13 +4419,98 @@ def _validate_tcgen05_grouped_device_split_sizes(
     if (
         not bool(plan.get("dynamic_ab_tensormaps"))
         or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
-        or not bool(plan.get("dynamic_d_tensormap"))
+        or not (
+            bool(plan.get("dynamic_d_tensormap"))
+            or plan.get("bounded_output_shift") is True
+        )
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 grouped device split_sizes requires rank-2 dynamic A/B "
             "TensorMaps and a dynamic D TensorMap",
         )
+    if plan.get("bounded_output_shift") is True and not (
+        plan.get("immutable_ab_tensormaps") is True
+        and not plan.get("dynamic_d_tensormap")
+        and not plan.get("fixed_tensormaps")
+        and not plan.get("direct_pointer_metadata")
+        and _tcgen05_grouped_scheduler_mode(plan)
+        is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+        and bounded_d_shift_index_domain(m_size, n_size, source_m_tile)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "bounded output shift requires immutable pure device-worklist maps"
+        )
+    if plan.get("balanced_workers") is True and not (
+        _tcgen05_plan_orientation(plan) == "mn"
+        and plan.get("cluster_m") == 2
+        and plan.get("cluster_n", 1) in (1, 2)
+        and (
+            plan.get("cluster_n", 1) == 1
+            or n_size
+            % (_plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n"))
+            == 0
+        )
+        and plan.get("num_sm_multiplier", 1) == 1
+        and not plan.get("fixed_tensormaps")
+        and not plan.get("direct_pointer_metadata")
+        and _tcgen05_grouped_scheduler_mode(plan)
+        is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+        and balanced_workers_index_domain(
+            group_count,
+            m_size,
+            n_size,
+            _plan_int_value(plan, "bm"),
+            _plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n"),
+        )
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "balanced output workers require the proved device M,N profile"
+        )
+    if (
+        plan.get("l2_swizzle_size", 1) != 1
+        or plan.get("device_panel_swizzle") is True
+        or plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+        or plan.get(GROUPED_PANEL_RATIO_KEY) is not None
+    ):
+        bm, bn = _plan_int_value(plan, "bm"), _plan_int_value(plan, "bn")
+        cluster_n = _plan_int_value(plan, "cluster_n")
+        if not (
+            plan.get("device_panel_swizzle") is True
+            and (
+                _plan_int_value(plan, "l2_swizzle_size") > 1
+                or plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+            )
+            and _tcgen05_plan_orientation(plan) == "mn"
+            and plan.get("device_layout_kind") == "offsets"
+            and _tcgen05_grouped_scheduler_mode(plan)
+            is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+            and (cluster_n == 1 or n_size % (bn * cluster_n) == 0)
+            and grouped_device_panel_index_domain(
+                group_count, m_size, n_size, bm, bn, cluster_n
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "device panel raster requires the bounded complete-cluster MN plan",
+            )
+        if (
+            plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+            or plan.get(GROUPED_PANEL_RATIO_KEY) is not None
+        ):
+            alternate = plan.get(GROUPED_PANEL_ALTERNATE_KEY)
+            ratio = plan.get(GROUPED_PANEL_RATIO_KEY)
+            if not (
+                type(alternate) is int
+                and alternate in TCGEN05_LEGAL_L2_SWIZZLE_SIZES
+                and type(ratio) is int
+                and ratio in GROUPED_PANEL_RATIO_CHOICES
+                and grouped_panel_ratio_index_domain(n_size, bn, cluster_n, ratio)
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "adaptive panel requires a legal alternate width and bounded positive integer ratio",
+                )
 
 
 def _tcgen05_grouped_device_split_total_clusters(
@@ -4358,7 +4542,12 @@ def _tcgen05_grouped_device_split_total_clusters(
             "tcgen05 grouped device split_sizes requires positive G, M, and N "
             "and a validated source M tile",
         )
-    n_clusters = (n_size + physical_mma_m - 1) // physical_mma_m
+    physical_columns = (
+        _plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n")
+        if _tcgen05_plan_orientation(plan) == "mn"
+        else physical_mma_m
+    )
+    n_clusters = (n_size + physical_columns - 1) // physical_columns
     packed_m_clusters = (m_size + source_m_tile - 1) // source_m_tile
     total_clusters = n_clusters * group_count * packed_m_clusters
     if total_clusters > torch.iinfo(torch.int32).max:
@@ -4377,7 +4566,10 @@ def _cute_dynamic_tensormap_contexts(
     contexts: list[_CuteGroupedLaunchContext] = []
     for plan in _tcgen05_grouped_static_plans(cute_kernel):
         if not (
-            bool(plan.get("dynamic_ab_tensormaps"))
+            (
+                bool(plan.get("dynamic_ab_tensormaps"))
+                and not bool(plan.get("immutable_ab_tensormaps"))
+            )
             or bool(plan.get("dynamic_d_tensormap"))
         ):
             continue
@@ -6669,6 +6861,9 @@ def _build_cute_schema_and_args(
     ) -> None:
         workspace_name: str | None = None
         tensormap_count = 0
+        if plan.get("bounded_output_shift") is True:
+            _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
+            return
         if bool(plan.get("dynamic_ab_tensormaps")):
             _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
             workspace_name = _plan_str_value(plan, "ab_tensormaps_arg")
