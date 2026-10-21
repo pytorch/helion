@@ -7333,6 +7333,22 @@ def _codegen_cute_store_tcgen05_tile(
     return [*main_stmts, *post_loop_stmts]
 
 
+def _ref_masked_slice_indices(
+    tensor: torch.Tensor, indices: list[object]
+) -> list[object]:
+    """Include sliced axes in Cartesian indexing and mask broadcasting."""
+    index_dtype = next(
+        (index.dtype for index in indices if isinstance(index, torch.Tensor)),
+        torch.int64,
+    )
+    return [
+        torch.arange(tensor.size(dim), device=tensor.device, dtype=index_dtype)[index]
+        if isinstance(index, slice)
+        else index
+        for dim, index in enumerate(indices)
+    ]
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -7349,15 +7365,12 @@ def _(
         raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
 
     # Normalize indices and identify tensor indices
-    indices = []
-    tensor_idx_positions = []
-    for i, idx in enumerate(index):
-        if isinstance(idx, RefTile):
-            idx = idx.index
-        # pyrefly: ignore [bad-argument-type]
-        indices.append(idx)
-        if isinstance(idx, torch.Tensor):
-            tensor_idx_positions.append(i)
+    indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+    if extra_mask is not None:
+        indices = _ref_masked_slice_indices(tensor, indices)
+    tensor_idx_positions = [
+        i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
+    ]
 
     # Handle broadcasting for multiple tensor indices
     if len(tensor_idx_positions) > 1:
@@ -7566,12 +7579,12 @@ def _(
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
 
-    # Process indices: convert RefTiles and clamp tensor indices
+    index = _ref_masked_slice_indices(
+        tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+    )
+    # Process indices: clamp tensor indices
     orig_indices, safe_indices, is_tensor_mask = [], [], []
     for i, idx in enumerate(index):
-        if isinstance(idx, RefTile):
-            idx = idx.index  # Convert RefTile to tensor
-
         if isinstance(idx, torch.Tensor):
             dim_size = tensor.shape[i] if i < len(tensor.shape) else tensor.numel()
             orig_indices.append(idx)

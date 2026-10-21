@@ -15,6 +15,14 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
+def _plan_int(plan: Mapping[str, object], key: str, default: int) -> int:
+    """Read an integer coordinate without coercing malformed plan metadata."""
+    value = plan.get(key, default)
+    if type(value) is not int:
+        raise ValueError(f"MXFP8 plan coordinate {key!r} must be an integer")
+    return value
+
+
 def preparation_source(plan: Mapping[str, object]) -> str:
     m, n, k, bn, bk = [cast("int", plan[key]) for key in ("m", "n", "k", "bn", "bk")]
     mp, np, kp = block_scaled_workspace_shape(m, n, k, bn, bk)
@@ -50,9 +58,28 @@ def preparation_source(plan: Mapping[str, object]) -> str:
         "",
         "@cute.jit",
         "def _entry(a: cute.Tensor, b: cute.Tensor, sa: cute.Tensor, sb: cute.Tensor, workspace: cute.Tensor, output: cute.Tensor, alpha: cutlass.Float32, stream: CUstream):",
-        f"    _prepare(sa, sb, workspace).launch(grid=({(total + 255) // 256}, 1, 1), block=(256, 1, 1), stream=stream)",
+        *(
+            []
+            if plan.get("fused_scales")
+            else [
+                f"    _prepare(sa, sb, workspace).launch(grid=({(total + 255) // 256}, 1, 1), block=(256, 1, 1), stream=stream)"
+            ]
+        ),
         f"    rhs = {rhs}",
-        "    _consumer.mxfp8(a, rhs, workspace, output, alpha, stream)",
+        *(
+            [
+                f"    transposed_output = cute.make_tensor(output.iterator, cute.make_layout(({n}, {m}), stride=(output.stride[1], output.stride[0])))",
+                "    _consumer.mxfp8_packed(rhs, a, sb, sa, transposed_output, alpha, stream)",
+            ]
+            if plan.get("swap_ab")
+            else [
+                (
+                    "    _consumer.mxfp8_packed(a, rhs, sa, sb, output, alpha, stream)"
+                    if plan.get("fused_scales")
+                    else "    _consumer.mxfp8(a, rhs, workspace, output, alpha, stream)"
+                ),
+            ]
+        ),
     ]
     return "\n".join(lines) + "\n"
 
@@ -70,8 +97,8 @@ def make_mxfp8_entry(plan: Mapping[str, object]) -> object:
         "cute": cute,
         "CUstream": importlib.import_module("cuda.bindings.driver").CUstream,
         "_consumer": Sm100BlockScaledGemm(
-            cast("int", plan["m"]),
-            cast("int", plan["n"]),
+            cast("int", plan["n"] if plan.get("swap_ab") else plan["m"]),
+            cast("int", plan["m"] if plan.get("swap_ab") else plan["n"]),
             cast("int", plan["k"]),
             cast("int", plan["bn"]),
             cast("int", plan["bk"]),
@@ -88,6 +115,37 @@ def make_mxfp8_entry(plan: Mapping[str, object]) -> object:
                 for name in cast("tuple[str,...]", plan["round_dtypes"])
             ),
             operand_format="mxfp8",
+            fused_scales=bool(plan.get("fused_scales", False)),
+            compact_m=bool(plan.get("compact_m", False)),
+            logical_m_per_cta=_plan_int(plan, "logical_m_per_cta", 128),
+            lhs_scale_row_stride=_plan_int(
+                plan,
+                "rhs_scale_row_stride"
+                if plan.get("swap_ab")
+                else "lhs_scale_row_stride",
+                1,
+            ),
+            lhs_scale_column_stride=_plan_int(
+                plan,
+                "rhs_scale_column_stride"
+                if plan.get("swap_ab")
+                else "lhs_scale_column_stride",
+                0,
+            ),
+            rhs_scale_row_stride=_plan_int(
+                plan,
+                "lhs_scale_row_stride"
+                if plan.get("swap_ab")
+                else "rhs_scale_row_stride",
+                1,
+            ),
+            rhs_scale_column_stride=_plan_int(
+                plan,
+                "lhs_scale_column_stride"
+                if plan.get("swap_ab")
+                else "rhs_scale_column_stride",
+                0,
+            ),
         ),
     }
     linecache.cache[filename] = (

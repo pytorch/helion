@@ -12,14 +12,27 @@ BLOCK_SCALED_CHOICES: dict[str, tuple[object, ...]] = {
     "cute_scaled_cluster_m": (2, 1),
     "cute_scaled_persistent": (True, False),
 }
-BLOCK_SCALED_CONFIG_KEYS = frozenset(BLOCK_SCALED_CHOICES)
+MXFP8_CONFIG_KEYS = frozenset(
+    {
+        "cute_scaled_fused_scales",
+        "cute_scaled_tile_m",
+        "cute_scaled_swap_ab",
+        "cute_scaled_compact_m",
+    }
+)
+BLOCK_SCALED_CONFIG_KEYS = frozenset(BLOCK_SCALED_CHOICES) | MXFP8_CONFIG_KEYS
 
 
 def block_scaled_choices(*, mxfp8: bool = False) -> dict[str, tuple[object, ...]]:
     """Return format-specific geometry without extending NVFP4's vocabulary."""
     choices = dict(BLOCK_SCALED_CHOICES)
     if mxfp8:
-        choices["cute_scaled_tile_n"] = (256, 128, 64)
+        choices["cute_scaled_tile_n"] = (256, 224, 128, 64, 32, 16)
+        choices["cute_scaled_stages"] = (4, 2, 3, 5, 6, 8, 10, 12)
+        choices["cute_scaled_fused_scales"] = (False, True)
+        choices["cute_scaled_tile_m"] = (128, 64, 32)
+        choices["cute_scaled_swap_ab"] = (False, True)
+        choices["cute_scaled_compact_m"] = (False, True)
     return choices
 
 
@@ -47,6 +60,7 @@ def normalize_block_scaled_config(
     capability: tuple[int, int] | None,
     fix_invalid: bool,
     mxfp8: bool = False,
+    fused_scales_available: bool = False,
 ) -> None:
     selected = BLOCK_SCALED_CONFIG_KEYS.intersection(config)
     if not available:
@@ -66,6 +80,14 @@ def normalize_block_scaled_config(
                 config[key] = choices[0]
             else:
                 raise InvalidConfig(f"{key} must be one of {choices}")
+    if not mxfp8 and MXFP8_CONFIG_KEYS.intersection(config):
+        if (
+            any(config.get(key) not in (None, False, 128) for key in MXFP8_CONFIG_KEYS)
+            and not fix_invalid
+        ):
+            raise InvalidConfig("fused scales require a proved MXFP8 contraction")
+        for key in MXFP8_CONFIG_KEYS:
+            config.pop(key, None)
     if config["cute_scaled_mma"] is True and (
         capability is None or capability[0] != 10
     ):
@@ -78,3 +100,29 @@ def normalize_block_scaled_config(
             config["cute_scaled_tile_k"] = 128
         else:
             raise InvalidConfig("MXFP8 block scaling requires K tiles of 128 or 256")
+    if config.get("cute_scaled_fused_scales") is True and not fused_scales_available:
+        if fix_invalid:
+            config["cute_scaled_fused_scales"] = False
+        else:
+            raise InvalidConfig(
+                "fused scale loading requires proved native packed INT32 scales"
+            )
+    if mxfp8 and config.get("cute_scaled_fused_scales") is not True:
+        unsupported = (
+            config.get("cute_scaled_tile_n") in (16, 32, 224)
+            or config.get("cute_scaled_tile_m") != 128
+            or config.get("cute_scaled_swap_ab") is True
+            or config.get("cute_scaled_compact_m") is True
+        )
+        if unsupported:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "small and transposed scaled tiles require fused packed scale loading"
+                )
+            if config.get("cute_scaled_tile_n") in (16, 32, 224):
+                config["cute_scaled_tile_n"] = 128
+            config["cute_scaled_tile_m"] = 128
+            config["cute_scaled_swap_ab"] = False
+            config["cute_scaled_compact_m"] = False
+    if mxfp8 and config.get("cute_scaled_tile_m") == 128:
+        config["cute_scaled_compact_m"] = False
