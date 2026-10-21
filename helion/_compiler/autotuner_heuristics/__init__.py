@@ -173,6 +173,10 @@ from .cute_warp_atomic import CuteWarpAtomicHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .register_chain import CuteRegisterChainHeuristic
+from .tileir import TileIRChunkReductionHeuristic
+from .tileir import TileIRMatmulSeedHeuristic
+from .tileir import TileIRRowReductionHeuristic
+from .tileir import TileIRSmallReductionHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100FormulaMatmulHeuristic
@@ -286,6 +290,12 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonReductionHeuristic,
         TritonNarrowReductionHeuristic,
         TritonPointwiseSeedHeuristic,
+    ),
+    "tileir": (
+        TileIRMatmulSeedHeuristic,
+        TileIRRowReductionHeuristic,
+        TileIRSmallReductionHeuristic,
+        TileIRChunkReductionHeuristic,
     ),
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
