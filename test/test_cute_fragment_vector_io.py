@@ -421,3 +421,505 @@ def test_cumsum_row_packets_match_reference(threads: int) -> None:
     )(g)
     torch.cuda.synchronize()
     assert torch.equal(out, plain)
+
+
+# -- windows at a runtime row offset (the varlen anchored gram) ---------------
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _varlen_anchored_gram(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gc: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """The two tiers of ``_anchored_gram`` over token-major q / k
+    ``[T, H, D]``: chunk ``j`` of head ``h`` reads its rows at
+    ``token_base[j]`` (the same static windows shifted by one runtime
+    offset), each row live below ``valid_len[j]`` and zero past it; gc is
+    chunk-major ``[H * NT, C, D]``."""
+    NT = token_base.size(0)
+    HNT = gc.size(0)
+    C = hl.specialize(gc.size(1))
+    D = hl.specialize(gc.size(2))
+    A = torch.zeros([HNT, C, C], dtype=q.dtype, device=q.device)
+    for tile_r in hl.tile(HNT, block_size=1):
+        r = tile_r.begin
+        j = r % NT
+        h = r // NT
+        base = token_base[j]
+        vlen = valid_len[j]
+        dcols = hl.arange(D)
+        rows0 = hl.arange(16)
+        cols0 = hl.arange(16)
+        m0 = rows0 < vlen
+        q0 = torch.where(
+            m0[:, None],
+            hl.load(q, [base + rows0, h, dcols], extra_mask=m0[:, None]),
+            0,
+        ).float()
+        k0 = torch.where(
+            m0[:, None],
+            hl.load(k, [base + rows0, h, dcols], extra_mask=m0[:, None]),
+            0,
+        ).float()
+        n0 = gc[r, 0, :]
+        e0 = torch.exp2(gc[r, rows0, :] - n0[None, :])
+        kg0 = (k0 * torch.exp2(n0[None, :] - gc[r, rows0, :])).transpose(-2, -1)
+        a0 = hl.dot(q0 * e0, kg0) * scale
+        A[r, rows0, cols0] = a0 * (rows0[:, None] >= cols0[None, :]).to(a0.dtype)
+
+        rows1 = 16 + hl.arange(16)
+        cols1 = hl.arange(32)
+        m1 = rows1 < vlen
+        mc1 = cols1 < vlen
+        q1 = torch.where(
+            m1[:, None],
+            hl.load(q, [base + rows1, h, dcols], extra_mask=m1[:, None]),
+            0,
+        ).float()
+        kc1 = torch.where(
+            mc1[:, None],
+            hl.load(k, [base + cols1, h, dcols], extra_mask=mc1[:, None]),
+            0,
+        ).float()
+        n1 = gc[r, 16, :]
+        e1 = torch.exp2(gc[r, rows1, :] - n1[None, :])
+        ec1 = torch.exp2(n1[None, :] - gc[r, cols1, :])
+        a1 = hl.dot(q1 * e1, (kc1 * ec1).transpose(-2, -1)) * scale
+        A[r, rows1, cols1] = a1 * (rows1[:, None] >= cols1[None, :]).to(a1.dtype)
+    return A
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mismatched_varlen_windows(
+    x: torch.Tensor, token_base: torch.Tensor, valid_len: torch.Tensor
+) -> torch.Tensor:
+    """Three windows of x at one runtime offset that must not share a slab:
+    the second's mask is over another window than its rows (rows 16.. under
+    ``rows 0.. < vlen``), the third has no mask (its rows past the limit
+    are the next sequence's, not zero)."""
+    NT = token_base.size(0)
+    HNT = x.size(1) * NT
+    out = torch.zeros([HNT, 48, x.size(2)], dtype=torch.float32, device=x.device)
+    for tile_r in hl.tile(HNT, block_size=1):
+        r = tile_r.begin
+        j = r % NT
+        h = r // NT
+        base = token_base[j]
+        vlen = valid_len[j]
+        rows0 = hl.arange(16)
+        rows1 = 16 + hl.arange(16)
+        rows2 = 32 + hl.arange(16)
+        m0 = rows0 < vlen
+        a = hl.load(x, [base + rows0, h, slice(None)], extra_mask=m0[:, None])
+        b = hl.load(x, [base + rows1, h, slice(None)], extra_mask=m0[:, None])
+        c = hl.load(x, [base + rows2, h, slice(None)])
+        out[r, rows0, :] = a.float() * 2.0
+        out[r, rows1, :] = b.float() * 3.0
+        out[r, rows2, :] = c.float() * 5.0
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _contiguous_dim_windows(x: torch.Tensor) -> torch.Tensor:
+    """Two static windows of ``x [B, D, N]`` varying along its contiguous
+    dimension (N's rows 0.. and 16..): one 32-wide slab whose varying
+    dimension is the contiguous one, walked element by element."""
+    B = x.size(0)
+    D = hl.specialize(x.size(1))
+    out = torch.zeros([B, 16, 16], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(B, block_size=1):
+        rows0 = hl.arange(16)
+        rows1 = 16 + hl.arange(16)
+        cols0 = hl.arange(16)
+        dcols = hl.arange(D)
+        a = x[tile_b, dcols, rows0]
+        b = x[tile_b, dcols, rows1]
+        out[tile_b, rows0, cols0] = hl.dot(
+            (a.float() * 2.0).transpose(-2, -1), b.float()
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _varlen_contiguous_dim_windows(
+    x: torch.Tensor, token_base: torch.Tensor, valid_len: torch.Tensor
+) -> torch.Tensor:
+    """``_contiguous_dim_windows`` at a runtime offset: ``x [H, D, T]``
+    (tokens contiguous) read at ``token_base[j] + rows`` under
+    ``(rows < valid_len[j])[None, :]``, the limit broadcast over the
+    leading dim."""
+    NT = token_base.size(0)
+    H = x.size(0)
+    D = hl.specialize(x.size(1))
+    HNT = H * NT
+    out = torch.zeros([HNT, 16, 16], dtype=torch.float32, device=x.device)
+    for tile_r in hl.tile(HNT, block_size=1):
+        r = tile_r.begin
+        j = r % NT
+        h = r // NT
+        base = token_base[j]
+        vlen = valid_len[j]
+        rows0 = hl.arange(16)
+        rows1 = 16 + hl.arange(16)
+        cols0 = hl.arange(16)
+        dcols = hl.arange(D)
+        m0 = rows0 < vlen
+        m1 = rows1 < vlen
+        a = torch.where(
+            m0[None, :],
+            hl.load(x, [h, dcols, base + rows0], extra_mask=m0[None, :]),
+            0,
+        )
+        b = torch.where(
+            m1[None, :],
+            hl.load(x, [h, dcols, base + rows1], extra_mask=m1[None, :]),
+            0,
+        )
+        out[r, rows0, cols0] = hl.dot((a.float() * 2.0).transpose(-2, -1), b.float())
+    return out
+
+
+def _varlen_tables(
+    lens: tuple[int, ...], c: int, device: torch.device | str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """``(token_base [NT], valid_len [NT], NT)`` of sequences of ``lens``
+    tokens cut into chunks of ``c`` rows (the last chunk of a sequence
+    ragged)."""
+    token_base: list[int] = []
+    valid_len: list[int] = []
+    start = 0
+    for length in lens:
+        for i in range(0, length, c):
+            token_base.append(start + i)
+            valid_len.append(min(length - i, c))
+        start += length
+    i64 = torch.int64
+    return (
+        torch.tensor(token_base, dtype=i64, device=device),
+        torch.tensor(valid_len, dtype=i64, device=device),
+        len(token_base),
+    )
+
+
+def _varlen_gram_inputs(
+    lens: tuple[int, ...] = (37, 64, 27),
+    h: int = 2,
+    d: int = 128,
+    device: torch.device | str = "cpu",
+    seed: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    token_base, valid_len, nt = _varlen_tables(lens, 32, device)
+    total = sum(lens)
+    if seed is None:
+        q = torch.ones(total, h, d, dtype=torch.bfloat16, device=device)
+        k = torch.ones(total, h, d, dtype=torch.bfloat16, device=device)
+        gc = torch.zeros(h * nt, 32, d, dtype=torch.float32, device=device)
+    else:
+        g = torch.Generator(device=device).manual_seed(seed)
+        q = torch.randn(total, h, d, device=device, generator=g).to(torch.bfloat16)
+        k = torch.randn(total, h, d, device=device, generator=g).to(torch.bfloat16)
+        gc = (-torch.rand(h * nt, 32, d, device=device, generator=g) * 0.1).cumsum(1)
+    return q, k, gc, token_base, valid_len, 0.125
+
+
+def _varlen_contiguous_inputs(
+    lens: tuple[int, ...] = (37, 64, 27),
+    h: int = 2,
+    d: int = 32,
+    device: torch.device | str = "cpu",
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    token_base, valid_len, _nt = _varlen_tables(lens, 32, device)
+    total = sum(lens)
+    if seed is None:
+        x = torch.ones(h, d, total, dtype=torch.float32, device=device)
+    else:
+        g = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(h, d, total, device=device, generator=g)
+    return x, token_base, valid_len
+
+
+def _varlen_contiguous_dim_windows_reference(
+    x: torch.Tensor, token_base: torch.Tensor, valid_len: torch.Tensor
+) -> torch.Tensor:
+    """Every chunk's 32 token columns gathered (zero past the sequence's
+    end), then ``(2 a)^T b`` over its two 16-column halves."""
+    h, d, t = x.shape
+    nt = token_base.numel()
+    rows = torch.arange(32, device=x.device)
+    index = (token_base[:, None] + rows[None, :]).clamp(max=t - 1)
+    valid = (rows[None, :] < valid_len[:, None]).to(x.dtype)
+    # [H, NT, D, 32], row h * NT + j
+    chunks = x[:, :, index].permute(0, 2, 1, 3) * valid[None, :, None, :]
+    chunks = chunks.reshape(h * nt, d, 32)
+    a = chunks[:, :, :16] * 2.0
+    b = chunks[:, :, 16:]
+    return a.transpose(-2, -1) @ b
+
+
+def _varlen_anchored_gram_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gc: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """The dense reference over every chunk's rows gathered (zero past the
+    sequence's end)."""
+    nt = token_base.numel()
+    h = q.shape[1]
+    rows = torch.arange(32, device=q.device)
+    index = (token_base[:, None] + rows[None, :]).clamp(max=q.shape[0] - 1)
+    valid = (rows[None, :] < valid_len[:, None]).to(q.dtype)
+    # [H * NT, 32, D], row h * NT + j
+    qc = torch.cat([q[index, head] * valid[:, :, None] for head in range(h)])
+    kc = torch.cat([k[index, head] * valid[:, :, None] for head in range(h)])
+    assert qc.shape[0] == gc.shape[0] == h * nt
+    return _anchored_gram_reference(qc, kc, gc, scale)
+
+
+def test_varlen_windows_at_one_runtime_offset_share_a_slab(_cpu_only: None) -> None:
+    from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
+
+    bound = _cpu_bind(_varlen_anchored_gram, _varlen_gram_inputs())
+    spec = bound.config_spec
+    # q (two row tiers) and k (rows, then columns) are read at the runtime
+    # offset token_base[j] under the valid_len[j] limit; gc's windows are
+    # static at the uniform chunk row tile_r.begin: three slabs.
+    assert spec.cute_fragment_slab_loads_root_ids
+    with bound.env, bound.host_function:
+        plan = plan_slab_loads(bound.env, bound.host_function.device_ir.graphs)
+    groups = {id(group): group for group in plan.values()}
+    assert len(groups) == 3 and len(plan) == 10
+    by_tensor = {group.tensor.args[0]: group for group in groups.values()}
+    assert sorted(by_tensor) == ["gc", "k", "q"]
+    for name in ("q", "k"):
+        group = by_tensor[name]
+        assert group.offset is not None and group.offset.tensor == "token_base"
+        assert group.limit is not None and group.limit.tensor == "valid_len"
+        assert (group.start, group.extent) == (0, 32)
+    assert by_tensor["gc"].offset is None and by_tensor["gc"].limit is None
+    assert by_tensor["gc"].descriptors[0][0] == "uniform"
+    assert sorted(by_tensor["q"].members.values()) == [(0, 16), (16, 16)]
+    assert sorted(by_tensor["k"].members.values()) == [(0, 16), (0, 32)]
+    windows = bound.to_code(_config(bound))
+    slabs = bound.to_code(_config(bound, **{SLAB: True}))
+    # Ten window loads + the two 0-d table loads become the three slab loads
+    # staged ahead of the body, behind the offset and the limit read once
+    # per CTA (the body's own 0-d loads of them stay).
+    assert windows.count(".load()") == 12
+    assert slabs.count(".load()") == 7
+    assert slabs.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
+    assert slabs.count("fragment_slab_scalar_1 = cutlass.Int32(0)") == 1
+    assert "(token_base.iterator + " in slabs and "(valid_len.iterator + " in slabs
+    # Every slab row is predicated by the limit (in the window's own
+    # coordinates) and the tensor's end at the shifted row.
+    assert len(re.findall(r"% 32 < fragment_slab_scalar_1\n", slabs)) == 2
+    assert len(re.findall(r"fragment_slab_scalar \+ 0 \+ .+? % 32 < \d+\n", slabs)) == 2
+    assert slabs.count(SYNC) < windows.count(SYNC)
+    # The members read views at their static offsets: tier 1's q rows 16..
+    # of the q slab; k's columns the whole k slab.
+    assert re.search(r"\(fragment_coordinate_\d+ \+ 16\) \* 128", slabs)
+    # With the packets the q / k slabs move as eight-lane bf16 packets under
+    # one row predicate each; the gc slab as four-lane fp32 packets.
+    everything = bound.to_code(_config(bound, **{SLAB: True, VEC: True, BATCH: True}))
+    assert everything.count(".load()") == 4  # the two tables, twice
+    assert everything.count("cute.copy(") == 3 * 2 + 2
+    assert "cute.make_layout((8,)), cutlass.BFloat16" in everything
+    assert "cute.make_layout((4,)), cutlass.Float32" in everything
+    assert everything.count(SYNC) < slabs.count(SYNC)
+
+
+def test_varlen_windows_under_another_mask_keep_their_walk(_cpu_only: None) -> None:
+    from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
+
+    token_base, valid_len, nt = _varlen_tables((37, 64, 27), 48)
+    x = torch.ones(128, 2, 64, dtype=torch.bfloat16)
+    bound = _cpu_bind(_mismatched_varlen_windows, (x, token_base, valid_len))
+    # A mask over another window than the rows it guards, or no mask at
+    # all beside a masked member, is not the slab's row predicate: no group.
+    assert not bound.config_spec.cute_fragment_slab_loads_root_ids
+    with bound.env, bound.host_function:
+        assert plan_slab_loads(bound.env, bound.host_function.device_ir.graphs) == {}
+
+
+def test_a_slab_along_the_contiguous_dim_is_walked(_cpu_only: None) -> None:
+    from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
+
+    bound = _cpu_bind(_contiguous_dim_windows, (torch.ones(4, 32, 128),))
+    spec = bound.config_spec
+    assert spec.cute_fragment_slab_loads_root_ids
+    with bound.env, bound.host_function:
+        plan = plan_slab_loads(bound.env, bound.host_function.device_ir.graphs)
+    groups = {id(group): group for group in plan.values()}
+    assert len(groups) == 1 and len(plan) == 2
+    (group,) = groups.values()
+    assert [kind for kind, _ in group.descriptors] == ["block", "window", "window"]
+    assert group.window_dim == 2 and (group.start, group.extent) == (0, 32)
+    assert group.offset is None and group.limit is None
+    windows = bound.to_code(_config(bound))
+    slabs = bound.to_code(_config(bound, **{SLAB: True}))
+    # The two windows are one slab load; the second reads its columns 16...
+    assert windows.count(".load()") == 2 and slabs.count(".load()") == 1
+    assert slabs.count(SYNC) < windows.count(SYNC)
+    assert re.search(r"\+ 16\) \* 1\]", slabs)
+    # The plain windows move as packets along the contiguous dim (two loads
+    # and the store); the slab varies along it and is walked: with the
+    # packets knob only the store is a packet copy.
+    vectors = bound.to_code(_config(bound, **{VEC: True}))
+    everything = bound.to_code(_config(bound, **{SLAB: True, VEC: True}))
+    assert vectors.count(PACKET) == 3 and everything.count(PACKET) == 1
+    assert everything.count(".load()") == 1
+    assert everything.count("cute.copy(") == 1 and "cute.copy(" not in slabs
+
+
+def test_varlen_windows_along_the_contiguous_dim_share_a_slab(
+    _cpu_only: None,
+) -> None:
+    from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
+
+    bound = _cpu_bind(_varlen_contiguous_dim_windows, _varlen_contiguous_inputs())
+    spec = bound.config_spec
+    assert spec.cute_fragment_slab_loads_root_ids
+    with bound.env, bound.host_function:
+        plan = plan_slab_loads(bound.env, bound.host_function.device_ir.graphs)
+    groups = {id(group): group for group in plan.values()}
+    assert len(groups) == 1 and len(plan) == 2
+    (group,) = groups.values()
+    # The head is the uniform scalar tile_r.begin // NT; the windows along
+    # the contiguous token dim share token_base[j] under valid_len[j].
+    assert [kind for kind, _ in group.descriptors] == ["uniform", "window", "window"]
+    assert group.window_dim == 2 and (group.start, group.extent) == (0, 32)
+    assert group.offset is not None and group.limit is not None
+    assert group.offset.tensor == "token_base" and group.limit.tensor == "valid_len"
+    windows = bound.to_code(_config(bound))
+    slabs = bound.to_code(_config(bound, **{SLAB: True}))
+    # Two window loads + two 0-d table loads -> one slab load + the offset
+    # and limit read once ahead of it + the body's two table loads.
+    assert windows.count(".load()") == 4 and slabs.count(".load()") == 5
+    assert slabs.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
+    assert slabs.count("fragment_slab_scalar_1 = cutlass.Int32(0)") == 1
+    assert "(token_base.iterator + " in slabs and "(valid_len.iterator + " in slabs
+    # Each slab column is live below the limit (in the window's own
+    # coordinates) and inside the tensor's 128 tokens; the offset shifts
+    # the unit-stride token index.
+    assert len(re.findall(r"% 32 < fragment_slab_scalar_1\n", slabs)) == 1
+    assert len(re.findall(r"fragment_slab_scalar \+ 0 \+ .+? % 32 < 128\n", slabs)) == 1
+    assert re.search(
+        r"cutlass\.Int64\(fragment_slab_scalar \+ 0 \+ [^)]*% 32\) \* cutlass\.Int64\(1\)",
+        slabs,
+    )
+    assert re.search(r"\+ 16\) \* 1\]", slabs)
+    assert slabs.count(SYNC) < windows.count(SYNC)
+    # Varying along the contiguous dim, the slab is walked under every
+    # transport knob.
+    everything = bound.to_code(_config(bound, **{SLAB: True, VEC: True, BATCH: True}))
+    assert everything.count(".load()") == 5
+    assert everything.count(PACKET) == 1 and everything.count("cute.copy(") == 1
+
+
+def test_engine_varlen_gram_plans_three_slabs(_cpu_only: None) -> None:
+    import importlib
+
+    from helion._compiler.cute.fragment_slab_loads import plan_slab_loads
+
+    engine = importlib.import_module("examples.linear.linear_attention_engine")
+    fn = engine.chunk_fwd_A_diag_anchored_varlen_helion.fn
+    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    token_base, valid_len, nt = _varlen_tables((100, 64, 90), 64)
+    h, d = 2, 64
+    total = 254
+    hnt = h * nt
+    bf16, f32 = torch.bfloat16, torch.float32
+    args = (
+        torch.ones(total, h, d, dtype=bf16),
+        torch.ones(total, h, d, dtype=bf16),
+        torch.zeros(hnt, 64, d, dtype=f32),
+        token_base,
+        valid_len,
+        torch.zeros(hnt, 64, 64, dtype=bf16),
+        torch.zeros(hnt, 64, 64, dtype=bf16),
+        0.125,
+        True,
+    )
+    bound = _cpu_bind(kernel, args)
+    # The engine's varlen anchored gram: four q tiers, seven k windows and
+    # eleven gc windows (four of them under the chunk-size tiers' ``if``)
+    # are three slabs; the tiers' captured ``base`` / ``vlen`` / ``dcols``
+    # resolve to the root's loads and iota.
+    assert bound.config_spec.cute_fragment_slab_loads_root_ids
+    with bound.env, bound.host_function:
+        plan = plan_slab_loads(bound.env, bound.host_function.device_ir.graphs)
+    groups = {id(group): group for group in plan.values()}
+    assert len(groups) == 3 and len(plan) == 22
+    assert sorted(len(g.members) for g in groups.values()) == [4, 7, 11]
+    code = bound.to_code(_config(bound, **{SLAB: True, VEC: True}))
+    assert code.count(".load()") == 4
+    assert code.count("fragment_slab_scalar") >= 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("vec", "batch", "threads"),
+    [(False, False, 256), (True, True, 256), (True, True, 512)],
+)
+def test_varlen_anchored_gram_slabs_match_reference(
+    vec: bool, batch: bool, threads: int
+) -> None:
+    # Sequences of 70, 32 and 45 tokens in chunks of 32: ragged last chunks
+    # of 6 and 13 rows, and a last chunk whose rows past the end lie past
+    # the tensor's end.
+    args = _varlen_gram_inputs((70, 32, 45), device=DEVICE, seed=0)
+    bound = _varlen_anchored_gram.bind(args)
+    knobs = {
+        DOT: "tf32_mma",
+        PAD: True,
+        "cute_fragment_unrolled_loops": True,
+        "cute_fragment_threads": threads,
+        SLAB: True,
+        VEC: vec,
+        BATCH: batch,
+    }
+    config = _config(bound, **knobs)
+    code = bound.to_code(config)
+    assert code.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
+    out = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    expected = _varlen_anchored_gram_reference(*args)
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    # The slabs stage the same scalars the masked windows read: the result
+    # is bitwise that of the plain walk.
+    plain = bound.compile_config(
+        _config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
+    )(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("vec", "batch"), [(False, False), (True, True)])
+def test_varlen_contiguous_dim_slab_matches_reference(vec: bool, batch: bool) -> None:
+    # Ragged last chunks of 6 and 13 tokens, and a last chunk whose tokens
+    # past the sequence's end lie past the tensor's end.
+    args = _varlen_contiguous_inputs((70, 32, 45), device=DEVICE, seed=0)
+    bound = _varlen_contiguous_dim_windows.bind(args)
+    knobs = {SLAB: True, VEC: vec, BATCH: batch}
+    config = _config(bound, **knobs)
+    code = bound.to_code(config)
+    assert code.count("fragment_slab_scalar = cutlass.Int32(0)") == 1
+    out = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    expected = _varlen_contiguous_dim_windows_reference(*args)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    # The slab stages the same scalars the masked windows read: bitwise
+    # the plain walk.
+    plain = bound.compile_config(
+        _config(bound, **(knobs | {SLAB: False, VEC: False, BATCH: False}))
+    )(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain)

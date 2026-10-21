@@ -5,11 +5,14 @@ CPU render pins: the barrier phases of ``squeeze_and_excitation_net_bwd_dx`` /
 tile triple (``materialized_matmul_block_ids``) and seeds, the pointwise phase
 keeps its SIMT layout knobs, and the relu-backward mask epilogue
 ``acc.to(fp16) * (c[tile] > 0)`` splices into the tcgen05 epilogue chain.
+``tcgen05_region_pid_types`` runs chosen GEMM launches of the flat chain as
+the static persistent two-CTA pipeline of the standalone single-GEMM surface.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_da
@@ -63,6 +66,10 @@ def _native_cpu_target() -> Generator[None, None, None]:
         ),
         patch(
             "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_budget_bytes",
+            return_value=232448,
+        ),
+        patch(
+            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
             return_value=232448,
         ),
     ):
@@ -127,17 +134,29 @@ def test_barrier_phases_plan_one_tcgen05_triple_per_gemm(bind: object) -> None:
     assert {"tcgen05_ab_stages", "num_threads", "cute_vector_widths"} <= keys
     assert "cute_pdl" in keys
     assert "cute_pointwise_pid_type" not in keys
-    # Clustered / two-CTA codegen and the per-region pipeline knobs whose
-    # schedule requires them need a persistent launch: a flat-only surface
-    # does not sample them (every such config fails at codegen).
+    # (``cute_pdl`` reaches the chain through the tcgen05 config's
+    # ``optional_fragments`` -- the chain is not a fission bundle.)
+    # Every GEMM phase has its complete single-output allocation proof (the
+    # exact-shape auxiliary epilogues load through registers), so the chain
+    # offers ``tcgen05_region_pid_types``: a GEMM launch may run the static
+    # persistent two-CTA pipeline while the chain itself stays flat.  The
+    # two-CTA coordinates and the per-region ring depths come with it; the
+    # fission plan's materialized-operand PDL edge does not.
+    assert all(facts is not None for facts in state.materialized_pipeline_facts)
+    assert state.region_pid_type_choices() == (
+        "inherit",
+        "persistent_blocked",
+        "persistent_interleaved",
+    )
     fragments = state.optional_fragments(for_search=True)
-    assert fragments["tcgen05_cluster_m"].choices == (1,)  # type: ignore[attr-defined]
-    assert fragments["tcgen05_cta_group"].choices == ("auto",)  # type: ignore[attr-defined]
-    assert not keys & {
+    assert fragments["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
+    assert fragments["tcgen05_cta_group"].choices == ("auto", "two")  # type: ignore[attr-defined]
+    assert {
         "tcgen05_region_ab_stages",
         "tcgen05_region_c_stages",
-        "tcgen05_materialized_pdl",
-    }
+        "tcgen05_region_pid_types",
+    } <= keys
+    assert "tcgen05_materialized_pdl" not in keys
     # Explicit configs still validate the full coordinate set.
     assert state.optional_fragments()["tcgen05_cluster_m"].choices == (1, 2)  # type: ignore[attr-defined]
 
@@ -409,3 +428,416 @@ def test_collective_seeds_ignore_axes_of_contraction_free_phases() -> None:
         assert isinstance(threads, list) and threads[:2] == unset_threads
         # The GEMM phases carry the collective geometry.
         assert seed.block_sizes[2] in (32, 64, 128)
+
+
+def _two_cta_chain_config(
+    bound: BoundKernel[Any], region_pid_types: list[str], **overrides: object
+) -> helion.Config:
+    """A dx chain config: grad_c 128x128x64, grad_x 128x128x64 CTA-pair tiles."""
+    spec = bound.config_spec
+    base = dict(spec.default_config().config)
+    blocks = list(cast("list[int]", base["block_sizes"]))
+    blocks[2:8] = [128, 128, 64, 128, 128, 64]
+    base.update(
+        block_sizes=blocks,
+        pid_type="flat",
+        loop_orders=[[1, 0], [0, 1], [0, 1]],
+        tcgen05_region_pid_types=region_pid_types,
+        tcgen05_cta_group="two",
+        tcgen05_cluster_m=2,
+        tcgen05_cluster_n=1,
+        tcgen05_region_ab_stages=[4, 2],
+        tcgen05_aux_load_placement="pre_acc_wait",
+    )
+    base.update(overrides)
+    return helion.Config.from_dict(base)
+
+
+def _strict(bound: BoundKernel[Any], config: helion.Config) -> helion.Config:
+    copy = helion.Config.from_dict(dict(config.config))
+    bound.config_spec.normalize(copy)
+    return copy
+
+
+def _repaired(bound: BoundKernel[Any], config: helion.Config) -> helion.Config:
+    copy = helion.Config.from_dict(dict(config.config))
+    bound.config_spec.normalize(copy, _fix_invalid=True)
+    return copy
+
+
+def test_two_cta_region_launches_render_per_gemm_launch() -> None:
+    bound = _bind_bwd_dx(shape=(256, 256, 128))
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.materialized_matmul_shapes == ((256, 128, 256), (256, 256, 128))
+    # A mixed chain: grad_c persistent two-CTA, grad_x left flat.  Strict
+    # normalization keeps every coordinate, including the pointwise launch's
+    # non-default loop order (only clustered launches bind their raster).
+    mixed = _two_cta_chain_config(bound, ["persistent_blocked", "inherit"])
+    normalized = _strict(bound, mixed)
+    for key in (
+        "tcgen05_region_pid_types",
+        "tcgen05_region_ab_stages",
+        "tcgen05_cta_group",
+        "tcgen05_cluster_m",
+        "loop_orders",
+        "block_sizes",
+    ):
+        assert normalized.config[key] == mixed.config[key], key
+    assert normalized.pid_type == "flat"
+    assert normalized.config["tcgen05_persistence_model"] == "non_persistent"
+    pointwise, gemm_c, gemm_x = _sources(bound.to_code(normalized))
+    # The persistent GEMM launch: the CtaGroup.TWO instruction under a
+    # (2, 1, 1) cluster and the static persistent tile walk; its epilogue
+    # still carries the relu-backward mask.
+    assert "CtaGroup.TWO" in gemm_c
+    assert "_helion_cute_cluster_shape = (2, 1, 1)" in gemm_c
+    assert " > 0.0" in gemm_c
+    # The flat GEMM launch keeps the one-CTA pipeline, no cluster.
+    assert "CtaGroup.ONE" in gemm_x and "CtaGroup.TWO" not in gemm_x
+    assert "_helion_cute_cluster_shape" not in gemm_x
+    # The pointwise launch renders exactly as under the plain flat chain.
+    flat = dict(normalized.config)
+    for key in (
+        "tcgen05_region_pid_types",
+        "tcgen05_region_ab_stages",
+        "tcgen05_aux_load_placement",
+    ):
+        flat.pop(key)
+    flat.update(tcgen05_cta_group="auto", tcgen05_cluster_m=1)
+    flat_pointwise, flat_c, _flat_x = _sources(
+        bound.to_code(_strict(bound, helion.Config.from_dict(flat)))
+    )
+    assert flat_pointwise == pointwise
+    assert "CtaGroup.ONE" in flat_c
+    # Both GEMM launches persistent, under either persistent pid type.
+    for pid_type in ("persistent_blocked", "persistent_interleaved"):
+        both = _strict(bound, _two_cta_chain_config(bound, [pid_type] * 2))
+        assert both.config["tcgen05_region_pid_types"] == [pid_type] * 2
+        stages = _sources(bound.to_code(both))
+        assert len(stages) == 3
+        assert stages[0] == pointwise
+        assert all("CtaGroup.TWO" in stage for stage in stages[1:])
+
+
+def test_region_pid_types_fail_closed() -> None:
+    bound = _bind_bwd_dx(shape=(256, 256, 128))
+    spec = bound.config_spec
+    # All-inherit is the implicit default: the key and the clusters leave.
+    inherit = _two_cta_chain_config(bound, ["inherit", "inherit"])
+    with pytest.raises(helion.exc.InvalidConfig):
+        _strict(bound, inherit)
+    repaired = _repaired(bound, inherit)
+    assert "tcgen05_region_pid_types" not in repaired.config
+    assert repaired.config["tcgen05_cluster_m"] == 1
+    assert repaired.config["tcgen05_cta_group"] == "auto"
+    # The knob has one subject, the two-CTA region schedule.
+    # A malformed list is a schema error under both normalization modes.
+    for malformed in (["persistent_blocked"], ["persistent_blocked", "flat"]):
+        with pytest.raises(helion.exc.InvalidConfig, match="tcgen05_region_pid_types"):
+            _strict(
+                bound,
+                _two_cta_chain_config(
+                    bound,
+                    ["persistent_blocked"] * 2,
+                    tcgen05_region_pid_types=malformed,
+                ),
+            )
+    for overrides in (
+        {"tcgen05_cta_group": "auto"},
+        {"tcgen05_cluster_m": 1},
+        {"tcgen05_cluster_n": 2},
+    ):
+        config = _two_cta_chain_config(bound, ["persistent_blocked"] * 2, **overrides)
+        with pytest.raises(helion.exc.InvalidConfig):
+            _strict(bound, config)
+        repaired = _repaired(bound, config)
+        assert "tcgen05_region_pid_types" not in repaired.config
+        assert repaired.config["tcgen05_cluster_m"] == 1
+        assert repaired.config["tcgen05_cluster_n"] == 1
+        assert repaired.config["tcgen05_cta_group"] == "auto"
+    # A cluster without the knob: the chain's flat launches refuse clusters.
+    clustered = dict(spec.default_config().config)
+    clustered.update(tcgen05_cluster_m=2)
+    with pytest.raises(helion.exc.InvalidConfig, match="ordered hl.barrier"):
+        _strict(bound, helion.Config.from_dict(clustered))
+    assert (
+        "tcgen05_region_pid_types"
+        not in _repaired(bound, helion.Config.from_dict(clustered)).config
+    )
+    assert (
+        _repaired(bound, helion.Config.from_dict(clustered)).config["tcgen05_cluster_m"]
+        == 1
+    )
+    # The per-region ring depth is bounded by the region's complete budget
+    # (two-CTA) or the flat validation cap (an ``inherit`` launch).
+    deep = _two_cta_chain_config(
+        bound, ["persistent_blocked", "inherit"], tcgen05_region_ab_stages=[16, 9]
+    )
+    with pytest.raises(helion.exc.InvalidConfig, match="per-region SMEM budgets"):
+        _strict(bound, deep)
+    repaired = _repaired(bound, deep)
+    stages = repaired.config["tcgen05_region_ab_stages"]
+    assert isinstance(stages, list) and stages[0] < 16 and stages[1] <= 3
+    # A persistent launch binds its raster: its non-default loop order is
+    # refused, and only that launch's entry is repaired.
+    raster = _two_cta_chain_config(
+        bound, ["persistent_blocked", "inherit"], loop_orders=[[1, 0], [1, 0], [1, 0]]
+    )
+    with pytest.raises(helion.exc.InvalidConfig, match="loop_orders"):
+        _strict(bound, raster)
+    assert _repaired(bound, raster).config["loop_orders"] == [[1, 0], [0, 1], [1, 0]]
+    # The fission plan's materialized-operand PDL edge has no subject here.
+    pdl = _two_cta_chain_config(
+        bound, ["persistent_blocked"] * 2, tcgen05_materialized_pdl=True
+    )
+    with pytest.raises(helion.exc.InvalidConfig, match="materialized"):
+        _strict(bound, pdl)
+    assert "tcgen05_materialized_pdl" not in _repaired(bound, pdl).config
+
+
+def _chain_with_vector_phase(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The dx chain behind a 1-D vector phase: its roots and the
+    ``loop_orders`` entries (one per multi-dim tile loop) no longer align."""
+    m, n = x.size()
+    k = a.size(1)
+    grad_cb = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    grad_c = torch.empty([m, k], dtype=x.dtype, device=x.device)
+    grad_x = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    w = torch.empty_like(v)
+    for pv in hl.tile(v.size(0)):
+        w[pv] = v[pv] * 2.0
+    hl.barrier()
+    for pm, pn in hl.tile((m, n)):
+        grad_cb[pm, pn] = grad_out[pm, pn] * x[pm, pn] * d[pm, pn] * (1.0 - d[pm, pn])
+    hl.barrier()
+    for rc, cc in hl.tile((m, k)):
+        acc = hl.zeros([rc, cc], dtype=torch.float32)
+        for rn in hl.tile(n):
+            acc = torch.addmm(acc, grad_cb[rc, rn], b[cc, rn].T)
+        grad_c[rc, cc] = acc.to(x.dtype) * (c[rc, cc] > 0)
+    hl.barrier()
+    for rx, cx in hl.tile((m, n)):
+        acc = hl.zeros([rx, cx], dtype=torch.float32)
+        for rk in hl.tile(k):
+            acc = torch.addmm(acc, grad_c[rx, rk], a[cx, rk].T)
+        grad_x[rx, cx] = grad_out[rx, cx] * d[rx, cx] + acc.to(x.dtype)
+    return grad_x, w
+
+
+def test_clustered_launch_loop_orders_bind_by_block_ids() -> None:
+    """A clustered GEMM launch's raster guard finds its ``loop_orders`` entry
+    by the launch's (m, n) block ids, not by its root position: behind a 1-D
+    phase (no ``LoopOrderSpec``) the roots are (2, 3) while the GEMM entries
+    are 1 and 2."""
+    t = _bwd_args(shape=(256, 256, 128))
+    v = torch.randn(777, generator=torch.Generator().manual_seed(5), dtype=t["x"].dtype)
+    bound = _bind(
+        _chain_with_vector_phase,
+        (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"], v),
+    )
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    assert state.region_pid_type_choices() is not None
+    assert state.materialized_matmul_region_indices == (2, 3)
+    assert state.materialized_matmul_block_ids == ((3, 4, 5), (6, 7, 8))
+    assert [tuple(item.block_ids) for item in spec.loop_orders] == [
+        (1, 2),
+        (3, 4),
+        (6, 7),
+    ]
+    base = dict(spec.default_config().config)
+    blocks = list(cast("list[int]", base["block_sizes"]))
+    blocks[3:9] = [128, 128, 64, 128, 128, 64]
+    base.update(
+        block_sizes=blocks,
+        pid_type="flat",
+        tcgen05_cta_group="two",
+        tcgen05_cluster_m=2,
+        tcgen05_cluster_n=1,
+        tcgen05_region_ab_stages=[4, 4],
+        tcgen05_aux_load_placement="pre_acc_wait",
+    )
+
+    def chain(pid_types: list[str], loop_orders: list[list[int]]) -> helion.Config:
+        return helion.Config.from_dict(
+            base | {"tcgen05_region_pid_types": pid_types, "loop_orders": loop_orders}
+        )
+
+    both = ["persistent_blocked", "persistent_blocked"]
+    # Either clustered GEMM launch's swapped raster is refused, and the
+    # repair resets exactly that entry; the pointwise phase keeps its order.
+    for swapped in ([[1, 0], [1, 0], [0, 1]], [[1, 0], [0, 1], [1, 0]]):
+        with pytest.raises(helion.exc.InvalidConfig, match="clustered GEMM launch"):
+            _strict(bound, chain(both, swapped))
+        assert _repaired(bound, chain(both, swapped)).config["loop_orders"] == [
+            [1, 0],
+            [0, 1],
+            [0, 1],
+        ]
+    assert _strict(bound, chain(both, [[1, 0], [0, 1], [0, 1]])).config[
+        "loop_orders"
+    ] == [[1, 0], [0, 1], [0, 1]]
+    # An ``inherit`` launch is a flat launch (shared ring depth, entry 0):
+    # its raster stays free.
+    mixed = helion.Config.from_dict(
+        chain(["persistent_blocked", "inherit"], [[1, 0], [0, 1], [1, 0]]).config
+        | {"tcgen05_region_ab_stages": [4, 0]}
+    )
+    assert _strict(bound, mixed).config["loop_orders"] == [[1, 0], [0, 1], [1, 0]]
+    # The entries are the specs over each clustered launch's (m, n) block ids.
+    free = chain(both, [[1, 0], [0, 1], [0, 1]])
+    assert state._clustered_launch_loop_order_entries(free.config) == [1, 2]
+    assert state._clustered_launch_loop_order_entries(mixed.config) == [1]
+    # Fail closed: a clustered launch without a unique entry over its (m, n)
+    # block ids (here grad_c's spec is missing) yields no binding, and the
+    # whole config then keeps the default raster.
+    with patch.object(spec, "loop_orders", [spec.loop_orders[0], spec.loop_orders[2]]):
+        assert state._clustered_launch_loop_order_entries(free.config) is None
+    with patch.object(
+        type(state), "_clustered_launch_loop_order_entries", return_value=None
+    ):
+        with pytest.raises(helion.exc.InvalidConfig, match="loop_orders"):
+            _strict(bound, free)
+        assert _repaired(bound, free).config["loop_orders"] == [[0, 1]] * 3
+
+
+def test_flat_launch_recipe_stays_with_the_inherit_launch() -> None:
+    """The chain's whole-kernel config carries the flat recipe of its
+    ``inherit`` launches (a scheduler warp, a one-slot accumulator ring,
+    direct stores -- the campaign's flat winners); the persistent launch
+    receives the paired recipe by projection and renders exactly as under
+    the plain monolithic whole-kernel config."""
+    bound = _bind_bwd_dx(shape=(256, 256, 128))
+    flat_recipe = {
+        "tcgen05_strategy": "role_local_with_scheduler",
+        "tcgen05_warp_spec_scheduler_warps": 1,
+        "tcgen05_acc_stages": 1,
+        "tcgen05_c_store_mode": "direct",
+    }
+    mixed = _strict(
+        bound,
+        _two_cta_chain_config(bound, ["persistent_blocked", "inherit"], **flat_recipe),
+    )
+    for key, value in flat_recipe.items():
+        assert mixed.config[key] == value, key
+    assert mixed.config["tcgen05_region_pid_types"] == ["persistent_blocked", "inherit"]
+    pointwise, gemm_c, gemm_x = _sources(bound.to_code(mixed))
+    plain = _strict(
+        bound, _two_cta_chain_config(bound, ["persistent_blocked", "inherit"])
+    )
+    _plain_pointwise, plain_c, _plain_x = _sources(bound.to_code(plain))
+    # The persistent launch does not see the flat recipe.
+    assert gemm_c == plain_c
+    assert "CtaGroup.TWO" in gemm_c
+    # The inherit launch renders exactly as the flat chain with that recipe
+    # (every store of dx loads an auxiliary operand, so the flat chain keeps
+    # the ``pre_acc_wait`` placement too).
+    flat = dict(mixed.config)
+    for key in ("tcgen05_region_pid_types", "tcgen05_region_ab_stages"):
+        flat.pop(key)
+    flat.update(tcgen05_cta_group="auto", tcgen05_cluster_m=1)
+    flat_pointwise, _flat_c, flat_x = _sources(
+        bound.to_code(_strict(bound, helion.Config.from_dict(flat)))
+    )
+    assert flat_pointwise == pointwise
+    assert flat_x == gemm_x
+
+
+def test_region_two_cta_seeds_round_trip() -> None:
+    bound = _bind_bwd_dx(shape=(256, 256, 128))
+    host = bound.host_function
+    assert host is not None
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    seeds = state.region_two_cta_seed_configs()
+    # Per K tile (64 and 128, both dividing every GEMM's K): the
+    # all-persistent seed and one seed per GEMM launch left flat.
+    assert [seed.block_sizes[2:8] for seed in seeds] == [
+        [128, 64, 64, 128, 64, 64]
+    ] * 3 + [[128, 64, 128, 128, 64, 128]] * 3
+    assert [seed.config["tcgen05_region_pid_types"] for seed in seeds] == [
+        ["persistent_blocked", "persistent_blocked"],
+        ["inherit", "persistent_blocked"],
+        ["persistent_blocked", "inherit"],
+    ] * 2
+    for seed in seeds:
+        assert seed.config["tcgen05_cta_group"] == "two"
+        assert seed.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
+        stages = seed.config["tcgen05_region_ab_stages"]
+        pid_types = seed.config["tcgen05_region_pid_types"]
+        assert isinstance(stages, list) and isinstance(pid_types, list)
+        # A flat launch keeps the shared ring depth; persistent ones their own.
+        assert all(
+            (stage == 0) == (pid_type == "inherit") and 0 <= stage <= 16
+            for stage, pid_type in zip(stages, pid_types, strict=True)
+        )
+    with bound.env, host:
+        ranked = CuteMaterializedMmaHeuristic.get_seed_configs(
+            bound.env, host.device_ir
+        )
+    assert ranked[0].pid_type == "flat"
+    assert "tcgen05_region_pid_types" not in ranked[0].config
+    two_cta = [seed for seed in ranked if "tcgen05_region_pid_types" in seed.config]
+    assert len(two_cta) == len(seeds)
+    generation = ConfigGeneration(spec)
+    for seed in two_cta:
+        # Strict normalization keeps the recipe, and the flat search schema
+        # carries every coordinate.
+        normalized = bound._normalized_config_copy(
+            helion.Config.from_dict(spec.default_config().config | seed.config)
+        )
+        assert (
+            normalized.config["tcgen05_region_pid_types"]
+            == seed.config["tcgen05_region_pid_types"]
+        )
+        assert normalized.config["tcgen05_cta_group"] == "two"
+        assert generation.unflatten(
+            generation.flatten(normalized)
+        ) == with_flat_min_blocks_default(spec, normalized)
+
+
+def test_region_two_cta_tile_rule() -> None:
+    from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+    from helion.autotuner.config_fragment import BlockSizeFragment
+
+    fragments = (BlockSizeFragment(64, 256, 128), BlockSizeFragment(16, 256, 128))
+    tile = CuteTcgen05Config._region_two_cta_tile
+    # Wide outputs: the widest machine-filling tile (B200: 74 CTA pairs).
+    assert tile(4096, 512, fragments, pairs_per_wave=74) == (128, 256)
+    assert tile(4096, 1024, fragments, pairs_per_wave=74) == (256, 256)
+    assert tile(2048, 1024, fragments, pairs_per_wave=74) == (128, 256)
+    # A narrow long-K output: the fullest small tile.
+    assert tile(1024, 512, fragments, pairs_per_wave=74) == (128, 64)
+    # Whole tiles only; nothing divides a 96-row output.
+    assert tile(96, 512, fragments, pairs_per_wave=74) is None
+    assert tile(256, 64, fragments, pairs_per_wave=74) == (128, 64)
+
+
+def test_fission_plan_keeps_its_whole_kernel_pid_types() -> None:
+    bound = _bind(
+        squeeze_and_excitation_net_fwd.fn, _se_args((128, 256, 64)), fission=True
+    )
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    assert state.region_pid_type_choices() is None
+    assert "tcgen05_region_pid_types" not in set(
+        ConfigGeneration(spec)._key_to_flat_indices
+    )
+    config = dict(spec.default_config().config)
+    config["tcgen05_region_pid_types"] = ["persistent_blocked", "persistent_blocked"]
+    with pytest.raises(helion.exc.InvalidConfig, match="ordered hl.barrier"):
+        _strict(bound, helion.Config.from_dict(config))
+    # (The fission plan's own two-CTA schedule is unchanged: persistent pid
+    # types, ``tcgen05_cta_group='two'`` and the region ring depths.)
+    assert (
+        "tcgen05_region_pid_types"
+        not in _repaired(bound, helion.Config.from_dict(config)).config
+    )

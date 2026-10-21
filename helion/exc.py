@@ -427,6 +427,14 @@ class NoTensorArgs(BaseError):
     message = "Kernel took no tensor or device args, unclear what device to use."
 
 
+class CuteSassCheckFailed(BaseError):
+    message = (
+        "The SASS check {1} refused kernel {0!r}: {2}. "
+        "The kernel never launched; the autotuner drops the config (plain "
+        "packets are unaffected)."
+    )
+
+
 class _WrapException(BaseError):
     message = "{name}: {msg}"
 

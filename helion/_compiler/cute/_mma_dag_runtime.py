@@ -96,6 +96,25 @@ def ldg_s32(
     return cutlass.Int32(result)
 
 
+@dsl_user_op
+def ldg_s64(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Int64:
+    """``ld.global.s64``: one int64 value (a loop bound read from a table of
+    chunk offsets)."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.s64 $0, [$1];",
+        "=l,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
 # -- predicated global accesses of a ragged root tile ---------------------------
 #
 # A root tile larger than its axis extent (``M = 8`` rows under a 16-row MMA
@@ -549,6 +568,107 @@ def sts_v2_b32(
         ],
         "st.shared.v2.b32 [$0], {$1, $2};",
         "r,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def l2_policy_evict_last(*, loc: object = None, ip: object = None) -> cutlass.Int64:
+    """``createpolicy.fractional.L2::evict_last``: the cache-policy word of
+    the hinted operand packets (``cp_async_16_l2``), created once per
+    kernel."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [],
+        "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+        "=l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
+@dsl_user_op
+def l2_policy_evict_first(*, loc: object = None, ip: object = None) -> cutlass.Int64:
+    """``createpolicy.fractional.L2::evict_first``: the cache-policy word of
+    streamed operand packets read once."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [],
+        "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+        "=l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
+# The hinted packet forms below are the ones ``helion.runtime.cute.sass_check``
+# verifies after assembly: the CuTe DSL's assembler (cutlass-dsl 4.7.0) has
+# encoded a hinted LDGSTS whose shared address it split into the
+# ``[R + UR + imm]`` form with the descriptor and address-offset fields
+# colliding (an illegal instruction at launch), so a kernel that emits them
+# declares the check and the launcher refuses the kernel when its SASS shows
+# that form (see ``emit_issue_tile``).
+
+
+@dsl_user_op
+def cp_async_16_l2(
+    smem_address: object,
+    gmem_address: object,
+    policy: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp.async.cg.shared.global.L2::cache_hint`` of one 16-byte packet
+    under the L2 cache policy ``policy`` (``l2_policy_evict_last`` /
+    ``l2_policy_evict_first``)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2;",
+        "r,l,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def cp_async_16_l2_zfill(
+    smem_address: object,
+    gmem_address: object,
+    src_bytes: object,
+    policy: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp_async_16_zfill`` under the L2 cache policy ``policy``: the bytes
+    past ``src_bytes`` (0 or 16) are zero-filled; at 0 nothing is read."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;",
+        "r,l,r,l,~{memory}",
         has_side_effects=True,
         loc=loc,
         ip=ip,
