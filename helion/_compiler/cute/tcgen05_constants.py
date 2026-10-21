@@ -672,6 +672,9 @@ TCGEN05_GROUPED_WORKLIST_MMA_M_CHOICES = (None, 64, 128, 256)
 TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY = "tcgen05_grouped_ab_tile_k"
 TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY = "tcgen05_grouped_d_shift"
 TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY = "tcgen05_grouped_balanced_workers"
+# The existing opt-in selects a validated paired width recipe from the
+# configured physical source M tile. Absence/False keeps the native path.
+TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY = "tcgen05_grouped_prefix_adaptive_n"
 TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY = "tcgen05_grouped_full_allocation_a"
 # Reviewed runtime-variable-M profiles may opt into the host-expanded direct
 # tile table.  Absence or explicit ``False`` retains the established

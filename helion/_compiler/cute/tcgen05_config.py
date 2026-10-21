@@ -173,6 +173,7 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .tcgen05_constants import TCGEN05_GROUPED_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
@@ -263,6 +264,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from .dense_gemm import DenseGemmFacts
     from .epilogue_fanout import PairedFanoutPlan
+    from .grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
     from .materialized_pdl import MaterializedOperandPdl
 
 
@@ -441,6 +443,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY,
     TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY,
     TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY,
+    TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY,
     TCGEN05_CTA_GROUP_CONFIG_KEY,
     TILE_N_KEY,
     "tcgen05_cluster_m",
@@ -611,6 +614,14 @@ class CuteTcgen05Config:
         self.grouped_ab_k_fusion_supported: bool = False
         self.grouped_d_shift_supported: bool = False
         self.grouped_balanced_workers_supported: bool = False
+        self.grouped_prefix_adaptive_n_supported: bool = False
+        self.grouped_prefix_adaptive_n_search_enabled: bool = False
+        self.grouped_prefix_adaptive_n_profile: GroupedPrefixAdaptiveNProfile | None = (
+            None
+        )
+        self.grouped_prefix_adaptive_n_profiles: dict[
+            int, GroupedPrefixAdaptiveNProfile
+        ] = {}
         self.grouped_device_mn_swizzle_supported: bool = False
         self.grouped_full_coverage_supported: bool = False
         self.grouped_full_coverage_eligible: bool = False
@@ -4482,6 +4493,100 @@ class CuteTcgen05Config:
             "per hardware slot"
         )
 
+    def get_grouped_prefix_adaptive_n_profile(
+        self, config: Mapping[str, object]
+    ) -> GroupedPrefixAdaptiveNProfile | None:
+        source_m = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+        if type(source_m) is not int:
+            return None
+        profile = self.grouped_prefix_adaptive_n_profiles.get(source_m)
+        if profile is None and source_m == 128:
+            # Preserve the existing single-profile interface for M128 callers.
+            return self.grouped_prefix_adaptive_n_profile
+        return profile
+
+    def _normalize_grouped_prefix_adaptive_n(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        view = self._matmul_config_view(config)
+        profile = self.get_grouped_prefix_adaptive_n_profile(config)
+        panel_supported = profile is not None and (
+            profile.row_tile == 128
+            and config.get(GROUPED_PANEL_ALTERNATE_KEY) is None
+            and config.get(GROUPED_PANEL_RATIO_KEY) is None
+            or profile.row_tile == 256
+            and config.get(GROUPED_PANEL_ALTERNATE_KEY) == 4
+            and config.get(GROUPED_PANEL_RATIO_KEY) == 1
+        )
+        valid = (
+            value is True
+            and self.grouped_prefix_adaptive_n_supported
+            and profile is not None
+            and view is not None
+            and view[0][view[1]] == 256
+            and view[0][view[2]] == 128
+            and view[0][view[3]] == 64
+            and config.get(TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY) is None
+            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get("tcgen05_grouped_worklist_orientation", "nm") == "mn"
+            and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+            == profile.row_tile
+            and config.get("tcgen05_grouped_worklist_mma_n") == profile.primary.n
+            and config.get("tcgen05_cluster_m", 1) == 2
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") in ("auto", "two")
+            and config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
+            is False
+            and config.get("cute_min_blocks_per_mp", 0) == 1
+            and config.get("tcgen05_ab_stages") == profile.primary.ab_stages
+            and config.get("tcgen05_c_stages") == profile.primary.c_stages
+            and config.get("tcgen05_acc_stages", 2) == 2
+            and config.get("tcgen05_num_epi_warps", 4) == 4
+            and config.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY) is True
+            and config.get(TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY) is True
+            and type(config.get(TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY, False))
+            is bool
+            and config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 8
+            and panel_supported
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, "default") == "default"
+            and all(config.get(key) is None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
+            and config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+            == TCGEN05_C_STORE_MODE_NORMAL
+            and config.get("pid_type")
+            in ("persistent_interleaved", "persistent_blocked")
+            and config.get("num_sm_multiplier", 1) == 1
+            and config.get("tcgen05_warp_spec_c_input_warps", 0) == 0
+            and config.get("tcgen05_warp_spec_mma_warps", 1) == 1
+            and config.get("tcgen05_warp_spec_ab_load_warps", 1) == 1
+            and config.get("tcgen05_warp_spec_scheduler_warps", 0) == 0
+            and config.get("tcgen05_warp_spec_epi_load_warps", 0) == 0
+            and config.get("tcgen05_warp_spec_store_warps", 0) == 0
+            and config.get(TCGEN05_CONSUMER_REGS_CONFIG_KEY, 256) == 256
+            and not self._is_grouped_clc_config(config)
+            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is False
+            and config.get(GROUPED_ROW_UNION_KEY, False) is False
+            and config.get(
+                TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
+                TCGEN05_GROUPED_FULL_COVERAGE_OFF,
+            )
+            == TCGEN05_GROUPED_FULL_COVERAGE_OFF
+        )
+        if valid:
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}=True requires a proved fresh immutable paired MN prefix "
+            "K64 recipe with coherent source tile, panel policy and output rings"
+        )
+
     def _normalize_grouped_ab_tile_k(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4607,6 +4712,7 @@ class CuteTcgen05Config:
         self._normalize_grouped_ab_tile_k(config, fix_invalid=fix_invalid)
         self._normalize_grouped_d_shift(config, fix_invalid=fix_invalid)
         self._normalize_grouped_balanced_workers(config, fix_invalid=fix_invalid)
+        self._normalize_grouped_prefix_adaptive_n(config, fix_invalid=fix_invalid)
         self._normalize_grouped_panel_adaptation(config, fix_invalid=fix_invalid)
         self._normalize_epilogue_fanout(config, fix_invalid=fix_invalid)
         self._normalize_warp_register_reallocation(config, fix_invalid=fix_invalid)
@@ -6844,6 +6950,8 @@ class CuteTcgen05Config:
             fragments[TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY] = BooleanFragment()
         if not for_search or self.grouped_balanced_workers_supported:
             fragments[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = BooleanFragment()
+        if not for_search or self.grouped_prefix_adaptive_n_search_enabled:
+            fragments[TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY] = BooleanFragment()
         if not for_search or self.grouped_device_mn_swizzle_supported:
             fragments[GROUPED_PANEL_ALTERNATE_KEY] = EnumFragment(
                 (None, *TCGEN05_LEGAL_L2_SWIZZLE_SIZES),
@@ -7477,6 +7585,7 @@ class CuteTcgen05Config:
             self._normalize_grouped_ab_tile_k(config, fix_invalid=fix_invalid)
             self._normalize_grouped_d_shift(config, fix_invalid=fix_invalid)
             self._normalize_grouped_balanced_workers(config, fix_invalid=fix_invalid)
+            self._normalize_grouped_prefix_adaptive_n(config, fix_invalid=fix_invalid)
             self._normalize_grouped_panel_adaptation(config, fix_invalid=fix_invalid)
             self._clamp_l2_swizzle_size_to_shape(config)
             self._validate_cta_group_config(config, fix_invalid=fix_invalid)
