@@ -672,12 +672,19 @@ class _FakeLocalBenchmarkProvider:
         self.effective_source_repairs = {}
         return repairs
 
+    def update_effective_source_measurement(self, config, fn, perf) -> None:
+        return None
+
+    def forget_effective_source_measurement(self, fn) -> None:
+        return None
+
     def benchmark(
         self,
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
         raise_if_no_viable_config: bool = True,
+        refresh_sources: bool = False,
     ) -> list[BenchmarkResult]:
         self.benchmark_calls.append((configs, desc))
         if self.kernel.error is not None:
@@ -830,9 +837,10 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
             "deduplicated",
             None,
         )
+        second_replacement_fn = Mock()
         children[1].effective_source_repairs[materialized] = BenchmarkResult(
             materialized,
-            Mock(),
+            second_replacement_fn,
             2.0,
             "deduplicated",
             None,
@@ -846,6 +854,10 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertEqual(repaired.status, "deduplicated")
         self.assertAlmostEqual(repaired.perf, math.sqrt(2.0))
         self.assertIs(repaired.fn, replacement_fn)
+        self.assertEqual(
+            provider.functions_for_config(failed),
+            (replacement_fn, second_replacement_fn),
+        )
         timings, objective, statuses = provider.args.measurements[repr(materialized)]
         self.assertEqual(timings, (1.0, 2.0))
         self.assertAlmostEqual(objective, math.sqrt(2.0))

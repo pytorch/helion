@@ -51,6 +51,7 @@ class BenchmarkJob:
     # Finalist slot whose private argument copies this job reads (None shares
     # the cached arguments with every other job).
     args_slot: int | None = None
+    default_cudagraph: bool = False
 
     def __call__(self) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -72,6 +73,7 @@ class BenchmarkJob:
                     rep=self.rep,
                     fixed_repetitions=self.fixed_repetitions,
                     probe_long_kernel=self.probe_long_kernel,
+                    default_cudagraph=self.default_cudagraph,
                 )
                 return cast(
                     "float",

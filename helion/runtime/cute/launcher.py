@@ -19,6 +19,7 @@ import contextvars
 import ctypes
 from dataclasses import dataclass
 from dataclasses import field
+import gc
 import hashlib
 import importlib
 import inspect
@@ -3652,6 +3653,13 @@ def cute_cuda_graph(
     """
     graph = _CuteCUDAGraph()
     token = _CUTE_ACTIVE_CUDA_GRAPH.set(graph)
+    gc_enabled = gc.isenabled()
+    if gc_enabled:
+        # Argument marshalling can make old graph-owned CUDA objects
+        # unreachable. Collecting their cycles during an active capture may
+        # free CUDA resources and invalidate that capture. torch.cuda.graph
+        # performs its explicit collection before capture starts.
+        gc.disable()
     try:
         with torch.cuda.graph(
             graph,
@@ -3662,6 +3670,8 @@ def cute_cuda_graph(
             yield graph
     finally:
         _CUTE_ACTIVE_CUDA_GRAPH.reset(token)
+        if gc_enabled:
+            gc.enable()
 
 
 @dataclass(frozen=True)

@@ -164,6 +164,7 @@ def _mock_kernel(settings: Settings) -> SimpleNamespace:
             autotune_config_is_viable=lambda _config_spec, _config: True,
             should_deduplicate_generated_sources=lambda config_spec: False,
             get_do_bench=lambda: None,
+            default_autotune_cudagraph=lambda _config_spec: False,
             classify_autotune_exception=lambda error: None,
             probe_long_autotune_kernels=lambda _config_spec: False,
             supports_precompile=lambda: True,

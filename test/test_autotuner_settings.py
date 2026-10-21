@@ -1478,7 +1478,7 @@ class TestAutotuneBudget(TestCase):
         )
         self.assertFalse(
             backend.should_deduplicate_generated_sources(
-                SimpleNamespace(cute_flash_search_enabled=False)
+                SimpleNamespace(cute_flash_search_enabled=False, matmul_facts=())
             )
         )
 

@@ -47,6 +47,7 @@ from .benchmark_provider import IsolatedBenchmarkFailure
 from .benchmark_provider import IsolatedBenchmarkTiming
 from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import MultiShapeBenchmarkProvider
+from .benchmark_provider import _aggregate_multi_shape_timings
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
@@ -74,6 +75,7 @@ from helion._dist_utils import sync_object
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from types import TracebackType
     from typing_extensions import Self
 
     from ..runtime.config import Config
@@ -1468,7 +1470,13 @@ class _FinalSelectionMeasurer(Protocol):
 
     def __enter__(self) -> Self: ...
 
-    def __exit__(self, exc_type: object, *exc_info: object) -> None: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None: ...
 
     def warm(self, index: int, duration_ms: int) -> None:
         """Run finalist ``index`` for ``duration_ms`` to settle the clocks."""
@@ -1602,6 +1610,130 @@ class _InProcessFinalSelectionMeasurer:
         return float(timing)
 
 
+class _MultiShapeFinalSelectionMeasurer:
+    """Steady windows over the validated function for every argument set."""
+
+    def __init__(
+        self,
+        provider: MultiShapeBenchmarkProvider,
+        configs: Sequence[Config],
+        measurers: Sequence[_FinalSelectionMeasurer],
+        valid_indices: Sequence[int],
+    ) -> None:
+        self.provider = provider
+        self.configs = list(configs)
+        self.prior_measurements = provider.args.measurements.copy()
+        self.measurers = list(measurers)
+        self.valid_indices = list(valid_indices)
+        self.local_indices = {
+            original: local for local, original in enumerate(valid_indices)
+        }
+        self.case_order = list(range(len(measurers)))
+        self.round_case_orders: list[list[int]] = []
+        self.samples: dict[int, list[tuple[float, ...]]] = {}
+        self.last_timings: dict[int, tuple[float, ...]] = {}
+        self.last_statuses: dict[int, tuple[str, ...]] = {}
+        self.stack = contextlib.ExitStack()
+
+    def __enter__(self) -> Self:
+        try:
+            for measurer in self.measurers:
+                self.stack.enter_context(measurer)
+        except BaseException:
+            self.stack.close()
+            raise
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.stack.__exit__(exc_type, exc_value, traceback)
+        except BenchmarkWorkerUnkillable as error:
+            if error.fn_index is not None:
+                error.fn_index = self.valid_indices[error.fn_index]
+            raise
+
+    def set_round_order(self, *, reverse: bool) -> None:
+        order = list(range(len(self.measurers)))
+        self.case_order = order[::-1] if reverse else order
+        self.round_case_orders.append(list(self.case_order))
+
+    def warm(self, index: int, duration_ms: int) -> None:
+        if index not in self.local_indices:
+            if not self.valid_indices:
+                return
+            index = self.valid_indices[0]
+        local_index = self.local_indices[index]
+        for measurer in self.measurers:
+            try:
+                measurer.warm(local_index, duration_ms)
+            except BenchmarkWorkerUnkillable as error:
+                error.fn_index = index
+                raise
+
+    def measure(
+        self, index: int, warmup_ms: int, rep_ms: int
+    ) -> IsolatedBenchmarkTiming:
+        if index not in self.local_indices:
+            self.last_timings[index] = (inf,) * len(self.measurers)
+            self.last_statuses[index] = ("error",) * len(self.measurers)
+            return IsolatedBenchmarkFailure("error")
+        timings = [inf] * len(self.measurers)
+        statuses = ["incomplete"] * len(self.measurers)
+        for case_index in self.case_order:
+            try:
+                result = self.measurers[case_index].measure(
+                    self.local_indices[index], warmup_ms, rep_ms
+                )
+            except BenchmarkWorkerUnkillable as error:
+                error.fn_index = index
+                raise
+            if isinstance(result, IsolatedBenchmarkFailure):
+                statuses[case_index] = result.status
+            elif result is not None and math.isfinite(result) and result > 0:
+                timings[case_index] = float(result)
+                statuses[case_index] = "ok"
+            self.last_timings[index] = tuple(timings)
+            self.last_statuses[index] = tuple(statuses)
+            if statuses[case_index] != "ok":
+                return result if isinstance(result, IsolatedBenchmarkFailure) else None
+        self.samples.setdefault(index, []).append(tuple(timings))
+        return _aggregate_multi_shape_timings(
+            timings,
+            aggregation=self.provider.args.aggregation,
+            references=self.provider.args.reference_latencies,
+        )
+
+    def summarize(self, index: int, rounds: int) -> float:
+        """Aggregate per-case medians from complete final rounds, excluding screen."""
+        samples = self.samples[index][-rounds:]
+        medians = tuple(statistics.median(case) for case in zip(*samples, strict=True))
+        return self.provider.record_steady_measurement(self.configs[index], medians)
+
+    def record_incomplete(self, index: int) -> None:
+        self.provider.record_steady_measurement(
+            self.configs[index],
+            self.last_timings.get(index, (inf,) * len(self.measurers)),
+            statuses=self.last_statuses.get(
+                index, ("incomplete",) * len(self.measurers)
+            ),
+        )
+
+    def restore_unavailable_fallback(self, index: int) -> None:
+        if index not in self.local_indices or any(
+            status in ("error", "timeout")
+            for status in self.last_statuses.get(index, ())
+        ):
+            return
+        self.provider.restore_unavailable_measurement(
+            self.configs[index], self.prior_measurements
+        )
+
+
 class PopulationBasedSearch(BaseSearch):
     """
     Base class for search algorithms that use a population of configurations.
@@ -1666,7 +1798,7 @@ class PopulationBasedSearch(BaseSearch):
             # eviction-priority leakage.
             # Fresh finalist processes cannot inherit cached argument storage
             # or live allocations from candidates measured earlier in search.
-            "timing_version": 4,
+            "timing_version": 5,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
@@ -1726,7 +1858,13 @@ class PopulationBasedSearch(BaseSearch):
         return (
             self.final_selection is not None
             and self.settings.autotune_benchmark_fn is None
-            and not isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider)
+        )
+
+    def _final_selection_case_count(self) -> int:
+        return (
+            len(self.args.cases)
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            else 1
         )
 
     def _final_selection_shortlist_estimate(self) -> int:
@@ -1742,7 +1880,8 @@ class PopulationBasedSearch(BaseSearch):
         policy = self.final_selection
         assert policy is not None
         return min(
-            policy.estimated_seconds(self._final_selection_shortlist_estimate()),
+            policy.estimated_seconds(self._final_selection_shortlist_estimate())
+            * self._final_selection_case_count(),
             _FINAL_SELECTION_RESERVE_FRACTION * budget,
         )
 
@@ -1752,7 +1891,10 @@ class PopulationBasedSearch(BaseSearch):
         policy = self.final_selection
         assert policy is not None
         smallest = policy.budget_ladder()[-1]
-        return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
+        return (
+            smallest.estimated_seconds(self._final_selection_shortlist_estimate())
+            * self._final_selection_case_count()
+        )
 
     def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
         """The policy sized to the budget left when the phase starts.
@@ -1765,7 +1907,9 @@ class PopulationBasedSearch(BaseSearch):
         budget = self.settings.autotune_budget_seconds
         if budget is not None and self._autotune_budget_start is not None:
             remaining = budget - (time.perf_counter() - self._autotune_budget_start)
-            plan = policy.fit_to_seconds(remaining, shortlist)
+            plan = policy.fit_to_seconds(
+                remaining / self._final_selection_case_count(), shortlist
+            )
             if plan is None:
                 smallest = policy.budget_ladder()[-1].estimated_seconds(shortlist)
                 self.log(
@@ -2769,31 +2913,55 @@ class PopulationBasedSearch(BaseSearch):
             return pinned_after
         return after
 
-    def _steady_bench(self) -> Callable[..., float | tuple[float, ...]]:
+    def _steady_bench(
+        self, config_spec: ConfigSpec | None = None
+    ) -> Callable[..., float | tuple[float, ...]]:
         """The backend's steady-window timer, or the generic ``do_bench``."""
-        return self.config_spec.backend.get_do_bench() or do_bench
+        spec = self.config_spec if config_spec is None else config_spec
+        backend = spec.backend
+        bench = backend.get_do_bench() or do_bench
+        if bench is do_bench:
+            default_cudagraph = backend.default_autotune_cudagraph(spec)
+            probe_long_kernel = (
+                spec.cute_flash_search_enabled
+                or backend.probe_long_autotune_kernels(spec)
+            )
+            if default_cudagraph or probe_long_kernel:
+                return functools.partial(
+                    do_bench,
+                    default_cudagraph=default_cudagraph,
+                    probe_long_kernel=probe_long_kernel,
+                )
+        return bench
 
-    def _private_benchmark_args(self, count: int) -> _PrivateBenchmarkArgs:
+    def _private_benchmark_args(
+        self, count: int, *, provider: LocalBenchmarkProvider | None = None
+    ) -> _PrivateBenchmarkArgs:
         """Private clones of the kernel arguments for ``count`` candidates.
 
         Raises ``torch.OutOfMemoryError`` when they do not fit on the device.
         """
-        process_group_name = self.kernel.env.process_group_name
+        args = self.args if provider is None else provider.args
+        kernel = self.kernel if provider is None else provider.kernel
+        process_group_name = kernel.env.process_group_name
         clones = [
-            _clone_args(self.args, process_group_name, idx_to_clone=None)
+            _clone_args(args, process_group_name, idx_to_clone=None)
             for _ in range(count + 1)
         ]
         return _PrivateBenchmarkArgs(clones[0], clones[1:])
 
-    def _shared_benchmark_args(self) -> Sequence[object]:
+    def _shared_benchmark_args(
+        self, *, provider: LocalBenchmarkProvider | None = None
+    ) -> Sequence[object]:
         """The kernel arguments every candidate of a re-timing shares: a clone
         of the mutated arguments when the kernel has any, else the originals."""
-        mutated = self.benchmark_provider.mutated_arg_indices
+        args = self.args if provider is None else provider.args
+        kernel = self.kernel if provider is None else provider.kernel
+        selected_provider = self.benchmark_provider if provider is None else provider
+        mutated = selected_provider.mutated_arg_indices
         if len(mutated) == 0:
-            return self.args
-        return _clone_args(
-            self.args, self.kernel.env.process_group_name, idx_to_clone=mutated
-        )
+            return args
+        return _clone_args(args, kernel.env.process_group_name, idx_to_clone=mutated)
 
     def _final_selection_measurer(
         self, finalists: Sequence[PopulationMember], policy: FinalSelectionConfig
@@ -2811,6 +2979,67 @@ class PopulationBasedSearch(BaseSearch):
             float(self.settings.autotune_benchmark_timeout),
             3.0 * max(window_s, thermal_s) + 15.0,
         )
+        if isinstance(provider, MultiShapeBenchmarkProvider):
+            functions = [
+                provider.functions_for_config(member.config) for member in finalists
+            ]
+            valid_indices = [
+                index for index, fns in enumerate(functions) if fns is not None
+            ]
+            # Each case can use at most its share of the existing half-free-memory
+            # allowance. This is conservative for differently sized argument sets.
+            private_copies = all(
+                child.private_argument_copies_affordable(
+                    len(valid_indices) * len(provider.children)
+                )
+                for child in provider.children
+            )
+            measurers: list[_FinalSelectionMeasurer] = []
+            for case_index, child in enumerate(provider.children):
+                fns = [
+                    cast("tuple[Callable[..., object], ...]", functions[index])[
+                        case_index
+                    ]
+                    for index in valid_indices
+                ]
+                if child.steady_window_benchmark_available():
+                    measurers.append(
+                        _WorkerFinalSelectionMeasurer(
+                            child,
+                            fns,
+                            private_copies=private_copies,
+                            timeout_s=timeout_s,
+                        )
+                    )
+                    continue
+                child_args: _PrivateBenchmarkArgs | Sequence[object] | None = None
+                if private_copies and not dist.is_initialized():
+                    try:
+                        child_args = self._private_benchmark_args(
+                            len(valid_indices), provider=child
+                        )
+                    except torch.OutOfMemoryError:
+                        self.log.warning(
+                            "Final selection could not allocate private arguments "
+                            f"for arg_sets[{case_index}]; finalists share that case."
+                        )
+                if child_args is None:
+                    child_args = self._shared_benchmark_args(provider=child)
+                measurers.append(
+                    _InProcessFinalSelectionMeasurer(
+                        fns,
+                        child_args,
+                        self._steady_bench(child.config_spec),
+                        process_group_name=child.kernel.env.process_group_name,
+                        log=self.log,
+                    )
+                )
+            return _MultiShapeFinalSelectionMeasurer(
+                provider,
+                [member.config for member in finalists],
+                measurers,
+                valid_indices,
+            )
         if isinstance(provider, LocalBenchmarkProvider):
             private_copies = provider.private_argument_copies_affordable(len(finalists))
             if provider.steady_window_benchmark_available():
@@ -2913,6 +3142,8 @@ class PopulationBasedSearch(BaseSearch):
                     survivors, process_group_name=process_group_name
                 )
                 for round_index in range(policy.rounds):
+                    if isinstance(measurer, _MultiShapeFinalSelectionMeasurer):
+                        measurer.set_round_order(reverse=round_index % 2 != 0)
                     # A finalist that failed, timed out or missed a reading in
                     # an earlier round cannot compete (it needs a reading from
                     # every round), so it is not timed again: a hung finalist
@@ -2945,10 +3176,18 @@ class PopulationBasedSearch(BaseSearch):
         for index in survivors:
             status = failures[index]
             if status is not None:
+                if isinstance(measurer, _MultiShapeFinalSelectionMeasurer):
+                    measurer.record_incomplete(index)
                 results.append(IsolatedBenchmarkFailure(status))
             elif len(readings[index]) == policy.rounds:
-                results.append(statistics.median(readings[index]))
+                results.append(
+                    measurer.summarize(index, policy.rounds)
+                    if isinstance(measurer, _MultiShapeFinalSelectionMeasurer)
+                    else statistics.median(readings[index])
+                )
             else:
+                if isinstance(measurer, _MultiShapeFinalSelectionMeasurer):
+                    measurer.record_incomplete(index)
                 results.append(None)
         results = sync_object(results, process_group_name=process_group_name)
         timings, failure_statuses = self._resolve_isolated_rebenchmark_results(
@@ -2962,6 +3201,7 @@ class PopulationBasedSearch(BaseSearch):
             for member, result in zip(members, results, strict=True)
             if isinstance(result, float) and math.isfinite(member.perf)
         ]
+        unavailable_only_fallback = not live
         if not live:
             self.log.warning(
                 "Final selection took no complete steady-window readings; "
@@ -2973,6 +3213,10 @@ class PopulationBasedSearch(BaseSearch):
         after = self._prefer_pinned_within_tolerance(
             min(live, key=performance), live, pinned_configs
         )
+        if unavailable_only_fallback and isinstance(
+            measurer, _MultiShapeFinalSelectionMeasurer
+        ):
+            measurer.restore_unavailable_fallback(finalists.index(after))
         self._log_final_selection(
             finalists,
             survivors,
@@ -2983,6 +3227,9 @@ class PopulationBasedSearch(BaseSearch):
             pinned_configs,
             policy,
             wall_s=time.perf_counter() - start,
+            multi_shape=measurer
+            if isinstance(measurer, _MultiShapeFinalSelectionMeasurer)
+            else None,
         )
         return after
 
@@ -2998,6 +3245,7 @@ class PopulationBasedSearch(BaseSearch):
         policy: FinalSelectionConfig,
         *,
         wall_s: float,
+        multi_shape: _MultiShapeFinalSelectionMeasurer | None = None,
     ) -> None:
         result_by_index = dict(zip(survivors, results, strict=True))
 
@@ -3032,6 +3280,19 @@ class PopulationBasedSearch(BaseSearch):
                     "disqualified": verdict(index),
                 }
             )
+            if multi_shape is not None:
+                case_samples = multi_shape.samples.get(index, [])[-policy.rounds :]
+                rows[-1]["per_shape_rounds_ms"] = [
+                    list(sample) for sample in case_samples
+                ]
+                rows[-1]["per_shape_medians_ms"] = (
+                    [
+                        statistics.median(case)
+                        for case in zip(*case_samples, strict=True)
+                    ]
+                    if isinstance(result, float)
+                    else None
+                )
             marks = ("*" if member is selected else " ") + (
                 "P" if member.config in pinned_configs else " "
             )
@@ -3064,6 +3325,13 @@ class PopulationBasedSearch(BaseSearch):
             "selected_config_id": canonical_config_id(selected.config),
             "rows": rows,
         }
+        if multi_shape is not None:
+            self._autotune_metrics.final_selection.update(
+                aggregation=multi_shape.provider.args.aggregation,
+                relative_to=multi_shape.provider.args.relative_to,
+                objective_reduction="aggregate of per-shape round medians",
+                case_orders=multi_shape.round_case_orders,
+            )
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
@@ -3453,6 +3721,18 @@ class PopulationBasedSearch(BaseSearch):
             if failure_status is not None:
                 continue
             member.perfs.append(timing)
+            if (
+                isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+                and trace_result is not None
+                and not isinstance(trace_result, IsolatedBenchmarkFailure)
+                and math.isfinite(trace_result)
+                and trace_result > 0
+                and math.isfinite(timing)
+                and timing > 0
+            ):
+                self.benchmark_provider.update_effective_source_measurement(
+                    member.config, member.fn, timing
+                )
             if timing < self.best_perf_so_far:
                 self.best_perf_so_far = timing
         invalidated = self._invalidate_cute_flash_rebenchmark_failures(

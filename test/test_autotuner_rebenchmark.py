@@ -1035,8 +1035,15 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             return 50.0 + in_process_calls
 
         search.config_spec = SimpleNamespace(
-            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+            cute_flash_search_enabled=False,
+            backend=SimpleNamespace(
+                get_do_bench=lambda: steady_bench,
+                should_deduplicate_generated_sources=lambda _spec: False,
+                probe_long_autotune_kernels=lambda _spec: False,
+                default_autotune_cudagraph=lambda _spec: False,
+            ),
         )
+        provider.config_spec = search.config_spec
         member_a = PopulationMember(lambda: None, [100.0], (), helion.Config())
         member_b = PopulationMember(lambda: None, [101.0], (), helion.Config())
 

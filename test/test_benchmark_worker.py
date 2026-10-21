@@ -497,10 +497,12 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 args_path="/tmp/args.pt",
                 use_wall_clock=False,
                 probe_long_kernel=True,
+                default_cudagraph=True,
             )()
 
         wall_bench.assert_not_called()
         self.assertIs(event_bench.call_args.kwargs["probe_long_kernel"], True)
+        self.assertIs(event_bench.call_args.kwargs["default_cudagraph"], True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_event_timed_long_kernel_skips_redundant_estimates(self) -> None:
@@ -1214,6 +1216,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 name="cute",
                 get_do_bench=lambda: None,
                 probe_long_autotune_kernels=lambda _config_spec: False,
+                default_autotune_cudagraph=lambda _config_spec: False,
             ),
             cute_flash_search_enabled=False,
         )
@@ -1253,7 +1256,12 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
-        provider.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            backend=SimpleNamespace(
+                default_autotune_cudagraph=lambda _config_spec: False
+            ),
+        )
         provider._precompile_args_path = "/tmp/args.pt"
         provider._benchmark_worker = Mock()
         provider._benchmark_worker.run.return_value = 1.25
@@ -1275,6 +1283,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         job = provider._benchmark_worker.run.call_args.args[0]
         self.assertEqual(job.fixed_repetitions, 3)
         self.assertTrue(job.probe_long_kernel)
+        self.assertFalse(job.default_cudagraph)
         self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
 
     def test_long_kernel_probe_uses_search_or_backend_policy(self) -> None:
@@ -2108,6 +2117,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
     ) -> None:
         search = object.__new__(PopulationBasedSearch)
         search.log = Mock(trace_enabled=False)
+        search.benchmark_provider = Mock(spec=LocalBenchmarkProvider)
         search.config_spec = SimpleNamespace(
             backend_name="cute",
             cute_flash_search_enabled=True,
@@ -2138,6 +2148,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         search._apply_rebenchmark_timings([failed_duplicate], [math.inf])
 
         self.assertEqual(failed_duplicate.perfs, [math.inf])
+        search.benchmark_provider.update_effective_source_measurement.assert_not_called()
         self.assertEqual(
             search._pinned_finalist_members[config].perfs,
             original.perfs,

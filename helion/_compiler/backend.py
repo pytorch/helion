@@ -687,6 +687,15 @@ class Backend(abc.ABC):
         """
         return False
 
+    def default_autotune_cudagraph(self, config_spec: ConfigSpec) -> bool:
+        """Whether CUDA candidate timing should use graphs by default.
+
+        The benchmark environment override still takes precedence. Backends
+        retain the builtin event timer and its killable worker by using this
+        policy instead of supplying a custom benchmark callable.
+        """
+        return False
+
     def get_interleaved_bench(
         self,
     ) -> Callable[..., list[float]] | None:

@@ -424,6 +424,7 @@ def test_rebenchmark_trace_does_not_report_retained_timing_as_measured(
     search = SimpleNamespace(
         log=log,
         performance_unit="ms",
+        benchmark_provider=Mock(spec=LocalBenchmarkProvider),
         best_perf_so_far=1.5,
         _autotune_metrics=AutotuneMetrics(),
         _invalidate_cute_flash_rebenchmark_failures=Mock(return_value=[]),
@@ -440,6 +441,33 @@ def test_rebenchmark_trace_does_not_report_retained_timing_as_measured(
     assert [row["status"] for row in rows] == ["timeout", "ok"]
     assert [row["perf_ms"] for row in rows] == [None, 0.8]
     assert members[0].perf == 1.5
+    search.benchmark_provider.update_effective_source_measurement.assert_called_once_with(
+        members[2].config, members[2].fn, 0.8
+    )
+
+
+@pytest.mark.parametrize(
+    "trace_result",
+    [None, IsolatedBenchmarkFailure("timeout"), math.nan, math.inf, 0.0, -1.0],
+)
+def test_source_cache_does_not_refresh_retained_unmeasured_timings(
+    trace_result: float | IsolatedBenchmarkFailure | None,
+) -> None:
+    provider = Mock(spec=LocalBenchmarkProvider)
+    member = PopulationMember(lambda: None, [1.5], [], Config(block_sizes=[32]))
+    search = SimpleNamespace(
+        log=Mock(trace_enabled=False),
+        benchmark_provider=provider,
+        performance_unit="ms",
+        best_perf_so_far=1.5,
+        _invalidate_cute_flash_rebenchmark_failures=Mock(return_value=[]),
+        _refresh_benchmarked_members_after_rebenchmark=Mock(),
+    )
+    PopulationBasedSearch._apply_rebenchmark_timings(
+        search, [member], [1.5], trace_results=[trace_result]
+    )
+    assert member.perf == 1.5
+    provider.update_effective_source_measurement.assert_not_called()
 
 
 @pytest.mark.parametrize("relative_to", [None, "baseline"])
@@ -506,7 +534,11 @@ def test_multi_shape_rebenchmark_traces_only_fresh_results(
     assert [member.perf for member in members] == [objective, math.inf, math.inf]
     assert metrics.num_configs_tested == 0
     provider._benchmark.assert_called_once_with(
-        configs, desc="Rebenchmarking", record_results=False, check_budget=False
+        configs,
+        desc="Rebenchmarking",
+        record_results=False,
+        check_budget=False,
+        refresh_sources=True,
     )
     assert provider.budget_exceeded_fn.call_count == 2
 

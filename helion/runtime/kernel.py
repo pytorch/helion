@@ -9,6 +9,8 @@ import hashlib
 import inspect
 import itertools
 import logging
+import math
+from numbers import Real
 import os
 import re
 import sys
@@ -1921,6 +1923,7 @@ class Kernel(Generic[_R]):
         *,
         aggregation: Literal["geomean", "max"] = "geomean",
         relative_to: Literal["default", "baseline"] | None = None,
+        reference_latencies_ms: Sequence[float] | None = None,
         cache_tag: str | None = None,
         force: bool = True,
         **options: object,
@@ -1943,6 +1946,9 @@ class Kernel(Generic[_R]):
             arg_sets: Non-empty sequence of representative kernel argument sequences.
             aggregation: Joint objective, either ``"geomean"`` or ``"max"``.
             relative_to: Optional ``"default"`` or ``"baseline"`` normalization.
+            reference_latencies_ms: Optional positive finite host timings, one
+                per argument set. Requires ``relative_to`` and replaces timing
+                its references. The exact tuple participates in cache identity.
             cache_tag: User-managed cache discriminator for dynamic shapes, runtime
                 numeric arguments, or callbacks.
             force: If true, ignore pinned configs and cache reads during the search.
@@ -1977,6 +1983,46 @@ class Kernel(Generic[_R]):
             raise exc.InvalidAPIUsage(
                 "autotune_multi arg_sets must be a non-empty sequence"
             )
+        normalized_references: tuple[float, ...] | None = None
+        if reference_latencies_ms is not None:
+            if relative_to is None:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi reference_latencies_ms requires relative_to"
+                )
+            if not isinstance(reference_latencies_ms, Sequence) or isinstance(
+                reference_latencies_ms, (str, bytes)
+            ):
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi reference_latencies_ms must be a host sequence"
+                )
+            if len(reference_latencies_ms) != len(arg_sets):
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi reference_latencies_ms must have one value "
+                    "per argument set"
+                )
+            values: list[float] = []
+            for index, value in enumerate(reference_latencies_ms):
+                # Tensor conversion could read device values on the host. Only
+                # host real scalars are admitted; bool is not a timing value.
+                if isinstance(value, bool) or not isinstance(value, Real):
+                    raise exc.InvalidAPIUsage(
+                        f"autotune_multi reference_latencies_ms[{index}] must be "
+                        "a positive finite host real value"
+                    )
+                try:
+                    latency = float(value)
+                except (OverflowError, ValueError) as error:
+                    raise exc.InvalidAPIUsage(
+                        f"autotune_multi reference_latencies_ms[{index}] must be "
+                        "a positive finite host real value"
+                    ) from error
+                if not math.isfinite(latency) or latency <= 0:
+                    raise exc.InvalidAPIUsage(
+                        f"autotune_multi reference_latencies_ms[{index}] must be "
+                        "a positive finite host real value"
+                    )
+                values.append(latency)
+            normalized_references = tuple(values)
         if dist.is_initialized():
             raise exc.InvalidAPIUsage(
                 "autotune_multi does not support an initialized distributed process group"
@@ -2145,26 +2191,29 @@ class Kernel(Generic[_R]):
                     "autotune_multi requires structurally compatible ConfigSpec "
                     f"instances; arg_sets[{case_index}] is incompatible with the anchor"
                 )
+        workload_key: tuple[object, ...] = (
+            "multi_shape:v1",
+            aggregation,
+            relative_to,
+            cache_tag,
+            tuple(
+                (
+                    case_key.specialization_key,
+                    case_key.extra_results,
+                    case_key.compiler_seed_results,
+                )
+                for case_key in case_keys
+            ),
+        )
+        if normalized_references is not None:
+            workload_key += ("reference_latencies_ms:v1", normalized_references)
         multi_args = _MultiShapeAutotuneArgs(
             cases=tuple(cases),
             aggregation=aggregation,
             relative_to=relative_to,
             cache_tag=cache_tag,
-            workload_key=(
-                "multi_shape:v1",
-                aggregation,
-                relative_to,
-                cache_tag,
-                tuple(
-                    (
-                        case_key.specialization_key,
-                        case_key.extra_results,
-                        case_key.compiler_seed_results,
-                    )
-                    for case_key in case_keys
-                ),
-            ),
-            reference_latencies=None,
+            workload_key=workload_key,
+            reference_latencies=normalized_references,
         )
 
         ephemeral = anchor.env.backend.make_ephemeral_cache()
