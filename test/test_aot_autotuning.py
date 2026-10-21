@@ -475,6 +475,156 @@ class TestFitOnFirstLaunch:
             )
         assert len(bound_kernel.attempts) == 17
 
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            "stages",
+            "warps",
+            "attempt_limit",
+            "host_code",
+            "codegen",
+            "launch",
+        ],
+    )
+    def test_failed_fit_restores_original_config_on_repeated_calls(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        threads = failure in ("warps", "attempt_limit", "host_code")
+        config = Config(
+            block_sizes=[64],
+            num_warps=2**20 if failure == "attempt_limit" else 16,
+            num_stages=8,
+        )
+        usage = (
+            (lambda config: config.num_warps * 32)
+            if threads
+            else (lambda config: config.num_stages * 1000)
+        )
+        bound_kernel = _FakeBoundKernel(
+            tmp_path,
+            192
+            if failure == "host_code"
+            else 3500
+            if failure in ("codegen", "launch")
+            else 0,
+            usage,
+            resource="threads" if threads else "shared memory",
+            grid=lambda candidate: (
+                "(2,)" if failure == "host_code" and candidate.num_warps < 8 else "(1,)"
+            ),
+        )
+        run = bound_kernel.select(config)
+        compile_config = bound_kernel.compile_config
+
+        def compile_candidate(
+            candidate: Config, *, allow_print: bool = True
+        ) -> Callable[..., object]:
+            if failure == "codegen" and candidate.num_stages == 3:
+                raise RuntimeError("later codegen failed")
+            return compile_config(candidate, allow_print=allow_print)
+
+        bound_kernel.compile_config = compile_candidate  # type: ignore[method-assign]
+        if failure == "launch":
+            bound_kernel.launch_error = lambda candidate: (
+                RuntimeError("later launch failed")
+                if candidate.num_stages == 3
+                else None
+            )
+        for call in range(3):
+            with pytest.raises(OutOfResources) as error:
+                run(torch.zeros(4))
+            assert error.value.required == usage(config)
+            assert bound_kernel._config == config
+            assert run.current[0] == config
+            assert run.current[1] is run.compiled
+            assert bound_kernel.launched == []
+            if call == 0:
+                assert len(bound_kernel.attempts) > 1
+                compiled = list(bound_kernel.compiled)
+                attempts = len(bound_kernel.attempts)
+            else:
+                assert bound_kernel.compiled == compiled
+                assert len(bound_kernel.attempts) == attempts + call
+                assert bound_kernel.attempts[-1][1] == config
+
+    def test_interrupted_fit_restores_original_config_after_partial_progress(
+        self, tmp_path: Path
+    ) -> None:
+        bound_kernel = _FakeBoundKernel(
+            tmp_path, 3500, lambda config: config.num_stages * 1000
+        )
+        config = Config(block_sizes=[64], num_stages=8)
+        run = bound_kernel.select(config)
+        compile_config = bound_kernel.compile_config
+        before_launch, after_launch = Mock(), Mock()
+        bound_kernel.before_launch = before_launch
+        bound_kernel.after_launch = after_launch
+
+        def interrupt(
+            candidate: Config, *, allow_print: bool = True
+        ) -> Callable[..., object]:
+            if candidate.num_stages == 3:
+                raise KeyboardInterrupt
+            return compile_config(candidate, allow_print=allow_print)
+
+        bound_kernel.compile_config = interrupt  # type: ignore[method-assign]
+        with pytest.raises(KeyboardInterrupt):
+            run(torch.zeros(4))
+        bound_kernel.compile_config = compile_config  # type: ignore[method-assign]
+        run(torch.zeros(4))
+        assert _stages(bound_kernel.attempts) == [8, 4, 8, 4, 3]
+        assert _stages(bound_kernel.launched) == [3]
+        assert (before_launch.call_count, after_launch.call_count) == (2, 1)
+
+    def test_concurrent_failed_fit_preserves_original_errors(
+        self, tmp_path: Path
+    ) -> None:
+        bound_kernel = _FakeBoundKernel(
+            tmp_path,
+            3500,
+            lambda candidate: (
+                8000
+                if candidate.num_stages == 8
+                else candidate.num_stages * 1000 + 3000
+            ),
+        )
+        config = Config(block_sizes=[64], num_stages=8)
+        run = bound_kernel.select(config)
+        candidate_started = threading.Event()
+        finish_candidate = threading.Event()
+        first_thread: int | None = None
+
+        def block_first_candidate(candidate: Config) -> Exception | None:
+            if candidate.num_stages == 4 and threading.get_ident() == first_thread:
+                candidate_started.set()
+                assert finish_candidate.wait(timeout=10)
+            return None
+
+        bound_kernel.launch_error = block_first_candidate
+
+        def call(first: bool) -> int:
+            nonlocal first_thread
+            if first:
+                first_thread = threading.get_ident()
+            with pytest.raises(OutOfResources) as error:
+                run(torch.zeros(4))
+            return error.value.required
+
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(call, True)
+            try:
+                assert candidate_started.wait(timeout=10)
+                second = pool.submit(call, False)
+                assert second.result(timeout=10) == 8000
+            finally:
+                finish_candidate.set()
+            assert first.result(timeout=10) == 8000
+        with pytest.raises(OutOfResources) as error:
+            run(torch.zeros(4))
+        assert error.value.required == 8000
+        assert bound_kernel._config == config
+        assert bound_kernel.launched == []
+
     def test_other_errors_raise_the_original_error(self, tmp_path: Path) -> None:
         bound_kernel = _FakeBoundKernel(tmp_path, 300_000, _buffers)
         run = bound_kernel.select(Config(block_sizes=[64], num_stages=8))
