@@ -80,6 +80,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
@@ -4800,6 +4801,120 @@ def _tcgen05_grouped_mn_device_tile_seeds(
     return dedupe_configs(seeds)
 
 
+def _tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec: ConfigSpec) -> list[Config]:
+    """Append both worker policies for one resource-derived paired recipe."""
+    model = spec._cute_tcgen05_config
+    profile = model.grouped_prefix_adaptive_n_profile
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: True,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+        }
+    )
+    # Explicit native roles/rings replace the generic warp and stage aliases.
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    static = deepcopy(seed)
+    static.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = False
+    result = [seed, static]
+    cluster_size = cast("int", static["tcgen05_cluster_m"]) * cast(
+        "int", static["tcgen05_cluster_n"]
+    )
+    reserved_sms = round(spec.num_sm / (16 * cluster_size)) * cluster_size
+    if (
+        0 < reserved_sms < spec.num_sm
+        and reserved_sms <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+    ):
+        reserved = deepcopy(static)
+        reserved.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = reserved_sms
+        result.append(reserved)
+    return result
+
+
+def _tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec: ConfigSpec) -> list[Config]:
+    """Offer the native M256 pair after the existing compiler seed palette."""
+    model = spec._cute_tcgen05_config
+    profile = model.get_grouped_prefix_adaptive_n_profile(
+        {"tcgen05_grouped_worklist_source_m_tile": 256}
+    )
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: False,
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 0,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+            GROUPED_PANEL_ALTERNATE_KEY: 4,
+            GROUPED_PANEL_RATIO_KEY: 1,
+        }
+    )
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    balanced = deepcopy(seed)
+    balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = True
+    return [seed, balanced]
+
+
+def _tcgen05_grouped_prefix_adaptive_n_seeds(spec: ConfigSpec) -> list[Config]:
+    """Preserve M128 recipes, then append the M256 worker policies."""
+    return [
+        *_tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec),
+        *_tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec),
+    ]
+
+
 def _tcgen05_grouped_source128_seeds(
     spec: ConfigSpec,
     *,
@@ -4997,6 +5112,39 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             and seed_facts.device_split_sizes
             and seed_facts.b_major == "k"
         )
+        from ..cute.grouped_prefix_adaptive_n import (
+            grouped_prefix_adaptive_n_analysis_eligible,
+        )
+        from ..cute.grouped_prefix_adaptive_n import (
+            resolve_grouped_prefix_adaptive_n_profile,
+        )
+
+        model = spec._cute_tcgen05_config
+        prefix_profiles = {}
+        if model.search_enabled and model._matmul_block_indices() is not None:
+            for source_m in (128, 256):
+                if not grouped_prefix_adaptive_n_analysis_eligible(
+                    analysis,
+                    matmul_operands_tma_provable=model.matmul_operands_tma_provable,
+                    source_m_tile=source_m,
+                ):
+                    continue
+                prefix_profile = resolve_grouped_prefix_adaptive_n_profile(
+                    int(analysis.grouped_tensor.shape[0]),
+                    analysis.packed_tensor.dtype.itemsize,
+                    (analysis.output_dtype or analysis.packed_tensor.dtype).itemsize,
+                    CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
+                    source_m_tile=source_m,
+                )
+                if prefix_profile is not None:
+                    prefix_profiles[source_m] = prefix_profile
+        model.grouped_prefix_adaptive_n_profiles = prefix_profiles
+        model.grouped_prefix_adaptive_n_profile = prefix_profiles.get(128)
+        model.grouped_prefix_adaptive_n_supported = bool(prefix_profiles)
+        model.grouped_prefix_adaptive_n_search_enabled = bool(prefix_profiles) and all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
         if analysis.input_kind == "external_worklist":
             from ..cute.grouped_worklist import (
                 register_tcgen05_grouped_worklist_runtime_specialization,
@@ -5089,7 +5237,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
     ) -> list[Config]:
         eligible = cls._eligible_inputs(env, device_ir)
         if eligible is None:
-            return []
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(env.config_spec)
         fact, analysis = eligible
         spec = env.config_spec
         seed_facts = analysis.seed_facts
@@ -5097,7 +5245,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             env, analysis
         )
         if not source_m_tiles:
-            return []
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(spec)
         families: list[list[Config]] = []
         target_policy = get_grouped_worklist_target_policy(
             None
@@ -5287,7 +5435,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                     ),
                 ]
             )
-        return seeds
+        return dedupe_configs([*seeds, *_tcgen05_grouped_prefix_adaptive_n_seeds(spec)])
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
@@ -5304,14 +5452,26 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return cls._eligible_inputs(env, device_ir) is not None
+        return (
+            cls._eligible_inputs(env, device_ir) is not None
+            or env.config_spec._cute_tcgen05_config.grouped_prefix_adaptive_n_search_enabled
+        )
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         configs = cls._seed_configs(env, device_ir)
-        return configs[0] if configs else None
+        # The optional recipe adds live-search candidates, while the existing
+        # promotion/default path keeps its established source and first seed.
+        return next(
+            (
+                config
+                for config in configs
+                if config.get(TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY) is not True
+            ),
+            None,
+        )
 
     @classmethod
     def get_seed_configs(
