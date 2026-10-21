@@ -71,6 +71,7 @@ from helion._dist_utils import sync_object
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -578,6 +579,16 @@ class BenchmarkProvider(abc.ABC):
 
     def invalidate_effective_source_hash(self, source_hash: str) -> None:
         """Prevent a failed rebenchmark source from being reused as an alias."""
+        return None
+
+    def update_effective_source_measurement(
+        self, config: Config, fn: Callable[..., object], perf: float
+    ) -> None:
+        """Refresh source aliases after re-timing when the provider keeps them."""
+        return None
+
+    def forget_effective_source_measurement(self, fn: Callable[..., object]) -> None:
+        """Drop an unavailable source reading without rejecting the source."""
         return None
 
     @abc.abstractmethod
@@ -1217,6 +1228,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return True
         return self.config_spec.backend.probe_long_autotune_kernels(self.config_spec)
 
+    def _default_cudagraph(self) -> bool:
+        """Keep backend CUDA timing policy identical in parent and worker."""
+        return self.config_spec.backend.default_autotune_cudagraph(self.config_spec)
+
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
 
@@ -1333,6 +1348,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path=self._precompile_args_path,
         )
 
+    def update_effective_source_measurement(
+        self, config: Config, fn: Callable[..., object], perf: float
+    ) -> None:
+        """Let later source aliases use a successful fresh reading."""
+        if (
+            not self._effective_source_dedup_enabled()
+            or not math.isfinite(perf)
+            or perf <= 0
+        ):
+            return
+        source_hash = self.config_spec.backend.generated_source_hash(fn)
+        if source_hash is None or source_hash in self._invalid_effective_source_hashes:
+            return
+        self._effective_source_results[source_hash] = BenchmarkResult(
+            config, fn, perf, "ok", None, time.perf_counter()
+        )
+
     def _budget_exceeded_synced(self) -> bool:
         """Return whether any rank reports the autotune budget exhausted.
 
@@ -1352,12 +1384,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             )
         )
 
+    def forget_effective_source_measurement(self, fn: Callable[..., object]) -> None:
+        if self._effective_source_dedup_enabled():
+            source_hash = self.config_spec.backend.generated_source_hash(fn)
+            if source_hash is not None:
+                self._effective_source_results.pop(source_hash, None)
+
     def benchmark(
         self,
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
         raise_if_no_viable_config: bool = True,
+        refresh_sources: bool = False,
     ) -> list[BenchmarkResult]:
         """Compile, precompile, validate, and time a batch of configs.
 
@@ -1377,6 +1416,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         that disable ``autotune_precompile`` (e.g. cute) skip that
         wait entirely.
         """
+        # Re-timing measures a source again, then deduplicates aliases within
+        # this batch. Its identity, rejection and retry state remain intact.
+        if refresh_sources:
+            self._effective_source_results.clear()
         self._no_viable_config_error = None
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
@@ -1895,6 +1938,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         rep=50,
                         process_group_name=self.kernel.env.process_group_name,
                         probe_long_kernel=self._probe_long_kernel(),
+                        default_cudagraph=self._default_cudagraph(),
                         pre_warmed=True,
                     )
                 else:
@@ -2210,6 +2254,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
             probe_long_kernel=self._probe_long_kernel(),
+            default_cudagraph=self._default_cudagraph(),
             fixed_repetitions=fixed_repetitions,
             args_slot=args_slot,
         )
@@ -2409,6 +2454,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._collect_effective_source_repairs = config_spec.cute_flash_search_enabled
         self._original_configs_by_materialized_key: dict[str, list[Config]] = {}
         self._anchor_fns_by_materialized_key: dict[str, Callable[..., object]] = {}
+        self._functions_by_materialized_key: dict[
+            str, tuple[Callable[..., object], ...]
+        ] = {}
         self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
         child_log = copy.copy(log)
         child_log._log_sink = None
@@ -2555,6 +2603,11 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         benchmark_runner = (
             backend.get_do_bench() if backend is not None else None
         ) or do_bench
+        benchmark_options: dict[str, Any] = (
+            {"default_cudagraph": child._default_cudagraph()}
+            if benchmark_runner in (do_bench, do_bench_generic)
+            else {}
+        )
         try:
             timing = benchmark_runner(
                 functools.partial(baseline_fn, *reference_args),
@@ -2562,6 +2615,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 warmup=1,
                 rep=50,
                 process_group_name=child.kernel.env.process_group_name,
+                **benchmark_options,
             )
         except Exception as error:
             raise exc.AutotuneError(
@@ -2599,6 +2653,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         record_results: bool,
         check_budget: bool = True,
         raise_if_no_viable_config: bool = True,
+        refresh_sources: bool = False,
     ) -> list[BenchmarkResult]:
         if not configs:
             return []
@@ -2653,6 +2708,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 desc=f"{desc} shape {index + 1}",
                 case_index=index,
                 raise_if_no_viable_config=raise_if_no_viable_config,
+                refresh_sources=refresh_sources,
             )
             for index, child in enumerate(self.children)
         ]
@@ -2710,6 +2766,11 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 if valid
                 else inf
             )
+            # Keep partially measured functions so later source repairs can
+            # replace failed slots. Their measurement gate stays separate.
+            self._functions_by_materialized_key[
+                materialized_keys[child_config_index]
+            ] = tuple(result.fn for result in row)
             if valid:
                 timing_tuple = tuple(timings)
                 statuses = tuple(result.status for result in row)
@@ -2805,6 +2866,11 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     continue
                 if case_index == 0:
                     self._anchor_fns_by_materialized_key[key] = repair.fn
+                functions = self._functions_by_materialized_key.get(key)
+                if functions is not None:
+                    repaired_functions = list(functions)
+                    repaired_functions[case_index] = repair.fn
+                    self._functions_by_materialized_key[key] = tuple(repaired_functions)
                 timings, previous_perf, statuses = measurement
                 repaired_timings = list(timings)
                 repaired_statuses = list(statuses)
@@ -2861,12 +2927,14 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         desc: str,
         case_index: int,
         raise_if_no_viable_config: bool = True,
+        refresh_sources: bool = False,
     ) -> list[BenchmarkResult]:
         try:
             return child.benchmark(
                 configs,
                 desc=desc,
                 raise_if_no_viable_config=raise_if_no_viable_config,
+                refresh_sources=refresh_sources,
             )
         except Exception as error:
             if not self._is_skippable_child_failure(child, error):
@@ -2929,6 +2997,84 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             )
         )
 
+    def functions_for_config(
+        self, config: Config
+    ) -> tuple[Callable[..., object], ...] | None:
+        """Validated functions for every case of one materialized config."""
+        if not self.has_valid_measurement(config):
+            return None
+        materialized = _materialize_multi_shape_config(self.config_spec, config)
+        return self._functions_by_materialized_key.get(repr(materialized))
+
+    def record_steady_measurement(
+        self,
+        config: Config,
+        timings: Sequence[float],
+        *,
+        statuses: Sequence[str] | None = None,
+    ) -> float:
+        """Publish final per-case medians and refresh their source readings."""
+        if len(timings) != len(self.children):
+            raise ValueError("A steady measurement needs one timing per case")
+        if statuses is None:
+            statuses = tuple(
+                "ok" if math.isfinite(timing) and timing > 0 else "error"
+                for timing in timings
+            )
+        if len(statuses) != len(timings):
+            raise ValueError("A steady measurement needs one status per case")
+        materialized = _materialize_multi_shape_config(self.config_spec, config)
+        key = repr(materialized)
+        valid = all(
+            _benchmark_status_succeeded(status) and math.isfinite(timing) and timing > 0
+            for timing, status in zip(timings, statuses, strict=True)
+        )
+        perf = (
+            _aggregate_multi_shape_timings(
+                timings,
+                aggregation=self.args.aggregation,
+                references=self.args.reference_latencies,
+            )
+            if valid
+            else inf
+        )
+        self.args.measurements[key] = (tuple(timings), perf, tuple(statuses))
+        functions = self._functions_by_materialized_key.get(key)
+        if functions is not None:
+            for child, fn, timing, status in zip(
+                self.children, functions, timings, statuses, strict=True
+            ):
+                if _benchmark_status_succeeded(status):
+                    child.update_effective_source_measurement(materialized, fn, timing)
+                elif status in ("error", "timeout"):
+                    source_hash = child.config_spec.backend.generated_source_hash(fn)
+                    if source_hash is not None:
+                        child.invalidate_effective_source_hash(source_hash)
+                else:
+                    child.forget_effective_source_measurement(fn)
+        return perf
+
+    def restore_unavailable_measurement(
+        self,
+        config: Config,
+        previous: Mapping[str, tuple[tuple[float, ...], float, tuple[str, ...]]],
+    ) -> None:
+        """Restore only the prior valid ledger; keep dropped source readings dropped."""
+        materialized = _materialize_multi_shape_config(self.config_spec, config)
+        key = repr(materialized)
+        measurement = previous.get(key)
+        functions = self._functions_by_materialized_key.get(key)
+        if measurement is None or functions is None:
+            return
+        for child, fn in zip(self.children, functions, strict=True):
+            source_hash = child.config_spec.backend.generated_source_hash(fn)
+            if (
+                source_hash is not None
+                and source_hash in child._invalid_effective_source_hashes
+            ):
+                return
+        self.args.measurements[key] = measurement
+
     def raw_latency(self, config: Config) -> float:
         materialized = _materialize_multi_shape_config(self.config_spec, config)
         measurement = self.args.measurements.get(repr(materialized))
@@ -2982,6 +3128,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             desc=desc,
             record_results=False,
             check_budget=False,
+            refresh_sources=True,
         )
         if self.log.trace_enabled:
             for result in results:

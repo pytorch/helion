@@ -166,6 +166,7 @@ class _Provider(BenchmarkProvider):
         self._worker_failure_config_ids: list[int] = []
         self.setup_count = 0
         self.cleanup_count = 0
+        self.benchmark_requests: list[tuple[str, bool]] = []
         self.mutated_arg_indices = ()
         self.kernel.script.providers.append(self)
 
@@ -181,7 +182,9 @@ class _Provider(BenchmarkProvider):
         *,
         desc: str = "Benchmarking",
         raise_if_no_viable_config: bool = True,
+        refresh_sources: bool = False,
     ) -> list[BenchmarkResult]:
+        self.benchmark_requests.append((desc, refresh_sources))
         results = []
         for config in configs:
             perf, status = self.kernel.script.next(_index(config))
@@ -289,6 +292,16 @@ class TestAutotuneHandoff(unittest.TestCase):
         for provider in script.providers:
             self.assertEqual(provider.setup_count, 1)
             self.assertEqual(provider.cleanup_count, 1)
+
+    def assert_source_refresh_requests(
+        self, script: _Script, *, expected: set[bool]
+    ) -> None:
+        requests = [
+            fresh
+            for provider in script.providers
+            for _, fresh in provider.benchmark_requests
+        ]
+        self.assertEqual(set(requests), expected)
 
     def test_early_handoff_keeps_rebenchmarked_winner(self) -> None:
         class RebenchmarkSearch(PopulationBasedSearch):
@@ -554,6 +567,9 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(result, _config(1))
         self.assertEqual(dict(script.calls), {1: 1, 2: 1})
         self.assertEqual(len(script.providers), 1)
+        self.assertEqual(
+            script.providers[0].benchmark_requests, [("Benchmarking", False)]
+        )
         self.assert_cleaned_up(script)
 
     def test_nested_search_stops_before_second_stage(self) -> None:
@@ -818,6 +834,9 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assert_cleaned_up(anchor_script)
         self.assert_cleaned_up(second_script)
 
+        self.assert_source_refresh_requests(anchor_script, expected={False, True})
+        self.assert_source_refresh_requests(second_script, expected={False, True})
+
     def test_multi_shape_source_identity_and_ratio_objective(self) -> None:
         anchor_script = _Script({1: [10.0], 2: [10.0]}, sources={1: "same", 2: "same"})
         second_script = _Script({1: [40.0], 2: [10.0]})
@@ -852,6 +871,9 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assert_cleaned_up(anchor_script)
         self.assert_cleaned_up(second_script)
 
+        self.assert_source_refresh_requests(anchor_script, expected={False})
+        self.assert_source_refresh_requests(second_script, expected={False})
+
     def test_multi_shape_completion_uses_last_shape_not_end_of_batch(self) -> None:
         script = _Script({1: [1.0], 2: [2.0]})
         anchor = _Kernel(script)
@@ -882,6 +904,7 @@ class TestAutotuneHandoff(unittest.TestCase):
         search_rows = [row for row in point.measurements if row.phase == "search"]
         self.assertEqual([row.elapsed_seconds for row in search_rows], [3.0, 4.0])
         self.assert_cleaned_up(script)
+        self.assert_source_refresh_requests(script, expected={False})
 
     def test_failed_multi_shape_evidence_and_finite_trace(self) -> None:
         anchor_script = _Script({1: [1.0], 2: [2.0], 3: [3.0]})
@@ -949,6 +972,9 @@ class TestAutotuneHandoff(unittest.TestCase):
             self.assertEqual(row["per_shape_statuses"], ["ok", "accuracy_error"])
         self.assert_cleaned_up(anchor_script)
         self.assert_cleaned_up(second_script)
+
+        self.assert_source_refresh_requests(anchor_script, expected={False})
+        self.assert_source_refresh_requests(second_script, expected={False})
 
     def test_peer_finalist_failure_disqualifies_local_success(self) -> None:
         script = _Script({1: [0.5], 2: [1.0]})
