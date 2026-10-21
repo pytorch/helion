@@ -116,6 +116,8 @@ def make_mxfp8_entry(plan: Mapping[str, object]) -> object:
             ),
             operand_format="mxfp8",
             fused_scales=bool(plan.get("fused_scales", False)),
+            sf_tma=bool(plan.get("sf_tma", False)),
+            sf_inplace=bool(plan.get("sf_inplace", False)),
             compact_m=bool(plan.get("compact_m", False)),
             logical_m_per_cta=_plan_int(plan, "logical_m_per_cta", 128),
             lhs_scale_row_stride=_plan_int(

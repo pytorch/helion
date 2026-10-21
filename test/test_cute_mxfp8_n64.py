@@ -36,6 +36,7 @@ def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
         64,
         32,
         16,
+        8,
     )
     raw_config: dict[str, object] = {"cute_scaled_mma": True, "cute_scaled_tile_n": 64}
     with pytest.raises(helion.exc.InvalidConfig):

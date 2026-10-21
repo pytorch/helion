@@ -559,13 +559,14 @@ def _append_cute_wrapper_plan(
         if (
             plan_int("bn")
             not in (
-                (16, 32, 64, 128, 224, 256)
+                (8, 16, 32, 64, 128, 224, 256)
                 if plan.get("format") == "mxfp8"
                 else (128, 256)
             )
             or plan_int("bk") not in (64, 128, 256)
             or plan_int("stages") not in (2, 3, 4, 5, 6, 8, 10, 12)
             or plan_int("cluster_m") not in (1, 2)
+            or (plan_int("bn") == 8 and plan_int("cluster_m") != 1)
             or any(plan_int(key) <= 0 for key in ("m", "n", "k", "workspace_bytes"))
             or plan_int("k") % 16
             or type(plan.get("persistent")) is not bool
@@ -4350,6 +4351,8 @@ def _cute_staged_plan_operands(
             # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
             # Preserve their values when a replacement binding is under-aligned.
             roles = (("lhs_idx", "rhs_idx"), ())
+            if plan.get("sf_tma") is True:
+                roles = (("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx"), ())
         if roles is None:
             continue
         input_keys, output_keys = roles
@@ -4376,6 +4379,15 @@ def _cute_stage_under_aligned_operands(
     """
     staged: list[object] | None = None
     copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    tma_scale_indices = {
+        index
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "block_scaled_mma"
+        and plan.get("format") == "mxfp8"
+        and plan.get("sf_tma") is True
+        for key in ("lhs_scale_idx", "rhs_scale_idx")
+        if isinstance(index := plan.get(key), int)
+    }
     for index, is_output in _cute_staged_plan_operands(cute_kernel):
         tensor = args[index]
         if (
@@ -4385,7 +4397,13 @@ def _cute_stage_under_aligned_operands(
             continue
         if staged is None:
             staged = list(args)
-        copy = tensor.clone()
+        if index in tma_scale_indices:
+            copy = torch.empty_strided(
+                tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
+            )
+            copy.copy_(tensor)
+        else:
+            copy = tensor.clone()
         staged[index] = copy
         if is_output:
             copy_backs.append((tensor, copy))
