@@ -110,6 +110,10 @@ ROLLED: dict[str, Any] = {
     "cute_vector_widths": [4, 1],
     "cute_lane_layouts": ["strided", "blocked"],
     "cute_reduction_reloads": ["register"],
+    # The sweep counts below are the merged graph's; the exact division
+    # hoist's redo form would add a second copy of every sweep
+    # (test_cute_exact_division.py covers that).
+    "cute_exact_div_form": "plain",
 }
 
 

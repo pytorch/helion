@@ -1748,6 +1748,10 @@ class CuteBackend(Backend):
             "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
             "cute_async_store_policy": weighted_choice(async_store_policy_weights),
             "cute_store_policy": weighted_choice(async_store_policy_weights),
+            # The exact division forms are bitwise identical; the redo form
+            # is the measured row-kernel winner, the plain form covers
+            # kernels at the register cap (see hoist_loop_invariant_recip).
+            "cute_exact_div_form": weighted_choice({"redo": 3.0, "plain": 1.0}),
             "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
             "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
@@ -2127,6 +2131,7 @@ class CuteBackend(Backend):
             }
             or key == "cute_async_store_policy"
             or key == "cute_store_policy"
+            or key == "cute_exact_div_form"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
             or key == "cute_simt_mma"
@@ -2611,6 +2616,9 @@ class CuteBackend(Backend):
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
+            "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
+            "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
+            "_cute_exact_div_redo_f32": "from helion._compiler.cute.exact_division import exact_div_redo_f32 as _cute_exact_div_redo_f32",
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
