@@ -33,15 +33,28 @@ This module rewrites the owner loop into:
    once-only tail nest for lane-invariant side effects (the reduced output),
    reading stashed values and finalized results instead of re-running loads.
 
+A reduction whose input depends on another reduction's result (the delta-rule
+step ``kts = sum(k * s); s -= k * kts; o = sum(q * s)``, a softmax's sum of
+``exp(x - max)``, a two-pass variance) gets one more accumulate nest per
+dependency level between the combines: the first nest issues every load and
+stashes what the later ones read, each later nest computes its level's values
+from the stashes and the finalized results (stashing those a still later nest
+needs) and accumulates its level's markers, so the tile is loaded once however
+many reductions chain over it.  With ``store_first`` the lane-varying side
+effects join the nest of the level they need instead of waiting for the last
+combine.
+
 Every lane's loads are therefore issued before the first store, each tile
 element is reduced across threads exactly once, and no load is repeated.
 
 The rewrite fails closed: anything outside this shape raises
 ``RegisterTileUnsupported`` naming the construct (rolled inner loops, control
-flow, unknown effects, loop-carried scalars, reads across loop scopes,
-dependent markers, stores inside element loops, a register or shared-memory
+flow, unknown effects, loop-carried scalars, reads across loop scopes, a load
+behind a combine, stores inside element loops, a register or shared-memory
 budget overrun, and any potentially aliasing write,
-``_lane_split_reorders_aliasing_memory``).  ``generate_ast`` then regenerates
+``_lane_split_reorders_aliasing_memory``; a reduction over a tile's own axis,
+owned by the tile lane rather than the owner, is rejected by the lane
+interchange pass before this module runs).  ``generate_ast`` then regenerates
 the kernel with the rolled lane nesting the persistent strategy used before
 register tiles existed, so such a config compiles exactly as it did then.
 Bodies the device IR already shows to be outside the shape never get here:
@@ -67,10 +80,12 @@ from ..ast_read_writes import ast_rename
 from .fuse_two_pass_loads import _is_store_call
 from .hoist_lane_invariant_reductions import _CUTLASS_SCALAR_TYPES
 from .persistent_branch_vec import _memory_load_calls
+from .register_tile_admission import RegisterTileOptions
 from .register_tile_admission import RegisterTileUnsupported
 from .thread_budget import CUTE_REGISTER_TILE_MAX_LIVE_VALUES
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
 _IGNORED_READS = frozenset({*lanes._CUTE_UNIFORM_GLOBAL_NAMES, "ir"})
@@ -107,6 +122,24 @@ class _Nest:
     leaves: list[_Leaf]
     loop_ids: dict[int, int]
     leaf_ids: dict[int, _Leaf]
+
+
+@dataclasses.dataclass
+class _Unit:
+    """A nest emitted after the first accumulate nest.
+
+    ``kind`` is ``"phase"`` (the accumulate nest of level ``position``, over
+    the owner lane), ``"consume"`` (the lane-varying side effects, over the
+    owner lane) or ``"tail"`` (the lane-invariant side effects, once).
+    ``position`` counts the combines that precede the nest; ``selected`` are
+    the leaves it runs for their effect (markers it accumulates, appends and
+    stores) and ``required`` the names it must define for them.
+    """
+
+    kind: str
+    position: int
+    selected: list[_Leaf]
+    required: set[str] = dataclasses.field(default_factory=set)
 
 
 def _constexpr_extent(loop: ast.For) -> int | None:
@@ -235,6 +268,42 @@ def _tile_count(nest: _Nest, path: tuple[int, ...]) -> int:
     return count
 
 
+def _loop_dependencies(
+    nest: _Nest, leaves: Sequence[_Leaf], lane_var: str
+) -> dict[str, frozenset[str]]:
+    """The loop variables (owner and element loops) each defined name depends
+    on, through the tile's own definitions.  A marker result is uniform across
+    the owner lane, so it drops the owner from its input's dependencies."""
+    loop_vars = {lane_var, *(loop.var for loop in nest.loops)}
+    deps: dict[str, frozenset[str]] = {}
+    for leaf in leaves:
+        target = leaf.appended_list if leaf.kind == "append" else leaf.defines
+        if target is None:
+            continue
+        found = set(deps.get(target, frozenset()))
+        for name in leaf.reads:
+            if name in loop_vars:
+                found.add(name)
+            elif name in deps:
+                found |= deps[name]
+        if leaf.kind == "marker":
+            found.discard(lane_var)
+        deps[target] = frozenset(found)
+    return deps
+
+
+def _distinct_values(nest: _Nest, lane_var: str, deps: frozenset[str]) -> int:
+    """Registers one stashed name occupies: one per combination of the loop
+    iterations its value depends on."""
+    count = 1
+    if lane_var in deps:
+        count *= nest.extent
+    for loop in nest.loops:
+        if loop.var in deps:
+            count *= loop.extent
+    return count
+
+
 def _has_carry(nest: _Nest, rename_groups: dict[str, str]) -> bool:
     """A name read before its definition and written in the body is carried."""
     loop_vars = {nest.owner, *(loop.var for loop in nest.loops)}
@@ -322,14 +391,22 @@ def _static_smem_bytes(
 
 
 def _finalize_marker(
-    marker: lanes._LaneReduceMarker, acc_list: str, results: str, count: int
+    marker: lanes._LaneReduceMarker,
+    acc_list: str,
+    results: str,
+    count: int,
+    *,
+    warp_fold: bool = False,
 ) -> tuple[list[ast.AST], int]:
     """Combine every accumulator element across the live thread group.
 
     Emitted as straight-line statements (``count`` is a small register tile)
     so no later V-loop peephole mistakes the per-element combines for one
     reduction over the elements.  Returns the statements and the static
-    shared memory (bytes) they allocate.
+    shared memory (bytes) they allocate.  ``warp_fold`` requests the
+    shared-column reduce's warp fold (``RegisterTileOptions.warp_fold``); it
+    applies to a multi-warp ``pre > 1`` group whose sibling count divides a
+    warp and is ignored elsewhere.
     """
     if marker.group_cluster_n > 1:
         _reject("cute_cluster_n > 1 cannot combine a register tile across CTAs")
@@ -352,11 +429,25 @@ def _finalize_marker(
         lane_in_group_var = f"{acc_list}_lane_in_group"
         reduced = f"{acc_list}_reduced"
         elements = [marker.finalize_expr(f"{reduced}[{t}]") for t in range(count)]
-        # One slot per warp (``pre == 1``) or per thread (``pre > 1``) of every
-        # group, per column (``_cute_grouped_reduce_shared_columns``).
-        slots = marker.group_count * (
-            marker.group_span // 32 if marker.group_pre == 1 else marker.group_span
+        # The warp fold needs warp-aligned groups whose ``pre`` sibling
+        # classes each hold ``32 // pre`` reduction coordinates per warp.
+        fold_warp = (
+            warp_fold
+            and marker.group_pre > 1
+            and marker.group_span > 32
+            and marker.group_span % 32 == 0
+            and 32 % marker.group_pre == 0
         )
+        # One slot per warp (``pre == 1``), per warp and sibling class (the
+        # warp fold) or per thread (serial ``pre > 1``) of every group, per
+        # column (``_cute_grouped_reduce_shared_columns``).
+        if marker.group_pre == 1:
+            slots = marker.group_count * (marker.group_span // 32)
+        elif fold_warp:
+            slots = marker.group_count * (marker.group_span // 32) * marker.group_pre
+        else:
+            slots = marker.group_count * marker.group_span
+        fold_keyword = ", fold='warp'" if fold_warp else ""
         return [
             statement_from_string(f"{lane_var} = {shared_lane_expr}"),
             statement_from_string(
@@ -366,7 +457,8 @@ def _finalize_marker(
                 f"{reduced} = _cute_grouped_reduce_shared_columns("
                 f"{acc_list}, {marker.reduction_type!r}, {marker.identity_expr}, "
                 f"{lane_var}, {lane_in_group_var}, pre={marker.group_pre}, "
-                f"group_span={marker.group_span}, group_count={marker.group_count})"
+                f"group_span={marker.group_span}, group_count={marker.group_count}"
+                f"{fold_keyword})"
             ),
             statement_from_string(f"{results} = [{', '.join(elements)}]"),
         ], _static_smem_bytes(marker, count, slots)
@@ -411,12 +503,17 @@ def lower_register_tile_lane_loop(
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
+    options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     """Lower a constexpr owner lane whose markers sit in nested constexpr loops.
 
     Returns the replacement statements; a body outside the proved shape raises
-    ``BackendUnsupported`` naming the offending construct.
+    ``BackendUnsupported`` naming the offending construct.  ``options`` are
+    the schedule knobs (``RegisterTileOptions``); ``None`` is the knob-free
+    schedule.
     """
+    if options is None:
+        options = RegisterTileOptions()
     nest = _collect_nest(loop, lane_var)
     leaves = nest.leaves
     markers = [leaf for leaf in leaves if leaf.kind == "marker"]
@@ -465,29 +562,47 @@ def lower_register_tile_lane_loop(
         if leaf.kind == "store" and _tile_count(nest, leaf.path) != 1:
             _reject("a store repeats inside an element loop")
 
-    # Marker results (finalized after the accumulate nest) taint the pure
-    # statements and lists that consume them; those run after finalize.
+    # Levels: how many cross-thread combines must precede a value.  A value
+    # that reads no reduction result has level 0; a marker's level is its
+    # input's and its result's level is one more; a staging list takes the
+    # level of the values appended to it (its own definition reads nothing
+    # and stays a coordinate-only statement).  ``post`` are the pure
+    # statements that read a value of level >= 1: they consume a result,
+    # directly or through others, so they run after that result's combine.
+    # The schedule runs one accumulate nest per level (``passes`` of them):
+    # the first issues every load, the later ones compute from stashed values
+    # only.
+    level: dict[str, int] = {}
+    marker_level: dict[int, int] = {}
+    post: set[int] = set()
+
+    def level_of(names: frozenset[str]) -> int:
+        return max((level.get(name, 0) for name in names), default=0)
+
+    for leaf in leaves:
+        if leaf.kind == "marker":
+            assert leaf.marker is not None
+            marker_level[leaf.index] = level_of(leaf.reads)
+            level[leaf.marker.result_var] = marker_level[leaf.index] + 1
+        elif leaf.kind == "pure":
+            assert leaf.defines is not None
+            level[leaf.defines] = level_of(leaf.reads)
+            if level[leaf.defines] >= 1:
+                post.add(leaf.index)
+        elif leaf.kind == "append":
+            assert leaf.appended_list is not None
+            level[leaf.appended_list] = max(
+                level.get(leaf.appended_list, 0), level_of(leaf.reads)
+            )
+    passes = max(marker_level.values()) + 1
     result_names = {leaf.defines for leaf in markers if leaf.defines is not None}
-    result_tainted = set(result_names)
-    changed = True
-    while changed:
-        changed = False
+    if passes > 1:
+        # The later accumulate nests run after the first combine; a load there
+        # could observe another lane's store, which the aliasing proof below
+        # only covers for the loads of the first nest.
         for leaf in leaves:
-            if leaf.kind == "pure" and leaf.defines not in result_tainted:
-                if leaf.reads & result_tainted:
-                    result_tainted.add(leaf.defines)  # type: ignore[arg-type]
-                    changed = True
-            elif leaf.kind == "append" and leaf.appended_list not in result_tainted:
-                if leaf.reads & result_tainted:
-                    result_tainted.add(leaf.appended_list)  # type: ignore[arg-type]
-                    changed = True
-    post = {
-        leaf.index
-        for leaf in leaves
-        if leaf.kind == "pure" and leaf.reads & result_tainted
-    }
-    if any(leaf.reads & result_tainted for leaf in markers):
-        _reject("a reduction input depends on another reduction's result")
+            if leaf.index in post and _memory_load_calls(leaf.stmt):
+                _reject("a load whose operands depend on a reduction result")
 
     # Statements that only rearrange coordinates (no loads, no data values)
     # are cheap to re-run in every nest; everything else computed before the
@@ -524,8 +639,8 @@ def lower_register_tile_lane_loop(
     def is_varying(leaf: _Leaf) -> bool:
         return bool(leaf.reads & varying)
 
-    # Everything that runs after the combine: the side effects (staging appends
-    # and stores) and the pure values derived from a reduction result.
+    # Everything that runs after the first combine: the side effects (staging
+    # appends and stores) and the pure values derived from a reduction result.
     consumers = [
         leaf
         for leaf in leaves
@@ -543,9 +658,13 @@ def lower_register_tile_lane_loop(
             ):
                 stash_roots.add(name)
 
-    # Accumulate nest: backward slice of the marker inputs and stashed values
-    # over the pure producers.
-    marker_inputs = {leaf.marker.input_name for leaf in markers if leaf.marker}
+    # First accumulate nest: backward slice of the level-0 marker inputs and
+    # the stashed values over the pure producers.
+    marker_inputs = {
+        leaf.marker.input_name
+        for leaf in markers
+        if leaf.marker and marker_level[leaf.index] == 0
+    }
     needed = set(marker_inputs) | stash_roots
     phase1: set[int] = set()
     for leaf in reversed(leaves):
@@ -557,10 +676,83 @@ def lower_register_tile_lane_loop(
     if needed & result_names:
         _reject("an accumulate-pass producer depends on a reduction result")
 
-    # Register budget: every stashed value lives once per lane per element and
-    # every accumulator once per element until the combine.
+    # The nests after the first, in emission order.  The lane-varying side
+    # effects move as one block to the earliest position whose combines they
+    # need (``store_first``), else behind the last combine; the lane-invariant
+    # ones (the reduced output) run once behind the last combine.  A position
+    # ``p`` in ``1 .. passes - 1`` is the accumulate nest of level ``p``
+    # (the block joins it); ``0`` is a nest of its own between the first
+    # accumulate nest and the first combine; ``passes`` is behind the last.
+    side_effects = [leaf for leaf in consumers if leaf.kind in ("append", "store")]
+    consume_leaves = [leaf for leaf in side_effects if is_varying(leaf)]
+    tail_leaves = [leaf for leaf in side_effects if not is_varying(leaf)]
+    consume_position = passes
+    if options.store_first:
+        consume_position = max(
+            (level_of(leaf.reads) for leaf in consume_leaves), default=0
+        )
+    units: list[_Unit] = []
+    if consume_leaves and consume_position == 0:
+        units.append(_Unit("consume", 0, list(consume_leaves)))
+    for position in range(1, passes):
+        selected = [leaf for leaf in markers if marker_level[leaf.index] == position]
+        if consume_leaves and consume_position == position:
+            selected.extend(consume_leaves)
+        units.append(_Unit("phase", position, selected))
+    if consume_leaves and consume_position == passes:
+        units.append(_Unit("consume", passes, list(consume_leaves)))
+    if tail_leaves:
+        units.append(_Unit("tail", passes, list(tail_leaves)))
+
+    # Names a nest must define: stashed values and marker results are read
+    # back, coordinate-only statements and the values of the nest's own level
+    # are re-run (so their reads count), and a value of a lower level is read
+    # back from the stash its own level's nest fills (``post_stash``).  The
+    # nests are resolved last to first so a nest's demands on earlier levels
+    # are complete before those nests are resolved.
+    post_stash: dict[int, set[str]] = {position: set() for position in range(passes)}
+
+    def needed_names(seeds: Iterable[str], position: int) -> set[str]:
+        names: set[str] = set()
+        pending = list(seeds)
+        while pending:
+            name = pending.pop()
+            if name in names or name not in definers:
+                continue
+            names.add(name)
+            definer = definers[name]
+            if definer.kind == "marker":
+                continue
+            if name in index_only:
+                pending.extend(definer.reads)
+                continue
+            value_level = level[name]
+            if value_level == 0:
+                continue
+            if value_level < position:
+                post_stash[value_level].add(name)
+                continue
+            if value_level > position:
+                _reject(f"{name} is read before its reduction's combine")
+            pending.extend(definer.reads)
+        return names
+
+    for unit in reversed(units):
+        seeds = [name for leaf in unit.selected for name in leaf.reads]
+        if unit.kind == "phase":
+            seeds.extend(sorted(post_stash[unit.position]))
+        unit.required = needed_names(seeds, unit.position)
+    stashed_post = {name for names in post_stash.values() for name in names}
+
+    # Register budget: every stashed value lives once per distinct value (the
+    # product of the extents of the loops it depends on: a per-row value once
+    # per lane, a per-column value once per element; the unrolled duplicates
+    # merge in the compiler) and every accumulator once per element until the
+    # combine.
+    loop_deps = _loop_dependencies(nest, leaves, lane_var)
     live_values = sum(
-        nest.extent * _tile_count(nest, definers[name].path) for name in stash_roots
+        _distinct_values(nest, lane_var, loop_deps[name])
+        for name in stash_roots | stashed_post
     ) + sum(_tile_count(nest, leaf.path) for leaf in markers)
     if live_values > CUTE_REGISTER_TILE_MAX_LIVE_VALUES:
         _reject(
@@ -638,7 +830,9 @@ def lower_register_tile_lane_loop(
         )
         return lanes._guard_stmt_with_owner(stmt, owner_exprs) if owner_exprs else stmt
 
-    stash_name = {name: f"{name}_lane_stash" for name in sorted(stash_roots)}
+    stash_name = {
+        name: f"{name}_lane_stash" for name in sorted(stash_roots | stashed_post)
+    }
     acc_name: dict[int, str] = {}
     results_name: dict[int, str] = {}
     prologue: list[ast.AST] = []
@@ -653,21 +847,26 @@ def lower_register_tile_lane_loop(
                 f"{acc} = [{', '.join([leaf.marker.identity_expr] * count)}]"
             )
         )
-    for name in sorted(stash_roots):
+    for name in sorted(stash_roots | stashed_post):
         prologue.append(statement_from_string(f"{stash_name[name]} = []"))
+
+    def accumulate(leaf: _Leaf) -> ast.AST:
+        marker = leaf.marker
+        assert marker is not None
+        acc = acc_name[leaf.index]
+        position = _flat_index(nest, leaf.path, with_owner=False)
+        ctor = lanes._dtype_ctor_from_identity(marker.identity_expr)
+        value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
+        combined = lanes._combine_expr(
+            marker.reduction_type, f"{acc}[{position}]", value, ctor
+        )
+        return statement_from_string(f"{acc}[{position}] = {combined}")
 
     def select_phase1(leaf: _Leaf) -> list[ast.AST]:
         if leaf.kind == "marker":
-            marker = leaf.marker
-            assert marker is not None
-            acc = acc_name[leaf.index]
-            position = _flat_index(nest, leaf.path, with_owner=False)
-            ctor = lanes._dtype_ctor_from_identity(marker.identity_expr)
-            value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
-            combined = lanes._combine_expr(
-                marker.reduction_type, f"{acc}[{position}]", value, ctor
-            )
-            return [statement_from_string(f"{acc}[{position}] = {combined}")]
+            if marker_level[leaf.index] != 0:
+                return []
+            return [accumulate(leaf)]
         if leaf.index not in phase1:
             return []
         statements = [lanes._clone_stmt(leaf.stmt)]
@@ -679,27 +878,16 @@ def lower_register_tile_lane_loop(
             )
         return statements
 
-    def needed_names(selected: list[_Leaf]) -> set[str]:
-        """Names a nest must define for ``selected``: stashed values and
-        marker results are read back, coordinate-only statements and values
-        derived from a reduction result are re-run (so their reads count)."""
-        names: set[str] = set()
-        pending = [name for leaf in selected for name in leaf.reads]
-        while pending:
-            name = pending.pop()
-            if name in names or name not in definers:
-                continue
-            names.add(name)
-            definer = definers[name]
-            if name in index_only or definer.index in post:
-                pending.extend(definer.reads)
-        return names
+    def select_unit(unit: _Unit) -> Callable[[_Leaf], list[ast.AST]]:
+        selected = {leaf.index for leaf in unit.selected if leaf.kind != "marker"}
+        required = unit.required
+        with_owner = unit.kind != "tail"
+        stashed_here = post_stash[unit.position] if unit.kind == "phase" else set()
 
-    def select_consume(
-        selected: set[int], required: set[str], *, with_owner: bool
-    ) -> Callable[[_Leaf], list[ast.AST]]:
         def select(leaf: _Leaf) -> list[ast.AST]:
             if leaf.kind == "marker":
+                if unit.kind == "phase" and marker_level[leaf.index] == unit.position:
+                    return [accumulate(leaf)]
                 if leaf.defines not in required:
                     return []
                 position = _flat_index(nest, leaf.path, with_owner=False)
@@ -712,9 +900,19 @@ def lower_register_tile_lane_loop(
                 return [guarded(leaf)]
             if leaf.defines is None or leaf.defines not in required:
                 return []
-            if leaf.defines in index_only or leaf.index in post:
+            if leaf.defines in index_only:
                 return [lanes._clone_stmt(leaf.stmt)]
-            assert leaf.defines in stash_roots
+            if leaf.index in post and level[leaf.defines] == unit.position:
+                statements = [lanes._clone_stmt(leaf.stmt)]
+                if leaf.defines in stashed_here:
+                    statements.append(
+                        statement_from_string(
+                            f"{stash_name[leaf.defines]}.append({leaf.defines})"
+                        )
+                    )
+                return statements
+            if leaf.defines not in stash_roots and leaf.defines not in stashed_post:
+                _reject(f"{leaf.defines} is read back without a stash")
             position = _flat_index(nest, leaf.path, with_owner=with_owner)
             return [
                 statement_from_string(
@@ -724,14 +922,6 @@ def lower_register_tile_lane_loop(
 
         return select
 
-    # A lane-invariant side effect never reads a lane-varying value, so the
-    # per-lane consume nest and the once-only tail nest are independent; the
-    # pure values each needs (including those derived from a reduction result)
-    # are re-emitted in place by ``select_consume``.
-    side_effects = [leaf for leaf in consumers if leaf.kind in ("append", "store")]
-    consume_leaves = [leaf for leaf in side_effects if is_varying(leaf)]
-    tail_leaves = [leaf for leaf in side_effects if not is_varying(leaf)]
-
     result: list[ast.AST] = list(prologue)
     result.append(
         lanes._clone_lane_loop_with_body(
@@ -739,6 +929,7 @@ def lower_register_tile_lane_loop(
         )
     )
     smem_bytes = 0
+    finalize: dict[int, list[ast.AST]] = {position: [] for position in range(passes)}
     for leaf in markers:
         assert leaf.marker is not None
         statements, allocated = _finalize_marker(
@@ -746,30 +937,27 @@ def lower_register_tile_lane_loop(
             acc_name[leaf.index],
             results_name[leaf.index],
             _tile_count(nest, leaf.path),
+            warp_fold=options.warp_fold,
         )
-        result.extend(statements)
+        finalize[marker_level[leaf.index]].extend(statements)
         smem_bytes += allocated
     if smem_bytes and smem_bytes > reductions._cute_shared_memory_budget_bytes():
         _reject(f"{smem_bytes} bytes of static shared memory exceed the budget")
-    if consume_leaves:
-        required = needed_names(consume_leaves)
-        body = _emit_nest(
-            nest,
-            loop.body,
-            select_consume(
-                {leaf.index for leaf in consume_leaves}, required, with_owner=True
-            ),
-        )
-        result.append(lanes._clone_lane_loop_with_body(loop, body))
-    if tail_leaves:
-        required = needed_names(tail_leaves)
-        result.extend(
-            _emit_nest(
-                nest,
-                loop.body,
-                select_consume(
-                    {leaf.index for leaf in tail_leaves}, required, with_owner=False
-                ),
-            )
-        )
+
+    def emit_unit(unit: _Unit) -> list[ast.AST]:
+        body = _emit_nest(nest, loop.body, select_unit(unit))
+        if unit.kind == "tail":
+            return body
+        return [lanes._clone_lane_loop_with_body(loop, body)]
+
+    # Each level's accumulate nest (and the side effects placed at its
+    # position) precedes that level's combines; the rest follows the last.
+    for position in range(passes):
+        for unit in units:
+            if unit.position == position:
+                result.extend(emit_unit(unit))
+        result.extend(finalize[position])
+    for unit in units:
+        if unit.position == passes:
+            result.extend(emit_unit(unit))
     return result

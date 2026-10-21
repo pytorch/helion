@@ -7,6 +7,7 @@ from itertools import zip_longest
 import math
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import cast
 
 import sympy
@@ -61,6 +62,7 @@ from ..cute.loop_nesting import tile_loop_paths
 from ..cute.matmul_utils import cute_matmul_root_placements
 from ..cute.mma_support import cute_fp32_dot_uses_tf32
 from ..cute.packed_matmul import packed_axis_for_fact
+from ..cute.register_tile_admission import register_tile_reduction_levels
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -1091,7 +1093,10 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
     the first store, and each tile column is combined once with the
     shared-memory column reduce.  The seed sizes the reduction thread count so
     the unrolled register tile holds ``CUTE_REGISTER_TILE_MAX_ELEMENTS`` per
-    thread.
+    thread, divided by the number of chained reduction levels
+    (``register_tile_reduction_levels``): a body whose second reduction reads
+    the first one's result (the delta-rule recurrent step) stashes more of the
+    tile between its combines.
 
     Disjoint from ``CuteColumnReductionHeuristic``, which seeds the reduction
     over a serial device-loop axis of a kernel without reduction loops (for
@@ -1161,7 +1166,13 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
         if tile_block % vec or (int(numel) % tile_block):
             return None
         tile_threads = tile_block // vec
-        lanes = max(1, CUTE_REGISTER_TILE_MAX_ELEMENTS // vec)
+        # Every accumulate nest after the first keeps more of the tile stashed
+        # (the delta-rule step holds the decayed tile, two per-row products
+        # and the corrected tile across its two combines), so a chained body
+        # takes proportionally fewer lanes per thread to stay inside the
+        # live-value budget.
+        levels = register_tile_reduction_levels(device_ir.graphs)
+        lanes = max(1, CUTE_REGISTER_TILE_MAX_ELEMENTS // vec // levels)
         reduction_threads = next_power_of_2(max(1, -(-size_hint // lanes)))
         if size_hint % reduction_threads or tile_threads * reduction_threads > (
             spec.max_reduction_threads or 1024
@@ -1215,6 +1226,60 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
             ),
         }
         return Config(**seed)
+
+    # The schedule knobs of ``RegisterTileOptions``: the warp fold of the
+    # multi-warp column reduce and the consume nest ahead of the combines.
+    SCHEDULE_KNOBS: ClassVar[dict[str, bool]] = {
+        "cute_register_tile_warp_fold": True,
+        "cute_register_tile_store_first": True,
+    }
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        """``[primary, primary + schedule knobs, finer tile + schedule knobs]``.
+
+        The primary stays the autotune-off default.  The alternates make the
+        schedule knobs searchable (``_flat_fields`` offers a knob only when a
+        compiler seed sets it) and point the search at the finer register
+        tile: half the lanes per thread on twice the reduction threads keeps
+        more CTAs per SM (fewer live registers each) and shorter CTAs, while
+        the column reduce then spans more warps, where the serial
+        ``pre > 1`` form reads ``group_span // pre`` partials per column and
+        the warp fold does not (fused linear-attention step at
+        [512, 128, 128] fp32, L2-warm: 8.4 us -> 8.2 us; the knob-free finer
+        tile was 10.0 us).
+        """
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        geometry = cls._geometry(env, device_ir)
+        assert geometry is not None
+        (
+            tile_block_id,
+            _tile_block,
+            tile_threads,
+            reduction_block_id,
+            reduction_threads,
+            _vec,
+        ) = geometry
+        spec = env.config_spec
+        alternates = [Config.from_dict(deepcopy(primary.config) | cls.SCHEDULE_KNOBS)]
+        size_hint = cast("ReductionLoopSpec", spec.reduction_loops[0]).size_hint
+        finer = reduction_threads * 2
+        if (
+            size_hint % finer == 0
+            and size_hint // finer >= 2
+            and tile_threads * finer <= (spec.max_reduction_threads or 1024)
+        ):
+            finer_seed = deepcopy(primary.config) | cls.SCHEDULE_KNOBS
+            finer_seed["num_threads"] = _seq_config_list(
+                spec.num_threads,
+                {tile_block_id: tile_threads, reduction_block_id: finer},
+            )
+            alternates.append(Config.from_dict(finer_seed))
+        return [primary, *alternates]
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
