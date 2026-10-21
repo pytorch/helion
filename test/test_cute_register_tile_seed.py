@@ -180,8 +180,8 @@ def test_seed_retries_wide_extents_as_the_looped_reduction(
 
 @skipUnlessBackends(["cute"])
 def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
-    # A rolled device loop, one reduction feeding another, or a dynamic
-    # reduction extent: the block is not admitted and no seed is offered.
+    # A rolled device loop or a dynamic reduction extent: the block is not
+    # admitted and no seed is offered.
     for kernel, arguments in (
         (
             col_sum_nested,
@@ -190,13 +190,45 @@ def test_seed_skips_bodies_outside_the_register_tile_shape() -> None:
                 torch.empty((4, 1024), dtype=torch.float32),
             ),
         ),
-        (col_softmax, (torch.empty((128, 1024), dtype=torch.float32),)),
         (col_sum_dynamic, (torch.empty((1024, 1024), dtype=torch.float32),)),
     ):
         bound = _cpu_bind(kernel, arguments)
         host = bound.host_function
         assert host is not None
         assert not CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+
+
+@skipUnlessBackends(["cute"])
+def test_chained_reductions_seed_half_the_lanes_per_level() -> None:
+    # One reduction feeding another (two accumulate nests) stashes more of the
+    # tile between the combines, so the seed halves the lanes per thread:
+    # 128 rows over 16 reduction threads instead of 8, with the same 32-column
+    # tile on 8 vector threads.  The chained body is also the autotune-off
+    # default and renders the two-level register tile.
+    arguments = (torch.empty((128, 1024), dtype=torch.float32),)
+    bound = _cpu_bind(col_softmax, arguments)
+    host = bound.host_function
+    assert host is not None
+    assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
+    seeds = CuteRegisterTileHeuristic.get_seed_configs(bound.env, host.device_ir)
+    assert seeds is not None
+    spec = bound.config_spec
+    (reduction,) = [
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    ]
+    thread_ids = spec.num_threads.valid_block_ids()
+    assert [seed.block_sizes for seed in seeds] == [[32], [32], [32]]
+    assert [seed.num_threads[thread_ids.index(reduction)] for seed in seeds] == [
+        16,
+        16,
+        32,
+    ]
+    default = spec.default_config()
+    assert default.num_threads[thread_ids.index(reduction)] == 16
+    code = bound.to_code(default)
+    assert code.count(CONSTEXPR_OWNER) == 3
+    assert "_lane_stash" in code
+    assert "block=(8, 16, 1)" in code
 
 
 @skipUnlessBackends(["cute"])

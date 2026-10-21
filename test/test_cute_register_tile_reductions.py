@@ -44,6 +44,8 @@ from test._cute_register_tile_kernels import col_sum_guarded
 from test._cute_register_tile_kernels import col_sum_nested
 from test._cute_register_tile_kernels import col_var
 from test._cute_register_tile_kernels import column_config
+from test._cute_register_tile_kernels import rms_norm_bwd
+from test._cute_register_tile_kernels import rms_norm_bwd_arguments
 
 import helion
 from helion._compiler import generate_ast as generate_ast_module
@@ -508,30 +510,77 @@ def _f32(*shape: int) -> torch.Tensor:
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
-    ("kernel", "make_arguments"),
+    ("kernel", "make_arguments", "owner_loops", "stashes", "once"),
     (
-        pytest.param(col_softmax, lambda: (_f32(128, 1024),), id="column-softmax"),
-        pytest.param(col_var, lambda: (_f32(128, 1024),), id="two-pass-variance"),
+        # Load, max combine; ``exp(t - max)`` once in the level-1 nest (stashed
+        # for the store), sum combine; the store nest reads it back.
+        pytest.param(
+            col_softmax,
+            lambda: (_f32(128, 1024),),
+            3,
+            ("t_lane_stash", "v_1_lane_stash"),
+            "cute.math.exp2(",
+            id="column-softmax",
+        ),
+        # Load, sum combine; the squared deviations in the level-1 nest, sum
+        # combine; both results flushed by the once-only tail (no store nest).
+        pytest.param(
+            col_var,
+            lambda: (_f32(128, 1024),),
+            2,
+            ("t_lane_stash",),
+            "cute.arch.load(x.iterator",
+            id="two-pass-variance",
+        ),
     ),
 )
-def test_chained_reductions_keep_the_rolled_lane_up_front(
+def test_chained_reductions_run_one_accumulate_nest_per_level(
     kernel: helion.Kernel,
     make_arguments: Callable[[], tuple[Any, ...]],
+    owner_loops: int,
+    stashes: tuple[str, ...],
+    once: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # One reduction feeding another needs a second accumulate pass; the device
-    # IR shows the chain, so the rolled lane nesting is chosen directly (no
-    # register tile, no second codegen pass) exactly as before register tiles.
+    # One reduction feeding another: the device IR admits the chain and the
+    # schedule runs a second accumulate nest between the two combines, reading
+    # the stashed tile instead of loading it again.
     arguments = make_arguments()
     bound = _cpu_bind(kernel, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=8)
     with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
         code = bound.to_code(config)
     assert FALLBACK_LOG not in caplog.text
-    assert ROLLED_OWNER in code
-    assert CONSTEXPR_OWNER not in code
-    assert "_lane_stash" not in code
-    assert code == _rolled_code(bound, config)
+    assert ROLLED_OWNER not in code
+    assert code.count(CONSTEXPR_OWNER) == owner_loops
+    for stash in stashes:
+        assert f"{stash} = []" in code
+    assert code.count(once) == 1
+    assert code.count("cute.arch.load(x.iterator") == 1
+    statements = _kernel_statements(code)
+    combines = [
+        i
+        for i, source in enumerate(statements)
+        if "_reduced" in source and "_lane_acc" in source and "= _cute_" in source
+    ]
+    owners = [
+        i for i, s in enumerate(statements) if s.startswith("for synthetic_lane_")
+    ]
+    # First nest, first combine(s), second nest, second combine, the rest.
+    assert owners[0] < combines[0] < owners[1] < combines[-1]
+    assert all(owner < combines[-1] for owner in owners[:2])
+    assert all(owner > combines[-1] for owner in owners[2:])
+
+
+def _kernel_statements(code: str) -> list[str]:
+    """The kernel body's top-level statements, unparsed, in program order."""
+    module = ast.parse(code)
+    (kernel,) = [
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    ]
+    return [ast.unparse(node) for node in kernel.body]
 
 
 @skipUnlessBackends(["cute"])
@@ -927,23 +976,27 @@ def test_column_reduce_returns_behind_a_barrier() -> None:
                 if isinstance(statement, ast.Return):
                     returns += 1
                     assert ast.unparse(previous) == "cute.arch.sync_threads()"
-    assert returns == 2
+    # The warp-fold branch (``fold='warp'``), the one-warp-per-slot branch
+    # (``pre == 1``) and the serial ``pre > 1`` branch.
+    assert returns == 3
 
 
 @skipUnlessBackends(["cute"])
 def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
     # Config normalization, the seed and codegen share one admission: the
-    # reduction block is listed only for a body the two-pass schedule may
-    # lower (independent reductions, no rolled loop, no reduction fed by
-    # another) and a static (unmasked) extent.
+    # reduction block is listed only for a body the schedule may lower (no
+    # rolled loop, no effects beyond loads, stores and per-element values;
+    # chained reductions take one accumulate nest per level) and a static
+    # (unmasked) extent.
     for kernel, arguments, admitted in (
         (col_sum, (_f32(128, 1024),), True),
         (col_stats, (_f32(128, 1024),), True),
         (col_scale, (_f32(128, 1024),), True),
-        (col_softmax, (_f32(128, 1024),), False),
-        (col_var, (_f32(128, 1024),), False),
+        (col_softmax, (_f32(128, 1024),), True),
+        (col_var, (_f32(128, 1024),), True),
         (col_sum_nested, (_f32(128, 1024), _f32(4, 1024)), False),
         (col_sum_dynamic, (_f32(1024, 1024),), False),
+        (rms_norm_bwd, rms_norm_bwd_arguments(), False),
     ):
         bound = _cpu_bind(kernel, arguments)
         (reduction,) = [
@@ -951,6 +1004,72 @@ def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
         ]
         blocks = bound.config_spec.cute_register_tile_reduction_blocks
         assert (reduction in blocks) is admitted, kernel.name
+
+
+@skipUnlessBackends(["cute"])
+def test_tile_axis_reductions_keep_the_rolled_nesting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The autodiff rms_norm backward reduces over the row tile itself for
+    # ``grad_weight`` beside its two chained feature reductions.  Under the
+    # register-tile nesting that marker is owned by the row tile's vector lane,
+    # which the schedule cannot place, so the admission refuses the body: no
+    # register-tile seed is promoted and the autotune-off default renders the
+    # warp-reduction layout it had before chained bodies were admitted.
+    arguments = rms_norm_bwd_arguments()
+    bound = _cpu_bind(rms_norm_bwd, arguments)
+    spec = bound.config_spec
+    assert not spec.cute_register_tile_reduction_blocks
+    assert "cute_register_tile" not in spec.autotuner_heuristics
+    assert spec.compiler_default_config is None
+    default = spec.default_config()
+    assert default.config["cute_vector_widths"] == [1, 1]
+    assert "num_threads" not in default.config
+    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+        code = bound.to_code(default)
+    assert FALLBACK_LOG not in caplog.text
+    assert "block=(32, 32, 1)" in code
+    assert "cute.arch.warp_reduction_sum(" in code
+    assert CONSTEXPR_OWNER not in code
+    assert COLUMN_REDUCE not in code
+    assert "_lane_stash" not in code
+
+
+@skipUnlessBackends(["cute"])
+def test_tile_axis_reduction_under_a_register_tile_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Were the device IR to admit the body all the same, the lowering fails
+    # closed: the row tile's one-vector wrapper under the register-tile owner
+    # carries the tile-axis reduction, so the lane interchange raises
+    # ``RegisterTileUnsupported`` (not the vector lane's ownership proof) and
+    # ``generate_ast`` regenerates with the rolled nesting, which rejects this
+    # config as it always did (a rolled reduction lane below the vectorized
+    # row tile), instead of a kernel-level failure of the seed's default.
+    arguments = rms_norm_bwd_arguments()
+    with patch(
+        "helion._compiler.device_ir.register_tile_body_admitted", return_value=True
+    ):
+        bound = _cpu_bind(rms_norm_bwd, arguments)
+    spec = bound.config_spec
+    (reduction,) = [
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    ]
+    assert reduction in spec.cute_register_tile_reduction_blocks
+    assert "cute_register_tile" in spec.autotuner_heuristics
+    seed = spec.default_config()
+    assert seed.config["num_threads"] == [8, 4]
+    assert seed.config["cute_vector_widths"] == [1, 4]
+    with (
+        caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
+        pytest.raises(
+            helion.exc.BackendUnsupported, match="nested in a different lane owner"
+        ),
+    ):
+        bound.to_code(seed)
+    assert FALLBACK_LOG in caplog.text
+    assert "owned by that tile lane, not by the register-tile owner" in caplog.text
+    assert LOOPED_RETRY_LOG not in caplog.text
 
 
 @skipUnlessBackends(["cute"])

@@ -1203,6 +1203,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -1354,6 +1356,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -1425,6 +1429,12 @@ VALID_MAXNREG = AUTOTUNED_MAXNREG
 MIN_MAXNREG = 1
 MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
+# Schedule knobs of the CuTe register tile (``RegisterTileOptions``); dropped
+# from a config that forms no register tile.
+_CUTE_REGISTER_TILE_KNOBS: tuple[str, ...] = (
+    "cute_register_tile_warp_fold",
+    "cute_register_tile_store_first",
+)
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         *RADIX_CONFIG_KEYS,
@@ -1524,6 +1534,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -5649,6 +5661,8 @@ class ConfigSpec:
             "cute_scalar_epilogue_keep_inputs",
             "cute_scalar_epilogue_owner_fold",
             "cute_warp_fp32_redux",
+            "cute_register_tile_warp_fold",
+            "cute_register_tile_store_first",
             "cute_replicated_reduction",
             "cute_vector_packet_unroll",
         ):
@@ -6812,6 +6826,7 @@ class ConfigSpec:
         # is regenerated with ``_cute_register_tiles=False`` (the looped
         # reduction this branch chooses without the register tile), and an
         # unproved reordering rejects the config instead of miscompiling.
+        register_tile = False
         if (
             self.backend_name == "cute"
             and self.max_reduction_threads is not None
@@ -6860,22 +6875,56 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
-                        if (
+                        forms_register_tile = (
                             _cute_register_tiles
                             and self._cute_config_forms_register_tile(
                                 config, spec, available
                             )
-                        ) or self._cute_config_forms_one_vector_lane(
-                            config, spec, available
+                        )
+                        if (
+                            forms_register_tile
+                            or self._cute_config_forms_one_vector_lane(
+                                config, spec, available
+                            )
                         ):
+                            # Only the register tile honours the schedule
+                            # knobs; a one-vector lane that is not one keeps
+                            # its lane loop but drops them below.
+                            register_tile = register_tile or forms_register_tile
                             continue
                         chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
                         changed = True
+                    elif (
+                        new_loops[i] is None
+                        and _cute_register_tiles
+                        and isinstance(
+                            requested := self.num_threads.config_get(
+                                nt_list, spec.block_id, 0
+                            ),
+                            int,
+                        )
+                        and 0 < requested < spec.size_hint
+                        and self._cute_config_forms_register_tile(
+                            config, spec, available
+                        )
+                    ):
+                        # An explicit reduction thread count below the extent
+                        # within the budget (a lane loop of >= 2 rows per
+                        # thread): the register tile forms here too.
+                        register_tile = True
                 if changed:
                     config["reduction_loops"] = new_loops
+        if self.backend_name == "cute" and not register_tile:
+            # The register-tile schedule knobs mean nothing without the tile
+            # (a one-vector persistent lane over an admitted reduction block);
+            # dropping them keeps the proven schedule and a byte-identical
+            # render, also on the ``_cute_register_tiles=False`` retry.
+            for key in _CUTE_REGISTER_TILE_KNOBS:
+                if config.get(key):
+                    config[key] = False
 
         # Disable range_* configs for static ranges
         static_range_block_ids = [
@@ -8579,6 +8628,8 @@ class ConfigSpec:
                         "cute_scalar_epilogue_keep_inputs",
                         "cute_scalar_epilogue_owner_fold",
                         "cute_warp_fp32_redux",
+                        "cute_register_tile_warp_fold",
+                        "cute_register_tile_store_first",
                         "cute_replicated_reduction",
                         "cute_vector_packet_unroll",
                     ):
