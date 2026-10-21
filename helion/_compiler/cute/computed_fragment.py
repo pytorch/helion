@@ -102,8 +102,8 @@ from .warp_results import warp_result_chain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Generator
     from collections.abc import Iterable
-    from collections.abc import Iterator
 
     from ..autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ..device_ir import DeviceIR
@@ -576,7 +576,9 @@ class FragmentCompiler:
                     self.local_register_nodes.update(chain)
 
     @contextmanager
-    def snapshot_scope(self, index: str, slot: str, size: int) -> Iterator[None]:
+    def snapshot_scope(
+        self, index: str, slot: str, size: int
+    ) -> Generator[None, None, None]:
         previous = self.snapshot_owner
         if (size,) in self.snapshot_shapes:
             self.snapshot_owner = SnapshotOwner(index, slot, size)
@@ -590,7 +592,7 @@ class FragmentCompiler:
         self.thread = self.df.new_var("fragment_thread")
 
     @contextmanager
-    def iteration_scope(self, index: str, size: int) -> Iterator[None]:
+    def iteration_scope(self, index: str, size: int) -> Generator[None, None, None]:
         """A returned scalar is valid only in this active owner's iteration."""
         assert self.iteration_owner is None and not self.iteration_defined
         self.iteration_owner = SnapshotOwner(index, "", size)
@@ -2084,6 +2086,13 @@ class FragmentCompiler:
 
         assert self.threads % 32 == 0
         assert indices is not None or source.dtype == torch.int64
+        if (
+            indices is None
+            and self.df.config.get("cute_fragment_cta_topk", False)
+            and source.dtype == torch.int64
+        ):
+            self.cta_int64_topk(source, selected, n, k, largest)
+            return
         padded_n = 1 << (n - 1).bit_length()
         padded_k = 1 << (k - 1).bit_length()
         local_n = max(1, padded_n // 32)
@@ -2203,6 +2212,146 @@ class FragmentCompiler:
             self.cg.add_statement(loop)
 
         self.elements(source.shape[:-1], line, threads_per_element=32)
+
+    def cta_int64_topk(
+        self,
+        source: Fragment,
+        selected: Fragment,
+        n: int,
+        k: int,
+        largest: bool,
+    ) -> None:
+        """Sort complete Int64 values with bounded private slots and CTA peers.
+
+        Every physical thread enters each shared publication and retirement
+        barrier, including padded owners. Comparisons within a lane use a
+        simultaneous private snapshot; exchanges within a warp use shuffles;
+        exchanges between warps use one held shared scratch vector. Original
+        indices are not observed on this path.
+        """
+        if not (0 < k <= n <= 1024 and self.threads & (self.threads - 1) == 0):
+            raise exc.InvalidConfig("CTA selection requires a bounded Int64 fragment")
+        padded = max(32, 1 << (n - 1).bit_length())
+        slots = (padded + self.threads - 1) // self.threads
+        keys = self.df.new_var("fragment_cta_sort_keys")
+        temporary = self.df.new_var("fragment_cta_sort_next")
+        self.emit(f"{keys} = cute.make_rmem_tensor(({slots},), cutlass.Int64)")
+        self.emit(f"{temporary} = cute.make_rmem_tensor(({slots},), cutlass.Int64)")
+        scratch = (
+            self.allocate(Fragment((padded,), torch.int64, lambda _: "0"))
+            if self.threads > 32 and padded > 32
+            else None
+        )
+        self.held.append(scratch)
+        leading = self.df.new_var("fragment_cta_sort_row")
+        slot = self.df.new_var("fragment_cta_sort_slot")
+        column = self.df.new_var("fragment_cta_sort_column")
+        mine = self.df.new_var("fragment_cta_sort_mine")
+        peer = self.df.new_var("fragment_cta_sort_peer")
+        maximum = self.df.new_var("fragment_cta_sort_maximum")
+        choose = self.df.new_var("fragment_cta_sort_choose")
+        outer = cast(
+            "ast.For",
+            statement_from_string(
+                f"for {leading} in range({math.prod(source.shape[:-1])}):\n    pass"
+            ),
+        )
+        outer.body.clear()
+        with self.cg.set_statements(cast("list[ast.AST]", outer.body)):
+            coords = self.coordinates(leading, source.shape[:-1])
+            fill = cast(
+                "ast.For",
+                statement_from_string(
+                    f"for {slot} in cutlass.range_constexpr({slots}):\n    pass"
+                ),
+            )
+            fill.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", fill.body)):
+                self.emit(f"{column} = {self.thread} + {slot} * {self.threads}")
+                self.emit(f"{mine} = cutlass.Int64(-9223372036854775808)")
+                valid = cast(
+                    "ast.If", statement_from_string(f"if {column} < {n}:\n    pass")
+                )
+                valid.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", valid.body)):
+                    value = self.cast(source.read((*coords, column)), torch.int64)
+                    self.emit(f"{mine} = {value if largest else f'~({value})'}")
+                self.cg.add_statement(valid)
+                self.emit(f"{keys}[{slot}] = {mine}")
+            self.cg.add_statement(fill)
+            for level in range(padded.bit_length() - 1):
+                span = 1 << (level + 1)
+                for bit in range(level, -1, -1):
+                    distance = 1 << bit
+                    cross_warp = 32 <= distance < self.threads
+                    if cross_warp:
+                        assert scratch is not None
+                        self.emit(
+                            f"for {slot} in cutlass.range_constexpr({slots}):\n"
+                            f"    {column} = {self.thread} + {slot} * {self.threads}\n"
+                            f"    if {column} < {padded}:\n"
+                            f"        {scratch.read((column,))} = {keys}[{slot}]"
+                        )
+                        self.synchronize()
+                    update = cast(
+                        "ast.For",
+                        statement_from_string(
+                            f"for {slot} in cutlass.range_constexpr({slots}):\n    pass"
+                        ),
+                    )
+                    update.body.clear()
+                    with self.cg.set_statements(cast("list[ast.AST]", update.body)):
+                        self.emit(f"{column} = {self.thread} + {slot} * {self.threads}")
+                        self.emit(f"{mine} = {keys}[{slot}]")
+                        valid = cast(
+                            "ast.If",
+                            statement_from_string(f"if {column} < {padded}:\n    pass"),
+                        )
+                        valid.body.clear()
+                        with self.cg.set_statements(cast("list[ast.AST]", valid.body)):
+                            if distance >= self.threads:
+                                expression = (
+                                    f"{keys}[{slot} ^ {distance // self.threads}]"
+                                )
+                            elif distance < 32:
+                                expression = (
+                                    f"cute.arch.shuffle_sync_bfly({mine}, offset={distance}, "
+                                    "mask=0xffffffff, mask_and_clamp=31)"
+                                )
+                            else:
+                                assert scratch is not None
+                                expression = scratch.read((f"{column} ^ {distance}",))
+                            self.emit(f"{peer} = {expression}")
+                            self.emit(
+                                f"{maximum} = (({column} & {span}) == 0) == (({column} & {distance}) == 0)"
+                            )
+                            self.emit(
+                                f"{choose} = ({mine} < {peer}) if {maximum} else ({mine} > {peer})"
+                            )
+                            self.emit(
+                                f"{temporary}[{slot}] = {peer} if {choose} else {mine}"
+                            )
+                        valid.orelse = [
+                            statement_from_string(f"{temporary}[{slot}] = {mine}")
+                        ]
+                        self.cg.add_statement(valid)
+                    self.cg.add_statement(update)
+                    if cross_warp:
+                        # Every peer read completes before the next shared pass.
+                        self.synchronize()
+                    self.emit(
+                        f"for {slot} in cutlass.range_constexpr({slots}):\n    {keys}[{slot}] = {temporary}[{slot}]"
+                    )
+            self.emit(
+                f"for {slot} in cutlass.range_constexpr({slots}):\n"
+                f"    {column} = {self.thread} + {slot} * {self.threads}\n"
+                f"    if {column} < {k}:\n"
+                f"        {selected.read((*coords, column))} = "
+                f"{keys + '[' + slot + ']' if largest else '~' + keys + '[' + slot + ']'}"
+            )
+            self.synchronize()
+        self.cg.add_statement(outer)
+        self.held.pop()
 
     def topk_gather(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[0])]
@@ -2502,6 +2651,21 @@ class FragmentCompiler:
                 self.synchronize()
                 self.held.pop()
                 return result
+
+            if self.df.config.get("cute_fragment_reduction", "serial") in (
+                "cta",
+                "cta_unroll",
+            ) and fragment_warp_reduction_supported(node):
+                return self.cta_reduction(
+                    result_shape,
+                    fake.dtype,
+                    reduction_shape,
+                    compute_dtype,
+                    lowering.reduction_type,
+                    element,
+                    combine,
+                    dependencies,
+                )
 
             def reduce(coords: tuple[str, ...]) -> str:
                 reduction_type = lowering.reduction_type
@@ -2890,6 +3054,7 @@ class FragmentCompiler:
             )
         if (
             not plan.local_allocations
+            and not plan.readonly_control
             and self.df.config.get("cute_fragment_bounded_gather", False) is not True
         ):
             raise exc.InvalidConfig("resident while requires explicit bounded gather")
@@ -3306,6 +3471,122 @@ class FragmentCompiler:
                 return f"{register}[{self.snapshot_owner.slot}]"
 
             return dataclasses.replace(result, element=read, dependencies=(result,))
+        return result
+
+    def cta_reduction(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        reduction_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+        kind: str,
+        element: Callable,
+        combine: Callable,
+        dependencies: tuple[Fragment, ...],
+    ) -> Fragment:
+        """Cooperate across the CTA for each complete output coordinate.
+
+        Warp leaders publish partials, then a complete first warp combines
+        them. Every thread participates in the publication and retirement
+        barriers, including threads with an empty input stripe.
+        """
+        assert self.threads % 32 == 0
+        self.held.append(dependencies)
+        result = self.allocate(Fragment(shape, dtype, lambda _: "0"))
+        self.held.append(result)
+        warps = self.threads // 32
+        scratch = self.allocate(Fragment((warps,), compute_dtype, lambda _: "0"))
+        self.held.append(scratch)
+        output = self.df.new_var("fragment_cta_output")
+        index = self.df.new_var("fragment_cta_index")
+        total = self.df.new_var("fragment_cta_reduce")
+        peer = self.df.new_var("fragment_cta_peer")
+        identity = self.cast(
+            self.scalar(Reduction.default_accumulator(kind, compute_dtype)),
+            compute_dtype,
+        )
+        loop = cast(
+            "ast.For",
+            statement_from_string(
+                f"for {output} in range({math.prod(shape)}):\n    pass"
+            ),
+        )
+        loop.body.clear()
+        with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+            coords = self.coordinates(output, shape)
+            self.emit(f"{total} = {identity}")
+            unroll = self.df.config.get("cute_fragment_reduction") == "cta_unroll"
+            slot = self.df.new_var("fragment_cta_slot") if unroll else index
+            count = math.prod(reduction_shape)
+            iteration = (
+                f"cutlass.range_constexpr({(count + self.threads - 1) // self.threads})"
+                if unroll
+                else f"range({self.thread}, {count}, {self.threads})"
+            )
+            inputs = cast(
+                "ast.For",
+                statement_from_string(f"for {slot} in {iteration}:\n    pass"),
+            )
+            inputs.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", inputs.body)):
+                if unroll:
+                    self.emit(f"{index} = {self.thread} + {slot} * {self.threads}")
+                    guard = cast(
+                        "ast.If",
+                        statement_from_string(f"if {index} < {count}:\n    pass"),
+                    )
+                    guard.body.clear()
+                    with (
+                        self.cg.set_statements(cast("list[ast.AST]", guard.body)),
+                        self.snapshot_scope(index, slot, count),
+                    ):
+                        value = element(
+                            coords, self.coordinates(index, reduction_shape)
+                        )
+                        self.emit(
+                            f"{total} = {self.cast(combine(total, value), compute_dtype)}"
+                        )
+                    self.cg.add_statement(guard)
+                else:
+                    value = element(coords, self.coordinates(index, reduction_shape))
+                    self.emit(
+                        f"{total} = {self.cast(combine(total, value), compute_dtype)}"
+                    )
+            self.cg.add_statement(inputs)
+            for distance in (16, 8, 4, 2, 1):
+                self.emit(
+                    f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                )
+                self.emit(f"{total} = {self.cast(combine(total, peer), compute_dtype)}")
+            self.emit(
+                f"if {self.thread} % 32 == 0:\n    {scratch.read((f'{self.thread} // 32',))} = {total}"
+            )
+            self.synchronize()
+            guard = cast(
+                "ast.If", statement_from_string(f"if {self.thread} < 32:\n    pass")
+            )
+            guard.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", guard.body)):
+                self.emit(f"{total} = {identity}")
+                self.emit(
+                    f"if {self.thread} < {warps}:\n    {total} = {scratch.read((self.thread,))}"
+                )
+                for distance in (16, 8, 4, 2, 1):
+                    self.emit(
+                        f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                    )
+                    self.emit(
+                        f"{total} = {self.cast(combine(total, peer), compute_dtype)}"
+                    )
+                self.emit(
+                    f"if {self.thread} == 0:\n    {result.read(coords)} = {self.cast(total, dtype)}"
+                )
+            self.cg.add_statement(guard)
+            self.synchronize()
+        self.cg.add_statement(loop)
+        self.held.pop()
+        self.held.pop()
+        self.held.pop()
         return result
 
     def completed_scan_reductions(self, shape: tuple[int, ...]) -> None:
@@ -4255,7 +4536,22 @@ def computed_fragment_supported(
         try:
             plans = [resident_while_plan(call, graphs) for call in while_calls]
             mutable_while = any(plan.local_allocations for plan in plans)
-            needs_bounded_gather = any(not plan.local_allocations for plan in plans)
+            needs_bounded_gather = any(
+                not plan.local_allocations and not plan.readonly_control
+                for plan in plans
+            )
+            for plan in plans:
+                if plan.readonly_control:
+                    from .uniform_region_tree import uniform_output_stores_are_writeonly
+                    from .uniform_region_tree import uniform_readonly_regions
+
+                    if not uniform_output_stores_are_writeonly(
+                        env,
+                        graphs,
+                        uniform_readonly_regions(graphs),
+                        allow_unbound=allow_unbound,
+                    ):
+                        return False
             if mutable_while:
                 prove_local_atomics(graphs)
         except exc.InvalidConfig:
@@ -4875,7 +5171,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             and root.graph_id in env.config_spec.cute_fragment_scan_root_ids
         )
         or (
-            cg.device_function.config.get("cute_fragment_reduction", "serial") == "warp"
+            cg.device_function.config.get("cute_fragment_reduction", "serial")
+            in ("warp", "cta", "cta_unroll")
             and root.graph_id in env.config_spec.cute_fragment_reduction_root_ids
         )
     )
@@ -4999,7 +5296,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
     )
     reduction_required = (
-        cg.device_function.config.get("cute_fragment_reduction", "serial") == "warp"
+        cg.device_function.config.get("cute_fragment_reduction", "serial")
+        in ("warp", "cta", "cta_unroll")
         and root.graph_id
         in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
     )

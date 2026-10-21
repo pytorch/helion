@@ -1087,6 +1087,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1226,6 +1227,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1380,6 +1382,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1764,6 +1767,8 @@ class ConfigSpec:
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_topk_network_search_enabled = False
+        self.cute_fragment_cta_topk_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_cta_topk_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_search_enabled = False
@@ -4259,6 +4264,25 @@ class ConfigSpec:
             fix_invalid=fix_invalid,
         )
 
+    def _normalize_cute_fragment_cta_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_cta_topk"
+        self._normalize_cute_fragment_option(
+            config,
+            key,
+            self.cute_fragment_cta_topk_root_ids,
+            "a supported complete Int64 value-only selection",
+            fix_invalid=fix_invalid,
+        )
+        if config.get(key) and config.get("cute_fragment_topk_network") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    "CTA selection requires cute_fragment_topk_network=True"
+                )
+
     def _normalize_cute_fragment_atomic_aggregation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4552,7 +4576,7 @@ class ConfigSpec:
             self.cute_fragment_reduction_root_ids,
             "a supported computed scalar reduction",
             fix_invalid=fix_invalid,
-            choices=("serial", "warp"),
+            choices=("serial", "warp", "cta", "cta_unroll"),
         )
 
     def _normalize_cute_fragment_scan(
@@ -5601,6 +5625,7 @@ class ConfigSpec:
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_cta_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -6898,6 +6923,7 @@ class ConfigSpec:
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_fragment_cta_topk",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_topk_coarse_keys",
@@ -7196,6 +7222,8 @@ class ConfigSpec:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_topk_network_search_enabled:
                 fields["cute_fragment_topk_network"] = BooleanFragment()
+            if self.cute_fragment_cta_topk_search_enabled:
+                fields["cute_fragment_cta_topk"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_integer_loop_reduction_search_enabled:
@@ -7232,7 +7260,7 @@ class ConfigSpec:
                 )
             if self.cute_fragment_reduction_search_enabled:
                 fields["cute_fragment_reduction"] = EnumFragment(
-                    choices=("serial", "warp")
+                    choices=("serial", "warp", "cta", "cta_unroll")
                 )
             if self.cute_pointwise_region_block_ids:
                 fields["cute_pointwise_pid_type"] = EnumFragment(
