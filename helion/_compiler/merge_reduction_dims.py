@@ -11,6 +11,7 @@ with a single reduction.  Chains it cannot rewrite are kept as they are.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import itertools
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -24,12 +25,13 @@ from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 
 from .. import exc
+from ..language import _MEMORY_OPS
 from ..language._tracing_ops import _host_tensor
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_expr
 from .host_function import HostFunction
-from .loop_dependency_checker import graph_memory_access_storage_ids
+from .loop_dependency_checker import _storage_ids
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import FlattenOrigin
 
@@ -44,6 +46,16 @@ if TYPE_CHECKING:
 
 
 _META_KEY = "helion_multi_dim_reduction"
+
+
+@dataclass(frozen=True)
+class _ReductionChain:
+    source: Node
+    op: torch._ops.OpOverload
+    dims: list[int]
+    keepdim: bool
+    kwargs: dict[str, Any]
+    nodes: frozenset[Node]
 
 
 def chain_reduction_dims(
@@ -66,7 +78,7 @@ def chain_reduction_dims(
             if fallback is None:
                 return NotImplemented
             return fallback(x, dim, keepdim, **kwargs)
-        merged = (op, sorted(dims), keepdim, {**kwargs})
+        merge_kwargs = dict(kwargs)
         source = x
         mode = proxy_tensor.get_proxy_mode()
         source_node = None
@@ -98,8 +110,8 @@ def chain_reduction_dims(
             x = op(x, [d], keepdim, **kwargs)
         result = x.to(out_dtype) if upcast or bool_extrema else x
         # Tag the chain with its source so merge_reduction_dims can replace it.
-        # The merged reduction is not decomposed again, so leave the bool
-        # inputs amax/amin decompose (to any/all) chained.
+        # Bool extrema use the integer chain above; merging the original
+        # bool op would bypass that conversion and recreate any/all lowering.
         if mode is not None and not (
             source.dtype == torch.bool
             and op in (torch.ops.aten.amax.default, torch.ops.aten.amin.default)
@@ -108,7 +120,14 @@ def chain_reduction_dims(
                 "Any", proxy_tensor.get_proxy_slot(result, mode.tracer)
             ).proxy.node
             chain_nodes = frozenset(node.graph.nodes) - existing_nodes
-            node.meta[_META_KEY] = (source_node, *merged, chain_nodes)
+            node.meta[_META_KEY] = _ReductionChain(
+                source=cast("Node", source_node),
+                op=op,
+                dims=sorted(dims),
+                keepdim=keepdim,
+                kwargs=merge_kwargs,
+                nodes=chain_nodes,
+            )
         return result
 
     return decomp
@@ -134,8 +153,9 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
         for node in [*graph.nodes]:
             if _META_KEY not in node.meta:
                 continue
-            source, op, dims, keepdim, kwargs, chain_nodes = node.meta.pop(_META_KEY)
-            source = replacements.get(source, source)
+            tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
+            source = replacements.get(tag.source, tag.source)
+            dims = tag.dims
             # A full-slice tensor's size is the original extent, even when
             # its reduction is later rolled in chunks. Keep scalar size reads
             # outside the rolled graph by specializing their static extents.
@@ -152,15 +172,18 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 # them in a different layout than they are written, and CuTe
                 # may promote an atomic target's dtype after merging, which
                 # its flattened view would miss.
+                graph_list = list(graphs)
                 excluded = {
                     storage
-                    for i in range(len(graphs))
-                    for storage in graph_memory_access_storage_ids([*graphs], i)[1]
+                    for info in graph_list
+                    for n in info.graph.nodes
+                    if n.target in _MEMORY_OPS and n.target is not load
+                    for storage in _storage_ids(graph_list, info.graph_id, n.args[0])
                 }
             merger = _Merger(source, dims, flat_views, flat_nodes, excluded)
             if (
                 merger.kind(source) != "merge"
-                or (chain := merger.chain(node, chain_nodes)) is None
+                or (chain := merger.chain(node, tag.nodes)) is None
             ):
                 continue
             merged = merger.clone(source)
@@ -169,12 +192,12 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                     # Emit the single-axis ATen op directly: decomposing it
                     # again would recreate the chain being replaced.
                     graph,
-                    op,
-                    (merged, [dims[0]], keepdim),
-                    kwargs,
+                    tag.op,
+                    (merged, [dims[0]], tag.keepdim),
+                    tag.kwargs,
                     node.meta,
                 )
-                for d in dims[1:] if keepdim else ():
+                for d in dims[1:] if tag.keepdim else ():
                     result = _new_node(
                         graph,
                         torch.ops.aten.unsqueeze.default,

@@ -89,7 +89,6 @@ def tile_row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton", "cute", "pallas", "metal"])
 @helion.kernel(static_shapes=True)
 def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
@@ -115,6 +114,7 @@ def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["triton", "cute", "pallas", "metal"])
 class TestReductions(RefEagerTestBase, TestCase):
     @skipUnlessBackends(["cute", "triton"])
     def test_factored_reductions_preserve_computed_coordinates(self):
@@ -288,7 +288,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         if transpose:
             x = x.transpose(1, 2)
         bound = _reduce_multi_dim_tile.bind((x, "sum"))
-        merges = bound.env.backend.name in ("triton", "cute")
+        merges = _merged_reduction_backend()
         if merges:
             self.assertEqual(len(bound.config_spec.reduction_loops), len(loops[0]))
         if _get_backend() == "cute":
@@ -607,7 +607,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn(4, 8, 8, 8, device=DEVICE)
         code, (total, inner, plane) = code_and_output(reduce_rows, (x,))
         for dims in ("1, 3", "1, 2", "2, 3"):
-            self.assertIn(f"flatten({dims})", code)
+            self.assertEqual(f"flatten({dims})" in code, _merged_reduction_backend())
         torch.testing.assert_close(total, x.sum(dim=(1, 2, 3)))
         torch.testing.assert_close(inner, x.amax(dim=(1, 2)))
         torch.testing.assert_close(plane, x[:, 1].sum(dim=(1, 2)))
