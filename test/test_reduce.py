@@ -17,6 +17,7 @@ from helion._compiler.cute.canonicalize_reductions import canonicalize_reduction
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import HelperFunctionGraphInfo
 from helion._compiler.inductor_lowering import ReductionLowering
+from helion._compiler.inductor_lowering import reduction_block_id
 from helion._compiler.node_masking import remove_unnecessary_masking
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -1055,13 +1056,17 @@ class TestCuteBuiltinReduce(RefEagerTestBase, TestCase):
 
         bound = reduce.bind((torch.empty(5, 65, device=DEVICE),))
         assert bound.host_function is not None
-        self.assertTrue(
-            any(
-                node.target is _reduce
-                for graph in bound.host_function.device_ir.graphs
-                for node in graph.graph.nodes
+        custom_nodes = [
+            node
+            for graph in bound.host_function.device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is _reduce
+        ]
+        self.assertTrue(custom_nodes)
+        with bound.env:
+            self.assertTrue(
+                all(reduction_block_id(node) is None for node in custom_nodes)
             )
-        )
         fact = bound.config_spec.reduction_kernel_fact
         self.assertTrue(fact is None or not fact.reductions)
         self.assertFalse(bound.config_spec.has_custom_reduction_loops)

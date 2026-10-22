@@ -1254,12 +1254,15 @@ def custom_reduction_sources(node: torch.fx.Node) -> tuple[torch.fx.Node, ...]:
 
 
 def reduction_block_id(node: torch.fx.Node) -> int | None:
-    """Return the block reduced by a native or single-axis custom reduction."""
+    """Return a native or Triton custom reduction's scheduling axis."""
 
     lowering = node.meta.get("lowering")
     if isinstance(lowering, ReductionLowering):
         return lowering.block_index
     if node.target is not _reduce or node.args[2] is None:
+        return None
+    env = CompileEnvironment.current()
+    if env.backend_name != "triton":
         return None
     inputs = custom_reduction_sources(node)
     dim = node.args[2]
@@ -1267,7 +1270,6 @@ def reduction_block_id(node: torch.fx.Node) -> int | None:
     value = source.meta["val"]
     assert isinstance(value, torch.Tensor)
     assert isinstance(dim, int)
-    env = CompileEnvironment.current()
     block_id = env.get_block_id(value.size(dim))
     if any(
         env.get_block_id(payload.meta["val"].size(dim)) != block_id
