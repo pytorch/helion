@@ -592,7 +592,10 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     fence = loop.index("cute.arch.fence_proxy(kind='async.shared', space='cta')")
     acc = loop.index(f"{RT}.mbar_wait(md_accb, md_parity ^ 1)")
     assert acc < wait < lds < fence < loop.index("cute.arch.barrier()")
-    assert loop[wait:fence].count("exp2(") == 2
+    # The two packets of a thread read their row's decay from the lane that
+    # evaluated it (one exp2 per lane, one shuffle per packet).
+    assert loop[wait:fence].count("exp2(") == 1
+    assert loop[wait:fence].count("cute.arch.shuffle_sync(") == 2
     # The decay scalar and the two K-vector rows of this thread come from
     # registers loaded one iteration ahead (after the MMA issue, guarded by
     # the trip count); the pass itself issues no global loads.
@@ -602,10 +605,11 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     assert loop.index(f"{P}.tcgen05_commit(") < refill
     assert "if md_i + 1 < 8:" in loop[:refill]
     # Once per branch of the split iteration (the epilogue warps' after the
-    # MMA issue, the store warps' after the barrier): three per thread.
+    # MMA issue, the store warps' after the barrier): the decay scalar and
+    # the lane's K-vector row, two per thread.
     epi, store = loop.split("else:", 1)
-    assert epi.count(f"{WARP_RT}.ldg_f32(") == 3
-    assert store.count(f"{WARP_RT}.ldg_f32(") == 3
+    assert epi.count(f"{WARP_RT}.ldg_f32(") == 2
+    assert store.count(f"{WARP_RT}.ldg_f32(") == 2
     # 512 packets over 256 threads, plus the staging packets.
     assert loop.count(f"{WARP_RT}.sts_v4_b32(") == 2 + 4
     # The leaves stay fp32 and the pack rounds once: no per-element casts
@@ -647,11 +651,13 @@ def test_renders_the_reversed_scaled_backward_with_fp32_stores() -> None:
         _kernel_body(_source(_bind_bwd("scalar"), _config(64, 64, warps=4, stages=4)))
     )
     pass_body = scalar[: scalar.index("cute.arch.fence_proxy(")]
-    # Four packets per thread over 128 threads: one exp2 each of a row value
-    # loaded one iteration ahead (four rows plus the decay scalar).
-    assert pass_body.count("exp2(") == 4 and "md_pch * 8" not in pass_body
+    # Four packets per thread over 128 threads: each lane evaluates one row's
+    # exp2 of a row value loaded one iteration ahead, the packets shuffle it.
+    assert pass_body.count("exp2(") == 1 and "md_pch * 8" not in pass_body
+    assert pass_body.count("cute.arch.shuffle_sync(") == 4
     assert pass_body.count(f"{WARP_RT}.ldg_f32(") == 0
-    assert scalar.count("md_ax4 = ") == 1 and "md_ax5" not in scalar
+    # One prefetched row per lane plus the decay scalar.
+    assert scalar.count("md_ax1 = ") == 1 and "md_ax2" not in scalar
 
 
 def test_narrow_tiles_use_the_narrow_swizzles() -> None:
@@ -1006,10 +1012,11 @@ def test_body_stores_of_the_first_block_are_double_buffered() -> None:
     assert facts.tcgen05.general_loop
     # The derived value (slot 1) is the stored one.
     assert facts.tcgen05.loop_stores == ((1, 2),)
-    # Ring, two staging buffers, the epilogue staging tile (the plan folds
-    # it into the ring), the barriers with the step barrier, the TMEM slot.
+    # Ring, two staging buffers (the epilogue staging tile folds into the
+    # drained ring, as the plan lays it out), the barriers with the step
+    # barrier, the TMEM slot.
     assert tc.tcgen05_smem_bytes(facts, [1, 64, 64, 64, 64], 2, True) == (
-        2 * 16384 + 2 * 64 * 64 * 2 + 64 * 64 * 2 + 8 * (2 + 3 + 1) + 16
+        2 * 16384 + 2 * 64 * 64 * 2 + 8 * (2 + 3 + 1) + 16
     )
     body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
     assert "alloc_smem(cutlass.Uint8, 49152, alignment=1024)" in body
@@ -1220,6 +1227,141 @@ def test_a_program_that_loads_a_tensor_it_stores_is_not_mine_either() -> None:
     bound = _bind_fn(_gen_epi_stored, _epi_inputs(stored=True))
     assert bound.config_spec.cute_mma_dag is None
     assert bound.config_spec.cute_mma_dag_facts is None
+
+
+def _chunk_state_inputs(seqlen: int = 512) -> tuple[torch.Tensor, ...]:
+    # examples/mamba2_chunk_state.py: batch 2, 8 heads in 2 groups, chunk
+    # 128, headdim 64, dstate 64.
+    bf16 = torch.bfloat16
+    nchunks = (seqlen + 127) // 128
+    return (
+        torch.empty((2, seqlen, 2, 64), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, seqlen, 8, 64), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, 8, nchunks, 128), dtype=bf16, device=CPU_DEVICE),
+        torch.empty((2, 8, nchunks, 128), dtype=bf16, device=CPU_DEVICE),
+    )
+
+
+def test_chunk_offset_tiles_and_lead_tile_begins_are_admitted() -> None:
+    # ``x[tile_b.begin, tile_k.index + tile_c.begin * chunk, tile_h.begin,
+    # tile_m]``: the leading tiles' begins are scalar coordinates and the
+    # chunk offset rides the loop tile, in the TMA coordinates and in the
+    # byte bases of the side loads.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.default_config().config["cute_mma_dag"] == "tcgen05"
+    body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=2)))
+    # The x box at (m, h, k + 128 * c, b) and the B box at (n, k + 128 * c, b).
+    assert re.search(
+        r"\[cutlass\.Int32\(md_a\d\), cutlass\.Int32\(tile_offset_\d\), "
+        r"cutlass\.Int32\(0 \* 128 \+ 128 \* tile_offset_\d\)",
+        body,
+    ), body
+    assert body.count("128 * tile_offset_") >= 4, body
+    warp = _kernel_body(
+        _source(
+            bound,
+            helion.Config(
+                block_sizes=[64, 64, 64],
+                cute_mma_dag="warp",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=2,
+            ),
+        )
+    )
+    assert re.search(r"md_base = x\.iterator\.toint\(\) .*128 \* tile_offset_", warp)
+
+
+def test_loop_invariant_scalar_side_loads_go_out_ahead_of_the_loop() -> None:
+    # dA_cumsum[b, h, c, chunk - 1] feeds every iteration's in-place pass:
+    # one load ahead of the K loop, not one behind each iteration's TMA wait.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=1)))
+    loop = body.index("for md_i in cutlass.range(")
+    scalar = re.findall(rf"md_sl\w* = {WARP_RT}\.ldg_bf16_as_f32\(md_base_\d+\)", body)
+    assert len(scalar) == 1, body
+    assert body.index(scalar[0]) < loop
+    assert f"{WARP_RT}.ldg_bf16_as_f32(md_base_" not in body[loop:]
+
+
+def test_the_persistent_launch_loops_over_tiles_around_one_setup() -> None:
+    # cute_mma_dag_persistent=k: the generic persistent_interleaved program
+    # ids at k CTAs per SM; the barriers and tensor memory are set up once
+    # ahead of the tile loop, re-armed at the end of every tile, and the
+    # tensor memory is freed once after it.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_persistent is not None
+    config = _config(64, 64, 128, warps=4, stages=1, cute_mma_dag_persistent=4)
+    with bound.env:
+        normalized = spec.normalized_config(config).config
+    assert normalized["pid_type"] == "persistent_interleaved"
+    assert normalized["num_sm_multiplier"] == 4
+    body = _kernel_body(bound.to_code(helion.Config(**normalized)))
+    loop = body.index("for virtual_pid in range(")
+    assert body.index(f"{P}.tcgen05_alloc(") < loop
+    assert body.index(f"{P}.tcgen05_relinquish_alloc_permit(") < loop
+    assert body.count(f"{P}.tcgen05_alloc(") == 1
+    tile = body[loop : body.index(f"{P}.tcgen05_dealloc(")]
+    assert "pid_0 = virtual_pid %" in tile
+    # Cross-tile prefetch: the ring's phases run on from the CTA's
+    # iteration count, only its first tile issues its own ring prologue, and
+    # each tile issues the next tile's slot right after its drain -- the x
+    # box, clear of the epilogue staging tile at the ring's end -- and the B
+    # box behind the epilogue's staging reads (one K step per tile here).
+    assert body.index("md_ib = cutlass.Int32(0)") < loop
+    assert "md_stage = (md_ib + md_i) % 1" in tile
+    first = tile.index("if md_ib == 0:")
+    assert first < tile.index(f"{P}.cp_async_bulk_tensor_shared_cta_global(")
+    drain = tile.index(f"{RT}.mbar_wait(md_accb, 1 - 0 - 1 & 1)")
+    staging = tile.index("md_srow = md_s0 + 24576 + ")
+    early = tile[drain:staging]
+    assert "md_npid = virtual_pid + _NUM_SM * 4" in early
+    assert early.count(f"{P}.mbarrier_arrive_expect_tx(md_full + (") == 1
+    assert early.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert "* 32768 + 0), md_tma0" in early
+    late = tile[tile.rindex("_helion_mma_dag.stg_v4_b32(") :]
+    assert late.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert "* 32768 + 16384), md_tma1" in late
+    # The other barriers are re-armed per tile, the ring's are not.
+    assert f"{P}.mbarrier_init(md_accb, 1)" in late
+    assert f"{P}.mbarrier_init(md_full" not in tile
+    assert "md_ib = md_ib + (1 - 0)" in late
+    # The dealloc follows the loop, once.
+    assert body.count(f"{P}.tcgen05_dealloc(") == 1
+    # The warp mode has no persistent launch: the knob is repaired to 0.
+    warp = helion.Config(
+        block_sizes=[64, 64, 64],
+        cute_mma_dag="warp",
+        cute_mma_dag_warps=4,
+        cute_mma_dag_stages=2,
+        cute_mma_dag_persistent=4,
+    )
+    with bound.env:
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_persistent"):
+            spec.normalize(dict(warp.config))
+        fixed = dict(warp.config)
+        spec.normalize(fixed, _fix_invalid=True)
+    assert fixed["cute_mma_dag_persistent"] == 0
+    assert fixed.get("pid_type", "flat") == "flat" and "num_sm_multiplier" not in fixed
+
+
+def test_an_offset_tile_that_can_leave_the_tensor_is_not_mine() -> None:
+    # seqlen 500: the last chunk's tile reads rows 384..511 of a 500-row x,
+    # which the masked scalar lowering zero-fills.
+    from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+
+    bound = _bind_fn(
+        helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs(seqlen=500)
+    )
+    assert bound.config_spec.cute_mma_dag is None
 
 
 # --------------------------------------------------------------------------
@@ -3587,11 +3729,11 @@ def test_gated_dstate_computes_its_decay_tables_one_iteration_ahead() -> None:
     assert "if md_i + 2 < 8:" in segments[3]
     assert segments[3].index("if md_i + 2 < 8:") > segments[3].rindex("md_tb1_")
     # The exchange multiplies by the registers and evaluates no exp2 (the
-    # two in its segment are the dog pass's row factors, run there since
-    # the pass moved under the first batch).
+    # one in its segment is the dog pass's row factor, one row per lane,
+    # run there since the pass moved under the first batch).
     assert re.search(r"\* md_tb0_0\b", segments[1])
     assert re.search(r"\* md_tb0_31\b", segments[1])
-    assert segments[1].count("exp2(") == 2
+    assert segments[1].count("exp2(") == 1
     assert segments[1].index("exp2(") < segments[1].index(f"{RT}.mbar_wait(md_stepb")
     # 33 entries, plus the dS rescale's scalar in block 2.
     assert sum(s.count("exp2(") for s in segments[2:]) == 33 + 1

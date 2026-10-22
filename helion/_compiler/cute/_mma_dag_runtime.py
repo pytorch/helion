@@ -72,6 +72,24 @@ def sts_b32(
 
 
 @dsl_user_op
+def ldg_s32(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Int32:
+    """``ld.global.s32``: one int32 value (a side vector of window bounds)."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.s32 $0, [$1];",
+        "=r,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
 def f32_bits(value: object, *, loc: object = None, ip: object = None) -> object:
     """``mov.b32``: the bit pattern of an fp32 value (an operand word the
     tensor core truncates to tf32)."""

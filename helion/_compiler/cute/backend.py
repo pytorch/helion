@@ -1008,10 +1008,12 @@ def _detect_flex_attention_bwd_loop(
     whole-graph-set match, probed once per device function."""
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_flash_bwd import _flash_bwd_gate_enabled
     from .flex_bwd_match import match_flex_attention_bwd
     from .flex_match import FLEX_PLAN_ENABLED
 
-    if not FLEX_PLAN_ENABLED:
+    # ``HELION_CUTE_FLASH_BWD=0`` disables the fused backward, dense and flex.
+    if not FLEX_PLAN_ENABLED or not _flash_bwd_gate_enabled():
         return False
     device_ir = HostFunction.current().device_ir
     root_grid_ids = device_ir.grid_block_ids[0]
@@ -1116,6 +1118,8 @@ def _detect_flex_attention_loop(
         for block_id in (match.b_block_id, match.h_block_id)
     ):
         return False
+    # (The matcher admits the widths above the pair body's only where the
+    # single-tile body's cooperative pair hosts the walk.)
     if not flash_head_dims_supported(match.head_dim, match.head_dim_v):
         return False
     state.attention_flash_score_plan = match.plan
@@ -1517,6 +1521,15 @@ class CuteBackend(Backend):
 
         env = CompileEnvironment.current()
         spec = env.config_spec._cute_tcgen05_config
+        dense = spec._dense_aligned_n_plan(fn.config.config)
+        if (
+            dense is not None
+            and env.canonical_block_id(block_id) in dense.block_ids[:2]
+        ):
+            return (
+                tuple(fn.resolved_block_size(axis) for axis in dense.block_ids)
+                == dense.physical_tile
+            )
         profile = physical_schedule(fn.config)
         axes = spec.matmul_block_ids
         return (
@@ -1533,12 +1546,13 @@ class CuteBackend(Backend):
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
 
-        return CompileEnvironment.current().config_spec._cute_tcgen05_config.project_row_union_codegen(
-            config
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        return state.project_dense_aligned_n_codegen(
+            state.project_row_union_codegen(config)
         )
 
     # Bump when config_value_priors() changes its candidate distribution.
-    config_value_priors_version = 3
+    config_value_priors_version = 4
 
     @property
     def name(self) -> str:
@@ -1610,6 +1624,7 @@ class CuteBackend(Backend):
             "cute_async_load_group_rows": weighted_choice({2: 4.0, 4: 1.0}),
             "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
             "cute_async_store_policy": weighted_choice(async_store_policy_weights),
+            "cute_store_policy": weighted_choice(async_store_policy_weights),
             "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
             "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
@@ -1901,6 +1916,7 @@ class CuteBackend(Backend):
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_fragment_cta_topk",
                 "cute_selection_algorithm",
                 "cute_radix_threads",
                 "cute_radix_candidate_key_cache",
@@ -1908,6 +1924,10 @@ class CuteBackend(Backend):
                 "cute_radix_valid_domain",
                 "cute_radix_ticket_stores",
                 "cute_radix_cached_payload_inverse",
+                "cute_radix_resident_input",
+                "cute_radix_boundary_early_exit",
+                "cute_radix_defer_output",
+                "cute_radix_partial_scan",
                 "cute_radix_packet_bits",
                 "cute_radix_scan_unroll",
                 "cute_radix_cluster_ctas",
@@ -1932,6 +1952,7 @@ class CuteBackend(Backend):
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
+            or key == "cute_store_policy"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
             or key == "cute_signed_bitfield_bf16"
@@ -2019,6 +2040,7 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_exchange"
             or key == "cute_mma_dag_pass_warps"
             or key == "cute_mma_dag_loads"
+            or key == "cute_mma_dag_persistent"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -2065,6 +2087,13 @@ class CuteBackend(Backend):
         # The CuTe DSL does not expose a Triton-style precompile entry point;
         # the autotuner has to compile + benchmark each config inline.
         return False
+
+    def supports_parallel_render(self) -> bool:
+        # Code generation only reads the device facts the render pool
+        # captures (the MMA-support probe's current device, device properties
+        # for shared-memory and SM budgets); the DSL JIT runs at first call in
+        # the parent. Forked workers render byte-identical source.
+        return True
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
         if "CUTE_DSL_CACHE_DIR" not in os.environ:
@@ -2344,6 +2373,10 @@ class CuteBackend(Backend):
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
+            "_cute_store_fp8e4m3fn_vec": "from helion._compiler.cute.vec_utils import store_fp8e4m3fn_vec as _cute_store_fp8e4m3fn_vec",
+            "_cute_store_fp8e5m2_vec": "from helion._compiler.cute.vec_utils import store_fp8e5m2_vec as _cute_store_fp8e5m2_vec",
+            "_cute_store_fp8e4m3fn_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_l2_evict_last as _cute_store_fp8e4m3fn_vec_l2_evict_last",
+            "_cute_store_fp8e5m2_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_l2_evict_last as _cute_store_fp8e5m2_vec_l2_evict_last",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
@@ -2360,6 +2393,8 @@ class CuteBackend(Backend):
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_load_nc_l2_evict_first_32b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_32b as _cute_load_nc_l2_evict_first_32b",
+            "_cute_load_nc_l2_evict_first_16b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_16b as _cute_load_nc_l2_evict_first_16b",
             "_cute_scalar_policy_load": "from helion._compiler.cute.l2_policy import scalar_policy_load as _cute_scalar_policy_load",
             "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
             "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",

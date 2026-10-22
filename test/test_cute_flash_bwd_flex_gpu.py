@@ -19,12 +19,16 @@ FlexAttention semantics) within bf16 tolerance:
   dS^T through TMEM, the polynomial exp2 share, the per-element mask form, hook
   group widths, register splits, the KV-fastest block order, the gathered aux
   table staged in shared memory;
-* repeated launches give stable gradients.
+* repeated launches give stable gradients;
+* the 2-CTA pair kernel (head dim 128) against the 1-CTA kernel on dense and
+  masked merged walks, chunked tables included, and at q_seq 64K with
+  identical pair lists and a 32-step table (the refill's bitmap barrier).
 """
 
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -100,9 +104,15 @@ def _reference_grads(
                 s = (qf @ kf.T) * scale
                 s = score_mod(s, b_t, h_t, q_idx, kv_idx)
                 if mask_mod is not None:
-                    s = torch.where(mask_mod(b_t, h_t, q_idx, kv_idx), s, float("-inf"))
-                p = torch.softmax(s, dim=-1)
-                p = torch.nan_to_num(p, nan=0.0)
+                    keep = mask_mod(b_t, h_t, q_idx, kv_idx)
+                    s = torch.where(keep, s, float("-inf"))
+                    # A fully masked row attends nothing: zero output and
+                    # zero gradients (not the NaNs of an all -inf softmax).
+                    row_valid = keep.any(dim=-1, keepdim=True)
+                    s = torch.where(row_valid, s, 0.0)
+                    p = torch.where(row_valid, torch.softmax(s, dim=-1), 0.0)
+                else:
+                    p = torch.softmax(s, dim=-1)
                 o = p @ vf
                 gq, gk, gv = torch.autograd.grad(o, (qf, kf, vf), do[b, h].float())
             dq[b, h] = gq
@@ -121,6 +131,7 @@ def _run(
     m: int,
     n: int,
     d: int,
+    dv: int | None = None,
     score_mod: Callable[..., torch.Tensor] = _identity_score,
     score_mod_bwd: Callable[..., torch.Tensor] = _identity_grad,
     mask_mod: Callable[..., torch.Tensor] | None = None,
@@ -128,29 +139,66 @@ def _run(
     repeats: int = 1,
     seed: int = 0,
     config_overrides: dict[str, object] | None = None,
+    layout: str = "bhsd",
+    dtype: torch.dtype = torch.bfloat16,
+    table_steps: int = 0,
+    block_size: int | tuple[int, int] = 128,
+    mask_dims: tuple[int | None, int | None] = (None, None),
+    capture: bool = False,
+    reference: bool = True,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], str]:
     """Run the example backward on the fused CuTe path with the default config
-    (``config_overrides``: knob values on top of it) and return the gradients,
-    the fp32 reference gradients and the generated code."""
+    (``config_overrides``: knob values on top of it; ``table_steps``: a
+    step-table cap, forced even when the shape is too small to offer it) and
+    return the gradients, the fp32 reference gradients and the generated code.
+
+    ``mask_dims``: the BlockMask's (B, H) dims (``None`` broadcasts); a
+    ``mask_mod`` reading ``b`` / ``h`` needs them. ``capture``: after the
+    eager launches, capture one launch into a CUDA graph and return the
+    gradients its replay produces. ``reference=False`` (long sequences,
+    whose fp32 score matrices do not fit): the forward O / LSE come from the
+    fused forward instead and the reference gradients are empty.
+
+    ``layout``: ``bhsd`` (contiguous), ``bshd`` (``[B, S, H, D]`` allocations
+    viewed ``[B, H, S, D]``, the forward output O included) or ``packed``
+    (Q/K/V head-dim slices of one ``[B, S, H, 3 * D]`` buffer, O and dO
+    transposed); the values are the same for every layout. ``dv`` is the
+    value head dim (V / dO / dV columns; default ``d``)."""
+    dv = d if dv is None else dv
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
-    dtype = torch.bfloat16
     q = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
     k = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
-    v = torch.randn((b, hkv, n, d), device=DEVICE, dtype=dtype, generator=gen)
-    do = torch.randn((b, hq, m, d), device=DEVICE, dtype=dtype, generator=gen)
+    v = torch.randn((b, hkv, n, dv), device=DEVICE, dtype=dtype, generator=gen)
+    do = torch.randn((b, hq, m, dv), device=DEVICE, dtype=dtype, generator=gen)
+    if layout == "bshd":
+        q, k, v, do = (_as_bshd(t) for t in (q, k, v, do))
+    elif layout == "packed":
+        assert hq == hkv and m == n
+        qkv = torch.empty((b, m, hq, 2 * d + dv), device=DEVICE, dtype=dtype)
+        q = qkv[..., :d].transpose(1, 2).copy_(q)
+        k = qkv[..., d : 2 * d].transpose(1, 2).copy_(k)
+        v = qkv[..., 2 * d :].transpose(1, 2).copy_(v)
+        do = _as_bshd(do)
+    else:
+        assert layout == "bhsd"
     scale = 1.0 / math.sqrt(d)
-    ref_dq, ref_dk, ref_dv, out, lse = _reference_grads(
-        q, k, v, do, ref_score_mod or score_mod, mask_mod, scale
-    )
     block_mask = create_block_mask(
         mask_mod if mask_mod is not None else noop_mask,
-        None,
-        None,
+        mask_dims[0],
+        mask_dims[1],
         m,
         n,
         device=str(DEVICE),
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=block_size,
     )
+    if reference:
+        ref_dq, ref_dk, ref_dv, out, lse = _reference_grads(
+            q, k, v, do, ref_score_mod or score_mod, mask_mod, scale
+        )
+        ref: tuple[torch.Tensor, ...] = (ref_dq, ref_dk, ref_dv)
+    else:
+        out, lse = _fused_forward(q, k, v, score_mod, block_mask, scale, hq != hkv)
+        ref = ()
     kernel = flex_example.helion_flex_attention_backward_kernel
     args = flex_example.flex_attention_backward_args(
         q,
@@ -174,20 +222,27 @@ def _run(
         for key in config_overrides:
             assert key in fields, f"{key} is not a knob of this kernel"
         config = helion.Config(**{**config.config, **config_overrides})
+    if table_steps:
+        import helion
+
+        config = helion.Config(
+            **{**config.config, "cute_flash_bwd_table_steps": table_steps}
+        )
     code = bound.to_code(config)
     assert "fbwd_sSteps" in code, "the fused flex backward did not fire"
     bound.set_config(config)
+    out = out.to(dtype) if layout == "bhsd" else _as_bshd(out.to(dtype))
     # The row-sum preprocess kernel would otherwise autotune per test shape.
     pre = flex_example._flex_attention_bwd_preprocess
-    pre_bound = pre.bind((out.to(dtype), do, lse))
+    pre_bound = pre.bind((out, do, lse))
     pre_bound.set_config(pre_bound.config_spec.default_config())
-    got = None
-    for _ in range(repeats):
-        got = flex_example.helion_flex_attention_backward(
+
+    def launch() -> tuple[torch.Tensor, ...]:
+        return flex_example.helion_flex_attention_backward(
             q,
             k,
             v,
-            out.to(dtype),
+            out,
             lse,
             do,
             score_mod=score_mod,
@@ -196,9 +251,78 @@ def _run(
             scale=scale,
             enable_gqa=hq != hkv,
         )
+
+    got = None
+    for _ in range(repeats):
+        got = launch()
     assert got is not None
     torch.cuda.synchronize()
-    return got, (ref_dq, ref_dk, ref_dv), code
+    if capture:
+        # The eager launches above warmed the kernel up; the capture records
+        # the host-side table derivation and the launch, the replay reruns
+        # them into the graph's output tensors.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            launch()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = launch()
+        for grad in got:
+            grad.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+    return got, ref, code
+
+
+def _fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    score_mod: Callable[..., torch.Tensor],
+    block_mask: object,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """O and the natural-log LSE from the example's fused forward, pinned to
+    its default config (the reference's fp32 score matrix does not fit at
+    long sequences)."""
+    full_num = block_mask.full_kv_num_blocks  # type: ignore[attr-defined]
+    full_idx = block_mask.full_kv_indices  # type: ignore[attr-defined]
+    if full_num is None or full_idx is None:
+        full_num = flex_example._zero_block_table_like(block_mask.kv_num_blocks)  # type: ignore[attr-defined]
+        full_idx = flex_example._zero_block_table_like(block_mask.kv_indices)  # type: ignore[attr-defined]
+    args = (
+        q,
+        k,
+        v,
+        score_mod,
+        block_mask.kv_num_blocks,  # type: ignore[attr-defined]
+        block_mask.kv_indices,  # type: ignore[attr-defined]
+        full_num,
+        full_idx,
+        block_mask.mask_mod,  # type: ignore[attr-defined]
+        block_mask.BLOCK_SIZE[0],  # type: ignore[attr-defined]
+        block_mask.BLOCK_SIZE[1],  # type: ignore[attr-defined]
+        scale,
+        enable_gqa,
+    )
+    fwd = flex_example.helion_flex_attention_kernel
+    bound = fwd.bind(args)
+    bound.set_config(bound.config_spec.default_config())
+    out, lse = fwd(*args)
+    return out, lse
+
+
+def _as_bshd(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s values in a ``[B, S, H, D]`` allocation viewed ``[B, H, S, D]``."""
+    batch, heads, seq, head_dim = t.shape
+    return (
+        torch.empty((batch, seq, heads, head_dim), device=t.device, dtype=t.dtype)
+        .transpose(1, 2)
+        .copy_(t)
+    )
 
 
 def _assert_close(
@@ -246,6 +370,84 @@ def test_sliding_window_mask() -> None:
 @_gpu_test
 def test_grouped_query_heads_head_dim_128() -> None:
     got, ref, _ = _run(b=1, hq=4, hkv=2, m=256, n=256, d=128, mask_mod=_causal)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(64, 128), (128, 64)])
+def test_mixed_head_dims(d: int, dv: int) -> None:
+    """D != Dv: the dP MMA's K extent and the dV width follow Dv, the dK / dQ
+    widths D (grouped heads, causal, ragged N)."""
+    got, ref, code = _run(b=1, hq=4, hkv=2, m=256, n=320, d=d, dv=dv, mask_mod=_causal)
+    assert f"'head_dim_v': {dv}" in code
+    assert f"partition_shape_C((128, {dv}))" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(96, 96), (80, 80), (32, 32), (48, 112)])
+def test_padded_head_dims(d: int, dv: int) -> None:
+    """Head dims that are not multiples of 64: the smem tiles pad to whole
+    swizzle atoms while the MMAs, TMEM accumulators and stores run the exact
+    extents (grouped heads, causal, ragged M and N)."""
+    got, ref, code = _run(b=1, hq=4, hkv=2, m=320, n=192, d=d, dv=dv, mask_mod=_causal)
+    assert f"flash_bwd_shared_storage({-(-d // 64) * 64}, " in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_mla_head_dims_192_128() -> None:
+    """The MLA pair (D=192, Dv=128): dQ aliases S / dP in TMEM (``alias_s``),
+    dP's MMA waits on the s_read barrier, one Q / dO stage, the dK epilogue
+    reuses its two staging slots for three boxes."""
+    got, ref, code = _run(
+        b=1, hq=4, hkv=2, m=320, n=192, d=192, dv=128, mask_mod=_causal
+    )
+    assert "fbwd_sread_ptr" in code
+    # Six steps per tile: the eight-box staging still fits beside the table.
+    assert "flash_bwd_shared_storage(192, 1, 1, 1, cutlass.BFloat16, 6, 8, " in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "overrides"),
+    [
+        # The MLA pair on the persistent walk with the statistics MMAs (one Q
+        # stage, the alias_s drain / s_read waits across tiles).
+        (192, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # A padded width (dQ aliases dP: the dS^T-through-TMEM knob is not
+        # offered) on the persistent walk with the statistics MMAs.
+        (96, 96, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # A small width keeps dQ's own TMEM columns: dS^T through TMEM applies;
+        # three dQ boxes per step alternate the staging slots across steps.
+        (96, 96, {"cute_flash_bwd_tile_group": 0}),
+        (32, 32, {"cute_flash_bwd_ds_tmem": 1, "cute_flash_bwd_persistent": 1}),
+        # Mixed widths with the dO ring at one stage and the KV-fastest order.
+        (64, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_tile_group": 0}),
+    ],
+)
+def test_head_dims_non_default_knobs(
+    d: int, dv: int, overrides: dict[str, object]
+) -> None:
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=640,
+        n=512,
+        d=d,
+        dv=dv,
+        mask_mod=_causal,
+        config_overrides=overrides,
+    )
+    if overrides.get("cute_flash_bwd_persistent"):
+        assert "fbwd_tfull_ptr" in code
+    if (d, dv) == (192, 128) and overrides.get("cute_flash_bwd_stats_mma"):
+        # The statistics slices leave room for four staging boxes: the chunked
+        # dQ drain with one box per warp (each store waits for its slot).
+        assert ", 4, 1, False, False, 0, head_dim_v=128, flex_mbars=9)" in code
+        assert "fbwd_sdq_box = fbwd_sdq[None, None, warp_idx]" in code
     _assert_close(got, ref)
 
 
@@ -395,9 +597,835 @@ def test_softcap_score_mod_with_jacobian() -> None:
     _assert_close(got, ref)
 
 
+def _assert_same_walk(
+    whole: tuple[torch.Tensor, ...], chunked: tuple[torch.Tensor, ...]
+) -> None:
+    """A chunked walk runs the same step sequence: dK / dV accumulate in the
+    same order (bitwise equal); dQ's fp32 reduce-adds from different CTAs
+    land in any order (run to run), so its bf16 result may round one ulp
+    either way."""
+    assert torch.equal(whole[1], chunked[1]), "dK differs"
+    assert torch.equal(whole[2], chunked[2]), "dV differs"
+    dq_a, dq_b = whole[0].float(), chunked[0].float()
+    ulp = torch.maximum(dq_a.abs(), dq_b.abs()) * 2.0**-7
+    slack = 1e-6 * dq_a.abs().max()
+    assert bool(((dq_a - dq_b).abs() <= ulp + slack).all()), "dQ differs"
+
+
+@_gpu_test
+def test_chunked_table_matches_the_whole_walk() -> None:
+    # 17 Q tiles x 2 q heads: 34 steps on KV tile 0 (28 on tile 3) in chunks
+    # of 16 (16 + 16 + 2) against the whole walk in one table; the causal
+    # diagonal puts masked steps in every chunk sequence.
+    kw = {"b": 1, "hq": 2, "hkv": 1, "m": 2176, "n": 512, "d": 64, "mask_mod": _causal}
+    whole, ref, _ = _run(**kw)
+    chunked, _, code = _run(**kw, table_steps=16)
+    assert "fbwd_nchunks = (fbwd_steps + 15) // 16" in code
+    assert "named_barrier_wait_unaligned(7, 448)" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "overrides"),
+    [
+        (64, 64, {}),
+        (128, 128, {}),
+        (64, 64, {"cute_flash_bwd_persistent": 1}),
+        (128, 128, {"cute_flash_bwd_persistent": 1}),
+        # The statistics MMAs (their per-stage aug barriers) across chunks.
+        (64, 64, {"cute_flash_bwd_stats_mma": 1}),
+        (128, 128, {"cute_flash_bwd_stats_mma": 1}),
+        (128, 128, {"cute_flash_bwd_persistent": 1, "cute_flash_bwd_stats_mma": 1}),
+        # Every knob that touches the per-step pipelines, chunked.
+        (
+            64,
+            64,
+            {
+                "cute_flash_bwd_persistent": 1,
+                "cute_flash_bwd_stats_mma": 1,
+                "cute_flash_bwd_ds_tmem": 1,
+                "cute_flash_bwd_tile_group": 0,
+            },
+        ),
+        # A padded width (dQ aliases dP: the chunk's first dP waits for the
+        # drain) and the MLA pair (dQ aliases S: the chunk's first S waits).
+        (96, 96, {}),
+        (192, 128, {}),
+        (192, 128, {"cute_flash_bwd_persistent": 1}),
+    ],
+)
+def test_chunked_grouped_heads_ragged(
+    d: int, dv: int, overrides: dict[str, object]
+) -> None:
+    # Group 4, ragged M (1000 rows: 8 Q tiles) and N (384 rows: 3 KV tiles):
+    # 32 steps on KV tile 0 in chunks of 12 (12 + 12 + 8).
+    kw = {
+        "b": 1,
+        "hq": 4,
+        "hkv": 1,
+        "m": 1000,
+        "n": 384,
+        "d": d,
+        "dv": dv,
+        "mask_mod": _causal,
+    }
+    whole, ref, _ = _run(**kw, config_overrides=overrides or None)
+    chunked, _, code = _run(**kw, config_overrides=overrides or None, table_steps=12)
+    assert "fbwd_nchunks = (fbwd_steps + 11) // 12" in code
+    if d == 192:
+        # The chunked dQ drain with the eight-box staging across chunked tables.
+        assert "cute.copy(fbwd_tiled_dq_ld, tRDtDQ_B, tRDrDQ)" in code
+        assert ", 8, 0, True, True, 0, head_dim_v=128, flex_mbars=9)" in code
+    if overrides.get("cute_flash_bwd_persistent"):
+        assert "fbwd_sSteps[24 + fbwd_tbuf]" in code
+        assert "if (fbwd_i == 0) & (fbwd_chunk == 0) & (fbwd_nz_it > 0):" in code
+    if overrides.get("cute_flash_bwd_stats_mma"):
+        assert "fbwd_aug_full_ptr" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("table_steps", [5, 7])
+def test_chunked_q_block_256(table_steps: int) -> None:
+    # 256-row Q blocks over 1000 rows: 4 blocks = 8 tiles (the last past M),
+    # 2 q heads: 16 steps in chunks of 5 (5 + 5 + 5 + 1) or 7 (7 + 7 + 2), so
+    # chunks start on the second tile of a block (odd step in the pair) too.
+    kw = {"b": 1, "hq": 2, "hkv": 1, "m": 1000, "n": 256, "d": 64, "mask_mod": _causal}
+    whole, ref, _ = _run(**kw, block_size=(256, 128))
+    chunked, _, code = _run(**kw, block_size=(256, 128), table_steps=table_steps)
+    assert f"fbwd_nchunks = (fbwd_steps + {table_steps - 1}) // {table_steps}" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("d", [64, 128])
+def test_chunked_persistent_two_tiles_per_cta(d: int) -> None:
+    # 2 batches x 8 kv heads x 12 KV tiles = 192 tiles over 148 SMs: the
+    # persistent CTAs walk a second tile (table buffer 1, the nz_it > 0 and
+    # chunk terms together, the TMA warp building tile t+1's table while tile
+    # t refills its chunks); group 2, causal (masked diagonal), 3-step chunks
+    # of up to 24 steps per tile.
+    overrides = {"cute_flash_bwd_persistent": 1}
+    kw = {"b": 2, "hq": 16, "hkv": 8, "m": 1536, "n": 1536, "d": d, "mask_mod": _causal}
+    whole, ref, code = _run(**kw, config_overrides=overrides)
+    assert "fbwd_tissued_ptr" in code and "fbwd_nchunks" not in code
+    chunked, _, code = _run(**kw, config_overrides=overrides, table_steps=3)
+    assert "fbwd_nchunks = (fbwd_steps + 2) // 3" in code
+    # The length words follow the two 3-step buffers.
+    assert "fbwd_sSteps[6 + fbwd_tbuf]" in code
+    assert torch.cuda.get_device_properties(0).multi_processor_count < 192
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize("persistent", [0, 1])
+def test_single_step_chunks(persistent: int) -> None:
+    # A sliding window: 1-2 (partial) steps per KV tile, one step per chunk:
+    # every chunk is a peeled first step with an empty pipelined loop.
+    overrides = {"cute_flash_bwd_persistent": 1} if persistent else None
+    kw = {
+        "b": 1,
+        "hq": 2,
+        "hkv": 2,
+        "m": 1024,
+        "n": 1024,
+        "d": 64,
+        "mask_mod": _window64,
+    }
+    whole, ref, _ = _run(**kw, config_overrides=overrides)
+    chunked, _, code = _run(**kw, config_overrides=overrides, table_steps=1)
+    assert "fbwd_nchunks = (fbwd_steps + 0) // 1" in code
+    _assert_close(chunked, ref)
+    _assert_same_walk(whole, chunked)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv"), [(64, 32), (32, 48), (64, 128), (96, 64), (48, 32)]
+)
+def test_ds_tmem_mixed_head_dims(d: int, dv: int) -> None:
+    """dS^T through TMEM with D != Dv (both orders, padded D): the dK MMA
+    runs with N = D, not the dV MMA's N = Dv."""
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=320,
+        n=256,
+        d=d,
+        dv=dv,
+        mask_mod=_causal,
+        config_overrides={"cute_flash_bwd_ds_tmem": 1},
+    )
+    assert "helion_fbwd_dskts_idesc" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(("d", "dv"), [(96, 64), (80, 64), (96, 48)])
+def test_dq_partition_past_tmem_end(d: int, dv: int) -> None:
+    """Plain plans whose padded dQ partition would reach past TMEM column
+    512: only the stored chunks are loaded (dq checked)."""
+    got, ref, code = _run(b=1, hq=2, hkv=2, m=384, n=256, d=d, dv=dv, mask_mod=_causal)
+    assert "tRDtDQ[None, fbwd_c, None, None]" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("d", "dv", "dtype"),
+    [
+        (80, 80, torch.float16),
+        (64, 128, torch.float16),
+        (96, 64, torch.bfloat16),
+        (192, 128, torch.bfloat16),
+    ],
+)
+def test_softcap_jacobian_head_dims(d: int, dv: int, dtype: torch.dtype) -> None:
+    """The Jacobian hook (a non-identity ``score_mod_bwd``) with the causal
+    mask on padded / mixed / MLA head dims, fp16 included."""
+    cap = 20.0
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1.0 - t * t)
+
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=384,
+        n=256,
+        d=d,
+        dv=dv,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=_causal,
+        dtype=dtype,
+    )
+    assert "fbwd_spre" in code
+    _assert_close(got, ref)
+
+
+@pytest.mark.parametrize(
+    ("hq", "hkv", "m", "n", "score"),
+    [
+        (2, 2, 256, 256, None),
+        (4, 2, 320, 256, None),
+        (2, 2, 256, 320, "alibi"),
+        (2, 2, 512, 512, "softcap"),
+    ],
+)
+@_gpu_test
+def test_head_dim_256_pair(
+    hq: int, hkv: int, m: int, n: int, score: str | None
+) -> None:
+    """The 2-CTA pair kernel (dK/dV and dQ cluster roles) at head dim 256:
+    causal, GQA, ragged M / N, an additive score_mod with coordinates (the
+    dQ clusters render the hooks in the forward frame) and a softcap
+    score_mod with its Jacobian."""
+    kw: dict[str, object] = {}
+    if score == "alibi":
+
+        def alibi(score, b, h, q_idx, kv_idx):
+            slope = 0.05 * (h + 1).to(torch.float32)
+            return score - slope * (q_idx - kv_idx).abs().to(torch.float32)
+
+        kw["score_mod"] = alibi
+    elif score == "softcap":
+        cap = 20.0
+
+        def softcap(score, b, h, q_idx, kv_idx):
+            return cap * torch.tanh(score / cap)
+
+        def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+            t = torch.tanh(score / cap)
+            return grad * (1.0 - t * t)
+
+        kw["score_mod"] = softcap
+        kw["score_mod_bwd"] = softcap_bwd
+    got, ref, code = _run(b=1, hq=hq, hkv=hkv, m=m, n=n, d=256, mask_mod=_causal, **kw)  # pyrefly: ignore[bad-argument-type]
+    assert "fbwd_is_dq" in code and "_helion_cute_cluster_shape = (2, 1, 1)" in code
+    _assert_close(got, ref)
+
+
+@pytest.mark.parametrize("bias_fold", [1, 0])
+@_gpu_test
+def test_head_dim_256_pair_table_bias(bias_fold: int) -> None:
+    """An additive table bias on the pair kernel: the dK/dV clusters fold it
+    into the LSE term (``bias_fold``) or evaluate it as a score hook, the dQ
+    clusters gather the table in the forward frame."""
+    bias = torch.randn((4, 1279), device=DEVICE, dtype=torch.float32)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        import helion.language as hl
+
+        return score + hl.load(bias, [h, q_idx - kv_idx + 639])
+
+    def ref_score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[h, q_idx - kv_idx + 639]
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=384,
+        n=256,
+        d=256,
+        score_mod=score_mod,
+        mask_mod=_causal,
+        ref_score_mod=ref_score_mod,
+        config_overrides={"cute_flash_bwd_bias_fold": bias_fold},
+    )
+    assert "fbwd_is_dq" in code and "_flash_aux0" in code
+    assert ("fbwd_lse_fold" in code) == bool(bias_fold)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_fp16_gqa_softcap() -> None:
+    """fp16 operands, grouped-query heads and a score_mod with its Jacobian
+    on both roles of the pair kernel."""
+    cap = 30.0
+
+    def softcap(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1.0 - t * t)
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=256,
+        n=384,
+        d=256,
+        score_mod=softcap,
+        score_mod_bwd=softcap_bwd,
+        mask_mod=_causal,
+        dtype=torch.float16,
+    )
+    assert "fbwd_is_dq" in code and "cutlass.Float16" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_dense() -> None:
+    """No mask: every KV block's full list, both roles on unmasked steps."""
+    got, ref, code = _run(b=1, hq=2, hkv=2, m=512, n=512, d=256)
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+def _batch_head_window(b, h, q_idx, kv_idx):
+    """Causal with a window that depends on the batch and the head: every
+    (b, h) of the BlockMask has its own tables."""
+    return (q_idx >= kv_idx) & (q_idx - kv_idx <= 64 + 128 * h + 192 * b)
+
+
+@_gpu_test
+def test_head_dim_256_pair_batch_head_tables() -> None:
+    """A BlockMask with (B, H) tables: the dK/dV clusters index them with the
+    KV-side (b, h), the dQ clusters with the Q-side (b, h) of their batch-head
+    (and the derived KV lists are per (b, h, Q block))."""
+    got, ref, code = _run(
+        b=2,
+        hq=4,
+        hkv=4,
+        m=512,
+        n=512,
+        d=256,
+        mask_mod=_batch_head_window,
+        mask_dims=(2, 4),
+    )
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_gqa_ragged_n_head_tables() -> None:
+    """Grouped-query heads (two Q heads per KV head, per-head tables) with
+    N > M (KV blocks past the causal frontier attended by no Q block; the
+    dQ clusters' lists stop early)."""
+
+    def head_causal(b, h, q_idx, kv_idx):
+        return kv_idx <= q_idx + 128 * h
+
+    got, ref, code = _run(
+        b=1,
+        hq=4,
+        hkv=2,
+        m=384,
+        n=640,
+        d=256,
+        mask_mod=head_causal,
+        mask_dims=(None, 4),
+    )
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_fully_masked_q_block() -> None:
+    """A Q block no KV block attends to: its dQ cluster walks zero steps (dQ
+    stays the zero initialization) and no dK/dV cluster visits it."""
+
+    def skip_block_one(b, h, q_idx, kv_idx):
+        return (q_idx // 128 != 1) & (q_idx >= kv_idx)
+
+    got, ref, code = _run(
+        b=1, hq=2, hkv=2, m=512, n=512, d=256, mask_mod=skip_block_one
+    )
+    assert "fbwd_is_dq" in code
+    assert torch.count_nonzero(got[0][:, :, 128:256]) == 0
+    assert torch.count_nonzero(got[0][:, :, :128]) > 0
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_head_dim_256_pair_capture_replay() -> None:
+    """The pair kernel under CUDA-graph capture: the host-side derivation of
+    the dQ clusters' KV lists is captured with the launch (static shapes,
+    built once per launch) and the replay reproduces the gradients."""
+    got, ref, code = _run(
+        b=1, hq=2, hkv=2, m=384, n=384, d=256, mask_mod=_causal, capture=True
+    )
+    assert "fbwd_is_dq" in code
+    _assert_close(got, ref)
+
+
 @_gpu_test
 def test_repeated_launches_are_stable() -> None:
     got, ref, _ = _run(
         b=1, hq=2, hkv=2, m=384, n=384, d=64, mask_mod=_causal, repeats=50
     )
     _assert_close(got, ref)
+
+
+# -- strided operands ---------------------------------------------------------
+
+
+def _assert_rank4_maps(code: str) -> None:
+    assert "'flex_strides': (" in code
+    assert "tQgQ = tQgQ_qdl[None, None, 0, fbwd_hq, fbwd_b]" in code
+    assert "tKgK_kdl[None, None, 0, fbwd_hk, fbwd_b]" in code
+    assert "_fbwd_mdKt[None, None, fbwd_hk, fbwd_b]" in code
+    assert "tQgQ_qdl[None, None, 0, fbwd_bhq]" not in code
+
+
+def _assert_same_gradients(
+    got: tuple[torch.Tensor, ...], got_c: tuple[torch.Tensor, ...]
+) -> None:
+    """dK / dV are accumulated in TMEM in the step-table order (bitwise across
+    layouts); dQ goes through fp32 reduce-adds whose arrival order varies."""
+    dq, dk, dv = got
+    dq_c, dk_c, dv_c = got_c
+    assert torch.equal(dk, dk_c)
+    assert torch.equal(dv, dv_c)
+    peak = max(dq_c.float().abs().max().item(), 1e-6)
+    assert (dq.float() - dq_c.float()).abs().max().item() / peak < 1e-3
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("hq", "hkv", "m", "n", "d", "dtype", "mask_mod"),
+    [
+        (2, 2, 512, 512, 64, torch.bfloat16, _causal),
+        (4, 2, 256, 256, 128, torch.float16, _causal),
+        (2, 2, 192, 320, 64, torch.bfloat16, _window64),
+        (2, 2, 256, 384, 64, torch.bfloat16, _prefix_only),
+    ],
+    ids=["causal_d64", "gqa_d128_fp16", "ragged_unequal", "empty_kv_tiles"],
+)
+def test_transposed_views_match_the_contiguous_path(
+    hq: int, hkv: int, m: int, n: int, d: int, dtype: torch.dtype, mask_mod
+) -> None:
+    """``[B, S, H, D].transpose(1, 2)`` Q/K/V/dO (dK/dV ``empty_like`` keep the
+    layout) run the fused backward through rank-4 TMA maps: dK/dV bitwise the
+    contiguous run, dQ within reduce-add reordering, all within tolerance of
+    the fp32 reference; the empty KV tiles' zero rows land in the strided
+    dK/dV too."""
+    got_c, _, code_c = _run(
+        b=2, hq=hq, hkv=hkv, m=m, n=n, d=d, mask_mod=mask_mod, dtype=dtype
+    )
+    assert "'flex_strides'" not in code_c
+    got, ref, code = _run(
+        b=2,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=d,
+        mask_mod=mask_mod,
+        dtype=dtype,
+        layout="bshd",
+    )
+    _assert_rank4_maps(code)
+    assert got[1].stride() == (hkv * n * d, d, hkv * d, 1)
+    assert got[2].stride() == (hkv * n * d, d, hkv * d, 1)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+    if mask_mod is _prefix_only:
+        assert torch.all(got[1][:, :, 128:] == 0) and torch.all(got[2][:, :, 128:] == 0)
+
+
+@_gpu_test
+def test_packed_qkv_slices_backward() -> None:
+    got_c, _, _ = _run(b=2, hq=2, hkv=2, m=512, n=512, d=64, mask_mod=_causal)
+    got, ref, code = _run(
+        b=2, hq=2, hkv=2, m=512, n=512, d=64, mask_mod=_causal, layout="packed"
+    )
+    _assert_rank4_maps(code)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_transposed_views_persistent_walk() -> None:
+    """The CLC persistent walk decodes the head / batch per tile too."""
+    overrides = {"cute_flash_bwd_persistent": 1}
+    got_c, _, _ = _run(
+        b=2,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=64,
+        mask_mod=_causal,
+        config_overrides=overrides,
+    )
+    got, ref, code = _run(
+        b=2,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=64,
+        mask_mod=_causal,
+        config_overrides=overrides,
+        layout="bshd",
+    )
+    assert "fbwd_tissued_ptr" in code
+    _assert_rank4_maps(code)
+    _assert_same_gradients(got, got_c)
+    _assert_close(got, ref)
+
+
+@_gpu_test
+def test_transposed_o_and_do_preprocess_is_bitwise() -> None:
+    """The preprocess reads O / dO through their 4-D views (no host copy):
+    transposed inputs give bitwise the contiguous ``delta`` / ``lse2``."""
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    o = torch.randn((2, 4, 512, 64), device=DEVICE, dtype=torch.bfloat16, generator=gen)
+    do = torch.randn(
+        (2, 4, 512, 64), device=DEVICE, dtype=torch.bfloat16, generator=gen
+    )
+    lse = torch.randn((2, 4, 512), device=DEVICE, dtype=torch.float32, generator=gen)
+    lse[0, 0, :7] = float("-inf")
+    pre = flex_example._flex_attention_bwd_preprocess
+    for args in ((o, do, lse), (_as_bshd(o), _as_bshd(do), lse)):
+        pre_bound = pre.bind(args)
+        pre_bound.set_config(pre_bound.config_spec.default_config())
+    delta_c, lse2_c = pre(o, do, lse)
+    delta, lse2 = pre(_as_bshd(o), _as_bshd(do), lse)
+    torch.cuda.synchronize()
+    assert torch.equal(delta, delta_c)
+    assert torch.equal(lse2, lse2_c)
+    expected = (o.float() * do.float()).sum(-1)
+    torch.testing.assert_close(delta_c, expected, atol=1e-2, rtol=1e-3)
+    assert torch.all(lse2_c[0, 0, :7] == 0)
+
+
+# -- the 2-CTA kernel (head dim 128) -------------------------------------------
+
+
+def _assert_pair_gradients(
+    got2: tuple[torch.Tensor, ...], got1: tuple[torch.Tensor, ...]
+) -> None:
+    """The pair kernel against the 1-CTA kernel on the same inputs: dK / dV
+    bitwise on the even KV tiles' rows (the same per-step products
+    accumulated in the same order; the odd tiles' rows follow the merged
+    walk's order and are compared within rounding), dQ within one bf16 ulp
+    at the peak (the wrapper's bf16 cast of fp32 sums that associate
+    differently: one K = 256 MMA against two partials added by the
+    reduce-add) and identical almost everywhere (mean difference below 1e-6
+    of the peak)."""
+    dq2, dk2, dv2 = got2
+    dq1, dk1, dv1 = got1
+    for name, a, b in (("dk", dk2, dk1), ("dv", dv2, dv1)):
+        even = a.view(*a.shape[:2], -1, 256, a.shape[-1])[:, :, :, :128]
+        even_c = b.view(*b.shape[:2], -1, 256, b.shape[-1])[:, :, :, :128]
+        assert torch.equal(even, even_c), f"{name}: even KV tiles differ"
+        peak = max(b.float().abs().max().item(), 1e-6)
+        assert (a.float() - b.float()).abs().max().item() / peak < 2**-8, name
+    peak = max(dq1.float().abs().max().item(), 1e-6)
+    diff = (dq2.float() - dq1.float()).abs()
+    assert diff.max().item() / peak <= 2**-8, "dq: more than one bf16 ulp at peak"
+    assert diff.mean().item() / peak < 1e-6, "dq: differs beyond isolated roundings"
+
+
+def _run_pair(**kwargs: object) -> tuple[tuple[torch.Tensor, ...], ...]:
+    """The 2-CTA and the 1-CTA kernel on the same inputs (``kwargs`` of
+    :func:`_run` plus ``overrides`` on top of both), and the reference."""
+    overrides = dict(kwargs.pop("overrides", {}))  # type: ignore[arg-type]
+    got2, ref, code2 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    assert "cta_group=2" in code2
+    got1, _, code1 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 0, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" not in code1
+    return got2, got1, ref
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("b", "hq", "hkv", "m", "n", "overrides"),
+    [
+        (1, 2, 2, 512, 512, {}),
+        (1, 4, 2, 512, 512, {}),
+        (2, 2, 2, 256, 1024, {}),
+        (1, 2, 2, 1000, 512, {}),
+        (1, 1, 1, 2048, 2048, {}),
+        (1, 2, 2, 512, 768, {"cute_flash_bwd_exp2_f32": 0}),
+        (2, 4, 2, 384, 512, {"cute_flash_bwd_tile_group": 2}),
+        (1, 2, 2, 512, 512, {"cute_flash_bwd_regs": "88/168/88"}),
+    ],
+    ids=[
+        "dense",
+        "gqa",
+        "cross_m_lt_n",
+        "ragged_m",
+        "long_walk",
+        "exp2_f16x2",
+        "tile_group",
+        "regs",
+    ],
+)
+def test_two_cta_dense_matches_the_single_cta(
+    b: int, hq: int, hkv: int, m: int, n: int, overrides: dict[str, object]
+) -> None:
+    """The cluster pair (one 256-row KV tile, dQ reduce-added once per 256
+    KV rows) on full-table walks: dK / dV bitwise the 1-CTA kernel's (the
+    same per-step products in the same order), dQ within rounding (one
+    K=256 accumulation instead of two fp32 partial adds)."""
+    got2, got1, ref = _run_pair(
+        b=b, hq=hq, hkv=hkv, m=m, n=n, d=128, overrides=overrides
+    )
+    _assert_pair_gradients(got2, got1)
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_repeated_launches_are_stable() -> None:
+    got2, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=128,
+        repeats=50,
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_knob_keeps_the_single_cta_where_not_legal() -> None:
+    """Outside the pair's envelope the knob renders the 1-CTA kernel: head
+    dim 64, an odd KV tile count."""
+    for kwargs in (
+        {"b": 1, "hq": 2, "hkv": 2, "m": 256, "n": 256, "d": 64},
+        {"b": 1, "hq": 2, "hkv": 2, "m": 256, "n": 384, "d": 128},
+    ):
+        got, ref, code = _run(
+            config_overrides={"cute_flash_bwd_two_cta": 1},
+            **kwargs,  # type: ignore[arg-type]
+        )
+        assert "flash_bwd_flex_2cta_shared_storage" not in code
+        _assert_close(got, ref)
+
+
+def _doc_blocks(b, h, q_idx, kv_idx):
+    # Block-diagonal documents of 384 rows: the two KV tiles of a pair fall in
+    # different documents at every odd pair, so the merged walk has steps one
+    # CTA never attends (its absent flag) and steps only the odd tile lists.
+    return (q_idx // 384) == (kv_idx // 384)
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("b", "hq", "hkv", "m", "n", "mask_mod", "kwargs"),
+    [
+        (2, 2, 2, 512, 512, _causal, {}),
+        (1, 2, 2, 512, 512, _window64, {}),
+        (1, 4, 2, 512, 512, _causal, {}),
+        (1, 2, 2, 1000, 512, _causal, {}),
+        (1, 2, 2, 768, 768, _doc_blocks, {}),
+        (1, 2, 2, 256, 512, _prefix_only, {}),
+        (1, 2, 2, 512, 512, _causal, {"dtype": torch.float16}),
+        (1, 4, 2, 8192, 1024, _causal, {"table_steps": 64}),
+        (1, 2, 2, 2048, 512, _causal, {"table_steps": 5}),
+        (1, 16, 2, 32768, 256, _causal, {}),
+        (
+            1,
+            2,
+            2,
+            512,
+            512,
+            _window64,
+            {"config_overrides": {"cute_flash_bwd_mask_form": "element"}},
+        ),
+    ],
+    ids=[
+        "causal",
+        "sliding_window",
+        "gqa_causal",
+        "ragged_causal",
+        "documents",
+        "empty_tiles",
+        "causal_fp16",
+        "chunked_gqa",
+        "chunked_odd",
+        "chunked_gqa8_natural",
+        "element_mask",
+    ],
+)
+def test_two_cta_masked_walks(
+    b: int, hq: int, hkv: int, m: int, n: int, mask_mod, kwargs: dict[str, object]
+) -> None:
+    """The merged pair walk: the pair's two KV tiles list different Q blocks
+    (causal diagonals, window edges, document boundaries, empty tiles); each
+    CTA walks the union with its own masked / absent flags; walks longer
+    than the table run in several chunks (the forced caps give up to four
+    chunks per tile; 8 q heads x 256 Q tiles overflow the table on their
+    own)."""
+    overrides = dict(kwargs.pop("config_overrides", {}))  # type: ignore[arg-type]
+    got2, ref, code2 = _run(
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=128,
+        mask_mod=mask_mod,
+        config_overrides={"cute_flash_bwd_two_cta": 1, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    if "table_steps" in kwargs:
+        assert "fbwd_nchunks" in code2
+    got1, _, _ = _run(
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        m=m,
+        n=n,
+        d=128,
+        mask_mod=mask_mod,
+        config_overrides={"cute_flash_bwd_two_cta": 0, **overrides},
+        **kwargs,  # type: ignore[arg-type]
+    )
+    _assert_pair_gradients(got2, got1)
+    _assert_close(got2, ref)
+
+
+@_gpu_test
+def test_two_cta_identical_pair_lists_long_q() -> None:
+    """The merged-walk fill at a long Q with IDENTICAL pair lists and a small
+    table. Causal at q_seq 64K: the odd tile's lists are a subset of the
+    even tile's, so no head runs the L1-only section (the only barriers
+    between a head's L0 fill and the next head's bitmap clear); the bitmap
+    words span two warps (16 words per bitmap plus the sentinel), and a
+    32-step table has every refill fill one warp's worth of entries while
+    the other 13 warps run ahead to the next head. Without a barrier before
+    the clear, rank 1 read a cleared bitmap and wrote the entry as absent:
+    the odd tile dropped the step (dq / dk / dv off by 3-15% of the peak on
+    every launch, two launches disagreeing). The pair kernel against the
+    1-CTA kernel: even tiles bitwise, the rest within rounding, and two
+    launches of the pair agree bitwise on dK / dV (the pair's own
+    accumulations are deterministic; dQ's TMA reduce-adds are not)."""
+    kw: dict[str, object] = {
+        "b": 1,
+        "hq": 16,
+        "hkv": 2,
+        "m": 65536,
+        "n": 16384,
+        "d": 128,
+        "mask_mod": _causal,
+        "reference": False,
+        "table_steps": 32,
+    }
+    got2, _, code2 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+        **kw,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code2
+    assert "fbwd_nchunks = (fbwd_steps + 31) // 32" in code2
+    # 512 Q blocks + the sentinel: 17 words per bitmap (51 words cleared per
+    # head of the prologue); every refill copies its 32 entries out of the
+    # walk scratch right after the working warps' barrier.
+    assert "for fbwd_wb in cutlass.range(0, 51, 512, unroll=1):" in code2
+    assert re.search(
+        r"named_barrier_wait_unaligned\(7, 448\)\n\s+"
+        r"for fbwd_ib in cutlass\.range\(0, fbwd_csteps, 448, unroll=1\):",
+        code2,
+    )
+    got2b, _, _ = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+        **kw,  # type: ignore[arg-type]
+    )
+    got1, _, code1 = _run(
+        config_overrides={"cute_flash_bwd_two_cta": 0},
+        **kw,  # type: ignore[arg-type]
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" not in code1
+    _assert_pair_gradients(got2, got1)
+    for name, a, b in (("dk", got2[1], got2b[1]), ("dv", got2[2], got2b[2])):
+        assert torch.equal(a, b), f"{name}: two launches of the pair kernel differ"
+
+
+@_gpu_test
+def test_two_cta_softcap_jacobian() -> None:
+    """A score_mod with a Jacobian region on the merged walk: the hooks run
+    per CTA on its own rows and the absent steps zero P and dS."""
+    cap = 20.0
+
+    def softcap(score, b, h, q_idx, kv_idx):
+        return cap * torch.tanh(score / cap)
+
+    def softcap_bwd(grad, score, b, h, q_idx, kv_idx):
+        t = torch.tanh(score / cap)
+        return grad * (1 - t * t)
+
+    got2, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=512,
+        n=512,
+        d=128,
+        score_mod=softcap,
+        score_mod_bwd=softcap_bwd,
+        mask_mod=_causal,
+        config_overrides={"cute_flash_bwd_two_cta": 1},
+    )
+    assert "flash_bwd_flex_2cta_shared_storage" in code
+    assert "fbwd_spre" in code
+    _assert_close(got2, ref)

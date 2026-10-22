@@ -627,6 +627,7 @@ def gemm_ptx_dyn_qk(
     *,
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+    k_tiles: int | None = None,
 ) -> None:
     """SS gemm with BOTH operand start addresses as runtime inputs.
 
@@ -634,10 +635,16 @@ def gemm_ptx_dyn_qk(
     register: the callers pass starts re-read per iteration (see
     ``_flash_runtime.ld_volatile_shared_u32``) so ptxas forms the per-k
     descriptors with uniform adds inside the loop instead of hoisting them.
+
+    ``k_tiles`` issues only the first K tiles of the operand layouts (the
+    exact head dim over smem tiles padded to whole swizzle atoms).
     """
     smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     num_k_tile = cute.size(tCrB_layout.shape[2])
+    if const_expr(k_tiles is not None):
+        assert 1 <= k_tiles <= num_k_tile, (k_tiles, num_k_tile)
+        num_k_tile = k_tiles
     offset_a = [cute.crd2idx((0, 0, k), a_layout) for k in range(num_k_tile)]
     offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
     smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
@@ -811,6 +818,9 @@ def _ptx_parity_wait(
         f"@P{tag} bra DONE{tag}; \n\t"
         f"bra     LAB_WAIT{tag}; \n\t"
         f"DONE{tag}: \n\t"
+        # The P tile behind the barrier was written by ``tcgen05.st``: the
+        # MMAs that follow are ordered after the wait by this fence.
+        "tcgen05.fence::after_thread_sync; \n\t"
     )
 
 
@@ -882,6 +892,7 @@ def gemm_ptx_precomputed_pv_ts(
             "@P1 bra DONE; \n\t"
             "bra     LAB_WAIT; \n\t"
             "DONE: \n\t"
+            "tcgen05.fence::after_thread_sync; \n\t"
         )
     else:
         assert mbar_mid_ptrs is None, "mbar_mid_ptrs needs the final-quarter mbar_ptr"
@@ -1134,6 +1145,7 @@ def gemm_ptx_partial(
                 "@P1 bra DONE; \n\t"
                 "bra     LAB_WAIT; \n\t"
                 "DONE: \n\t"
+                "tcgen05.fence::after_thread_sync; \n\t"
             )
         else:
             mbar_wait_str = ""

@@ -96,7 +96,9 @@ from .cute_mma_dag import _is_call
 from .cute_mma_dag import _is_pointwise
 from .cute_mma_dag import _node_inputs
 from .cute_mma_dag import _storage
+from .cute_mma_dag import _tile_index_position
 from .cute_mma_dag import frag_word_blocks
+from .cute_mma_dag import rounded_dot_dtype
 from .cute_warp_mma_gemm import _swizzled_chunk
 from .cute_warp_mma_gemm import warp_mma_warp_layout
 
@@ -117,6 +119,9 @@ _IDENTIFIER = r"(?<![\w.])[A-Za-z_]\w*"
 # Module roots an address expression may name (``cutlass.Int64(...)``).
 _MODULES = frozenset({"cutlass", "cute"})
 _PREAMBLE = f"import helion._compiler.cute._mma_dag_runtime as {_RUNTIME}\n"
+# Side-load dtypes loaded widened to fp32 (``ldg_*_as_f32``): the raw fp32
+# value stands for the element, the DSL-typed one for the FX value.
+_WIDENED: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 # The launcher's wrapper plan that names the program's tensor arguments so
 # a launch can refuse arguments that alias (see ``mma_dag_alias_plan``).
 ALIAS_KIND = "helion_mma_dag_alias"
@@ -276,7 +281,18 @@ class _Evaluator:
             return self.evaluate(cast("Node", node.args[0]), coords)
         if node in self.program.frag_slots:
             assert self.reg is not None
-            return em.reg(self.program.frag_slots[node], *self.reg)
+            register = em.reg(self.program.frag_slots[node], *self.reg)
+            rounded = rounded_dot_dtype(node)
+            if rounded is None:
+                return register
+            # A 16-bit ``aten.mm``: its fp32 product rounded once, as the
+            # SIMT lowering rounds it.
+            key = ("rounded", node, coords, register)
+            cached = self._lookup(key)
+            if cached is None:
+                cached = em.bind("md_v", em.typed(register, rounded))
+                self.scopes[-1][key] = cached
+            return cached
         if node in self.program.vec_leaves:
             slot = self.program.vec_leaves[node]
             if self.program.vec_slots[slot].axis is None:
@@ -295,6 +311,10 @@ class _Evaluator:
         widened = self.widened_leaf(node, coords)
         if widened is not None:
             result = widened
+        elif node in self.program.tile_index_loads:
+            axis = self.program.tile_index_loads[node]
+            coord = coords[cast("int", _tile_index_position(node))]
+            result = em.bind("md_v", f"cutlass.Int32({em.axis_base(axis)} + {coord})")
         elif node.op == "call_function" and node.target is memory_ops.load:
             result = self._load(node, coords)
         elif node.op == "call_function" and node.target is _tracing_ops._get_symnode:
@@ -503,7 +523,7 @@ class _Evaluator:
             return None
         source = self.program.resolve(cast("Node", node.args[0]))
         access = self.emitter.accesses.get(source)
-        if access is None or access.dtype == torch.float32:
+        if access is None or access.dtype not in _WIDENED:
             return None
         if len(access.tile_dims) == 2:
             assert self.element is not None
@@ -533,16 +553,16 @@ class _Evaluator:
                 value = em.df.new_var("md_sl")
                 em.hoist(hoist, f"{value} = {em.scalar_load(address, access.dtype)}")
                 typed = value
-                if access.dtype != torch.float32:
+                if access.dtype in _WIDENED:
                     typed = em.df.new_var("md_sl")
                     em.hoist(hoist, f"{typed} = {em.typed(value, access.dtype)}")
                 hoist.loads[key] = (value, typed)
             value, typed = hoist.loads[key]
-            if access.dtype != torch.float32:
+            if access.dtype in _WIDENED:
                 self.scopes[-1][("raw", key)] = value
             return typed
         value = em.bind("md_v", em.scalar_load(address, access.dtype))
-        if access.dtype == torch.float32:
+        if access.dtype not in _WIDENED:
             return value
         self.scopes[-1][("raw", (node, coords))] = value
         return em.bind("md_v", em.typed(value, access.dtype))
@@ -1125,9 +1145,16 @@ class _Emitter:
             return value
         return f"{self.env.backend.dtype_str(dtype)}({value})"
 
+    @staticmethod
+    def zero(dtype: torch.dtype) -> str:
+        """A register's initial value for a side load of ``dtype``."""
+        return "cutlass.Int32(0)" if dtype == torch.int32 else "cutlass.Float32(0.0)"
+
     def scalar_load(self, address: str, dtype: torch.dtype) -> str:
         if dtype == torch.float32:
             return f"{_RUNTIME}.ldg_f32({address})"
+        if dtype == torch.int32:
+            return f"{_RUNTIME}.ldg_s32({address})"
         if dtype == torch.float16:
             return f"{_RUNTIME}.ldg_f16_as_f32({address})"
         assert dtype == torch.bfloat16, dtype
@@ -1291,6 +1318,10 @@ class _Emitter:
                 if subscript.kind == "axis":
                     axis = subscript.axis
                     assert axis is not None
+                    if subscript.offset is not None:
+                        terms.append(
+                            f"cutlass.Int64({self.uniform(subscript.offset, {})}) * {scale}"
+                        )
                     if axis.kind in (AXIS_LOOP, AXIS_RDIM):
                         continue
                     terms.append(f"cutlass.Int64({self.axis_base(axis)}) * {scale}")
