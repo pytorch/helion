@@ -16,7 +16,9 @@ from test.test_cute_collective_tf32 import _kernel
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
 
-_initial_population = partial(_shared_population, random_seed=46291)
+_initial_population = partial(
+    _shared_population, random_seed=46291, assert_canonical=False
+)
 
 pytestmark = skipUnlessBackends(["cute"])
 

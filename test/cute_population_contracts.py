@@ -172,7 +172,9 @@ def _legacy_order(
     return seeds
 
 
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
+def _legacy_registered_seeds(
+    bound: BoundKernel, *, require_no_parameters: bool = False
+) -> list[helion.Config]:
     assert bound.host_function is not None
     with (
         bound.env,
@@ -180,11 +182,13 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
             CuteCollectiveMatmulHeuristic,
             "_interleave_bounded_k_seeds",
             side_effect=_legacy_order,
-        ),
+        ) as interleaved,
     ):
         legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
+    if require_no_parameters:
+        assert all(not call.args[2] for call in interleaved.call_args_list)
     # Other registered heuristics retain their original positions. Replace
     # only this heuristic's permutation when reproducing the old population.
     members = set(legacy)
@@ -207,8 +211,9 @@ def _initial_population(
     count: int | None = None,
     user_seeds: list[helion.Config] | None = None,
     random_seed: int | None = None,
+    assert_canonical: bool = True,
 ) -> list[helion.Config]:
-    state = random.getstate()
+    state = random.getstate() if random_seed is not None else None
     try:
         if random_seed is not None:
             random.seed(random_seed)
@@ -233,6 +238,8 @@ def _initial_population(
             )
             flat = checked_initial_population(search)
             result = [search.config_gen.unflatten(value) for value in flat]
+            if assert_canonical:
+                assert [search.config_gen.flatten(config) for config in result] == flat
             assert result[0] == search.config_gen.unflatten(
                 search.config_gen.default_flat()
             )
@@ -243,5 +250,5 @@ def _initial_population(
             )
             return result
     finally:
-        if random_seed is not None:
+        if state is not None:
             random.setstate(state)
