@@ -1308,6 +1308,7 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                         allow_non_power_of_two=env.backend_name == "cute",
                         allow_full_extent=env.backend_name == "cute",
+                        allow_wide_persistent=env.backend.allow_wide_persistent_reduction(),
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
