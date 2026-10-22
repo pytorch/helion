@@ -994,7 +994,8 @@ def _cute_tile_inner_block_dtype(
     vector seeds, which share the same device-graph walk.
     """
     bs = env.block_sizes[block_id]
-    extent = _to_sympy(bs.var) if env.is_jagged_tile(block_id) else bs.numel
+    jagged = env.is_jagged_tile(block_id)
+    extent = _to_sympy(bs.var) if jagged else bs.numel
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             # Index/mask intermediates are not memory payloads. Keep the
@@ -1006,6 +1007,7 @@ def _cute_tile_inner_block_dtype(
             if (
                 isinstance(val, torch.Tensor)
                 and val.ndim >= 1
+                and (not jagged or _cute_tile_seed_vec_width_for_dtype(val.dtype) > 1)
                 and _to_sympy(val.shape[-1]) == extent
             ):
                 return val.dtype

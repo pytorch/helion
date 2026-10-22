@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from examples.softmax import softmax_two_pass
 import pytest
@@ -22,6 +23,9 @@ from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language._tracing_ops import _host_tensor
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _softmax(x: torch.Tensor) -> torch.Tensor:
@@ -45,7 +49,9 @@ def _masked_softmax(x: torch.Tensor) -> torch.Tensor:
 @skipUnlessBackends(["cute"])
 @skipIfRefEager("asserts generated CuTe source, which ref eager does not emit")
 @pytest.mark.parametrize("fn", [_softmax, _masked_softmax])
-def test_cute_dynamic_reduction_seeds_vector_memory(dtype: torch.dtype, fn) -> None:
+def test_cute_dynamic_reduction_seeds_vector_memory(
+    dtype: torch.dtype, fn: Callable[[torch.Tensor], torch.Tensor]
+) -> None:
     softmax = helion.kernel(
         fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
@@ -97,7 +103,7 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
     aligned = seeded.bind((first,))
     for width in (4096, 4100):
         if layout == "padded":
-            x = torch.randn(5, width + 8, device="cuda", dtype=dtype)[:, :width]
+            x = torch.randn(5, width + 3, device="cuda", dtype=dtype)[:, :width]
         elif layout == "offset":
             x = torch.randn(5, width + 1, device="cuda", dtype=dtype)[:, 1:]
         else:
@@ -136,7 +142,9 @@ def test_dynamic_two_pass_tile_seeds_execute(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int64])
-def test_dtype_walk_ignores_index_and_mask_tensors(mask_dtype: torch.dtype) -> None:
+def test_dtype_walk_ignores_non_memory_index_and_mask_nodes(
+    mask_dtype: torch.dtype,
+) -> None:
     graph = torch.fx.Graph()
     index = graph.placeholder("index")
     index.meta["val"] = torch.empty(4096, dtype=mask_dtype)
