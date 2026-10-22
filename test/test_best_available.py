@@ -1883,7 +1883,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 self.assertIn(default, configs)
                 search.log.assert_any_call(
                     "Base compiler seed budget of 4 rows (explicit seeds, compiler "
-                    "seeds, default) did not admit 21 of 25 compiler seed configs before any requested overflow"
+                    "seeds, default) did not admit 21 of 25 compiler seed configs"
                 )
 
     def test_compiler_seed_limit_fills_budget_with_default(self):
@@ -1953,14 +1953,29 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             },
         )
 
-    def test_base_budget_is_separate_from_requested_overflow(self):
+    def test_compiler_seed_limit_keeps_required_overflow(self):
         generation = self._make_config_gen(CuteBackend())
         spec = generation.config_spec
         spec.compiler_seed_configs = self._seed_grid()
-        search = self._make_mock_search(generation, cached_configs=[])
-        expected = self._populate(search, compiler_seed_limit=2)
         spec.compiler_seed_overflow_requested = True
-        self.assertEqual(self._populate(search, compiler_seed_limit=2), expected)
+        search = self._make_mock_search(generation, cached_configs=[])
+        self.assertEqual(
+            self._populate(search, compiler_seed_limit=2), self._populate(search)
+        )
+
+    def test_de_padding_keeps_required_overflow_and_cached_rows(self):
+        generation = self._make_config_gen(CuteBackend())
+        spec = generation.config_spec
+        spec.compiler_seed_configs = self._seed_grid()
+        spec.compiler_seed_overflow_requested = True
+        cached = [Config(block_sizes=[16, 64])]
+        source = self._make_mock_search(generation, cached_configs=cached)
+        search = self._make_de_search(source)
+        search.population_size = 2
+        search.best_available_pad_random = True
+        expected = self._populate(source)
+        self.assertGreater(len(expected), 4)
+        self.assertEqual(search._generate_initial_population_flat(), expected)
 
     def test_compiler_seed_limit_does_not_cap_flash(self):
         with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):

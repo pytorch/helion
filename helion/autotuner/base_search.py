@@ -2087,8 +2087,8 @@ class PopulationBasedSearch(BaseSearch):
         ``compiler_default_config`` and ``ConfigSpec.autotune_seed_configs``).
         Specs with ``cute_flash_search_enabled`` ignore the limit, since their
         seed set is the structural design the flash search measures. Explicit
-        PatternSearch may append a requested compiler overflow palette after
-        this base population is built.
+        A backend-requested compiler overflow palette also bypasses the limit,
+        since the backend requires all of those candidates to be measured.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
@@ -2121,6 +2121,7 @@ class PopulationBasedSearch(BaseSearch):
 
         if (
             generation.config_spec.cute_flash_search_enabled
+            or generation.config_spec.compiler_seed_overflow_requested
             or compiler_seed_limit is None
             or compiler_seed_limit <= 0
         ):
@@ -2167,14 +2168,7 @@ class PopulationBasedSearch(BaseSearch):
             self.log(
                 f"Base compiler seed budget of {compiler_seed_limit} rows (explicit "
                 f"seeds, compiler seeds, default) did not admit {skipped} of "
-                f"{len(seed_pairs)} compiler seed configs before any requested overflow"
-            )
-
-        required_rows = len(result) + (default_config not in seen)
-        if compiler_seed_limit is not None and required_rows > compiler_seed_limit:
-            self.log(
-                f"Required seed/default rows raise the {compiler_seed_limit}-row "
-                f"base budget to {required_rows}"
+                f"{len(seed_pairs)} compiler seed configs"
             )
 
         for flat, transferred_config in generation.user_seed_flat_config_pairs(
@@ -2183,6 +2177,12 @@ class PopulationBasedSearch(BaseSearch):
             seed_description="best-available",
         ):
             admit(flat, transferred_config)
+        required_rows = len(result) + (default_config not in seen)
+        if compiler_seed_limit is not None and required_rows > compiler_seed_limit:
+            self.log(
+                f"Required seed/default rows raise the {compiler_seed_limit}-row "
+                f"base budget to {required_rows}"
+            )
         admit(default_flat, default_config)
         # Every row so far is a seed or the default; cached rows are not pinned.
         self._pinned_finalist_configs.update(copy.deepcopy(config) for config in seen)
