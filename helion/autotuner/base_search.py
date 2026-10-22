@@ -2086,7 +2086,7 @@ class PopulationBasedSearch(BaseSearch):
         cached configs, and protected seeds (the promoted
         ``compiler_default_config`` and ``ConfigSpec.autotune_seed_configs``).
         Specs with ``cute_flash_search_enabled`` ignore the limit, since their
-        seed set is the structural design the flash search measures. Explicit
+        seed set is the structural design the flash search measures.
         A backend-requested compiler overflow palette also bypasses the limit,
         since the backend requires all of those candidates to be measured.
 
@@ -2134,6 +2134,11 @@ class PopulationBasedSearch(BaseSearch):
         # Keep them before the raw fragment default so expensive fallback defaults
         # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
         seed_pairs = generation.seed_flat_config_pairs(self.log)
+        # A budgeted-out seed may still be discovered later by mutation. Keep
+        # its final-verification protection without benchmarking it up front.
+        self._pinned_finalist_configs.update(
+            copy.deepcopy(config) for _, config in seed_pairs
+        )
         protected: set[Config] = set()
         quota: int | None = None
         if compiler_seed_limit is not None and seed_pairs:
