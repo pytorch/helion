@@ -563,6 +563,30 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     # CuTe needs more than three thread axes for the merged + stack-store dims.
     @onlyBackends(["triton"])
+    @parametrize("static_shapes", (False, True))
+    @skipIfRefEager("checks reduction coordinates after resolving logical sizes")
+    def test_full_slice_size_in_arange(self, static_shapes):
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                value = x[row, :]
+                columns = hl.arange(value.size(1))
+                out[row] = (value * columns[None, :]).sum(1)
+            return out
+
+        kernel = helion.kernel(
+            reduce, static_shapes=static_shapes, autotune_effort="none"
+        )
+        x = torch.randn(64, 33, device=DEVICE)
+        bound = kernel.bind((x,))
+        expected = (x * torch.arange(33, device=DEVICE)).sum(1)
+        for chunk in (None, 8):
+            actual = bound.compile_config(
+                helion.Config(block_sizes=[4], reduction_loops=[chunk])
+            )(x)
+            torch.testing.assert_close(actual, expected)
+
+    @onlyBackends(["triton"])
     @skipIfRefEager("checks merged dimensions beside an indirect store")
     def test_merged_reduction_dims_beside_a_stack_store(self):
         @helion.kernel(static_shapes=True)

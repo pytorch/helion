@@ -147,10 +147,8 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
             node.args = (env.sympy_debug(_to_sympy(size)),)
             node.kwargs = {}
             node.meta["val"] = size
-            origins = HostFunction.current().expr_to_origin
-            node.meta["helion_host_scalar"] = all(
-                symbol in origins and origins[symbol].origin.is_host()
-                for symbol in _to_sympy(size).free_symbols
+            node.meta["helion_host_scalar"] = (
+                HostFunction.current().is_host_scalar_expr(_to_sympy(size))
             )
             node.meta.pop("lowering", None)
 

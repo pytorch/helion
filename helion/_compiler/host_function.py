@@ -301,6 +301,13 @@ class HostFunction:
             if type_info.origin.is_host():
                 type_info.populate_symbol_origins(NameOrigin(name, self))
 
+    def is_host_scalar_expr(self, expr: sympy.Expr) -> bool:
+        return all(
+            symbol in self.expr_to_origin
+            and self.expr_to_origin[symbol].origin.is_host()
+            for symbol in expr.free_symbols
+        )
+
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):

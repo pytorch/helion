@@ -176,11 +176,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             original = nodes_by_name[tag.source]
             source = replacements.get(original, original)
             dims = tag.dims
-            if (
-                not enabled
-                or source.graph is not graph
-                or dims != [*range(dims[0], dims[-1] + 1)]
-            ):
+            if not enabled or dims != [*range(dims[0], dims[-1] + 1)]:
                 continue
             if excluded is None:
                 # Leave tensors the kernel writes unmerged: a merged load reads

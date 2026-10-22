@@ -90,11 +90,7 @@ def _host_seed(value: object) -> bool:
     if type(value) is int:
         return True
     if isinstance(value, torch.SymInt):
-        origins = HostFunction.current().expr_to_origin
-        return all(
-            symbol in origins and origins[symbol].origin.is_host()
-            for symbol in value._sympy_().free_symbols
-        )
+        return HostFunction.current().is_host_scalar_expr(value._sympy_())
     return False
 
 

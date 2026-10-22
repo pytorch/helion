@@ -257,10 +257,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 # context. Preserve the proof that a scalar can be lifted as
                 # a uniform runtime argument, rather than a device coordinate.
                 if isinstance(obj, (torch.SymInt, torch.SymFloat)):
-                    origins = HostFunction.current().expr_to_origin
-                    proxy.node.meta["helion_host_scalar"] = all(
-                        symbol in origins and origins[symbol].origin.is_host()
-                        for symbol in obj.node.expr.free_symbols
+                    proxy.node.meta["helion_host_scalar"] = (
+                        HostFunction.current().is_host_scalar_expr(obj.node.expr)
                     )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
