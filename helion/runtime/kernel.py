@@ -93,6 +93,7 @@ from .cute_structural_config import CuteStructuralConfig
 from .cute_structural_config import StructuralPolicyError
 from .cute_structural_config import require_same_structural_policy
 from .cute_structural_config import select_structural_policy
+from .pipeline import _active_pipeline
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -2270,6 +2271,8 @@ class Kernel(Generic[_R]):
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
         is_compiling = torch.compiler.is_compiling()
+        if not is_compiling and (pipeline := _active_pipeline.get()) is not None:
+            pipeline.prepare(self, args)
         if (
             not is_compiling
             and (prepared := self._prepared_call) is not None

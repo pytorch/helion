@@ -1684,9 +1684,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 compiler_seed_timeout_retry_repetitions=None,
                 backend=SimpleNamespace(supports_precompile=lambda: True),
             ),
-            env=SimpleNamespace(device=DEVICE, process_group_name=None),
+            env=SimpleNamespace(device=torch.device("cpu"), process_group_name=None),
         )
-        args = (torch.randn([8], device=DEVICE),)
+        args = (torch.randn([8]),)
         with (
             patch("helion.autotuner.llm_seeded_lfbo.LLMGuidedSearch", FakeLLMSearch),
             patch(
@@ -1912,9 +1912,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 compiler_seed_timeout_retry_repetitions=None,
                 backend=SimpleNamespace(supports_precompile=lambda: True),
             ),
-            env=SimpleNamespace(device=DEVICE, process_group_name=None),
+            env=SimpleNamespace(device=torch.device("cpu"), process_group_name=None),
         )
-        args = (torch.randn([8], device=DEVICE),)
+        args = (torch.randn([8]),)
         with (
             patch(
                 "helion.autotuner.llm_seeded_lfbo.LLMGuidedSearch",

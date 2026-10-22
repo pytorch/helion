@@ -47,6 +47,7 @@ from .benchmark_provider import IsolatedBenchmarkFailure
 from .benchmark_provider import IsolatedBenchmarkTiming
 from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import MultiShapeBenchmarkProvider
+from .benchmark_provider import PipelineBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
@@ -3103,9 +3104,22 @@ class PopulationBasedSearch(BaseSearch):
         readings: list[list[float]] = [[] for _ in range(count)]
         failures: list[Literal["error", "timeout"] | None] = [None] * count
         process_group_name = self.kernel.env.process_group_name
+        provider = self.benchmark_provider
+        pipeline_benchmarking = isinstance(provider, PipelineBenchmarkProvider)
 
         def take(index: int, warmup_ms: int, rep_ms: int) -> float | None:
-            result = measurer.measure(index, warmup_ms, rep_ms)
+            if pipeline_benchmarking:
+                member = finalists[index]
+                row = provider.benchmark([member.config], desc="Final selection")[0]
+                member.fn = row.fn
+                member.status = row.status
+                if row.status != "ok":
+                    failures[index] = "timeout" if row.status == "timeout" else "error"
+                    return None
+                result = row.perf
+            else:
+                assert measurer is not None
+                result = measurer.measure(index, warmup_ms, rep_ms)
             if isinstance(result, IsolatedBenchmarkFailure):
                 failures[index] = result.status
                 return None
@@ -3114,8 +3128,14 @@ class PopulationBasedSearch(BaseSearch):
             return float(result)
 
         try:
-            with self._final_selection_measurer(finalists, policy) as measurer:
-                if policy.thermal_warmup_ms > 0:
+            with (
+                contextlib.nullcontext(None)
+                if pipeline_benchmarking
+                else self._final_selection_measurer(finalists, policy)
+            ) as measurer:
+                # Pipeline callbacks own warmup; native warmup settings are skipped.
+                if not pipeline_benchmarking and policy.thermal_warmup_ms > 0:
+                    assert measurer is not None
                     measurer.warm(finalists.index(incumbent), policy.thermal_warmup_ms)
                 screened = policy.screens(count)
                 if screened:
@@ -3354,6 +3374,17 @@ class PopulationBasedSearch(BaseSearch):
             candidate_private_args: Use a fresh worker process per candidate;
                 when unavailable, keep argument storage private in-process.
         """
+        if isinstance(self.benchmark_provider, PipelineBenchmarkProvider):
+            results = self.benchmark_provider.benchmark(
+                [member.config for member in members], desc=desc
+            )
+            for member, result in zip(members, results, strict=True):
+                member.fn = result.fn
+                member.status = result.status
+            self._apply_rebenchmark_timings(
+                members, [result.perf for result in results]
+            )
+            return
         if len(members) < 2:
             return
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
@@ -3556,6 +3587,28 @@ class PopulationBasedSearch(BaseSearch):
         """Rebenchmark candidates with deterministic mirrored wall-time sweeps."""
         if len(members) < 2:
             return MirroredBenchmarkTrace([], [], [member.perf for member in members])
+        if isinstance(self.benchmark_provider, PipelineBenchmarkProvider):
+            orders = [list(range(len(members))), list(reversed(range(len(members))))]
+            elapsed: list[list[float]] = []
+            samples: list[list[float]] = [[] for _ in members]
+            for order in orders:
+                row = []
+                for index in order:
+                    member = members[index]
+                    result = self.benchmark_provider.benchmark(
+                        [member.config], desc=desc
+                    )[0]
+                    member.fn = result.fn
+                    member.status = result.status
+                    samples[index].append(result.perf)
+                    row.append(result.perf)
+                elapsed.append(row)
+            medians = [statistics.median(values) for values in samples]
+            for member, timing in zip(members, medians, strict=True):
+                if not math.isfinite(timing):
+                    member.status = "error"
+            self._apply_rebenchmark_timings(members, medians)
+            return MirroredBenchmarkTrace(orders, elapsed, medians, sweep_count=2)
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             raise exc.AutotuneError(
                 "mirrored terminal refinement does not support multi-shape benchmarking"
