@@ -2284,14 +2284,20 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         }
         axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
         non_matmul_axes = blocks.keys() - axis_ids
-        # A separate reduction can claim an extra CUDA thread axis. This
-        # seed family currently coordinates sibling pointwise tiles only.
-        if any(
-            block.reduction and block.block_id not in axis_ids
-            for block in env.block_sizes
+        matmul_roots = {tuple(root) for _, root, _, _ in sites}
+        # A sibling reduction can claim an extra CUDA thread axis. Preserve
+        # existing epilogue admission within the matmul's own root.
+        reduction = spec.reduction_kernel_fact
+        grid = spec.kernel_grid_fact
+        if (
+            reduction is not None
+            and grid is not None
+            and any(
+                grid.group_for_graph(item.graph_id) not in matmul_roots
+                for item in reduction.reductions
+            )
         ):
             return []
-        matmul_roots = {tuple(root) for _, root, _, _ in sites}
         # Only separate roots may retain ordinary tile defaults. A non-MMA
         # axis nested under a matmul still shares its collective thread layout.
         matmul_tree_axes = {

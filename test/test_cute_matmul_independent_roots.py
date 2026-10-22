@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
 
@@ -13,6 +15,21 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
+
+
+def _pointwise_block_id(bound: BoundKernel) -> int:
+    spec = bound.config_spec
+    fact = spec.matmul_facts[0]
+    (block_id,) = set(spec.block_sizes.valid_block_ids()) - {
+        fact.m_block_id,
+        fact.n_block_id,
+        fact.k_block_id,
+    }
+    return block_id
+
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -61,15 +78,13 @@ def test_unrelated_root_retains_its_default_tile(first: bool) -> None:
         bound = _cpu_bind(_pointwise_first if first else _pointwise_last, args)
         assert bound.host_function is not None
         spec = bound.config_spec
-        fact = spec.matmul_facts[0]
-        mma_axes = {fact.m_block_id, fact.n_block_id, fact.k_block_id}
-        (other,) = set(spec.block_sizes.valid_block_ids()) - mma_axes
+        other = _pointwise_block_id(bound)
+        fragment = spec.block_sizes.block_id_lookup(other)._fragment(spec)
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
         assert seeds
         for seed in seeds:
-            fragment = spec.block_sizes.block_id_lookup(other)._fragment(spec)
             assert (
                 spec.block_sizes.config_get(seed.block_sizes, other)
                 == fragment.default()
@@ -151,14 +166,10 @@ def test_mixed_root_seed_executes(
         bound.env, bound.host_function.device_ir
     )
     seed = next(s for s in seeds if s.get("cute_collective_compute", "warp") == compute)
+    spec = bound.config_spec
+    fact = spec.matmul_facts[0]
     if explicit_tile:
-        spec = bound.config_spec
-        fact = spec.matmul_facts[0]
-        (other,) = set(spec.block_sizes.valid_block_ids()) - {
-            fact.m_block_id,
-            fact.n_block_id,
-            fact.k_block_id,
-        }
+        other = _pointwise_block_id(bound)
         seed = helion.Config.from_dict(
             seed.config
             | {
@@ -173,8 +184,6 @@ def test_mixed_root_seed_executes(
             }
         )
     if reverse_order:
-        spec = bound.config_spec
-        fact = spec.matmul_facts[0]
         root = next(
             root
             for root in bound.host_function.device_ir.grid_block_ids
@@ -217,5 +226,69 @@ def test_sibling_reduction_does_not_receive_unlaunchable_seeds() -> None:
         )
         assert bound.host_function is not None
         assert not CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _inactive_sibling_axis(
+    a: torch.Tensor, b: torch.Tensor, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+    pointwise = torch.empty_like(x)
+    for m, n in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([m, n], dtype=torch.float32)
+        for k in hl.tile(a.size(1)):
+            acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
+        out[m, n] = acc.to(out.dtype)
+    for _unused, i in hl.tile([9, x.numel()]):
+        pointwise[i] = x[i] + 1
+    return out, pointwise
+
+
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@skipIfNotCUDA()
+@skipIfRefEager("checks collective launch dimensions")
+def test_inactive_leading_sibling_axis_keeps_the_collective_launch(
+    compute: str,
+) -> None:
+    if compute == "tcgen05" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("tcgen05 needs SM100")
+    a = torch.randn(64, 128, device="cuda", dtype=torch.float16)
+    b = torch.randn(128, 64, device="cuda", dtype=torch.float16)
+    x = torch.randn(257, device="cuda")
+    bound = _inactive_sibling_axis.bind((a, b, x))
+    assert bound.host_function is not None
+    seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+        bound.env, bound.host_function.device_ir
+    )
+    seed = next(s for s in seeds if s.get("cute_collective_compute", "warp") == compute)
+    actual, pointwise = bound.compile_config(seed)(a, b, x)
+    torch.testing.assert_close(actual, (a * 0.5) @ b)
+    torch.testing.assert_close(pointwise, x + 1)
+
+
+@skipIfRefEager("requires compiler seeds")
+def test_epilogue_reduction_keeps_its_existing_seed_admission() -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def mixed(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+        for m, n in hl.tile([a.size(0), b.size(1)]):
+            acc = hl.zeros([m, n], dtype=torch.float32)
+            acc = torch.addmm(acc, a[m, :] * 0.5, b[:, n])
+            out[m, n] = (acc + bias[m, :].sum(-1)[:, None]).to(out.dtype)
+        return out
+
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(
+            mixed,
+            (
+                torch.empty(64, 128, dtype=torch.float16),
+                torch.empty(128, 64, dtype=torch.float16),
+                torch.empty(64, 129),
+            ),
+        )
+        assert bound.host_function is not None
+        assert CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )

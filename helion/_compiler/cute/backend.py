@@ -4218,6 +4218,40 @@ class CuteBackend(Backend):
 
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
             spec = env.config_spec
+            original_num_threads_config = list(num_threads_config)
+            mma_candidate = _is_mma_candidate_loop(
+                fn,
+                block_ids,
+                block_sizes=nd_block_size,
+                num_threads_config=original_num_threads_config,
+                grid_ids=grid_ids,
+            )
+            should_filter_inactive_block_ids = len(block_ids) > 1
+            inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
+            if should_filter_inactive_block_ids:
+                used_block_ids = _graph_used_block_ids(fn, block_ids)
+                if not used_block_ids:
+                    used_block_ids = set(block_ids)
+                for block_id in tuple(used_block_ids):
+                    block_size = env.block_sizes[block_id].size
+                    if block_size is None or not isinstance(
+                        block_size, (int, torch.SymInt)
+                    ):
+                        continue
+                    for other_block_id in block_ids:
+                        if other_block_id == block_id:
+                            continue
+                        other_size = env.block_sizes[other_block_id].size
+                        if other_size is None or not isinstance(
+                            other_size, (int, torch.SymInt)
+                        ):
+                            continue
+                        if sizes_known_equal(block_size, other_size):
+                            used_block_ids.add(other_block_id)
+                inactive_block_ids.update(set(block_ids) - used_block_ids)
+            for i, block_id in enumerate(block_ids):
+                if block_id in inactive_block_ids:
+                    num_threads_config[i] = 1
             if (
                 self.name == "cute"
                 and config.get("cute_collective_mma")
@@ -4260,40 +4294,6 @@ class CuteBackend(Backend):
                         )
                     if num_threads_config[i] > 1:
                         axis += 1
-            original_num_threads_config = list(num_threads_config)
-            mma_candidate = _is_mma_candidate_loop(
-                fn,
-                block_ids,
-                block_sizes=nd_block_size,
-                num_threads_config=original_num_threads_config,
-                grid_ids=grid_ids,
-            )
-            should_filter_inactive_block_ids = len(block_ids) > 1
-            inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
-            if should_filter_inactive_block_ids:
-                used_block_ids = _graph_used_block_ids(fn, block_ids)
-                if not used_block_ids:
-                    used_block_ids = set(block_ids)
-                for block_id in tuple(used_block_ids):
-                    block_size = env.block_sizes[block_id].size
-                    if block_size is None or not isinstance(
-                        block_size, (int, torch.SymInt)
-                    ):
-                        continue
-                    for other_block_id in block_ids:
-                        if other_block_id == block_id:
-                            continue
-                        other_size = env.block_sizes[other_block_id].size
-                        if other_size is None or not isinstance(
-                            other_size, (int, torch.SymInt)
-                        ):
-                            continue
-                        if sizes_known_equal(block_size, other_size):
-                            used_block_ids.add(other_block_id)
-                inactive_block_ids.update(set(block_ids) - used_block_ids)
-            for i, block_id in enumerate(block_ids):
-                if block_id in inactive_block_ids:
-                    num_threads_config[i] = 1
             is_device_loop = any(bid not in grid_ids for bid in block_ids)
             active_block_ids = device_ir.codegen_active_block_ids
             reduction_axis_reserve = (
