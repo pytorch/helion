@@ -1160,6 +1160,27 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(run(x, other), torch.full_like(result, other))
 
+    @skipIfRefEager("checks masks on rolled custom reduction inputs")
+    def test_custom_reduction_keeps_mask_after_native_reduction(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                inverse_sum = 1.0 / values.sum(1, keepdim=True)
+                out[row] = hl.reduce(
+                    max_combine_fn, values * inverse_sum, dim=1, other=0.0
+                )
+            return out
+
+        # Valid lanes become +/-inf; padded zero lanes become NaN without
+        # the mask immediately before the custom maximum.
+        x = torch.tensor([1.0, -1.0], device=DEVICE).repeat(3, 257)
+        _, result = code_and_output(
+            reduce, (x,), block_sizes=[2], reduction_loops=[256]
+        )
+        torch.testing.assert_close(result, torch.full_like(result, float("inf")))
+
     @skipIfRefEager("checks mixed reduction heuristic seeds")
     def test_custom_baseline_preserves_unrelated_native_schedule(self) -> None:
         @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")

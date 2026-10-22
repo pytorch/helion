@@ -4435,6 +4435,22 @@ class _LivenessTileAllocation(NamedTuple):
     num_warps: int
 
 
+def _custom_persistent_reduction_loops(
+    spec: ConfigSpec, config: Config
+) -> tuple[list[int | None], bool]:
+    """Keep native loop widths while making custom axes persistent."""
+    fact = spec.reduction_kernel_fact
+    assert fact is not None
+    custom_ids = {r.block_id for r in fact.reductions if r.is_custom}
+    mixed = any(loop.block_id not in custom_ids for loop in spec.reduction_loops)
+    return [
+        None if loop.block_id in custom_ids else width
+        for loop, width in zip(
+            spec.reduction_loops, config.reduction_loops, strict=True
+        )
+    ], mixed
+
+
 class TritonReductionHeuristic(AutotunerHeuristic):
     """Candidate-resolved Triton reduction seed for H100 and B200.
 
@@ -5253,16 +5269,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             return [config]
 
         persistent = dict(config.config)
-        custom_ids = {
-            reduction.block_id for reduction in kf.reductions if reduction.is_custom
-        }
-        mixed = any(loop.block_id not in custom_ids for loop in spec.reduction_loops)
-        persistent["reduction_loops"] = [
-            None if loop.block_id in custom_ids else width
-            for loop, width in zip(
-                spec.reduction_loops, config.reduction_loops, strict=True
-            )
-        ]
+        persistent["reduction_loops"], mixed = _custom_persistent_reduction_loops(
+            spec, config
+        )
         if not mixed:
             persistent["block_sizes"] = [
                 cls._block_floor(block)
@@ -5316,25 +5325,16 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         seed: dict[str, Any] = {
-            "block_sizes": [1] * len(spec.block_sizes),
+            "block_sizes": [1],
             "reduction_loops": [None],
         }
         mixed = False
         if spec.has_custom_reduction_loops:
-            fact = spec.reduction_kernel_fact
-            assert fact is not None
-            custom_ids = {r.block_id for r in fact.reductions if r.is_custom}
-            mixed = any(
-                loop.block_id not in custom_ids for loop in spec.reduction_loops
-            )
             default = spec._base_default_config()
             seed = dict(default.config)
-            seed["reduction_loops"] = [
-                None if loop.block_id in custom_ids else width
-                for loop, width in zip(
-                    spec.reduction_loops, default.reduction_loops, strict=True
-                )
-            ]
+            seed["reduction_loops"], mixed = _custom_persistent_reduction_loops(
+                spec, default
+            )
             seed["block_sizes"] = [
                 1 if not mixed and block.block_id in spec.grid_block_ids else value
                 for block, value in zip(
