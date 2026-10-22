@@ -32,6 +32,7 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
+from .inductor_lowering import custom_reduction_sources
 from .inductor_lowering import reduction_block_id
 
 if TYPE_CHECKING:
@@ -566,8 +567,11 @@ class ReductionRoller:
                     continue
                 seen.add(node)
                 if self.is_reduction(node):
-                    inputs = node.args[1] if node.target is _reduce else node.args[0]
-                    sources = inputs if isinstance(inputs, (list, tuple)) else (inputs,)
+                    sources = (
+                        custom_reduction_sources(node)
+                        if node.target is _reduce
+                        else (node.args[0],)
+                    )
                     if any(
                         isinstance(source, torch.fx.Node) and inside_loop(source)
                         for source in sources

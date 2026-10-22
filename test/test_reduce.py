@@ -16,6 +16,8 @@ from helion._compiler.cute.canonicalize_reductions import _independent_combines
 from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import HelperFunctionGraphInfo
+from helion._compiler.inductor_lowering import ReductionLowering
+from helion._compiler.node_masking import remove_unnecessary_masking
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -1278,50 +1280,69 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                 custom[other_row] = hl.reduce(add_combine_fn, y[other_row, :], dim=1)
             return native, custom
 
-        bound = mixed.bind(
-            (torch.empty(5, 65536, device=DEVICE), torch.empty(5, 8192, device=DEVICE))
-        )
-        assert bound.host_function is not None
-        env, ir = bound.env, bound.host_function.device_ir
-        self.assertTrue(bound.config_spec.has_custom_reduction_loops)
-        seeds = TritonReductionHeuristic.get_seed_configs(env, ir)
-        with patch.object(
-            type(bound.config_spec),
-            "has_custom_reduction_loops",
-            new_callable=PropertyMock,
-            return_value=False,
-        ):
-            native_seed = TritonReductionHeuristic.get_seed_configs(env, ir)[0]
-        self.assertEqual(seeds[0], native_seed)
-        native_ids = {
-            r.block_id
-            for r in bound.config_spec.reduction_kernel_fact.reductions
-            if not r.is_custom
-        }
-        for seed in seeds:
-            for block_id in native_ids:
-                self.assertEqual(
-                    bound.config_spec.reduction_loops.config_get(
-                        seed.reduction_loops, block_id
-                    ),
-                    bound.config_spec.reduction_loops.config_get(
-                        native_seed.reduction_loops, block_id
-                    ),
-                )
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def mixed_same_root(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            native = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            custom = torch.empty_like(native)
+            for row in hl.tile(x.size(0)):
+                native[row] = x[row, :].sum(1)
+                custom[row] = hl.reduce(add_combine_fn, y[row, :], dim=1)
+            return native, custom
 
-        narrow = TritonNarrowReductionHeuristic.get_seed_config(env, ir)
-        default = bound.config_spec._base_default_config()
-        for block_id in native_ids:
-            self.assertEqual(
-                bound.config_spec.reduction_loops.config_get(
-                    narrow.reduction_loops, block_id
-                ),
-                bound.config_spec.reduction_loops.config_get(
-                    default.reduction_loops, block_id
-                ),
-            )
-        self.assertEqual(narrow.block_sizes, default.block_sizes)
-        self.assertEqual(narrow.num_warps, default.num_warps)
+        for custom_width, same_root in ((8192, False), (65536, False), (65536, True)):
+            with self.subTest(custom_width=custom_width, same_root=same_root):
+                bound = (mixed_same_root if same_root else mixed).bind(
+                    (
+                        torch.empty(5, 65536, device=DEVICE),
+                        torch.empty(5, custom_width, device=DEVICE),
+                    )
+                )
+                assert bound.host_function is not None
+                env, ir = bound.env, bound.host_function.device_ir
+                self.assertEqual(
+                    bound.config_spec.has_custom_reduction_loops, not same_root
+                )
+                seeds = TritonReductionHeuristic.get_seed_configs(env, ir)
+                with patch.object(
+                    type(bound.config_spec),
+                    "has_custom_reduction_loops",
+                    new_callable=PropertyMock,
+                    return_value=False,
+                ):
+                    native_seed = TritonReductionHeuristic.get_seed_configs(env, ir)[0]
+                self.assertEqual(seeds[0], native_seed)
+                native_ids = {
+                    r.block_id
+                    for r in bound.config_spec.reduction_kernel_fact.reductions
+                    if not r.is_custom
+                }
+                for seed in seeds:
+                    for block_id in native_ids:
+                        self.assertEqual(
+                            bound.config_spec.reduction_loops.config_get(
+                                seed.reduction_loops, block_id
+                            ),
+                            bound.config_spec.reduction_loops.config_get(
+                                native_seed.reduction_loops, block_id
+                            ),
+                        )
+
+                if bound.config_spec.has_custom_reduction_loops:
+                    narrow = TritonNarrowReductionHeuristic.get_seed_config(env, ir)
+                    default = bound.config_spec._base_default_config()
+                    for block_id in native_ids:
+                        self.assertEqual(
+                            bound.config_spec.reduction_loops.config_get(
+                                narrow.reduction_loops, block_id
+                            ),
+                            bound.config_spec.reduction_loops.config_get(
+                                default.reduction_loops, block_id
+                            ),
+                        )
+                    self.assertEqual(narrow.block_sizes, default.block_sizes)
+                    self.assertEqual(narrow.num_warps, default.num_warps)
 
     @skipIfRefEager("checks generated reduction-loop code")
     def test_nonzero_identity_and_nonidentity_padding(self) -> None:
@@ -1411,6 +1432,37 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(totals, x.sum(1), atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(squares, x.square().sum(1))
         self.assertEqual(code.count("for roffset_"), 1)
+
+
+class TestCustomReductionMasks(unittest.TestCase):
+    def test_reduction_dependent_padding_keeps_its_mask(self) -> None:
+        for custom_before, custom_after in ((False, True), (True, False), (True, True)):
+            with self.subTest(custom_before=custom_before, custom_after=custom_after):
+                graph = torch.fx.Graph()
+                value = graph.placeholder("value")
+                if custom_before:
+                    total = graph.call_function(_reduce, (0, value, 0, True, False))
+                else:
+                    total = graph.call_function(
+                        torch.ops.aten.sum.dim_IntList, (value, [0], True)
+                    )
+                    total.meta["lowering"] = object.__new__(ReductionLowering)
+                shifted = graph.call_function(torch.ops.aten.sub.Tensor, (value, total))
+                # Even a known padded value cannot remove the explicit mask
+                # across two reductions with different logical lane domains.
+                shifted.meta["masked_value"] = 0.0
+                mask = graph.call_function(_mask_to, (shifted, 0.0))
+                if custom_after:
+                    result = graph.call_function(_reduce, (0, mask, 0, False, False))
+                else:
+                    result = graph.call_function(
+                        torch.ops.aten.sum.dim_IntList, (mask, [0], False)
+                    )
+                    result.meta["lowering"] = object.__new__(ReductionLowering)
+                graph.output(result)
+                remove_unnecessary_masking(graph)
+                self.assertIn(mask, graph.nodes)
+                self.assertIs(result.args[1] if custom_after else result.args[0], mask)
 
 
 if __name__ == "__main__":

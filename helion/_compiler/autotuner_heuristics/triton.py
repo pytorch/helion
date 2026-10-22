@@ -4451,11 +4451,12 @@ def _custom_reduction_grid_ids(spec: ConfigSpec) -> set[int]:
 def _custom_persistent_reduction_loops(
     spec: ConfigSpec, config: Config
 ) -> tuple[list[int | None], bool]:
-    """Keep native loop widths while making custom axes persistent."""
+    """Keep native loop widths while making custom-only axes persistent."""
     fact = spec.reduction_kernel_fact
     assert fact is not None
-    custom_ids = {r.block_id for r in fact.reductions if r.is_custom}
-    mixed = any(loop.block_id not in custom_ids for loop in spec.reduction_loops)
+    native_ids = {r.block_id for r in fact.reductions if not r.is_custom}
+    custom_ids = {r.block_id for r in fact.reductions if r.is_custom} - native_ids
+    mixed = bool(native_ids)
     return [
         None if loop.block_id in custom_ids else width
         for loop, width in zip(

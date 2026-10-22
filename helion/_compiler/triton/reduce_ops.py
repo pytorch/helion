@@ -20,6 +20,7 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..inductor_lowering import custom_reduction_sources
 from ..node_masking import cached_masked_value
 from ..tile_strategy import DeviceLoopState
 
@@ -86,11 +87,7 @@ def _codegen_rolled_reduce(
 ) -> ast.AST:
     """Carry chunk-sized payloads through the loop and reduce after it finishes."""
     assert state.fx_node is not None
-    inputs = state.fx_node.args[1]
-    sources = cast(
-        "tuple[torch.fx.Node, ...]",
-        inputs if isinstance(inputs, (tuple, list)) else (inputs,),
-    )
+    sources = custom_reduction_sources(state.fx_node)
     dim = cast("int", state.proxy_arg(2))
     keep_dims = state.proxy_arg(3)
     is_tuple_input = bool(state.proxy_arg(4))

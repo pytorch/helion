@@ -40,6 +40,7 @@ from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .inductor_lowering import custom_reduction_sources
 from .inductor_lowering import reduction_block_id
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
@@ -1155,6 +1156,7 @@ class GraphAnalysis:
         reduction_axis_by_node_id: dict[int, int] = {}
         custom_reduction_steps: list[tuple[LiveTile, ...]] = []
         custom_reduction_block_ids: set[int] = set()
+        native_reduction_block_ids: set[int] = set()
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
         operand_positions = matmul_operand_positions()
         promoted_lhs_nodes: set[torch.fx.Node] = set()
@@ -1200,16 +1202,17 @@ class GraphAnalysis:
                 reduction_axis_by_node_id[id(node)] = block_id
                 if node.target is _reduce:
                     custom_reduction_block_ids.add(block_id)
+                else:
+                    native_reduction_block_ids.add(block_id)
                 if block_id not in seen_reductions:
                     seen_reductions.add(block_id)
                     reduction_occurrences.append(block_id)
                 if (
                     node.target is _reduce
                     and env.backend_name == "triton"
-                    and node.args[2] is not None
+                    and block_id in env.config_spec.reduction_loops.valid_block_ids()
                 ):
-                    inputs = node.args[1]
-                    sources = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                    sources = custom_reduction_sources(node)
                     # Each payload needs its own carry, even when inputs alias.
                     custom_reduction_steps.append(
                         tuple(
@@ -1296,7 +1299,9 @@ class GraphAnalysis:
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
             memory_tiles=tuple(memory_tiles),
-            custom_reduction_block_ids=frozenset(custom_reduction_block_ids),
+            custom_reduction_block_ids=frozenset(
+                custom_reduction_block_ids - native_reduction_block_ids
+            ),
         )
 
     def reaches_output(self, node: torch.fx.Node, limit: int = 64) -> bool:

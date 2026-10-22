@@ -23,6 +23,7 @@ from ..language._tracing_ops import _mask_to
 from ..language._tracing_ops import _phi
 from ..language._tracing_ops import is_for_loop_target
 from ..language.creation_ops import full
+from ..language.reduce_ops import _reduce
 from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
@@ -126,7 +127,7 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
                 continue
             visited.add(current)
             lowering = current.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
+            if isinstance(lowering, ReductionLowering) or current.target is _reduce:
                 result = True
                 break
             stack.extend(current.all_input_nodes)
@@ -142,7 +143,7 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
         result = False
         for user in node.users:
             lowering = user.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
+            if isinstance(lowering, ReductionLowering) or user.target is _reduce:
                 result = True
                 break
             if user.op == "call_function" and feeds_reduction_input(user):

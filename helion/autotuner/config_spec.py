@@ -701,6 +701,7 @@ class ReductionDescriptor(NamedTuple):
     row_reread: bool = False
     reread_eviction_index: int | None = None
     fixed_tile_size_hint: int | None = None
+    # Native scheduling owns an axis shared by native and custom operations.
     is_custom: bool = False
 
 

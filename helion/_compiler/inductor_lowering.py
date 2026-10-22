@@ -1244,6 +1244,15 @@ class ReductionLowering(InductorLowering):
         return result
 
 
+def custom_reduction_sources(node: torch.fx.Node) -> tuple[torch.fx.Node, ...]:
+    """Normalize the tensor payloads of an ``_reduce`` node."""
+    inputs = node.args[1]
+    return cast(
+        "tuple[torch.fx.Node, ...]",
+        tuple(inputs) if isinstance(inputs, (tuple, list)) else (inputs,),
+    )
+
+
 def reduction_block_id(node: torch.fx.Node) -> int | None:
     """Return the block reduced by a native or single-axis custom reduction."""
 
@@ -1252,15 +1261,15 @@ def reduction_block_id(node: torch.fx.Node) -> int | None:
         return lowering.block_index
     if node.target is not _reduce or node.args[2] is None:
         return None
-    inputs, dim = node.args[1:3]
-    source = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-    assert isinstance(source, torch.fx.Node)
+    inputs = custom_reduction_sources(node)
+    dim = node.args[2]
+    source = inputs[0]
     value = source.meta["val"]
     assert isinstance(value, torch.Tensor)
     assert isinstance(dim, int)
     env = CompileEnvironment.current()
     block_id = env.get_block_id(value.size(dim))
-    if isinstance(inputs, (tuple, list)) and any(
+    if any(
         env.get_block_id(payload.meta["val"].size(dim)) != block_id
         for payload in inputs
     ):
