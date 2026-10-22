@@ -1,4 +1,4 @@
-"""Logical axes still referenced by a set of lowered CuTe device graphs."""
+"""Logical axes still referenced by a set of lowered device graphs."""
 
 from __future__ import annotations
 
@@ -7,25 +7,26 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
-from ...language import _MEMORY_OPS
-from ...language.matmul_ops import MATMUL_FACT_ID_META
-from ...language.memory_ops import load
-from ..compile_environment import CompileEnvironment
-from ..device_ir import ForLoopGraphInfo
-from ..indexing_strategy import SubscriptIndexing
-from ..inductor_lowering import ReductionLowering
+from ..language import _MEMORY_OPS
+from ..language.matmul_ops import MATMUL_FACT_ID_META
+from ..language.memory_ops import load
+from .compile_environment import CompileEnvironment
+from .indexing_strategy import SubscriptIndexing
+from .inductor_lowering import ReductionLowering
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
-    from ..device_ir import GraphInfo
+    from .device_ir import GraphInfo
 
 
 def active_block_ids(
     graphs: Sequence[GraphInfo], root_blocks: Iterable[int], env: CompileEnvironment
 ) -> frozenset[int]:
     """Keep shape/index symbols, explicit loops and actual reduction lowerings."""
+    from .device_ir import ForLoopGraphInfo
+
     result = set(root_blocks)
 
     def visit(value: object) -> None:
@@ -74,10 +75,14 @@ def unused_block_ids(graphs: Sequence[GraphInfo], block_ids: set[int]) -> set[in
             if (
                 node.target in _MEMORY_OPS
                 and node.target is not load
-                and isinstance(node.args[0], torch.fx.Node)
-                and isinstance(tensor := node.args[0].meta["val"], torch.Tensor)
                 and isinstance(node.args[1], (list, tuple))
             ):
+                target = node.args[0]
+                if isinstance(target, (list, tuple)):
+                    target = target[0]  # StackTensor's shape/stride template
+                assert isinstance(target, torch.fx.Node)
+                tensor = target.meta["val"]
+                assert isinstance(tensor, torch.Tensor)
                 index = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
                 shape = SubscriptIndexing.compute_shape(tensor, [*index])
                 unused.difference_update(map(env.get_block_id, shape))

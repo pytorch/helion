@@ -203,7 +203,7 @@ class TileStrategyDispatch:
         inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
 
         if self._constexpr_live_graph_ids is not None:
-            from .cute.active_blocks import active_block_ids as live_block_ids
+            from .active_blocks import active_block_ids as live_block_ids
 
             # A reduction dim used only on the untaken side of a constant
             # branch is never emitted; its strategy would only claim an axis.

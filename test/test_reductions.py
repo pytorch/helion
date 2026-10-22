@@ -485,6 +485,36 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, x.sum(dim=(1, 2)))
         self.assertTrue((cleared == 0).all())
 
+    # CuTe needs more than three thread axes for the merged + stack-store dims.
+    @onlyBackends(["triton"])
+    @skipIfRefEager("checks merged dimensions beside an indirect store")
+    def test_merged_reduction_dims_beside_a_stack_store(self):
+        @helion.kernel(static_shapes=True)
+        def sum_and_clear(
+            x: torch.Tensor, example: torch.Tensor, pointers: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = x[row, :, :].sum((1, 2))
+                tensors = hl.stacktensor_like(example, pointers[0])
+                tensors[row, :, :] = 0
+            return out
+
+        x = torch.randint(-4, 5, (6, 7, 9), device=DEVICE).float()
+        members = [torch.ones_like(x)]
+        pointers = torch.tensor(
+            [member.data_ptr() for member in members],
+            device=DEVICE,
+            dtype=torch.uint64,
+        )
+        code, output = code_and_output(
+            sum_and_clear, (x, members[0], pointers), block_sizes=[2]
+        )
+        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
+        torch.testing.assert_close(output, x.sum((1, 2)))
+        for member in members:
+            self.assertTrue((member == 0).all())
+
     # CuTe can't lower the chained reductions yet
     @onlyBackends(["triton"])
     @skipIfRefEager("checks the generated code")

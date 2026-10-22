@@ -3506,7 +3506,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         if scaled_contractions:
-            from .cute.active_blocks import active_block_ids
+            from .active_blocks import active_block_ids
 
             device_ir.codegen_active_block_ids = active_block_ids(
                 device_ir.graphs,
@@ -3530,7 +3530,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             if any(
                 [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
             ):
-                from .cute.active_blocks import active_block_ids
+                from .active_blocks import active_block_ids
 
                 device_ir.codegen_active_block_ids = active_block_ids(
                     device_ir.graphs,
@@ -3611,7 +3611,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # rolling analysis. CuTe would also claim a thread axis for each.
             # Only rdims nothing uses are demoted: a later slice of the same
             # extent would come from a subscript that kept the rdim in use.
-            from .cute.active_blocks import unused_block_ids
+            from .active_blocks import unused_block_ids
 
             for block_id in unused_block_ids(device_ir.graphs, merged_rdims):
                 CompileEnvironment.current().block_sizes[block_id].reduction = False

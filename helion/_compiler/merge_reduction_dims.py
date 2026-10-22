@@ -112,10 +112,7 @@ def chain_reduction_dims(
         # Tag the chain with its source so merge_reduction_dims can replace it.
         # Bool extrema use the integer chain above; merging the original
         # bool op would bypass that conversion and recreate any/all lowering.
-        if mode is not None and not (
-            source.dtype == torch.bool
-            and op in (torch.ops.aten.amax.default, torch.ops.aten.amin.default)
-        ):
+        if mode is not None and not bool_extrema:
             node = cast(
                 "Any", proxy_tensor.get_proxy_slot(result, mode.tracer)
             ).proxy.node
