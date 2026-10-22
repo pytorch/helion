@@ -101,6 +101,44 @@ def mma_e4m3(
 
 
 @dsl_user_op
+def mma_tf32(
+    a0: object,
+    a1: object,
+    a2: object,
+    a3: object,
+    b0: object,
+    b1: object,
+    c0: object,
+    c1: object,
+    c2: object,
+    c3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> tuple[object, ...]:
+    """``mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32``: lane (g, c)
+    supplies A rows g / g+8 at k c (a0 / a1) and k c+4 (a2 / a3), column g
+    of B at the same k (b0 / b1), as fp32 bit patterns the tensor core
+    truncates to tf32 (the ``input_precision='tf32'`` numerics)."""
+    values = [
+        *[cutlass.Uint32(v).ir_value(loc=loc, ip=ip) for v in (a0, a1, a2, a3, b0, b1)],
+        *[cutlass.Float32(v).ir_value(loc=loc, ip=ip) for v in (c0, c1, c2, c3)],
+    ]
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),  # pyrefly: ignore[missing-attribute]
+        values,
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return _floats(result, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def ldg_b32(
     gmem_address: object, *, loc: object = None, ip: object = None
 ) -> cutlass.Uint32:

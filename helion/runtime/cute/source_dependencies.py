@@ -74,6 +74,8 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ),
     "gathered_mma_tma": (
         "_compiler/cute/_mlir_compat.py",
@@ -96,6 +98,12 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/gdn_recurrence_sm100.py",
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
+    ),
+    "helion_mma_dag_tma": (
+        "_compiler/cute/_mma_dag_runtime.py",
+        "_compiler/cute/_mma_dag_tcgen05_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+        "_compiler/cute/_warp_mma_runtime.py",
     ),
 }
 

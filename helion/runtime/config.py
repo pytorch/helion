@@ -22,6 +22,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
@@ -57,6 +58,7 @@ class Config(Mapping[str, object]):
         ) = None,
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
+        cute_store_policy: CuteStorePolicyLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
         cute_async_load_group_rows: int | None = None,
@@ -73,6 +75,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -112,9 +115,12 @@ class Config(Mapping[str, object]):
                 ordinary path.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
-                Valid values are "", "first", and "last".
+                Valid values are "", "first", and "last". CuTe also supports
+                "nc_l2_first" for proven read-only 16-byte or 32-byte packets.
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
+            cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
+                global store packets ("default" or "l2_evict_last").
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
@@ -155,6 +161,9 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
+                reservations for equal addresses within each active warp. Each
+                lane retains its own valid fetch-add return value. Off by default.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -234,6 +243,7 @@ class Config(Mapping[str, object]):
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
+            "cute_store_policy": cute_store_policy,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
             "cute_async_load_group_rows": cute_async_load_group_rows,
@@ -250,6 +260,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,
@@ -520,6 +531,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteAsyncStorePolicyLiteral",
             self.config.get("cute_async_store_policy", "default"),
+        )
+
+    @property
+    def cute_store_policy(self) -> CuteStorePolicyLiteral:
+        return cast(
+            "CuteStorePolicyLiteral",
+            self.config.get("cute_store_policy", "default"),
         )
 
     @property

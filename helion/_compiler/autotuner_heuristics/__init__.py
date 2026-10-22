@@ -31,6 +31,7 @@ from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFlashGatedAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteGdnRecurrenceHeuristic
+from .cute import CuteMaskedRolledClusterHeuristic
 from .cute import CuteNestedRowHeuristic
 from .cute import CutePackedSingleTokenRank1Heuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
@@ -141,6 +142,7 @@ from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
 from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
 from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
+from .cute_full_chunk_row import CuteFullChunkRowHeuristic
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -151,20 +153,30 @@ from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
 from .cute_materialized_pdl import register_materialized_pdl_coverage
+from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_packed_operand import register_packed_operand_coverage
+from .cute_radix_selection import CuteRadixSelectionHeuristic
+from .cute_radix_selection import register_radix_selection_coverage
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
+from .cute_warp_atomic import CuteWarpAtomicHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .register_chain import CuteRegisterChainHeuristic
+from .tileir import TileIRChunkReductionHeuristic
+from .tileir import TileIRMatmulSeedHeuristic
+from .tileir import TileIRRowReductionHeuristic
+from .tileir import TileIRSmallReductionHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100FormulaMatmulHeuristic
@@ -191,6 +203,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
         CuteGdnRecurrenceHeuristic,
+        CuteMmaDagHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,
         CuteTopKHeuristic,
@@ -205,6 +218,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteMaterializedMmaHeuristic,
         CuteMaterializedOperandHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
+        CuteTcgen05ScheduleHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedWorklistHeuristic,
         CuteTcgen05GroupedStaticCommonKHeuristic,
@@ -219,6 +233,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteAsyncPersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
         CuteRolledClusterLadderHeuristic,
+        CuteMaskedRolledClusterHeuristic,
         CuteScanTileHeuristic,
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
@@ -230,6 +245,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentRowWideClusterHeuristic,
         CuteResidentMultiRowHeuristic,
         CutePointwiseVecHeuristic,
+        CuteWarpAtomicHeuristic,
         CuteRegisterChainHeuristic,
         CuteBoundedLoopCacheHeuristic,
         CuteHostPairedSumHeuristic,
@@ -258,6 +274,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentWarpProducerRegionsHeuristic,
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
+        CuteRadixSelectionHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -273,6 +290,12 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonReductionHeuristic,
         TritonNarrowReductionHeuristic,
         TritonPointwiseSeedHeuristic,
+    ),
+    "tileir": (
+        TileIRMatmulSeedHeuristic,
+        TileIRRowReductionHeuristic,
+        TileIRSmallReductionHeuristic,
+        TileIRChunkReductionHeuristic,
     ),
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
@@ -347,9 +370,13 @@ def compiler_seed_specialization_facts(
     one heuristic registered for the backend happens to depend on it.
     """
     fired = frozenset(fired_heuristics)
+    heuristics = get_heuristics(backend)
+    if backend == "cute":
+        # This bounded family is appended after the complete legacy seed list.
+        heuristics = (*heuristics, CuteRolledClusterPacketHeuristic)
     return frozenset(
         fact
-        for heuristic in get_heuristics(backend)
+        for heuristic in heuristics
         if heuristic.name in fired
         for fact in heuristic.CACHE_SPECIALIZATION_FACTS
     )
@@ -484,6 +511,21 @@ def compiler_seed_configs(
             configs.append(paired)
             configs.append(
                 Config.from_dict(paired.config | {STARTUP_PREFILL_KEY: True})
+            )
+    if env.backend_name == "cute":
+        # Add these last, after every legacy postprocessor and carrier. Existing
+        # seed prefixes and promoted defaults must remain unchanged.
+        full_chunks = CuteFullChunkRowHeuristic.get_seed_configs(env, device_ir)
+        if full_chunks:
+            configs.extend(full_chunks)
+            env.config_spec.autotuner_heuristics.append(CuteFullChunkRowHeuristic.name)
+        cluster_packets = CuteRolledClusterPacketHeuristic.get_seed_configs(
+            env, device_ir
+        )
+        if cluster_packets:
+            configs.extend(cluster_packets)
+            env.config_spec.autotuner_heuristics.append(
+                CuteRolledClusterPacketHeuristic.name
             )
     return dedupe_configs(configs)
 
@@ -752,3 +794,7 @@ def register_compiler_coverage_groups(
     )
     register_fragment_scan_exports_coverage(env, device_ir)
     register_fragment_warp_producer_regions_coverage(env, device_ir)
+    register_radix_selection_coverage(env, device_ir)
+    from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
+
+    register_mxfp8_epilogue_coverage(env)

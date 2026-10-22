@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _codegen_skip_reason
 from ._cute_binding import _cpu_bind
 from ._cute_binding import _forbid_native_compile
 from ._cute_binding import _mock_cuda_unavailable
@@ -52,6 +53,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1784,6 +1786,30 @@ class TestMisc(RefEagerTestBase, TestCase):
                         self.assertLess(mismatched, 0.05)
 
     @skipIfNotCUDA()
+    def test_gelu_half_subnormal_rounds_like_eager(self):
+        # Odd fp16 subnormals cannot represent x / 2 exactly. GELU must keep
+        # that prefactor in fp32 and round only its completed result.
+        @helion.kernel(autotune_effort="none")
+        def gelu_then_mul(
+            x: torch.Tensor, w: torch.Tensor, approximate: str
+        ) -> torch.Tensor:
+            out = torch.empty([2, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                g = torch.nn.functional.gelu(x[tile], approximate=approximate)
+                out[0, tile] = g
+                out[1, tile] = g * w[tile]
+            return out
+
+        x = (torch.arange(-2048, 2048, device=DEVICE).float() * 2**-24).half()
+        w = torch.full_like(x, 1.5)
+        for approximate in ("tanh", "none"):
+            with self.subTest(approximate=approximate):
+                _, result = code_and_output(gelu_then_mul, (x, w, approximate))
+                gelu = torch.nn.functional.gelu(x, approximate=approximate)
+                expected = torch.stack([gelu, gelu * w])
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
     @onlyBackends(["triton", "cute"])
     def test_device_symint_local_not_lifted_as_host_arg(self):
@@ -1876,13 +1902,20 @@ class TestHelionCutePrinter(TestCase):
                 result[row] = x[row] + value
             return result
 
+        backends = [
+            backend
+            for backend in ("cute", "triton")
+            if _codegen_skip_reason(backend) is None
+        ]
+        if not backends:
+            raise unittest.SkipTest("no backend can generate device source")
         with (
             _mock_cuda_unavailable(),
             _target(),
             _forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
-            for backend in ("cute", "triton"):
+            for backend in backends:
                 kernel = helion.kernel(
                     powers, backend=backend, static_shapes=True, autotune_effort="none"
                 )
@@ -2549,6 +2582,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cutlass = pytest.importorskip("cutlass")
@@ -2653,7 +2687,7 @@ def test_cute_unsigned_scalar_load_codegen(dtype):
             assert ast.unparse(branches[0].orelse) == f"{logical}(0)"
 
 
-@skipUnlessBackends(["cute"])
+@onlyBackends(["cute"])
 class TestUnsignedScalarLoads(TestCase):
     def test_unsigned_scalar_loads_preserve_high_bits_and_tails(self):
         for dtype in (torch.uint8, torch.uint32):

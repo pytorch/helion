@@ -30,6 +30,7 @@ dev = [
     "expecttest",
     "pytest",
     "pytest-timeout",
+    "pytest-xdist",
     "pre-commit",
     "hypothesis",
     "tabulate",
@@ -172,6 +173,7 @@ allow-direct-references = true
 source = "vcs"
 
 [tool.pytest.ini_options]
+markers = ["cuda: requires an explicitly assigned CUDA device"]
 # artifacts/ holds gitignored benchmark and probe outputs, some of them named
 # test_*.py with import-time side effects; pytest must never collect them
 # (pytest's built-in defaults plus artifacts and the docs build).

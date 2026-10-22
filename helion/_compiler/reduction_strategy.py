@@ -2404,6 +2404,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         # cluster; decided lazily at the first ``codegen_device_loop`` (see
         # ``_maybe_apply_cute_rolled_cluster``).
         self._cute_rolled_cluster_n = 1
+        self._cute_rolled_cluster_slice_len = 0
         self._cute_rolled_cluster_checked = False
 
     def _maybe_apply_cute_rolled_cluster(self, state: CodegenState) -> None:
@@ -2459,17 +2460,37 @@ class LoopedReductionStrategy(ReductionStrategy):
         ):
             return
         numel = env.specialize_expr(env.block_sizes[self.block_index].numel)
-        # A partial chunk would cross its CTA's slice and double-count values.
-        # Dynamic extents may use the existing exact input-metadata guard;
-        # unbacked extents and bindings without that guard remain masked.
-        if not env.specialized_multiple(numel, cl * self._loop_block_size):
+        # Static tails can be padded to whole chunks per CTA. Each rank owns
+        # a disjoint contiguous padded slice, and the original extent still
+        # masks the loads and reduction inputs. Dynamic extents retain the
+        # exact input-metadata guard used by the unmasked cluster schedule.
+        static_numel = isinstance(numel, sympy.Integer)
+        if not static_numel and not env.specialized_multiple(
+            numel, cl * self._loop_block_size
+        ):
             return
         numel_int = shape_env_size_hint(env.shape_env, numel)
         if numel_int <= 0:
             return
+        slice_len = (
+            -(-numel_int // (cl * self._loop_block_size)) * self._loop_block_size
+            if static_numel
+            else numel_int // cl
+        )
+        # Cluster rank-relative begin/end expressions use cutlass.Int32.
+        # A logical extent can fit while the padded final slice overflows.
+        if static_numel and slice_len * cl > 2**31 - 1:
+            return
         self._cute_rolled_cluster_n = cl
+        self._cute_rolled_cluster_slice_len = slice_len
         self.fn.cute_state.simt_cluster_n = cl
-        self._mask_var = None
+        if slice_len * cl == numel_int:
+            self._mask_var = None
+        elif self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
+            self._cute_reduction_chunk_uniform_mask = env.known_multiple(
+                numel, self._cute_reduction_vec_width
+            )
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -3053,7 +3074,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             # own contiguous slice (the launch adds a grid dim of
             # ``cluster_n`` CTAs per outer index); the finalize combines
             # the partials across the cluster.
-            slice_len = int(numel) // self._cute_rolled_cluster_n
+            slice_len = self._cute_rolled_cluster_slice_len
             rank_expr = env.backend.program_id_expr(1, index_dtype="cutlass.Int32")
             range_begin = f"{rank_expr} * {slice_len}"
             range_end = f"{rank_expr} * {slice_len} + {slice_len}"

@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _forbid_cuda_work
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
@@ -240,7 +241,7 @@ def test_rejects_unmodelled_or_overfull_configs(invalid: str) -> None:
         bound.to_code(_config(**overrides))
 
 
-@pytest.mark.parametrize("other", ("bias", "fanout", "column_major", "no_capacity"))
+@pytest.mark.parametrize("other", ("bias", "fanout", "no_capacity"))
 def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     a, b, out = args = _args()
     if other == "bias":
@@ -249,9 +250,6 @@ def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     elif other == "fanout":
         second = torch.empty_like(out)
         bound = _fanout_gemm._bind_isolated((a, b, out, second))
-    elif other == "column_major":
-        out = out.t().contiguous().t()
-        bound = _gemm._bind_isolated((a, b, out))
     else:
         with patch.object(
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=0
@@ -266,6 +264,45 @@ def test_unknown_allocations_keep_conservative_profile(other: str) -> None:
     )
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(_config())
+
+
+def test_column_major_output_prices_its_actual_store_ring() -> None:
+    import cutlass
+    from cutlass import cute
+    from cutlass._mlir import ir
+    from cutlass.utils import blackwell_helpers
+    from cutlass.utils.layout import LayoutEnum
+
+    from helion._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+
+    a, b, out = _args()
+    out = out.t().contiguous().t()
+    with _forbid_cuda_work():
+        bound = _gemm._bind_isolated((a, b, out))
+        facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+        assert facts is not None and facts.output_column_major
+        code = bound.to_code(_config())
+        assert "LayoutEnum.COL_MAJOR" in code
+        assert "PipelineTmaStore.create" in code
+        with ir.Context(), ir.Location.unknown():
+            module = ir.Module.create()
+            with ir.InsertionPoint(module.body):
+                tile = blackwell_helpers.compute_epilogue_tile_shape(
+                    (64, 128), True, LayoutEnum.COL_MAJOR, cutlass.BFloat16
+                )
+                layout = blackwell_helpers.make_smem_layout_epi(
+                    cutlass.BFloat16, LayoutEnum.COL_MAJOR, tile, 2
+                )
+                actual_output_bytes = 2 * cute.cosize(layout.outer)
+        ab_bytes = tcgen05_ab_smem_bytes_per_cta(
+            bm=128, bn=128, bk=64, dtype_bytes=2, ab_stages=13, cluster_m=2
+        )
+        assert (
+            pipeline_smem_bytes(
+                facts, bm=128, bn=128, bk=64, ab_stages=13, c_stages=2, acc_stages=2
+            )
+            == ab_bytes + actual_output_bytes + 2048 + 16 * 13 + 16 * 2
+        )
 
 
 def test_cold_search_can_encode_and_repair_deep_geometry_seeds() -> None:

@@ -5932,9 +5932,11 @@ def test_topk_composition_normalizes_before_selection(
         source * torch.rsqrt((source * source).sum(-1, keepdim=True) / width + 1e-5)
         if mode == "rms"
         else torch.softmax(source, dim=-1)
-    ).to(x.dtype)
+    )
+    # Compare one BF16 rounding against the FP32 reference.
+    assert normalized.dtype == x.dtype
     torch.testing.assert_close(
-        normalized, expected, rtol=0.004, atol=1e-7, equal_nan=True
+        normalized.float(), expected, rtol=0.004, atol=1e-7, equal_nan=True
     )
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
@@ -8690,7 +8692,8 @@ def test_fragment_network_topk_mixed_fallback(wide):
         actual[0], x.sort(dim=-1, descending=True, stable=True).values[:, :, :3]
     )
     assert torch.equal(actual[1], y.sort(dim=-1, stable=True).values[:, :, :3])
-    assert "fragment_topk_previous_rank" in source and _has_register_selection(source)
+    assert ("fragment_topk_previous_rank" in source) is wide
+    assert _has_register_selection(source)
 
 
 @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)

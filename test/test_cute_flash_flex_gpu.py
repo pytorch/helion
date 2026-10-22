@@ -20,8 +20,13 @@ matcher, the hook renderer and the list-walk emitter. Expectations:
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -123,10 +128,15 @@ def _flex_args(
 
 
 def _compile_flex(
-    args: tuple[Any, ...], overrides: dict[str, object] | None
+    args: tuple[Any, ...],
+    overrides: dict[str, object] | None,
+    *,
+    expect_in_code: str | None = None,
+    code_sink: list[str] | None = None,
 ) -> tuple[Any, cute_flash.FlashAttentionConfig]:
     """Compile the flex kernel at the default config plus ``overrides``,
-    asserting the surface is the flex plan category and the body the walk."""
+    asserting the surface is the flex plan category and the body the walk
+    (``code_sink`` receives the rendered source)."""
     bound = _flex_kernel().bind(args)
     spec = bound.config_spec
     assert spec.cute_flash_search_enabled
@@ -137,11 +147,16 @@ def _compile_flex(
     )
     resolved = spec._resolve_cute_flash_config(normalized.config)
     assert resolved.pipeline_family == "fa4"
+    # (The list walk is persistent by default; an override pins either way.)
     assert resolved.persistent == bool(
-        (overrides or {}).get(cute_flash.FLASH_PERSISTENT_KEY, False)
+        {**base, **(overrides or {})}[cute_flash.FLASH_PERSISTENT_KEY]
     )
     code = bound.to_code(normalized)
     assert "flash_flex_status" in code
+    if expect_in_code is not None:
+        assert expect_in_code in code
+    if code_sink is not None:
+        code_sink.append(code)
     return bound.compile_config(normalized), resolved
 
 
@@ -190,13 +205,20 @@ def _assert_close_to_reference(
 
 
 def _qkv(
-    batch: int, heads: int, q_seq: int, kv_seq: int, *, kv_heads: int | None = None
+    batch: int,
+    heads: int,
+    q_seq: int,
+    kv_seq: int,
+    *,
+    kv_heads: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
     kv_heads = heads if kv_heads is None else kv_heads
-    q = torch.randn(batch, heads, q_seq, 64, dtype=torch.bfloat16, device=DEVICE)
-    k = torch.randn(batch, kv_heads, kv_seq, 64, dtype=torch.bfloat16, device=DEVICE)
-    v = torch.randn(batch, kv_heads, kv_seq, 64, dtype=torch.bfloat16, device=DEVICE)
+    q = torch.randn(batch, heads, q_seq, head_dim, dtype=dtype, device=DEVICE)
+    k = torch.randn(batch, kv_heads, kv_seq, head_dim, dtype=dtype, device=DEVICE)
+    v = torch.randn(batch, kv_heads, kv_seq, head_dim, dtype=dtype, device=DEVICE)
     return q, k, v
 
 
@@ -692,6 +714,436 @@ def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_item_words_are_bitwise_the_device_list_walk() -> None:
+    """The host-built per-item bitmask words (``cute_flash_flex_item_words``,
+    the default) give the same output and LSE as the device walk over the
+    index lists, on the persistent loop and the plain grid."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    for persistent in (False, True):
+        base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent}
+        fn, resolved = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False},
+            expect_in_code="for flash_flex_i in cutlass.range(flash_flex_cp0, unroll=1):",
+        )
+        assert not resolved.flex_item_words
+        out_ref, lse_ref = fn(*args)
+        torch.cuda.synchronize()
+        fn, resolved = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: True},
+            expect_in_code="_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)]",
+        )
+        assert resolved.flex_item_words
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_ref), persistent
+        assert torch.equal(lse, lse_ref), persistent
+
+
+def _half(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    # Every row sees the first half of the keys: equal counts (the identity
+    # item order), full tiles only, not every tile.
+    return kv_idx < 1024
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_host_flags_skip_the_table_loads_bitwise() -> None:
+    """The tables' host flags (``flex_item_flags``, a runtime scalar): the
+    all-full bit binds the words as constants without loading them and the
+    identity-order bit decodes the persistent item without the item table;
+    both give the output and LSE of the table path (inference-tensor
+    copies of the tables, which rebuild per call with the flags 0), on the
+    persistent loop and the plain grid."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    for mask_mod, expect in (
+        (noop_mask, FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER),
+        (_half, FLEX_FLAG_IDENTITY_ORDER),
+    ):
+        block_mask = create_block_mask(
+            mask_mod, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+        )
+        args = _flex_args(q, k, v, _identity, block_mask)
+        tables = args[4:8]
+        geometry = {
+            "q_block": 128,
+            "batch": batch,
+            "heads": heads,
+            "num_pairs": seq // 256,
+            "num_kv": seq // 128,
+        }
+        assert flex_item_flags(*tables, **geometry) == expect
+        with torch.inference_mode():
+            plain_tables = tuple(table.clone() for table in tables)
+        assert flex_item_flags(*plain_tables, **geometry) == 0
+        plain_args = (*args[:4], *plain_tables, *args[8:])
+        for persistent in (False, True):
+            fn, resolved = _compile_flex(
+                args,
+                {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent},
+                expect_in_code="if _flash_flex_hflags & cutlass.Int32(1) == cutlass.Int32(0):",
+            )
+            assert resolved.flex_item_words
+            out_ref, lse_ref = fn(*plain_args)
+            torch.cuda.synchronize()
+            out, lse = fn(*args)
+            torch.cuda.synchronize()
+            assert torch.equal(out, out_ref), (mask_mod.__name__, persistent)
+            assert torch.equal(lse, lse_ref), (mask_mod.__name__, persistent)
+            ref_out, ref_lse = _reference(q, k, v, None, block_mask)
+            _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
+def _plain_table_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The same arguments with inference-tensor copies of the four tables:
+    the uncached table path, host flags 0."""
+    with torch.inference_mode():
+        plain_tables = tuple(table.clone() for table in args[4:8])
+    return (*args[:4], *plain_tables, *args[8:])
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("q_seq", "block_rows", "persistent"),
+    [(2048 + 128, 128, False), (2048 + 128, 128, True), (2048, 256, False)],
+    ids=["odd_rows_grid", "odd_rows_persistent", "q_block_256"],
+)
+def test_host_flags_all_full_constants_on_odd_rows_and_256_row_tables(
+    q_seq: int, block_rows: int, persistent: bool
+) -> None:
+    """The all-full constants where the device's word is not the plain full
+    word of both stages: an odd row count (the last pair's missing
+    second-stage row is the ``select_`` zero word) and 256-row BlockMask
+    tables (one row, one word pair per item); bitwise the table path."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, kv_seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        noop_mask,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(block_rows, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    geometry = {
+        "q_block": block_rows,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": -(-q_seq // 256),
+        "num_kv": kv_seq // 128,
+    }
+    assert (
+        flex_item_flags(*args[4:8], **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    full_word = (1 << (kv_seq // 128)) - 1
+    rows = -(-q_seq // block_rows)
+    if block_rows == 256:
+        expect = f"flash_flex_f0_0 = cutlass.Int32({full_word})"
+    else:
+        expect = (
+            f"flash_flex_f1_0 = cutlass.Int32(cutlass.select_(flash_m_tile1 < {rows}, "
+            f"cutlass.Int32({full_word}), cutlass.Int32(0)))"
+        )
+    fn, resolved = _compile_flex(
+        args,
+        {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent},
+        expect_in_code=expect,
+    )
+    assert resolved.flex_item_words
+    out_ref, lse_ref = fn(*_plain_table_args(args))
+    torch.cuda.synchronize()
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    ref_out, ref_lse = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_host_flags_follow_table_rewrites_and_graph_replay() -> None:
+    """The flags live in the per-BlockMask cache behind the tables' version
+    counters: rewriting a full mask's tables in place into a banded mask's
+    flips them 3 -> 0 and the same compiled kernel (built with the band's
+    mask hook, which full tiles never run) follows, bitwise the band's own
+    tables; a CUDA-graph capture of the flags-3 mask rebuilds the tables in
+    the graph with the flags 0 and replays the eager result bitwise."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    full = create_block_mask(
+        noop_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    band = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, full, mask_mod=_band)
+    band_args = _flex_args(q, k, v, _identity, band)
+    tables, band_tables = args[4:8], band_args[4:8]
+    assert all(a.shape == b.shape for a, b in zip(tables, band_tables, strict=True))
+    geometry = {
+        "q_block": 128,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": seq // 256,
+        "num_kv": seq // 128,
+    }
+    fn, _ = _compile_flex(args, PAIR_DESC)
+    assert (
+        flex_item_flags(*tables, **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    out_full, lse_full = fn(*args)
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(q, k, v, None, full)
+    _assert_close_to_reference(out_full, lse_full, ref_out, ref_lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = fn(*args)
+    for _ in range(2):
+        graph_out.fill_(0)
+        graph_lse.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, out_full)
+        assert torch.equal(graph_lse, lse_full)
+    # The in-place rewrite bumps the version counters: the flags follow.
+    for table, source in zip(tables, band_tables, strict=True):
+        table.copy_(source)
+    assert flex_item_flags(*tables, **geometry) == 0
+    out_band, lse_band = fn(*args)
+    torch.cuda.synchronize()
+    band_ref_out, band_ref_lse = _reference(q, k, v, None, band)
+    _assert_close_to_reference(out_band, lse_band, band_ref_out, band_ref_lse)
+    out_own, lse_own = fn(*band_args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_band, out_own)
+    assert torch.equal(lse_band, lse_own)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", ["gqa", "kv_split"])
+def test_host_flags_with_grouped_queries_and_the_split_walk(case: str) -> None:
+    """Grouped-query heads (two KV heads for four query heads) and the
+    split-KV grid (``cute_flash_kv_split`` 2: two CTAs per pair item, the
+    words guarded by the all-full bit on both) with the all-full flags:
+    bitwise the table path, close to torch."""
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_ALL_FULL
+    from helion.runtime.cute.flash_flex import FLEX_FLAG_IDENTITY_ORDER
+    from helion.runtime.cute.flash_flex import flex_item_flags
+
+    batch, heads, seq = 2, 4, 2048
+    kv_heads = 2 if case == "gqa" else None
+    q, k, v = _qkv(batch, heads, seq, seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        noop_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, enable_gqa=kv_heads is not None)
+    geometry = {
+        "q_block": 128,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": seq // 256,
+        "num_kv": seq // 128,
+    }
+    assert (
+        flex_item_flags(*args[4:8], **geometry)
+        == FLEX_FLAG_ALL_FULL | FLEX_FLAG_IDENTITY_ORDER
+    )
+    overrides: dict[str, object] = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    if case == "kv_split":
+        overrides[cute_flash.FLASH_KV_SPLIT_KEY] = 2
+    fn, resolved = _compile_flex(
+        args,
+        overrides,
+        expect_in_code="_flash_flex_hflags = cutlass.Int32(flash_flex_host_flags)",
+    )
+    assert resolved.flex_item_words
+    if case == "kv_split":
+        assert resolved.kv_split == 2
+    out_ref, lse_ref = fn(*_plain_table_args(args))
+    torch.cuda.synchronize()
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+    ref_out, ref_lse = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads is not None
+    )
+    _assert_close_to_reference(out, lse, ref_out, ref_lse)
+
+
+RESIDENT_REP32: dict[str, object] = {
+    **PAIR_DESC,
+    cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+    cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+    cute_flash.FLASH_CORR_REGS_KEY: 64,
+    cute_flash.FLASH_OTHER_REGS_KEY: 48,
+}
+
+
+RESIDENT_REP16_SPLIT: dict[str, object] = {
+    **RESIDENT_REP32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 16,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+}
+RESIDENT_REP32_SPLIT: dict[str, object] = {
+    **RESIDENT_REP32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("persistent", "store"),
+    [
+        (False, "rep32"),
+        (True, "rep32"),
+        (False, "rep16_split"),
+        (True, "rep16_split"),
+        (False, "rep32_split"),
+        (True, "rep32_split"),
+    ],
+    ids=[
+        "grid_rep32",
+        "persistent_rep32",
+        "grid_rep16_split",
+        "persistent_rep16_split",
+        "grid_rep32_split",
+        "persistent_rep32_split",
+    ],
+)
+def test_resident_pass2_is_bitwise_the_reload_pass2(
+    persistent: bool, store: str
+) -> None:
+    """``cute_flash_s_resident``: PASS2 over the chunks PASS1 left in registers
+    gives the same output and LSE as the TMEM-reload PASS2 (the per-chunk
+    numerics are shared), on a mask-only walk with partial and full tiles,
+    with Rep32 P stores and with Rep16 stores keeping the split P arrival."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    body = {
+        "rep32": RESIDENT_REP32,
+        "rep16_split": RESIDENT_REP16_SPLIT,
+        "rep32_split": RESIDENT_REP32_SPLIT,
+    }[store]
+    base = {**body, cute_flash.FLASH_PERSISTENT_KEY: persistent}
+    fn, resolved = _compile_flex(
+        args,
+        base,
+        expect_in_code={
+            "rep32": "fa4_disc_exp_convert_store_rep32_pipe(",
+            "rep16_split": "fa4_disc_exp_convert_store_pipe(",
+            "rep32_split": "fa4_disc_exp_convert_store_rep32_split(",
+        }[store],
+    )
+    assert not resolved.s_resident
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_S_RESIDENT_KEY: True},
+        expect_in_code={
+            "rep32": "fa4_disc_exp_convert_store_resident_rep32((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
+            "rep16_split": "fa4_disc_resident_chunk16(flash_res_frg0, ",
+            "rep32_split": "fa4_disc_resident_pair32(flash_p_sum, flash_res_frg0, flash_res_frg1, ",
+        }[store],
+    )
+    assert resolved.s_resident
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("resident", [False, True], ids=["reload", "resident"])
+def test_tmem_rowmax_is_bitwise_the_software_rowmax_on_the_list_walk(
+    resident: bool,
+) -> None:
+    """``cute_flash_rowmax="tmem"`` on the list walk's full tiles (the hardware
+    per-load maxima) gives the same output and LSE as the software FMNMX tree
+    (the maximum is exact in any order), with the reload and the resident PASS2."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    base = {**RESIDENT_REP32, cute_flash.FLASH_S_RESIDENT_KEY: resident}
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.rowmax == "software" and resolved.s_resident is resident
+    bound = _flex_kernel().bind(args)
+    probe = bound.config_spec._resolve_cute_flash_config(
+        bound._normalized_config_copy(
+            helion.Config(
+                **{
+                    **bound.config_spec.default_config().config,
+                    **base,
+                    cute_flash.FLASH_ROWMAX_KEY: "tmem",
+                }
+            )
+        ).config
+    )
+    if probe.rowmax != "tmem":
+        pytest.skip("this device's policy has no TMEM row reduction (GB300 only)")
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_ROWMAX_KEY: "tmem"},
+        expect_in_code=(
+            "(flash_res_frg3, flash_res_red3))" if resident else "disc_rowmax_ldred("
+        ),
+    )
+    assert resolved.rowmax == "tmem"
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 def test_random_table_mask_with_empty_rows_is_stable_under_repeated_launches() -> None:
     batch, heads, seq = 4, 8, 2048
     torch.manual_seed(1)
@@ -910,6 +1362,313 @@ def test_dead_stage_split_merges_both_softmax_warpgroups(
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("tail_split", "kv_order", "kv_seq", "epilogue"),
+    [
+        (2, "descending", 2048, "stg"),
+        (8, "descending", 2048, "stg"),
+        (4, "ascending", 2048, "stg"),
+        (2, "descending", 4352, "stg"),
+        (4, "ascending", 4352, "stg"),
+        (8, "descending", 8192, "stg"),
+        (2, "descending", 8192, "tma"),
+        (2, "descending", 8192, "tma_shared"),
+        (4, "descending", 4352, "stg_gqa"),
+        (4, "descending", 4352, "stg_register_words"),
+    ],
+    ids=[
+        "tail2",
+        "tail8",
+        "tail4_asc",
+        "tail2_cursor",
+        "tail4_asc_cursor",
+        "tail8_cursor64",
+        "tail2_cursor64_tma_even",
+        "tail2_cursor64_tma_even_shared",
+        "tail4_cursor_gqa",
+        "tail4_two_word_register_walk",
+    ],
+)
+def test_tail_split_matches_the_unsplit_grid(
+    tail_split: int, kv_order: str, kv_seq: int, epilogue: str
+) -> None:
+    """``cute_flash_flex_tail_split``: the grid's last partial wave runs as
+    split units merged in the kernel; the full waves run unsplit.  A grid
+    of one full wave plus a tail the device's idle SMs hold eight times
+    (``8 * SMs // 8 + 16`` items: a ragged query length, a random table
+    mask with an empty row): within the merge's rounding of the unsplit
+    grid (the unsplit units bitwise, the tail items within the split-KV
+    tolerance), close to torch, repeat launches bitwise.  Both walk orders
+    (the slice is taken off the walk word from the order's end) and both
+    walk forms: the one-word register walk (16 KV tiles) and the cursor
+    walk over the words table (34 and 64 KV tiles: two words, the slice's
+    leading tiles consumed through the cursor); the TMA epilogue on an even
+    query length (the units' merge stores through the plain output view,
+    which the TMA epilogue binds only for a ragged length otherwise)."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    # One full wave plus a tail of 8..16 items (eight pairs per batch-head).
+    bh_total = sm_count // 8 + 2
+    heads = next(h for h in (4, 2, 1) if bh_total % h == 0)
+    batch = bh_total // heads
+    # GQA: half as many KV heads (the cursor walk's per-item rows and the
+    # merge are per query head either way).
+    kv_heads = heads // 2 if epilogue == "stg_gqa" and heads % 2 == 0 else heads
+    q_seq = 2048 if epilogue.startswith("tma") else 2048 - 64
+    torch.manual_seed(7)
+    rows, num_kv = -(-q_seq // 128), kv_seq // 128
+    table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.6).to(
+        torch.int32
+    )
+    table[0, 1, 3] = 0  # an empty row
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        _identity,
+        block_mask,
+        mask_mod=table_mask,
+        enable_gqa=kv_heads != heads,
+    )
+    items = batch * heads * -(-q_seq // 256)
+    waves_full, tail_items = divmod(items, sm_count)
+    assert waves_full >= 1 and tail_items > 0 and tail_items * tail_split <= sm_count
+    base = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: False,
+        # The list walk's direction (``_flash_flex_walk_step``).
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: kv_order,
+    }
+    if epilogue.startswith("tma"):
+        base = {
+            **base,
+            cute_flash.FLASH_EPI_TMA_KEY: True,
+            cute_flash.FLASH_EPI_STG_KEY: False,
+        }
+    if epilogue == "tma_shared":
+        # The shared softmax region: the merge indexes the workspace by the
+        # runtime stage.
+        base = {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"}
+    if epilogue == "stg_register_words":
+        # Two words without the host words table: the register walk trims
+        # both words.
+        base = {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False}
+    plain_fn, plain_cfg = _compile_flex(args, base)
+    tail_fn, tail_cfg = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: tail_split},
+        expect_in_code="if flash_pid >= _flash_tail_base:",
+    )
+    if epilogue.startswith("tma"):
+        assert plain_cfg.epi_tma and tail_cfg.epi_tma and q_seq % 256 == 0
+    if epilogue == "tma_shared":
+        assert tail_cfg.softmax_region == "shared"
+    if epilogue == "stg_register_words":
+        assert not tail_cfg.flex_item_words and kv_seq // 128 > 32
+    assert plain_cfg.causal_kv_order == kv_order == tail_cfg.causal_kv_order
+    assert plain_cfg.flex_tail_split == 0 and tail_cfg.flex_tail_split == tail_split
+    out_plain, lse_plain = plain_fn(*args)
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads != heads
+    )
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    torch.testing.assert_close(
+        out_tail.float(), out_plain.float(), atol=1e-2, rtol=1e-2
+    )
+    finite = torch.isfinite(lse_plain)
+    assert torch.equal(finite, torch.isfinite(lse_tail))
+    torch.testing.assert_close(lse_tail[finite], lse_plain[finite], atol=1e-3, rtol=0)
+    assert torch.equal(lse_tail[~finite], lse_plain[~finite])
+    for _ in range(3):
+        out_again, lse_again = tail_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_tail)
+        assert torch.equal(lse_again, lse_tail)
+
+
+def _tail_grid(
+    q_seq: int, bh_total: int, tail_split: int, *, kv_heads: int | None = None
+) -> tuple[tuple[Any, ...], Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """A tail-split grid: ``bh_total`` batch-heads of ``q_seq`` query rows
+    over 2048 keys under a random table mask (an empty row in it), with the
+    item count's last partial wave split ``tail_split`` ways on this device."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    heads = next(h for h in (4, 3, 2, 1) if bh_total % h == 0)
+    batch = bh_total // heads
+    kv_seq = 2048
+    torch.manual_seed(7)
+    rows, num_kv = -(-q_seq // 128), kv_seq // 128
+    table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.6).to(
+        torch.int32
+    )
+    table[0, heads - 1, min(3, rows - 1)] = 0  # an empty row
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        _identity,
+        block_mask,
+        mask_mod=table_mask,
+        enable_gqa=kv_heads is not None,
+    )
+    items = batch * heads * -(-q_seq // 256)
+    waves_full, tail_items = divmod(items, sm_count)
+    assert waves_full >= 1 and tail_items > 0 and tail_items * tail_split <= sm_count, (
+        items,
+        sm_count,
+    )
+    return args, block_mask, (q, k, v)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_tail_split_forced_timeout_leaves_the_merge_to_the_last_arriver() -> None:
+    """A tail unit polls the generation word a bounded number of times
+    before it gives its slice up; at 0 polls (``HELION_CUTE_FLASH_FLEX_TAIL
+    _SPIN_POLLS``, read at render time) no unit but the item's last arriver
+    merges anything, and that unit claims and merges every slice: the
+    output is bitwise the free run's (whose units each merge their own),
+    and repeat launches are bitwise."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    args, block_mask, (q, k, v) = _tail_grid(2048 - 64, sm_count // 8 + 2, 4)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    free_fn, _ = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4},
+        expect_in_code="flash_split_polls < cutlass.Int32(1024)",
+    )
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH_FLEX_TAIL_SPIN_POLLS": "0"}):
+        timeout_fn, _ = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4},
+            expect_in_code="flash_split_polls < cutlass.Int32(0)",
+        )
+    out_free, lse_free = free_fn(*args)
+    out_timeout, lse_timeout = timeout_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_timeout, lse_timeout, out_ref, lse_ref)
+    assert torch.equal(out_timeout, out_free)
+    assert torch.equal(lse_timeout, lse_free)
+    for _ in range(3):
+        out_again, lse_again = timeout_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_free)
+        assert torch.equal(lse_again, lse_free)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_tail_split_with_an_empty_last_stage_and_eight_units() -> None:
+    """A query length whose last pair has no second tile (``q_seq % 256 <=
+    128``): the dead stage stores no partial, counts no arrival and merges
+    nothing on any unit, at the widest split (8) over a one-wave-plus-tail
+    grid; within the merge's rounding of the unsplit grid, repeat launches
+    bitwise."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    q_seq = 2048 + 64
+    pairs = -(-q_seq // 256)
+    # One full wave plus the smallest tail eight units of which fit the SMs.
+    bh_total = next(
+        bh
+        for bh in range(1, 4 * sm_count)
+        if bh * pairs > sm_count and 0 < (bh * pairs) % sm_count <= sm_count // 8
+    )
+    args, block_mask, (q, k, v) = _tail_grid(q_seq, bh_total, 8)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    plain_fn, _ = _compile_flex(args, base)
+    tail_fn, tail_cfg = _compile_flex(
+        args, {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 8}
+    )
+    assert tail_cfg.flex_tail_split == 8
+    out_plain, lse_plain = plain_fn(*args)
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    torch.testing.assert_close(
+        out_tail.float(), out_plain.float(), atol=1e-2, rtol=1e-2
+    )
+    finite = torch.isfinite(lse_plain)
+    assert torch.equal(finite, torch.isfinite(lse_tail))
+    torch.testing.assert_close(lse_tail[finite], lse_plain[finite], atol=1e-3, rtol=0)
+    for _ in range(3):
+        out_again, lse_again = tail_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_tail)
+        assert torch.equal(lse_again, lse_tail)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_tail_split_gqa_grid_replays_under_a_cuda_graph() -> None:
+    """Grouped-query heads (two query heads per key head) with a tail split
+    of 4; a CUDA-graph capture of the launch (the workspace and its counters
+    captured with it) replays the eager result bitwise, three times."""
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    bh_total = next(bh for bh in range(sm_count // 8 + 2, 4 * sm_count) if bh % 4 == 0)
+    args, block_mask, (q, k, v) = _tail_grid(2048 - 64, bh_total, 4, kv_heads=2)
+    base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: False}
+    tail_fn, tail_cfg = _compile_flex(
+        args, {**base, cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 4}
+    )
+    assert tail_cfg.flex_tail_split == 4
+    out_tail, lse_tail = tail_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask, enable_gqa=True)
+    _assert_close_to_reference(out_tail, lse_tail, out_ref, lse_ref)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = tail_fn(*args)
+    for _ in range(3):
+        graph_out.fill_(0)
+        graph_lse.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, out_tail)
+        assert torch.equal(graph_lse, lse_tail)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 @pytest.mark.parametrize("kv_split", [2, 4])
 @pytest.mark.parametrize(
     ("q_seq", "kv_seq", "body", "dead_split"),
@@ -1014,7 +1773,10 @@ def _copy_tables(args: tuple[Any, ...], block_mask: Any) -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
-def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -> None:
+@pytest.mark.parametrize("early_qk", [True, False], ids=["early_qk", "item_order"])
+def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites(
+    early_qk: bool,
+) -> None:
     batch, heads, seq = 2, 4, 2048 + 128  # a ragged last pair: 9 pairs, 17 rows
     rows = num_kv = -(-seq // 128)
     torch.manual_seed(2)
@@ -1037,9 +1799,18 @@ def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -
     args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
     fn_grid, _ = _compile_flex(args, PAIR_DESC)
     fn_persistent, resolved = _compile_flex(
-        args, {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: True}
+        args,
+        {
+            **PAIR_DESC,
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+            cute_flash.FLASH_FLEX_EARLY_QK_KEY: early_qk,
+        },
+        expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim"
+        if early_qk
+        else None,
     )
     assert resolved.persistent and resolved.persistent_loop == "while"
+    assert resolved.flex_early_qk is early_qk
 
     def check() -> None:
         out, lse = fn_grid(*args)
@@ -1063,6 +1834,190 @@ def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -
     )
     _copy_tables(args, block_mask)
     check()
+
+
+def _stage1_tail_absent(num_kv: int) -> Callable[..., Any]:
+    """Even query tiles (stage 0) see every KV tile; odd query tiles (stage
+    1) see all but the two highest: on the descending walk every item's
+    first tile is absent for stage 1 and its last tile live for it. (One
+    pointwise relation of both indices: a q-only term or-ed with a kv-only
+    term is not a flex hook region.)"""
+
+    def mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return kv_idx // 128 + (q_idx // 128) % 2 * 2 < num_kv
+
+    return mask
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "structured", [True, False], ids=["stage1_tail_absent", "random_table"]
+)
+def test_persistent_early_qk_wraps_items_under_the_absent_stage_skip(
+    structured: bool,
+) -> None:
+    """The early next-item QK0 with ``cute_flash_flex_skip_absent`` on a grid
+    every CTA of which walks at least two items, so the hoisted head runs
+    inside the loop (the 72-item shape above walks one item per CTA and
+    never reaches it). That head set the walk's stage-1 liveness flag for
+    the NEXT item's first tile between this item's last PV0 and PV1, so a
+    last tile live for stage 1 followed by an item whose first tile is not
+    lost its last PV1 (O1 short of that tile, silently). The structured mask
+    makes that the case at every item boundary; the random table covers the
+    rest. Bitwise the one-item grid with the skip and the persistent loop
+    without it, and within tolerance of torch."""
+    batch, seq = 2, 2048 + 128  # a ragged last pair: 9 pairs, 17 rows
+    rows = num_kv = -(-seq // 128)
+    pairs = -(-rows // 2)
+    num_sm = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    heads = -(-(2 * num_sm) // (batch * pairs))
+    items = batch * heads * pairs
+    assert items >= 2 * num_sm
+    mask_dev: Callable[..., Any] | None = None
+    if structured:
+        mask_ref = _stage1_tail_absent(num_kv)
+    else:
+        torch.manual_seed(3)
+        table = (torch.rand(batch, heads, rows, num_kv, device=DEVICE) < 0.35).to(
+            torch.int32
+        )
+        table[0, 1, 2:4] = 0  # an empty pair
+
+        def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+        def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+        mask_ref, mask_dev = table_mask_ref, table_mask
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        mask_ref, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=mask_dev)
+    skip = {cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True}
+    fn_grid, grid_cfg = _compile_flex(args, {**PAIR_DESC, **skip})
+    assert grid_cfg.flex_skip_absent and not grid_cfg.persistent
+    early = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+        cute_flash.FLASH_FLEX_EARLY_QK_KEY: True,
+    }
+    fn_skip, cfg_skip = _compile_flex(
+        args,
+        {**early, **skip},
+        expect_in_code=(
+            "flash_flex_pv_issue1 = flash_flex_pv_last1 | cutlass.Int32(flash_o_zero1)"
+        ),
+    )
+    assert cfg_skip.persistent and cfg_skip.flex_early_qk and cfg_skip.flex_skip_absent
+    # The persistent grid is capped at the SMs' CTAs: every CTA wraps.
+    assert items > num_sm * cfg_skip.persistent_ctas_per_sm
+    fn_dense, cfg_dense = _compile_flex(
+        args, early, expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim"
+    )
+    assert cfg_dense.flex_early_qk and not cfg_dense.flex_skip_absent
+    out, lse = fn_grid(*args)
+    out_skip, lse_skip = fn_skip(*args)
+    out_dense, lse_dense = fn_dense(*args)
+    torch.cuda.synchronize()
+    finite = torch.isfinite(lse)
+    for out_x, lse_x in ((out_skip, lse_skip), (out_dense, lse_dense)):
+        assert torch.equal(out_x, out)
+        assert torch.equal(torch.isfinite(lse_x), finite)
+        assert torch.equal(lse_x[finite], lse[finite])
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_skip, lse_skip, out_ref, lse_ref)
+
+
+# The campaign cell whose persistent list-walk seed deadlocked (causal, b4
+# h16 s4096 d128, BlockMask 128): 1024 items over a 148-CTA grid.
+_EARLY_QK_ORDER1_SHAPE = (4, 16, 4096, 128)
+_EARLY_QK_ORDER1_OK = "EARLY_QK_ORDER1_OK"
+
+
+def _early_qk_order1_child() -> None:
+    """The body of ``test_persistent_early_qk_with_first_load_order_1_completes``
+    (run in a subprocess): the persistent early-QK kernel with the loader's
+    order 1 (K0, V0, Q0, Q1) and the two-stage K/V ring, against the
+    one-item grid of the same body."""
+    batch, heads, seq, head_dim = _EARLY_QK_ORDER1_SHAPE
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(batch, heads, seq, head_dim, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    block_mask = create_block_mask(
+        _causal, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    body = {
+        **PAIR_DESC,
+        cute_flash.FLASH_KV_STAGE_KEY: 2,
+        cute_flash.FLASH_FIRST_LOAD_ORDER_KEY: 1,
+    }
+    fn_grid, grid_cfg = _compile_flex(args, body)
+    assert grid_cfg.first_load_order == 1 and grid_cfg.kv_stage == 2
+    fn_persistent, cfg = _compile_flex(
+        args,
+        {
+            **body,
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+            cute_flash.FLASH_FLEX_EARLY_QK_KEY: True,
+        },
+        expect_in_code="flash_tile_next = flash_tile_id + flash_grid_dim",
+    )
+    assert cfg.persistent and cfg.flex_early_qk and cfg.kv_stage == 2
+    # The early head takes the loader's order 3 (K0, Q0, V0, Q1).
+    assert cfg.first_load_order == 3
+    out, lse = fn_grid(*args)
+    out_p, lse_p = fn_persistent(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_p, out)
+    assert torch.equal(lse_p, lse)
+    print(_EARLY_QK_ORDER1_OK, flush=True)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_persistent_early_qk_with_first_load_order_1_completes() -> None:
+    """The early next-item QK0 hoists the MMA warp's waits for the next
+    item's Q0 and K0 ahead of its last PV1, which still holds this item's
+    last V slot. With the loader's order 1 (K0, V0, Q0, Q1) and the
+    two-stage aliased K/V ring the loader blocked on the next V0's slot
+    before issuing Q0: the loader waiting on the MMA's PV1, the MMA on the
+    loader's Q0, every CTA that wraps (the 4K causal campaign cells hung on
+    their persistent seed). The resolver now gives the early head order 3
+    (K0, Q0, V0, Q1). The cell runs in a subprocess under a timeout so a
+    reintroduced deadlock fails the suite instead of hanging it."""
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('flex_gpu_child', {str(Path(__file__).resolve())!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['flex_gpu_child'] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "module._early_qk_order1_child()\n"
+    )
+    env = {**os.environ, "HELION_BACKEND": "cute"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        tail = (
+            (exc.stderr or b"")[-2000:] if isinstance(exc.stderr, bytes) else exc.stderr
+        )
+        raise AssertionError(
+            f"the persistent early-QK kernel did not complete (deadlock): {tail!r}"
+        ) from exc
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert _EARLY_QK_ORDER1_OK in proc.stdout, proc.stdout[-2000:]
 
 
 def _dilated(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
@@ -1110,3 +2065,435 @@ def test_keep_word_mask_form_is_bitwise_the_element_form(
     assert torch.equal(lse, results["element"][1])
     out_ref, lse_ref = _reference(q, k, v, None, block_mask)
     _assert_close_to_reference(out, lse, out_ref, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("persistent", "seq"),
+    [(False, 2048), (True, 2048), (False, 16384), (True, 16384)],
+    ids=["grid_words", "persistent_words", "grid_cursor", "persistent_cursor"],
+)
+def test_shared_softmax_region_is_bitwise_the_per_stage_regions(
+    persistent: bool, seq: int
+) -> None:
+    """``cute_flash_softmax_region="shared"``: one softmax region for both
+    query stages (the stage a warp-uniform runtime value) gives the same
+    output and LSE as the two per-stage regions with the same exp cadence,
+    on a mask-only walk with partial, full and absent tiles, over the
+    register words (2K) and the host words table's cursor (16K), on the
+    grid and the persistent walks. (One CTA per pair: the split-KV walk
+    the small 2K grid defaults to keeps the per-stage regions.)"""
+    batch, heads = (2, 4) if seq == 2048 else (1, 2)
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    base = {
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/6",
+        cute_flash.FLASH_E2E_OFFSET0_KEY: 3,
+        cute_flash.FLASH_E2E_OFFSET_KEY: 3,
+    }
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.softmax_region == "per_stage"
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        expect_in_code="flash_stage = cute.arch.make_warp_uniform(warp_idx // 4)",
+    )
+    assert resolved.softmax_region == "shared"
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+def _score_table_mod(table: torch.Tensor) -> Callable[..., Any]:
+    """A per-(row, column) score bias ``table[q, kv]`` (a row-strided table
+    load in the score hook: a coalescible run, so the hook runs on every
+    tile and stages through the per-warp cooperative ring)."""
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(table, [q_idx, kv_idx]).to(torch.float32)
+
+    return score_mod
+
+
+def _keep_table_masks(
+    keep: torch.Tensor,
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """A causal mask gated by a per-(row, column) table ``keep[q, kv]`` (a
+    row-strided table load in the mask hook: the coalescible run the
+    staging ring serves, and the prefetch's per-chunk table load): the
+    Helion form for the kernel and the eager form for the BlockMask."""
+
+    def helion_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (hl.load(keep, [q_idx, kv_idx]) != 0)
+
+    def torch_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (keep[q_idx, kv_idx] != 0)
+
+    return helion_mask, torch_mask
+
+
+_SHARED_COVERAGE: dict[str, dict[str, object]] = {
+    # The shapes and bodies the shared region must match per stage on.
+    "ragged": {"seq": 1920},
+    "fp16": {"dtype": torch.float16},
+    "gqa": {"kv_heads": 2},
+    "rep32_store": {
+        "overrides": {
+            cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+            cute_flash.FLASH_P_STORE_REP_KEY: 32,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        }
+    },
+    "mixed_store": {
+        "overrides": {
+            cute_flash.FLASH_P_STORE_REP_KEY: 32,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        }
+    },
+    "resident": {
+        "overrides": {**RESIDENT_REP32, cute_flash.FLASH_S_RESIDENT_KEY: True}
+    },
+    "coalesced_mask": {
+        "table_mask": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+        },
+        "expect": ("flex_coalesce", 64),
+    },
+    "prefetched_mask": {
+        "table_mask": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_PREFETCH_KEY: 32,
+        },
+        "expect": ("flex_prefetch", 32),
+    },
+    "coalesced_score": {
+        "score_table": True,
+        "overrides": {
+            cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 64,
+        },
+        "expect": ("flex_coalesce", 64),
+    },
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", sorted(_SHARED_COVERAGE), ids=sorted(_SHARED_COVERAGE))
+def test_shared_softmax_region_coverage_is_bitwise_the_per_stage_regions(
+    case: str,
+) -> None:
+    """The shared softmax region matches the per-stage regions bitwise on a
+    ragged query length (the live-rows guard), fp16, grouped-query heads,
+    the Rep32 and the mixed Rep32/Rep16 P stores, the resident PASS2, and
+    the table-gated mask whose hook stages its rows through the per-warp
+    cooperative ring (``cute_flash_flex_coalesce``: the ring is addressed by
+    the runtime stage) or prefetches them (``cute_flash_flex_prefetch``),
+    and a score region (a coalesced score table: the hook on every tile)."""
+    spec = _SHARED_COVERAGE[case]
+    batch, heads = 2, 4
+    seq = int(spec.get("seq", 2048))
+    kv_heads = spec.get("kv_heads")
+    q, k, v = _qkv(
+        batch,
+        heads,
+        seq,
+        seq,
+        kv_heads=kv_heads,  # pyrefly: ignore[bad-argument-type]
+        dtype=spec.get("dtype", torch.bfloat16),  # pyrefly: ignore[bad-argument-type]
+    )
+    if spec.get("table_mask"):
+        torch.manual_seed(1)
+        keep = (torch.rand(seq, seq, device=DEVICE) < 0.7).to(torch.int32)
+        helion_mask, torch_mask = _keep_table_masks(keep)
+    else:
+        helion_mask = torch_mask = _band
+    score_mod: Callable[..., Any] = _identity
+    if spec.get("score_table"):
+        torch.manual_seed(2)
+        score_mod = _score_table_mod(
+            torch.randn(seq, seq, dtype=torch.bfloat16, device=DEVICE)
+        )
+    block_mask = create_block_mask(
+        torch_mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(
+        q,
+        k,
+        v,
+        score_mod,
+        block_mask,
+        mask_mod=helion_mask,
+        enable_gqa=kv_heads is not None,
+    )
+    base = {
+        cute_flash.FLASH_KV_SPLIT_KEY: 1,
+        cute_flash.FLASH_E2E_OFFSET0_KEY: 3,
+        cute_flash.FLASH_E2E_OFFSET_KEY: 3,
+        **spec.get("overrides", {}),  # pyrefly: ignore[bad-argument-type]
+    }
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.softmax_region == "per_stage"
+    expect = spec.get("expect")
+    if expect is not None:
+        name, value = expect  # pyrefly: ignore[bad-assignment]
+        assert getattr(resolved, name) == value, (name, getattr(resolved, name))
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        expect_in_code="flash_stage = cute.arch.make_warp_uniform(warp_idx // 4)",
+    )
+    assert resolved.softmax_region == "shared"
+    if expect is not None:
+        name, value = expect  # pyrefly: ignore[bad-assignment]
+        assert getattr(resolved, name) == value
+    if case == "coalesced_mask":
+        assert resolved.flex_coalesce_slots  # the staging ring is in use
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+def _window(width: int) -> Callable[..., Any]:
+    def window(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return (q_idx >= kv_idx) & (q_idx - kv_idx <= width)
+
+    return window
+
+
+def _documents_320(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    # 320-token documents (not a multiple of the tile): every boundary tile
+    # is partial with whole-warp kept rows on one side, but the keep-word
+    # peephole has no lane word for the ``// 320`` equality (element form).
+    return (q_idx // 320) == (kv_idx // 320)
+
+
+# (name: batch, heads, kv_heads, q_seq, kv_seq, mask, config overrides,
+# dtype, whether the knob renders the plain hook: a table gather or a
+# predicate the keep-word peephole does not fold (``// 320``), or no mask).
+_FAST_FULL_CASES: dict[str, tuple[Any, ...]] = {
+    "ragged_causal_2000": (2, 2, 2, 2000, 2000, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_4000": (1, 2, 2, 4000, 4000, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_3001": (1, 2, 2, 3001, 3001, _causal, {}, torch.bfloat16, False),
+    "ragged_causal_fp16": (2, 2, 2, 2000, 2000, _causal, {}, torch.float16, False),
+    "ragged_causal_resident": (
+        2,
+        2,
+        2,
+        2000,
+        2000,
+        _causal,
+        {cute_flash.FLASH_S_RESIDENT_KEY: True, cute_flash.FLASH_S_LOAD_REP_KEY: 32},
+        torch.bfloat16,
+        False,
+    ),
+    "ragged_causal_shared_region": (
+        2,
+        2,
+        2,
+        2000,
+        2000,
+        _causal,
+        {cute_flash.FLASH_SOFTMAX_REGION_KEY: "shared"},
+        torch.bfloat16,
+        False,
+    ),
+    "causal_diagonal": (2, 2, 2, 2048, 2048, _causal, {}, torch.bfloat16, False),
+    "window_256": (2, 2, 2, 2048, 2048, _window(256), {}, torch.bfloat16, False),
+    "window_512": (2, 2, 2, 2048, 2048, _window(512), {}, torch.bfloat16, False),
+    "window_1024": (2, 2, 2, 2048, 2048, _window(1024), {}, torch.bfloat16, False),
+    "band": (2, 4, 4, 2048, 2048, _band, {}, torch.bfloat16, False),
+    "band_gqa_persistent": (
+        2,
+        8,
+        2,
+        2048,
+        2048,
+        _band,
+        {cute_flash.FLASH_PERSISTENT_KEY: True},
+        torch.bfloat16,
+        False,
+    ),
+    "documents_320": (2, 2, 2, 2048, 2048, _documents_320, {}, torch.bfloat16, True),
+    "documents_table": (2, 2, 2, 2048, 2048, None, {}, torch.bfloat16, True),
+    "whisper_noop_ragged": (
+        2,
+        2,
+        2,
+        448,
+        1500,
+        noop_mask,
+        {},
+        torch.bfloat16,
+        True,
+    ),
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("case", list(_FAST_FULL_CASES))
+def test_flex_hook_fast_full_is_bitwise_the_plain_hook(case: str) -> None:
+    """``cute_flash_flex_hook_fast_full``: a warp whose rows keep every
+    column of a partial tile takes the step's dense path, which is the same
+    values in the same places: the same output and LSE as the plain hook on
+    ragged causal lengths (every tile of the ragged query row is a partial
+    tile for torch; two-pass, resident and shared-region bodies, fp16), the
+    causal diagonal, sliding windows of three widths, a band, a GQA band on
+    the persistent walk.  Document masks (a table gather, or ``// 320``
+    which the keep-word peephole does not fold) and a mask-less ragged cross
+    attention (Whisper's 448 x 1500) keep the plain hook: the knob renders
+    the same code."""
+    batch, heads, kv_heads, q_seq, kv_seq, mask, base, dtype, plain = _FAST_FULL_CASES[
+        case
+    ]
+    mask_arg: Callable[..., Any] | None = None
+    if mask is None:
+        doc = (torch.arange(q_seq, device=DEVICE) // 320).to(torch.int32)
+
+        def documents_table(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return hl.load(doc, [q_idx]) == hl.load(doc, [kv_idx])
+
+        def documents_table_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return doc[q_idx] == doc[kv_idx]
+
+        mask, mask_arg = documents_table_ref, documents_table
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq, kv_heads=kv_heads, dtype=dtype)
+    block_mask = create_block_mask(
+        mask, batch, heads, q_seq, kv_seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(
+        q, k, v, _identity, block_mask, mask_mod=mask_arg, enable_gqa=kv_heads != heads
+    )
+    base = {**base, cute_flash.FLASH_KV_SPLIT_KEY: 1}
+    plain_code: list[str] = []
+    fn, resolved = _compile_flex(args, base, code_sink=plain_code)
+    assert resolved.flex_hook_fast_full is False
+    assert resolved.s_resident is (case == "ragged_causal_resident")
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fast_code: list[str] = []
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY: True},
+        code_sink=fast_code,
+    )
+    assert resolved.flex_hook_fast_full is True
+    vote = "flash_flex_needs_mask = cutlass.Boolean(cute.arch.vote_any_sync(flash_flex_masked))"
+    if plain:
+        assert fast_code == plain_code
+        return
+    assert vote in fast_code[0]
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    "case",
+    [
+        "causal_d128_persistent",
+        "band_d64_persistent",
+        "gqa_d64_grid",
+        "ragged_d128_persistent",
+        "shared_region_d128_persistent",
+        "cross_d64_persistent",
+        "many_items_shared_d128_persistent",
+        "fp16_d128_persistent",
+    ],
+)
+def test_shared_staged_output_tile_is_bitwise_the_two_tiles(case: str) -> None:
+    """``cute_flash_o_stage``: one staged output tile shared by the pair's two
+    query stages (the epilogue warp drains stage 0's TMA store before the
+    correction warps stage stage 1 into the tile) gives the same output and
+    LSE as a tile per stage: on the persistent loop at head dim 128, where
+    the freed tile deepens the K/V ring from 3 to 4 slots; at head dim 64;
+    with grouped-query heads on the plain grid; on a ragged query length
+    (the hybrid TMA / row-guarded epilogue); under the shared softmax
+    region; on a persistent cross-attention grid (448 queries over 1536
+    unmasked keys, the whisper shape's form); with more items than twice the
+    device's SMs under the shared region, so every CTA crosses item
+    boundaries (odd counts on some) and the shared tile is handed between
+    items, repeated over five launches; and in fp16."""
+    head_dim = 128 if "d128" in case else 64
+    persistent = "persistent" in case
+    batch, heads = 2, 2
+    if "many_items" in case:
+        # 8 x 10 batch-heads x 4 pairs = 320 items: 2-3 per CTA on 148 SMs.
+        batch, heads = 8, 10
+    kv_heads = 1 if "gqa" in case else None
+    seq = 1024 + (128 if "ragged" in case else 0)
+    q_seq, kv_seq = (448, 1536) if "cross" in case else (seq, seq)
+    q, k, v = _qkv(
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=torch.float16 if "fp16" in case else torch.bfloat16,
+    )
+    if "many_items" in case:
+        sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        assert batch * heads * (q_seq // 256) >= 2 * sm_count
+    mask = noop_mask if "cross" in case else _band if "band" in case else _causal
+    block_mask = create_block_mask(
+        mask, batch, heads, q_seq, kv_seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, enable_gqa=kv_heads is not None)
+    base = {
+        **PAIR_DESC,
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+        cute_flash.FLASH_KV_STAGE_KEY: 4,
+    }
+    if "shared" in case:
+        base[cute_flash.FLASH_SOFTMAX_REGION_KEY] = "shared"
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for o_stage in (2, 1):
+        fn, resolved = _compile_flex(
+            args, {**base, cute_flash.FLASH_O_STAGE_KEY: o_stage}
+        )
+        assert resolved.o_stage == o_stage and resolved.epi_tma
+        assert resolved.softmax_region == (
+            "shared" if "shared" in case else "per_stage"
+        )
+        # Two staged tiles at head dim 128 clamp the ring to the 227 KB cap.
+        assert resolved.kv_stage == (3 if head_dim == 128 and o_stage == 2 else 4)
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        results[o_stage] = (out, lse)
+        if o_stage == 1 and "many_items" in case:
+            # The tile is handed between items on every CTA: repeat launches.
+            for _ in range(5):
+                again_out, again_lse = fn(*args)
+                torch.cuda.synchronize()
+                assert torch.equal(again_out, out)
+                assert torch.equal(again_lse, lse)
+    assert torch.equal(results[1][0], results[2][0])
+    assert torch.equal(results[1][1], results[2][1])
+    out_ref, lse_ref = _reference(
+        q, k, v, None, block_mask, enable_gqa=kv_heads is not None
+    )
+    _assert_close_to_reference(*results[1], out_ref, lse_ref)

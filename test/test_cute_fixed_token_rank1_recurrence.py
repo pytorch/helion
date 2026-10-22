@@ -15,6 +15,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -202,6 +203,8 @@ def _config(
     )
 
 
+# unittest runners ignore pytestmark.
+@onlyBackends(["cute"])
 class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
     def _code(
         self,

@@ -59,6 +59,9 @@ BODY: dict[str, object] = {
     cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
     cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
     cute_flash.FLASH_EPI_TMA_KEY: True,
+    # These tests inspect the one-item render (the list walk is persistent
+    # by default; the persistent form repeats the setup per role).
+    cute_flash.FLASH_PERSISTENT_KEY: False,
 }
 
 
@@ -321,13 +324,29 @@ def test_render_differs_only_in_the_present_masks_and_the_mma_warp(
     for stage in ("0", "1"):
         assert on.count(f"issue=flash_flex_qk_live{stage})") == 2
         assert on.count(f"issue=flash_flex_pv_issue{stage})") == 2
-        assert (
-            on.count(
-                f"flash_flex_pv_issue{stage} = flash_flex_pv_live{stage} | "
-                f"cutlass.Int32(flash_o_zero{stage})"
-            )
-            == 2
+    # The steady loop's PVs and the last PV0 issue on the walk's flags; the
+    # last PV1 on the item's snapshot of its stage-1 flag (the persistent
+    # loop's early next-item head rewrites the walk's flag between the two
+    # last PVs; the one-item body takes the same, inert, snapshot).
+    assert (
+        on.count(
+            "flash_flex_pv_issue0 = flash_flex_pv_live0 | cutlass.Int32(flash_o_zero0)"
         )
+        == 2
+    )
+    assert (
+        on.count(
+            "flash_flex_pv_issue1 = flash_flex_pv_live1 | cutlass.Int32(flash_o_zero1)"
+        )
+        == 1
+    )
+    assert on.count("flash_flex_pv_last1 = flash_flex_pv_live1") == 1
+    assert (
+        on.count(
+            "flash_flex_pv_issue1 = flash_flex_pv_last1 | cutlass.Int32(flash_o_zero1)"
+        )
+        == 1
+    )
     for arrival in (
         "cute_tcgen05_flash.commit(flash_s_full_ptr + 0)",
         "cute_tcgen05_flash.commit(flash_s_full_ptr + 1)",

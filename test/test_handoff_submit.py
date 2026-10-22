@@ -11,6 +11,14 @@ import time
 
 import pytest
 
+# Launches a real handoff client subprocess -- compile-mode machinery that
+# HELION_INTERPRET=1 bypasses, and it flakes on the single-GPU A10G ref-eager
+# runner.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("HELION_INTERPRET") == "1",
+    reason="handoff client subprocess flakes on the A10G ref-eager runner",
+)
+
 
 def write_json(path, value):
     temporary = path.with_suffix(".tmp")

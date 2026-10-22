@@ -40,6 +40,7 @@ from torch.fx.node import Node
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
@@ -69,6 +70,11 @@ from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
 from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
+from .grouped_ab_k import physical_grouped_ab_k
+from .grouped_ab_k import prove_grouped_ab_k_loop
+from .grouped_balanced_workers import GroupedBalancedWorkersPlan
+from .grouped_balanced_workers import balanced_workers_index_domain
+from .grouped_d_shift import bounded_d_shift_index_domain
 from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
 from .grouped_full_coverage import full_allocation_b_two_cta_profile_supported
 from .grouped_full_coverage import full_allocation_b_two_cta_smem_upper_bound
@@ -77,6 +83,10 @@ from .grouped_full_coverage import full_coverage_pipeline_supported
 from .grouped_full_coverage import full_coverage_smem_upper_bound
 from .grouped_full_coverage import full_row_union_predicate
 from .grouped_full_coverage import full_row_union_statements
+from .grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from .grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from .grouped_panel_raster import grouped_device_panel_index_domain
+from .grouped_panel_raster import grouped_panel_ratio_index_domain
 from .grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from .grouped_row_union import PAIRED_CLC
 from .grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
@@ -100,6 +110,7 @@ from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
 from .mma_support import tcgen05_supports_input_dtype
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
@@ -154,8 +165,12 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
@@ -172,6 +187,7 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_K
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
@@ -190,9 +206,11 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -204,7 +222,6 @@ if TYPE_CHECKING:
     from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
-    from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
@@ -590,11 +607,14 @@ class Tcgen05GroupedWorklistAnalysis:
     metadata_tensor: torch.Tensor
     packed_tensor: torch.Tensor
     grouped_tensor: torch.Tensor
+    output_dtype: torch.dtype | None = None
     device_layout_kind: Literal["split_sizes", "offsets"] | None = None
     full_coverage_supported: bool = False
     dense_row_union_supported: bool = False
     dense_row_union_cluster4_supported: bool = False
     dense_row_union_paired_clc_supported: bool = False
+    ab_k_fusion_supported: bool = False
+    d_shift_supported: bool = False
 
     @property
     def input_kind(self) -> Literal["device_split_sizes", "external_worklist"]:
@@ -1028,6 +1048,81 @@ def _shared_rhs_region_is_exclusive(cg: GenerateAST, mma: Node, store: Node) -> 
     return True
 
 
+def _grouped_ab_k_loop_supported(
+    cg: GenerateAST,
+    mma: Node,
+    proof: _Rank3RhsGroupedProof,
+    *,
+    static_k: int | None,
+    k_multiple: int = 128,
+) -> bool:
+    """Retain the complete native worklist proof before grouping K iterations."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    store = proof.worklist_store
+    if (
+        not proof.is_worklist
+        or proof.packed_split is None
+        or store is None
+        or proof.k_mask is not None
+        or proof.tail_epilogue is not None
+        or not _operand_infos_exclusive_for_mma(proof.lhs, proof.rhs, mma)
+        or not _mma_loop_is_exclusive(mma)
+        or proof.lhs.source_fake.ndim != 2
+        or not proof.lhs.source_fake.is_contiguous()
+    ):
+        return False
+    rhs = proof.rhs.source_fake
+    if not (
+        rhs.ndim == 2
+        and rhs.is_contiguous()
+        or rhs.ndim == 3
+        and (
+            rhs.is_contiguous()
+            or (
+                env.known_equal(rhs.stride(1), 1)
+                and env.known_equal(rhs.stride(2), rhs.shape[1])
+                and env.known_equal(rhs.stride(0), rhs.shape[1] * rhs.shape[2])
+            )
+        )
+    ):
+        return False
+    output_node = store.store_node.args[0]
+    output = output_node.meta.get("val") if isinstance(output_node, Node) else None
+    if not (
+        isinstance(output, torch.Tensor)
+        and output.is_contiguous()
+        and env.tensor_storage_is_compiler_allocated(output)
+        and id(output.untyped_storage())
+        not in {
+            id(tensor.untyped_storage())
+            for tensor in (
+                *env.input_sources,
+                proof.lhs.source_fake,
+                proof.rhs.source_fake,
+            )
+        }
+        and all(
+            0 < env.size_hint(tensor.numel()) <= (1 << 31) - 1
+            for tensor in (proof.lhs.source_fake, rhs, output)
+        )
+    ):
+        return False
+    acc = mma.args[0]
+    return isinstance(acc, Node) and prove_grouped_ab_k_loop(
+        env,
+        cg.codegen_graphs,
+        mma,
+        lhs_load=proof.lhs.load,
+        rhs_load=proof.rhs.load,
+        static_k=static_k,
+        zero_seed=_is_zero_init_acc_node(acc, graphs=cg.codegen_graphs),
+        exclusive_region=_shared_rhs_region_is_exclusive(cg, mma, store.store_node),
+        k_multiple=k_multiple,
+    )
+
+
 def _trace_to_load(node: Node) -> Node | None:
     """Trace through dtype casts to the underlying load node."""
     from ...language import memory_ops
@@ -1214,11 +1309,9 @@ def _tcgen05_mma_output_tma_store_provable(
     requests the direct-entry seed never makes. An untraced fan-out is left
     to the store lowering, as in codegen.
 
-    ``candidate`` was analyzed with the DeviceIR, which also analyzes the
-    output stores; codegen analyzes the MMA from the graphs alone and stages
-    D row-major unless that view carries a store analysis (leading
-    passthrough or permuted operands), so the expected destination layout is
-    taken from the same graph-only view.
+    ``candidate`` was analyzed with the DeviceIR, which caches the output-store
+    layout. Graph-only codegen reuses that analysis, so both phases select the
+    destination's actual row-major or column-major layout.
     """
     if _tcgen05_grouped_rhs_keeps_store_protocol(candidate.operands.rhs):
         return True
@@ -3172,6 +3265,20 @@ class _MmaOperandAnalysis:
     rhs: _MmaOperandInfo
 
     @property
+    def lhs_tma_major_supported(self) -> bool:
+        """Whether the tcgen05 TMA pipeline can stage A in its storage order.
+
+        A K-major (row-major) A always can; an M-major A (``x.T``) only in a
+        plain rank-2 GEMM, mirroring ``_emit_mma_pipeline``'s gate.
+        """
+        return self.lhs.matrix_major == "row" or (
+            self.lhs.matrix_major == "col"
+            and not self.has_leading_passthrough
+            and self.lhs.logical_fake.ndim == 2
+            and self.rhs.logical_fake.ndim == 2
+        )
+
+    @property
     def supports_role_local_n_edge_tma(self) -> bool:
         """Whether rank-2 layouts support the partial-N role-local TMA path."""
         return (
@@ -4058,18 +4165,18 @@ def analyze_cute_mma_node(
         return None
     if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
         return None
-    output_store_analysis: _MmaOutputStoreAnalysis | None = None
+    cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
+    output_store_analysis = (
+        cached if isinstance(cached, _MmaOutputStoreAnalysis) else None
+    )
     needs_output_store_analysis = operands.has_leading_passthrough or (
         operands.lhs.source_to_logical_order is not None
         and operands.rhs.source_to_logical_order is not None
     )
-    # DeviceIR provides the complete graph set needed to compute and cache the
-    # store analysis for small-N search. Later codegen callers lack DeviceIR;
-    # operand forms that require this proof retrieve the cached result instead.
+    # DeviceIR provides the complete graph set needed to cache store analysis.
+    # Every later codegen caller reuses it, including ordinary contractions
+    # writing through a column-major view.
     if needs_output_store_analysis or device_ir is not None:
-        cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
-        if isinstance(cached, _MmaOutputStoreAnalysis):
-            output_store_analysis = cached
         if device_ir is not None:
             if operands.rhs.rhs_packed_group is not None:
                 graph_view = cast(
@@ -4164,7 +4271,7 @@ def analyze_cute_mma_node(
         operands=operands,
         output_store_analysis=output_store_analysis,
         explicit_epi_tile_compatible=(
-            operands.lhs.matrix_major == "row"
+            operands.lhs_tma_major_supported
             and operands.rhs.matrix_major in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
@@ -4646,10 +4753,24 @@ def analyze_tcgen05_grouped_worklist(
                     metadata_tensor=proof.layout_tensor,
                     packed_tensor=proof.lhs.source_fake,
                     grouped_tensor=proof.rhs.source_fake,
+                    output_dtype=_trace_mma_to_store_dtype(node, device_ir.graphs),
                     device_layout_kind=(
                         proof.packed_split.layout_kind
                         if proof.packed_split is not None
                         else None
+                    ),
+                    ab_k_fusion_supported=_grouped_ab_k_loop_supported(
+                        cast("GenerateAST", graph_view),
+                        node,
+                        proof,
+                        static_k=fact.static_k,
+                    ),
+                    d_shift_supported=_grouped_ab_k_loop_supported(
+                        cast("GenerateAST", graph_view),
+                        node,
+                        proof,
+                        static_k=fact.static_k,
+                        k_multiple=64,
                     ),
                     full_coverage_supported=_grouped_full_coverage_semantics(
                         cast("GenerateAST", graph_view), node, proof
@@ -5530,6 +5651,25 @@ def prepare_cute_collective_lane_loop_suppression(
             rhs_rank3_worklist_lhs_info is not None
             and grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
         )
+        if (
+            cg.device_function.config.get(TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY)
+            is not None
+        ):
+            if not worklist_lowering or not _grouped_ab_k_loop_supported(
+                cg,
+                node,
+                proof,
+                static_k=(
+                    lhs_info.source_fake.shape[-1]
+                    if type(lhs_info.source_fake.shape[-1]) is int
+                    else None
+                ),
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "physical grouped K128 requires a pure direct-load addmm loop",
+                )
+            bk = physical_grouped_ab_k(cg.device_function.config, bk)
         worklist_profile = (
             resolve_tcgen05_grouped_worklist_mma_profile(
                 cg.device_function.config,
@@ -5548,21 +5688,26 @@ def prepare_cute_collective_lane_loop_suppression(
         collective_bn = (
             collective_profile.mma_n if collective_profile is not None else bn
         )
-        if (
-            _choose_mma_impl(
-                lhs_fake.dtype,
-                bm=collective_bm,
-                bn=collective_bn,
-                bk=bk,
-                config=cg.device_function.config,
-                input_device=lhs_fake.device,
-                defer_grouped_worklist_smem_check=(
-                    worklist_profile is not None
-                    or physical_schedule(cg.device_function.config) is not None
-                ),
-            )
-            != "tcgen05"
-        ):
+        selected_mma_impl = _choose_mma_impl(
+            lhs_fake.dtype,
+            bm=collective_bm,
+            bn=collective_bn,
+            bk=bk,
+            config=cg.device_function.config,
+            input_device=lhs_fake.device,
+            defer_grouped_worklist_smem_check=(
+                worklist_profile is not None
+                or physical_schedule(cg.device_function.config) is not None
+            ),
+        )
+        if selected_mma_impl != "tcgen05":
+            if (
+                cg.device_function.config.get(TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY)
+                is not None
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "physical grouped K128 requires native tcgen05 MMA"
+                )
             continue
         if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
             cg,
@@ -6770,7 +6915,7 @@ def _analyze_packed_split_mma_output_store(
     if (
         not isinstance(tensor_fake, torch.Tensor)
         or tensor_fake.ndim != 2
-        or tensor_fake.dtype != analysis.lhs.source_fake.dtype
+        or tensor_fake.dtype not in (analysis.lhs.source_fake.dtype, torch.float32)
         or not isinstance(subscripts, list | tuple)
         or len(subscripts) != 2
         or not isinstance(subscripts[1], Node)
@@ -6795,7 +6940,9 @@ def _analyze_packed_split_mma_output_store(
     ):
         return None
     return _MmaOutputStoreAnalysis(
-        explicit_epi_tile_compatible=True,
+        explicit_epi_tile_compatible=(
+            tensor_fake.dtype == analysis.lhs.source_fake.dtype
+        ),
         output_column_major=_tcgen05_tma_matrix_major(tensor_fake) == "col",
     )
 
@@ -7069,10 +7216,11 @@ def _rank3_rhs_packed_split_consumers_are_exclusive(
 
 def _requested_tcgen05_grouped_schedule(
     grouped_mode: str | None,
+    orientation: object = "nm",
 ) -> Tcgen05Orientation | None:
     if grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM:
         return None
-    return Tcgen05Orientation.NM
+    return Tcgen05Orientation.MN if orientation == "mn" else Tcgen05Orientation.NM
 
 
 def _tcgen05_full_allocation_b_index_domain(m: int, k: int, tile_m: int) -> bool:
@@ -7083,6 +7231,23 @@ def _tcgen05_full_allocation_b_index_domain(m: int, k: int, tile_m: int) -> bool
         and tile_m > 0
         and m * k <= (1 << 31) - 1
         and m + tile_m - 1 <= (1 << 31) - 1
+    )
+
+
+def _tcgen05_grouped_b_rank3_index_domain(
+    groups: int, n: int, k: int, tile_n: int
+) -> bool:
+    """Bound original signed offsets and independently padded expert rows.
+
+    An immutable [N,K,G] descriptor gives N its own exact extent. Padded N
+    coordinates remain out of bounds in that dimension, even when the next
+    expert occupies adjacent storage; they never become that expert's rows.
+    """
+    limit = (1 << 31) - 1
+    return (
+        min(groups, n, k, tile_n) > 0
+        and groups * n * k <= limit
+        and n + tile_n - 1 <= limit
     )
 
 
@@ -7142,25 +7307,55 @@ def _emit_tcgen05_device_segments_setup(
             ),
         ]
     )
-    setup_lines = [
-        (
-            "if (cute.arch.thread_idx()[0] == 0) and "
-            "(cute.arch.thread_idx()[1] == 0) and "
-            "(cute.arch.thread_idx()[2] == 0):"
+    # Each offset pair describes an independent group. Full-coverage folds
+    # consume the complete metadata table in the leader's setup region.
+    parallel_offsets = (
+        grouped.device_layout_kind == "offsets" and grouped.full_coverage is None
+    )
+    if parallel_offsets:
+        thread_idx = df.new_var("tcgen05_grouped_metadata_thread_idx")
+        block_dim = df.new_var("tcgen05_grouped_metadata_block_dim")
+        metadata_group = df.new_var("tcgen05_grouped_metadata_group")
+        prefix.extend(
+            [
+                statement_from_string(f"{thread_idx} = cute.arch.thread_idx()"),
+                statement_from_string(f"{block_dim} = cute.arch.block_dim()"),
+            ]
         )
-    ]
+        setup_lines = [
+            (
+                f"for {metadata_group} in cutlass.range("
+                f"{thread_idx}[0] + {block_dim}[0] * "
+                f"({thread_idx}[1] + {block_dim}[1] * {thread_idx}[2]), "
+                f"{group_count}, "
+                f"{block_dim}[0] * {block_dim}[1] * {block_dim}[2], unroll=1):"
+            )
+        ]
+        group_indices = [metadata_group]
+    else:
+        setup_lines = [
+            (
+                "if (cute.arch.thread_idx()[0] == 0) and "
+                "(cute.arch.thread_idx()[1] == 0) and "
+                "(cute.arch.thread_idx()[2] == 0):"
+            )
+        ]
+        group_indices = range(group_count)
     if grouped.device_layout_kind == "split_sizes":
         assert running_start is not None
         setup_lines.append(f"    {running_start} = {layout_int_type}(0)")
-    for group_idx in range(group_count):
+    for group_idx in group_indices:
         layout_load = (
             f"({grouped.layout}.iterator + cutlass.Int64({group_idx}) * "
             f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
         )
         if grouped.device_layout_kind == "offsets":
             assert raw_start is not None and raw_extent is not None
+            next_group_idx = (
+                group_idx + 1 if isinstance(group_idx, int) else f"{group_idx} + 1"
+            )
             next_layout_load = (
-                f"({grouped.layout}.iterator + cutlass.Int64({group_idx + 1}) * "
+                f"({grouped.layout}.iterator + cutlass.Int64({next_group_idx}) * "
                 f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
             )
             setup_lines.extend(
@@ -7251,11 +7446,11 @@ def _emit_tcgen05_device_segments_setup(
                 ),
                 (
                     f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
-                    f"cutlass.Int32(0)] = cutlass.Int32({n_size})"
+                    f"cutlass.Int32(0)] = cutlass.Int32({n_size if grouped.orientation is Tcgen05Orientation.NM else visible_extent})"
                 ),
                 (
                     f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
-                    f"cutlass.Int32(1)] = cutlass.Int32({visible_extent})"
+                    f"cutlass.Int32(1)] = cutlass.Int32({visible_extent if grouped.orientation is Tcgen05Orientation.NM else n_size})"
                 ),
                 (
                     f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
@@ -7275,6 +7470,12 @@ def _emit_tcgen05_device_segments_setup(
         assert isinstance(initializer, ast.If)
         initializer.body.extend(full_row_union_statements(df, grouped))
     prefix.extend([initializer, statement_from_string("cute.arch.sync_threads()")])
+    if grouped.worker_balance is not None:
+        prefix.extend(
+            grouped.worker_balance.setup_statements(
+                grouped.problem_sizes, group_count, df.new_var
+            )
+        )
     if grouped.full_coverage is not None:
         prefix.append(full_row_union_predicate(grouped))
 
@@ -7309,7 +7510,10 @@ def _emit_mma_pipeline(
     env = CompileEnvironment.current()
     row_union_requested = cg.device_function.config.get(GROUPED_ROW_UNION_KEY, False)
     row_union_plan: GroupedRowUnionPlan | None = None
-    requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
+    requested_schedule = _requested_tcgen05_grouped_schedule(
+        grouped_mode,
+        cg.device_function.config.get("tcgen05_grouped_worklist_orientation", "nm"),
+    )
 
     def _unsupported_schedule(reason: str) -> None:
         if requested_schedule is not None:
@@ -7659,10 +7863,21 @@ def _emit_mma_pipeline(
     ) or (input_dtype == torch.float32 and cute_fp32_dot_uses_tf32())
     _lhs_major = lhs_operand.matrix_major
     _rhs_major = rhs_operand.matrix_major
-    # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
-    # layout Helion emits expects the standard row-major A. Only B's major
-    # mode is made layout-aware here.
-    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
+    # A is K-major when its (M, K) storage is K-contiguous (row-major) and
+    # M-major when M-contiguous (column-major, e.g. ``x.T``). The grouped
+    # schedules stage the original A as a K-major operand, so an M-major A is
+    # staged through TMA only for the plain 2-D GEMM.
+    plain_gemm = (
+        grouped_mode is None
+        and not row_union_requested
+        and lhs_fake.ndim == 2
+        and rhs_fake.ndim == 2
+        and not (analysis is not None and analysis.has_leading_passthrough)
+    )
+    tcgen05_use_tma_a = _dtype_tma_ok and (
+        _lhs_major == "row" or (_lhs_major == "col" and plain_gemm)
+    )
+    tcgen05_a_k_major = _lhs_major == "row"
     tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
     # The wrapper constructs an A/B descriptor pair. Keep both scalar
     # producers if either descriptor's alignment is unproved; this also
@@ -7704,6 +7919,7 @@ def _emit_mma_pipeline(
     if k_loop_info is None:
         return _unsupported_schedule("K loop analysis failed")
     device_loop, k_block_id, k_offset_var, bk = k_loop_info
+    logical_bk = bk
     if analysis is not None and k_block_id != analysis.k_block_id:
         return None
     if analysis is None and _has_non_root_lane_loops(
@@ -7919,6 +8135,22 @@ def _emit_mma_pipeline(
     )
     if row_union_requested is True and row_union_plan is None:
         raise exc.BackendUnsupported("cute", "dense row-union semantic proof failed")
+    grouped_ab_k_fused = df.config.get(TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY) is not None
+    if grouped_ab_k_fused:
+        if (
+            rhs_rank3_grouped_proof is None
+            or fx_node is None
+            or requested_schedule is not Tcgen05Orientation.NM
+            or not tcgen05_use_tma_pipeline
+            or not _grouped_ab_k_loop_supported(
+                cg, fx_node, rhs_rank3_grouped_proof, static_k=k_total_size
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "physical grouped K128 requires the complete pure direct-load TMA worklist proof",
+            )
+        bk = physical_grouped_ab_k(df.config, logical_bk)
     # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
     # `helion/language/memory_ops.py`. Static-full flat kernels and validated
     # role-local persistent kernels use the SMEM-staged TMA-store epilogue;
@@ -8000,7 +8232,9 @@ def _emit_mma_pipeline(
         output_column_major = True
     # N,M orientation computes C.T = B @ A.T. Therefore the original grouped
     # B becomes physical operand A, while packed A becomes physical operand B.
-    tcgen05_mma_a_k_major = not tcgen05_nm_orientation or tcgen05_b_k_major
+    tcgen05_mma_a_k_major = (
+        tcgen05_b_k_major if tcgen05_nm_orientation else tcgen05_a_k_major
+    )
     tcgen05_mma_b_k_major = True if tcgen05_nm_orientation else tcgen05_b_k_major
     worklist_profile = None
     tcgen05_worklist_source_m_tile: int | None = None
@@ -8028,6 +8262,15 @@ def _emit_mma_pipeline(
         tcgen05_one_cta_worklist_shape = tcgen05_cluster_m == 1
         tcgen05_source_bm = tcgen05_worklist_source_m_tile
         tcgen05_source_bn = tcgen05_mma_bm
+    elif requested_schedule is Tcgen05Orientation.MN:
+        worklist_profile = resolve_tcgen05_grouped_worklist_mma_profile(
+            df.config, block_k=bk
+        )
+        if worklist_profile is None:
+            return _unsupported_schedule("unsupported physical M,N worklist profile")
+        tcgen05_worklist_source_m_tile = worklist_profile.source_m_tile
+        tcgen05_mma_bm = tcgen05_source_bm = worklist_profile.mma_m
+        tcgen05_mma_bn = tcgen05_source_bn = worklist_profile.mma_n
     else:
         tcgen05_mma_bm = tcgen05_source_bm = bm
         tcgen05_mma_bn = tcgen05_source_bn = bn
@@ -8040,7 +8283,13 @@ def _emit_mma_pipeline(
             # Full eligibility (plain full-tile static family) is enforced
             # after the family flags are derived below.
             tcgen05_mma_bm = TCGEN05_TWO_CTA_BLOCK_M
-    tcgen05_m_subtile_count = bm // tcgen05_mma_bm if not tcgen05_nm_orientation else 1
+    # Transposed row-union profiles own one physical accumulator per tile even
+    # when they do not request a grouped orientation through the config.
+    tcgen05_m_subtile_count = (
+        bm // tcgen05_mma_bm
+        if requested_schedule is None and not tcgen05_nm_orientation
+        else 1
+    )
 
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
     if tcgen05_large_bn_proof and (
@@ -8080,6 +8329,10 @@ def _emit_mma_pipeline(
             or physical_schedule(cg.device_function.config) is not None
         ),
     )
+    if grouped_ab_k_fused and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute", "physical grouped K128 requires native tcgen05 MMA"
+        )
     if mma_impl == "tcgen05" and input_dtype == torch.float32:
         # fp32 operands run the tcgen05 MMA as tf32 (permitted by
         # settings.dot_precision, checked in _mma_impl_matches_problem_shape).
@@ -8115,6 +8368,21 @@ def _emit_mma_pipeline(
             mma_impl = "universal"
         else:
             input_dtype_str = "cutlass.TFloat32"
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_b
+        and tcgen05_mma_b_k_major
+        and tcgen05_mma_bn == 8
+        and bk * input_dtype.itemsize == 32
+    ):
+        # CuTe cannot fold an 8-row stage of 32-byte K-major B rows into one
+        # TMA box: it issues one bulk copy per row at 32-byte shared offsets,
+        # and the TMA unit faults on the unaligned destination (a sticky
+        # misaligned-address error that also kills an in-process autotune).
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 K-major B TMA with block_n=8 needs block_k * itemsize >= 64",
+        )
     if (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -8242,7 +8510,7 @@ def _emit_mma_pipeline(
         input_dtype=input_dtype,
         cta_group=cast("str", df.config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto")),
     )
-    if tcgen05_nm_orientation and tcgen05_cluster_m == 2:
+    if requested_schedule is not None and tcgen05_cluster_m == 2:
         tcgen05_requested_two_cta = True
     tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
     # A leading-batch grid axis composes with the CtaGroup.TWO cluster: the
@@ -8359,11 +8627,41 @@ def _emit_mma_pipeline(
         and n_size % bn == 0
         and k_total_size % bk == 0
     )
+    # The new N-multicast edge family keeps every peer's tile origin in
+    # bounds and all roles on one identical, unsplit static tile stream.
+    # Its graph/alignment and schedule proof is also used by seed admission
+    # and normalization. Any other persistent cluster_n=2 N-edge config is
+    # rejected here; the shared non-TMA path that used to lower them cannot
+    # run a persistent cluster_m=2 launch anyway. The M-edge, double-edge and
+    # K-tail families keep their existing gates.
+    tcgen05_even_n_cluster_edge = (
+        env.config_spec._cute_tcgen05_config.n_edge_cluster_schedule_config_supported(
+            df.config.config
+        )
+    )
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_pid_is_persistent
+        and row_union_plan is None
+        and not tcgen05_grouped_static_persistent_requested
+        and tcgen05_cluster_n_requested == 2
+        and m_size % bm == 0
+        and n_size % bn != 0
+        and k_total_size % bk == 0
+        and not tcgen05_even_n_cluster_edge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N-edge cluster_n=2 requires proved aligned native rank-2 "
+            "operands with K-major B, an even N tile count, and the unsplit "
+            "static role-local schedule with no scheduler warp, L2 grouping "
+            "or swizzle",
+        )
     tcgen05_n_edge_only = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
-        and tcgen05_cluster_n_requested == 1
+        and (tcgen05_cluster_n_requested == 1 or tcgen05_even_n_cluster_edge)
         and m_size % bm == 0
         and n_size % bn != 0
         and k_total_size % bk == 0
@@ -8480,7 +8778,9 @@ def _emit_mma_pipeline(
     tcgen05_role_local_m_edge_tma = (
         tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
-    tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and tcgen05_cluster_n == 1
+    tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and (
+        tcgen05_cluster_n == 1 or tcgen05_even_n_cluster_edge
+    )
     tcgen05_role_local_double_edge_tma = (
         tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
@@ -8495,7 +8795,13 @@ def _emit_mma_pipeline(
             or tcgen05_n_edge_only
             or tcgen05_k_tail_only
         )
-        and l2_swizzle_size_from_config(df.config) > 1
+        and (
+            l2_swizzle_size_from_config(df.config) > 1
+            or (
+                df.config.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+                and _tcgen05_config_int(df.config, GROUPED_PANEL_ALTERNATE_KEY, 1) > 1
+            )
+        )
     ):
         # The edge/K-tail family's split full/fringe scheduler does not
         # compose with the CUTLASS scheduler swizzle under a 4-CTA cluster:
@@ -8920,6 +9226,8 @@ def _emit_mma_pipeline(
         mma_impl != "tcgen05"
         or tcgen05_is_two_cta
         or not tcgen05_use_tma_pipeline
+        # The G4 envelope was proven with the row-major (K-major) A layout.
+        or not tcgen05_a_k_major
         or not tcgen05_static_full_tiles
         or not tcgen05_use_tma_store_epilogue
     ):
@@ -9013,8 +9321,25 @@ def _emit_mma_pipeline(
             k_major=False,
         )
         worklist_nm_static_checks = {
+            "mn_complete_n_clusters": (
+                requested_schedule is not Tcgen05Orientation.MN
+                or tcgen05_cluster_n == 1
+                or (
+                    rhs_source_n is not None
+                    and rhs_source_n % (tcgen05_mma_bn * tcgen05_cluster_n) == 0
+                )
+            ),
+            "source128_device_metadata": (
+                tcgen05_worklist_source_m_tile
+                != TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+                or (
+                    rhs_rank3_grouped_proof is not None
+                    and rhs_rank3_grouped_proof.packed_split is not None
+                )
+            ),
             "f16_or_bf16_operands": input_dtype in (torch.float16, torch.bfloat16),
-            "matching_f16_or_bf16_store": epi_elem_dtype_str == input_dtype_str,
+            "input_or_accumulator_store": epi_elem_dtype_str
+            in (input_dtype_str, "cutlass.Float32"),
             "tile_256x128x64_or_128": (
                 bm == 256
                 and bn == 128
@@ -9070,6 +9395,49 @@ def _emit_mma_pipeline(
                 "256x128), zero accumulator, and a matching-dtype "
                 "store; failed checks: " + ", ".join(failed_static_checks),
             )
+        if requested_schedule is Tcgen05Orientation.MN and (
+            _tcgen05_config_int(df.config, TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) > 1
+            or df.config.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+        ):
+            if (
+                rhs_rank3_grouped_proof is None
+                or rhs_rank3_grouped_proof.packed_split is None
+                or rhs_rank3_grouped_proof.packed_split.layout_kind != "offsets"
+                or fx_node is None
+                or not _grouped_ab_k_loop_supported(
+                    cg,
+                    fx_node,
+                    rhs_rank3_grouped_proof,
+                    static_k=k_total_size,
+                    k_multiple=64,
+                )
+                or not grouped_device_panel_index_domain(
+                    int(rhs_rank3_grouped_proof.rhs.rhs_group_count),
+                    m_size,
+                    n_size,
+                    tcgen05_mma_bm,
+                    tcgen05_mma_bn,
+                    tcgen05_cluster_n,
+                )
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "device MN panel raster requires the pure signed-offset "
+                    "worklist proof and bounded Int32 cluster prefixes",
+                )
+            if df.config.get(GROUPED_PANEL_ALTERNATE_KEY) is not None and (
+                rhs_source_n is None
+                or not grouped_panel_ratio_index_domain(
+                    rhs_source_n,
+                    tcgen05_mma_bn,
+                    tcgen05_cluster_n,
+                    _tcgen05_config_int(df.config, GROUPED_PANEL_RATIO_KEY, 0),
+                )
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "adaptive panel ratio requires a guarded static N extent and a signed Int32 threshold",
+                )
     if tcgen05_grouped_static_persistent_requested:
         if rhs_rank3_grouped_proof is None:
             raise exc.BackendUnsupported(
@@ -9114,7 +9482,7 @@ def _emit_mma_pipeline(
             tcgen05_grouped_worklist_persistent
             and tcgen05_is_two_cta
             and tcgen05_cluster_m == 2
-            and tcgen05_cluster_n == 1
+            and (tcgen05_cluster_n == 1 or requested_schedule is Tcgen05Orientation.MN)
             and bm == TCGEN05_TWO_CTA_BLOCK_M
             and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
         )
@@ -9124,7 +9492,7 @@ def _emit_mma_pipeline(
             and not tcgen05_is_two_cta
             and tcgen05_cluster_m == 1
             and tcgen05_cluster_n == 1
-            and tcgen05_mma_bm == 128
+            and tcgen05_mma_bm in (64, 128)
             and tcgen05_mma_bn in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
             and bm == TCGEN05_TWO_CTA_BLOCK_M
             and bn == 128
@@ -9155,7 +9523,8 @@ def _emit_mma_pipeline(
             "cluster_m_1_or_supported_worklist": (
                 tcgen05_cluster_m == 1 or grouped_worklist_supported
             ),
-            "cluster_n_1": tcgen05_cluster_n == 1,
+            "cluster_n_1": tcgen05_cluster_n == 1
+            or (requested_schedule is Tcgen05Orientation.MN and tcgen05_cluster_n == 2),
             "cta_group_one_or_supported_worklist": (
                 not tcgen05_is_two_cta or grouped_worklist_supported
             ),
@@ -9500,8 +9869,11 @@ def _emit_mma_pipeline(
         nm_deep_ab = (
             requested_schedule is not None
             and grouped_worklist_supported
-            and 4 <= tcgen05_ab_stage_count_value <= 7
-            and tcgen05_c_stage_count_value == 2
+            and 4
+            <= tcgen05_ab_stage_count_value
+            <= (32 if requested_schedule is Tcgen05Orientation.MN else 7)
+            and tcgen05_c_stage_count_value
+            in ((2, 3, 4) if requested_schedule is Tcgen05Orientation.MN else (2,))
             and _tcgen05_config_int(
                 df.config,
                 "tcgen05_acc_stages",
@@ -9580,7 +9952,7 @@ def _emit_mma_pipeline(
         tcgen05_grouped_problem_n = df.new_var("tcgen05_grouped_problem_n")
         tcgen05_grouped_problem_k = df.new_var("tcgen05_grouped_problem_k")
         tcgen05_grouped_global_m_start = df.new_var("tcgen05_grouped_global_m_start")
-        if requested_schedule is not None:
+        if requested_schedule is Tcgen05Orientation.NM:
             tcgen05_grouped_valid_m = df.new_var("tcgen05_grouped_valid_m")
             tcgen05_grouped_store_m = df.new_var("tcgen05_grouped_store_m")
         if (
@@ -9644,9 +10016,16 @@ def _emit_mma_pipeline(
             d_tensormap=tcgen05_grouped_d_tensormap,
             fixed_tensormaps=tcgen05_grouped_fixed_tensormaps,
             source_m_tile=(
-                tcgen05_worklist_source_m_tile if tcgen05_nm_orientation else None
+                tcgen05_worklist_source_m_tile
+                if requested_schedule is not None
+                else None
             ),
             m_size=m_size if tcgen05_grouped_device_split_sizes else None,
+            device_n_size=(
+                _static_int(rhs_info.matrix_cols)
+                if tcgen05_grouped_device_split_sizes
+                else None
+            ),
             device_layout_kind=tcgen05_grouped_device_layout_kind,
             clipped_negative_start=(
                 rhs_rank3_grouped_proof is not None
@@ -9669,33 +10048,6 @@ def _emit_mma_pipeline(
             f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires the "
             "generated segment-worklist grouped tcgen05 path",
         )
-    if requested_schedule is Tcgen05Orientation.NM:
-        assert tcgen05_grouped_plan is not None
-        grouped_smem_capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
-            lhs_info.source_fake.device
-        )
-        grouped_smem_required = tcgen05_grouped_worklist_smem_bytes(
-            group_count=int(tcgen05_grouped_plan.count),
-            device_split_sizes=tcgen05_grouped_plan.device_split_sizes,
-            sched_stage_count=_tcgen05_config_int(
-                df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1
-            ),
-            bm=tcgen05_mma_bm,
-            bn=tcgen05_mma_bn,
-            bk=bk,
-            dtype_bytes=input_dtype.itemsize,
-            ab_stages=tcgen05_ab_stage_count_value,
-            acc_stages=tcgen05_acc_stage_count_value,
-            c_stages=tcgen05_c_stage_count_value,
-            cluster_m=tcgen05_cluster_m,
-        )
-        if grouped_smem_capacity <= 0 or grouped_smem_required > grouped_smem_capacity:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 grouped N,M worklist generated allocations "
-                f"require {grouped_smem_required} bytes of per-CTA SMEM, "
-                f"exceeding the {grouped_smem_capacity}-byte capacity",
-            )
     tcgen05_grouped_static_persistent = tcgen05_grouped_plan is not None
     tcgen05_grouped_dynamic_ab_tensormaps = (
         tcgen05_grouped_dynamic_ab_tensormap_rank is not None
@@ -9711,7 +10063,12 @@ def _emit_mma_pipeline(
     tcgen05_grouped_full_allocation_b = (
         grouped_worklist_one_cta and tcgen05_grouped_device_split_sizes
     )
-    tcgen05_grouped_two_cta_full_allocation_b = (
+    tcgen05_grouped_full_allocation_b_rank3 = False
+    tcgen05_grouped_full_allocation_a_requested = (
+        df.config.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY, False) is True
+    )
+    tcgen05_grouped_full_allocation_a = False
+    tcgen05_grouped_two_cta_full_allocation_b_legacy = (
         grouped_worklist_two_cta
         and tcgen05_grouped_device_split_sizes
         and tcgen05_shared_rhs
@@ -9736,6 +10093,22 @@ def _emit_mma_pipeline(
         and tcgen05_grouped_plan is not None
         and full_allocation_b_two_cta_smem_upper_bound(int(tcgen05_grouped_plan.count))
         <= CuteTcgen05Config.per_cta_smem_capacity_bytes(lhs_info.source_fake.device)
+    )
+    # The opt-in immutable grouped-weight descriptor also permits the packed
+    # input descriptor to stay immutable on a two-CTA worklist. Its global
+    # row origin is shared by both peers; the existing dynamic output map
+    # discards padded rows. The ownership and signed coordinate proof below
+    # applies independently of whether experts share their weights.
+    tcgen05_grouped_two_cta_full_allocation_b = (
+        tcgen05_grouped_two_cta_full_allocation_b_legacy
+        or (
+            tcgen05_grouped_full_allocation_a_requested
+            and grouped_worklist_two_cta
+            and tcgen05_grouped_device_split_sizes
+            and not tcgen05_shared_rhs
+            and not tcgen05_grouped_runtime_nm_direct
+            and tcgen05_cluster_n == 1
+        )
     )
     full_coverage_output: torch.Tensor | None = None
     if tcgen05_grouped_full_allocation_b or tcgen05_grouped_two_cta_full_allocation_b:
@@ -9786,6 +10159,192 @@ def _emit_mma_pipeline(
         tcgen05_grouped_full_allocation_b = (
             tcgen05_grouped_full_allocation_b
             or tcgen05_grouped_two_cta_full_allocation_b
+        )
+        if tcgen05_grouped_full_allocation_a_requested:
+            assert tcgen05_grouped_plan is not None
+            tcgen05_grouped_full_allocation_a = (
+                (grouped_worklist_one_cta or grouped_worklist_two_cta)
+                and full_allocation_b_checks
+                and not tcgen05_shared_rhs
+                and tcgen05_b_k_major
+                and _is_contiguous_grouped_rhs_source_fake(
+                    rhs_info.source_fake, k_major=True
+                )
+                and n_size % tcgen05_mma_bm == 0
+                and _tcgen05_full_allocation_b_index_domain(
+                    int(tcgen05_grouped_plan.count) * n_size,
+                    k_total_size,
+                    tcgen05_mma_bm,
+                )
+            )
+    if (
+        requested_schedule is Tcgen05Orientation.MN
+        and tcgen05_grouped_full_allocation_a_requested
+    ):
+        assert rhs_rank3_worklist_store_info is not None
+        assert rhs_rank3_grouped_proof is not None
+        assert tcgen05_grouped_plan is not None
+        assert fx_node is not None
+        output_node = rhs_rank3_worklist_store_info.store_node.args[0]
+        output = output_node.meta.get("val") if isinstance(output_node, Node) else None
+        packed_input_checks = (
+            tcgen05_grouped_device_split_sizes
+            and tcgen05_grouped_dynamic_ab_tensormaps
+            and tcgen05_grouped_dynamic_ab_tensormap_rank == 2
+            and tcgen05_grouped_plan.d_mode is Tcgen05GroupedDMode.ALL_TILES
+            and rhs_rank3_grouped_proof.packed_split is not None
+            and not tcgen05_grouped_direct_pointer_metadata
+            and not tcgen05_shared_rhs
+            and _is_contiguous_mk_source_fake(lhs_info.source_fake)
+            and _tcgen05_full_allocation_b_index_domain(
+                m_size, k_total_size, tcgen05_mma_bm
+            )
+            and isinstance(output, torch.Tensor)
+            and id(output.untyped_storage())
+            not in {id(tensor.untyped_storage()) for tensor in env.input_sources}
+            and _shared_rhs_region_is_exclusive(
+                cg, fx_node, rhs_rank3_worklist_store_info.store_node
+            )
+        )
+        tcgen05_grouped_full_allocation_a = packed_input_checks
+        # Flattening [G,N,K] requires whole N tiles to keep padded rows in
+        # their expert. For a feature tail, retain exact N and G dimensions.
+        # The closed contraction and fresh output proof also excludes any
+        # observable auxiliary use of the zero-filled padding.
+        tcgen05_grouped_full_allocation_b_rank3 = (
+            packed_input_checks
+            and n_size % tcgen05_mma_bn != 0
+            and _tcgen05_grouped_b_rank3_index_domain(
+                int(tcgen05_grouped_plan.count), n_size, k_total_size, tcgen05_mma_bn
+            )
+            and _grouped_ab_k_loop_supported(
+                cg,
+                fx_node,
+                rhs_rank3_grouped_proof,
+                static_k=k_total_size,
+                k_multiple=64,
+            )
+        )
+        tcgen05_grouped_full_allocation_b = (
+            packed_input_checks
+            and tcgen05_b_k_major
+            and _is_contiguous_grouped_rhs_source_fake(
+                rhs_info.source_fake, k_major=True
+            )
+            and (
+                tcgen05_grouped_full_allocation_b_rank3
+                or (
+                    n_size % tcgen05_mma_bn == 0
+                    and _tcgen05_full_allocation_b_index_domain(
+                        int(tcgen05_grouped_plan.count) * n_size,
+                        k_total_size,
+                        tcgen05_mma_bn,
+                    )
+                )
+            )
+        )
+        tcgen05_grouped_full_allocation_b_rank3 &= tcgen05_grouped_full_allocation_b
+    if (
+        tcgen05_grouped_full_allocation_a_requested
+        and not tcgen05_grouped_full_allocation_a
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "full-allocation physical A requires contiguous K-major grouped "
+            "weights in a signed-Int32-sized allocation, whole output feature "
+            "tiles, and the pure fresh-output device worklist proof",
+        )
+    tcgen05_grouped_d_shift = (
+        df.config.get(TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY, False) is True
+    )
+    if tcgen05_grouped_d_shift:
+        if (
+            tcgen05_grouped_plan is None
+            or rhs_rank3_grouped_proof is None
+            or fx_node is None
+            or not tcgen05_grouped_plan.device_split_sizes
+            or tcgen05_grouped_plan.d_mode is not Tcgen05GroupedDMode.ALL_TILES
+            or tcgen05_grouped_plan.direct_pointers is not None
+            or tcgen05_grouped_plan.uses_runtime_tile_table
+            or not tcgen05_grouped_full_allocation_a
+            or not tcgen05_grouped_full_allocation_b
+            or not _grouped_ab_k_loop_supported(
+                cg,
+                fx_node,
+                rhs_rank3_grouped_proof,
+                static_k=k_total_size,
+                k_multiple=64,
+            )
+            or not bounded_d_shift_index_domain(
+                m_size,
+                n_size,
+                tcgen05_mma_bn if tcgen05_nm_orientation else tcgen05_mma_bm,
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "bounded output D shift requires the pure fresh-output signed "
+                "device worklist proof and immutable whole input allocations",
+            )
+        tcgen05_grouped_plan = replace(
+            tcgen05_grouped_plan,
+            bounded_output_shift=True,
+            d_tensormap=None,
+        )
+        tcgen05_grouped_dynamic_d_tensormap = False
+        # Both inputs and D are fixed TensorMaps; no mutable workspace is read.
+        tcgen05_grouped_ab_tensormaps = None
+    if df.config.get(TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY, False) is True:
+        if (
+            tcgen05_grouped_plan is None
+            or rhs_rank3_grouped_proof is None
+            or fx_node is None
+            or tcgen05_nm_orientation
+            or not tcgen05_grouped_plan.device_split_sizes
+            or tcgen05_cluster_m != 2
+            or tcgen05_cluster_n not in (1, 2)
+            or (
+                tcgen05_cluster_n == 2
+                and n_size % (tcgen05_mma_bn * tcgen05_cluster_n) != 0
+            )
+            or not tcgen05_is_two_cta
+            or df.config.get("num_sm_multiplier", 1) != 1
+            or tcgen05_grouped_plan.uses_runtime_tile_table
+            or tcgen05_grouped_plan.direct_pointers is not None
+            or tcgen05_grouped_plan.fixed_tensormaps
+            or tcgen05_grouped_plan.full_coverage is not None
+            or not _grouped_ab_k_loop_supported(
+                cg,
+                fx_node,
+                rhs_rank3_grouped_proof,
+                static_k=k_total_size,
+                k_multiple=64,
+            )
+            or not balanced_workers_index_domain(
+                int(tcgen05_grouped_plan.count),
+                m_size,
+                n_size,
+                tcgen05_mma_bm,
+                tcgen05_mma_bn * tcgen05_cluster_n,
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "balanced workers require a pure fresh-output signed device "
+                "M,N worklist with complete feature clusters and bounded SDK "
+                "tile counts",
+            )
+        tcgen05_grouped_plan = replace(
+            tcgen05_grouped_plan,
+            worker_balance=GroupedBalancedWorkersPlan(
+                total_tiles=df.new_var("tcgen05_grouped_total_tiles"),
+                workers=df.new_var("tcgen05_grouped_balanced_workers"),
+                grid=df.new_var("tcgen05_grouped_virtual_grid"),
+                collective_m=tcgen05_mma_bm,
+                collective_n=tcgen05_mma_bn * tcgen05_cluster_n,
+                cluster_m=tcgen05_cluster_m,
+                cluster_n=tcgen05_cluster_n,
+            ),
         )
     if df.config.config.get(TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY) in (
         TCGEN05_GROUPED_FULL_COVERAGE_DENSE,
@@ -10586,6 +11145,13 @@ def _emit_mma_pipeline(
         tcgen05_use_merged_pipeline_init
         or tcgen05_use_cluster_deferred_pipelines
         or (row_union_plan is not None and row_union_plan.resident_ctas == 2)
+        or (
+            tcgen05_grouped_plan is not None
+            and df.config.get("num_sm_multiplier", 1) == 2
+            and env.config_spec._cute_tcgen05_config._grouped_grid_multiplier_supported(
+                df.config.config
+            )
+        )
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
@@ -10627,7 +11193,7 @@ def _emit_mma_pipeline(
         tcgen05_warp_spec = warp_spec_from_config(df.config)
         # The public NM profile reserves its scheduler warp internally.
         nm_scheduler_decode = (
-            tcgen05_nm_orientation
+            requested_schedule is not None
             and tcgen05_grouped_static_persistent
             and tcgen05_grouped_worklist_persistent
             and (
@@ -10635,7 +11201,9 @@ def _emit_mma_pipeline(
                 or tcgen05_grouped_fixed_tensormaps
             )
             and (
-                tcgen05_grouped_dynamic_d_tensormap or tcgen05_grouped_fixed_tensormaps
+                tcgen05_grouped_dynamic_d_tensormap
+                or tcgen05_grouped_fixed_tensormaps
+                or tcgen05_grouped_d_shift
             )
             and grouped_worklist_supported
             and tcgen05_warp_spec.scheduler_warps == 0
@@ -10653,6 +11221,11 @@ def _emit_mma_pipeline(
         tcgen05_explicit_epi_tile_m = _tcgen05_layout_overrides.epi_tile_m
         tcgen05_explicit_epi_tile_n = _tcgen05_layout_overrides.epi_tile_n
         tcgen05_explicit_d_store_box_n = _tcgen05_layout_overrides.d_store_box_n
+        nm_default_store_shape = (
+            (row_profile.epi_m, row_profile.epi_n, row_profile.epi_n)
+            if row_profile
+            else tcgen05_grouped_worklist_store_shape(tcgen05_mma_bm, tcgen05_mma_bn)
+        )
         if tcgen05_nm_orientation:
             nm_store_shape = (
                 tcgen05_explicit_epi_tile_m,
@@ -10664,16 +11237,13 @@ def _emit_mma_pipeline(
                     tcgen05_explicit_epi_tile_m,
                     tcgen05_explicit_epi_tile_n,
                     tcgen05_explicit_d_store_box_n,
-                ) = TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
-            elif nm_store_shape != (
-                (row_profile.epi_m, row_profile.epi_n, row_profile.epi_n)
-                if row_profile
-                else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
-            ):
+                ) = nm_default_store_shape
+            elif nm_store_shape != nm_default_store_shape:
                 raise exc.BackendUnsupported(
                     "cute",
-                    "tcgen05 N,M store requires explicit epi_tile=(128, 32) "
-                    "and d_store_box_n=32",
+                    f"tcgen05 N,M store requires explicit epi_tile="
+                    f"{nm_default_store_shape[:2]} and "
+                    f"d_store_box_n={nm_default_store_shape[2]}",
                 )
         # The explicit tile the config (or the N,M worklist default) requested,
         # taken before the matmul plan adds its own subtile below: the
@@ -11000,10 +11570,8 @@ def _emit_mma_pipeline(
             tcgen05_explicit_epi_tile_n,
             tcgen05_explicit_d_store_box_n,
         )
-        nm_explicit_store_wave = tcgen05_nm_orientation and explicit_epi_tile_shape == (
-            (row_profile.epi_m, row_profile.epi_n, row_profile.epi_n)
-            if row_profile
-            else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        nm_explicit_store_wave = (
+            tcgen05_nm_orientation and explicit_epi_tile_shape == nm_default_store_shape
         )
         explicit_epi_aux_supported = not c_input_aux_tensor_descriptors_value or (
             tcgen05_warp_spec.c_input_warps == 0
@@ -11494,7 +12062,7 @@ def _emit_mma_pipeline(
             # gate as ``aux_stages``), so T1-T7 stay byte-identical at
             # the 256 default.
             consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
-            if (
+            if df.config.get(TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY, True) and (
                 row_profile is None
                 or row_profile.paired_protocol is None
                 or not row_profile.paired_protocol.static_registers
@@ -11585,6 +12153,46 @@ def _emit_mma_pipeline(
             )
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
+        if requested_schedule is not None:
+            assert tcgen05_grouped_plan is not None
+            grouped_smem_capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                lhs_info.source_fake.device
+            )
+            grouped_smem_required = tcgen05_grouped_worklist_smem_bytes(
+                group_count=int(tcgen05_grouped_plan.count),
+                device_split_sizes=tcgen05_grouped_plan.device_split_sizes,
+                sched_stage_count=_tcgen05_config_int(
+                    df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1
+                ),
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                dtype_bytes=input_dtype.itemsize,
+                output_dtype_bytes=(epi_elem_dtype or input_dtype).itemsize,
+                ab_stages=tcgen05_ab_stage_count_value,
+                acc_stages=tcgen05_acc_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+                cluster_m=tcgen05_cluster_m,
+                orientation="nm" if tcgen05_nm_orientation else "mn",
+                epi_tile_shape=(
+                    (tcgen05_explicit_epi_tile_m, tcgen05_explicit_epi_tile_n)
+                    if tcgen05_explicit_epi_tile_m is not None
+                    and tcgen05_explicit_epi_tile_n is not None
+                    else None
+                ),
+                immutable_ab_tensormaps=tcgen05_grouped_d_shift,
+                immutable_d_tensormap=tcgen05_grouped_d_shift,
+            )
+            if (
+                grouped_smem_capacity <= 0
+                or grouped_smem_required > grouped_smem_capacity
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist proved allocations "
+                    f"require {grouped_smem_required} bytes of per-CTA SMEM, "
+                    f"exceeding the {grouped_smem_capacity}-byte capacity",
+                )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
@@ -11609,6 +12217,13 @@ def _emit_mma_pipeline(
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 nm_explicit_store_wave=nm_explicit_store_wave and row_profile is None,
+                tmem_load_output_dtype_str=(
+                    epi_elem_dtype_str
+                    if output_column_major
+                    and tcgen05_is_two_cta
+                    and not tcgen05_nm_orientation
+                    else None
+                ),
                 a_k_major=tcgen05_mma_a_k_major,
                 b_k_major=tcgen05_mma_b_k_major,
                 c_layout=tcgen05_d_store_layout,
@@ -11971,6 +12586,16 @@ def _emit_mma_pipeline(
                 and c_input_aux_tensor_descriptors
                 and aux_single_store_value
             )
+            if aux_productive_body_gate_open and not tcgen05_pid_is_persistent:
+                # Only the persistent program's role-local whiles emit the aux
+                # producer body; without it the epilogue's consumer_wait on
+                # the aux ring never completes (the kernel hangs).
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "a tcgen05 aux producer warp (tcgen05_warp_spec_c_input_warps"
+                    "=1 or the aux-TMA store warp) requires a persistent "
+                    "tcgen05 pid_type",
+                )
             if (
                 tcgen05_aux_tma_requested
                 and all_aux_tensor_descriptors
@@ -12565,6 +13190,16 @@ def _emit_mma_pipeline(
                     {
                         "kind": "tcgen05_grouped_static_persistent",
                         "scheduler_mode": grouped_plan.scheduler_mode.value,
+                        **(
+                            {"balanced_workers": True}
+                            if grouped_plan.worker_balance is not None
+                            else {}
+                        ),
+                        **(
+                            {"num_sm_multiplier": df.config.get("num_sm_multiplier", 1)}
+                            if df.config.get("num_sm_multiplier", 1) != 1
+                            else {}
+                        ),
                         "layout_name": grouped_plan.layout,
                         **(
                             {"n_sizes_name": tcgen05_grouped_n_sizes_arg_name}
@@ -12619,6 +13254,28 @@ def _emit_mma_pipeline(
                         "cluster_m": tcgen05_cluster_m,
                         "cluster_n": tcgen05_cluster_n,
                         "l2_swizzle_size": tcgen05_l2_swizzle_size_value,
+                        **(
+                            {"device_panel_swizzle": True}
+                            if requested_schedule is Tcgen05Orientation.MN
+                            and (
+                                tcgen05_l2_swizzle_size_value > 1
+                                or df.config.get(GROUPED_PANEL_ALTERNATE_KEY)
+                                is not None
+                            )
+                            else {}
+                        ),
+                        **(
+                            {
+                                GROUPED_PANEL_ALTERNATE_KEY: df.config.get(
+                                    GROUPED_PANEL_ALTERNATE_KEY
+                                ),
+                                GROUPED_PANEL_RATIO_KEY: df.config.get(
+                                    GROUPED_PANEL_RATIO_KEY
+                                ),
+                            }
+                            if df.config.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+                            else {}
+                        ),
                         **(
                             {
                                 TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: (
@@ -12692,7 +13349,14 @@ def _emit_mma_pipeline(
                         **(
                             {
                                 "dynamic_ab_tensormaps": True,
-                                "ab_tensormaps_arg": tcgen05_grouped_ab_tensormaps,
+                                **(
+                                    {"ab_tensormaps_arg": tcgen05_grouped_ab_tensormaps}
+                                    if not tcgen05_grouped_d_shift
+                                    else {
+                                        "immutable_ab_tensormaps": True,
+                                        "bounded_output_shift": True,
+                                    }
+                                ),
                                 "lhs_name": lhs_arg_name,
                                 "rhs_name": rhs_arg_name,
                                 **(
@@ -12781,6 +13445,19 @@ def _emit_mma_pipeline(
                     # MN-major logical B cannot flatten [G,N,K] to [G*N,K].
                     # Preserve one immutable rank-3 full-allocation TensorMap.
                     ab_tma_plan["fixed_grouped_b_rank3"] = True
+            if tcgen05_grouped_full_allocation_a:
+                ab_tma_plan["full_allocation_a"] = True
+                if not tcgen05_nm_orientation:
+                    ab_tma_plan["full_allocation_b"] = tcgen05_grouped_full_allocation_b
+                    if tcgen05_grouped_full_allocation_b_rank3:
+                        ab_tma_plan["full_allocation_b_rank3"] = True
+                    ab_tma_plan["source_m_tile"] = tcgen05_worklist_source_m_tile
+                    ab_tma_plan["device_split_sizes"] = (
+                        tcgen05_grouped_device_split_sizes
+                    )
+                    ab_tma_plan["device_layout_kind"] = (
+                        tcgen05_grouped_device_layout_kind
+                    )
             # The bm=128 CtaGroup.TWO family cannot be derived from
             # ``bm == 256`` by the host wrapper, so record the resolved 2-CTA
             # decision on the plan. Only recorded for this family (where the
@@ -12959,7 +13636,7 @@ def _emit_mma_pipeline(
                     f"{tma_thr_mma} = {tiled_mma}.get_slice({tma_thr_mma_slice})"
                 )
             )
-            if tcgen05_grouped_dynamic_ab_tensormaps:
+            if tcgen05_grouped_dynamic_ab_tensormaps and not tcgen05_grouped_d_shift:
                 prefix.extend(
                     [
                         statement_from_string(
@@ -13031,7 +13708,7 @@ def _emit_mma_pipeline(
                     setup_stmt,
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
-            if tcgen05_grouped_dynamic_ab_tensormaps:
+            if tcgen05_grouped_dynamic_ab_tensormaps and not tcgen05_grouped_d_shift:
                 dynamic_operands = [
                     (
                         tma_atom_a,
@@ -13054,7 +13731,7 @@ def _emit_mma_pipeline(
                         grouped_tensormap_real_b_stride_expr,
                     ),
                 ]
-                if tcgen05_shared_rhs:
+                if tcgen05_shared_rhs or tcgen05_grouped_full_allocation_a:
                     # N,M orientation puts the shared RHS in physical A.
                     # It keeps its one immutable host-created descriptor.
                     dynamic_operands = dynamic_operands[1:]
@@ -13160,6 +13837,14 @@ def _emit_mma_pipeline(
                         else f"({n_offset_var} // cutlass.Int32({bn}), None)"
                     )
                 )
+            if tcgen05_grouped_full_allocation_a and tcgen05_nm_orientation:
+                assert tcgen05_grouped_group_idx is not None
+                assert tcgen05_grouped_cta_tile_idx_n is not None
+                a_tile_coord = (
+                    f"({tcgen05_grouped_group_idx} * cutlass.Int32("
+                    f"{n_size // tcgen05_mma_bm}) + "
+                    f"{tcgen05_grouped_cta_tile_idx_n}, None)"
+                )
             if row_profile is not None:
                 a_tile_coord = (
                     f"({n_offset_var} // cutlass.Int32({row_profile.mma_m}), None)"
@@ -13167,10 +13852,23 @@ def _emit_mma_pipeline(
                 b_tile_coord = (
                     f"({m_offset_var} // cutlass.Int32({row_profile.mma_n}), None)"
                 )
+            if tcgen05_grouped_full_allocation_b and not tcgen05_nm_orientation:
+                assert tcgen05_grouped_group_idx is not None
+                assert tcgen05_grouped_cta_tile_idx_n is not None
+                b_tile_coord = (
+                    f"({tcgen05_grouped_cta_tile_idx_n}, None, {tcgen05_grouped_group_idx})"
+                    if tcgen05_grouped_full_allocation_b_rank3
+                    else (
+                        f"({tcgen05_grouped_group_idx} * cutlass.Int32({n_size // tcgen05_mma_bn}) + "
+                        f"{tcgen05_grouped_cta_tile_idx_n}, None)"
+                    )
+                )
             gmem_a_tma_tiler = f"({tcgen05_mma_bm}, {bk})"
             gmem_b_tma_tiler = f"({tcgen05_mma_bn}, {bk})"
             if tcgen05_grouped_fixed_tensormaps and not tcgen05_b_k_major:
                 gmem_a_tma_tiler = f"({tcgen05_mma_bm}, {bk}, 1)"
+            if tcgen05_grouped_full_allocation_b_rank3:
+                gmem_b_tma_tiler = f"({tcgen05_mma_bn}, {bk}, 1)"
             if lhs_operand.is_leading_passthrough:
                 assert leading_global is not None
                 gmem_a_tma_tiler = f"({bm}, {bk}, 1)"
@@ -13183,8 +13881,12 @@ def _emit_mma_pipeline(
                 b_tile_coord = (
                     f"({n_offset_var} // cutlass.Int32({bn}), None, {leading_global})"
                 )
+            gmem_a_tma_tensor = tma_tensor_a
+            if tcgen05_grouped_full_allocation_a and not tcgen05_nm_orientation:
+                assert tcgen05_grouped_global_m_start is not None
+                gmem_a_tma_tensor = f"cute.domain_offset(({tcgen05_grouped_global_m_start}, cutlass.Int32(0)), {tma_tensor_a})"
             gmem_b_tma_tensor = tma_tensor_b
-            if tcgen05_grouped_full_allocation_b:
+            if tcgen05_grouped_full_allocation_b and tcgen05_nm_orientation:
                 assert tcgen05_grouped_global_m_start is not None
                 gmem_b_tma_tensor = (
                     f"cute.domain_offset(({tcgen05_grouped_global_m_start}, "
@@ -13232,7 +13934,7 @@ def _emit_mma_pipeline(
                 gmem_b_tma_tensor = tma_tensor_b_tail
             _emit_per_tile(
                 f"{gmem_a_tma} = cute.local_tile("
-                f"{tma_tensor_a}, {gmem_a_tma_tiler}, "
+                f"{gmem_a_tma_tensor}, {gmem_a_tma_tiler}, "
                 f"{a_tile_coord})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
@@ -13488,6 +14190,7 @@ def _emit_mma_pipeline(
                             grouped_tensormap_a_desc_ptr
                             if tcgen05_grouped_dynamic_ab_tensormaps
                             and not tcgen05_shared_rhs
+                            and not tcgen05_grouped_full_allocation_a
                             else None
                         ),
                         tma_desc_ptr_b=(
@@ -14042,16 +14745,17 @@ def _emit_mma_pipeline(
             # The narrow-subtile epilogues opt in by name
             # (``tcgen05_narrow_subtile_nounroll_k_loop``: promoted row-vector
             # rows and plain 16-bit stores on the 256-wide two-CTA tile,
-            # decided with their subtile); every other kernel keeps the
-            # unrolled ``range``.
+            # decided with their subtile). Column-major paired stores also
+            # use this loop form; every other kernel keeps the unrolled ``range``.
             tcgen05_use_nounroll_k_loop = (
                 (
                     tcgen05_explicit_epi_tile_configured
                     or tcgen05_narrow_subtile_nounroll_k_loop
+                    or output_column_major
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
-                and (bk == 64 or tcgen05_nm_orientation)
+                and (bk == 64 or tcgen05_nm_orientation or output_column_major)
             )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
@@ -14095,7 +14799,9 @@ def _emit_mma_pipeline(
                 tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
                 tma_desc_ptr_a=(
                     grouped_tensormap_a_desc_ptr
-                    if tcgen05_grouped_dynamic_ab_tensormaps and not tcgen05_shared_rhs
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    and not tcgen05_shared_rhs
+                    and not tcgen05_grouped_full_allocation_a
                     else None
                 ),
                 tma_desc_ptr_b=(
@@ -14111,7 +14817,11 @@ def _emit_mma_pipeline(
                         + "\n".join(
                             f"    {grouped_tensormap_manager}.fence_tensormap_update({pointer})"
                             for pointer, dynamic in (
-                                (grouped_tensormap_a_ptr, not tcgen05_shared_rhs),
+                                (
+                                    grouped_tensormap_a_ptr,
+                                    not tcgen05_shared_rhs
+                                    and not tcgen05_grouped_full_allocation_a,
+                                ),
                                 (
                                     grouped_tensormap_b_ptr,
                                     not tcgen05_grouped_full_allocation_b,
@@ -14121,7 +14831,10 @@ def _emit_mma_pipeline(
                         )
                     )
                     if tcgen05_grouped_dynamic_ab_tensormaps
-                    and not (tcgen05_shared_rhs and tcgen05_grouped_full_allocation_b)
+                    and not (
+                        (tcgen05_shared_rhs or tcgen05_grouped_full_allocation_a)
+                        and tcgen05_grouped_full_allocation_b
+                    )
                     else None
                 ),
                 scalar_smem_sync=scalar_smem_sync,
@@ -14132,7 +14845,7 @@ def _emit_mma_pipeline(
                         problem_k=tcgen05_k_bound_expr,
                         bk=bk,
                     )
-                    if tcgen05_grouped_k_mask is not None
+                    if tcgen05_grouped_k_mask is not None or grouped_ab_k_fused
                     else None
                 )
                 cloned_k_loop_iter_expr = (
@@ -15020,13 +15733,15 @@ def _tcgen05_use_2cta_instrs(
             not in (
                 torch.float16,
                 torch.bfloat16,
+                torch.float8_e4m3fn,
                 "cutlass.Float16",
                 "cutlass.BFloat16",
+                "cutlass.Float8E4M3FN",
             )
         ):
             raise exc.BackendUnsupported(
                 "cute",
-                "explicit two-CTA MMA requires M128/M256 half or bfloat16 "
+                "explicit two-CTA MMA requires M128/M256 half, bfloat16 or FP8 E4M3 "
                 "operands and tcgen05_cluster_m=2",
             )
         return True
@@ -15223,6 +15938,31 @@ def _tcgen05_candidate_exceeds_smem(
     support = get_cute_mma_support()
     if not tcgen05_supports_input_dtype(support, input_dtype):
         return False
+    if CompileEnvironment.has_current():
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        values = cast("dict[str, object]", config)
+        aligned_n = state._dense_aligned_n_plan(values)
+        if (
+            aligned_n is not None
+            and input_dtype == torch.float8_e4m3fn
+            and aligned_n.physical_tile == (bm, bn, bk)
+        ):
+            stages = _tcgen05_config_int(config, "tcgen05_ab_stages", 2)
+            return not 1 <= stages <= aligned_n.max_ab_stages
+        parameters = state._paired_pipeline_parameters(values)
+        if parameters is not None and parameters[:3] == (bm, bn, bk):
+            limit = state._paired_pipeline_stage_limit(values)
+            assert limit is not None
+            stages = _tcgen05_config_int(config, "tcgen05_ab_stages", 2)
+            return not 1 <= stages <= limit
+        parameters = state._one_cta_pipeline_parameters(values)
+        if parameters is not None and parameters[:3] == (bm, bn, bk):
+            limit = state._one_cta_pipeline_stage_limit(values)
+            assert limit is not None
+            # The native single-root proof prices AB, the actual output ring
+            # and bookkeeping together. Do not subtract the legacy reserve
+            # again; unrelated MMA/configs retain the ordinary prefilter.
+            return _tcgen05_config_int(config, "tcgen05_ab_stages", 2) > limit
     if cast("_ConfigLike", config).get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
         # Config normalization already checked the complete AB + epilogue +
         # bookkeeping allocation using the proven single-output facts. This
@@ -15260,12 +16000,56 @@ def _choose_mma_impl(
     input_device: torch.device | None = None,
     defer_grouped_worklist_smem_check: bool = False,
 ) -> str:
+    # Aligned-N schedules carry a public power-of-two tile around their physical
+    # width. Operand order and M/N axes already come from the frontend kernel.
+    aligned_n = None
+    if config is not None and CompileEnvironment.has_current():
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        aligned_n = state._dense_aligned_n_plan(cast("dict[str, object]", config))
+        if (
+            aligned_n is not None
+            and input_dtype == torch.float8_e4m3fn
+            and (bm, bn, bk) == aligned_n.public_tile
+        ):
+            bm, bn, bk = aligned_n.physical_tile
     tcgen05_cluster_m = 1
     if config is not None:
         tcgen05_cluster_m = _tcgen05_cluster_m(config)
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
+    if aligned_n is not None:
+        # A positive physical-width request owns a native collective layout.
+        # Falling back would reuse that layout with unrelated scalar threads.
+        if (
+            env_choice not in ("auto", "tcgen05")
+            or input_dtype != torch.float8_e4m3fn
+            or (bm, bn, bk) != aligned_n.physical_tile
+            or not tcgen05_supports_input_dtype(support, input_dtype)
+            or not _mma_impl_matches_problem_shape(
+                "tcgen05",
+                input_dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                tcgen05_cluster_m=tcgen05_cluster_m,
+                tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+            )
+            or _tcgen05_candidate_exceeds_smem(
+                input_dtype,
+                input_device=input_device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+                defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_tile_n requires its supported native tcgen05 implementation",
+            )
+        return "tcgen05"
     if env_choice != "auto":
         if env_choice not in support.supported_impls:
             raise exc.BackendUnsupported(
@@ -15461,6 +16245,7 @@ def _make_tcgen05_layout_plan_setup(
     explicit_epi_tile_m: int | None = None,
     explicit_epi_tile_n: int | None = None,
     nm_explicit_store_wave: bool = False,
+    tmem_load_output_dtype_str: str | None = None,
     a_k_major: bool = True,
     b_k_major: bool = False,
     c_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
@@ -15504,13 +16289,14 @@ def _make_tcgen05_layout_plan_setup(
     )
     tmem_load_atom_expr = (
         "cute.make_copy_atom("
-        "cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x4), "
+        "cute.nvgpu.tcgen05.Ld16x256bOp("
+        f"cute.nvgpu.tcgen05.Repetition.x{min(bn, 32) // 8}), "
         f"{acc_dtype_str})"
         if nm_explicit_store_wave
         else (
             "cutlass.utils.blackwell_helpers.get_tmem_load_op("
             f"({epi_tile_m}, {bn}, {bk}), {plan.c_layout}, "
-            f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
+            f"{tmem_load_output_dtype_str or acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
         )
     )
     return [

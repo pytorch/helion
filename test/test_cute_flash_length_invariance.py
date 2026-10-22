@@ -1567,10 +1567,14 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
             id="singleton",
         ),
         # The two-warpgroup ws_overlap body also chooses its O epilogue
-        # (staged coalesced store vs direct per-thread store).
+        # (staged coalesced store vs direct per-thread store); its two-stage
+        # rows also measure the load warp, the extra K ring slot and, on the
+        # causal plan, the mask phases (the single-stage rows keep all three
+        # at rest): dense 6 + 24 -> 6 + 96, causal 6 + 12 -> 6 + 96 at 64;
+        # 2 + 8 -> 2 + 32 and 2 + 4 -> 2 + 32 at 128.
         pytest.param(
             3,
-            {(64, False): 30, (64, True): 18, (128, False): 10, (128, True): 6},
+            {(64, False): 102, (64, True): 102, (128, False): 34, (128, True): 34},
             id="odd",
         ),
     ),
@@ -1589,19 +1593,112 @@ def test_small_flash_search_spaces_are_exhaustive(
         is_causal=is_causal,
     )
     generation = spec.create_config_generation()
-    exact = generation.flash_exact_effective_search_space_configs(100)
+    # The bound is on each family's raw product before normalization, not on
+    # the distinct rows: the three-tile d64 ws_overlap family multiplies the
+    # kv_stage triple by six binary knobs (192 raw rows for 102 distinct) once
+    # the single-tile body searches its issue-stream knobs; d128 is 64 raw
+    # rows for 34.  The autotuner's own floor is ``_FLASH_EXACT_SPACE_RAW_FLOOR``
+    # (1024); this test's is its own, kept at the next power of two above d64.
+    exact = generation.flash_exact_effective_search_space_configs(256)
     assert exact is not None
     assert len(exact) == expected_by_shape[(head_dim, is_causal)]
 
+    # The population passes its own size as that raw bound, so a population
+    # at least the raw product holds every distinct row (the fill repeats
+    # them; 100 draws would sample the 192-row d64 families instead).
     random_state = random.getstate()
     try:
         random.seed(20260815)
-        population = generation.random_population_flat(100)
+        population = generation.random_population_flat(256)
     finally:
         random.setstate(random_state)
     population_configs = {generation.unflatten(flat) for flat in population}
-    assert len(population) == 100
+    assert len(population) == 256
     assert population_configs == set(exact)
+
+
+def _flash_family_search_rows(
+    spec: ConfigSpec, generation: ConfigGeneration
+) -> list[tuple[object, dict[int, str], list[list[object]]]]:
+    """Each live pipeline family's searched product: (family, flat index ->
+    key, the per-slot searched values), the way the exact-space enumerator
+    and the random population draw it (the family's own fragments)."""
+    layout = generation._key_to_flat_indices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    family_index = layout[0][0]
+    family_fragment = generation.flat_spec[family_index]
+    families = family_fragment.search_values(1 << 20)
+    assert families is not None
+    index_to_key = {
+        indices[0]: key
+        for key, (indices, is_sequence) in generation._key_to_flat_indices.items()
+        if not is_sequence and len(indices) == 1
+    }
+    rows = []
+    for family in families:
+        fragments = spec._cute_flash_autotune_fragments(None, cast("str", family))
+        value_sets: list[list[object]] = []
+        for index, fragment in enumerate(generation.flat_spec):
+            if index == family_index:
+                value_sets.append([family])
+                continue
+            key = index_to_key.get(index)
+            live = fragments.get(key, fragment) if key is not None else fragment
+            values = live.search_values(1 << 20)
+            assert values is not None, key
+            value_sets.append(list(values))
+        rows.append((family, index_to_key, value_sets))
+    return rows
+
+
+@pytest.mark.parametrize("is_causal", (True, False), ids=("causal", "dense"))
+@pytest.mark.parametrize("head_dim", (144, 160, 176, 192, 256))
+def test_issue_stream_knobs_add_no_aliases_at_the_pair_widths(
+    head_dim: int, is_causal: bool
+) -> None:
+    """A searched issue-stream knob value is honored on every row of the
+    two-stage body: no two of its rows that differ only in the load warp,
+    the mask phases or the extra K slot normalize to one config. The
+    surface builder asks the resolver per searched depth, output staging
+    and query tile (the byte model declines the slot beside the deepest
+    rings: the d144 / d176 pair's five- and four-deep rings, the single
+    CTA's full-height ring), so a surface keeps a knob at rest rather than
+    searching an alias. The single score stage's body and the small biased
+    plan carry no knob (the dependency witnesses pin the two-stage body for
+    the coverage design): their rows alias by design, like every other
+    knob's aliases (the depth clamps, the LPT shift), outside this
+    contract."""
+    knobs = (
+        cute_flash.FLASH_WS_LOADER_WARP_KEY,
+        cute_flash.FLASH_WS_MASK_PHASES_KEY,
+        cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY,
+    )
+    spec = _flash_config_spec(
+        head_dim=head_dim, num_kv=32, dtype=torch.bfloat16, is_causal=is_causal
+    )
+    generation = spec.create_config_generation()
+    searched: set[str] = set()
+    for family, index_to_key, value_sets in _flash_family_search_rows(spec, generation):
+        knob_slots = [index for index, key in index_to_key.items() if key in knobs]
+        searched.update(
+            index_to_key[index] for index in knob_slots if len(value_sets[index]) > 1
+        )
+        seen: dict[helion.Config, set[tuple[object, ...]]] = {}
+        for row in itertools.product(*value_sets):
+            try:
+                config = generation.unflatten(list(row))
+            except InvalidConfig:
+                continue
+            seen.setdefault(config, set()).add(tuple(row[i] for i in knob_slots))
+        aliased = {
+            config: values
+            for config, values in seen.items()
+            if len(values) > 1
+            and config.config[cute_flash.FLASH_S_STAGE_KEY] == 2
+            and not config.config[cute_flash.FLASH_SMALL_BIASED_KEY]
+        }
+        assert not aliased, (family, next(iter(aliased.items())))
+    # The contract is not vacuous: the pair widths search the knobs.
+    assert cute_flash.FLASH_WS_LOADER_WARP_KEY in searched
 
 
 def test_large_flash_search_space_is_not_partially_enumerated() -> None:
@@ -1852,7 +1949,11 @@ def test_direct_output_kv_depth_fixed_override_remains_legal(
             (2, 3, 4),
             id="d64-ws",
         ),
-        pytest.param(128, "ws_overlap", (2, 3), (2,), id="d128-ws"),
+        # (The one-deep ring stays legal at the measured widths so a config
+        # carried over from a width or shape where it is the resolved value
+        # normalizes -- the resolver clamps it to the band -- but it is not
+        # searched there.)
+        pytest.param(128, "ws_overlap", (1, 2, 3), (2,), id="d128-ws"),
         pytest.param(
             64,
             "fa4_deep_1cta",
@@ -1996,6 +2097,12 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
         cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
         cute_flash.FLASH_ROWMAX_KEY: "software",
         cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
+        # The cooperative pair's cluster size (``ws_2cta``, a family of the
+        # value widths above 128): one pair per cluster off the pair.
+        cute_flash.FLASH_PAIR_CLUSTER_KEY: 1,
+        # The causal mask phases: at rest on the dense plan (the single
+        # CTA's load warp and extra K ring slot are measured).
+        cute_flash.FLASH_WS_MASK_PHASES_KEY: False,
     }
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
@@ -2033,12 +2140,27 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # table loads) and the flex table request width
     # (``cute_flash_flex_coalesce``, live only on flex plans with a
     # coalescible row-table run) and the rolled flex chunk loop
-    # (``cute_flash_flex_rolled_chunks``, live only on list-walk plans);
-    # the two-warpgroup body measures both of its O epilogues
-    # (``cute_flash_epi_stg``).
-    # Resident-only coordinates add exactly three inactive singletons; keep
-    # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 78
+    # (``cute_flash_flex_rolled_chunks``, live only on list-walk plans), the
+    # host-built item words (``cute_flash_flex_item_words``, live only on
+    # list-walk plans) and the register-resident chunked PASS2
+    # (``cute_flash_s_resident``, live only on list-walk plans without a
+    # score region) and the shared softmax region
+    # (``cute_flash_softmax_region``, live on list-walk plans of the fa4
+    # family) and the hooked PASS1's all-kept fast path
+    # (``cute_flash_flex_hook_fast_full``, live on the same plans) and the
+    # last wave's split (``cute_flash_flex_tail_split``, live only on the
+    # one-item fa4 grid of a one-word list walk); the two-warpgroup body
+    # measures both of its O epilogues (``cute_flash_epi_stg``).
+    # Resident-only coordinates add exactly three inactive singletons, the
+    # pair's cluster size and the causal body's mask phases one more; the
+    # shared softmax region adds its searched values, the load warp and the
+    # extra K ring slot their two measured values each (82 -> 86), the
+    # hooked PASS1's all-kept fast path one more (87), the tail split's
+    # singleton one more (88), the shared staged output tile's singleton
+    # (``cute_flash_o_stage``, live only on the one-CTA fa4 pair's TMA
+    # epilogue) one more (89). Keep the upstream bound on all other values
+    # and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 89
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2100,7 +2222,9 @@ def test_ws_structural_generation_is_bounded_and_complete(
         configs = generation.flash_deterministic_population_configs()
 
     assert configs
-    assert len(configs) <= 3
+    # Three rows cover the ring depths; the extra K ring slot's dependency
+    # witness (the two-stage body with the slot) is one more.
+    assert len(configs) <= 4
     assert generation.flash_structural_coverage_uncovered_values() == []
     assert {
         config.config[cute_flash.FLASH_KV_STAGE_KEY] for config in configs

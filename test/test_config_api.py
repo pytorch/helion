@@ -2497,30 +2497,36 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 repaired.config,
             )
 
-    def test_grouped_rejects_num_sm_multiplier(self) -> None:
+    def test_grouped_grid_multiplier_requires_independent_worklist(self) -> None:
         spec = self._make_cute_tcgen05_spec()
 
-        def make_config(grouped_mode: str) -> helion.Config:
+        def make_config(grouped_mode: str, multiplier: int) -> helion.Config:
             return helion.Config(
                 block_sizes=[256, 128, 64],
-                num_sm_multiplier=2,
+                num_sm_multiplier=multiplier,
                 pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
                 tcgen05_grouped_mode=grouped_mode,
             )
 
-        for grouped_mode in (
-            TCGEN05_GROUPED_MODE_STATIC,
-            TCGEN05_GROUPED_MODE_DYNAMIC,
-            TCGEN05_GROUPED_MODE_DIRECT,
-            TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        for grouped_mode, multiplier in (
+            (TCGEN05_GROUPED_MODE_STATIC, 2),
+            (TCGEN05_GROUPED_MODE_DYNAMIC, 2),
+            (TCGEN05_GROUPED_MODE_DIRECT, 2),
+            (TCGEN05_GROUPED_MODE_WORKLIST_NM, 3),
         ):
-            with self.subTest(grouped_mode=grouped_mode):
-                with self.assertRaisesRegex(exc.InvalidConfig, "num_sm_multiplier=1"):
-                    spec.normalize(make_config(grouped_mode))
+            with self.subTest(grouped_mode=grouped_mode, multiplier=multiplier):
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig, "independent single-CTA N,M worklist"
+                ):
+                    spec.normalize(make_config(grouped_mode, multiplier))
 
-                repaired = make_config(grouped_mode)
+                repaired = make_config(grouped_mode, multiplier)
                 spec.normalize(repaired, _fix_invalid=True)
                 self.assertNotIn("num_sm_multiplier", repaired.config)
+
+        independent = make_config(TCGEN05_GROUPED_MODE_WORKLIST_NM, 2)
+        spec.normalize(independent)
+        self.assertEqual(independent.config["num_sm_multiplier"], 2)
 
     def test_grouped_clc_rejects_ignored_occupancy_limits(self) -> None:
         from helion._compiler.cute.strategies import (

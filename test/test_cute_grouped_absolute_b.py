@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -71,7 +72,8 @@ def _check_absolute_b(source: str, *, shared_rhs: bool) -> None:
     assert grouped["dynamic_ab_tensormaps"] is True
     assert grouped["device_split_sizes"] is True
     assert grouped["scheduler_mode"] == "device_group_search"
-    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)]
+    tree = ast.parse(source)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
     copies = [node for node in calls if ast.unparse(node.func) == "cute.copy"]
     b_copies = [node for node in copies if ast.unparse(node.args[0]) == "tma_atom_b"]
     assert b_copies
@@ -81,10 +83,70 @@ def _check_absolute_b(source: str, *, shared_rhs: bool) -> None:
     assert "init_tensormap_from_atom(tma_atom_b" not in source
     assert "tcgen05_grouped_tensormap_real_b =" not in source
     assert "fence_tensormap_update(tcgen05_grouped_tensormap_b_ptr)" not in source
-    assert (
-        "cute.local_tile(cute.domain_offset((tcgen05_grouped_global_m_start, "
-        "cutlass.Int32(0)), tma_tensor_b), (32, "
-    ) in source
+    b_tiles = [
+        node
+        for node in calls
+        if ast.unparse(node.func) == "cute.local_tile"
+        and any(
+            isinstance(value, ast.Name) and value.id == "tma_tensor_b"
+            for value in ast.walk(node.args[0])
+        )
+    ]
+    assert b_tiles
+    constants = {
+        target.id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant)
+        and type(node.value.value) is int
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    for tile in b_tiles:
+        offset = tile.args[0]
+        assert isinstance(offset, ast.Call)
+        assert ast.unparse(offset.func) == "cute.domain_offset"
+        assert ast.unparse(offset.args[1]) == "tma_tensor_b"
+        assert isinstance(offset.args[0], ast.Tuple)
+        assert [ast.unparse(value) for value in offset.args[0].elts] == [
+            "tcgen05_grouped_global_m_start",
+            "cutlass.Int32(0)",
+        ]
+        # The physical packed-row tile is a proved plan property. Discovery
+        # includes source128 as well as the original source32 profile.
+        shape = eval(
+            compile(ast.Expression(tile.args[1]), "<native B tile shape>", "eval"),
+            constants,
+        )
+        assert shape == (grouped["source_m_tile"], grouped["bk"])
+        assert isinstance(tile.args[2], ast.Tuple)
+        assert [ast.unparse(value) for value in tile.args[2].elts] == [
+            "tcgen05_grouped_cta_tile_idx_m",
+            "None",
+        ]
+        # Execute the emitted view/tile composition in row coordinates. The
+        # contiguous packed input's K stride scales this into element addresses.
+        # Its row origin must remain absolute for every live start.
+        for start in (0, 1, 193, 256):
+            for row_tile in (0, 1, 2):
+                namespace = {
+                    **constants,
+                    "cutlass": SimpleNamespace(Int32=int),
+                    "tma_tensor_b": 0,
+                    "tcgen05_grouped_global_m_start": start,
+                    "tcgen05_grouped_cta_tile_idx_m": row_tile,
+                    "cute": SimpleNamespace(
+                        domain_offset=lambda coords, tensor: tensor + coords[0],
+                        local_tile=lambda tensor, shape, coords: (
+                            tensor + shape[0] * coords[0]
+                        ),
+                    ),
+                }
+                actual_row = eval(
+                    compile(ast.Expression(tile), "<native absolute B view>", "eval"),
+                    namespace,
+                )
+                assert actual_row == start + row_tile * grouped["source_m_tile"]
     assert "tcgen05_grouped_d_tensormap_manager.update_tensormap" in source
     assert "tcgen05_grouped_d_tensormap_manager.fence_tensormap_update" in source
     if shared_rhs:

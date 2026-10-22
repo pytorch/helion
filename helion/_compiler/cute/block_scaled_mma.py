@@ -78,13 +78,28 @@ class BlockScaledMmaPlan:
     cluster_m: int
     persistent: bool
     num_sm: int
+    format: str = "nvfp4"
+    rhs_transposed: bool = False
+    fused_scales: bool = False
+    logical_m_per_cta: int = 128
+    swap_ab: bool = False
+    compact_m: bool = False
+    sf_tma: bool = False
+    sf_inplace: bool = False
+    accumulator_stages: int = 1
+    prefetch_output_registers: bool = False
+    tma_output: bool = False
 
     @property
     def workspace_bytes(self) -> int:
+        if self.fused_scales:
+            return 1
         padded_m, padded_n, padded_k = block_scaled_workspace_shape(
             self.m, self.n, self.k, self.bn, self.bk
         )
         padded_rows = padded_m + padded_n
+        if self.format == "mxfp8":
+            return padded_rows * padded_k // 32
         return padded_rows * padded_k // 2 + padded_rows * padded_k // 16
 
 
@@ -601,7 +616,9 @@ def plan_block_scaled(graphs: Sequence[GraphInfo]) -> None:
     df = DeviceFunction.current()
     if df.config.get("cute_scaled_mma", False) is not True:
         return
-    plan = _plan_block_scaled(graphs)
+    from .mxfp8_mma import plan_mxfp8
+
+    plan = plan_mxfp8(graphs) or _plan_block_scaled(graphs)
     if plan is None:
         raise exc.BackendUnsupported(
             "cute", "native block-scaled contraction proof declined"
@@ -672,6 +689,28 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         "lhs_row_fast": plan.lhs.row_fast,
         "rhs_row_fast": plan.rhs.row_fast,
     }
+    if plan.format == "mxfp8":
+        wrapper_plan["format"] = plan.format
+        wrapper_plan["rhs_transposed"] = plan.rhs_transposed
+        wrapper_plan["fused_scales"] = plan.fused_scales
+        wrapper_plan["logical_m_per_cta"] = plan.logical_m_per_cta
+        wrapper_plan["swap_ab"] = plan.swap_ab
+        wrapper_plan["compact_m"] = plan.compact_m
+        wrapper_plan["sf_tma"] = plan.sf_tma
+        wrapper_plan["sf_inplace"] = plan.sf_inplace
+        if plan.tma_output:
+            wrapper_plan["accumulator_stages"] = plan.accumulator_stages
+            wrapper_plan["prefetch_output_registers"] = plan.prefetch_output_registers
+            wrapper_plan["tma_output"] = plan.tma_output
+        if plan.fused_scales:
+            for side, operand in (("lhs", plan.lhs), ("rhs", plan.rhs)):
+                row_stride, column_stride = operand.source.scale.stride()
+                wrapper_plan[side + "_scale_row_stride"] = (
+                    CompileEnvironment.current().size_hint(row_stride)
+                )
+                wrapper_plan[side + "_scale_column_stride"] = (
+                    CompileEnvironment.current().size_hint(column_stride)
+                )
     if alpha.isidentifier():
         wrapper_plan["scale_name"] = alpha
     else:

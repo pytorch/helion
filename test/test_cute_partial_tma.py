@@ -43,11 +43,9 @@ def test_transposed_matmul_reference(dtype: torch.dtype, transpose_a: bool) -> N
 def test_transposed_matmul_staging_needs_no_thread_barrier(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # The transposed operand is staged into shared memory by a copy loop on
-    # each side of the full-tile branch, every thread writing its own
-    # elements.  The cross-thread barrier pass accepts the branch and adds
-    # nothing to the emitter's own barriers (the codegen is what it was
-    # before the pass existed).
+    # The transposed (M-major) operand of a plain 2-D GEMM rides the TMA
+    # pipeline like a K-major one: no per-thread copy loop stages it, and the
+    # cross-thread barrier pass adds nothing to the emitter's own barriers.
     a = torch.empty((256, 256), device=DEVICE, dtype=torch.float16).T
     b = torch.empty((256, 256), device=DEVICE, dtype=torch.float16)
     bound = helion.kernel(matmul.fn, backend="cute", static_shapes=True).bind((a, b))
@@ -55,7 +53,7 @@ def test_transposed_matmul_staging_needs_no_thread_barrier(
         logging.DEBUG, logger="helion._compiler.cute.lane_loop_distribution"
     ):
         code = bound.to_code(bound.config_spec.autotune_reference_config())
-    assert code.count("sA_mma[") == 2, code
+    assert "sA_mma[" not in code and "tma_atom_a" in code, code
     assert "thread barrier placed" not in caplog.text
 
 

@@ -13,6 +13,8 @@ from ...exc import InvalidConfig
 from ..ast_extension import statement_from_string
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
     from .tensorcore_plan import DmaAccessPlan
@@ -21,12 +23,33 @@ if TYPE_CHECKING:
 DmaDirection = Literal["load", "store"]
 
 
-def is_tpu_dma_aligned_shape(shape: tuple[int, ...], dtype: torch.dtype) -> bool:
-    """Whether a concrete VMEM shape satisfies TPU local-DMA alignment."""
+def is_tpu_dma_aligned_shape(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    full_shape: Sequence[int | None] | None = None,
+) -> bool:
+    """Whether a concrete VMEM shape satisfies TPU local-DMA alignment.
+
+    Mosaic requires 2D+ DMA blocks to be multiples of 8x128, except when
+    a dimension slices HBM from 0 (:) without padding or sub-tiling.
+
+    `full_shape`: Optional. Has one entry per dimension of `shape`:
+      - the backing HBM dimension size if the tile is proven to span `[0, dim)`,
+      or
+      - `None` if the tile is a sub-range (e.g. a dynamic/jagged slice).
+    An unaligned sublane or lane dimension in `shape` is accepted only when it
+    equals the corresponding non-None entry in `full_shape`.
+    """
     if len(shape) >= 2:
-        # TPU DMA rows must contain a multiple of 128 contiguous bytes and
+        if full_shape is None:
+            return shape[-1] * dtype.itemsize % 128 == 0 and shape[-2] % 8 == 0
+        # TPU DMA rows must contain a multiple of 128 lanes and
         # transfers must contain a multiple of eight rows.
-        return shape[-1] * dtype.itemsize % 128 == 0 and shape[-2] % 8 == 0
+        full_lane = full_shape[-1] if len(full_shape) >= 2 else None
+        full_sublane = full_shape[-2] if len(full_shape) >= 2 else None
+        lane_ok = shape[-1] % 128 == 0 or shape[-1] == full_lane
+        sublane_ok = shape[-2] % 8 == 0 or shape[-2] == full_sublane
+        return lane_ok and sublane_ok
     if len(shape) == 1:
         bitwidth = min(dtype.itemsize * 8, 32)
         return shape[0] % (128 * (32 // bitwidth)) == 0
