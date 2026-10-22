@@ -40,6 +40,9 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
+from test.test_cute_scan_lowering import _segment_args
+from test.test_cute_scan_lowering import _segment_scan
+from test.test_cute_scan_lowering import _segment_scan_reverse
 
 import helion
 from helion import exc
@@ -5762,3 +5765,612 @@ def test_a_load_of_another_tensor_in_the_test_leaves_the_store_alone() -> None:
         f"    {_pointer('x', 'indices_0 * 250 + indices_2')}.store(c)\n"
     )
     assert _repeated_loop_nest(body, (), {"_BLOCK_SIZE_2": 64}) == ["stmt"]
+
+
+# --------------------------------------------------------------------------
+# A full-slice store beside a reduction over the row
+# --------------------------------------------------------------------------
+
+
+def _row_sum_then_zero_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    """The attention backward's preprocess shape: ``delta = sum(o * do)`` over
+    the value head dim beside a full-slice zero of the query gradient's rows
+    (another head dim, or the same one)."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        dq[tile_b, tile_h, tile_m, :] = hl.zeros(
+            [tile_b, tile_h, tile_m, D], dtype=dq.dtype
+        )
+    return delta
+
+
+def _row_sum_then_fill_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        dq[tile_b, tile_h, tile_m, :] = hl.full(
+            [tile_b, tile_h, tile_m, D], 1.0, dtype=dq.dtype
+        )
+    return delta
+
+
+def _row_sum_then_scalar_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    B, H, M, _ = o.size()
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        dq[tile_b, tile_h, tile_m, :] = 0.0
+    return delta
+
+
+def _row_sum_then_rowvec_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, row: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        dq[tile_b, tile_h, tile_m, :] = row[None, None, None, :] + hl.zeros(
+            [tile_b, tile_h, tile_m, D], dtype=dq.dtype
+        )
+    return delta
+
+
+def _row_sum_then_zero_flagged_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, flag: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    """The masked form: only the rows ``flag`` marks are zeroed (the rows no
+    KV block adds into, in the backward preprocess)."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        absent = flag[tile_b, tile_h, tile_m] != 0
+        hl.store(
+            dq,
+            [tile_b, tile_h, tile_m, slice(None)],
+            hl.zeros([tile_b, tile_h, tile_m, D], dtype=dq.dtype),
+            extra_mask=absent[:, :, :, None],
+        )
+    return delta
+
+
+_ROW_SUM_STORE_FNS = {
+    "zeros": _row_sum_then_zero_rows_fn,
+    "ones": _row_sum_then_fill_rows_fn,
+    "scalar": _row_sum_then_scalar_rows_fn,
+    "rowvec": _row_sum_then_rowvec_rows_fn,
+    "masked": _row_sum_then_zero_flagged_rows_fn,
+}
+_ROW_SUM_SHAPE = (2, 2, 256)
+
+
+def _row_sum_store_kernel(variant: str, backend: str = "cute") -> object:
+    return helion.kernel(
+        _ROW_SUM_STORE_FNS[variant],
+        backend=backend,
+        static_shapes=True,
+        autotune_effort="none",
+    )
+
+
+def _row_sum_store_args(
+    variant: str,
+    d: int,
+    dv: int,
+    device: str = "cpu",
+    shape: tuple[int, int, int] = _ROW_SUM_SHAPE,
+) -> tuple[torch.Tensor, ...]:
+    """``(o, do, [row | flag], dq)`` for one variant (``dq`` in the returned
+    tuple's last slot); ``shape`` is ``(B, H, M)``."""
+    b, h, m = shape
+    o = torch.empty((b, h, m, dv), dtype=torch.bfloat16, device=device)
+    do = torch.empty((b, h, m, dv), dtype=torch.bfloat16, device=device)
+    dq = torch.empty((b, h, m, d), dtype=torch.float32, device=device)
+    if variant == "rowvec":
+        return (o, do, torch.empty((d,), dtype=torch.float32, device=device), dq)
+    if variant == "masked":
+        return (o, do, torch.empty((b, h, m), dtype=torch.int32, device=device), dq)
+    return (o, do, dq)
+
+
+def _row_sum_store_config(
+    bound: object, *, rolled: int | None = None, pid_type: str | None = None
+) -> dict[str, object]:
+    """The default config, its reduction loops rolled to ``rolled``-lane chunks
+    when given (64 is the resolver's own choice at head dim 128), under the
+    persistent grid ``pid_type`` when given."""
+    config = dict(bound.config_spec.default_config().config)  # pyrefly: ignore [missing-attribute]
+    if rolled is not None:
+        loops = config.get("reduction_loops")
+        if isinstance(loops, list) and loops:
+            config["reduction_loops"] = [rolled] * len(loops)
+    if pid_type is not None:
+        config["pid_type"] = pid_type
+    return config
+
+
+def _row_sum_render(
+    variant: str,
+    d: int,
+    dv: int,
+    *,
+    rolled: int | None = None,
+    shape: tuple[int, int, int] = _ROW_SUM_SHAPE,
+    pid_type: str | None = None,
+) -> str:
+    args = _row_sum_store_args(variant, d, dv, shape=shape)
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_row_sum_store_kernel(variant), args)
+        config = _row_sum_store_config(bound, rolled=rolled, pid_type=pid_type)
+        return bound.to_code(helion.Config(**config))
+
+
+def _enclosing_body(function: ast.FunctionDef, loop: ast.For) -> list[ast.AST]:
+    for node in ast.walk(function):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and loop in body:
+            return body
+    raise AssertionError(ast.unparse(loop))
+
+
+@pytest.mark.parametrize("variant", ["zeros", "ones", "masked"])
+@pytest.mark.parametrize(("extent", "chunk"), [(128, 64), (128, 32), (64, 32)])
+def test_full_slice_store_over_a_rolled_reductions_extent_takes_a_chunk_lane_loop(
+    variant: str, extent: int, chunk: int
+) -> None:
+    """``dq[..., :] = zeros`` beside ``sum(o * do)`` at the same head dim: the
+    slice's block is the reduction's, which the rolled strategy walks in
+    chunks inside ``for roffset``.  For these power-of-two extents the store
+    is neither emitted inside that loop nor given a replay of it, so outside
+    it the block had no coordinate ("indexing dimension is not active in
+    this scope"); a chunk lane loop with the reduction's thread geometry now
+    stands in for it, and the distribution places only the store (and what
+    it reads) inside it, the reduction's loop once outside."""
+    code = _row_sum_render(variant, extent, extent, rolled=chunk)
+    function = _kernel_function(code)
+    (rolled,) = _loops(function, "roffset_")
+    (replica,) = _loops(function, "synthetic_lane_")
+    match = re.search(
+        r"rindex_lane_(\d+) = cutlass\.Int32\(cute\.arch\.thread_idx\(\)\[0\]\)"
+        r" \+ cutlass\.Int32\(synthetic_lane_(\d+)\) \* (\d+)",
+        code,
+    )
+    assert match is not None, code
+    assert match.group(1) == match.group(2)
+    threads = int(match.group(3))
+    assert extent % threads == 0 and "rmask_lane_" not in code
+    assert f"range({extent // threads})" in ast.unparse(replica.iter)
+    assert f"rindex_lane_{match.group(1)}" in ast.unparse(replica)
+    assert _accesses(rolled, "o") and not _accesses(rolled, "dq")
+    assert _accesses(replica, "dq") and not _accesses(replica, "o")
+    assert not _loops(replica, "roffset_") and not _loops(rolled, "synthetic_lane_")
+    body = _enclosing_body(function, rolled)
+    assert replica in body and body.index(rolled) < body.index(replica)
+
+
+@pytest.mark.parametrize("variant", sorted(_ROW_SUM_STORE_FNS))
+@pytest.mark.parametrize("extent", [80, 96, 128, 192])
+def test_full_slice_store_over_a_rolled_reductions_extent_never_repeats_the_sum(
+    variant: str, extent: int
+) -> None:
+    """Whichever form the store takes beside the rolled reduction of its own
+    extent (inside the reduction's loop, a replay of that loop, or the chunk
+    lane loop above), the accumulation runs once: no ``for roffset`` loop
+    that accumulates sits inside a synthetic lane loop."""
+    code = _row_sum_render(variant, extent, extent, rolled=64)
+    function = _kernel_function(code)
+    for lane in _loops(function, "synthetic_lane_"):
+        for rolled in _loops(lane, "roffset_"):
+            assert "sum_1_acc = sum_1_acc" not in ast.unparse(rolled), code
+    assert any(_accesses(loop, "dq") for loop in _loops(function, "")), code
+
+
+@pytest.mark.parametrize("variant", sorted(_ROW_SUM_STORE_FNS))
+@pytest.mark.parametrize(("d", "dv"), [(16, 128), (64, 128), (192, 128)])
+def test_full_slice_store_beside_a_rolled_reduction_of_another_extent_keeps_its_lanes(
+    variant: str, d: int, dv: int
+) -> None:
+    """A store over D next to a rolled reduction over Dv: the store's own
+    synthetic lanes hold it, the reduction's ``for roffset`` loop runs once
+    outside them.  The masked form used to abandon the placement: the mask's
+    flag load was ordered after the shared-memory reduce helper (pinned, so
+    inside the lanes) yet needed by the store inside, and the full nest then
+    repeated the rolled accumulation per lane and was rejected; such a load
+    and the register computation on it now run inside the lanes."""
+    code = _row_sum_render(variant, d, dv)
+    function = _kernel_function(code)
+    (rolled,) = _loops(function, "roffset_")
+    lanes = _loops(function, "synthetic_lane_")
+    assert lanes, code
+    assert all(not _loops(lane, "roffset_") for lane in lanes)
+    assert not _loops(rolled, "synthetic_lane_")
+    store_lanes = [lane for lane in lanes if _accesses(lane, "dq")]
+    assert store_lanes, code
+    if variant == "masked":
+        assert any(_accesses(lane, "flag") for lane in store_lanes)
+
+
+def _dq_store_terms(code: str) -> list[list[str]]:
+    """The index terms (one per tensor dim) of every store into ``dq``."""
+    terms = []
+    for line in code.splitlines():
+        if "dq.iterator" not in line or ".store(" not in line:
+            continue
+        address = line.split("dq.iterator + ", 1)[1].split(").store(", 1)[0]
+        terms.append(
+            [
+                part.split(" * cutlass.Int32(dq.layout.stride[")[0]
+                for part in address.split(" + ")
+            ]
+        )
+    return terms
+
+
+@pytest.mark.parametrize("variant", ["zeros", "masked", "ones"])
+@pytest.mark.parametrize(
+    ("shape", "extent", "chunk"), [((64, 2, 256), 64, 16), ((128, 2, 256), 128, 32)]
+)
+def test_full_slice_store_at_a_batch_extent_equal_to_the_head_dim_never_takes_the_batch_index(
+    variant: str, shape: tuple[int, int, int], extent: int, chunk: int
+) -> None:
+    """The slice resolver matches blocks by extent.  With the batch extent
+    equal to the head dim (static shapes) and the slice's own block a rolled
+    reduction whose index lives only inside its loop, the resolver fell
+    back to the batch tile's block although the subscript's first position
+    already indexes it: the store took ``indices_0`` as its column and wrote
+    one element per row (the column equal to the batch index), silently,
+    delta correct (headdims' b64 h12 s512 d64 preprocess).  A block another
+    position indexes is never a slice's now; the slice takes the rolled
+    block's chunk lane loop."""
+    code = _row_sum_render(variant, extent, extent, rolled=chunk, shape=shape)
+    stores = _dq_store_terms(code)
+    assert stores, code
+    for terms in stores:
+        assert len(terms) == 4, terms
+        assert terms[3] != terms[0], terms
+        assert terms[3].startswith("cutlass.Int32(rindex_lane_"), terms
+    function = _kernel_function(code)
+    (replica,) = _loops(function, "synthetic_lane_")
+    assert _accesses(replica, "dq")
+
+
+# --------------------------------------------------------------------------
+# Every definition a lane placement moves stays in scope of its readers
+# --------------------------------------------------------------------------
+
+
+def _escaping_names(function: ast.FunctionDef) -> set[str]:
+    """The names ``function`` reads where no definition is in scope: assigned
+    only inside a loop closed before the read.  The DSL compiles such a
+    kernel to a ``NameError``; a loop-carried name is assigned before its
+    loop as well, so it never appears here.  ``if`` / ``with`` bodies share
+    their enclosing scope."""
+    assigned = {
+        node.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    escaped: set[str] = set()
+
+    def reads(node: ast.AST, visible: set[str]) -> None:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Name)
+                and isinstance(child.ctx, ast.Load)
+                and child.id in assigned
+                and child.id not in visible
+            ):
+                escaped.add(child.id)
+
+    def stores(node: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        }
+
+    def walk(body: list[ast.stmt], visible: set[str]) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.For):
+                reads(stmt.iter, visible)
+                walk(stmt.body, visible | stores(stmt.target))
+                walk(stmt.orelse, visible)
+            elif isinstance(stmt, ast.While):
+                reads(stmt.test, visible)
+                walk(stmt.body, set(visible))
+                walk(stmt.orelse, visible)
+            elif isinstance(stmt, ast.If):
+                reads(stmt.test, visible)
+                walk(stmt.body, visible)
+                walk(stmt.orelse, visible)
+            elif isinstance(stmt, ast.With):
+                for item in stmt.items:
+                    reads(item.context_expr, visible)
+                walk(stmt.body, visible)
+            else:
+                reads(stmt, visible)
+                visible |= stores(stmt)
+
+    walk(function.body, {argument.arg for argument in function.args.args})
+    return escaped
+
+
+_SCAN_THREAD_SPLITS = {
+    "warp": {"block_sizes": [32, 128], "num_threads": [32, 4]},
+    "strided": {
+        "block_sizes": [32, 128],
+        "num_threads": [4, 32],
+        "cute_lane_layouts": ["strided", "blocked"],
+    },
+}
+
+
+@pytest.mark.parametrize("split", sorted(_SCAN_THREAD_SPLITS))
+@pytest.mark.parametrize(
+    "fn", [_segment_scan, _segment_scan_reverse], ids=["forward", "reverse"]
+)
+def test_a_definition_the_placement_would_move_into_a_lane_loop_keeps_its_outside_readers(
+    fn: object, split: str
+) -> None:
+    """A warp-scan step (a pinned shuffle inside the lanes) orders a register
+    computation after itself while a statement outside the lanes reads it
+    too: moving the computation inside left the reader after the loop with
+    an undefined name, and the DSL compiled a ``NameError`` (``scan_out_7``)
+    where the original nest was right.  The move is refused when any
+    statement left outside the loop reads a moved definition; every name is
+    read where a definition is in scope."""
+    kernel = helion.kernel(
+        fn,  # pyrefly: ignore [bad-argument-type]
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, _segment_args())
+        config = {
+            **bound.config_spec.default_config().config,
+            **_SCAN_THREAD_SPLITS[split],
+        }
+        code = bound.to_code(helion.Config(**config))
+    assert not _escaping_names(_kernel_function(code)), code
+
+
+@pytest.mark.parametrize("variant", sorted(_ROW_SUM_STORE_FNS))
+@pytest.mark.parametrize(("d", "chunk"), [(128, 64), (128, 32), (64, 16)])
+def test_full_slice_store_renders_read_only_names_in_scope(
+    variant: str, d: int, chunk: int
+) -> None:
+    code = _row_sum_render(variant, d, d, rolled=chunk)
+    assert not _escaping_names(_kernel_function(code)), code
+
+
+def _row_sum_then_zero_flagged_rows_reporting_fn(
+    o: torch.Tensor,
+    do: torch.Tensor,
+    flag: torch.Tensor,
+    dq: torch.Tensor,
+    flag_out: torch.Tensor,
+) -> torch.Tensor:
+    """The masked form with the mask read again after the store."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        absent = flag[tile_b, tile_h, tile_m] != 0
+        hl.store(
+            dq,
+            [tile_b, tile_h, tile_m, slice(None)],
+            hl.zeros([tile_b, tile_h, tile_m, D], dtype=dq.dtype),
+            extra_mask=absent[:, :, :, None],
+        )
+        flag_out[tile_b, tile_h, tile_m] = absent.to(torch.int32)
+    return delta
+
+
+def _row_sum_then_zero_flagged_rows_clearing_fn(
+    o: torch.Tensor, do: torch.Tensor, flag: torch.Tensor, dq: torch.Tensor
+) -> torch.Tensor:
+    """The masked form with the flag tensor rewritten after the store."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        absent = flag[tile_b, tile_h, tile_m] != 0
+        hl.store(
+            dq,
+            [tile_b, tile_h, tile_m, slice(None)],
+            hl.zeros([tile_b, tile_h, tile_m, D], dtype=dq.dtype),
+            extra_mask=absent[:, :, :, None],
+        )
+        flag[tile_b, tile_h, tile_m] = torch.zeros_like(flag[tile_b, tile_h, tile_m])
+    return delta
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        _row_sum_then_zero_flagged_rows_reporting_fn,
+        _row_sum_then_zero_flagged_rows_clearing_fn,
+    ],
+    ids=["mask_read_after", "flag_written_after"],
+)
+def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_stays_rejected(
+    fn: object,
+) -> None:
+    """The mask (a load the reduce helper orders inside the lanes) is needed
+    before the store inside and read again outside after it, or its tensor
+    is rewritten by a later store: neither form can be made the tile program
+    by repeating the mask inside the lanes (the first would leave the outside
+    reader with no definition, the second repeats a load of a written
+    tensor), so both stay rejected with the full nest's verdict.  Before the
+    refusal the first rendered and compiled to a ``NameError``."""
+    b, h, m = _ROW_SUM_SHAPE
+    o = torch.empty((b, h, m, 128), dtype=torch.bfloat16)
+    flag = torch.empty((b, h, m), dtype=torch.int32)
+    dq = torch.empty((b, h, m, 128), dtype=torch.float32)
+    args: tuple[torch.Tensor, ...] = (o, o.clone(), flag, dq)
+    if fn is _row_sum_then_zero_flagged_rows_reporting_fn:
+        args = (*args, torch.empty((b, h, m), dtype=torch.int32))
+    kernel = helion.kernel(
+        fn,  # pyrefly: ignore [bad-argument-type]
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, args)
+        config = _row_sum_store_config(bound, rolled=64)
+        with pytest.raises(exc.BackendUnsupported, match="not the tile program"):
+            bound.to_code(helion.Config(**config))
+
+
+# --------------------------------------------------------------------------
+# One replica per grid: two root loops sharing the rolled block
+# --------------------------------------------------------------------------
+
+
+def _two_row_sums_then_zero_rows_fn(
+    o: torch.Tensor, do: torch.Tensor, dq: torch.Tensor, dq2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two root loops, each the preprocess body over the same head dim: the
+    reduction dimension is one block for both (deduplicated by size)."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    delta2 = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = torch.sum(o_rows * do_rows, dim=-1)
+        dq[tile_b, tile_h, tile_m, :] = hl.zeros(
+            [tile_b, tile_h, tile_m, D], dtype=dq.dtype
+        )
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta2[tile_b, tile_h, tile_m] = torch.sum(o_rows * o_rows, dim=-1)
+        dq2[tile_b, tile_h, tile_m, :] = hl.zeros(
+            [tile_b, tile_h, tile_m, D], dtype=dq2.dtype
+        )
+    return delta, delta2
+
+
+def _two_root_kernel(backend: str = "cute") -> object:
+    return helion.kernel(
+        _two_row_sums_then_zero_rows_fn,
+        backend=backend,
+        static_shapes=True,
+        autotune_effort="none",
+    )
+
+
+def _two_root_args(d: int, device: str = "cpu") -> tuple[torch.Tensor, ...]:
+    b, h, m = _ROW_SUM_SHAPE
+    o = torch.empty((b, h, m, d), dtype=torch.bfloat16, device=device)
+    return (
+        o,
+        torch.empty_like(o),
+        torch.empty((b, h, m, d), dtype=torch.float32, device=device),
+        torch.empty((b, h, m, d), dtype=torch.float32, device=device),
+    )
+
+
+@pytest.mark.parametrize(("d", "chunk"), [(128, 64), (64, 16)])
+def test_full_slice_stores_in_two_root_loops_take_a_replica_each(
+    d: int, chunk: int
+) -> None:
+    """The replica is registered on the grid whose lane loop it is; a second
+    root loop sharing the rolled block registers its own.  Keyed per device
+    function, the second root reused the first's ``rindex_lane`` with no lane
+    loop of its own: a ``NameError`` in the DSL."""
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_two_root_kernel(), _two_root_args(d))
+        config = _row_sum_store_config(bound, rolled=chunk)
+        code = bound.to_code(helion.Config(**config))
+    function = _kernel_function(code)
+    assert not _escaping_names(function), code
+    replicas = _loops(function, "synthetic_lane_")
+    assert len(replicas) == 2, code
+    assert _accesses(replicas[0], "dq") and not _accesses(replicas[0], "dq2")
+    assert _accesses(replicas[1], "dq2") and not _accesses(replicas[1], "dq")
+    assigned = [
+        {
+            node.id
+            for node in ast.walk(replica)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id.startswith("rindex_lane_")
+        }
+        for replica in replicas
+    ]
+    assert all(assigned), code
+    assert not (assigned[0] & assigned[1]), code
+
+
+# --------------------------------------------------------------------------
+# The replica under a persistent grid
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("variant", ["zeros", "masked"])
+@pytest.mark.parametrize("pid_type", ["persistent_blocked", "persistent_interleaved"])
+def test_full_slice_store_over_a_rolled_reductions_extent_under_a_persistent_grid(
+    variant: str, pid_type: str
+) -> None:
+    code = _row_sum_render(variant, 128, 128, rolled=64, pid_type=pid_type)
+    function = _kernel_function(code)
+    assert not _escaping_names(function), code
+    (replica,) = _loops(function, "synthetic_lane_")
+    assert _accesses(replica, "dq"), code
+    assert all(
+        terms[3].startswith("cutlass.Int32(rindex_lane_")
+        for terms in _dq_store_terms(code)
+    ), code
+
+
+@pytest.mark.parametrize("variant", ["zeros", "masked"])
+@pytest.mark.parametrize(("extent", "chunk"), [(48, 32), (80, 16), (96, 32), (160, 64)])
+def test_full_slice_store_over_an_extent_the_chunks_do_not_divide_replays_the_rolled_loop(
+    variant: str, extent: int, chunk: int
+) -> None:
+    """An extent the reduction's thread count does not divide never reaches
+    the replica: the device IR attaches such a store to a replay of the
+    rolled loop (a second ``for roffset`` around it), which walks the tail
+    chunk with the loop's own bound.  The replica therefore carries no
+    mask; a power-of-two chunk of a power-of-two extent always divides."""
+    code = _row_sum_render(variant, extent, extent, rolled=chunk)
+    function = _kernel_function(code)
+    assert not _escaping_names(function), code
+    assert "rindex_lane_" not in code and "rmask_lane_" not in code, code
+    rolled = _loops(function, "roffset_")
+    assert len(rolled) == 2, code
+    assert _accesses(rolled[1], "dq") and not _accesses(rolled[0], "dq"), code

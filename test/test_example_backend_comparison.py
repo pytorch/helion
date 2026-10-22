@@ -397,3 +397,80 @@ def test_provenance_records_power_limit_and_software(monkeypatch):
     }
     assert result["software"]["torch"] == "torch-test"
     assert result["software"]["quack-kernels"] == "quack-kernels-test"
+
+
+def test_run_restricts_jobs_to_requested_cases(monkeypatch, tmp_path):
+    from benchmarks.cute import compare_attention_backends
+
+    launched = []
+
+    def fake_run(command, **kwargs):
+        assert "worker" not in command
+        return SimpleNamespace(returncode=1, stdout="")
+
+    def fake_popen(command, **kwargs):
+        option = dict(zip(command[3::2], command[4::2], strict=False))
+        result = {
+            "module": option["--module"],
+            "shape": int(option["--shape"]),
+            "case": option["--case"],
+            "provider": option["--provider"],
+            "impl": option["--impl"],
+            "status": "ok",
+        }
+        if option["--provider"] == "inventory":
+            result["cases"] = [
+                {"name": name, "kernels": ["helion"], "baselines": ["aten"]}
+                for name in ("00_forward", "01_backward")
+            ]
+        else:
+            launched.append((option["--case"], option["--provider"]))
+        Path(option["--output"]).write_text(json.dumps(result))
+        assert kwargs["start_new_session"]
+        return SimpleNamespace(returncode=0, pid=-1, wait=lambda: 0)
+
+    reaped = []
+    monkeypatch.setattr(compare.subprocess, "run", fake_run)
+    monkeypatch.setattr(compare.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(compare.os, "killpg", lambda pid, sig: reaped.append(pid))
+    monkeypatch.setattr(compare, "check_gpu_idle", lambda gpu, **kwargs: "GPU-0")
+    monkeypatch.setattr(compare, "provenance", lambda gpu: {})
+    monkeypatch.setattr(
+        compare_attention_backends, "_git_source_snapshot", lambda *args: None
+    )
+    args = SimpleNamespace(
+        modules="add",
+        shapes="0",
+        cases="01_backward",
+        seed=1,
+        gpu="0",
+        repetitions=1,
+        output=tmp_path / "run",
+    )
+    compare.run(args)
+    record = json.loads((tmp_path / "run" / "results.json").read_text())
+    assert record["status"] == "complete"
+    assert record["cases"] == ["01_backward"]
+    assert sorted(launched) == [
+        ("01_backward", "baselines"),
+        ("01_backward", "cute"),
+        ("01_backward", "triton"),
+    ]
+    # Every worker's session (inventory included) is reaped.
+    assert len(reaped) == 4
+
+
+def test_gpu_idle_check_waits_out_a_departing_process(monkeypatch):
+    apps = iter(["GPU-0, 123\n", ""])
+
+    def fake_run(command, **kwargs):
+        if "--query-gpu=uuid" in command:
+            return SimpleNamespace(stdout="GPU-0\n")
+        return SimpleNamespace(stdout=next(apps))
+
+    monkeypatch.setattr(compare.subprocess, "run", fake_run)
+    monkeypatch.setattr(compare.time, "sleep", lambda seconds: None)
+    assert compare.check_gpu_idle("0", grace_seconds=30.0) == "GPU-0"
+    apps = iter(["GPU-0, 123\n"] * 2)
+    with pytest.raises(RuntimeError, match="busy"):
+        compare.check_gpu_idle("0", grace_seconds=5.0)

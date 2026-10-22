@@ -169,21 +169,54 @@ class PatternSearch(PopulationBasedSearch):
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
         # Empty registries retain the exact old builder, cache lookup and draws.
         if not self.config_gen.config_spec.compiler_coverage_groups:
-            return self._generate_initial_population_base()
-        generation = self.config_gen.initial_population_view()
-        population = self._generate_initial_population_base(generation=generation)
+            population = self._generate_initial_population_base()
+        else:
+            generation = self.config_gen.initial_population_view()
+            population = self._generate_initial_population_base(generation=generation)
+            if (
+                self.initial_population > 0
+                and self.config_gen.compiler_coverage_enabled
+            ):
+                population = self._append_compiler_coverage(
+                    population,
+                    use_cache=self.initial_population_strategy
+                    == InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                )
+        # Both additions follow every old return, including padding/truncation.
+        # Nothing may trim or reorder the nominal/coverage prefix afterward.
+        return self._append_requested_compiler_seeds(population)
+
+    def _append_requested_compiler_seeds(
+        self, population: list[FlatConfig]
+    ) -> list[FlatConfig]:
+        spec = self.config_gen.config_spec
         if (
-            self.initial_population <= 0
-            or not self.config_gen.compiler_coverage_enabled
+            not getattr(spec, "compiler_seed_overflow_requested", False)
+            or not spec.compiler_seed_configs
+            or self.initial_population <= 0
         ):
             return population
-        # This is after every old return, including flash padding/truncation.
-        # There must be no later nominal-population slice.
-        return self._append_compiler_coverage(
-            population,
-            use_cache=self.initial_population_strategy
-            == InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        # The existing transfer path owns normalization, scalar overrides and
+        # invalid-seed handling. It performs no sampling or cache lookup.
+        pairs = self.config_gen.seed_flat_config_pairs(log_func=self.log)
+        self.pin_finalist_configs([config for _, config in pairs])
+        seen: set[Config] = set()
+        for flat in population:
+            try:
+                _, config = self.config_gen.canonicalize_flat(flat)
+            except (exc.InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+                continue
+            seen.add(config)
+        result = list(population)
+        for flat, config in pairs:
+            if config not in seen:
+                result.append(flat)
+                seen.add(config)
+        self.log(
+            f"Compiler seed overflow: appended {len(result) - len(population)} "
+            f"normalized seeds after {len(population)} nominal/coverage rows"
         )
+        return result
 
     def _generate_initial_population_base(
         self, *, generation: ConfigGeneration | None = None

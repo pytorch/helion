@@ -32,7 +32,7 @@ from .row_fragment import row_fragment_tensor_inputs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from torch.fx import Node
 
@@ -304,24 +304,29 @@ class _ScalarConsumer:
         elif node.target is torch.ops.aten.constant_pad_nd.default:
             source = cast("Node", node.args[0])
             source_value = cast("torch.Tensor", tensor_value(source))
-            name = self.fn.new_var("radix_padded_value")
-            other = self.cast(expr_from_string(repr(node.args[2])), value.dtype)
-            self.cg.add_statement(
-                statement_from_string(f"{name} = {{value}}", value=other)
-            )
-            branch = statement_from_string(
-                f"if ({coord}) < {source_value.size(0)}:\n    pass"
-            )
-            assert isinstance(branch, ast.If)
-            branch.body.clear()
-            with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+            if source_value.shape == value.shape:
+                # The admission proof allows right padding only. Equal shapes
+                # therefore make this a typed identity at every coordinate.
+                result = self.read(source, coord)
+            else:
+                name = self.fn.new_var("radix_padded_value")
+                other = self.cast(expr_from_string(repr(node.args[2])), value.dtype)
                 self.cg.add_statement(
-                    statement_from_string(
-                        f"{name} = {{value}}", value=self.read(source, coord)
-                    )
+                    statement_from_string(f"{name} = {{value}}", value=other)
                 )
-            self.cg.add_statement(branch)
-            result = expr_from_string(name)
+                branch = statement_from_string(
+                    f"if ({coord}) < {source_value.size(0)}:\n    pass"
+                )
+                assert isinstance(branch, ast.If)
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    self.cg.add_statement(
+                        statement_from_string(
+                            f"{name} = {{value}}", value=self.read(source, coord)
+                        )
+                    )
+                self.cg.add_statement(branch)
+                result = expr_from_string(name)
         elif node.target is torch.ops.aten.view.dtype:
             operand = self.read(cast("Node", node.args[0]), coord)
             result = expr_from_string(
@@ -606,7 +611,8 @@ def _primary_key(
 
 
 def _histogram_update(w: _Writer, spec: _RadixCodegenSpec) -> None:
-    w.line("members = cute.arch.vote_ballot_sync(matched)")
+    if spec.candidate_capacity or spec.plan.histogram_mode != "direct":
+        w.line("members = cute.arch.vote_ballot_sync(matched)")
     with w.block("if matched"):
         if spec.plan.histogram_mode == "direct":
             w.line(
@@ -624,11 +630,13 @@ def _histogram_update(w: _Writer, spec: _RadixCodegenSpec) -> None:
 def _compact(w: _Writer, spec: _RadixCodegenSpec) -> None:
     w.line("primary_boundary = primary_prefix[0]")
     w.line("boundary_remaining = remaining[0]")
+    if spec.plan.boundary_early_exit:
+        w.line("boundary_complete = cutlass.Boolean(primary_done[0] != 0)")
     w.line(f"global_above = cutlass.Int32({spec.k}) - boundary_remaining")
     w.line("cute.arch.sync_threads()")
     _scan_length(w, spec)
     w.line("use_candidates = cutlass.Boolean(False)")
-    if spec.candidate_capacity:
+    if spec.candidate_capacity and not spec.plan.defer_output:
         with w.block(f"if candidate_counter[0] <= {spec.candidate_capacity}"):
             w.line(f"scan_length = {spec.column_scalar}(candidate_counter[0])")
             w.line("use_candidates = cutlass.Boolean(True)")
@@ -701,15 +709,34 @@ def _core_source(spec: _RadixCodegenSpec) -> str:
     w.line(
         f"input_members = cute.make_rmem_tensor(cute.make_layout(({spec.packet},)), cutlass.Boolean)"
     )
-    if spec.cache_keys_enabled:
+    if spec.cache_keys_enabled or spec.plan.resident_input:
         w.line(
             f"input_keys = cute.make_rmem_tensor(cute.make_layout(({spec.packet},)), cutlass.Uint32)"
+        )
+    if spec.plan.resident_input:
+        if not spec.plan.resident_keys_only:
+            w.line(
+                f"resident_values = cute.make_rmem_tensor(cute.make_layout(({spec.plan.resident_elements},)), {dtype})"
+            )
+        w.line(
+            f"resident_keys = cute.make_rmem_tensor(cute.make_layout(({spec.plan.resident_elements},)), cutlass.Uint32)"
         )
     with w.block("if thread == 0"):
         w.line("primary_prefix[0] = cutlass.Uint32(0)")
         w.line("primary_mask[0] = cutlass.Uint32(0)")
         w.line(f"remaining[0] = cutlass.Int32({spec.k})")
-        w.line("candidate_counter[0] = cutlass.Int32(0)")
+        if spec.plan.boundary_early_exit:
+            # Until round one completes there is no populated candidate band.
+            # A first-digit exact boundary therefore falls back to the source.
+            w.line(
+                f"candidate_counter[0] = cutlass.Int32({spec.candidate_capacity + 1})"
+            )
+            if not spec.plan.defer_output:
+                w.line("coarse_prefix[0] = cutlass.Uint32(0)")
+                w.line("coarse_mask[0] = cutlass.Uint32(0)")
+            w.line("primary_done[0] = cutlass.Int32(0)")
+        else:
+            w.line("candidate_counter[0] = cutlass.Int32(0)")
         w.line("counters[0] = cutlass.Int32(0)")
         w.line("counters[1] = cutlass.Int32(0)")
         lengths = cast("torch.Tensor", tensor_value(spec.plan.graph.length.args[0]))
@@ -719,10 +746,9 @@ def _core_source(spec: _RadixCodegenSpec) -> str:
         )
     w.line("cute.arch.sync_threads()")
     w.line("selection_length = length_slot[0]")
-    # Every admitted primary key has at least two byte passes. The first
-    # histogram release/wait publishes initialized counters before any DSM
-    # ticket use, which starts in pass one; shortfill never reads DSM tickets.
-    # The unconditional final lifetime barrier is retained for both branches.
+    # The first histogram release/wait publishes initialized counters before
+    # any DSM ticket use, including compacting an exact first-digit boundary.
+    # Shortfill never reads DSM tickets. Both branches retain the final barrier.
     if spec.valid_domain:
         # Keep the raw typed length for every traced consumer. Clamp in Int64
         # before narrowing so huge positive or negative Int64 lengths cannot
@@ -746,6 +772,8 @@ def _core_source(spec: _RadixCodegenSpec) -> str:
             _emit_consumer(w, spec, column="output_source_column")
         w.line("else:")
         w.indent += 1
+    if spec.plan.resident_input:
+        _initialize_resident_input(w, spec)
     _primary_passes(w, spec)
     _compact(w, spec)
     # All peer reads drain before the scalar suffix. It reads private scratch
@@ -769,7 +797,7 @@ class _Writer:
         self.lines.append("    " * self.indent + text)
 
     @contextmanager
-    def block(self, header: str) -> Iterator[None]:
+    def block(self, header: str) -> Generator[None, None, None]:
         self.line(header + ":")
         self.indent += 1
         try:
@@ -802,7 +830,28 @@ def _rank(
         w.line(f"{name} = cutlass.Int32({mask})")
 
 
-def _packet(w: _Writer, spec: _RadixCodegenSpec, *, candidates: bool) -> None:
+def _initialize_resident_input(w: _Writer, spec: _RadixCodegenSpec) -> None:
+    _scan_length(w, spec)
+    with w.block(
+        f"for packet_round in cutlass.range_constexpr({spec.plan.source_packet_rounds})"
+    ):
+        _packet(w, spec, candidates=False, initialize=True)
+        with w.block(f"for vec in cutlass.range_constexpr({spec.packet})"):
+            _primary_key(w, spec, "input_packet[vec]", "input_columns[vec]", "key")
+            if not spec.plan.resident_keys_only:
+                w.line(
+                    f"resident_values[packet_round * {spec.packet} + vec] = input_packet[vec]"
+                )
+            w.line(f"resident_keys[packet_round * {spec.packet} + vec] = key")
+
+
+def _packet(
+    w: _Writer,
+    spec: _RadixCodegenSpec,
+    *,
+    candidates: bool,
+    initialize: bool = False,
+) -> None:
     dtype = "cutlass." + _FORMATS[spec.dtype].cute_name
     p = spec.packet
     column_scalar = spec.column_scalar
@@ -827,7 +876,18 @@ def _packet(w: _Writer, spec: _RadixCodegenSpec, *, candidates: bool) -> None:
             w.line(
                 f"input_members[prepare] = cutlass.Boolean({_boolean('member', f'column < {spec.logical_cols}')})"
             )
-        w.line(f"input_packet[prepare] = {dtype}(0)")
+        if spec.plan.resident_input and not (candidates or initialize):
+            if spec.plan.resident_keys_only:
+                w.line(f"input_packet[prepare] = {dtype}(0)")
+            else:
+                w.line(
+                    f"input_packet[prepare] = resident_values[packet_round * {p} + prepare]"
+                )
+            w.line(f"input_keys[prepare] = resident_keys[packet_round * {p} + prepare]")
+        else:
+            w.line(f"input_packet[prepare] = {dtype}(0)")
+    if spec.plan.resident_input and not (candidates or initialize):
+        return
     read_terms = [
         _boolean(
             f"input_members[{i}]",
@@ -921,6 +981,9 @@ def _selection_packet(w: _Writer, spec: _RadixCodegenSpec, *, candidates: bool) 
 
 
 def _selection_key(w: _Writer, spec: _RadixCodegenSpec, *, candidates: bool) -> None:
+    if spec.plan.resident_input and not candidates:
+        w.line("key = cutlass.Uint32(input_keys[vec])")
+        return
     if not spec.cache_keys_enabled or not candidates:
         _primary_key(w, spec, "input_packet[vec]", "input_columns[vec]", "key")
         return
@@ -984,6 +1047,37 @@ def _packet_scan(
     candidates: bool,
     work: Callable[[_Writer, _RadixCodegenSpec, bool], None],
 ) -> None:
+    if spec.plan.resident_input:
+        if candidates:
+            with (
+                w.block("if use_candidates"),
+                w.block("for packet_round in range(scan_rounds)"),
+            ):
+                if spec.scalar_candidates:
+                    _scalar_candidate_packet(w, spec)
+                    with w.block("for vec in cutlass.range_constexpr(1)"):
+                        work(w, spec, True)
+                else:
+                    if spec.cache_keys_enabled:
+                        _cached_packet(w, spec)
+                    else:
+                        _packet(w, spec, candidates=True)
+                    with w.block(f"for vec in cutlass.range_constexpr({spec.packet})"):
+                        work(w, spec, True)
+            w.line("else:")
+            w.indent += 1
+        with (
+            w.block(
+                f"for packet_round in cutlass.range_constexpr({spec.plan.source_packet_rounds})"
+            ),
+            w.block("if packet_round < scan_rounds"),
+        ):
+            _packet(w, spec, candidates=False)
+            with w.block(f"for vec in cutlass.range_constexpr({spec.packet})"):
+                work(w, spec, False)
+        if candidates:
+            w.indent -= 1
+        return
     if spec.scan_unroll > 1:
         if candidates:
             # Preserve uniform candidate scheduling. Only the source scan gets
@@ -1041,19 +1135,28 @@ def _primary_packet_work(w: _Writer, spec: _RadixCodegenSpec, candidates: bool) 
     _histogram_update(w, spec)
     if spec.candidate_capacity:
         _cache_update(w, spec)
-    with w.block("if primary_round == 1"):
-        w.line(
-            f"coarse_above = cutlass.Boolean({_boolean('input_members[vec]', '(key & pass_mask) > pass_prefix')})"
-        )
-        _reserve(w, spec, "above", "coarse_above", candidates=candidates)
+    if not spec.plan.defer_output:
+        with w.block("if primary_round == 1"):
+            w.line(
+                f"coarse_above = cutlass.Boolean({_boolean('input_members[vec]', '(key & pass_mask) > pass_prefix')})"
+            )
+            _reserve(w, spec, "above", "coarse_above", candidates=candidates)
 
 
 def _compact_packet_work(w: _Writer, spec: _RadixCodegenSpec, candidates: bool) -> None:
     _selection_key(w, spec, candidates=candidates)
     w.line("better = cutlass.Boolean(key > primary_boundary)")
     w.line("same = cutlass.Boolean(key == primary_boundary)")
+    if spec.plan.boundary_early_exit:
+        with w.block("if boundary_complete"):
+            # All keys in the chosen prefix bucket are selected. Its low bits
+            # need not be refined; treat them together with the above keys.
+            w.line("better = cutlass.Boolean(key >= primary_boundary)")
+            w.line("same = cutlass.Boolean(False)")
     w.line(
-        "coarse_member = cutlass.Boolean((key & coarse_mask[0]) == coarse_prefix[0])"
+        "coarse_member = cutlass.Boolean(True)"
+        if spec.plan.defer_output
+        else "coarse_member = cutlass.Boolean((key & coarse_mask[0]) == coarse_prefix[0])"
     )
     w.line(
         f"take_above = cutlass.Boolean({_boolean('input_members[vec]', 'coarse_member', 'better')})"
@@ -1118,6 +1221,12 @@ def _histogram_choose(
 ) -> None:
     w.line("cute.arch.sync_threads()")
     _synchronize_cluster(w, spec, release=True)
+    if spec.plan.partial_scan:
+        # This owner replaces the whole device root; scalar consumers do not
+        # use named barriers. Exactly eight complete warps own the histogram
+        # scan. Other warps wait at the full-CTA publication barrier below.
+        w.line("if thread < 256:")
+        w.indent += 1
     w.line("bin_count = cutlass.Int32(0)")
     with w.block("if thread < 256"):
         if spec.cluster > 1:
@@ -1135,7 +1244,11 @@ def _histogram_choose(
             w.line("suffix_count = suffix_count + scan_peer")
     with w.block(f"if {_boolean('thread < 256', 'lane == 0')}"):
         w.line("warp_totals[warp] = suffix_count")
-    w.line("cute.arch.sync_threads()")
+    w.line(
+        "cute.arch.barrier(barrier_id=1, number_of_threads=256)"
+        if spec.plan.partial_scan
+        else "cute.arch.sync_threads()"
+    )
     with w.block("if thread < 256"):
         w.line("greater_count = suffix_count - bin_count")
         with (
@@ -1152,6 +1265,12 @@ def _histogram_choose(
             w.line(f"{prefix}[0] = pass_prefix | ({word}(thread) << {word}({shift}))")
             w.line(f"{mask}[0] = pass_mask | ({word}(255) << {word}({shift}))")
             w.line("remaining[0] = pass_remaining - greater_count")
+            if spec.plan.boundary_early_exit:
+                with w.block("if bin_count == pass_remaining - greater_count"):
+                    w.line("primary_done[0] = cutlass.Int32(1)")
+                    w.line("remaining[0] = cutlass.Int32(0)")
+    if spec.plan.partial_scan:
+        w.indent -= 1
     w.line("cute.arch.sync_threads()")
     _synchronize_cluster(w, spec, release=False)
 
@@ -1160,6 +1279,9 @@ def _primary_passes(w: _Writer, spec: _RadixCodegenSpec) -> None:
     word = "cutlass.Uint64" if spec.primary_width == 64 else "cutlass.Uint32"
     count = spec.primary_width // 8
     with w.block(f"for primary_round in cutlass.range_constexpr({count})"):
+        if spec.plan.boundary_early_exit:
+            w.line("if primary_done[0] == 0:")
+            w.indent += 1
         w.line(f"primary_shift = cutlass.Int32(({count - 1} - primary_round) * 8)")
         with w.block("if cutlass.const_expr(primary_round == 0)"):
             w.line(f"pass_prefix = {word}(0)")
@@ -1171,9 +1293,10 @@ def _primary_passes(w: _Writer, spec: _RadixCodegenSpec) -> None:
         w.line("pass_mask = primary_mask[0]")
         w.line("pass_remaining = remaining[0]")
         w.indent -= 1
-        with w.block(f"if {_boolean('primary_round == 1', 'thread == 0')}"):
-            w.line("coarse_prefix[0] = pass_prefix")
-            w.line("coarse_mask[0] = pass_mask")
+        if not spec.plan.defer_output:
+            with w.block(f"if {_boolean('primary_round == 1', 'thread == 0')}"):
+                w.line("coarse_prefix[0] = pass_prefix")
+                w.line("coarse_mask[0] = pass_mask")
         if spec.candidate_capacity:
             with w.block(f"if {_boolean('primary_round == 1', 'thread == 0')}"):
                 w.line("candidate_counter[0] = cutlass.Int32(0)")
@@ -1201,6 +1324,8 @@ def _primary_passes(w: _Writer, spec: _RadixCodegenSpec) -> None:
             word=word,
             shift="primary_shift",
         )
+        if spec.plan.boundary_early_exit:
+            w.indent -= 1
 
 
 def _reserve(
@@ -1272,20 +1397,32 @@ def _direct_output(
             )
         w.line("else:")
         w.indent += 1
+        if spec.plan.resident_keys_only:
+            _inverse_cached_payload(w, spec)
         _emit_consumer(
             w,
             spec,
             column="output_source_column",
-            raw_value="input_packet[vec]",
+            raw_value=(
+                "cached_payload_raw"
+                if spec.plan.resident_keys_only
+                else "input_packet[vec]"
+            ),
             known_valid=spec.valid_domain,
         )
         w.indent -= 1
     else:
+        if spec.plan.resident_keys_only:
+            _inverse_cached_payload(w, spec)
         _emit_consumer(
             w,
             spec,
             column="output_source_column",
-            raw_value="input_packet[vec]",
+            raw_value=(
+                "cached_payload_raw"
+                if spec.plan.resident_keys_only
+                else "input_packet[vec]"
+            ),
             known_valid=spec.valid_domain,
         )
 

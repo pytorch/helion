@@ -16,10 +16,13 @@ from test.test_cute_full_reduction_loop_encoding import rms_norm
 import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
+import helion._compiler.cute.prefetch_reduction_packets as prefetch_module
 from helion._compiler.cute.prefetch_reduction_packets import prefetch_reduction_packets
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import CuteReductionReloadSpec
+import helion.language as hl
 
 
 def source(*, lanes: int = 1, width: int = 4, carrier: str = "Uint16") -> str:
@@ -435,6 +438,162 @@ def test_actual_strict_configs_keep_control_math_and_reach_bounded_lane_domains(
     assert torch.cuda.is_initialized() == initialized
 
 
+def fused_residual_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        value = x[row, :].to(torch.float32) + residual[row, :].to(torch.float32)
+        stored = value.to(x.dtype)
+        inverse = torch.rsqrt(torch.mean(value * value, dim=-1) + 1e-6)
+        output[row, :] = (value * inverse[:, None] * weight[:].to(torch.float32)).to(
+            x.dtype
+        )
+        residual_out[row, :] = stored
+    return output, residual_out
+
+
+@pytest.mark.parametrize(
+    "width,rows,threads", [(4096, 2, 128), (4096, 4, 128), (8192, 2, 256)]
+)
+def test_multirow_launch_dimensions_allow_prefetch_without_changing_math(
+    width: int, rows: int, threads: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    initialized = torch.cuda.is_initialized()
+    with (
+        _cpu_target(),
+        _forbid_native_compile() as native,
+        patch.object(
+            BaseSearch, "autotune", side_effect=AssertionError("autotune forbidden")
+        ) as tune,
+    ):
+        kernel = helion.kernel(
+            fused_residual_norm,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+        )
+        bound = kernel._bind_isolated(
+            (
+                torch.empty((1024, width), dtype=torch.bfloat16),
+                torch.empty((1024, width), dtype=torch.bfloat16),
+                torch.empty(width, dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        owner = spec.reduction_loops[0].block_id
+        config = helion.Config(
+            block_sizes=[rows],
+            reduction_loops=[width],
+            num_threads=[
+                threads if block == owner else rows
+                for block in spec.num_threads.valid_block_ids()
+            ],
+            cute_vector_widths=[
+                8 if block == owner else 1
+                for block in spec.cute_vector_widths.valid_block_ids()
+            ],
+            cute_lane_layouts=[
+                "strided" if block == owner else "blocked"
+                for block in spec.cute_lane_layouts.valid_block_ids()
+            ],
+            cute_reduction_reloads=["register"],
+            cute_independent_reduction=True,
+            cute_replicated_reduction=False,
+            cute_pdl=True,
+            load_eviction_policies=["l2_last"]
+            * len(spec.load_eviction_policies.default()),
+        )
+        generation = ConfigGeneration(spec)
+        with bound.env:
+            flat, effective = generation.strict_config_pair(config)
+            assert generation.strict_unflatten(flat) == effective
+            for key, value in config.config.items():
+                assert effective.config[key] == value
+            requested = helion.Config(
+                **dict(effective.config, cute_reduction_reloads=["register_prefetch"])
+            )
+            flat, enabled = generation.strict_config_pair(requested)
+            assert generation.strict_unflatten(flat) == enabled
+            assert enabled == requested
+        control = bound.to_code(effective)
+        code = bound.to_code(enabled)
+        # Reproduce the old grammar on this actual generated launch, rather
+        # than changing packet indices or masks to introduce the intrinsic.
+        with patch.object(
+            prefetch_module,
+            "_PURE",
+            prefetch_module._PURE - {"cute.arch.block_dim"},
+        ):
+            legacy = bound.to_code(enabled)
+        bodies = [
+            next(
+                node.body
+                for node in ast.parse(text).body
+                if isinstance(node, ast.FunctionDef)
+                and any(
+                    ast.unparse(decorator) == "cute.kernel"
+                    for decorator in node.decorator_list
+                )
+            )
+            for text in (control, code, legacy)
+        ]
+        assert "cute.arch.block_dim()" in control
+        assert f"block=({threads}, {rows}, 1)" in code
+        assert not admitted(bodies[2])
+        assert dumped(bodies[2]) == dumped(bodies[0])
+        assert admitted(bodies[1])
+        assert dumped(inverse_motion(*bodies[:2])) == dumped(bodies[0])
+
+        producer, consumer = [
+            statement for statement in bodies[1] if isinstance(statement, ast.For)
+        ]
+        weight_loads = [
+            node
+            for node in ast.walk(producer)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "_cute_load_l2_evict_last"
+            and any(
+                isinstance(part, ast.Attribute)
+                and isinstance(part.value, ast.Name)
+                and part.value.id == "weight"
+                and part.attr == "iterator"
+                for part in ast.walk(node.value)
+            )
+        ]
+        assert len(weight_loads) == 1
+        assert not any(
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "_cute_load_l2_evict_last"
+            for node in ast.walk(consumer)
+        )
+        stores = [
+            node
+            for node in ast.walk(consumer)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "_cute_store_u16_vec"
+        ]
+        assert len(stores) == 2
+        assert {ast.unparse(node.args[0]).split(".", 1)[0] for node in stores} == {
+            "output",
+            "residual_out",
+        }
+        wait = next(
+            index
+            for index, statement in enumerate(bodies[1])
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and ast.unparse(statement.value.func) == "cute.arch.griddepcontrol_wait"
+        )
+        assert wait < bodies[1].index(producer) < bodies[1].index(consumer)
+        assert all(call.call_count == 0 for call in native)
+        assert tune.call_count == 0
+    assert torch.cuda.is_initialized() == initialized
+
+
 @pytest.mark.parametrize("stop", [64, 128])
 def test_register_prefetch_retains_existing_register_fuser_semantics(
     stop: int, monkeypatch: pytest.MonkeyPatch
@@ -475,3 +634,23 @@ def test_mismatched_consumer_domain_declines() -> None:
         "cutlass.Int32(0)", "cutlass.Int32(1)", 1
     )
     assert not admitted(run_pass(text))
+
+
+def block_dim_source() -> str:
+    return source().replace(
+        "before = roffset_1 +",
+        "before = cutlass.Int32(cute.arch.block_dim()[0]) * 0 + roffset_1 +",
+    )
+
+
+def test_block_dim_prefix_peer_store_keeps_read_only_policy() -> None:
+    text = block_dim_source().replace(
+        "total = cutlass.Float32(0)",
+        "if cute.arch.thread_idx()[0] == 1:\n    _cute_store_u16_vec(weight.iterator, [cutlass.Uint16(17)] * 4)\ntotal = cutlass.Float32(0)",
+    )
+    assert not admitted(run_pass(text))
+    assert dumped(run_pass(text)) == dumped(ast.parse(text).body)
+
+
+def test_block_dim_read_only_control_still_prefetches() -> None:
+    assert admitted(run_pass(block_dim_source()))

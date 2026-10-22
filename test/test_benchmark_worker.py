@@ -34,6 +34,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasTpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
@@ -47,6 +48,7 @@ from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_worker import _REAP_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
@@ -182,6 +184,12 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
         self.assertEqual(metrics.num_successful_candidate_measurements, 0)
 
 
+@skipIfRefEager(
+    "Spawns real benchmark-worker subprocesses and exercises their "
+    "SIGKILL/process-group reaping -- compile-mode machinery that "
+    "HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker "
+    "with no traceback) on the single-GPU A10G ref-eager runner."
+)
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
@@ -1447,7 +1455,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.run(_ReturnValue(7), timeout=0.01)
 
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
-        process.join.assert_called_once_with(timeout=5)
+        process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)

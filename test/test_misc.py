@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _codegen_skip_reason
 from ._cute_binding import _cpu_bind
 from ._cute_binding import _forbid_native_compile
 from ._cute_binding import _mock_cuda_unavailable
@@ -52,6 +53,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1900,13 +1902,20 @@ class TestHelionCutePrinter(TestCase):
                 result[row] = x[row] + value
             return result
 
+        backends = [
+            backend
+            for backend in ("cute", "triton")
+            if _codegen_skip_reason(backend) is None
+        ]
+        if not backends:
+            raise unittest.SkipTest("no backend can generate device source")
         with (
             _mock_cuda_unavailable(),
             _target(),
             _forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
-            for backend in ("cute", "triton"):
+            for backend in backends:
                 kernel = helion.kernel(
                     powers, backend=backend, static_shapes=True, autotune_effort="none"
                 )
@@ -2573,6 +2582,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cutlass = pytest.importorskip("cutlass")
@@ -2677,7 +2687,7 @@ def test_cute_unsigned_scalar_load_codegen(dtype):
             assert ast.unparse(branches[0].orelse) == f"{logical}(0)"
 
 
-@skipUnlessBackends(["cute"])
+@onlyBackends(["cute"])
 class TestUnsignedScalarLoads(TestCase):
     def test_unsigned_scalar_loads_preserve_high_bits_and_tails(self):
         for dtype in (torch.uint8, torch.uint32):

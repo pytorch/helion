@@ -11,6 +11,7 @@ requires a CuTe/cutlass install.
 from __future__ import annotations
 
 import base64
+import bisect
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextlib import suppress
@@ -25,12 +26,14 @@ import json
 import linecache
 import logging
 import math
+import operator
 import os
 import sys
 import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
+from typing import NoReturn
 from typing import cast
 import weakref
 
@@ -41,7 +44,14 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_balanced_workers import balanced_workers_index_domain
+from ..._compiler.cute.grouped_d_shift import bounded_d_shift_index_domain
 from ..._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_CHOICES
+from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from ..._compiler.cute.grouped_panel_raster import grouped_device_panel_index_domain
+from ..._compiler.cute.grouped_panel_raster import grouped_panel_ratio_index_domain
 from ..._compiler.cute.grouped_row_union import (
     schedule_by_name as row_union_schedule_by_name,
 )
@@ -54,6 +64,7 @@ from ..._compiler.cute.grouped_worklist import (
     tcgen05_grouped_worklist_compatible_source_m_tiles,
 )
 from ..._compiler.cute.grouped_worklist import validate_tcgen05_grouped_worklist_rows
+from ..._compiler.cute.strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
 from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
@@ -69,6 +80,9 @@ from ..._compiler.cute.tcgen05_constants import (
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+)
+from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
@@ -78,6 +92,7 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .occupancy import get_max_active_clusters
 from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
@@ -297,12 +312,38 @@ def _tcgen05_grouped_scheduler_mode(
     return mode
 
 
+def _flex_rank4_layout(
+    rows: int,
+    cols: int,
+    heads: int,
+    batch: int,
+    strides: Sequence[int],
+    *,
+    mn_major: bool = False,
+) -> str:
+    """A rank-4 TMA map over a ``[B, H, S, D]`` flex operand's strides
+    (``flex_match.flex_operand_strides`` form): ``(S, D, H, B)``, or
+    ``(D, S, H, B)`` for the MN-major V. The device body indexes the
+    trailing ``(head, batch)`` modes."""
+    batch_stride, head_stride, row_stride, _ = strides
+    if mn_major:
+        return (
+            f"cute.make_layout(({cols}, {rows}, {heads}, {batch}), "
+            f"stride=(1, {row_stride}, {head_stride}, {batch_stride}))"
+        )
+    return (
+        f"cute.make_layout(({rows}, {cols}, {heads}, {batch}), "
+        f"stride=({row_stride}, 1, {head_stride}, {batch_stride}))"
+    )
+
+
 def _append_cute_wrapper_plan(
     body: list[str],
     call_args: list[str],
     plan: dict[str, object],
     num_sm: int | None = None,
     schema_key: Sequence[tuple[object, ...]] | None = None,
+    device: torch.device | None = None,
 ) -> None:
     descriptor_identity = plan.get("wrapped_grouped_descriptors")
     descriptors = (
@@ -421,6 +462,7 @@ def _append_cute_wrapper_plan(
         rank3_mnl_tensor: bool = False,
         orientation: str = "mn",
         column_major: bool = False,
+        bounded_output_shift: bool = False,
     ) -> None:
         assert len(kernel_args) == 2
         assert orientation in ("mn", "nm")
@@ -483,6 +525,27 @@ def _append_cute_wrapper_plan(
             if worklist_nm_store
             else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
         )
+        gmem_pointer = f"arg{tensor_idx}.iterator"
+        if bounded_output_shift:
+            if not rank3_mnl_tensor or column_major or descriptors is not None:
+                raise exc.BackendUnsupported(
+                    "cute", "bounded D shift requires its proved rank-3 output view"
+                )
+            extra_extent = f"arg{tensor_idx}_shape0 + 1"
+            rank3_gmem_shape = (
+                f"(arg{tensor_idx}_shape1, arg{tensor_idx}_shape0, {extra_extent})"
+                if worklist_nm_store
+                else f"(arg{tensor_idx}_shape0, arg{tensor_idx}_shape1, {extra_extent})"
+            )
+            rank3_gmem_stride = (
+                f"(arg{tensor_idx}_stride1, arg{tensor_idx}_stride0, arg{tensor_idx}_stride0)"
+                if worklist_nm_store
+                else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, arg{tensor_idx}_stride0)"
+            )
+            gmem_pointer = (
+                f"(arg{tensor_idx}.iterator - cutlass.Int64(arg{tensor_idx}_shape0) "
+                f"* cutlass.Int64(arg{tensor_idx}_stride0))"
+            )
         gmem_layout = (
             descriptors.layout(f"arg{tensor_idx}", output=True)
             if descriptors is not None
@@ -504,7 +567,7 @@ def _append_cute_wrapper_plan(
                     (
                         (
                             f"    {gmem_tensor} = cute.make_tensor("
-                            f"arg{tensor_idx}.iterator, "
+                            f"{gmem_pointer}, "
                             "layout=cute.make_layout("
                             f"{gmem_layout}))"
                         ),
@@ -528,10 +591,15 @@ def _append_cute_wrapper_plan(
     if kind == "block_scaled_mma":
         if (
             plan_int("bn")
-            not in ((64, 128, 256) if plan.get("format") == "mxfp8" else (128, 256))
+            not in (
+                (8, 16, 32, 64, 128, 224, 256)
+                if plan.get("format") == "mxfp8"
+                else (128, 256)
+            )
             or plan_int("bk") not in (64, 128, 256)
-            or plan_int("stages") not in (2, 3, 4, 5)
+            or plan_int("stages") not in (2, 3, 4, 5, 6, 8, 10, 12)
             or plan_int("cluster_m") not in (1, 2)
+            or (plan_int("bn") == 8 and plan_int("cluster_m") != 1)
             or any(plan_int(key) <= 0 for key in ("m", "n", "k", "workspace_bytes"))
             or plan_int("k") % 16
             or type(plan.get("persistent")) is not bool
@@ -734,6 +802,54 @@ def _append_cute_wrapper_plan(
         )
         return
 
+    if kind == "helion_mma_dag_alias":
+        # cute_mma_dag: launch-time argument metadata for the alias guard
+        # (``_MmaDagAliasGuard``); nothing to prepare on the host.
+        return
+
+    if kind == "helion_mma_dag_tma":
+        # cute_mma_dag tcgen05 mode: one tiled TMA descriptor per operand,
+        # built here over the wrapper's tensor views and passed to the kernel
+        # as grid constants after the ordinary arguments.  The launch keeps
+        # the generic flat grid.
+        count = plan_int("tma_count")
+        if count <= 0 or count > 16:
+            raise exc.BackendUnsupported("cute", "invalid mma_dag tensor-map count")
+        tma_params: list[str] = []
+        for index in range(count):
+            param = plan.get(f"tma{index}_param")
+            dims = plan.get(f"tma{index}_dims")
+            box = plan.get(f"tma{index}_box")
+            swizzle = plan.get(f"tma{index}_swizzle")
+            tensor_idx = plan_int(f"tma{index}_idx")
+            if (
+                not isinstance(param, str)
+                or not isinstance(dims, (list, tuple))
+                or not isinstance(box, (list, tuple))
+                or len(dims) != len(box)
+                or not 1 <= len(dims) <= 5
+                or not all(type(d) is int and d >= 0 for d in dims)
+                or len(set(dims)) != len(dims)
+                or not all(type(b) is int and 1 <= b <= 256 for b in box)
+                or swizzle not in ("none", "s32b", "s64b", "s128b", "s128b_atom_32b")
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "invalid mma_dag tensor-map wrapper plan"
+                )
+            if schema_key is not None and (
+                _cute_schema_pointer_alignment(schema_key[tensor_idx]) % 16
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "mma_dag tensor maps require 16-byte-aligned bases"
+                )
+            body.append(
+                f"    {param} = _helion_mma_dag_tensor_map(arg{tensor_idx}, "
+                f"{tuple(dims)!r}, {tuple(box)!r}, {swizzle!r})"
+            )
+            tma_params.append(param)
+        call_args.extend(tma_params)
+        return
+
     if kind == "helion_warp_mma_gemm":
         # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
         # plain tensor arguments, no host-side descriptors.
@@ -790,11 +906,18 @@ def _append_cute_wrapper_plan(
             "row_kv_begin_heads_per_batch", default=1
         )
         kv_stage = plan_int("kv_stage")
+        # The K ring may be one slot deeper than V's (``k_stage``).
+        k_stage = plan_int("k_stage", default=kv_stage)
         q_stage = plan_int("q_stage", default=1)
         use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
         use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
         use_clc_scheduler = bool(plan.get("use_clc_scheduler"))
-        cluster_m = 2 if use_2cta_instrs or use_cga2_local_cta else 1
+        # The cooperative pair's cluster holds ``pair_cluster`` MMA pairs
+        # (two pairs share every K/V tile by TMA multicast across the pairs).
+        pair_cluster = plan_int("pair_cluster", default=1) if use_2cta_instrs else 1
+        cluster_m = (
+            2 * pair_cluster if use_2cta_instrs else 2 if use_cga2_local_cta else 1
+        )
         # KV tile width. 128 is the historical fixed value; a wider tile
         # amortizes the per-tile softmax correction over more columns, which is
         # where FA4's tuned plans get their edge on sm_103.
@@ -809,6 +932,9 @@ def _append_cute_wrapper_plan(
         # The split-KV list walk (``cute_flash_kv_split``): that many CTAs
         # per pair item (the device body decodes the split id).
         kv_split = plan_int("kv_split", default=1)
+        # The tail split: the last partial wave's items as split units.
+        tail_split = plan_int("flex_tail_split", default=0)
+        tail_items_ws = plan_int("flex_tail_items_ws", default=0)
         pass_dynamic_tile_counts = plan.get("topology") != "fa4"
         hd = head_dim
         hd_v = head_dim_v
@@ -831,52 +957,74 @@ def _append_cute_wrapper_plan(
         mma_m = 256 if use_2cta_instrs else q_tile_m
         qkd = f"({mma_m}, {kv_n}, {hd})"
         pvd = f"({mma_m}, {hd_v}, {kv_n})"
-        if use_tensor_4d_tma:
-            # The 4D descriptors describe Q/K/V/O with one head dim and one
-            # sequence length.
-            assert hd_v == hd
-            assert kv_seq == seq
-            bh_stride = seq * hd
-            batch_stride = tensor_4d_heads * bh_stride
-            sdb = (
-                f"cute.make_layout(({seq}, {hd}, {tensor_4d_heads}, "
-                f"{tensor_4d_batch}), stride=({hd}, 1, {bh_stride}, "
-                f"{batch_stride}))"
+        operand_strides = plan.get("operand_strides")
+        if operand_strides is not None:
+            # Strided flex operands: rank-4 (S, D, H, B) maps over the real
+            # [B, H, S, D] strides of each operand (unit inner stride, the
+            # rest 16-byte aligned; ``flex_match.flex_operand_strides``). The
+            # device body indexes them ``[.., head, batch]`` like the dense
+            # 4D family; K/V span their own head count and length.
+            assert use_tensor_4d_tma
+            assert isinstance(operand_strides, (list, tuple))
+            q_st, k_st, v_st, o_st = cast(
+                "tuple[Sequence[int], ...]", tuple(operand_strides)
             )
-            dsb = (
-                f"cute.make_layout(({hd}, {seq}, {tensor_4d_heads}, "
-                f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
-                f"{batch_stride}))"
+            kv_heads = tensor_4d_heads // kv_group
+            sdb = _flex_rank4_layout(seq, hd, tensor_4d_heads, tensor_4d_batch, q_st)
+            sdb_o = _flex_rank4_layout(
+                seq, hd_v, tensor_4d_heads, tensor_4d_batch, o_st
             )
-            sdb_o = sdb
+            sdb_kv = _flex_rank4_layout(kv_seq, hd, kv_heads, tensor_4d_batch, k_st)
+            dsb_kv = _flex_rank4_layout(
+                kv_seq, hd_v, kv_heads, tensor_4d_batch, v_st, mn_major=True
+            )
         else:
-            # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows that
-            # share its view) and the MN-major V are ``hd_v`` wide.
-            sdb = (
-                f"cute.make_layout(({seq}, {hd}, {batch}), "
-                f"stride=({hd}, 1, {seq * hd}))"
-            )
-            sdb_o = (
-                f"cute.make_layout(({seq}, {hd_v}, {batch}), "
-                f"stride=({hd_v}, 1, {seq * hd_v}))"
-            )
-            dsb = (
-                f"cute.make_layout(({hd_v}, {seq}, {batch}), "
-                f"stride=(1, {hd_v}, {seq * hd_v}))"
-            )
-        # K/V layouts span their own (grouped) batch-head count and length.
-        if kv_group == 1 and kv_seq == seq:
-            sdb_kv = sdb
-            dsb_kv = dsb
-        else:
-            sdb_kv = (
-                f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
-                f"stride=({hd}, 1, {kv_seq * hd}))"
-            )
-            dsb_kv = (
-                f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
-                f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
-            )
+            if use_tensor_4d_tma:
+                # The 4D descriptors describe Q/K/V/O with one head dim and
+                # one sequence length.
+                assert hd_v == hd
+                assert kv_seq == seq
+                bh_stride = seq * hd
+                batch_stride = tensor_4d_heads * bh_stride
+                sdb = (
+                    f"cute.make_layout(({seq}, {hd}, {tensor_4d_heads}, "
+                    f"{tensor_4d_batch}), stride=({hd}, 1, {bh_stride}, "
+                    f"{batch_stride}))"
+                )
+                dsb = (
+                    f"cute.make_layout(({hd}, {seq}, {tensor_4d_heads}, "
+                    f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
+                    f"{batch_stride}))"
+                )
+                sdb_o = sdb
+            else:
+                # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows
+                # that share its view) and the MN-major V are ``hd_v`` wide.
+                sdb = (
+                    f"cute.make_layout(({seq}, {hd}, {batch}), "
+                    f"stride=({hd}, 1, {seq * hd}))"
+                )
+                sdb_o = (
+                    f"cute.make_layout(({seq}, {hd_v}, {batch}), "
+                    f"stride=({hd_v}, 1, {seq * hd_v}))"
+                )
+                dsb = (
+                    f"cute.make_layout(({hd_v}, {seq}, {batch}), "
+                    f"stride=(1, {hd_v}, {seq * hd_v}))"
+                )
+            # K/V layouts span their own (grouped) batch-head count and length.
+            if kv_group == 1 and kv_seq == seq:
+                sdb_kv = sdb
+                dsb_kv = dsb
+            else:
+                sdb_kv = (
+                    f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
+                    f"stride=({hd}, 1, {kv_seq * hd}))"
+                )
+                dsb_kv = (
+                    f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
+                    f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
+                )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
         )
@@ -884,6 +1032,12 @@ def _append_cute_wrapper_plan(
         majk = "cute.nvgpu.OperandMajorMode.K"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
         cg = "cute.nvgpu.tcgen05.CtaGroup.TWO" if use_2cta_instrs else cg1
+        # K/V multicast across the two pairs of a four-CTA cluster.
+        kv_op = (
+            f"cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp({cg})"
+            if pair_cluster > 1
+            else "_flash_op"
+        )
         sel = "cute.select"
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
@@ -893,11 +1047,11 @@ def _append_cute_wrapper_plan(
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb_o})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
-            f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
+            f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({cluster_m}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
-            # the device-body kv_stage + the SharedStorage MemRange depths.
-            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
+            # the device-body ring depths + the SharedStorage MemRange depths.
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {k_stage})",
             f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
         ]
         if hd_v != hd:
@@ -922,7 +1076,7 @@ def _append_cute_wrapper_plan(
             if uneven_kv_ring:
                 flash_lines.append(
                     "_flash_ksl = cute.make_composed_layout(_flash_ksl.inner, 0, "
-                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {kv_stage}), "
+                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {k_stage}), "
                     "stride=(*_flash_ksl.outer.stride[:-1], _flash_kv_stage_stride)))"
                 )
             flash_lines.append(
@@ -934,8 +1088,8 @@ def _append_cute_wrapper_plan(
             f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
             f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg})",
             f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
-            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
-            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B({kv_op}, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B({kv_op}, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape)",
             f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
             f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
         ]
@@ -1049,12 +1203,15 @@ def _append_cute_wrapper_plan(
             # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
             # where each CTA stores its own half) or the ws_overlap tile height.
             otile = f"({q_tile_m}, {hd_v})"
+            # One sO tile shared by both query stages (``cute_flash_o_stage``
+            # = 1) keeps the layout at one stage; the device indexes stage 0.
+            o_stages = 1 if plan.get("o_stage") == 1 else q_stage
             flash_lines.extend(
                 [
                     (
                         f"_flash_osl = {bw}.make_smem_layout_epi("
                         f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, "
-                        f"{q_stage})"
+                        f"{o_stages})"
                     ),
                 ]
             )
@@ -1118,8 +1275,39 @@ def _append_cute_wrapper_plan(
             assert num_sm is not None and num_sm > 0
             ctas_per_sm = max(1, plan_int("persistent_ctas_per_sm", 1))
             max_ctas = ((num_sm * ctas_per_sm) // cluster_m) * cluster_m
+            if cluster_m > 2:
+                # ``num_sm // cluster_m`` is exact for the CTA pair (every
+                # TPC holds one) but over-counts the two-pair cluster: a
+                # cluster lives inside one GPC and the GPCs hold uneven TPC
+                # counts (a B200's 148 SMs hold 33 four-CTA clusters, not
+                # 37), and the surplus persistent clusters form a second
+                # hardware wave. The driver's count sizes the grid where the
+                # device is known (the SM-count model stays the fallback).
+                max_ctas = min(
+                    max_ctas,
+                    _cute_persistent_cluster_ctas(device, cluster_m, num_sm)
+                    * ctas_per_sm,
+                )
             grid_cap = min(total_tiles * kv_split * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
+        elif plan.get("topology") == "fa4" and tail_split > 1:
+            # The tail split (``cute_flash_flex_tail_split``): the full waves
+            # of the device run unsplit, the last partial wave's items as
+            # ``tail_split`` split units each (one wave of CTAs); a tail the
+            # idle SMs cannot hold, a grid of one wave or less or an unknown
+            # device keeps the whole grid unsplit (the kernel reads the first
+            # tail unit as an argument).
+            from .flash_flex import flex_tail_base
+
+            tail_base = flex_tail_base(
+                total_tiles, num_sm or 0, tail_split, tail_items_ws
+            )
+            body.extend(
+                [
+                    f"    _flash_tail_base = cutlass.Int32({tail_base})",
+                    f"    grid_x = cutlass.Int32({tail_base + (total_tiles - tail_base) * tail_split})",
+                ]
+            )
         elif plan.get("topology") == "fa4":
             # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
             # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs
@@ -1128,6 +1316,11 @@ def _append_cute_wrapper_plan(
             body.append(
                 f"    grid_x = cutlass.Int32({total_tiles * kv_split * cluster_m})"
             )
+        elif use_2cta_instrs:
+            # The single-tile body's cooperative pair: ``cluster_m`` CTAs per
+            # work item (the flex walk's ragged last pair has a dead second
+            # tile the default 128-row root grid does not count).
+            body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
         elif q_tile_m != 128:
             # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
             # default 128-row root grid.
@@ -1153,6 +1346,8 @@ def _append_cute_wrapper_plan(
         )
         if pass_dynamic_tile_counts:
             call_args.extend(["_flash_num_bh", "_flash_total_tiles"])
+        if tail_split > 1:
+            call_args.append("_flash_tail_base")
         if lse_idx is not None:
             call_args.append("_flash_mLSE")
         if bias_idx is not None:
@@ -1258,6 +1453,138 @@ def _append_cute_wrapper_plan(
         ]
         body.extend(f"    {line}" for line in gated_lines)
         call_args.extend(GATED_KERNEL_PARAMS)
+        return
+    if kind == "helion_flash_bwd" and plan.get("flex_two_cta"):
+        # The 2-CTA flex backward at head dim 128 (``cute_flash_bwd_flex_2cta``):
+        # the dense 2-CTA operand set (CtaGroup.TWO MMAs, natural- and
+        # transposed-orientation Q / dO halves, the 256-row K^T half, the
+        # exchanged dS) over the flex (seq, D, B*H) maps; dQ reduce-added in
+        # (32 x 32) fp32 boxes, dK / dV stored as (128, 64) boxes per
+        # (batch, kv head).
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        assert hd == 128
+        tq = plan_int("total_q_rows")
+        seq_q = plan_int("flex_seq_q")
+        seq_k = plan_int("flex_seq_k")
+        bh_q = plan_int("flex_bh_q")
+        bh_k = plan_int("flex_bh_k")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        ssd = f"(256, 128, {hd})"
+        tsd = f"(256, {hd}, 128)"
+        dqd = f"(128, {hd}, 256)"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg2 = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        sel = "cute.select"
+        q_sdb = (
+            f"cute.make_layout(({seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {seq_q * hd}))"
+        )
+        k_sdb = (
+            f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+        )
+        q_dsb = (
+            f"cute.make_layout(({hd}, {seq_q}, {bh_q}), stride=(1, {hd}, {seq_q * hd}))"
+        )
+        k_dsb = (
+            f"cute.make_layout(({hd}, {seq_k}, {bh_k}), stride=(1, {hd}, {seq_k * hd}))"
+        )
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQT = cute.make_tensor(arg{q_idx}.iterator, {q_dsb})",
+            f"_fbwd_mdOT = cute.make_tensor(arg{do_idx}.iterator, {q_dsb})",
+            f"_fbwd_mKT = cute.make_tensor(arg{k_idx}.iterator, {k_dsb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg2}, (256, 128))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg2}, (256, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg2}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_op2 = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg2})",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_dot, _fbwd_mdOtN = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do2, _fbwd_mdOtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdOT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_qt, _fbwd_mQtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQT, {sel}(_fbwd_qtl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kt, _fbwd_mKtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mKT, {sel}(_fbwd_ktl, mode=[0, 1, 2]), {dqd}, _fbwd_dq_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, {q_sdb})",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 4)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {k_sdb})",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {hd // 64})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        call_args.extend(
+            [
+                "_fbwd_ss_mma",
+                "_fbwd_ts_mma",
+                "_fbwd_dq_mma",
+                "_fbwd_cluster_vmnk",
+                "_fbwd_tma_q",
+                "_fbwd_mQt",
+                "_fbwd_tma_k",
+                "_fbwd_mKt",
+                "_fbwd_tma_v",
+                "_fbwd_mVt",
+                "_fbwd_tma_dot",
+                "_fbwd_mdOtN",
+                "_fbwd_tma_do2",
+                "_fbwd_mdOtT",
+                "_fbwd_tma_qt",
+                "_fbwd_mQtT",
+                "_fbwd_tma_kt",
+                "_fbwd_mKtT",
+                "_fbwd_qsl",
+                "_fbwd_ksl",
+                "_fbwd_vsl",
+                "_fbwd_dosl",
+                "_fbwd_ptl",
+                "_fbwd_dotl",
+                "_fbwd_qtl",
+                "_fbwd_ktl",
+                "_fbwd_dssl",
+                "_fbwd_mLSE",
+                "_fbwd_mDelta",
+                "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
+                "_fbwd_mdK",
+                "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
+            ]
+        )
         return
     if kind == "helion_flash_bwd" and plan.get("two_cta"):
         # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened
@@ -1377,6 +1704,110 @@ def _append_cute_wrapper_plan(
             ]
         )
         return
+    if kind == "helion_flash_bwd" and plan.get("flex_pair"):
+        # The 2-CTA flex backward at head dim 256 (``cute_flash_bwd_flex_pair``):
+        # two cluster roles per 128-row KV block. The dK/dV clusters (64 KV
+        # rows per CTA) run S / dP as the pair's M=128 MMAs over K-major K / V
+        # (A) and Q / dO (B, 64 Q rows per CTA, 256 wide) and dV / dK as
+        # M=128 N=256 MMAs over the staged P^T / dS^T (A, K-major 64 x 128)
+        # and dO^T / Q^T halves (B, MN-major: each CTA its 128 head-dim
+        # columns x 128 Q), storing (64, 64) boxes. The dQ clusters (64 Q rows
+        # of the step per CTA) run S^T / dP^T with Q / dO as the A operands
+        # and K / V as the B operands (the same tiles and layouts, the roles
+        # swapped) and dQ = dS K as an M=128 N=256 MMA over the staged dS (A)
+        # and K^T (B, MN-major: each CTA its 128 head-dim columns x 128 KV
+        # rows), reduce-added in (32 x 16) fp32 boxes. Maps are the flex
+        # (seq, D, B*H) ones (contiguous operands).
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        assert hd == 256
+        tq = plan_int("total_q_rows")
+        seq_q = plan_int("flex_seq_q")
+        seq_k = plan_int("flex_seq_k")
+        bh_q = plan_int("flex_bh_q")
+        bh_k = plan_int("flex_bh_k")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg2 = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        sel = "cute.select"
+        ssd = f"(128, 128, {hd})"
+        pvd = f"(128, {hd}, 128)"
+        q_sdb = (
+            f"cute.make_layout(({seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {seq_q * hd}))"
+        )
+        k_sdb = (
+            f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+        )
+        q_dsb = (
+            f"cute.make_layout(({hd}, {seq_q}, {bh_q}), stride=(1, {hd}, {seq_q * hd}))"
+        )
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQT = cute.make_tensor(arg{q_idx}.iterator, {q_dsb})",
+            f"_fbwd_mdOT = cute.make_tensor(arg{do_idx}.iterator, {q_dsb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg2}, (128, 128))",
+            f"_fbwd_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg2}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_pal = {bw}.make_smem_layout_a(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_dotl2 = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 2)",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_pv_mma, {pvd}, {dtype}, 1)",
+            f"_fbwd_op2 = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg2})",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_dot, _fbwd_mdOtN = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do2, _fbwd_mdOtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdOT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_qt, _fbwd_mQtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQT, {sel}(_fbwd_qtl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            # The dQ clusters' operands (the Q-split orientation): Q / dO as
+            # the A operands of S^T / dP^T, K / V as their B operands, and
+            # K^T (this CTA's 128 head-dim columns x 128 KV rows) as the dQ
+            # MMA's B operand.
+            f"_fbwd_mKT = cute.make_tensor(arg{k_idx}.iterator, cute.make_layout(({hd}, {seq_k}, {bh_k}), stride=(1, {hd}, {seq_k * hd})))",
+            f"_fbwd_tma_qa, _fbwd_mQa = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_doa, _fbwd_mdOa = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kb, _fbwd_mKb = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_vb, _fbwd_mVb = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kt2, _fbwd_mKt2 = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mKT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {pvd}, _fbwd_pv_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {seq_q * hd})))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 16), 4)",
+            # The dQ clusters' once-per-tile drain: 16 boxes per 32 KB operand buffer.
+            f"_fbwd_dqsl16 = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 16), 16)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 16))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {k_sdb})",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (64, 64), 4)",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        from ..._compiler.cute.cute_flash_bwd_flex_pair import (
+            _FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS,
+        )
+
+        # The generated kernel's parameter order (one list, owned by the emitter).
+        call_args.extend(_FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS)
+        return
     if kind == "helion_flash_bwd":
         # Fused tcgen05 attention-backward host setup: four tiled_mmas (S/dP
         # smem-smem, dV tmem-A, dK smem K-major, dQ smem MN-major), TMA atoms
@@ -1392,60 +1823,163 @@ def _append_cute_wrapper_plan(
         dk_idx = plan_int("dk_idx")
         dv_idx = plan_int("dv_idx")
         hd = plan_int("head_dim")
+        # The value head dim: dO / V / dV tiles, the dP MMA's K extent and the
+        # dV MMA's N extent (Q / K / dK / dQ use ``hd``).
+        hd_v = plan_int("head_dim_v", hd)
+        # Shared-memory tiles and TMA boxes are whole SWIZZLE_128B atoms: the
+        # head dims padded to multiples of 64 columns (the TMA unit zero-fills
+        # the columns past the tensor extent and clips the stores); the MMAs
+        # that take N from the head dim get exact-width instruction
+        # descriptors from the ``_x`` tiled MMAs.
+        hd_p = -(-hd // 64) * 64
+        hd_v_p = -(-hd_v // 64) * 64
+        # The dQ MMA's N: the whole (padded) head dim, or one 64-column chunk
+        # when the flex walk drains dQ chunk by chunk (its K^T operand layout
+        # and fragments then carry a 3-wide N mode; the body offsets them).
+        dq_n = plan_optional_int("flex_dq_chunk") or hd_p
         tq = plan_int("total_q_rows")
         tk = plan_int("total_kv_rows")
         q_stage = plan_int("q_stage")
         do_stage = plan_int("do_stage")
         kv_stage = plan_int("kv_stage", 1)
-        epi_stages = hd // 64 * kv_stage
+        epi_stages = max(hd_p, hd_v_p) // 64 * kv_stage
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
         bw = "cutlass.utils.blackwell_helpers"
-        ssd = f"(128, 128, {hd})"
-        tsd = f"(128, {hd}, 128)"
+        ssd = f"(128, 128, {hd_p})"
+        ssd_v = f"(128, 128, {hd_v_p})"
+        tsd = f"(128, {hd_p}, 128)"
+        tsd_v = f"(128, {hd_v_p}, 128)"
         majk = "cute.nvgpu.OperandMajorMode.K"
         majmn = "cute.nvgpu.OperandMajorMode.MN"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
         sel = "cute.select"
-        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
-        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        # The FlexAttention backward walks per-(batch, head) sequences: the
+        # maps are (seq, D, B*H) so a ragged M / N is zero-filled on load and
+        # clipped on store by the TMA unit; the dense path keeps the flat
+        # (rows, D) view (its sequences are multiples of 128).
+        flex_seq_q = plan_optional_int("flex_seq_q")
+        flex_strides = plan.get("flex_strides")
+        seq_k = plan_optional_int("flex_seq_k")
+        if flex_seq_q is not None:
+            assert seq_k is not None
+            bh_q = plan_int("flex_bh_q")
+            bh_k = plan_int("flex_bh_k")
+            q_sdb = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
+            do_sdb = f"cute.make_layout(({flex_seq_q}, {hd_v}, {bh_q}), stride=({hd_v}, 1, {flex_seq_q * hd_v}))"
+            k_sdb = f"cute.make_layout(({seq_k}, {hd}, {bh_k}), stride=({hd}, 1, {seq_k * hd}))"
+            v_sdb = f"cute.make_layout(({seq_k}, {hd_v}, {bh_k}), stride=({hd_v}, 1, {seq_k * hd_v}))"
+            dq2_layout = f"cute.make_layout(({flex_seq_q}, {hd}, {bh_q}), stride=({hd}, 1, {flex_seq_q * hd}))"
+            dk_sdb = k_sdb
+            dv_sdb = v_sdb
+        else:
+            q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+            do_sdb = (
+                f"cute.make_layout(({tq}, {hd_v}, 1), stride=({hd_v}, 1, {tq * hd_v}))"
+            )
+            k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+            v_sdb = (
+                f"cute.make_layout(({tk}, {hd_v}, 1), stride=({hd_v}, 1, {tk * hd_v}))"
+            )
+            dq2_layout = f"cute.make_layout(({tq}, {hd}), stride=({hd}, 1))"
+            dk_sdb = f"cute.make_layout(({tk}, {hd}), stride=({hd}, 1))"
+            dv_sdb = f"cute.make_layout(({tk}, {hd_v}), stride=({hd_v}, 1))"
+        # One map per operand: the flex walk's strided operands (a
+        # ``[B, S, H, D]`` transpose, a packed-QKV slice) take rank-4
+        # (seq, D, H, B) maps over their real strides (unit inner stride, the
+        # rest 16-byte aligned); the device body indexes them by head and
+        # batch. dQ, LSE and delta stay contiguous.
+        q_layout, do_layout = q_sdb, do_sdb
+        k_layout, v_layout = k_sdb, v_sdb
+        dk_layout, dv_layout = dk_sdb, dv_sdb
+        if flex_strides is not None:
+            assert flex_seq_q is not None and seq_k is not None
+            assert isinstance(flex_strides, (list, tuple))
+            flex_batch = plan_int("flex_batch")
+            flex_heads = plan_int("flex_heads")
+            flex_kv_heads = plan_int("flex_kv_heads")
+            q_st, do_st, k_st, v_st, dk_st, dv_st = cast(
+                "tuple[Sequence[int], ...]", tuple(flex_strides)
+            )
+            q_layout = _flex_rank4_layout(flex_seq_q, hd, flex_heads, flex_batch, q_st)
+            do_layout = _flex_rank4_layout(
+                flex_seq_q, hd_v, flex_heads, flex_batch, do_st
+            )
+            k_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, k_st)
+            v_layout = _flex_rank4_layout(seq_k, hd_v, flex_kv_heads, flex_batch, v_st)
+            dk_layout = _flex_rank4_layout(seq_k, hd, flex_kv_heads, flex_batch, dk_st)
+            dv_layout = _flex_rank4_layout(
+                seq_k, hd_v, flex_kv_heads, flex_batch, dv_st
+            )
         fbwd_lines = [
-            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
-            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
-            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
-            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_layout})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_layout})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {v_layout})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {do_layout})",
             f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
-            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
-            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
-            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_v_p}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_p}))",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {dq_n}))",
             "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
             f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
-            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd_v}, {dtype}, {kv_stage})",
             f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {q_stage})",
-            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {do_stage})",
-            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
-            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, {do_stage})",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd_v}, {dtype}, {do_stage})",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd_v}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd_v}, {dtype}, {do_stage})",
             f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_dsk_mma, {tsd}, {dtype}, {q_stage})",
             f"_fbwd_dsnk = {bw}.make_smem_layout_a(_fbwd_dsk_mma, {tsd}, {dtype}, 1)",
             f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {tsd}, {dtype}, 1)",
             f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {tsd}, {dtype}, {kv_stage})",
             "_fbwd_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cute.nvgpu.tcgen05.CtaGroup.ONE)",
             f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
-            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd_v}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
             f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
-            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd_v}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
             f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
-            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
-            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 8)",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, {dq2_layout})",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), {plan_optional_int('flex_dq_boxes') or 8})",
             "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
-            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
-            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, {dk_layout})",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, {dv_layout})",
             f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {epi_stages})",
             "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
             "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         ]
+        exact_mmas: list[str] = []
+        if hd_v != hd_v_p:
+            exact_mmas.append("_fbwd_ts_mma_x")
+            fbwd_lines.append(
+                f"_fbwd_ts_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+            )
+        if hd != hd_p:
+            exact_mmas += ["_fbwd_dsk_mma_x", "_fbwd_dq_mma_x"]
+            fbwd_lines += [
+                f"_fbwd_dsk_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+                f"_fbwd_dq_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            ]
+        if plan.get("flex_ds_tmem_dk"):
+            # dS^T through TMEM feeds the dK MMA (A from TMEM, B = Q^T MN-major)
+            # with its own N = D atom; the exact-N descriptor twin at padded D.
+            exact_mmas.append("_fbwd_dskts_mma")
+            fbwd_lines.append(
+                f"_fbwd_dskts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd_p}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+            )
+            if hd != hd_p:
+                exact_mmas.append("_fbwd_dskts_mma_x")
+                fbwd_lines.append(
+                    f"_fbwd_dskts_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
+                )
+        aug_stages = plan_optional_int("flex_aug_stages") or 0
+        if aug_stages:
+            # The flex walk's statistics slices: one (128 x 16) B-operand
+            # slice per Q stage and the (128 x 16) A-operand constant slice.
+            fbwd_lines += [
+                f"_fbwd_augl = {bw}.make_smem_layout_b(_fbwd_ss_mma, (128, 128, 16), {dtype}, {aug_stages})",
+                f"_fbwd_kaugl = {bw}.make_smem_layout_a(_fbwd_ss_mma, (128, 128, 16), {dtype}, 1)",
+            ]
         body.extend(f"    {line}" for line in fbwd_lines)
         call_args.extend(
             [
@@ -1486,6 +2020,9 @@ def _append_cute_wrapper_plan(
                 "_fbwd_mdKt",
             ]
         )
+        call_args.extend(exact_mmas)
+        if aug_stages:
+            call_args.extend(["_fbwd_augl", "_fbwd_kaugl"])
         return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
@@ -1514,6 +2051,7 @@ def _append_cute_wrapper_plan(
             rank3_mnl_tensor=bool(plan.get("rank3_mnl_tensor")),
             orientation=_tcgen05_plan_orientation(plan),
             column_major=bool(plan.get("d_column_major")),
+            bounded_output_shift=bool(plan.get("bounded_output_shift")),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -1545,6 +2083,7 @@ def _append_cute_wrapper_plan(
             cluster_m=max(1, cluster_m),
             reserved_sms=reserved_sms,
             num_sm_multiplier=plan_int("num_sm_multiplier", 1),
+            cluster_n=cluster_n,
         )
         quota_args = tuple(
             str(arg)
@@ -1687,6 +2226,8 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     fixed_ab_tensormaps = bool(plan.get("fixed_ab_tensormaps"))
     full_allocation_a = bool(plan.get("full_allocation_a"))
+    full_allocation_b = bool(plan.get("full_allocation_b"))
+    full_allocation_b_rank3 = bool(plan.get("full_allocation_b_rank3"))
     fixed_grouped_b_rank3 = bool(plan.get("fixed_grouped_b_rank3"))
     if fixed_grouped_b_rank3 and not fixed_ab_tensormaps:
         raise exc.BackendUnsupported(
@@ -1735,17 +2276,44 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormap_rank2 = (
         dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     )
-    if full_allocation_a and not (
-        swapped_nm
+    immutable_mn_profile = (
+        not swapped_nm
         and dynamic_ab_tensormap_rank2
-        and lhs_rank3_grouped_nt
-        and not shared_rhs
+        and not lhs_rank3_grouped_nt
+        and rhs_rank3_grouped_nt
         and a_k_major
-        and cluster_m == 1
-        and cluster_n == 1
+        and b_k_major
+        and not shared_rhs
+        and cluster_m == 2
+        and cluster_n in (1, 2)
+        and bm in (128, 256)
+        and bn in (128, 192, 224, 256)
+        and plan.get("source_m_tile") == bm
+        and plan.get("device_split_sizes") is True
+        and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+    )
+    if full_allocation_a and not (
+        immutable_mn_profile
+        or (
+            swapped_nm
+            and dynamic_ab_tensormap_rank2
+            and lhs_rank3_grouped_nt
+            and not shared_rhs
+            and a_k_major
+            and ((cluster_m == 1 and bm in (64, 128)) or (cluster_m == 2 and bm == 256))
+            and cluster_n == 1
+        )
     ):
         raise exc.BackendUnsupported(
-            "cute", "full-allocation A requires a K-major grouped ONE-CTA N,M input"
+            "cute", "full-allocation A requires a K-major grouped N,M input"
+        )
+    if full_allocation_b and not immutable_mn_profile:
+        raise exc.BackendUnsupported(
+            "cute", "immutable grouped physical B requires the device M,N profile"
+        )
+    if full_allocation_b_rank3 and not (full_allocation_b and immutable_mn_profile):
+        raise exc.BackendUnsupported(
+            "cute", "rank-3 immutable physical B requires its proved M,N input mode"
         )
     if shared_rhs and (
         not swapped_nm
@@ -1874,6 +2442,9 @@ def _append_cute_wrapper_plan(
             ),
         )
     else:
+        rhs_physical_n = f"arg{rhs_idx}_shape1"
+        if full_allocation_b and not full_allocation_b_rank3:
+            rhs_physical_n = f"arg{rhs_idx}_shape0 * arg{rhs_idx}_shape1"
         lhs_tma_setup = (
             (
                 (
@@ -1901,9 +2472,9 @@ def _append_cute_wrapper_plan(
                 f"arg{rhs_idx}.iterator, "
                 "layout=cute.make_layout("
                 + (
-                    f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2), "
+                    f"({rhs_physical_n}, arg{rhs_idx}_shape2), "
                     f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride2)))"
-                    if dynamic_ab_tensormap_rank2
+                    if dynamic_ab_tensormap_rank2 and not full_allocation_b_rank3
                     else (
                         f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2, "
                         f"arg{rhs_idx}_shape0), "
@@ -2335,6 +2906,145 @@ def _validate_gdn_recurrence_launch_args(
         raise exc.BackendUnsupported("cute", "gdn recurrence TMA base is misaligned")
 
 
+def _tensor_byte_span(tensor: torch.Tensor) -> int:
+    """Bytes from the tensor's first element to one past its last (the span
+    of storage its view can touch; 0 for an empty tensor)."""
+    if tensor.numel() == 0:
+        return 0
+    last = 0
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        last += (size - 1) * stride
+    return (last + 1) * tensor.element_size()
+
+
+_MMA_DAG_ALIAS_PASSED_LIMIT = 64
+
+
+class _MmaDagAliasGuard:
+    """Refuses a cute_mma_dag launch whose tensor arguments alias.
+
+    The planner admits a program whose loads and stores touch distinct
+    storages and the emitter hoists side loads and stages tiles ahead of
+    the stores on that proof.  The proof is over the fake tensors the
+    kernel is compiled against (one storage per argument), so a caller
+    passing one tensor, or two views of one buffer, under two names is
+    only visible here: the byte span of every stored argument must not
+    overlap any other tensor argument's.  Two loads may alias freely (the
+    engine passes views of one tensor and the same tensor twice).
+
+    The spans follow from the pinned tensor metadata, so a guard built for
+    one launch holds for the fast relaunches that share that metadata; the
+    per-launch work is the pointers, and a launch repeating a pointer set
+    that passed recently (the allocator cycles through a few blocks for a
+    workload's fresh outputs) is not checked again.  A stored span overlaps
+    another iff more than one span (its own) begins before it ends and
+    does not end before it begins: two bisections per store over the
+    sorted begins and ends; only a failure names the pair.
+    """
+
+    __slots__ = ("indices", "names", "passed", "pick", "spans", "stores")
+
+    def __init__(self, plan: dict[str, object], args: tuple[object, ...]) -> None:
+        indices = plan.get("tensor_idx")
+        names = plan.get("tensor_names")
+        stored = plan.get("stored")
+        if (
+            not isinstance(indices, list)
+            or not isinstance(names, list)
+            or not isinstance(stored, list)
+            or len(indices) != len(names)
+            or len(indices) != len(stored)
+        ):
+            raise exc.BackendUnsupported("cute", "invalid mma_dag alias plan")
+        kept: list[int] = []
+        kept_names: list[str] = []
+        stores: list[int] = []
+        spans: list[int] = []
+        for index, name, is_store in zip(indices, names, stored, strict=True):
+            if type(index) is not int or not isinstance(name, str):
+                raise exc.BackendUnsupported("cute", "invalid mma_dag alias plan")
+            tensor = args[index]
+            if not isinstance(tensor, torch.Tensor):
+                raise exc.BackendUnsupported(
+                    "cute", f"mma_dag argument {name!r} is not a tensor"
+                )
+            span = _tensor_byte_span(tensor)
+            if span == 0:
+                continue
+            if is_store:
+                stores.append(len(kept))
+            kept.append(index)
+            kept_names.append(name)
+            spans.append(span)
+        self.indices = tuple(kept)
+        self.names = tuple(kept_names)
+        self.spans = tuple(spans)
+        self.stores = tuple(stores)
+        # The guarded tensors of a launch (``args[index]`` for each index).
+        self.pick = cast(
+            "Callable[[tuple[object, ...]], Sequence[torch.Tensor]]",
+            operator.itemgetter(*kept)
+            if len(kept) > 1
+            else (lambda args: tuple(args[index] for index in kept)),
+        )
+        self.passed: set[tuple[int, ...]] = set()
+
+    def check(self, args: tuple[object, ...]) -> None:
+        self.check_begins(tuple(map(torch.Tensor.data_ptr, self.pick(args))))
+
+    def check_begins(self, begins: tuple[int, ...]) -> None:
+        """``check`` on the guarded tensors' data pointers in ``indices``
+        order (the fast relaunch gathers them once for every guard)."""
+        if begins in self.passed:
+            return
+        ends = tuple(map(operator.add, begins, self.spans))
+        sorted_begins = sorted(begins)
+        sorted_ends = sorted(ends)
+        for store in self.stores:
+            if (
+                bisect.bisect_left(sorted_begins, ends[store])
+                - bisect.bisect_right(sorted_ends, begins[store])
+                > 1
+            ):
+                self.refuse(store, begins, ends)
+        if len(self.passed) >= _MMA_DAG_ALIAS_PASSED_LIMIT:
+            self.passed.clear()
+        self.passed.add(begins)
+
+    def refuse(
+        self, store: int, begins: tuple[int, ...], ends: tuple[int, ...]
+    ) -> NoReturn:
+        other = next(
+            index
+            for index in range(len(begins))
+            if index != store
+            and begins[index] < ends[store]
+            and begins[store] < ends[index]
+        )
+        first, second = sorted((store, other))
+        raise exc.BackendUnsupported(
+            "cute",
+            f"cute_mma_dag arguments {self.names[first]!r} and "
+            f"{self.names[second]!r} alias (their storage overlaps); the "
+            "kernel reads and writes them as distinct tensors",
+        )
+
+
+def _mma_dag_alias_guard(
+    cute_kernel: object, args: tuple[object, ...]
+) -> _MmaDagAliasGuard | None:
+    plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "helion_mma_dag_alias"
+    ]
+    if not plans:
+        return None
+    if len(plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple mma_dag alias plans")
+    return _MmaDagAliasGuard(plans[0], args)
+
+
 def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -> None:
     """Launch the selected warp-HMMA DV4 schedule through its pinned host entry."""
 
@@ -2404,6 +3114,7 @@ def _create_cute_wrapper(
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
     num_sm: int | None = None,
+    device: torch.device | None = None,
 ) -> object:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass
@@ -2587,7 +3298,12 @@ def _create_cute_wrapper(
         )
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(
-            body, call_args, plan, num_sm=num_sm, schema_key=schema_key
+            body,
+            call_args,
+            plan,
+            num_sm=num_sm,
+            schema_key=schema_key,
+            device=device,
         )
     gathered_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
@@ -2733,6 +3449,10 @@ def _create_cute_wrapper(
         from ..._compiler.cute.gathered_mma_runtime import make_tma_arguments
 
         namespace["_helion_make_gathered_tma"] = make_tma_arguments
+    if any(plan.get("kind") == "helion_mma_dag_tma" for plan in wrapper_plans):
+        from ..._compiler.cute._mma_dag_tcgen05_runtime import make_tensor_map
+
+        namespace["_helion_mma_dag_tensor_map"] = make_tensor_map
     if block_scaled_plans:
         from ..._compiler.cute.block_scaled_prepare import make_block_scaled_entry
 
@@ -3020,18 +3740,65 @@ def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
     return " ".join(tokens)
 
 
-def _cute_num_sm_from_arch_args(arch_args: tuple[object, ...] | None) -> int | None:
+def _cute_device_from_arch_args(
+    arch_args: tuple[object, ...] | None,
+) -> torch.device | None:
+    """The CUDA device of the launch's first tensor argument (``None`` off GPU)."""
     if arch_args is None:
         return None
     for arg in arch_args:
         if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
-            cache_key = (arg.device.type, arg.device.index)
-            cached = _CUTE_NUM_SM_CACHE.get(cache_key)
-            if cached is None:
-                cached = get_num_sm(arg.device)
-                _CUTE_NUM_SM_CACHE[cache_key] = cached
-            return cached
+            return arg.device
     return None
+
+
+def _cute_num_sm_from_arch_args(arch_args: tuple[object, ...] | None) -> int | None:
+    device = _cute_device_from_arch_args(arch_args)
+    if device is None:
+        return None
+    cache_key = (device.type, device.index)
+    cached = _CUTE_NUM_SM_CACHE.get(cache_key)
+    if cached is None:
+        cached = get_num_sm(device)
+        _CUTE_NUM_SM_CACHE[cache_key] = cached
+    return cached
+
+
+def _cute_persistent_cluster_ctas(
+    device: torch.device | None, cluster_size: int, num_sm: int
+) -> int:
+    """CTAs of a persistent one-CTA-per-SM cluster grid the device co-schedules.
+
+    The driver's co-resident cluster count (``get_max_active_clusters``, a
+    CUDA context query) where the device is known; ``num_sm // cluster_size``
+    clusters otherwise (CPU renders, tests without a device).
+    """
+    if device is None or device.type != "cuda":
+        return (num_sm // cluster_size) * cluster_size
+    return get_max_active_clusters(device, cluster_size) * cluster_size
+
+
+def _cute_resident_clusters(
+    cluster_shape: object, device: torch.device | None
+) -> int | None:
+    """The co-resident cluster count a wrapper of ``cluster_shape`` bakes in.
+
+    Clusters above two CTAs take their persistent grid from the driver's
+    count (``_cute_persistent_cluster_ctas``), which varies with the GPC
+    floorsweeping of same-SM-count devices, so the compiled-launcher keys
+    carry it; ``None`` for the single CTA, the pair and CPU builds (their
+    keys are unchanged).
+    """
+    if device is None or device.type != "cuda":
+        return None
+    if not isinstance(cluster_shape, (tuple, list)):
+        return None
+    cluster_size = 1
+    for extent in cluster_shape:
+        cluster_size *= int(cast("int", extent))
+    if cluster_size <= 2:
+        return None
+    return get_max_active_clusters(device, cluster_size)
 
 
 def _cute_compiled_launcher_discriminator(
@@ -3039,15 +3806,20 @@ def _cute_compiled_launcher_discriminator(
     block: tuple[int, int, int],
     compile_options: str | None,
     arch_args: tuple[object, ...] | None,
+    cluster_shape: object = None,
 ) -> tuple[tuple[object, ...], str, int | None]:
     merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
+    resident_clusters = _cute_resident_clusters(
+        cluster_shape, _cute_device_from_arch_args(arch_args)
+    )
     return (
         (
             schema_key,
             block,
             merged_compile_options,
             num_sm,
+            *(() if resident_clusters is None else (resident_clusters,)),
         ),
         merged_compile_options,
         num_sm,
@@ -3068,11 +3840,15 @@ def _get_compiled_cute_launcher(
     # than replace because other flags (e.g. ``--generate-line-info`` when
     # ``tcgen05_cubin_lineinfo`` is True) can already be in
     # ``compile_options``.
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
     cache_key, compile_options, num_sm = _cute_compiled_launcher_discriminator(
         schema_key,
         block,
         compile_options,
         arch_args,
+        cluster_shape,
     )
     try:
         # pyrefly: ignore [missing-attribute]
@@ -3091,10 +3867,14 @@ def _get_compiled_cute_launcher(
         repr(plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
     )
-    cluster_shape = getattr(
-        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    device = _cute_device_from_arch_args(arch_args)
+    jit_func = _create_cute_wrapper(
+        cute_kernel,
+        schema_key,
+        block,
+        num_sm=num_sm,
+        device=device,
     )
-    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block, num_sm=num_sm)
     disk_cache_key = _cute_disk_cache_key(
         cute_kernel,
         schema_key,
@@ -3103,6 +3883,7 @@ def _get_compiled_cute_launcher(
         cluster_shape,
         compile_options,
         num_sm,
+        resident_clusters=_cute_resident_clusters(cluster_shape, device),
     )
     launcher = _CompiledCuteLauncher(
         jit_func, compile_options, cache_key=disk_cache_key
@@ -3140,6 +3921,7 @@ def _cute_disk_cache_key(
     cluster_shape: object,
     compile_options: str | None,
     num_sm: int | None = None,
+    resident_clusters: int | None = None,
 ) -> str | None:
     """Compute a stable cross-process key for the on-disk CuTe compile cache.
 
@@ -3164,6 +3946,11 @@ def _cute_disk_cache_key(
     grid clamp.  It is included unconditionally to match the in-memory cache
     key; for non-persistent kernels num_sm does not affect codegen, so it only
     costs an occasional cross-GPU miss, never a wrong-kernel reload.
+    ``resident_clusters`` is the driver's co-resident cluster count a wrapper
+    with a cluster above two CTAs bakes into that clamp instead
+    (``_cute_resident_clusters``): it varies with the GPC floorsweeping of
+    same-SM-count devices, so it joins the key where it is not ``None`` (the
+    other kernels' keys are unchanged).
     """
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
@@ -3211,6 +3998,7 @@ def _cute_disk_cache_key(
             cutlass_version,
             num_sm,
             _cute_use_pdl(cute_kernel),
+            *(() if resident_clusters is None else (resident_clusters,)),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -3630,6 +4418,10 @@ def _cute_staged_plan_operands(
             # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
             # Preserve their values when a replacement binding is under-aligned.
             roles = (("lhs_idx", "rhs_idx"), ())
+            if plan.get("sf_tma") is True:
+                roles = (("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx"), ())
+            if plan.get("tma_output") is True:
+                roles = (roles[0], ("out_idx",))
         if roles is None:
             continue
         input_keys, output_keys = roles
@@ -3656,6 +4448,23 @@ def _cute_stage_under_aligned_operands(
     """
     staged: list[object] | None = None
     copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    tma_scale_indices = {
+        index
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "block_scaled_mma"
+        and plan.get("format") == "mxfp8"
+        and plan.get("sf_tma") is True
+        for key in ("lhs_scale_idx", "rhs_scale_idx")
+        if isinstance(index := plan.get(key), int)
+    }
+    tma_output_indices = {
+        index
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "block_scaled_mma"
+        and plan.get("format") == "mxfp8"
+        and plan.get("tma_output") is True
+        and isinstance(index := plan.get("out_idx"), int)
+    }
     for index, is_output in _cute_staged_plan_operands(cute_kernel):
         tensor = args[index]
         if (
@@ -3665,7 +4474,16 @@ def _cute_stage_under_aligned_operands(
             continue
         if staged is None:
             staged = list(args)
-        copy = tensor.clone()
+        if index in tma_scale_indices or index in tma_output_indices:
+            copy = torch.empty_strided(
+                tensor.size(),
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            copy.copy_(tensor)
+        else:
+            copy = tensor.clone()
         staged[index] = copy
         if is_output:
             copy_backs.append((tensor, copy))
@@ -3760,6 +4578,7 @@ def _tcgen05_grouped_static_active_clusters(
     cluster_m: int,
     reserved_sms: int,
     num_sm_multiplier: int = 1,
+    cluster_n: int = 1,
 ) -> int:
     if num_sm <= 0:
         raise ValueError("num_sm must be positive")
@@ -3770,7 +4589,7 @@ def _tcgen05_grouped_static_active_clusters(
     if type(num_sm_multiplier) is not int or num_sm_multiplier not in (1, 2):
         raise ValueError("num_sm_multiplier must be one or two")
     active_sms = max(1, num_sm - reserved_sms)
-    return max(1, active_sms * num_sm_multiplier // cluster_m)
+    return max(1, active_sms * num_sm_multiplier // (cluster_m * cluster_n))
 
 
 def _tcgen05_grouped_static_quotas(
@@ -3965,6 +4784,35 @@ def _tcgen05_grouped_static_layout_arg(
 def _tcgen05_grouped_device_source_m_tile_supported(plan: dict[str, object]) -> bool:
     """Admit compact ONE profiles and retain the proved source64 contract."""
     source_m_tile = plan.get("source_m_tile")
+    if plan.get("orientation", "mn") == "mn":
+        return (
+            plan.get("kind") == "tcgen05_grouped_static_persistent"
+            and plan.get("scheduler_mode") == "device_group_search"
+            and source_m_tile in (128, 256)
+            and plan.get("bm") == source_m_tile
+            and plan.get("bn") in (128, 192, 224, 256)
+            and plan.get("cluster_m") == 2
+            and plan.get("cluster_n") in (1, 2)
+            and plan.get("device_split_sizes") is True
+            and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+        )
+    if (
+        type(source_m_tile) is int
+        and source_m_tile == TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+    ):
+        cluster_m = plan.get("cluster_m")
+        return (
+            type(cluster_m) is int
+            and cluster_m in (1, 2)
+            and plan.get("kind") == "tcgen05_grouped_static_persistent"
+            and plan.get("scheduler_mode") == "device_group_search"
+            and plan.get("orientation") == "nm"
+            and plan.get("bm") == 128 * cluster_m
+            and plan.get("bn") == source_m_tile
+            and plan.get("cluster_n") == 1
+            and plan.get("device_split_sizes") is True
+            and plan.get("device_layout_kind") in ("offsets", "split_sizes")
+        )
     if type(source_m_tile) is int and source_m_tile in (8, 16):
         return (
             plan.get("kind") == "tcgen05_grouped_static_persistent"
@@ -4058,7 +4906,9 @@ def _validate_tcgen05_grouped_device_split_sizes(
             "cute",
             f"tcgen05 grouped device {layout_kind} must have shape {expected_shape}",
         )
-    if _tcgen05_plan_orientation(plan) != "nm":
+    if _tcgen05_plan_orientation(
+        plan
+    ) != "nm" and not _tcgen05_grouped_device_source_m_tile_supported(plan):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 grouped device split_sizes requires N,M orientation",
@@ -4100,13 +4950,98 @@ def _validate_tcgen05_grouped_device_split_sizes(
     if (
         not bool(plan.get("dynamic_ab_tensormaps"))
         or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
-        or not bool(plan.get("dynamic_d_tensormap"))
+        or not (
+            bool(plan.get("dynamic_d_tensormap"))
+            or plan.get("bounded_output_shift") is True
+        )
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 grouped device split_sizes requires rank-2 dynamic A/B "
             "TensorMaps and a dynamic D TensorMap",
         )
+    if plan.get("bounded_output_shift") is True and not (
+        plan.get("immutable_ab_tensormaps") is True
+        and not plan.get("dynamic_d_tensormap")
+        and not plan.get("fixed_tensormaps")
+        and not plan.get("direct_pointer_metadata")
+        and _tcgen05_grouped_scheduler_mode(plan)
+        is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+        and bounded_d_shift_index_domain(m_size, n_size, source_m_tile)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "bounded output shift requires immutable pure device-worklist maps"
+        )
+    if plan.get("balanced_workers") is True and not (
+        _tcgen05_plan_orientation(plan) == "mn"
+        and plan.get("cluster_m") == 2
+        and plan.get("cluster_n", 1) in (1, 2)
+        and (
+            plan.get("cluster_n", 1) == 1
+            or n_size
+            % (_plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n"))
+            == 0
+        )
+        and plan.get("num_sm_multiplier", 1) == 1
+        and not plan.get("fixed_tensormaps")
+        and not plan.get("direct_pointer_metadata")
+        and _tcgen05_grouped_scheduler_mode(plan)
+        is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+        and balanced_workers_index_domain(
+            group_count,
+            m_size,
+            n_size,
+            _plan_int_value(plan, "bm"),
+            _plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n"),
+        )
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "balanced output workers require the proved device M,N profile"
+        )
+    if (
+        plan.get("l2_swizzle_size", 1) != 1
+        or plan.get("device_panel_swizzle") is True
+        or plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+        or plan.get(GROUPED_PANEL_RATIO_KEY) is not None
+    ):
+        bm, bn = _plan_int_value(plan, "bm"), _plan_int_value(plan, "bn")
+        cluster_n = _plan_int_value(plan, "cluster_n")
+        if not (
+            plan.get("device_panel_swizzle") is True
+            and (
+                _plan_int_value(plan, "l2_swizzle_size") > 1
+                or plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+            )
+            and _tcgen05_plan_orientation(plan) == "mn"
+            and plan.get("device_layout_kind") == "offsets"
+            and _tcgen05_grouped_scheduler_mode(plan)
+            is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+            and (cluster_n == 1 or n_size % (bn * cluster_n) == 0)
+            and grouped_device_panel_index_domain(
+                group_count, m_size, n_size, bm, bn, cluster_n
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "device panel raster requires the bounded complete-cluster MN plan",
+            )
+        if (
+            plan.get(GROUPED_PANEL_ALTERNATE_KEY) is not None
+            or plan.get(GROUPED_PANEL_RATIO_KEY) is not None
+        ):
+            alternate = plan.get(GROUPED_PANEL_ALTERNATE_KEY)
+            ratio = plan.get(GROUPED_PANEL_RATIO_KEY)
+            if not (
+                type(alternate) is int
+                and alternate in TCGEN05_LEGAL_L2_SWIZZLE_SIZES
+                and type(ratio) is int
+                and ratio in GROUPED_PANEL_RATIO_CHOICES
+                and grouped_panel_ratio_index_domain(n_size, bn, cluster_n, ratio)
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "adaptive panel requires a legal alternate width and bounded positive integer ratio",
+                )
 
 
 def _tcgen05_grouped_device_split_total_clusters(
@@ -4138,7 +5073,12 @@ def _tcgen05_grouped_device_split_total_clusters(
             "tcgen05 grouped device split_sizes requires positive G, M, and N "
             "and a validated source M tile",
         )
-    n_clusters = (n_size + physical_mma_m - 1) // physical_mma_m
+    physical_columns = (
+        _plan_int_value(plan, "bn") * _plan_int_value(plan, "cluster_n")
+        if _tcgen05_plan_orientation(plan) == "mn"
+        else physical_mma_m
+    )
+    n_clusters = (n_size + physical_columns - 1) // physical_columns
     packed_m_clusters = (m_size + source_m_tile - 1) // source_m_tile
     total_clusters = n_clusters * group_count * packed_m_clusters
     if total_clusters > torch.iinfo(torch.int32).max:
@@ -4157,7 +5097,10 @@ def _cute_dynamic_tensormap_contexts(
     contexts: list[_CuteGroupedLaunchContext] = []
     for plan in _tcgen05_grouped_static_plans(cute_kernel):
         if not (
-            bool(plan.get("dynamic_ab_tensormaps"))
+            (
+                bool(plan.get("dynamic_ab_tensormaps"))
+                and not bool(plan.get("immutable_ab_tensormaps"))
+            )
             or bool(plan.get("dynamic_d_tensormap"))
         ):
             continue
@@ -6449,6 +7392,9 @@ def _build_cute_schema_and_args(
     ) -> None:
         workspace_name: str | None = None
         tensormap_count = 0
+        if plan.get("bounded_output_shift") is True:
+            _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
+            return
         if bool(plan.get("dynamic_ab_tensormaps")):
             _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
             workspace_name = _plan_str_value(plan, "ab_tensormaps_arg")
@@ -6594,6 +7540,10 @@ def _build_cute_schema_and_args(
         # The nested CuTe host builds its TMA descriptors from the baked tensor
         # views, so the runtime tensors must match the compiled geometry.
         _validate_gdn_recurrence_launch_args(gdn_recurrence_plans[0], args)
+
+    alias_guard = _mma_dag_alias_guard(cute_kernel, args)
+    if alias_guard is not None:
+        alias_guard.check(args)
 
     launch_args.extend(grid)
     # The stream is intentionally NOT appended here; it is sampled fresh per
@@ -6743,7 +7693,12 @@ class _CuteFastRelaunch:
     2. writes each tensor arg's ``data_ptr()`` into its probe-verified
        ``exe_args`` slot (tensor pointers marshal by value),
     3. refreshes the CUDA stream slot(s), and
-    4. invokes the executor's ``run_compiled_program``.
+    4. launches: a C-API ``JitExecutor`` is entered directly through its
+       ``capi_func`` with a fastpath-owned copy of the packed ``void*``
+       array it would build from ``exe_args`` on every call (the pointer
+       and stream slots are written into that copy in steps 2-3), and its
+       ``cuda_result`` is checked as ``run_compiled_program`` would; any
+       other executor still goes through ``run_compiled_program``.
 
     Slot discovery is probe-verified at build time: tensor slots by
     re-marshalling with per-tensor shifted pointers, stream slots by
@@ -6757,6 +7712,8 @@ class _CuteFastRelaunch:
     """
 
     __slots__ = (
+        "alias_guard",
+        "alias_pick",
         "arg_count",
         "block",
         "by_ref_writers",
@@ -6766,6 +7723,8 @@ class _CuteFastRelaunch:
         "constexpr_flags",
         "cuda_error",
         "cuda_result",
+        "cxx_check",
+        "cxx_guards",
         "device_index",
         "exe_args",
         "executor",
@@ -6774,6 +7733,14 @@ class _CuteFastRelaunch:
         "last_raw",
         "lock",
         "packed_args",
+        "pick_tensors",
+        "pointer_indices",
+        "pointer_masks",
+        "pointer_writers",
+        "pointer_slots",
+        "raw_grid",
+        "raw_kwargs",
+        "scalar_fast",
         "scalar_guards",
         "tensor_guard",
         "tensor_guards",
@@ -6810,8 +7777,62 @@ class _CuteFastRelaunch:
         last_raw: int,
         keepalive: tuple[object, ...],
         packed_launch: _CutePackedLaunch | None = None,
+        alias_guard: _MmaDagAliasGuard | None = None,
+        cxx_guards: object | None = None,
     ) -> None:
         self.executor = executor
+        self.alias_guard = alias_guard
+        # One C++ check of every tensor's dtype / device / shape / stride
+        # (``_cute_cxx_tensor_guards``); the Python guards decide when it
+        # misses (it also pins requires_grad and the dispatch keys).
+        self.cxx_guards = cxx_guards
+        self.cxx_check: Callable[..., bool] | None = (
+            None if cxx_guards is None else cast("Any", cxx_guards).check
+        )
+        self.pick_tensors = _cute_tuple_picker(tuple(g[0] for g in tensor_guards))
+        # Scalars: an exact (type, value) match; the normalizing guard
+        # decides otherwise (Sym* values, NaN).
+        self.scalar_fast = tuple(
+            (
+                guard.index,
+                _CUTE_SCALAR_TYPES[guard.scalar_kind],
+                float.fromhex(cast("str", guard.scalar_value))
+                if guard.scalar_kind == "float"
+                else guard.scalar_value,
+            )
+            for guard in scalar_guards
+        )
+        # The data pointers are gathered once, in ``tensor_slots`` order,
+        # for the compiled alignment check, the alias guard and the patch.
+        self.pointer_indices = tuple(index for index, _slot, _writer in tensor_slots)
+        alignments = {g[0]: g[6] for g in tensor_guards}
+        self.pointer_masks = tuple(
+            alignments.get(index, 1) - 1 for index in self.pointer_indices
+        )
+        # The by-reference cells and the by-value slots the pointers patch, as
+        # two plain lists paired with the gathered pointers.
+        self.pointer_writers = tuple(
+            (position, writer)
+            for position, (_index, _slot, writer) in enumerate(tensor_slots)
+            if writer is not None
+        )
+        self.pointer_slots = tuple(
+            (position, slot)
+            for position, (_index, slot, writer) in enumerate(tensor_slots)
+            if writer is None
+        )
+        self.alias_pick: Callable[[Sequence[int]], tuple[int, ...]] | None = None
+        if alias_guard is not None and all(
+            index in self.pointer_indices for index in alias_guard.indices
+        ):
+            self.alias_pick = _cute_tuple_picker(
+                tuple(self.pointer_indices.index(i) for i in alias_guard.indices)
+            )
+        # The launch as the generated host code spells it (grid tuple and
+        # keyword arguments), recorded by the entry after the first launch
+        # so the relaunch compares them without normalizing.
+        self.raw_grid: tuple[int, ...] | None = None
+        self.raw_kwargs: dict[str, object] | None = None
         self.exe_args = exe_args
         self.tensor_guards = tensor_guards
         self.tensor_guard = _compile_cute_fastpath_tensor_guard(tensor_guards)
@@ -6851,12 +7872,66 @@ class _CuteFastRelaunch:
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
-            or not self.tensor_guard(args)
         ):
             return _CUTE_FASTPATH_MISS
-        for guard in self.scalar_guards:
-            if not guard.matches(args, self.constexpr_flags):
+        return self.launch(args)
+
+    def try_launch_raw(
+        self,
+        args: tuple[object, ...],
+        grid: tuple[int, ...],
+        kwargs: dict[str, object],
+    ) -> tuple[bool, object]:
+        """``try_launch`` on the launch as the host code spells it (before
+        the entry normalizes grid, block and options)."""
+        if (
+            grid != self.raw_grid
+            or kwargs != self.raw_kwargs
+            or len(args) != self.arg_count
+        ):
+            return _CUTE_FASTPATH_MISS
+        return self.launch(args)
+
+    def launch(self, args: tuple[object, ...]) -> tuple[bool, object]:
+        """Guards, then the relaunch, for a launch whose grid / block /
+        options and argument count already matched."""
+        # One C++ check of every tensor (``_cute_cxx_tensor_guards``); when it
+        # is absent or misses, the compiled metadata guard (dtype, shape,
+        # stride, device, compiled pointer alignment) decides.
+        cxx_check = self.cxx_check
+        if (
+            cxx_check is None or not cxx_check(*self.pick_tensors(args))
+        ) and not self.tensor_guard(args):
+            return _CUTE_FASTPATH_MISS
+        for position, (index, kind, value) in enumerate(self.scalar_fast):
+            arg = args[index]
+            if (
+                type(arg) is not kind
+                or arg != value
+                # -0.0 == 0.0, but a float travels by value and is pinned in
+                # the argument array: the sign of a zero must match too.
+                or (
+                    kind is float
+                    and arg == 0.0
+                    and math.copysign(1.0, arg)
+                    != math.copysign(1.0, cast("float", value))
+                )
+            ) and not self.scalar_guards[position].matches(args, self.constexpr_flags):
                 return _CUTE_FASTPATH_MISS
+        # (No ``typing.cast`` on this path: it is a Python call per use, and
+        # the pointer gather and the slot pokes run once per tensor.)
+        pointers = [
+            args[index].data_ptr()  # pyrefly: ignore[missing-attribute]
+            for index in self.pointer_indices
+        ]
+        # The compiled schema's pointer alignment (no pointer equality).
+        if any(map(operator.and_, pointers, self.pointer_masks)):
+            return _CUTE_FASTPATH_MISS
+        if self.alias_guard is not None:
+            if self.alias_pick is not None:
+                self.alias_guard.check_begins(self.alias_pick(pointers))
+            else:
+                self.alias_guard.check(args)
         raw = torch._C._cuda_getCurrentRawStream(self.device_index)
         with self.lock:
             # The slots are poked in the pre-packed C array of a CuTe DSL
@@ -6864,17 +7939,14 @@ class _CuteFastRelaunch:
             # profiling wrappers) has no such array and keeps packing
             # ``exe_args`` itself through ``run_compiled_program``.
             packed_args = self.packed_args
-            slots = cast("Any", self.exe_args if packed_args is None else packed_args)
-            # tensor_slots entries: (arg_index, exe_slot_or_None, writer_or_None)
-            for index, slot, writer in self.tensor_slots:
-                ptr = cast("torch.Tensor", args[index]).data_ptr()
-                if writer is not None:
-                    cast("Any", writer).value = ptr
-                else:
-                    slots[cast("int", slot)] = ptr
+            slots: Any = self.exe_args if packed_args is None else packed_args
+            for position, writer in self.pointer_writers:
+                writer.value = pointers[position]  # pyrefly: ignore[missing-attribute]
+            for position, slot in self.pointer_slots:
+                slots[slot] = pointers[position]
             if raw != self.last_raw:
                 for stream_writer in self.by_ref_writers:
-                    cast("Any", stream_writer).value = raw
+                    stream_writer.value = raw  # pyrefly: ignore[missing-attribute]
                 for stream_slot in self.by_val_slots:
                     slots[stream_slot] = raw
                 self.last_raw = raw
@@ -6883,14 +7955,69 @@ class _CuteFastRelaunch:
                     True,
                     cast("Any", self.executor).run_compiled_program(self.exe_args),
                 )
-            cast("Any", self.capi_func)(packed_args)
-            cuda_result = self.cuda_result
+            capi_func: Any = self.capi_func
+            try:
+                capi_func(packed_args)
+            except Exception as error:
+                _cute_raise_direct_launch_crash(error)
+            cuda_result: Any = self.cuda_result
             if cuda_result is None:
                 return (True, None)
-            error_code = cast("Any", cuda_result).value
+            error_code = cuda_result.value
             if error_code == 0:
                 return (True, 0)
             raise cast("Any", self.cuda_error)(error_code)
+
+
+_CUTE_SCALAR_TYPES: dict[str, type] = {"bool": bool, "int": int, "float": float}
+
+
+def _cute_tuple_picker(
+    indices: tuple[int, ...],
+) -> Callable[[Sequence[Any]], tuple[Any, ...]]:
+    """``lambda items: tuple(items[i] for i in indices)`` at C speed."""
+    if len(indices) > 1:
+        return cast(
+            "Callable[[Sequence[Any]], tuple[Any, ...]]", operator.itemgetter(*indices)
+        )
+    if len(indices) == 1:
+        (index,) = indices
+        return lambda items: (items[index],)
+    return lambda items: ()
+
+
+def _cute_cxx_tensor_guards(
+    args: tuple[object, ...],
+    tensor_guards: Sequence[tuple[Any, ...]],
+) -> object | None:
+    """Dynamo's C++ tensor guard over the launch's tensor arguments: one
+    call checks every tensor's type, dtype, device, requires_grad, dispatch
+    keys, sizes and strides against this launch's.  None when the guard is
+    unavailable or does not accept these tensors (the Python guards then
+    decide alone)."""
+    try:
+        from torch._C._dynamo.guards import TensorGuards
+    except ImportError:  # pragma: no cover - older torch
+        return None
+    tensors = [args[guard[0]] for guard in tensor_guards]
+    if not tensors or not all(type(t) is torch.Tensor for t in tensors):
+        return None
+    try:
+        # (The stub types the per-tensor lists as flat; the binding takes
+        # one list of concrete sizes / strides per tensor.)
+        guards = TensorGuards(
+            *tensors,
+            dynamic_dims_sizes=cast("Any", [list(guard[4]) for guard in tensor_guards]),
+            dynamic_dims_strides=cast(
+                "Any", [list(guard[5]) for guard in tensor_guards]
+            ),
+        )
+        if not guards.check(*tensors):
+            return None
+    except Exception:
+        log.debug("CuTe fastpath: C++ tensor guards unavailable", exc_info=True)
+        return None
+    return guards
 
 
 @dataclass(frozen=True)
@@ -6923,19 +8050,25 @@ def _cute_packed_launch(executor: object, exe_args: list[object]) -> object | No
     jit_executor = sys.modules.get("cutlass.base_dsl.jit_executor")
     if jit_executor is None or not isinstance(executor, jit_executor.JitExecutor):
         return None
-    create_cuda_runtime_error = sys.modules[
-        "cutlass.base_dsl.runtime.cuda"
-    ].create_cuda_runtime_error
-    source = executor._get_invoke_packed_args(list(exe_args))
-    total = len(exe_args) + executor._num_extra_args
-    packed_args = (ctypes.c_void_p * total)()
-    ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
-    return _CutePackedLaunch(
-        packed_args=packed_args,
-        capi_func=executor.capi_func,
-        cuda_result=executor.cuda_result,
-        cuda_error=create_cuda_runtime_error,
-    )
+    try:
+        create_cuda_runtime_error = sys.modules[
+            "cutlass.base_dsl.runtime.cuda"
+        ].create_cuda_runtime_error
+        source = executor._get_invoke_packed_args(list(exe_args))
+        total = len(exe_args) + executor._num_extra_args
+        packed_args = (ctypes.c_void_p * total)()
+        ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
+        return _CutePackedLaunch(
+            packed_args=packed_args,
+            capi_func=executor.capi_func,
+            cuda_result=executor.cuda_result,
+            cuda_error=create_cuda_runtime_error,
+        )
+    except Exception:
+        # A packing-internals change in cutlass gives up only the direct C
+        # entry; the fastpath keeps the ``run_compiled_program`` launch.
+        log.debug("CuTe direct C-API launch unavailable", exc_info=True)
+        return None
 
 
 def _compile_cute_fastpath_tensor_guard(
@@ -6989,6 +8122,13 @@ def _compile_cute_fastpath_tensor_guard(
             item.append(f"{tensor}.data_ptr() % {int(alignment)} == 0")
         checks.append(f"({' and '.join(item)})")
     return eval(f"lambda args: {' and '.join(checks) if checks else 'True'}", namespace)
+
+
+def _cute_raise_direct_launch_crash(error: Exception) -> NoReturn:
+    """Wrap a C-API entry failure as ``run_compiled_program`` does."""
+    from cutlass.base_dsl.common import DSLRuntimeError
+
+    raise DSLRuntimeError("Runtime Crash", cause=error)
 
 
 def _cute_maybe_build_fastpath(
@@ -7292,6 +8432,10 @@ def _cute_build_fast_relaunch(
             packed_launch=cast(
                 "_CutePackedLaunch | None", _cute_packed_launch(executor, exe_args)
             ),
+            # The metadata guards above pin the spans the alias guard
+            # computed from this launch's tensors.
+            alias_guard=_mma_dag_alias_guard(cute_kernel, args),
+            cxx_guards=_cute_cxx_tensor_guards(args, tensor_guards),
         )
     except Exception:
         return None
@@ -7314,6 +8458,7 @@ def _cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        getattr(cast("Any", cute_kernel), "_helion_cute_cluster_shape", None),
     )[0]
     if discriminator != entry.compiled_discriminator:
         return None
@@ -7339,6 +8484,7 @@ def _set_cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        getattr(cast("Any", cute_kernel), "_helion_cute_cluster_shape", None),
     )[0]
     cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
         arg_guard=arg_guard,
@@ -7353,6 +8499,51 @@ def default_cute_launcher(
     grid: tuple[int, ...],
     *args: object,
     **kwargs: object,
+) -> object:
+    # The relaunch of a kernel launched before, compared as the host code
+    # spells the launch (every tensor and scalar argument still guarded).
+    fastpath = getattr(cute_kernel, "_helion_cute_fastpath", None)
+    if fastpath.__class__ is _CuteFastRelaunch:
+        hit, result = fastpath.try_launch_raw(args, grid, kwargs)
+        if hit:
+            return result
+    return _default_cute_launcher_normalized(
+        cute_kernel, grid, args, kwargs, dict(kwargs)
+    )
+
+
+def _cute_record_raw_launch(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    raw_kwargs: dict[str, object],
+    grid_xyz: tuple[int, int, int],
+    block_xyz: tuple[int, int, int],
+    compile_options: str | None,
+) -> None:
+    """Record how the host code spells the launch the fast relaunch just
+    served or was built for (``try_launch_raw`` compares against it) -- only
+    when this call's normalized grid, block and options are the fastpath's:
+    a concurrent first launch with another grid must not leave its spelling
+    on a fastpath pinned to a different one."""
+    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    if (
+        fastpath.__class__ is _CuteFastRelaunch
+        and fastpath.raw_grid is None
+        and fastpath.grid == grid_xyz
+        and fastpath.block == block_xyz
+        and fastpath.compile_options == compile_options
+    ):
+        # kwargs first: a raw check that sees the grid must see them too.
+        fastpath.raw_kwargs = raw_kwargs
+        fastpath.raw_grid = grid
+
+
+def _default_cute_launcher_normalized(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    raw_kwargs: dict[str, object],
 ) -> object:
     block = kwargs.pop("block", (256, 1, 1))
     cute_compile_options = kwargs.pop("cute_compile_options", None)
@@ -7390,21 +8581,29 @@ def default_cute_launcher(
             args_tuple, grid_xyz, block_xyz, cute_compile_options
         )
         if hit:
+            _cute_record_raw_launch(
+                cute_kernel, grid, raw_kwargs, grid_xyz, block_xyz, cute_compile_options
+            )
             return result
     # Under-aligned TMA/vector operands of the staged plan kinds never reach
     # the compiled wrapper: the fast path's alignment guard rejected them
     # above, and the copies below are what the slower paths see and cache.
     staging = _cute_stage_under_aligned_operands(cute_kernel, args_tuple)
     if staging is None:
-        return _launch_cute_marshalled(
+        result = _launch_cute_marshalled(
             cute_kernel, args_tuple, grid_xyz, block_xyz, cute_compile_options
         )
-    staged_args, copy_backs = staging
-    result = _launch_cute_marshalled(
-        cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+    else:
+        staged_args, copy_backs = staging
+        result = _launch_cute_marshalled(
+            cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+        )
+        for destination, copy in copy_backs:
+            destination.copy_(copy)
+    # The marshalled launch may have built the fastpath for this launch.
+    _cute_record_raw_launch(
+        cute_kernel, grid, raw_kwargs, grid_xyz, block_xyz, cute_compile_options
     )
-    for destination, copy in copy_backs:
-        destination.copy_(copy)
     return result
 
 

@@ -20,6 +20,7 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
+from examples.attention import attention_relu_output
 import pytest
 import torch
 
@@ -608,9 +609,11 @@ def test_coverage_design_keeps_the_64_row_tile_witness() -> None:
         coverage = generation.flash_deterministic_population_configs()
     # the family's only output path is the TMA store: under the direct-epilogue
     # override it is unreachable, which the design reports but does not reject
-    assert generation.flash_structural_coverage_uncovered_values() == [
-        (FAMILY_KEY, "fa4_alt")
-    ]
+    # (as it does the shared staged output tile, a child of that epilogue)
+    assert set(generation.flash_structural_coverage_uncovered_values()) == {
+        (FAMILY_KEY, "fa4_alt"),
+        (cute_flash.FLASH_O_STAGE_KEY, 1),
+    }
     witnesses = [
         config.config
         for config in coverage
@@ -889,6 +892,35 @@ def test_output_only_body_matches_the_fa4_body_and_sdpa(
     assert (out_alt.float() - out_fa4.float()).abs().max().item() <= 2 * 2.0**-7
     assert (out_alt.float() - out_ref.float()).abs().max().item() < 1e-2
     assert torch.equal(run(config), out_alt)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_output_relu_epilogue_matches_the_fa4_body_and_sdpa() -> None:
+    """The output ReLU of ``attention_relu_output`` is applied by the
+    correction warps (it used to be dropped: the plain attention output)."""
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(2, 16, 768, 128, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    out_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v).relu()
+
+    def run(cfg: dict[str, object]) -> torch.Tensor:
+        kernel = helion.kernel(
+            attention_relu_output.fn,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config.from_dict(cfg),
+        )
+        out = cast("Any", kernel)(q, k, v)
+        torch.cuda.synchronize()
+        return out
+
+    out_alt = run(_ALT)
+    out_fa4 = run({**_ALT, FAMILY_KEY: "fa4"})
+    assert (out_alt.float() - out_fa4.float()).abs().max().item() <= 2 * 2.0**-7
+    assert (out_alt.float() - out_ref.float()).abs().max().item() < 1e-2
 
 
 @skipIfNotCUDA()

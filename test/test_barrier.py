@@ -419,7 +419,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         used to fall back to ``flat`` and raise ``BarrierRequiresPersistent``."""
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
         spec = barrier_dep_single.bind((x,)).config_spec
-        self.assertEqual(spec.allowed_pid_types, ("persistent_blocked",))
+        self.assertEqual(spec.allowed_pid_types, ("persistent_blocked", "flat"))
         self.assertEqual(spec.default_config().pid_type, "persistent_blocked")
         # A partial user config must keep the persistent choice through normalize
         # (a stripped pid_type would fall back to flat and fail codegen).
@@ -637,6 +637,57 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteOrderedPhases(RefEagerTestBase, TestCase):
+    @skipIfRefEager("pid_type is only materialized in compiled mode")
+    def test_autotune_searches_ordered_phase_launches(self) -> None:
+        """Ordered launches are the only CuTe lowering that gives each barrier
+        phase its own thread block (and matmul phases their MMA paths), so the
+        search must reach them; the persistent launch stays the default."""
+        x = torch.randn(137, device=DEVICE)
+        spec = barrier_multiple.bind((x,)).config_spec
+        self.assertEqual(spec.allowed_pid_types, ("persistent_blocked", "flat"))
+        self.assertEqual(spec.default_config().pid_type, "persistent_blocked")
+        generation = spec.create_config_generation()
+        configs = [
+            generation.unflatten(flat) for flat in generation.random_population_flat(32)
+        ]
+        self.assertEqual(
+            {config.pid_type for config in configs}, {"persistent_blocked", "flat"}
+        )
+        bound = barrier_multiple.bind((x,))
+        for pid_type in ("persistent_blocked", "flat"):
+            config = next(config for config in configs if config.pid_type == pid_type)
+            torch.testing.assert_close(bound.compile_config(config)(x), (x + 3) * 2 - 5)
+        # Phases that share a launch cannot be split into ordered launches.
+        grouped = barrier_groups.bind((x, x)).config_spec
+        self.assertEqual(grouped.allowed_pid_types, ("persistent_blocked",))
+
+    @skipIfRefEager("checks separately launched matmul phases")
+    def test_explicit_barrier_matmul_phase_launch(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def scale_then_mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = w.size(1)
+            scaled = torch.empty_like(x)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for row, col in hl.tile([m, k]):
+                scaled[row, col] = x[row, col] * 2.0
+            hl.barrier()
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, scaled[tile_m, tile_k], w[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(128, 192, device=DEVICE, dtype=torch.float16)
+        self.assertIn("flat", scale_then_mm.bind((x, w)).config_spec.allowed_pid_types)
+        code, out = code_and_output(
+            scale_then_mm, (x, w), block_sizes=[32, 32, 64, 64, 32], pid_type="flat"
+        )
+        torch.testing.assert_close(out, (x * 2.0) @ w, rtol=1e-2, atol=1e-1)
+        self.assertIn("_helion_cute_region_1_module", code)
+
     @skipIfRefEager("checks separately launched grid phases")
     def test_explicit_barrier_launch_order(self) -> None:
         x = torch.randn(137, device=DEVICE)

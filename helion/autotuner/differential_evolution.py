@@ -80,7 +80,13 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         """
         super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if immediate_update is None:
-            immediate_update = not bool(kernel.settings.autotune_precompile)
+            # Batched updates pay off only with a precompile pool; a backend
+            # that merely renders candidates in forked workers (CuTe) still
+            # compiles and times them one at a time.
+            immediate_update = not (
+                kernel.settings.autotune_precompile
+                and kernel.config_spec.backend.supports_precompile()
+            )
         if initial_population_strategy is None:
             initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         self.initial_population_strategy = initial_population_strategy
@@ -183,8 +189,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
         initial_population_name = self.initial_population_strategy.name
-        oversized_population = sorted(
-            self.benchmark_flat_batch(
+        with self._initial_population_batch():
+            initial_members = self.benchmark_flat_batch(
                 self._generate_initial_population_flat(),
                 random_fallback_target=random_fallback_population_target(
                     self.initial_population_strategy,
@@ -192,9 +198,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                     self.config_spec,
                     self.population_size * 2,
                 ),
-            ),
-            key=performance,
-        )
+            )
+        oversized_population = sorted(initial_members, key=performance)
         self.log(
             f"Initial population (initial_population={initial_population_name}):",
             lambda: population_statistics(oversized_population),

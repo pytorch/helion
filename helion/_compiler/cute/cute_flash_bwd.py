@@ -17,7 +17,10 @@ The matched Helion source shape (see ``benchmarks/cute/attnbwd_kernels.py``
   ``dQ = dS^T @ K`` — plus the softmax recompute
   ``P = exp2(S^T * qk_scale2 - lse2[None, :])`` (lse2 = base-2 LSE row
   vector), ``dS = (P * (dP^T - delta[None, :])).to(io)``, and an
-  ``hl.atomic_add(dq_fp32, [tile_m, :], dQ * out_scale)``.
+  ``hl.atomic_add(dq_fp32, [tile_m, :], dQ * dq_scale)``; the root stores
+  ``dK * dk_scale``. Each scale is a host scalar or a Python number, and may
+  be omitted (1): e.g. examples/attention.py pre-scales K by
+  ``sm_scale * log2(e)`` and rescales dQ by ``ln(2)``.
 - Causal variants mask ``S^T`` with
   ``where(q_pos[None, :] >= kv_pos[:, None], s, -inf)`` where
   ``q_pos = tile_index(tile_m) % m_dim`` / ``kv_pos = tile_index(tile_n) %
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
 
     from ..device_ir import DeviceIR
     from ..generate_ast import GenerateAST
+    from .flex_bwd_match import FlexBwdPlan
+    from .flex_bwd_match import FlexBwdTmemPlan
 
 __all__ = [
     "AttentionBwdMatch",
@@ -69,8 +74,9 @@ class AttentionBwdPlan:
     mm_dim: int  # query rows per KV group (group * m_dim)
     n_dim: int  # KV rows per group
     total_kv_rows: int
-    qk_scale_expr: str  # sympy expr (host symbols) for the exp2-domain scale
-    out_scale_expr: str  # sympy expr for the dK/dQ output scale
+    qk_scale_expr: str  # host expression (or literal) for the exp2-domain scale
+    out_scale_expr: str  # host expression (or literal) for the dQ output scale
+    dk_scale_expr: str  # host expression (or literal) for the dK output scale
 
     @property
     def group(self) -> int:
@@ -96,11 +102,13 @@ class AttentionBwdMatch:
     dq_name: str
     dk_name: str
     dv_name: str
-    # Sympy expressions (host symbols) for the two runtime scales, captured
-    # from the traced SymFloat metadata so symbol identity is preserved for
-    # ``DeviceFunction.sympy_expr`` rendering at codegen time.
-    qk_scale_sym: sympy.Expr | None = None
-    out_scale_sym: sympy.Expr | None = None
+    # The runtime scales (exp2 domain, dQ, dK): sympy expressions (host
+    # symbols) captured from the traced SymFloat metadata so symbol identity is
+    # preserved for ``DeviceFunction.sympy_expr`` rendering at codegen time, or
+    # Python floats for constants in the graph (an omitted scale is 1.0).
+    qk_scale_sym: sympy.Expr | float | None = None
+    out_scale_sym: sympy.Expr | float | None = None
+    dk_scale_sym: sympy.Expr | float | None = None
 
 
 def _node_target_name(node: torch.fx.Node) -> str:
@@ -152,6 +160,30 @@ def _symnode_sympy(node: object) -> sympy.Expr | None:
     val = node.meta.get("val")
     node_attr = getattr(val, "node", None)
     return getattr(node_attr, "expr", None)
+
+
+def _scale_operand(node: object) -> tuple[sympy.Expr | float, str] | None:
+    """A runtime scale operand: a traced host SymFloat (its sympy expression and
+    host expression text) or a Python number baked into the graph."""
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        return float(node), repr(float(node))
+    text = _symnode_expr(node)
+    sym = _symnode_sympy(node)
+    if text is None or sym is None:
+        return None
+    return sym, text
+
+
+def _split_scale(
+    node: object,
+) -> tuple[object, tuple[sympy.Expr | float, str]] | None:
+    """``mul(x, scale)`` -> (x, scale operand); any other node is ``x * 1``."""
+    if isinstance(node, torch.fx.Node) and node.target is torch.ops.aten.mul.Tensor:
+        scale = _scale_operand(node.args[1])
+        if scale is None:
+            return None
+        return node.args[0], scale
+    return node, (1.0, "1.0")
 
 
 def _through_new_var(node: object) -> object:
@@ -319,7 +351,7 @@ def _match_bwd_inner_graph(
     q_name, _ = q_load
     do_name, _ = do_load
 
-    # Softmax recompute chain: p_t = exp2(mul(score, scale_sym) - lse[None, :]).
+    # Softmax recompute chain: p_t = exp2(score * qk_scale - lse[None, :]).
     p_t = None
     for node in graph.nodes:
         if node.op == "call_function" and node.target is torch.ops.aten.exp2.default:
@@ -333,17 +365,11 @@ def _match_bwd_inner_graph(
         and sub_node.target is torch.ops.aten.sub.Tensor
     ):
         return None
-    mul_node, lse_bcast = sub_node.args
-    if not (
-        isinstance(mul_node, torch.fx.Node)
-        and mul_node.target is torch.ops.aten.mul.Tensor
-    ):
+    scaled_score, lse_bcast = sub_node.args
+    split = _split_scale(scaled_score)
+    if split is None:
         return None
-    score_node, scale_sym = mul_node.args
-    qk_scale_expr = _symnode_expr(scale_sym)
-    if qk_scale_expr is None:
-        return None
-    qk_scale_sympy = _symnode_sympy(scale_sym)
+    score_node, (qk_scale_sympy, qk_scale_expr) = split
     causal = False
     m_dim = n_dim = None
     if isinstance(score_node, torch.fx.Node) and score_node is not qk_dot:
@@ -435,17 +461,10 @@ def _match_bwd_inner_graph(
         isinstance(index, (list, tuple)) and len(index) == 2 and index[1] == slice(None)
     ):
         return None
-    value = atomic_node.args[2]
-    if not (
-        isinstance(value, torch.fx.Node)
-        and value.target is torch.ops.aten.mul.Tensor
-        and value.args[0] is dq_dot
-    ):
+    split = _split_scale(atomic_node.args[2])
+    if split is None or split[0] is not dq_dot:
         return None
-    out_scale_expr = _symnode_expr(value.args[1])
-    if out_scale_expr is None:
-        return None
-    out_scale_sympy = _symnode_sympy(value.args[1])
+    out_scale_sympy, out_scale_expr = split[1]
 
     # head_dim from the dv dot output metadata.
     dv_val = dv_dot.meta.get("val")
@@ -567,8 +586,9 @@ def _match_bwd_root_graph(
     else:
         return None
 
-    # dv / dk stores: store(dv, [kv_block, :], convert(phi0)) and
-    # store(dk, [kv_block, :], convert(phi1 * out_scale)).
+    # dv / dk stores: store(dv, [kv_block, :], convert(phi(dv_acc))) and
+    # store(dk, [kv_block, :], convert(phi(dk_acc) * dk_scale)). The emitted
+    # epilogue scales dK only, so each store must read its own accumulator.
     store_nodes = [
         node
         for node in graph.nodes
@@ -577,6 +597,7 @@ def _match_bwd_root_graph(
     if len(store_nodes) != 2:
         return None
     dv_name = dk_name = None
+    dk_scale = None
     for store_node in store_nodes:
         base = store_node.args[0]
         if not (isinstance(base, torch.fx.Node) and base.target is _host_tensor):
@@ -587,18 +608,22 @@ def _match_bwd_root_graph(
             and value.target is torch.ops.prims.convert_element_type.default
         ):
             return None
-        inner = value.args[0]
-        if isinstance(inner, torch.fx.Node) and inner.target is _phi:
+        split = _split_scale(value.args[0])
+        if split is None:
+            return None
+        phi, scale = split
+        if not (isinstance(phi, torch.fx.Node) and phi.target is _phi):
+            return None
+        if phi.args[0] is dv_full and scale[0] == 1.0:
             dv_name = base.args[0]
-        elif (
-            isinstance(inner, torch.fx.Node)
-            and inner.target is torch.ops.aten.mul.Tensor
-            and _symnode_expr(inner.args[1]) is not None
-        ):
+        elif phi.args[0] is dk_full:
             dk_name = base.args[0]
+            dk_scale = scale
         else:
             return None
-    if not (isinstance(dv_name, str) and isinstance(dk_name, str)):
+    if not (
+        isinstance(dv_name, str) and isinstance(dk_name, str) and dk_scale is not None
+    ):
         return None
 
     inner_causal = bool(inner_facts["causal"])
@@ -620,6 +645,8 @@ def _match_bwd_root_graph(
         "dv_name": dv_name,
         "mm_dim": mm_dim,
         "n_dim": n_dim,
+        "dk_scale_sym": dk_scale[0],
+        "dk_scale_expr": dk_scale[1],
     }
 
 
@@ -679,6 +706,7 @@ def match_attention_bwd(device_ir: DeviceIR) -> AttentionBwdMatch | None:
         total_kv_rows=total_kv_rows,
         qk_scale_expr=typing.cast("str", inner_facts["qk_scale_expr"]),
         out_scale_expr=typing.cast("str", inner_facts["out_scale_expr"]),
+        dk_scale_expr=typing.cast("str", root_facts["dk_scale_expr"]),
     )
     return AttentionBwdMatch(
         plan=plan,
@@ -691,8 +719,9 @@ def match_attention_bwd(device_ir: DeviceIR) -> AttentionBwdMatch | None:
         dq_name=typing.cast("str", inner_facts["dq_name"]),
         dk_name=typing.cast("str", root_facts["dk_name"]),
         dv_name=typing.cast("str", root_facts["dv_name"]),
-        qk_scale_sym=typing.cast("sympy.Expr | None", inner_facts["qk_scale_sym"]),
-        out_scale_sym=typing.cast("sympy.Expr | None", inner_facts["out_scale_sym"]),
+        qk_scale_sym=typing.cast("sympy.Expr | float", inner_facts["qk_scale_sym"]),
+        out_scale_sym=typing.cast("sympy.Expr | float", inner_facts["out_scale_sym"]),
+        dk_scale_sym=typing.cast("sympy.Expr | float", root_facts["dk_scale_sym"]),
     )
 
 
@@ -707,9 +736,25 @@ def _fbwd_epilogue_block(
     io_dtype: str,
     dkv_wait: str,
     v_empty_expr: str,
+    gm_expr: str | None = None,
+    cols: int | None = None,
+    thr_mma: str = "fbwd_tst",
+    slots: int | None = None,
+    stage_buf: str | None = None,
 ) -> str:
     """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> a free
     smem buffer as (128, 64) SWIZZLE_128B boxes -> one TMA store per box.
+    ``stage_buf`` overrides the staging buffer (the persistent flex alias_s
+    walk stages dV through the dO slot, see the flex emitter).
+
+    ``d`` is the accumulator's TMEM width (the MMA's N, a multiple of 64 in
+    the padded flex plan); ``cols`` (default ``d``, a multiple of 16) the
+    columns the tensor has: a partial last box is stored after its last
+    chunk and the TMA unit clips the columns past the tensor extent.
+    ``thr_mma`` is the thread MMA whose accumulator partition the TMEM tile
+    follows (its N is ``d``); ``slots`` the (128, 64) boxes the staging
+    buffer holds: a tile with more boxes than slots reuses them in order,
+    waiting for the store that read the slot before overwriting it.
 
     dV (h=0) stages through this tile's V operand slot (free once dP(n-1)
     retired, i.e. at dv_done) and hands the slot back to the load warp with an
@@ -717,12 +762,33 @@ def _fbwd_epilogue_block(
     completed; dK (h=1) stages through sdS (free after the tail dQ, i.e. at
     dkv_done), so K/Kt can be released by the MMA warp at the tail and the next
     tile's K loads overlap the epilogue."""
-    buf = "sV" if h == 0 else "sdS"
+    buf = stage_buf or ("sV" if h == 0 else "sdS")
     tma = "_fbwd_tma_dv" if h == 0 else "_fbwd_tma_dk"
-    gm = "_fbwd_mdVt" if h == 0 else "_fbwd_mdKt"
+    gm = ("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") if gm_expr is None else gm_expr
     warp_lo = 4 if h == 0 else 8
+    cols = d if cols is None else cols
+    assert cols % 16 == 0 and cols <= d, (cols, d)
+    n_chunks = cols // 16
+    n_boxes = -(-n_chunks // 4)
+    slots = n_boxes if slots is None else slots
+
+    def slot(c: int) -> int:
+        return (c // 4) % slots
+
+    def reuse_wait(c: int) -> str:
+        # The slot's earlier box: its TMA store must have read the staging
+        # before the warps overwrite it (the issuing warp waits, then the
+        # group syncs).
+        if c % 4 != 0 or c // 4 < slots:
+            return ""
+        return f"""
+        if warp_idx == {warp_lo}:
+            cute.arch.cp_async_bulk_wait_group({slots - 1}, read=True)
+        _helion_flash_rt.named_barrier_wait_unaligned({5 + h}, 128)"""
+
     chunks = "".join(
-        (
+        reuse_wait(c)
+        + (
             f"""
         fbwd_row64 = cute.make_rmem_tensor(cute.make_layout(64), {io_dtype})"""
             if c % 4 == 0
@@ -736,17 +802,17 @@ def _fbwd_epilogue_block(
         fbwd_rego.store(fbwd_reg.load().to({io_dtype}))"""
         + (
             f"""
-        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, fbwd_epi_slot0 + {c // 4}])
+        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, fbwd_epi_slot0 + {slot(c)}])
         cute.arch.fence_view_async_shared()
         _helion_flash_rt.named_barrier_wait_unaligned({5 + h}, 128)
         if warp_idx == {warp_lo}:
-            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, fbwd_epi_slot0 + {c // 4}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
+            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, fbwd_epi_slot0 + {slot(c)}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
             cute.copy({tma}, tEPIsS{c // 4}, tEPIgS{c // 4})
             cute.arch.cp_async_bulk_commit_group()"""
-            if c % 4 == 3
+            if c % 4 == 3 or c == n_chunks - 1
             else ""
         )
-        for c in range(d // 16)
+        for c in range(n_chunks)
     )
     hs = (
         """
@@ -764,8 +830,8 @@ def _fbwd_epilogue_block(
     )
     done_ptr = "fbwd_dv_done_ptr" if h == 0 else "fbwd_dkv_done_ptr"
     return f"""        _helion_flash_rt.mbar_spin_wait({done_ptr}, {dkv_wait}, 10000000)
-        fbwd_dkv_shape = fbwd_tst.partition_shape_C(({rows}, {d}))
-        tDKV_frag = fbwd_tst.make_fragment_C(fbwd_dkv_shape)
+        fbwd_dkv_shape = {thr_mma}.partition_shape_C(({rows}, {d}))
+        tDKV_frag = {thr_mma}.make_fragment_C(fbwd_dkv_shape)
         tEPI_t = cute.make_tensor(fbwd_tmem_ptr + {epi_off}, tDKV_frag.layout)
         fbwd_epi_tiler = ((cute.size(tEPI_t, mode=[0, 0]), cute.size(tEPI_t, mode=[0, 1])),)
         tEPI_epi = cute.zipped_divide(tEPI_t, fbwd_epi_tiler)
@@ -774,7 +840,7 @@ def _fbwd_epilogue_block(
         fbwd_thr_epi_ld = fbwd_tiled_epi_ld.get_slice(fbwd_local_tidx)
         tEPItT = fbwd_thr_epi_ld.partition_S(tEPI_epi)
         fbwd_cepi = cute.make_identity_tensor(({rows}, {d}))
-        fbwd_c_epi = cute.zipped_divide(fbwd_tst.partition_C(fbwd_cepi), fbwd_epi_tiler)
+        fbwd_c_epi = cute.zipped_divide({thr_mma}.partition_C(fbwd_cepi), fbwd_epi_tiler)
         tEPIcC = fbwd_thr_epi_ld.partition_D(fbwd_c_epi)
         # Epilogue: the tile is staged through the (now free) {buf} operand buffer
         # as (128, 64) SWIZZLE_128B boxes -- 16 columns per t2r chunk, one row
@@ -784,7 +850,7 @@ def _fbwd_epilogue_block(
         fbwd_epi_slot0 = {f"{d // 64} * (FBWD_KV_SLOT)" if h == 0 else "0"}
         fbwd_gEpi = cute.local_tile({gm}, (128, 64), (None, None)){kv_empty}{chunks}
         if warp_idx == {warp_lo}:
-            cute.arch.cp_async_bulk_wait_group(0){hs}
+            cute.arch.cp_async_bulk_wait_group(0, read=True){hs}
 """
 
 
@@ -794,7 +860,7 @@ def _flash_bwd_wg_compute_block(
     plan: AttentionBwdPlan,
     io_dtype: str,
     scale2_expr: str,
-    out_scale_expr: str,
+    dk_scale_expr: str,
     n_tiles: int,
     m_mod_tiles: int,
     steps_expr: str,
@@ -848,7 +914,7 @@ def _flash_bwd_wg_compute_block(
         epi_off=str(256 if h == 0 else "FBWD_DK_OFF"),
         epi_scale=(
             "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
-            + out_scale_expr
+            + dk_scale_expr
             + "))"
             if h == 1
             else "pass"
@@ -1110,7 +1176,7 @@ def _fbwd_wrap_persistent(body: str, plan: AttentionBwdPlan, total_tiles: int) -
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1  # WG0's V-slot release sits under the same if
         regions.append((s, e))
@@ -1150,6 +1216,7 @@ def emit_flash_bwd_device_body(
     io_dtype: str,
     scale2_expr: str,
     out_scale_expr: str,
+    dk_scale_expr: str,
     q_stage: int,
     do_stage: int,
     kv_stage: int = 1,
@@ -1262,7 +1329,7 @@ def emit_flash_bwd_device_body(
             plan=plan,
             io_dtype=io_dtype,
             scale2_expr=scale2_expr,
-            out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             n_tiles=n_tiles,
             m_mod_tiles=m_mod_tiles,
             steps_expr=steps_expr,
@@ -1638,7 +1705,7 @@ def _fbwd2_wrap_persistent(body: str, plan: AttentionBwdPlan, total_pairs: int) 
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1
         regions.append((s, e))
@@ -1676,7 +1743,7 @@ def _flash_bwd_2cta_wg_compute_block(
     plan: AttentionBwdPlan,
     io_dtype: str,
     scale2_expr: str,
-    out_scale_expr: str,
+    dk_scale_expr: str,
     m_mod_tiles: int,
     steps_expr: str,
     exp2_f32: bool = False,
@@ -1694,7 +1761,7 @@ def _flash_bwd_2cta_wg_compute_block(
     )
     epi_scale = (
         "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
-        + out_scale_expr
+        + dk_scale_expr
         + "))"
         if h == 1
         else "pass"
@@ -1889,6 +1956,7 @@ def emit_flash_bwd_2cta_device_body(
     io_dtype: str,
     scale2_expr: str,
     out_scale_expr: str,
+    dk_scale_expr: str,
     persistent: bool = False,
     total_pairs: int = 0,
     exp2_f32: bool = False,
@@ -1906,7 +1974,7 @@ def emit_flash_bwd_2cta_device_body(
             plan=plan,
             io_dtype=io_dtype,
             scale2_expr=scale2_expr,
-            out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             m_mod_tiles=m_mod_tiles,
             steps_expr="fbwd_steps",
             exp2_f32=exp2_f32,
@@ -2402,6 +2470,12 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     df = cg.device_function
     match = df.cute_state.attention_flash_bwd_match
+    from .flex_bwd_match import FlexBwdMatch
+
+    if isinstance(match, FlexBwdMatch):
+        from .cute_flash_bwd_flex import codegen_attention_flash_bwd_flex
+
+        return codegen_attention_flash_bwd_flex(cg, match)
     if not isinstance(match, AttentionBwdMatch):
         return False
     plan: AttentionBwdPlan = match.plan
@@ -2471,10 +2545,20 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     ):
         return False
 
-    if match.qk_scale_sym is None or match.out_scale_sym is None:
+    qk_scale, dq_scale, dk_scale = (
+        match.qk_scale_sym,
+        match.out_scale_sym,
+        match.dk_scale_sym,
+    )
+    if qk_scale is None or dq_scale is None or dk_scale is None:
         return False
-    scale2_expr = df.sympy_expr(match.qk_scale_sym)  # pyrefly: ignore [bad-argument-type]
-    out_scale_expr = df.sympy_expr(match.out_scale_sym)  # pyrefly: ignore [bad-argument-type]
+
+    def render(scale: sympy.Expr | float) -> str:
+        return repr(scale) if isinstance(scale, float) else df.sympy_expr(scale)
+
+    scale2_expr = render(qk_scale)
+    out_scale_expr = render(dq_scale)
+    dk_scale_expr = render(dk_scale)
 
     env = CompileEnvironment.current()
     io_dtype_str = env.backend.dtype_str(plan.io_dtype)
@@ -2550,6 +2634,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             io_dtype=io_dtype_str,
             scale2_expr=scale2_expr,
             out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             persistent=persistent,
             total_pairs=plan.total_kv_rows // 256,
             exp2_f32=exp2_f32,
@@ -2560,6 +2645,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             io_dtype=io_dtype_str,
             scale2_expr=scale2_expr,
             out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
             q_stage=q_stage,
             do_stage=do_stage,
             kv_stage=kv_stage,
@@ -2596,7 +2682,7 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
         return False
     match = match_attention_bwd(device_ir)
     if match is None:
-        return False
+        return _detect_flex_bwd_search_surface(device_ir)
     env = CompileEnvironment.current()
     kv_block_id = device_ir.grid_block_ids[0][0]
     inner_block_id = None
@@ -2614,5 +2700,101 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=_flash_bwd_two_cta_allowed(match.plan),
+    )
+    return True
+
+
+def _flex_bwd_kv_stage_allowed(
+    plan: FlexBwdPlan, device: torch.device, tmem: FlexBwdTmemPlan | None
+) -> bool:
+    """Whether the flex backward's persistent walk can run two K / V ring
+    slots on this plan: not the pair or alias_s plans (their own boundary
+    schedules and staging), and only where ``_fit_smem_budget`` holds the
+    second slot beside the statistics-MMA form (the deepest searched storage;
+    at d128 the one-slot q1 / do1 storage is already 201 KB of 227)."""
+    from .cute_flash_bwd_flex import _fbwd_fit_kwargs
+    from .cute_flash_bwd_flex import _fit_smem_budget
+    from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
+
+    if tmem is not None and tmem.mode in ("pair", "alias_s"):
+        return False
+    candidates = fbwd_aux_smem_candidates(plan)
+    return (
+        _fit_smem_budget(
+            plan,
+            stats_mma=True,
+            raw_score=False,
+            device=device,
+            persistent=True,
+            aux_smem=max(candidates) if candidates else 0,
+            kv_stage=2,
+            **_fbwd_fit_kwargs(plan),  # type: ignore[arg-type]
+        )
+        is not None
+    )
+
+
+def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
+    """Enable the bwd flash search surface for the FlexAttention backward
+    envelope (pins the KV tile and the Q tile to 128 rows; the list walk has
+    a CLC persistent variant but no 2-CTA one)."""
+    from ..backend import _flash_block_sizes_reachable
+    from ..compile_environment import CompileEnvironment
+    from .flex_bwd_match import match_flex_attention_bwd
+    from .flex_match import FLEX_PLAN_ENABLED
+
+    if not FLEX_PLAN_ENABLED or not _flash_bwd_gate_enabled():
+        return False
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 3:
+        return False
+    env = CompileEnvironment.current()
+    match = match_flex_attention_bwd(
+        device_ir.graphs, device_ir.grid_block_ids[0], env=env
+    )
+    if match is None:
+        return False
+    targets = {match.kv_block_id: 128, match.q_block_id: 128}
+    if not _flash_block_sizes_reachable(env, targets):
+        return False
+    from .cute_flash_bwd_flex import additive_bias_region
+    from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
+    from .cute_flash_bwd_flex import fbwd_table_step_choices
+    from .cute_flash_bwd_flex import fbwd_tile_group_choices
+    from .cute_flash_bwd_flex_2cta import flex_bwd_two_cta_allowed
+    from .cute_flash_bwd_flex_2cta import flex_bwd_two_cta_table_steps
+    from .flex_bwd_match import flex_bwd_tmem_plan
+
+    tmem = flex_bwd_tmem_plan(match.plan.head_dim, match.plan.head_dim_v)
+    # The 2-CTA pair kernel (head dim 256) has no persistent walk, statistics
+    # MMAs, staged aux tables or chunked step table.
+    pair = tmem is not None and tmem.mode == "pair"
+    # The cluster-of-2 family at head dims (128, 128) (``cute_flash_bwd_flex_2cta``).
+    two_cta = not pair and flex_bwd_two_cta_allowed(match.plan, env.device)
+    env.config_spec.enable_cute_flash_bwd_search(
+        block_size_targets=targets,
+        two_cta_allowed=two_cta,
+        two_cta_table_steps=flex_bwd_two_cta_table_steps(match.plan, env.device)
+        if two_cta
+        else 0,
+        persistent_allowed=not pair,
+        flex=True,
+        tile_groups=fbwd_tile_group_choices(match.plan),
+        fast_math=bool(env.settings.fast_math),
+        aux_smem_candidates=() if pair else fbwd_aux_smem_candidates(match.plan),
+        # dS^T through TMEM needs dQ's own columns (the plain TMEM plan).
+        ds_tmem_allowed=tmem is not None and tmem.mode == "plain",
+        stats_mma_allowed=not pair,
+        # The first-step order knob: the plain forms (the alias_s plan has
+        # its own measured orders, the pair kernel none of this).
+        s_first_allowed=not pair and (tmem is None or tmem.mode != "alias_s"),
+        # Two K / V ring slots: the plain forms' persistent walk, where the
+        # storage holds them beside the deepest searched statistics form.
+        kv_stage_allowed=_flex_bwd_kv_stage_allowed(match.plan, env.device, tmem),
+        table_step_choices=(0,)
+        if pair
+        else fbwd_table_step_choices(match.plan, env.device),
+        has_mask=match.plan.mask_region is not None,
+        has_score=match.plan.score_region is not None,
+        additive_bias=additive_bias_region(match.plan) is not None,
     )
     return True

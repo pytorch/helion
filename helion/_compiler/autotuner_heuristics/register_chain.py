@@ -63,7 +63,7 @@ class CuteRegisterChainHeuristic(AutotunerHeuristic):
         ):
             return []
         return cls._register_chain_seeds(
-            env, device_ir, axes, has_collective_native_seed_candidate(device_ir.graphs)
+            env, device_ir, axes, has_collective_native_seed_candidate(env, device_ir)
         )
 
     @staticmethod

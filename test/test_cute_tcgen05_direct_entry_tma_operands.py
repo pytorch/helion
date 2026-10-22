@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from examples.grouped_gemm import grouped_gemm_jagged
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
+from test._cute_dense_tcgen05 import wrapper_plans
 from test.test_cute_shared_rhs_grouped import _bind as _bind_shared_rhs_grouped
 from test.test_cute_shared_rhs_grouped import _inputs as _shared_rhs_grouped_inputs
 
@@ -26,6 +28,7 @@ from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 import helion.language as hl
+from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -79,10 +82,10 @@ def _output_destinations(
 ) -> dict[str, tuple[torch.Tensor, bool]]:
     """Output tensors for an ``m x n`` GEMM paired with their TMA-store legality.
 
-    Only the plain row-major allocation satisfies the TensorMap proof the
-    direct-entry TMA store epilogue needs: an outer stride that is not a
-    16-byte multiple, a base offset of 8 bytes, or an N-major view all take
-    the SIMT store body, which rejects the flat-role / TVM-FFI seed.
+    Aligned row-major and N-major allocations satisfy the TensorMap proof:
+    the epilogue stages D in the destination's layout. An outer stride that
+    is not a 16-byte multiple or a base offset of 8 bytes takes the SIMT
+    store body, which rejects the flat-role / TVM-FFI seed in either layout.
     """
     return {
         "aligned": (torch.empty([m, n], device=DEVICE, dtype=dtype), True),
@@ -90,12 +93,60 @@ def _output_destinations(
             torch.empty([m, n + 4], device=DEVICE, dtype=dtype)[:, :n],
             False,
         ),
-        "n_major": (torch.empty([n, m], device=DEVICE, dtype=dtype).t(), False),
+        "n_major": (torch.empty([n, m], device=DEVICE, dtype=dtype).t(), True),
+        "n_major_under_aligned_stride": (
+            torch.empty([n, m + 4], device=DEVICE, dtype=dtype).t()[:m, :],
+            False,
+        ),
+        "n_major_offset_base": (
+            torch.empty([m * n + 4], device=DEVICE, dtype=dtype)[4:].view(n, m).t(),
+            False,
+        ),
         "offset_base": (
             torch.empty([m * n + 4], device=DEVICE, dtype=dtype)[4:].view(m, n),
             False,
         ),
     }
+
+
+def _assert_default_output_tma_layout(
+    bound: helion.runtime.kernel.BoundKernel,
+    config: helion.Config,
+    out: torch.Tensor,
+    *,
+    tma_store_legal: bool,
+) -> None:
+    """The selected default must lower and describe the same output layout."""
+    source = bound.to_code(config)
+    plans = wrapper_plans(source)
+    output_plans = [plan for plan in plans if plan["kind"] == "tcgen05_d_tma"]
+    assert len(output_plans) == int(tma_store_legal)
+    if not tma_store_legal:
+        return
+    output = output_plans[0]
+    column_major = out.stride(0) == 1
+    assert bool(output.get("d_column_major")) == column_major
+    assert output["d_idx"] == 2
+    assert output.get("orientation", "mn") == "mn"
+    assert (output["bm"], output["bn"]) == tuple(config.block_sizes[:2])
+    assert (output["epi_tile_m"], output["epi_tile_n"]) == (128, 32)
+    assert output["d_store_box_n"] == 32
+    assert "--enable-tvm-ffi" in source
+    ab = next(plan for plan in plans if plan["kind"] == "tcgen05_ab_tma")
+    assert (ab["lhs_idx"], ab["rhs_idx"]) == (0, 1)
+    wrapper: list[str] = []
+    _append_cute_wrapper_plan(wrapper, [], output)
+    wrapper_source = "\n".join(wrapper)
+    layout = "COL_MAJOR" if column_major else "ROW_MAJOR"
+    assert f"LayoutEnum.{layout}" in source
+    assert f"LayoutEnum.{layout}" in wrapper_source
+    # A column-major store changes staging, not the logical M/N coordinates
+    # or the output pointer: the descriptor uses the destination's strides.
+    if output.get("rank3_mnl_tensor"):
+        assert "(arg2_shape0, arg2_shape1, 1)" in wrapper_source
+        assert "stride=(arg2_stride0, arg2_stride1, 0)" in wrapper_source
+    else:
+        assert ", arg2, " in wrapper_source
 
 
 @onlyBackends(["cute"])
@@ -128,6 +179,53 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         bound.set_config(config)
         out = bound(a, b)
         torch.testing.assert_close(out, torch.matmul(a, b), rtol=1e-2, atol=1e-1)
+
+    def test_m_major_lhs_uses_the_tma_pipeline_and_direct_entry_seed(self) -> None:
+        """``x.T @ y`` stages its M-major A through TMA like a row-major A.
+
+        It used to keep the scalar SMEM producer and lose the row-major GEMM's
+        seeds, so its default config ran ~250x slower than the same GEMM on a
+        row-major copy of ``x.T``.
+        """
+        x = torch.randn([2048, 1024], device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn([2048, 1024], device=DEVICE, dtype=torch.bfloat16)
+        a = x.T
+        bound = _ordinary_gemm.bind((a, b))
+        spec = bound.config_spec
+        row_major_spec = _ordinary_gemm.bind((a.contiguous(), b)).config_spec
+        self.assertEqual(
+            spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+            row_major_spec._tcgen05_full_tile_direct_entry_seed_eligible(),
+        )
+        self.assertEqual(spec.default_config(), row_major_spec.default_config())
+        a_major = re.compile(
+            r"make_trivial_tiled_mma\([^,]+, [^,]+, cute\.nvgpu\.OperandMajorMode\.MN"
+        )
+        for config in (spec.default_config(), helion.Config(block_sizes=[128, 64, 64])):
+            self.assertRegex(bound.to_triton_code(config), a_major)
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
+            )
+
+    def test_k_major_b_block_n8_short_k_is_refused(self) -> None:
+        """An 8-row stage of 32-byte K-major B rows cannot be one TMA box.
+
+        CuTe splits it into one bulk copy per row at 32-byte shared offsets,
+        which faults with a sticky misaligned-address error. The config must be
+        refused at codegen instead (a wider K tile keeps the same B layout).
+        """
+        a = torch.randn([256, 256], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([256, 256], device=DEVICE, dtype=torch.float16).T
+        bound = _ordinary_gemm.bind((a, b))
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "block_n=8"):
+            bound.to_triton_code(helion.Config(block_sizes=[64, 8, 16]))
+        config = helion.Config(block_sizes=[64, 8, 32])
+        self.assertIn("tcgen05", bound.to_triton_code(config))
+        bound.set_config(config)
+        torch.testing.assert_close(
+            bound(a, b), torch.matmul(a, b), rtol=1e-2, atol=1e-1
+        )
 
     def test_reshape_view_lhs_keeps_direct_entry_seed(self) -> None:
         """A pointer-preserving host view keeps the direct-entry seed.
@@ -171,8 +269,13 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
             config.config.get("tcgen05_flat_role_coordinates") is True,
             tma_store_legal,
         )
+        _assert_default_output_tma_layout(
+            bound, config, out, tma_store_legal=tma_store_legal
+        )
         bound.set_config(config)
         result = bound(a, b, out)
+        self.assertEqual(result.data_ptr(), out.data_ptr())
+        self.assertEqual(result.stride(), out.stride())
         torch.testing.assert_close(result, torch.matmul(a, b), rtol=1e-2, atol=1e-1)
 
     def test_unaligned_output_stride_default_config_runs(self) -> None:
@@ -189,14 +292,13 @@ class TestCuteTcgen05DirectEntryTmaOperands(unittest.TestCase):
         self._assert_output_destination_default_runs(out, tma_store_legal=False)
 
     def test_n_major_output_default_config_runs(self) -> None:
-        """An N-major output must not select the TMA-store direct-entry seed.
+        """An aligned N-major output keeps the TMA-store direct-entry seed.
 
-        The plain matmul stages its D tile row-major, so a column-major
-        destination fails the TMA-store proof even though its base and outer
-        stride are aligned.
+        The ordinary GEMM stages its D tile column-major to match this
+        destination, preserving its logical shape, pointer and strides.
         """
         out = torch.empty([1024, 8192], device=DEVICE, dtype=torch.bfloat16).t()
-        self._assert_output_destination_default_runs(out, tma_store_legal=False)
+        self._assert_output_destination_default_runs(out, tma_store_legal=True)
 
 
 @contextlib.contextmanager
@@ -236,9 +338,13 @@ class TestCuteTcgen05DirectEntryTmaOutputProof(unittest.TestCase):
                     tma_store_legal,
                 )
                 self.assertEqual(len(_direct_entry_seeds(bound)), int(tma_store_legal))
-                default = spec.default_config().config
+                default_config = spec.default_config()
+                default = default_config.config
                 self.assertEqual(
                     default.get("tcgen05_tvm_ffi_launch") is True, tma_store_legal
+                )
+                _assert_default_output_tma_layout(
+                    bound, default_config, out, tma_store_legal=tma_store_legal
                 )
 
     def _single_mma_candidate(

@@ -32,6 +32,8 @@ from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
 from .memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torch._guards import Source
 
     from ...runtime.kernel import BoundKernel
@@ -440,6 +442,39 @@ def _input_specializations(
     return pointer_residues, guards
 
 
+def _mma_dag_alias_spec(
+    plans: Sequence[dict[str, object]], schema: Sequence[tuple[Any, ...]]
+) -> tuple[tuple[int, ...], tuple[bool, ...]] | None:
+    """The launch positions and store flags of a cute_mma_dag alias plan
+    (the launcher's ``_MmaDagAliasGuard``) for the exported launcher's span
+    check; None without the plan."""
+    alias = [plan for plan in plans if plan.get("kind") == "helion_mma_dag_alias"]
+    if not alias:
+        return None
+    if len(alias) > 1:
+        raise NotImplementedError(
+            "Standalone CuTe export expects one mma_dag alias plan per kernel"
+        )
+    indices = alias[0].get("tensor_idx")
+    stored = alias[0].get("stored")
+    if (
+        not isinstance(indices, list)
+        or not isinstance(stored, list)
+        or len(indices) != len(stored)
+        or any(
+            type(index) is not int
+            or not 0 <= index < len(schema)
+            or schema[index][0] != "tensor"
+            for index in indices
+        )
+        or any(type(flag) is not bool for flag in stored)
+    ):
+        raise NotImplementedError(
+            "Standalone CuTe export needs a well-formed mma_dag alias plan"
+        )
+    return tuple(indices), tuple(stored)
+
+
 def _capture_launches(
     bound: BoundKernel[Any],
     source: str,
@@ -461,7 +496,14 @@ def _capture_launches(
             )
         plans = getattr(kernel, "_helion_cute_wrapper_plans", ())
         if any(
-            plan.get("kind") not in ("helion_flash", "helion_small_biased_attention")
+            plan.get("kind")
+            not in (
+                "helion_flash",
+                "helion_small_biased_attention",
+                # Launch-time argument metadata: the exported launcher runs
+                # the alias check from the launch table (no host preparation).
+                "helion_mma_dag_alias",
+            )
             for plan in plans
         ):
             raise NotImplementedError(
@@ -479,14 +521,16 @@ def _capture_launches(
                 schema.append(_argument_schema(arg, pointer_residues))
         kernel_name = cast("Any", kernel).__name__
         options = kwargs.get("cute_compile_options")
+        alias = _mma_dag_alias_spec(plans, schema)
         if kernel_name in launch_specs:
-            previous_schema, _, previous_block, previous_options = launch_specs[
-                kernel_name
-            ]
-            if (tuple(schema), block, options) != (
+            previous_schema, _, previous_block, previous_options, previous_alias = (
+                launch_specs[kernel_name]
+            )
+            if (tuple(schema), block, options, alias) != (
                 previous_schema,
                 previous_block,
                 previous_options,
+                previous_alias,
             ):
                 raise NotImplementedError(
                     "Standalone CuTe export requires one launch schema per device function"
@@ -502,7 +546,13 @@ def _capture_launches(
             if isinstance(node, ast.Name) and node.id == "_kernel":
                 node.id = kernel_name
         wrappers.append(wrapper)
-        launch_specs[kernel_name] = (tuple(schema), wrapper.name, block, options)
+        launch_specs[kernel_name] = (
+            tuple(schema),
+            wrapper.name,
+            block,
+            options,
+            alias,
+        )
 
     with bound.env:
         entrypoint(*bound.fake_args, _launcher=capture)
@@ -591,8 +641,8 @@ def build_standalone_code(
     table = (
         "_STANDALONE_LAUNCHES = {\n"
         + "\n".join(
-            f"    {name!r}: ({_schema_repr(schema)}, {wrapper}, {block!r}, {options!r}),"
-            for name, (schema, wrapper, block, options) in launch_specs.items()
+            f"    {name!r}: ({_schema_repr(schema)}, {wrapper}, {block!r}, {options!r}, {alias!r}),"
+            for name, (schema, wrapper, block, options, alias) in launch_specs.items()
         )
         + "\n}"
     )
