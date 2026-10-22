@@ -167,11 +167,12 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
     replacements: dict[Node, Node] = {}
     for graph_info in graphs:
         graph = graph_info.graph
+        tagged_nodes = [node for node in graph.nodes if _META_KEY in node.meta]
+        if not tagged_nodes:
+            continue
         flat_nodes: dict[tuple[Node, int, int], Node] = {}
         nodes_by_name = {node.name: node for node in graph.nodes}
-        for node in [*graph.nodes]:
-            if _META_KEY not in node.meta:
-                continue
+        for node in tagged_nodes:
             tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
             original = nodes_by_name[tag.source]
             source = replacements.get(original, original)
