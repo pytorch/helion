@@ -428,7 +428,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @onlyBackends(["triton"])
     @parametrize("static_shapes", (False, True))
-    @parametrize("method", ("expand", "zeros", "view", "broadcast"))
+    @parametrize("method", ("expand", "zeros", "full", "view", "broadcast"))
     @skipIfRefEager("checks physical shapes after resolving logical sizes")
     def test_full_slice_size_in_shape_operations(self, static_shapes, method):
         def reduce(x: torch.Tensor, method: hl.constexpr) -> torch.Tensor:
@@ -439,6 +439,8 @@ class TestReductions(RefEagerTestBase, TestCase):
                     value = value.expand(value.shape)
                 elif method == "zeros":
                     value = value + value.new_zeros(value.shape)
+                elif method == "full":
+                    value = value + value.new_full(value.shape, value.size(1))
                 elif method == "view":
                     value = value.view(value.shape)
                 else:
@@ -455,7 +457,8 @@ class TestReductions(RefEagerTestBase, TestCase):
             actual = bound.compile_config(
                 helion.Config(block_sizes=[4], reduction_loops=[chunk])
             )(x, method)
-            torch.testing.assert_close(actual, x.sum(1))
+            expected = x.sum(1) + x.size(1) ** 2 if method == "full" else x.sum(1)
+            torch.testing.assert_close(actual, expected)
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
@@ -585,6 +588,27 @@ class TestReductions(RefEagerTestBase, TestCase):
                 helion.Config(block_sizes=[4], reduction_loops=[chunk])
             )(x)
             torch.testing.assert_close(actual, expected)
+
+    @onlyBackends(["triton"])
+    @parametrize("static_shapes", (False, True))
+    @skipIfRefEager("checks multi-dim chains after random-op rewriting")
+    def test_multi_dim_reduction_of_rewritten_random_source(self, static_shapes):
+        @helion.kernel(
+            backend="triton", static_shapes=static_shapes, autotune_effort="none"
+        )
+        def reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            samples = torch.empty_like(x)
+            totals = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                values = torch.rand_like(x[row, :, :])
+                samples[row, :, :] = values
+                totals[row] = values.sum((1, 2))
+            return samples, totals
+
+        x = torch.empty(5, 7, 9, device=DEVICE)
+        code, (samples, totals) = code_and_output(reduce, (x,), block_sizes=[2])
+        self.assertNotIn("flatten(1, 2)", code)
+        torch.testing.assert_close(totals, samples.sum((1, 2)))
 
     @onlyBackends(["triton"])
     @skipIfRefEager("checks merged dimensions beside an indirect store")

@@ -122,6 +122,43 @@ def register_lowering(
     return lowering
 
 
+def _keep_shape_size_reads(node: Node) -> None:
+    """Keep physical tile extents in ATen shape parameters."""
+    physical: Node | None = None
+
+    def physical_size(arg: Node) -> Node:
+        nonlocal physical
+        if arg is not node:
+            return arg
+        if physical is None:
+            with node.graph.inserting_before(node):
+                physical = node.graph.call_function(
+                    _get_symnode,
+                    (
+                        CompileEnvironment.current().sympy_debug(
+                            _to_sympy(node.meta["val"])
+                        ),
+                    ),
+                )
+            physical.meta.update(node.meta)
+            physical.meta.pop("lowering", None)
+            physical.meta["helion_host_scalar"] = False
+        return physical
+
+    for user in list(node.users):
+        if not isinstance(user.target, torch._ops.OpOverload):
+            continue
+        args, kwargs = list(user.args), dict(user.kwargs)
+        for position, argument in enumerate(user.target._schema.arguments):
+            if argument.name not in {"size", "shape", "length", "output_size"}:
+                continue
+            if position < len(args):
+                args[position] = map_arg(args[position], physical_size)
+            elif argument.name in kwargs:
+                kwargs[argument.name] = map_arg(kwargs[argument.name], physical_size)
+        user.args, user.kwargs = tuple(args), kwargs
+
+
 def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
     """Read a full slice's logical extent, independent of padding or chunk size."""
     env = CompileEnvironment.current()
@@ -130,6 +167,10 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
     ):
         block_id = env.get_block_id(node.meta["val"])
         if block_id is None or not env.block_sizes[block_id].reduction:
+            continue
+        _keep_shape_size_reads(node)
+        if not node.users:
+            graph.erase_node(node)
             continue
         size = env.block_sizes[block_id].size
         assert isinstance(size, (int, torch.SymInt))
@@ -216,9 +257,7 @@ def codegen_where(ctx: LoweringContext, node: Node) -> object:
 @full_lowering.register_codegen("common")
 def codegen_full(ctx: LoweringContext, node: Node) -> object:
     env = CompileEnvironment.current()
-    # The result metadata retains tile/reduction axes even when a size read
-    # used to request the factory has been resolved to its logical extent.
-    size = cast("torch.Tensor", node.meta["val"]).shape
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
     dtype = node.kwargs.get("dtype", torch.get_default_dtype())
     assert isinstance(dtype, torch.dtype)
     device = node.kwargs.get("device", env.device)
@@ -228,6 +267,7 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     if isinstance(value_ast, (int, float, bool)):
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
+    # pyrefly: ignore [not-iterable]
     shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
     return expr_from_string(
         env.backend.full_expr(shape_dims, "{value}", dtype),

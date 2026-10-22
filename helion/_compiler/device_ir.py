@@ -3462,6 +3462,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        # Resolve source-level sizes before RNG lowering introduces internal
+        # size queries that identify physical tile coordinates.
+        for graph in device_ir.graphs:
+            resolve_reduction_sizes(graph.graph)
         if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
             from .cute.philox_stream import rewrite_random_stream
 
@@ -3469,7 +3473,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
-            resolve_reduction_sizes(graph.graph)
         merged_rdims = merge_reduction_dims(device_ir.graphs)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
