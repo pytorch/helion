@@ -1819,9 +1819,9 @@ class RefEagerTestDisabled:
 
     def setUp(self) -> None:
         """Skip test if ref eager mode is enabled."""
-        super().setUp()  # type: ignore[misc]
         if os.environ.get("HELION_INTERPRET") == "1":
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
+        super().setUp()  # type: ignore[misc]
 
 
 class TestCase(unittest.TestCase):
@@ -1855,6 +1855,9 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+        # unittest does not call tearDown if setUp raises, including SkipTest.
+        # Close contexts even when a subclass skips after calling super().setUp().
+        self.addCleanup(self._test_stack.close)
 
         from torch._inductor.utils import fresh_cache
 

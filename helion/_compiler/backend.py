@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from ..runtime.settings import PrecompileMode
     from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
@@ -717,6 +718,18 @@ class Backend(abc.ABC):
         Other backends (Pallas, CuTe) may not need or support this.
         """
         return True
+
+    def supports_parallel_render(self) -> bool:
+        """Whether autotune candidates may be rendered in forked workers.
+
+        Code generation for such a backend is a pure function of the bound
+        kernel and the config whose only CUDA reads are the device facts
+        ``helion.autotuner.render_pool.CudaDeviceFacts`` captures, so a child
+        forked from the autotuning process renders byte-identical source
+        without touching the driver. Backends with a precompile pool do not
+        need it; see :mod:`helion.autotuner.render_pool`.
+        """
+        return False
 
     def setup_compile_cache_dir(self, device_index: int) -> None:
         """Point the backend's on-disk compile cache at Helion's cache root.
@@ -1506,9 +1519,11 @@ class Backend(abc.ABC):
         """
         force = force or bound_kernel.settings.force_autotune
 
-        # Disable precompile for backends that don't support it
-        if not self.supports_precompile():
-            bound_kernel.settings.autotune_precompile = None
+        # Backends without a precompile pool keep only the fork mode, and only
+        # when they render candidates in forked workers instead.
+        bound_kernel.settings.autotune_precompile = autotune_precompile_mode(
+            self, bound_kernel.settings.autotune_precompile
+        )
 
         if bound_kernel.settings.autotune_effort == "none" and (
             force or not bound_kernel.kernel.configs
@@ -2849,14 +2864,21 @@ def _attention_k_load_head_dim(node: torch.fx.Node) -> int | None:
     canonical ``k_view[b, tile_n, :]`` load whose host tensor keeps the
     specialized head dim (the loop graph's operand metadata does not).
     """
-    from ..language import memory_ops
-    from ..language._tracing_ops import _host_tensor
-
     if node.op != "call_function" or not node.args:
         return None
     source = node.args[0]
     if not isinstance(source, torch.fx.Node):
         return None
+    return _attention_load_head_dim(source)
+
+
+def _attention_load_head_dim(source: torch.fx.Node) -> int | None:
+    """Return the static head dim of the host tensor behind a canonical
+    ``x_view[b, tile, :]`` load (the loop graph's operand metadata may carry
+    the width as an unbacked symbol; the host tensor keeps it specialized)."""
+    from ..language import memory_ops
+    from ..language._tracing_ops import _host_tensor
+
     if source.op != "call_function" or source.target is not memory_ops.load:
         return None
     tensor = source.args[0] if source.args else None
@@ -3247,7 +3269,17 @@ def _attention_softmax_pattern_head_dim(
             return None
     head_dim_v = pv_val.shape[2]
     if not isinstance(head_dim_v, int):
-        return None
+        # The loop graph's PV output carries the V/O width as an unbacked
+        # symbol for the widths the shape environment does not keep concrete
+        # (64 and 128 stay ints, 96 does not); V's host tensor keeps the
+        # specialized width, as K's does for the Q/K width below.
+        head_dim_v = (
+            _attention_load_head_dim(pv_node.args[2])
+            if len(pv_node.args) > 2 and isinstance(pv_node.args[2], torch.fx.Node)
+            else None
+        )
+        if head_dim_v is None:
+            return None
     if not isinstance(qk_node.args[1], torch.fx.Node):
         return None
     k_indices = _attention_k_load_indices(qk_node.args[1], kv_block_id=kv_block_id)
@@ -3997,3 +4029,22 @@ from .metal.backend import MetalBackend  # noqa: E402, F401
 from .pallas.backend import PallasBackend  # noqa: E402, F401
 from .triton.backend import TileIRBackend  # noqa: E402, F401
 from .triton.backend import TritonBackend  # noqa: E402, F401
+
+
+def autotune_precompile_mode(
+    backend: Backend, requested: PrecompileMode
+) -> PrecompileMode:
+    """The ``autotune_precompile`` mode ``backend`` honours.
+
+    A backend with a precompile pool takes the setting as is. One without
+    keeps ``"fork"`` only to render candidates in forked workers
+    (``Backend.supports_parallel_render``); ``"spawn"`` has no equivalent
+    there and turns into ``None`` like any other mode. A function rather
+    than a method so any object with ``supports_precompile`` (test doubles
+    included) can stand in for a backend that has a pool.
+    """
+    if backend.supports_precompile():
+        return requested
+    if requested == "fork" and backend.supports_parallel_render():
+        return "fork"
+    return None

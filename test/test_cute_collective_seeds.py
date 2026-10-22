@@ -10,12 +10,16 @@ from examples.matmul import matmul
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
 from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.collective_matmul import _is_direct_zero_seed
+from helion._compiler.cute.collective_matmul import has_collective_native_seed_candidate
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
+from helion._testing import TestCase
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import KernelGridFact
@@ -27,6 +31,7 @@ if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import DeviceIR
     from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.kernel import BoundKernel
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -50,48 +55,43 @@ def _independent_matmuls(
     return first, second
 
 
-@skipUnlessBackends(["cute"])
-def test_independent_contractions_receive_complete_collective_seeds() -> None:
-    inputs = tuple(
+def _admitted_inputs() -> tuple[torch.Tensor, ...]:
+    return tuple(
         torch.empty(shape, dtype=torch.float16)
         for shape in ((128, 256), (256, 64), (96, 64), (64, 256))
     )
-    with ExitStack() as stack:
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", (10, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (10, 0)),
-            ("helion.runtime.get_num_sm", 148),
-            ("helion._compat._is_hip", False),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        bound = _independent_matmuls._bind_isolated(inputs)
-        assert bound.host_function is not None
-        with bound.env:
-            seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
-                bound.env, bound.host_function.device_ir
-            )
-        assert seeds
-        assert bound.to_code(seeds[0]).count("cute.gemm(") == 2
-        assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
-        spec = bound.config_spec
-        assert len(spec.matmul_facts) == 2
-        for seed in seeds:
-            assert len(seed.block_sizes) == len(spec.block_sizes) == 6
-            assert len(seed.num_threads) == len(spec.num_threads)
-            widths = seed["cute_vector_widths"]
-            assert isinstance(widths, list)
-            assert len(widths) == len(spec.cute_vector_widths)
-            assert seed["cute_collective_mma"]
-            for fact in spec.matmul_facts:
-                n = fact.n_block_id
-                m = fact.m_block_id
-                k = fact.k_block_id
-                assert m is not None and n is not None and k is not None
-                bn = spec.block_sizes.config_get(seed.block_sizes, n)
-                assert bn is not None
-                assert spec.num_threads.config_get(seed.num_threads, m) == 128 // bn
-                assert spec.num_threads.config_get(seed.num_threads, n) == bn
-                assert spec.num_threads.config_get(seed.num_threads, k) == 1
+
+
+@skipUnlessBackends(["cute"])
+def test_independent_contractions_receive_complete_collective_seeds() -> None:
+    bound = _cpu_bind(_independent_matmuls, _admitted_inputs())
+    assert bound.host_function is not None
+    with bound.env:
+        seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds
+    assert bound.to_code(seeds[0]).count("cute.gemm(") == 2
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    spec = bound.config_spec
+    assert len(spec.matmul_facts) == 2
+    for seed in seeds:
+        assert len(seed.block_sizes) == len(spec.block_sizes) == 6
+        assert len(seed.num_threads) == len(spec.num_threads)
+        widths = seed["cute_vector_widths"]
+        assert isinstance(widths, list)
+        assert len(widths) == len(spec.cute_vector_widths)
+        assert seed["cute_collective_mma"]
+        for fact in spec.matmul_facts:
+            n = fact.n_block_id
+            m = fact.m_block_id
+            k = fact.k_block_id
+            assert m is not None and n is not None and k is not None
+            bn = spec.block_sizes.config_get(seed.block_sizes, n)
+            assert bn is not None
+            assert spec.num_threads.config_get(seed.num_threads, m) == 128 // bn
+            assert spec.num_threads.config_get(seed.num_threads, n) == bn
+            assert spec.num_threads.config_get(seed.num_threads, k) == 1
 
 
 def test_incomplete_attribution_does_not_seed_independent_roots() -> None:
@@ -254,3 +254,176 @@ def test_collective_async_priority_preserves_candidates_and_default(
             assert normalized[0][1]["cute_collective_copy"] == (
                 "async" if preferred else "scalar"
             )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _serial_state_recurrence(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    bh, n, _c, d = k.shape
+    dv = v.size(3)
+    h_all = torch.empty((bh, n, d, dv), dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([bh, d, dv], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i in hl.grid(n):
+            h_all[idx, i, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+            h_acc = hl.dot(
+                k[idx, i, :, tile_d].transpose(-2, -1), v[idx, i, :, tile_dv], acc=h_acc
+            )
+    return h_all
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _serial_fresh_zero(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    bh, n, _c, d = k.shape
+    dv = v.size(3)
+    h_all = torch.empty((bh, n, d, dv), dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([bh, d, dv], block_size=[1, None, None]):
+        idx = tile_bh.id
+        for i in hl.grid(n):
+            h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+            h_acc = hl.dot(
+                k[idx, i, :, tile_d].transpose(-2, -1), v[idx, i, :, tile_dv], acc=h_acc
+            )
+            h_all[idx, i, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+    return h_all
+
+
+def _state_inputs() -> tuple[torch.Tensor, ...]:
+    return tuple(torch.empty((4, 8, 64, 64), dtype=torch.bfloat16) for _ in range(2))
+
+
+def _assert_geometry_without_seeds(bound: BoundKernel) -> None:
+    # Only the seeds are withheld. The geometry still exposes the
+    # proven-bounds knob and registers the stride facts, so an explicit
+    # (or previously autotuned) config keeps normalizing and compiling.
+    spec = bound.config_spec
+    assert not any(
+        seed.get("cute_collective_mma", False) for seed in spec.compiler_seed_configs
+    )
+    assert spec.cute_proven_bounds_enabled
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    default = spec.default_config()
+    assert default["cute_proven_bounds"] is False
+    explicit = helion.Config.from_dict(
+        default.config | {"cute_proven_bounds": False, "cute_collective_mma": True}
+    )
+    assert "cute.gemm(" not in bound.to_code(explicit)
+
+
+@skipUnlessBackends(["cute"])
+def test_serial_loop_carried_accumulator_receives_no_collective_seeds() -> None:
+    # The full-slice K contraction accumulates the chunk loop's carry, so only
+    # the first chunk starts from the captured zero. The lowering refuses such
+    # a site under every config, so the heuristic must not seed the kernel.
+    bound = _cpu_bind(_serial_state_recurrence, _state_inputs())
+    assert bound.host_function is not None
+    ir = bound.host_function.device_ir
+    (fact,) = bound.config_spec.matmul_facts
+    assert fact.k_block_id is not None
+    assert bound.env.block_sizes[fact.k_block_id].reduction
+    with bound.env:
+        (node,) = [
+            node
+            for graph in ir.graphs
+            for node in graph.graph.nodes
+            if node.target is hl.dot
+        ]
+        acc = node.args[2]
+        assert isinstance(acc, torch.fx.Node)
+        assert not _is_direct_zero_seed(ir.graphs, node, acc, fact.k_block_id)
+        assert has_collective_native_seed_candidate(bound.env, ir)
+        assert CuteCollectiveMatmulHeuristic._axes(bound.env, ir)
+        assert CuteCollectiveMatmulHeuristic.get_seed_configs(bound.env, ir) == []
+    _assert_geometry_without_seeds(bound)
+
+
+@skipUnlessBackends(["cute"])
+def test_serial_loop_indexed_operands_receive_no_collective_seeds() -> None:
+    # A zero created in every chunk passes the seed proof, but the operands
+    # index the chunk loop's coordinate, which no scalar recipe can replay.
+    bound = _cpu_bind(_serial_fresh_zero, _state_inputs())
+    assert bound.host_function is not None
+    ir = bound.host_function.device_ir
+    with bound.env:
+        assert not has_collective_native_seed_candidate(bound.env, ir)
+        assert CuteCollectiveMatmulHeuristic._axes(bound.env, ir)
+        assert CuteCollectiveMatmulHeuristic.get_seed_configs(bound.env, ir) == []
+    _assert_geometry_without_seeds(bound)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _branch_around_reduction(
+    a: torch.Tensor, b: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    out = torch.zeros((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+    for row, col in hl.tile([a.size(0), b.size(1)]):
+        if flag[0] > 0:
+            acc = hl.zeros([row, col], dtype=torch.float32)
+            for kk in hl.tile(a.size(1)):
+                acc = torch.addmm(acc, a[row, kk] * 0.5, b[kk, col])
+            out[row, col] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _block_size_scaled_operand(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty((4, a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+    for row, col in hl.tile([a.size(0), b.size(1)]):
+        for rep in hl.tile(4, block_size=1):
+            acc = hl.zeros([row, col], dtype=torch.float32)
+            for kk in hl.tile(a.size(1)):
+                acc = torch.addmm(acc, a[row, kk] * rep.block_size, b[kk, col])
+            out[rep.begin, row, col] = acc.to(out.dtype)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_branch_between_grid_rows_and_reduction_receives_no_collective_seeds() -> None:
+    # The predicate is scalar, but the row lane of a grid M wraps the whole
+    # root body, so the branch sits inside the row/reduction region the
+    # lowering refuses under every config.
+    inputs = (
+        torch.empty((256, 256), dtype=torch.float16),
+        torch.empty((256, 256), dtype=torch.float16),
+        torch.empty((1,), dtype=torch.float32),
+    )
+    bound = _cpu_bind(_branch_around_reduction, inputs)
+    assert bound.host_function is not None
+    ir = bound.host_function.device_ir
+    with bound.env:
+        assert CuteCollectiveMatmulHeuristic._axes(bound.env, ir)
+        assert CuteCollectiveMatmulHeuristic.get_seed_configs(bound.env, ir) == []
+    _assert_geometry_without_seeds(bound)
+
+
+@skipUnlessBackends(["cute"])
+def test_enclosing_loop_block_size_keeps_collective_seeds() -> None:
+    # The enclosing loop's block size is replayed as a constant; only its
+    # position (grid index, tile begin, or the tile as a load coordinate)
+    # would deny the operands a scalar recipe.
+    inputs = tuple(torch.empty((256, 256), dtype=torch.float16) for _ in range(2))
+    bound = _cpu_bind(_block_size_scaled_operand, inputs)
+    assert bound.host_function is not None
+    with bound.env:
+        seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds
+    assert bound.to_code(seeds[0]).count("cute.gemm(") == 1
+
+
+class TestCollectiveSeedCodegen(TestCase):
+    @skipUnlessBackends(["cute"])
+    def test_admitted_contractions_keep_their_seeds_and_code(self) -> None:
+        # The structural seed filter must leave an admitted kernel untouched:
+        # pin the seed count and the first seed's generated code.
+        bound = _cpu_bind(_independent_matmuls, _admitted_inputs())
+        assert bound.host_function is not None
+        with bound.env:
+            seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        self.assertEqual(len(seeds), 112)
+        code = bound.to_code(seeds[0], output_origin_lines=False)
+        self.assertEqual(code.count("cute.gemm("), 2)
+        self.assertExpectedJournal(code)

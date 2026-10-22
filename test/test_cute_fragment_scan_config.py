@@ -426,16 +426,18 @@ def _reduction_config(bound, mode):
     ],
 )
 def test_fragment_reduction_algorithm_fact_matches_supported_combines(kind, dtype):
+    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+
     bound = _bind_reduction(kind, dtype)
     spec = bound.config_spec
     assert spec.cute_fragment_reduction_root_ids
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     field = spec._flat_fields()[REDUCTION_KEY]
     assert isinstance(field, EnumFragment)
-    assert field.choices == ("serial", "warp")
+    assert field.choices == MODES
     assert REDUCTION_KEY not in spec.default_config()
     generation = spec.create_config_generation()
-    for mode in ("serial", "warp"):
+    for mode in MODES:
         flat, config = generation.strict_config_pair(_reduction_config(bound, mode))
         assert config.get(REDUCTION_KEY, "serial") == mode
         assert generation.unflatten(flat).get(REDUCTION_KEY, "serial") == mode
@@ -494,6 +496,8 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_preserves_original_population_and_rng(strategy):
+    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
     ):
@@ -515,21 +519,25 @@ def test_fragment_reduction_coverage_preserves_original_population_and_rng(strat
         for index in positions
     ]
     assert [[row[index] for index in indices] for row in actual[:20]] == expected
-    assert len(actual) == len(expected) + 1
+    assert len(actual) == len(expected) + len(MODES) - 1
     assert bound.config_spec.compiler_seed_configs == seeds
     group = next(
         group
         for group in bound.config_spec.compiler_coverage_groups
         if group.key == REDUCTION_KEY
     )
-    assert group.domain == ("serial", "warp") and group.legacy == "serial"
-    assert len(group.witnesses) == 1
-    assert full.config_gen.unflatten(actual[-1])[REDUCTION_KEY] == "warp"
+    assert group.domain == MODES and group.legacy == "serial"
+    assert len(group.witnesses) == len(MODES) - 1
+    assert [
+        full.config_gen.unflatten(row)[REDUCTION_KEY] for row in actual[20:]
+    ] == list(MODES[1:])
 
 
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_neighbors_random_mutation_and_overrides():
+    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+
     bound = _bind_reduction()
     generation = bound.config_spec.create_config_generation()
     projections = generation.coordinate_neighbor_projections(generation.default_flat())
@@ -540,7 +548,7 @@ def test_fragment_reduction_neighbors_random_mutation_and_overrides():
     random.seed(4182)
     assert {
         generation.random_config().get(REDUCTION_KEY, "serial") for _ in range(24)
-    } == {"serial", "warp"}
+    } == set(MODES)
     for disabled in (False, True):
         search = make_search(
             bound.config_spec,
@@ -589,6 +597,8 @@ def _scan_and_fragment_reduction(x: torch.Tensor):
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
 @pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
+    from helion._compiler.autotuner_heuristics.cute_fragment_reduction import MODES
+
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
     ):
@@ -615,8 +625,10 @@ def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
     assert [
         [row[index] for index in indices] for row in actual[: len(expected)]
     ] == expected
-    assert len(expected) == 21 and len(actual) == 22
-    assert full.config_gen.unflatten(actual[-1])[REDUCTION_KEY] == "warp"
+    assert len(expected) == 21 and len(actual) == len(expected) + len(MODES) - 1
+    assert [
+        full.config_gen.unflatten(row)[REDUCTION_KEY] for row in actual[len(expected) :]
+    ] == list(MODES[1:])
 
 
 def test_fragment_reduction_mixed_supported_and_indexed_nodes_use_shared_predicate():
@@ -761,7 +773,7 @@ def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
     modes = {
         full.config_gen.random_config().get(REDUCTION_KEY, "serial") for _ in range(32)
     }
-    assert modes == {"serial", "warp"}
+    assert modes == {"serial", "warp", "cta", "cta_unroll"}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

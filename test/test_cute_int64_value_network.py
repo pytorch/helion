@@ -329,5 +329,11 @@ def test_int64_network_default_and_population_prefix_stay_legacy() -> None:
             )
             states.append(random.getstate())
     assert states[0] == states[1]
-    assert populations[1][:-1] == populations[0]
-    assert populations[1][-1]["cute_fragment_topk_network"] is True
+    # New deferred owners append witnesses after the unchanged legacy prefix.
+    assert populations[1][: len(populations[0])] == populations[0]
+    suffix = populations[1][len(populations[0]) :]
+    assert len(suffix) == 2
+    assert suffix[0]["cute_fragment_topk_network"] is True
+    assert suffix[0].get("cute_fragment_cta_topk", False) is False
+    assert suffix[1]["cute_fragment_topk_network"] is True
+    assert suffix[1]["cute_fragment_cta_topk"] is True

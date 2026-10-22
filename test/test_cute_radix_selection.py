@@ -528,53 +528,59 @@ def test_flags_require_typed_booleans_and_radix_and_trim_requires_largest() -> N
         smallest.to_code(_radix_config(smallest, cute_radix_valid_domain=True))
 
 
+_RADIX_SOURCE_FLAGS = tuple(
+    key for key in BOOLEAN_KEYS if key != "cute_radix_cached_payload_inverse"
+)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_all_flag_combinations_keep_typed_bounded_source_and_allocations(dtype) -> None:
+@pytest.mark.parametrize(
+    "modes", tuple(product((False, True), repeat=len(_RADIX_SOURCE_FLAGS)))
+)
+def test_all_flag_combinations_keep_typed_bounded_source_and_allocations(
+    dtype: torch.dtype, modes: tuple[bool, ...]
+) -> None:
     bound = _cpu_bind(_payload_selection, _args(dtype))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
-    flags = tuple(
-        key for key in BOOLEAN_KEYS if key != "cute_radix_cached_payload_inverse"
+    config = _radix_config(
+        bound,
+        cute_radix_candidate_capacity=1024,
+        **dict(zip(_RADIX_SOURCE_FLAGS, modes, strict=True)),
     )
-    for modes in product((False, True), repeat=len(flags)):
-        config = _radix_config(
-            bound,
-            cute_radix_candidate_capacity=1024,
-            **dict(zip(flags, modes, strict=True)),
-        )
-        plan = radix_schedule(graph, config.config)
-        source = bound.to_code(config)
-        tree = ast.parse(source)
-        assert not any(isinstance(node, ast.Set) for node in ast.walk(tree))
-        assert "_helion_radix_consumer" not in source
+    plan = radix_schedule(graph, config.config)
+    source = bound.to_code(config)
+    tree = ast.parse(source)
+    assert not any(isinstance(node, ast.Set) for node in ast.walk(tree))
+    assert "_helion_radix_consumer" not in source
+    assert (
+        "scope='cluster'" in source
+        if plan.ticket_stores
+        else "scope='cluster'" not in source
+    )
+    declarations = {name: (kind, count) for name, kind, count in plan.allocations}
+    if plan.cache_keys_enabled:
+        key_type = torch.uint32 if dtype == torch.float32 else torch.uint16
+        assert declarations["candidate_keys"] == (key_type, 1024)
         assert (
-            "scope='cluster'" in source
-            if plan.ticket_stores
-            else "scope='cluster'" not in source
+            "allocate_tensor(cutlass.Uint32" in source
+            if dtype == torch.float32
+            else "allocate_tensor(cutlass.Uint16" in source
         )
-        declarations = {name: (kind, count) for name, kind, count in plan.allocations}
-        if plan.cache_keys_enabled:
-            key_type = torch.uint32 if dtype == torch.float32 else torch.uint16
-            assert declarations["candidate_keys"] == (key_type, 1024)
-            assert (
-                "allocate_tensor(cutlass.Uint32" in source
-                if dtype == torch.float32
-                else "allocate_tensor(cutlass.Uint16" in source
-            )
-            assert "candidate_keys[" in source
-        else:
-            assert "candidate_keys" not in source
-        assert ("selected_indices" in declarations) is not plan.ticket_stores
-        assert ("metadata" in declarations) is not plan.ticket_stores
-        assert plan.shared_bytes == sum(
-            ((kind.itemsize * count + 15) // 16) * 16
-            for kind, count in declarations.values()
-        )
-        if plan.scalar_candidates:
-            assert "range_constexpr(1)" in source
-        if plan.valid_domain:
-            assert "clamped_length = cutlass.Int64(" in source
-            assert "short_slot" in source
+        assert "candidate_keys[" in source
+    else:
+        assert "candidate_keys" not in source
+    assert ("selected_indices" in declarations) is not plan.ticket_stores
+    assert ("metadata" in declarations) is not plan.ticket_stores
+    assert plan.shared_bytes == sum(
+        ((kind.itemsize * count + 15) // 16) * 16
+        for kind, count in declarations.values()
+    )
+    if plan.scalar_candidates:
+        assert "range_constexpr(1)" in source
+    if plan.valid_domain:
+        assert "clamped_length = cutlass.Int64(" in source
+        assert "short_slot" in source
 
 
 def test_zero_capacity_bypasses_key_and_scalar_cache_and_c1_avoids_dsm() -> None:
@@ -593,6 +599,20 @@ def test_zero_capacity_bypasses_key_and_scalar_cache_and_c1_avoids_dsm() -> None
     assert "map_dsmem_ptr" not in source and "scope='cluster'" not in source
     assert "range_constexpr(1)" not in source
     assert "selected_indices" not in source
+
+
+def test_resident_input_register_budget_preserves_reload_path() -> None:
+    bound = _cpu_bind(_payload_selection, _args(cols=65537))
+    reload = _radix_config(bound, cute_radix_threads=256, cute_radix_cluster_ctas=1)
+    bound.config_spec.normalized_config(reload)
+    resident = _radix_config(
+        bound,
+        cute_radix_threads=256,
+        cute_radix_cluster_ctas=1,
+        cute_radix_resident_input=True,
+    )
+    with pytest.raises(exc.InvalidConfig, match="register budget"):
+        bound.config_spec.normalized_config(resident)
 
 
 def test_int64_length_clamps_before_narrowing_and_raw_suffix_is_preserved() -> None:
@@ -702,14 +722,23 @@ def test_forwarded_raw_keeps_identity_prefix_masks_and_unmasked_loads_reread() -
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("packet_bits", [128, 256])
 @pytest.mark.parametrize("unroll", [1, 2, 4])
+@pytest.mark.parametrize("resident_input", [False, True])
+@pytest.mark.parametrize("payload_inverse", [False, True])
 def test_packet_width_and_source_unroll_keep_uniform_candidate_loops(
-    dtype, packet_bits, unroll
+    dtype, packet_bits, unroll, resident_input, payload_inverse
 ) -> None:
     args = _args(dtype, cols=35)
     bound = _cpu_bind(_payload_selection, args)
     config = _radix_config(
         bound,
-        **dict.fromkeys(BOOLEAN_KEYS, True),
+        **{
+            key: True
+            for key in BOOLEAN_KEYS
+            if key
+            not in ("cute_radix_resident_input", "cute_radix_cached_payload_inverse")
+        },
+        cute_radix_resident_input=resident_input,
+        cute_radix_cached_payload_inverse=payload_inverse,
         cute_radix_candidate_capacity=1024,
         cute_radix_packet_bits=packet_bits,
         cute_radix_scan_unroll=unroll,
@@ -724,12 +753,16 @@ def test_packet_width_and_source_unroll_keep_uniform_candidate_loops(
     assert f"align({packet_bits // 8})" in source
     assert f"% {plan.packet} == 0" in source
     assert "cutlass.Int64(35)" in source
-    if unroll > 1:
+    if unroll > 1 and not resident_input:
         assert f"unroll={unroll}" in source
         # The cached scalar branch still uses ordinary uniform range rounds.
         assert "for radix_packet_round in range(radix_scan_rounds):" in source
     else:
         assert "unroll=" not in source
+    if resident_input:
+        assert ("radix_resident_values" in source) is not payload_inverse
+        assert "radix_resident_keys" in source
+        assert "if radix_packet_round < radix_scan_rounds:" in source
     assert "range_constexpr(1)" in source
     assert "_helion_radix_consumer" not in source
 
@@ -826,7 +859,13 @@ def test_first_histogram_publishes_counters_and_all_row_branches_keep_final_wait
     assert "short_slot" in ast.unparse(short)
     assert ast.unparse(kernel.body[-1]) == "cute.arch.cluster_wait()"
     assert ast.unparse(kernel.body[-2]) == "cute.arch.cluster_arrive()"
-    primary = next(node for node in branch.orelse if isinstance(node, ast.For))
+    primary = next(
+        node
+        for node in branch.orelse
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "radix_primary_round"
+    )
     assert primary.iter.args[0].value >= 2
     published = ast.unparse(primary)
     assert "cute.arch.cluster_arrive()" in published

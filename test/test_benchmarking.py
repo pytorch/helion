@@ -4370,7 +4370,10 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 
     assert policy["kind"] == "canonical_cute_flash"
     # Dense populations retain the explicit standard/resident choices; every
-    # surface also seeds upstream's distinct flat ws_overlap grid, the dense
+    # surface also seeds upstream's distinct flat ws_overlap grid and the
+    # single-tile issue-stream body on it (the TMA ring on its own warp, one
+    # extra K slot, the two-stage stat ring: ``cute_flash_ws_loader_warp``),
+    # the dense
     # hd64 surface the two measured wide fa4_local_tma packets and the causal
     # hd64 surface the three measured causal bodies (the paired 16-column
     # score-load body at s2048 and s8192 and the hybrid s4096 body) and the
@@ -4379,8 +4382,8 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     # The examples run without the fast_math setting, so no seed carries a
     # polynomial exp2 packet: each such seed keeps its structure on the exact
     # default packet instead (the same raw and effective counts).
-    assert policy["raw_config_count"] == (14 if causal else 33)
-    assert len(policy["effective_config_ids"]) == (14 if causal else 32)
+    assert policy["raw_config_count"] == (15 if causal else 34)
+    assert len(policy["effective_config_ids"]) == (15 if causal else 33)
     # Generation zero retains every seed and every structural coverage row;
     # their union may exceed the nominal 100 rows (the dense hd64 surface's
     # resident lowerings widen the design and it seeds the two fa4_local_tma
@@ -4404,7 +4407,7 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
         # D128 batched exp2 packets and alternating-warpgroup family; the
         # dense hd64 surface also seeds the two wide fa4_local_tma packets and
         # the causal hd64 surface the three measured causal bodies.
-        ("attention_output", (2, 32, 262144, 128), 18, 18),
+        ("attention_output", (2, 32, 262144, 128), 19, 19),
         # The causal hd128 surface seeds the hardware-only resident cadence
         # packet (the three polynomial cadences are fast_math-only and fold
         # onto it without the setting) and the staggered descending split
@@ -4412,15 +4415,15 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
         # target seed's and the fragment defaults' parents produce the same
         # structure).
         ("causal_attention_output", (2, 32, 524288, 128), 8, 8),
-        ("attention_output", (1, 32, 524288, 64), 23, 22),
+        ("attention_output", (1, 32, 524288, 64), 24, 23),
         # Every plain causal hd64 surface seeds the staggered walk at ring 4
         # once on top of its measured bodies.
-        ("causal_attention_output", (1, 32, 1048576, 64), 17, 17),
+        ("causal_attention_output", (1, 32, 1048576, 64), 18, 18),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
         ("causal_attention_output", (8, 32, 786432, 64), 15, 15),
-        ("attention_relu_output", (2, 32, 524288, 64), 23, 22),
+        ("attention_relu_output", (2, 32, 524288, 64), 24, 23),
         ("causal_attention_relu_output", (2, 32, 1048576, 64), 15, 15),
-        ("causal_attention_output", (2, 32, 65536, 64), 19, 19),
+        ("causal_attention_output", (2, 32, 65536, 64), 20, 20),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")

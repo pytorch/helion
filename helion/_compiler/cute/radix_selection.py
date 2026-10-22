@@ -267,6 +267,23 @@ class RadixSelectionPlan:
     packet_bits: int = 128
     scan_unroll: int = 1
     cached_payload_inverse: bool = False
+    resident_input: bool = False
+    boundary_early_exit: bool = False
+    defer_output: bool = False
+    partial_scan: bool = False
+
+    @property
+    def source_packet_rounds(self) -> int:
+        step = self.threads * self.packet
+        return (self.cta_cols + step - 1) // step
+
+    @property
+    def resident_elements(self) -> int:
+        return self.source_packet_rounds * self.packet
+
+    @property
+    def resident_keys_only(self) -> bool:
+        return self.resident_input and self.cached_payload_inverse
 
     @property
     def cache_keys_enabled(self) -> bool:
@@ -337,6 +354,12 @@ class RadixSelectionPlan:
                 for allocation in allocations
                 if allocation[0] not in ("selected_indices", "metadata")
             )
+        if self.defer_output:
+            allocations = tuple(
+                allocation
+                for allocation in allocations
+                if allocation[0] not in ("coarse_prefix", "coarse_mask")
+            )
         if self.candidate_capacity:
             allocations += (
                 ("candidate_indices", torch.int32, self.candidate_capacity),
@@ -345,6 +368,8 @@ class RadixSelectionPlan:
             allocations += (
                 ("candidate_keys", self.cached_key_dtype, self.candidate_capacity),
             )
+        if self.boundary_early_exit:
+            allocations += (("primary_done", torch.int32, 1),)
         return allocations
 
     @property
@@ -828,6 +853,10 @@ def radix_schedule(
         cast("int", config.get("cute_radix_packet_bits", 128)),
         cast("int", config.get("cute_radix_scan_unroll", 1)),
         cast("bool", config.get("cute_radix_cached_payload_inverse", False)),
+        cast("bool", config.get("cute_radix_resident_input", False)),
+        cast("bool", config.get("cute_radix_boundary_early_exit", False)),
+        cast("bool", config.get("cute_radix_defer_output", False)),
+        cast("bool", config.get("cute_radix_partial_scan", False)),
     )
 
 
@@ -836,10 +865,17 @@ def validate_radix_schedule(spec: ConfigSpec, config: dict[str, object]) -> None
     if graph is None:
         raise exc.InvalidConfig("radix requires a proved unordered selection root")
     plan = radix_schedule(graph, config)
+    resident_words = plan.resident_elements * (1 if plan.resident_keys_only else 2)
+    if plan.resident_input and resident_words > 128:
+        raise exc.InvalidConfig("resident radix input exceeds the register budget")
     if plan.cached_payload_inverse:
-        if not (plan.cache_keys_enabled and plan.ticket_stores and plan.valid_domain):
+        if not (
+            (plan.cache_keys_enabled or plan.resident_input)
+            and plan.ticket_stores
+            and plan.valid_domain
+        ):
             raise exc.InvalidConfig(
-                "cached payload inverse needs paired keys and a known-valid ticket plan"
+                "cached payload inverse needs a key cache and a known-valid ticket plan"
             )
         from .radix_selection_codegen import has_exact_cached_payload_consumer
 

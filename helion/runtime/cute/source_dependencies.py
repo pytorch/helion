@@ -99,6 +99,12 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
     ),
+    "helion_mma_dag_tma": (
+        "_compiler/cute/_mma_dag_runtime.py",
+        "_compiler/cute/_mma_dag_tcgen05_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+        "_compiler/cute/_warp_mma_runtime.py",
+    ),
 }
 
 

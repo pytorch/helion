@@ -21,8 +21,8 @@ import torch
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from collections.abc import Iterable
-    from collections.abc import Iterator
 
     from rich.progress import Task
 
@@ -40,8 +40,13 @@ class SpeedColumn(ProgressColumn):
 
 def iter_with_progress(
     iterable: Iterable[T], *, total: int, description: str | None = None, enabled: bool
-) -> Iterator[T]:
+) -> Generator[T, None, None]:
     """Yield items from *iterable*, optionally showing a progress bar.
+
+    The bar is driven from the consuming thread (no Rich refresh or track
+    thread), so leaving the loop early and closing the generator never waits
+    on a helper thread; callers that break out should ``close()`` it so the
+    bar ends there rather than when the generator is collected.
 
     Parameters
     ----------
@@ -68,5 +73,11 @@ def iter_with_progress(
         BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
         MofNCompleteColumn(),
         SpeedColumn(),
+        auto_refresh=False,
     ) as progress:
-        yield from progress.track(iterable, total=total, description=description)
+        task = progress.add_task(description, total=total)
+        progress.refresh()
+        for item in iterable:
+            yield item
+            progress.advance(task)
+            progress.refresh()
