@@ -65,6 +65,7 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .inductor_lowering import reduction_block_id
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
@@ -1044,7 +1045,6 @@ class DeviceIR:
         (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
         its taken side runs, and it is walked without extending the path.
         """
-        from .inductor_lowering import reduction_block_id
 
         result: dict[int, list[list[tuple[int, int]]]] = {}
 

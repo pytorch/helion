@@ -5253,15 +5253,31 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             return [config]
 
         persistent = dict(config.config)
-        persistent["reduction_loops"] = [None] * len(spec.reduction_loops)
-        persistent["block_sizes"] = [
-            cls._block_floor(block) if block.block_id in spec.grid_block_ids else value
-            for block, value in zip(spec.block_sizes, config.block_sizes, strict=True)
+        custom_ids = {
+            reduction.block_id for reduction in kf.reductions if reduction.is_custom
+        }
+        mixed = any(loop.block_id not in custom_ids for loop in spec.reduction_loops)
+        persistent["reduction_loops"] = [
+            None if loop.block_id in custom_ids else width
+            for loop, width in zip(
+                spec.reduction_loops, config.reduction_loops, strict=True
+            )
         ]
-        width = max(loop.size_hint for loop in spec.reduction_loops)
-        persistent["num_warps"] = cls._num_warps_for_reduction_width(width)
+        if not mixed:
+            persistent["block_sizes"] = [
+                cls._block_floor(block)
+                if block.block_id in spec.grid_block_ids
+                else value
+                for block, value in zip(
+                    spec.block_sizes, config.block_sizes, strict=True
+                )
+            ]
+            width = max(loop.size_hint for loop in spec.reduction_loops)
+            persistent["num_warps"] = cls._num_warps_for_reduction_width(width)
         baseline = _materialize_config(persistent, config_spec=spec)
-        return dedupe_configs([baseline, config])
+        # Keep the native liveness proposal primary when unrelated native
+        # reductions share the kernel; only the custom axes need a baseline.
+        return dedupe_configs([config, baseline] if mixed else [baseline, config])
 
 
 # Hardware the tuned reduction seeds own; the narrow fallback yields to these targets.
@@ -5312,6 +5328,8 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
             and "last" in eviction.inner.choices
         ):
             seed["load_eviction_policies"] = ["last"] * eviction.length
+        if spec.has_custom_reduction_loops:
+            return _materialize_config(seed, config_spec=spec)
         return Config(**seed)
 
 

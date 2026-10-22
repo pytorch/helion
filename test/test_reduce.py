@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import operator
 import unittest
+from unittest.mock import PropertyMock
+from unittest.mock import patch
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.cute.canonicalize_reductions import _independent_combines
 from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
 from helion._compiler.device_ir import DeviceIR
@@ -1134,6 +1137,71 @@ class TestCuteBuiltinReduce(RefEagerTestBase, TestCase):
 # Backend test marks also admit TileIR; these kernels explicitly select Triton.
 @onlyBackends(["triton"])
 class TestRolledCustomReduce(RefEagerTestBase, TestCase):
+    @skipIfRefEager("checks empty compiled custom reductions")
+    def test_empty_custom_reduction_matches_persistent_padding(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=False, autotune_effort="none")
+        def reduce(x: torch.Tensor, other: hl.constexpr) -> torch.Tensor:
+            out = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            for row in hl.tile(x.size(0)):
+                out[row] = hl.reduce(max_combine_fn, x[row, :], dim=1, other=other)
+            return out
+
+        x = torch.empty((5, 0), device=DEVICE)
+        for other in (float("-inf"), -7.0):
+            _, result = code_and_output(
+                reduce, (x, other), block_sizes=[2], reduction_loops=[256]
+            )
+            torch.testing.assert_close(result, torch.full_like(result, other))
+
+            bound = reduce.bind((torch.empty((5, 17), device=DEVICE), other))
+            run = bound.compile_config(
+                helion.Config(block_sizes=[2], reduction_loops=[256])
+            )
+            torch.testing.assert_close(run(x, other), torch.full_like(result, other))
+
+    @skipIfRefEager("checks mixed reduction heuristic seeds")
+    def test_custom_baseline_preserves_unrelated_native_schedule(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def mixed(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            native = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            custom = torch.empty_like(native)
+            for row in hl.tile(x.size(0)):
+                native[row] = x[row, :].sum(1)
+                custom[row] = hl.reduce(add_combine_fn, y[row, :], dim=1)
+            return native, custom
+
+        bound = mixed.bind(
+            (torch.empty(5, 65536, device=DEVICE), torch.empty(5, 65, device=DEVICE))
+        )
+        assert bound.host_function is not None
+        env, ir = bound.env, bound.host_function.device_ir
+        seeds = TritonReductionHeuristic.get_seed_configs(env, ir)
+        with patch.object(
+            type(bound.config_spec),
+            "has_custom_reduction_loops",
+            new_callable=PropertyMock,
+            return_value=False,
+        ):
+            native_seed = TritonReductionHeuristic.get_seed_configs(env, ir)[0]
+        self.assertEqual(seeds[0], native_seed)
+        native_ids = {
+            r.block_id
+            for r in bound.config_spec.reduction_kernel_fact.reductions
+            if not r.is_custom
+        }
+        for seed in seeds:
+            for block_id in native_ids:
+                self.assertEqual(
+                    bound.config_spec.reduction_loops.config_get(
+                        seed.reduction_loops, block_id
+                    ),
+                    bound.config_spec.reduction_loops.config_get(
+                        native_seed.reduction_loops, block_id
+                    ),
+                )
+
     @skipIfRefEager("checks generated reduction-loop code")
     def test_nonzero_identity_and_nonidentity_padding(self) -> None:
         @helion.kernel(

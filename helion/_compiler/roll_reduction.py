@@ -565,8 +565,12 @@ class ReductionRoller:
                     continue
                 seen.add(node)
                 if self.is_reduction(node):
-                    source = node.args[0]
-                    if isinstance(source, torch.fx.Node) and inside_loop(source):
+                    inputs = node.args[1] if node.target is _reduce else node.args[0]
+                    sources = inputs if isinstance(inputs, (list, tuple)) else (inputs,)
+                    if any(
+                        isinstance(source, torch.fx.Node) and inside_loop(source)
+                        for source in sources
+                    ):
                         return True
                     continue
                 if inside_loop(node):

@@ -173,7 +173,7 @@ def _emit_reduction_padding(
     assert chunk_var is not None
     dynamic = not numel.is_number
     if not dynamic:
-        padded_extent = env.backend.static_rdim_size(int(numel))
+        padded_extent = max(1, env.backend.static_rdim_size(int(numel)))
         padded = str(padded_extent)
         if padded_extent == int(numel):
             return padded, dynamic
@@ -181,7 +181,9 @@ def _emit_reduction_padding(
         padded = device_function.new_var("custom_reduce_padded")
         # Widen before rounding the runtime extent up to a power of two.
         loop.outer_suffix.append(
-            statement_from_string(f"{padded} = tl.cast({numel_expr} - 1, tl.uint64)")
+            statement_from_string(
+                f"{padded} = tl.cast(tl.maximum({numel_expr}, 1) - 1, tl.uint64)"
+            )
         )
         for shift in (1, 2, 4, 8, 16, 32):
             loop.outer_suffix.append(
@@ -193,7 +195,10 @@ def _emit_reduction_padding(
     loop.outer_suffix.append(
         statement_from_string(
             f"for {padding} in range((({numel_expr} + {chunk_var} - 1) // {chunk_var}) * {chunk_var}, {padded}, {chunk_var}):\n"
-            f"    {assignment_target} = {combine_func}({targets}, {padding_args})"
+            f"    if {padding} == 0:\n"
+            f"        {assignment_target} = ({padding_args})\n"
+            f"    else:\n"
+            f"        {assignment_target} = {combine_func}({targets}, {padding_args})"
         )
     )
     return padded, dynamic

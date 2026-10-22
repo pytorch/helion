@@ -39,6 +39,7 @@ from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .inductor_lowering import reduction_block_id
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
 from .variable_origin import GridOrigin
@@ -1140,7 +1141,6 @@ class GraphAnalysis:
     ) -> GraphAnalysis:
         from ..language import memory_ops
         from ..language.reduce_ops import _reduce
-        from .inductor_lowering import reduction_block_id
 
         graph = graph_info.graph
         nodes = tuple(graph.nodes)
