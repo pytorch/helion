@@ -8,6 +8,7 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.autotuner_heuristics.cute import _seq_config_list
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -27,7 +28,7 @@ def _pointwise_first(
     for m, n in hl.tile([a.size(0), b.size(1)]):
         acc = hl.zeros([m, n], dtype=torch.float32)
         for k in hl.tile(a.size(1)):
-            acc = hl.dot(a[m, k], b[k, n], acc)
+            acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
         out[m, n] = acc.to(out.dtype)
     return out, pointwise
 
@@ -41,7 +42,7 @@ def _pointwise_last(
     for m, n in hl.tile([a.size(0), b.size(1)]):
         acc = hl.zeros([m, n], dtype=torch.float32)
         for k in hl.tile(a.size(1)):
-            acc = hl.dot(a[m, k], b[k, n], acc)
+            acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
         out[m, n] = acc.to(out.dtype)
     for i in hl.tile(x.numel()):
         pointwise[i] = x[i] + 1
@@ -90,7 +91,7 @@ def test_non_matmul_axis_in_matmul_tree_is_not_admitted(nested: bool) -> None:
                 for extra in hl.tile(x.size(0)):
                     acc = hl.zeros([m, n], dtype=torch.float32)
                     for k in hl.tile(a.size(1)):
-                        acc = hl.dot(a[m, k], b[k, n], acc)
+                        acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
                     out[extra, m, n] = (
                         acc[None, :, :] + hl.zeros([extra, 1, 1], dtype=torch.float32)
                     ).to(out.dtype)
@@ -104,7 +105,7 @@ def test_non_matmul_axis_in_matmul_tree_is_not_admitted(nested: bool) -> None:
             for extra, m, n in hl.tile([x.size(0), a.size(0), b.size(1)]):
                 acc = hl.zeros([m, n], dtype=torch.float32)
                 for k in hl.tile(a.size(1)):
-                    acc = hl.dot(a[m, k], b[k, n], acc)
+                    acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
                 out[extra, m, n] = (
                     acc[None, :, :] + hl.zeros([extra, 1, 1], dtype=torch.float32)
                 ).to(out.dtype)
@@ -131,9 +132,15 @@ def test_non_matmul_axis_in_matmul_tree_is_not_admitted(nested: bool) -> None:
 
 @pytest.mark.parametrize("first", [False, True])
 @pytest.mark.parametrize("explicit_tile", [False, True])
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@pytest.mark.parametrize("reverse_order", [False, True])
 @skipIfNotCUDA()
 @skipIfRefEager("requires compiler seeds")
-def test_mixed_root_seed_executes(first: bool, explicit_tile: bool) -> None:
+def test_mixed_root_seed_executes(
+    first: bool, explicit_tile: bool, compute: str, reverse_order: bool
+) -> None:
+    if compute == "tcgen05" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("tcgen05 needs SM100")
     a = torch.randn(64, 128, device="cuda", dtype=torch.float16)
     b = torch.randn(128, 64, device="cuda", dtype=torch.float16)
     x = torch.randn(257, device="cuda")
@@ -143,7 +150,7 @@ def test_mixed_root_seed_executes(first: bool, explicit_tile: bool) -> None:
     seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
         bound.env, bound.host_function.device_ir
     )
-    seed = next(s for s in seeds if s.get("cute_collective_compute", "warp") == "warp")
+    seed = next(s for s in seeds if s.get("cute_collective_compute", "warp") == compute)
     if explicit_tile:
         spec = bound.config_spec
         fact = spec.matmul_facts[0]
@@ -165,6 +172,50 @@ def test_mixed_root_seed_executes(first: bool, explicit_tile: bool) -> None:
                 ]
             }
         )
+    if reverse_order:
+        spec = bound.config_spec
+        fact = spec.matmul_facts[0]
+        root = next(
+            root
+            for root in bound.host_function.device_ir.grid_block_ids
+            if fact.m_block_id in root
+        )
+        seed = helion.Config.from_dict(
+            seed.config
+            | {"loop_orders": _seq_config_list(spec.loop_orders, {root[0]: [1, 0]})}
+        )
     actual, pointwise = bound.compile_config(seed)(*args)
-    torch.testing.assert_close(actual, a @ b)
+    torch.testing.assert_close(actual, (a * 0.5) @ b)
     torch.testing.assert_close(pointwise, x + 1)
+
+
+@skipIfRefEager("requires compiler seeds")
+def test_sibling_reduction_does_not_receive_unlaunchable_seeds() -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def mixed(
+        a: torch.Tensor, b: torch.Tensor, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+        reduced = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+        for m, n in hl.tile([a.size(0), b.size(1)]):
+            acc = hl.zeros([m, n], dtype=torch.float32)
+            for k in hl.tile(a.size(1)):
+                acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
+            out[m, n] = acc.to(out.dtype)
+        for row in hl.tile(x.size(0)):
+            reduced[row] = x[row, :].sum(-1)
+        return out, reduced
+
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(
+            mixed,
+            (
+                torch.empty(64, 128, dtype=torch.float16),
+                torch.empty(128, 64, dtype=torch.float16),
+                torch.empty(5, 128),
+            ),
+        )
+        assert bound.host_function is not None
+        assert not CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )

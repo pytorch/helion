@@ -4229,29 +4229,37 @@ class CuteBackend(Backend):
                     for bid in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
                 )
             ):
-                # Sibling roots reuse physical CUDA axes. Their auto widths
-                # must fit every collective M/N thread dimension, including
-                # swapped loop orders; the product is not a safe axis bound.
-                # Nested loops and native collectives stay serial here.
-                cap = 1
+                # Sibling roots reuse CUDA axes. Bound each physical dimension
+                # separately, following the collective root's configured order.
+                caps = [1, 1, 1]
                 if (
                     block_ids in device_ir.grid_block_ids
                     and config.get("cute_collective_compute", "warp") == "warp"
                 ):
-                    cap = min(
-                        (
-                            spec.num_threads.config_get(config.num_threads, bid, 0) or 1
-                            for fact, _root in placements
-                            for bid in (fact.m_block_id, fact.n_block_id)
-                            if bid is not None
-                        ),
-                        default=1,
-                    )
-                for i, size in enumerate(nd_block_size):
-                    if num_threads_config[i] == 0 and isinstance(size, int):
+                    caps = [1024, 1024, 64]
+                    for _fact, root in placements:
+                        order = spec.loop_orders.config_get(
+                            config.loop_orders, root[0]
+                        ) or range(len(root))
+                        dims = [
+                            spec.num_threads.config_get(config.num_threads, root[i], 0)
+                            or 1
+                            for i in order
+                        ]
+                        dims = [threads for threads in dims if threads > 1]
+                        dims += [1] * (3 - len(dims))
+                        caps = list(starmap(min, zip(caps, dims, strict=True)))
+                axis = 0
+                for i in loop_order:
+                    size = nd_block_size[i]
+                    if num_threads_config[i] == 0:
                         num_threads_config[i] = (
-                            _largest_divisor_at_most(size, cap) if i < 2 else 1
+                            _largest_divisor_at_most(size, caps[axis])
+                            if isinstance(size, int) and axis < 3
+                            else 1
                         )
+                    if num_threads_config[i] > 1:
+                        axis += 1
             original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
                 fn,
