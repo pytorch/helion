@@ -3078,6 +3078,9 @@ class TestAutotunerHeuristic(TestCase):
         device_ir = MagicMock()
         grouped_fact = spec.matmul_facts[0]
         worklist_analysis = MagicMock()
+        # This fixture represents the external worklist, whose N is opaque.
+        # Device split-size layouts have their own validated static-N path.
+        worklist_analysis.seed_facts.device_split_sizes = False
         worklist_analysis.seed_facts.groups_hint = 1
         worklist_analysis.seed_facts.packed_m_hint = 256
         worklist_analysis.seed_facts.n_hint = 256

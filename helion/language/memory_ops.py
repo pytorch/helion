@@ -2804,6 +2804,9 @@ def _codegen_cute_store_tcgen05_tile(
         and segment_grouped is not None
         and segment_grouped.fixed_tensormaps
     )
+    grouped_bounded_output_shift = bool(
+        segment_grouped is not None and segment_grouped.bounded_output_shift
+    )
     tcgen05_source_bm = tcgen05_value.source_tile_m
     tcgen05_source_bn = tcgen05_value.source_tile_n
     tile_coord_m = (
@@ -3707,7 +3710,9 @@ def _codegen_cute_store_tcgen05_tile(
 
     worklist_nm_segment_valid_m_bound = (
         tcgen05_value.segment_store_valid_m_bound
-        if tcgen05_value.orientation is Tcgen05Orientation.NM and segment_store
+        if tcgen05_value.orientation is Tcgen05Orientation.NM
+        and segment_store
+        and not grouped_bounded_output_shift
         else ""
     )
 
@@ -4579,6 +4584,7 @@ def _codegen_cute_store_tcgen05_tile(
         (tcgen05_value.output_column_major and not leading_passthrough_output)
         or (row_union is not None and row_union.schedule is not None)
         or grouped_fixed_d_tensormap
+        or grouped_bounded_output_shift
         or (
             grouped_tma is not None
             and grouped_tma.d_mode is not Tcgen05GroupedDMode.NONE
@@ -4645,6 +4651,7 @@ def _codegen_cute_store_tcgen05_tile(
             **({"orientation": "nm"} if tcgen05_nm_store else {}),
             **({"fixed_tensormap": True} if grouped_fixed_d_tensormap else {}),
             **({"rank3_mnl_tensor": True} if d_tma_uses_rank3_mnl_tensor else {}),
+            **({"bounded_output_shift": True} if grouped_bounded_output_shift else {}),
             **(
                 {
                     "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
@@ -4923,6 +4930,28 @@ def _codegen_cute_store_tcgen05_tile(
         if row_union is not None and row_union.schedule is not None and tma_store:
             local_gmem_tensor = f"{gmem_tensor}[None, None, 0]"
             tile_coord = f"({static_tile_coord_n}, {static_tile_coord_m})"
+        elif (
+            grouped_bounded_output_shift
+            and gmem_tensor
+            in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)
+            and rank3_mnl_tensor
+        ):
+            assert grouped_tma is not None and grouped_tma.m_size is not None
+            row_delta = f"cutlass.Int32({grouped_tma.m_size}) - {grouped_tma.problem_m}"
+            row_end = f"{grouped_tma.global_m_start} + {grouped_tma.problem_m}"
+            offset = (
+                f"(cutlass.Int32(0), {row_delta}, {row_end})"
+                if tcgen05_nm_store
+                else f"({row_delta}, cutlass.Int32(0), {row_end})"
+            )
+            local_gmem_tensor = df.new_var("tcgen05_bounded_output")
+            tile_setup.append(
+                f"{local_gmem_tensor} = cute.domain_offset({offset}, {gmem_tensor})"
+            )
+            coord_m, coord_n = grouped_tma.cta_tile_idx_m, grouped_tma.cta_tile_idx_n
+            if tcgen05_nm_store:
+                coord_m, coord_n = coord_n, coord_m
+            tile_coord = f"({coord_m}, {coord_n}, 0)"
         elif (
             gmem_tensor
             in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)

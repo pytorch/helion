@@ -1932,6 +1932,9 @@ class ConfigSpec:
         self._cute_flash_bwd_fast_math: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        # A compiler may request complete initial coverage of its normalized
+        # seeds after the unchanged nominal and declared-coverage population.
+        self.compiler_seed_overflow_requested: bool = False
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
         self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
         self.cute_matmul_min_blocks_search_enabled: bool = False
@@ -8096,9 +8099,16 @@ class ConfigSpec:
         )
         legacy_hash = self._cache_fingerprint_from_structural_hash(structural_hash)
         policy = coverage_policy(self.compiler_coverage_groups)
-        if policy is None:
-            return legacy_hash
-        return hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        result = (
+            legacy_hash
+            if policy is None
+            else hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        )
+        if self.compiler_seed_overflow_requested and self.compiler_seed_configs:
+            return hashlib.sha256(
+                repr((result, "compiler_seed_overflow:v1")).encode("utf-8")
+            ).hexdigest()
+        return result
 
     def projected_cache_fingerprint_hash(
         self, *, advanced_controls_files: list[str] | None = None

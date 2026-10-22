@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+from functools import partial
 from itertools import zip_longest
 import math
 from typing import TYPE_CHECKING
@@ -40,6 +41,8 @@ from ..cute.grouped_full_coverage import FULL_COVERAGE_PIPELINES
 from ..cute.grouped_full_coverage import full_coverage_index_domain
 from ..cute.grouped_full_coverage import full_coverage_pipeline_supported
 from ..cute.grouped_full_coverage import full_coverage_smem_upper_bound
+from ..cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from ..cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from ..cute.grouped_row_union import PAIRED_CLC
 from ..cute.grouped_row_union import PAIRED_CLC_SCHEDULE
 from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
@@ -66,6 +69,10 @@ from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
 from ..cute.tcgen05_config import CuteTcgen05Config
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
@@ -80,6 +87,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
 from ..cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES,
 )
@@ -94,7 +102,9 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ..cute.tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+from ..cute.tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
 from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
@@ -4558,6 +4568,300 @@ def _tcgen05_grouped_output_ring_seeds(
     return dedupe_configs(result)
 
 
+def _tcgen05_grouped_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+    source_m_tile: int,
+    physical_k: int | None = None,
+) -> list[Config]:
+    """Seed complete device pipelines using their physical allocation sizes.
+
+    Physical rows and the CTA group determine each ring's actual footprint.
+    Cover both a deep ring and an independent ONE ring that can occupy two
+    CTAs per SM; kernel names and routing-vector contents are irrelevant.
+    """
+    if (
+        min(groups, n, k, dtype_bytes, output_dtype_bytes) <= 0
+        or n % 32
+        or capacity_bytes <= _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    ):
+        return []
+    result: list[Config] = []
+    budget = capacity_bytes - _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    logical_choices = (
+        (64,) if physical_k is not None else TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+    )
+    for block_k in logical_choices:
+        effective_k = physical_k if physical_k is not None else block_k
+        if k % effective_k or not _block_size_value_reachable(spec, 2, block_k):
+            continue
+        for cluster_m in (1, 2):
+            config = _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                block_k,
+                1,
+                TCGEN05_CONSUMER_REGS_DEFAULT,
+                runtime_direct=False,
+            )
+            config.config["tcgen05_cluster_m"] = cluster_m
+            if physical_k is not None:
+                config.config[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = physical_k
+            if cluster_m == 1:
+                config.config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+                config.config[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = False
+            profile = resolve_tcgen05_grouped_worklist_mma_profile(
+                config.config, block_k=effective_k
+            )
+            if profile is None:
+                continue
+
+            footprint = partial(
+                tcgen05_grouped_worklist_smem_bytes,
+                group_count=groups,
+                device_split_sizes=True,
+                sched_stage_count=1,
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=effective_k,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                acc_stages=2,
+                c_stages=2,
+                cluster_m=cluster_m,
+            )
+
+            max_stages = min(7, k // effective_k)
+            while max_stages > 0 and footprint(ab_stages=max_stages) > budget:
+                max_stages -= 1
+            if max_stages == 0:
+                continue
+            config.config["tcgen05_ab_stages"] = max_stages
+            result.append(config)
+            immutable_supported = (
+                b_major == "k"
+                and n % profile.mma_m == 0
+                and groups * n * k <= (1 << 31) - 1
+            )
+            if immutable_supported:
+                immutable = deepcopy(config)
+                immutable.config[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = True
+                result.append(immutable)
+            if cluster_m != 1:
+                continue
+            resident_stages = min(2, max_stages)
+            while (
+                resident_stages > 0
+                and 2 * footprint(ab_stages=resident_stages) > budget
+            ):
+                resident_stages -= 1
+            if resident_stages:
+                resident = deepcopy(config)
+                resident.config["tcgen05_ab_stages"] = resident_stages
+                resident.config["num_sm_multiplier"] = 2
+                result.append(resident)
+                if immutable_supported:
+                    resident_immutable = deepcopy(resident)
+                    resident_immutable.config[
+                        TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
+                    ] = True
+                    result.append(resident_immutable)
+    return _filter_reachable_block_size_configs(spec, dedupe_configs(result))
+
+
+def _tcgen05_grouped_mn_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: str,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    """Seed resource-checked physical M,N tiles on typed device worklists.
+
+    These are additive proposals. Row geometry, output buffering, and optional
+    worker balancing remain choices measured by the autotuner.
+    """
+    if (
+        not spec._cute_tcgen05_config.grouped_device_worklist_supported
+        or not spec._cute_tcgen05_config.grouped_d_shift_supported
+        or not spec._cute_tcgen05_config.matmul_operands_tma_provable
+        or min(groups, n, k, capacity_bytes) <= 0
+        or dtype_bytes != 2
+        or output_dtype_bytes not in (2, 4)
+        or b_major != "k"
+        or n % 32
+        or k % 64
+        or groups * n > (1 << 31) - 1
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+
+    seeds: list[Config] = []
+    for row_tile in (128, 256):
+        for column_tile in (128, 192, 224, 256):
+            epi_m, epi_n = tcgen05_grouped_worklist_epilogue_shape(
+                bm=row_tile,
+                bn=column_tile,
+                cluster_m=2,
+                output_dtype_bytes=output_dtype_bytes,
+                orientation="mn",
+            )
+            subtiles = (row_tile // 2 // epi_m) * (column_tile // epi_n)
+            preferred_c_stages = max(
+                value for value in (2, 3, 4) if value == 2 or subtiles % value == 0
+            )
+            for cluster_n in (1, 2):
+                if cluster_n == 2 and n % (column_tile * cluster_n):
+                    continue
+                for c_stages in (2, 3, 4):
+                    if c_stages != 2 and subtiles % c_stages:
+                        continue
+                    ab_stages = 32
+                    while ab_stages >= 2:
+                        required = tcgen05_grouped_worklist_smem_bytes(
+                            group_count=groups,
+                            device_split_sizes=True,
+                            sched_stage_count=1,
+                            bm=row_tile,
+                            bn=column_tile,
+                            bk=64,
+                            dtype_bytes=dtype_bytes,
+                            output_dtype_bytes=output_dtype_bytes,
+                            ab_stages=ab_stages,
+                            acc_stages=2,
+                            c_stages=c_stages,
+                            cluster_m=2,
+                            orientation="mn",
+                            immutable_ab_tensormaps=True,
+                            immutable_d_tensormap=True,
+                        )
+                        if required <= capacity_bytes:
+                            break
+                        ab_stages -= 1
+                    if ab_stages < 2:
+                        continue
+                    candidate = _tcgen05_grouped_worklist_config(
+                        row_tile, 64, ab_stages, 256, runtime_direct=False
+                    )
+                    candidate.config.update(
+                        {
+                            "tcgen05_cluster_m": 2,
+                            "tcgen05_cluster_n": cluster_n,
+                            "tcgen05_c_stages": c_stages,
+                            "cute_min_blocks_per_mp": 1,
+                            "tcgen05_grouped_worklist_orientation": "mn",
+                            "tcgen05_grouped_worklist_mma_n": column_tile,
+                            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+                            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+                        }
+                    )
+                    variants = [candidate]
+                    if spec._cute_tcgen05_config.grouped_balanced_workers_supported:
+                        balanced = deepcopy(candidate)
+                        balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = (
+                            True
+                        )
+                        variants.append(balanced)
+                    seeds.extend(variants)
+                    if (
+                        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
+                        and c_stages == preferred_c_stages
+                    ):
+                        for variant in variants:
+                            for swizzle in (4, 8):
+                                panel = deepcopy(variant)
+                                panel.config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                                    swizzle
+                                )
+                                seeds.append(panel)
+                            for alternate in (2, 4):
+                                adaptive = deepcopy(variant)
+                                adaptive.config.update(
+                                    {
+                                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 8,
+                                        GROUPED_PANEL_ALTERNATE_KEY: alternate,
+                                        GROUPED_PANEL_RATIO_KEY: 1,
+                                    }
+                                )
+                                seeds.append(adaptive)
+    return dedupe_configs(seeds)
+
+
+def _tcgen05_grouped_source128_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    return _tcgen05_grouped_device_tile_seeds(
+        spec,
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        dtype_bytes=dtype_bytes,
+        output_dtype_bytes=output_dtype_bytes,
+        capacity_bytes=capacity_bytes,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+    )
+
+
+def _tcgen05_grouped_physical_k_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    if not spec._cute_tcgen05_config.grouped_ab_k_fusion_supported:
+        return []
+    return dedupe_configs(
+        [
+            config
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            )
+            for config in _tcgen05_grouped_device_tile_seeds(
+                spec,
+                groups=groups,
+                n=n,
+                k=k,
+                b_major=b_major,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                capacity_bytes=capacity_bytes,
+                source_m_tile=source_m_tile,
+                physical_k=128,
+            )
+        ]
+    )
+
+
 def _tcgen05_grouped_worklist_hardware_identity(
     env: CompileEnvironment,
 ) -> GroupedWorklistHardwareIdentity | None:
@@ -4663,6 +4967,36 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             )
         )
         seed_facts = analysis.seed_facts
+        spec._cute_tcgen05_config.grouped_device_worklist_supported = (
+            seed_facts.device_split_sizes
+        )
+        spec._cute_tcgen05_config.grouped_ab_k_fusion_supported = (
+            analysis.ab_k_fusion_supported
+        )
+        spec._cute_tcgen05_config.grouped_d_shift_supported = analysis.d_shift_supported
+        # The pure typed device-worklist palette can exceed the nominal search
+        # population as physical layouts/panel policies compose. Keep its legal
+        # normalized seeds after that unchanged prefix; no sampler budget grows.
+        spec.compiler_seed_overflow_requested = (
+            spec.compiler_seed_overflow_requested
+            or (
+                analysis.d_shift_supported
+                and seed_facts.device_split_sizes
+                and analysis.device_layout_kind == "offsets"
+                and seed_facts.b_major == "k"
+            )
+        )
+        # The same native K64 proof supplies closed work ownership, a fresh
+        # output, live compact metadata, and signed input/output allocations.
+        spec._cute_tcgen05_config.grouped_balanced_workers_supported = (
+            analysis.d_shift_supported
+        )
+        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported = (
+            analysis.d_shift_supported
+            and analysis.device_layout_kind == "offsets"
+            and seed_facts.device_split_sizes
+            and seed_facts.b_major == "k"
+        )
         if analysis.input_kind == "external_worklist":
             from ..cute.grouped_worklist import (
                 register_tcgen05_grouped_worklist_runtime_specialization,
@@ -4739,7 +5073,10 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             or analysis.seed_facts.n_hint % 32 != 0
         ):
             return None
-        if not tcgen05_runtime_n_ptx_compatible():
+        if (
+            not tcgen05_runtime_n_ptx_compatible()
+            and not analysis.seed_facts.device_split_sizes
+        ):
             warn_tcgen05_runtime_n_ptx_fallback()
             return None
         return fact, analysis
@@ -4860,13 +5197,106 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                     ),
                 ]
             )
+            source128_seeds = _tcgen05_grouped_source128_seeds(
+                spec,
+                groups=seed_facts.groups_hint,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                dtype_bytes=fact.lhs_dtype.itemsize,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
+                capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                    env.device
+                ),
+            )
+            spec._cute_tcgen05_config.grouped_source128_search_enabled = bool(
+                source128_seeds
+            )
+            seeds = dedupe_configs([*seeds, *source128_seeds])
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_physical_k_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+            # Larger routed-row profiles need the same resource-checked
+            # device pipelines as source128, including immutable K-major
+            # weights. Append them after the established seed/default prefix.
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            ):
+                seeds = dedupe_configs(
+                    [
+                        *seeds,
+                        *_tcgen05_grouped_device_tile_seeds(
+                            spec,
+                            groups=seed_facts.groups_hint,
+                            n=seed_facts.n_hint,
+                            k=seed_facts.k_hint,
+                            b_major=seed_facts.b_major,
+                            dtype_bytes=fact.lhs_dtype.itemsize,
+                            output_dtype_bytes=(
+                                analysis.output_dtype or fact.lhs_dtype
+                            ).itemsize,
+                            capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                                env.device
+                            ),
+                            source_m_tile=source_m_tile,
+                        ),
+                    ]
+                )
+        if spec._cute_tcgen05_config.grouped_d_shift_supported:
+            shifted = []
+            for seed in seeds:
+                if seed.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY) is True:
+                    candidate = deepcopy(seed)
+                    candidate.config[TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY] = True
+                    shifted.append(candidate)
+            seeds = dedupe_configs([*seeds, *shifted])
+        if seed_facts.device_split_sizes:
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_mn_device_tile_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
         return seeds
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
         fact = _tcgen05_grouped_worklist_fact(env)
         return (
-            tcgen05_runtime_n_ptx_compatible()
+            (
+                tcgen05_runtime_n_ptx_compatible()
+                or env.config_spec._cute_tcgen05_config.grouped_device_worklist_supported
+            )
             and fact is not None
             and fact.static_k is not None
             and super().should_promote(env)
