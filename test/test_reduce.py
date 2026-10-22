@@ -1039,6 +1039,33 @@ class TestReduce(RefEagerTestBase, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteBuiltinReduce(RefEagerTestBase, TestCase):
+    @skipIfRefEager("checks backend scheduling facts")
+    def test_custom_reductions_keep_non_triton_scheduling_facts(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = hl.reduce(
+                    keep_left_max_combine_fn,
+                    x[row, :],
+                    dim=1,
+                    other=-1,
+                )
+            return out
+
+        bound = reduce.bind((torch.empty(5, 65, device=DEVICE),))
+        assert bound.host_function is not None
+        self.assertTrue(
+            any(
+                node.target is _reduce
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+            )
+        )
+        fact = bound.config_spec.reduction_kernel_fact
+        self.assertTrue(fact is None or not fact.reductions)
+        self.assertFalse(bound.config_spec.has_custom_reduction_loops)
+
     def test_nonidentity_padding_is_not_canonicalized(self) -> None:
         combine = make_fx(operator.add)(torch.ones(1), torch.ones(1)).graph
         for other in (0.0, 1.0):

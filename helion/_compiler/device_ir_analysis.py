@@ -1197,7 +1197,13 @@ class GraphAnalysis:
             if node.op == "call_function" and node.target in dot_targets:
                 dot_nodes.append(node)
 
-            block_id = reduction_block_id(node)
+            # Custom scheduling facts belong to the new Triton rolling path;
+            # preserve other backends' existing reduction seed/dispatch policy.
+            block_id = (
+                reduction_block_id(node)
+                if node.target is not _reduce or env.backend_name == "triton"
+                else None
+            )
             if block_id is not None:
                 reduction_axis_by_node_id[id(node)] = block_id
                 if node.target is _reduce:
@@ -1209,7 +1215,6 @@ class GraphAnalysis:
                     reduction_occurrences.append(block_id)
                 if (
                     node.target is _reduce
-                    and env.backend_name == "triton"
                     and block_id in env.config_spec.reduction_loops.valid_block_ids()
                 ):
                     sources = custom_reduction_sources(node)
