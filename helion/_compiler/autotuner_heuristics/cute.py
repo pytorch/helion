@@ -2109,10 +2109,13 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         vector recipes, cooperative epilogues, and proved bounds together.
         FP32 native MMA can instead convert vector register loads directly,
         avoiding an asynchronous copy's raw shared-memory staging. Rotate its
-        paired copy/recipe choices before repeating geometries. When the TMEM
-        storage alternative is present, rotate through complete
-        schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. This only reorders existing seeds;
+        paired copy/recipe choices before repeating geometries. Ordinary
+        matmuls and TMEM-operand alternatives rotate through complete schedules
+        as well as compute/copy/depth/chunk groups, retaining the ranked geometry
+        order within each. Ordinary gathered-row matmuls keep their existing
+        order to preserve their column-width and depth alternatives. Exposing
+        more schedules trades some early geometry coverage for schedule coverage.
+        This only reorders existing seeds;
         the first seed, default promotion, other heuristics, and search budget
         stay unchanged. Unrelated user knobs never supply a grouping dimension.
         """

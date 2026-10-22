@@ -9,7 +9,9 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import _initial_population
+from test.cute_population_contracts import _legacy_order
+from test.cute_population_contracts import _legacy_registered_seeds
 from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
@@ -20,9 +22,6 @@ from test.test_cute_gathered_mma_codegen import _bound as _gathered_bound
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -30,7 +29,6 @@ pytestmark = skipUnlessBackends(["cute"])
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 
@@ -58,74 +56,6 @@ def partitioned_case() -> tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]]:
     return _cpu_bind(kernel, args), args
 
 
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    return seeds
-
-
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ),
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    # Other registered heuristics retain their original positions. Replace
-    # only this heuristic's permutation when reproducing the old population.
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
-
-
-def _initial_population(
-    bound: BoundKernel,
-    args: tuple[object, ...],
-    *,
-    seeds: list[helion.Config] | None = None,
-    count: int | None = None,
-    user_seeds: list[helion.Config] | None = None,
-) -> list[helion.Config]:
-    profile = get_effort_profile("full").pattern_search
-    assert profile is not None
-    with (
-        bound.env,
-        patch.object(
-            bound.config_spec,
-            "compiler_seed_configs",
-            bound.config_spec.compiler_seed_configs if seeds is None else seeds,
-        ),
-        patch.object(bound.settings, "autotune_seed_configs", user_seeds),
-    ):
-        search = PatternSearch(
-            bound,
-            args,
-            initial_population=profile.initial_population if count is None else count,
-            initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
-        )
-        flat = checked_initial_population(search)
-        result = [search.config_gen.unflatten(value) for value in flat]
-        assert [search.config_gen.flatten(config) for config in result] == flat
-        assert result[0] == search.config_gen.unflatten(
-            search.config_gen.default_flat()
-        )
-        assert len(result) == len(set(result))
-        return result
-
-
 def _schedule(config: helion.Config) -> tuple[object, ...]:
     return (
         config.get("cute_collective_compute"),
@@ -138,7 +68,9 @@ def test_full_random_population_reaches_coupled_pipeline_chunk_geometries(
     partitioned_case: tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     bound, args = partitioned_case
-    legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
+    legacy = _initial_population(
+        bound, args, seeds=_legacy_registered_seeds(bound), count=100
+    )
     actual = _initial_population(bound, args)
     assert len(actual) == len(legacy)
     assert actual == _initial_population(bound, args)
@@ -323,9 +255,11 @@ def test_nonzero_accumulator_reaches_native_seed_schedules(dtype: torch.dtype) -
         torch.empty((128, 256), dtype=torch.float32),
     )
     bound = _cpu_bind(_seeded_fp32, args)
-    legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
+    legacy = _initial_population(
+        bound, args, seeds=_legacy_registered_seeds(bound), count=100
+    )
     assert not any(seed.get("cute_collective_tmem_seed") for seed in legacy)
-    population = _initial_population(bound, args)
+    population = _initial_population(bound, args, count=100)
     native = [
         seed for seed in population if seed.get("cute_collective_compute") == "tcgen05"
     ]

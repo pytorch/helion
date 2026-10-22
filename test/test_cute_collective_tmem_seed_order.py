@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -9,17 +8,14 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import _initial_population
+from test.cute_population_contracts import _legacy_registered_seeds
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
 from test.test_cute_collective_tmem_seed import _dependent_contractions
 from test.test_cute_collective_tmem_seed import _dependent_inputs
 
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -27,7 +23,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import helion
-    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 
@@ -38,80 +33,6 @@ def _forbid_cuda_init() -> Iterator[None]:
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
-
-
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    # None of these contractions has a config-owned K chunk. The reviewed
-    # bounded-K interleaver previously returned this list unchanged.
-    assert not parameters
-    return seeds
-
-
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ),
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
-
-
-def _initial_population(
-    bound: BoundKernel,
-    args: tuple[torch.Tensor, ...],
-    *,
-    seeds: list[helion.Config] | None = None,
-    count: int | None = None,
-    user_seeds: list[helion.Config] | None = None,
-) -> list[helion.Config]:
-    profile = get_effort_profile("full").pattern_search
-    assert profile is not None
-    random_state = random.getstate()
-    try:
-        random.seed(46291)
-        with (
-            bound.env,
-            patch.object(
-                bound.config_spec,
-                "compiler_seed_configs",
-                bound.config_spec.compiler_seed_configs if seeds is None else seeds,
-            ),
-            patch.object(bound.settings, "autotune_seed_configs", user_seeds),
-        ):
-            search = PatternSearch(
-                bound,
-                args,
-                initial_population=(
-                    profile.initial_population if count is None else count
-                ),
-                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
-            )
-            flat = checked_initial_population(search)
-            result = [search.config_gen.unflatten(value) for value in flat]
-            assert result[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
-            )
-            return result
-    finally:
-        random.setstate(random_state)
 
 
 def _complete_schedule(config: helion.Config) -> bool:
