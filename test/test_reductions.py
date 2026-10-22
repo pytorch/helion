@@ -488,7 +488,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             samples = torch.empty_like(x)
             totals = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
             for row in hl.tile(x.size(0)):
-                values = torch.rand_like(x[row, :, :])
+                values = hl.rand(x[row, :, :].shape, seed=42)
                 samples[row, :, :] = values
                 totals[row] = values.sum((1, 2))
             return samples, totals

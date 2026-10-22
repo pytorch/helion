@@ -14,6 +14,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from ..language._decorators import is_api_func
 from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from ..language.matmul_ops import MATMUL_FACT_ID_META
@@ -123,7 +124,7 @@ def register_lowering(
 
 
 def _keep_shape_size_reads(node: Node) -> None:
-    """Keep physical tile extents in ATen shape parameters."""
+    """Keep physical tile extents in shape parameters."""
     physical: Node | None = None
 
     def physical_size(arg: Node) -> Node:
@@ -141,21 +142,24 @@ def _keep_shape_size_reads(node: Node) -> None:
                     ),
                 )
             physical.meta.update(node.meta)
-            physical.meta.pop("lowering", None)
             physical.meta["helion_host_scalar"] = False
         return physical
 
     for user in list(node.users):
-        if not isinstance(user.target, torch._ops.OpOverload):
+        if isinstance(user.target, torch._ops.OpOverload):
+            parameters = [argument.name for argument in user.target._schema.arguments]
+        elif is_api_func(user.target):
+            parameters = list(user.target._signature.parameters)
+        else:
             continue
         args, kwargs = list(user.args), dict(user.kwargs)
-        for position, argument in enumerate(user.target._schema.arguments):
-            if argument.name not in {"size", "shape", "length", "output_size"}:
+        for position, name in enumerate(parameters):
+            if name not in {"size", "shape", "length", "output_size"}:
                 continue
             if position < len(args):
                 args[position] = map_arg(args[position], physical_size)
-            elif argument.name in kwargs:
-                kwargs[argument.name] = map_arg(kwargs[argument.name], physical_size)
+            elif name in kwargs:
+                kwargs[name] = map_arg(kwargs[name], physical_size)
         user.args, user.kwargs = tuple(args), kwargs
 
 
@@ -191,7 +195,6 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
             node.meta["helion_host_scalar"] = (
                 HostFunction.current().is_host_scalar_expr(_to_sympy(size))
             )
-            node.meta.pop("lowering", None)
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)
