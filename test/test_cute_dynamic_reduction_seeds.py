@@ -12,6 +12,7 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._compiler.autotuner_heuristics.cute import CuteReductionTileHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
@@ -119,25 +120,49 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @skipUnlessBackends(["cute"])
-@skipIfNotCUDA()
-@skipIfRefEager("checks dynamic tile heuristic code")
-def test_dynamic_two_pass_tile_seeds_execute(dtype: torch.dtype) -> None:
+@skipIfRefEager("checks dynamic tile heuristic eligibility")
+def test_dynamic_tile_heuristics_keep_their_existing_static_gate(
+    dtype: torch.dtype,
+) -> None:
     kernel = helion.kernel(
         softmax_two_pass.fn, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    x = torch.randn(5, 4100, device="cuda", dtype=dtype)
-    bound = kernel.bind((x,))
-    assert bound.host_function is not None
-    for heuristic in (
-        CuteTileVecHeuristic,
-        CuteTileVecWarpReduceHeuristic,
-        CuteTileVecWarpPerRowHeuristic,
-    ):
-        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
-        assert seed is not None
-        actual = bound.compile_config(seed)(x)
-        torch.testing.assert_close(
-            actual, torch.softmax(x.float(), -1).to(dtype), rtol=1e-2, atol=1e-4
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, (torch.empty(5, 4100, dtype=dtype),))
+        assert bound.host_function is not None
+        for heuristic in (
+            CuteTileVecHeuristic,
+            CuteTileVecWarpReduceHeuristic,
+            CuteTileVecWarpPerRowHeuristic,
+        ):
+            assert not heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            assert (
+                heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+                is None
+            )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+@skipIfRefEager("checks persistent dynamic seed settings")
+def test_dynamic_persistent_seed_keeps_scalar_memory(dtype: torch.dtype) -> None:
+    kernel = helion.kernel(
+        _softmax, backend="cute", static_shapes=False, autotune_effort="none"
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, (torch.empty(5, 1024, dtype=dtype),))
+        assert bound.host_function is not None
+        seed = CuteReductionTileHeuristic.get_seed_config(
+            bound.env, bound.host_function.device_ir
+        )
+        assert seed is not None and seed.reduction_loops == [None]
+        spec = bound.config_spec
+        reduction_id = spec.reduction_loops[0].block_id
+        assert (
+            spec.cute_vector_widths.config_get(
+                seed.get("cute_vector_widths", []), reduction_id, 1
+            )
+            == 1
         )
 
 

@@ -735,7 +735,9 @@ def _cute_seed_vec_width(
         # remove enough loop iters to matter.
         return 1
     return _cute_tile_seed_vec_width_for_dtype(
-        _cute_tile_inner_block_dtype(env, device_ir, rl_spec.block_id)
+        _cute_tile_inner_block_dtype(
+            env, device_ir, rl_spec.block_id, allow_symbolic=True
+        )
     )
 
 
@@ -785,7 +787,10 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             "reduction_loops": reduction_loops,
         }
         vec = _cute_seed_vec_width(env, rl_spec, device_ir)
-        if vec > 1:
+        if vec > 1 and (
+            reduction_loops[0] is not None
+            or env.block_sizes[rl_spec.block_id].numel.is_Integer
+        ):
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
             )
@@ -986,16 +991,22 @@ def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
 
 
 def _cute_tile_inner_block_dtype(
-    env: CompileEnvironment, device_ir: DeviceIR, block_id: int
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    block_id: int,
+    *,
+    allow_symbolic: bool = False,
 ) -> torch.dtype | None:
     """Find a tensor dtype whose last axis matches the block's extent.
 
-    Matches static and symbolic extents for both tiled and rolled-reduction
-    vector seeds, which share the same device-graph walk.
+    Rolled seeds opt into symbolic extents. Other tile heuristics retain
+    their static-extent gate, including its existing specialization policy.
     """
     bs = env.block_sizes[block_id]
     jagged = env.is_jagged_tile(block_id)
     extent = _to_sympy(bs.var) if jagged else bs.numel
+    if not jagged and not allow_symbolic and not extent.is_Integer:
+        return None
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             # Index/mask intermediates are not memory payloads. Keep the
