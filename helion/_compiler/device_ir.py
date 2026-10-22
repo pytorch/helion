@@ -58,6 +58,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
+from .aten_lowering import resolve_reduction_sizes
 from .compile_environment import CompileEnvironment
 from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
@@ -3470,6 +3471,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+            resolve_reduction_sizes(graph.graph)
         merged_rdims = merge_reduction_dims(device_ir.graphs)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":

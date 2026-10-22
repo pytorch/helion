@@ -157,11 +157,6 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
             source = replacements.get(tag.source, tag.source)
             dims = tag.dims
-            # A full-slice tensor's size is the original extent, even when
-            # its reduction is later rolled in chunks. Keep scalar size reads
-            # outside the rolled graph by specializing their static extents.
-            if enabled:
-                _specialize_reduced_sizes(source, dims)
             if (
                 not enabled
                 or source.graph is not graph
@@ -222,26 +217,6 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                     graph.erase_node(n)
                     dead.remove(n)
     return replaced
-
-
-def _specialize_reduced_sizes(source: Node, dims: list[int]) -> None:
-    """Keep static full-slice size reads outside a later rolled reduction."""
-    env = CompileEnvironment.current()
-    for user in list(source.users):
-        if user.target is not torch.ops.aten.sym_size.int or user.args[1] not in dims:
-            continue
-        block_id = env.get_block_id(source.meta["val"].size(user.args[1]))
-        if block_id is None or not env.block_sizes[block_id].reduction:
-            continue
-        extent = env.block_sizes[block_id].numel
-        if not extent.is_Integer:
-            continue
-        for consumer in list(user.users):
-            consumer.args, consumer.kwargs = map_arg(
-                (consumer.args, consumer.kwargs),
-                lambda n, size=int(extent), source=user: size if n is source else n,
-            )
-        source.graph.erase_node(user)
 
 
 def _new_node(

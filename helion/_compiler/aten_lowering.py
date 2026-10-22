@@ -14,11 +14,13 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import _to_sympy
 from .node_masking import apply_masking
 from .node_masking import broadcasts_onto_masked_lanes
 from .node_masking import cached_masked_value
@@ -117,6 +119,34 @@ def register_lowering(
     lowering = AtenLowering(target=fn, masked_value_fn=masked_value_fn)
     aten_lowering_dispatch[fn] = lambda node: make_lowering(lowering, node)
     return lowering
+
+
+def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
+    """Read a full slice's logical extent, independent of padding or chunk size."""
+    env = CompileEnvironment.current()
+    for node in list(
+        graph.find_nodes(op="call_function", target=torch.ops.aten.sym_size.int)
+    ):
+        block_id = env.get_block_id(node.meta["val"])
+        if block_id is None or not env.block_sizes[block_id].reduction:
+            continue
+        size = env.block_sizes[block_id].size
+        assert isinstance(size, (int, torch.SymInt))
+        if isinstance(size, int):
+            for consumer in list(node.users):
+                consumer.args, consumer.kwargs = map_arg(
+                    (consumer.args, consumer.kwargs),
+                    lambda n, extent=size, source=node: extent if n is source else n,
+                )
+            graph.erase_node(node)
+        else:
+            # Removing the tensor dependency lets this scalar stay outside
+            # rolled graphs, even when the full slice is loaded in chunks.
+            node.target = _get_symnode
+            node.args = (env.sympy_debug(_to_sympy(size)),)
+            node.kwargs = {}
+            node.meta["val"] = size
+            node.meta.pop("lowering", None)
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)

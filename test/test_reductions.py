@@ -395,6 +395,36 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = mask.amin((1, 2)) if op == "amin" else mask.amax((1, 2))
         torch.testing.assert_close(output, expected)
 
+    @onlyBackends(["triton", "pallas"])
+    @parametrize("static_shapes", (False, True))
+    @parametrize("multi", (False, True))
+    def test_full_slice_size_is_logical_extent(self, static_shapes, multi):
+        def reduce(x: torch.Tensor, dims: hl.constexpr) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                values = x[row]
+                out[row] = values.sum(dims) / values.size(1)
+            return out
+
+        kernel = helion.kernel(
+            reduce, static_shapes=static_shapes, autotune_effort="none"
+        )
+        shape = (5, 7, 9) if multi else (5, 7)
+        if multi and _get_backend() == "pallas":
+            # Pallas chains currently require unpadded intermediate extents.
+            shape = (4, 32, 64)
+        x = torch.randn(shape, device=DEVICE)
+        dims = (1, 2) if multi else (1,)
+        bound = kernel.bind((x, dims))
+        for chunk in (None, 2) if _get_backend() == "triton" else (None,):
+            config = helion.Config(block_sizes=[2])
+            if bound.config_spec.reduction_loops:
+                config.config["reduction_loops"] = [chunk] * len(
+                    bound.config_spec.reduction_loops
+                )
+            actual = bound.compile_config(config)(x, dims)
+            torch.testing.assert_close(actual, x.sum(dims) / x.size(1))
+
     @onlyBackends(["triton"])
     @parametrize("case", ("nonadjacent", "partial", "size"))
     def test_multi_dim_reduction_fallbacks(self, case):
