@@ -21,6 +21,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering import custom_reduction_sources
+from ..inductor_lowering import reduction_block_id
 from ..node_masking import cached_masked_value
 from ..tile_strategy import DeviceLoopState
 
@@ -36,7 +37,6 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     """Generate a persistent or rolled custom reduction."""
     # reduction_strategy imports DeviceIR before helion.Config is initialized.
     from ..device_ir import HelperFunctionGraphInfo
-    from ..inductor_lowering import reduction_block_id
     from ..reduction_strategy import LoopedReductionStrategy
 
     raw_input = state.ast_args[1]
@@ -172,7 +172,8 @@ def _emit_reduction_padding(
     if not dynamic:
         padded_extent = env.backend.static_rdim_size(int(numel))
         padded = str(padded_extent)
-        if padded_extent == int(numel):
+        start = -(-int(numel) // strategy.block_size) * strategy.block_size
+        if start >= padded_extent:
             return padded, dynamic
     else:
         padded = device_function.new_var("custom_reduce_padded")

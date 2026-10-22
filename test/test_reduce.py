@@ -1361,14 +1361,23 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
 
         x = torch.randint(-10, 10, (5, 2051), device=DEVICE).float()
         for other in (-1, 2):
-            code, result = code_and_output(
-                shifted_rows, (x, other), block_sizes=[2], reduction_loops=[256]
-            )
-            padding = 4096 - x.size(1)
-            expected = x.sum(1) + x.size(1) - 1 + padding * (other + 1)
-            torch.testing.assert_close(result, expected)
-            self.assertIn("for roffset_", code)
-            self.assertNotIn("custom_reduce_valid_combine", code)
+            for chunk in (256, 2048):
+                with self.subTest(other=other, chunk=chunk):
+                    code, result = code_and_output(
+                        shifted_rows,
+                        (x, other),
+                        block_sizes=[2],
+                        reduction_loops=[chunk],
+                    )
+                    padding = 4096 - x.size(1)
+                    expected = x.sum(1) + x.size(1) - 1 + padding * (other + 1)
+                    torch.testing.assert_close(result, expected)
+                    self.assertIn("for roffset_", code)
+                    if chunk == 2048:
+                        self.assertNotIn("custom_reduce_padding", code)
+                    else:
+                        self.assertIn("custom_reduce_padding", code)
+                    self.assertNotIn("custom_reduce_valid_combine", code)
 
     @skipIfRefEager("Checks dynamic reduction results")
     def test_dynamic_tuple_padding(self) -> None:
