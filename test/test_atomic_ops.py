@@ -14506,7 +14506,7 @@ class TestUniformLocalDiscoveryCPU(unittest.TestCase):
             domains = {g.key: g.domain for g in spec.compiler_coverage_groups}
             expected = {
                 "cute_fragment_scan": ("serial", "cooperative"),
-                "cute_fragment_reduction": ("serial", "warp"),
+                "cute_fragment_reduction": ("serial", "warp", "cta", "cta_unroll"),
                 "cute_fragment_warp_scan": (False, True),
                 "cute_fragment_skip_zero_atomics": (False, True),
                 "cute_fragment_atomic_aggregation": (False, True),

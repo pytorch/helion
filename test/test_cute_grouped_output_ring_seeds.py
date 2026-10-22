@@ -30,6 +30,9 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.autotuner_heuristics.cute import _block_size_value_reachable
 from helion._compiler.autotuner_heuristics.cute import (
+    _bounded_grouped_worklist_seed_families,
+)
+from helion._compiler.autotuner_heuristics.cute import (
     _tcgen05_grouped_output_ring_seeds,
 )
 from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_config
@@ -49,6 +52,7 @@ from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Sequence
     from typing import Any
 
     from helion.runtime.kernel import BoundKernel
@@ -56,6 +60,9 @@ if TYPE_CHECKING:
 
 _HELPER = (
     "helion._compiler.autotuner_heuristics.cute._tcgen05_grouped_output_ring_seeds"
+)
+_BOUNDED_HELPER = (
+    "helion._compiler.autotuner_heuristics.cute._bounded_grouped_worklist_seed_families"
 )
 
 
@@ -104,11 +111,65 @@ def _values(shape: int, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _bind_with_legacy_projection(
+    values: tuple[torch.Tensor, ...],
+    *,
+    static_shapes: bool = False,
+    function: Callable[..., object] = grouped_gemm_jagged.fn,
+) -> tuple[BoundKernel[Any], list[helion.Config], list[helion.Config]]:
+    """Observe the original family boundary without disabling later palettes."""
+    bounded_calls: list[list[helion.Config]] = []
+    ring_calls: list[list[helion.Config]] = []
+
+    def bounded(
+        families: Sequence[Sequence[helion.Config]],
+        *,
+        preferred_config: helion.Config | None = None,
+    ) -> list[helion.Config]:
+        result = _bounded_grouped_worklist_seed_families(
+            families, preferred_config=preferred_config
+        )
+        bounded_calls.append(copy.deepcopy(result))
+        return result
+
+    def rings(
+        seeds: Sequence[helion.Config],
+        *,
+        group_count: int,
+        dtype_bytes: int,
+        capacity_bytes: int,
+        output_dtype_bytes: int | None = None,
+    ) -> list[helion.Config]:
+        result = _tcgen05_grouped_output_ring_seeds(
+            seeds,
+            group_count=group_count,
+            dtype_bytes=dtype_bytes,
+            capacity_bytes=capacity_bytes,
+            output_dtype_bytes=output_dtype_bytes,
+        )
+        ring_calls.append(copy.deepcopy(result))
+        return result
+
+    with (
+        patch(_BOUNDED_HELPER, side_effect=bounded),
+        patch(_HELPER, side_effect=rings),
+    ):
+        bound = _bind(values, static_shapes=static_shapes, function=function)
+    for calls in (bounded_calls, ring_calls):
+        assert not calls or all(call == calls[0] for call in calls)
+    return (
+        bound,
+        bounded_calls[0] if bounded_calls else [],
+        ring_calls[0] if ring_calls else [],
+    )
+
+
 def _population(
     bound: BoundKernel[Any],
     values: tuple[torch.Tensor, ...],
     seeds: list[helion.Config],
-) -> tuple[list[helion.Config], list[helion.Config]]:
+    tracked: list[helion.Config],
+) -> tuple[list[helion.Config], list[helion.Config], list[helion.Config]]:
     state = random.getstate()
     try:
         random.seed(691)
@@ -128,9 +189,18 @@ def _population(
                 is InitialPopulationStrategy.FROM_RANDOM
             )
             flats = checked_initial_population(search)
+            before_normalizing = random.getstate()
+            normalized_tracked = [
+                search.config_gen.canonicalize_flat(
+                    search.config_gen.flatten(copy.deepcopy(seed))
+                )[1]
+                for seed in tracked
+            ]
+            assert random.getstate() == before_normalizing
             return (
                 [search.config_gen.unflatten(flat) for flat in flats],
                 [config for _, config in search.config_gen.seed_flat_config_pairs()],
+                normalized_tracked,
             )
     finally:
         random.setstate(state)
@@ -147,8 +217,21 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
     with patch(_HELPER, return_value=[]):
         old_bound = _bind(values, static_shapes=static_shapes)
     previous = old_bound.config_spec.compiler_seed_configs
-    bound = _bind(values, static_shapes=static_shapes)
+    bound, legacy, added = _bind_with_legacy_projection(
+        values, static_shapes=static_shapes
+    )
     seeds = bound.config_spec.compiler_seed_configs
+    assert (
+        bound.config_spec.compiler_default_config
+        == old_bound.config_spec.compiler_default_config
+    )
+    if static_shapes and shape == 0:
+        # Static small-M planning already limits this axis below M256. Seed
+        # coverage must not expand the existing native layout admission.
+        assert not _block_size_value_reachable(bound.config_spec, 0, 256)
+        assert seeds == previous == []
+        assert legacy == added == []
+        return
     assert bound.host_function is not None
     with bound.env:
         source64 = CuteTcgen05GroupedSource64Heuristic.get_seed_config(
@@ -160,46 +243,43 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
         paired = grouped_row_union_paired_clc_carrier(
             bound.env, bound.host_function.device_ir
         )
-    # Independent carriers follow the worklist family. Check each exact suffix
-    # in reverse order before checking the old prefix and output-ring append.
-    previous_prefix, seed_prefix = previous, seeds
+    # Keep the original independent-carrier tail checks. The new native device
+    # families are inside the worklist palette, before these separate carriers.
+    previous_tail, seed_tail = previous, seeds
     if paired is not None:
         startup = copy.deepcopy(paired)
         startup.config["tcgen05_ab_startup_prefill"] = True
         suffix = [paired, startup]
-        assert previous_prefix[-2:] == seed_prefix[-2:] == suffix
-        previous_prefix, seed_prefix = previous_prefix[:-2], seed_prefix[:-2]
-        assert all(seed not in suffix for seed in (*previous_prefix, *seed_prefix))
+        assert previous_tail[-2:] == seed_tail[-2:] == suffix
+        previous_tail, seed_tail = previous_tail[:-2], seed_tail[:-2]
+        assert all(seed not in suffix for seed in (*previous_tail, *seed_tail))
     if row_union is not None:
-        assert previous_prefix[-1] == seed_prefix[-1] == row_union
-        previous_prefix, seed_prefix = previous_prefix[:-1], seed_prefix[:-1]
-        assert row_union not in previous_prefix and row_union not in seed_prefix
+        assert previous_tail[-1] == seed_tail[-1] == row_union
+        previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]
+        assert row_union not in previous_tail and row_union not in seed_tail
     if source64 is not None:
-        assert previous_prefix[-1] == seed_prefix[-1] == source64
-        previous_prefix, seed_prefix = previous_prefix[:-1], seed_prefix[:-1]
+        assert previous_tail[-1] == seed_tail[-1] == source64
+        previous_tail, seed_tail = previous_tail[:-1], seed_tail[:-1]
         assert all(
             seed.get("tcgen05_grouped_worklist_source_m_tile") != 64
-            for seed in (*previous_prefix, *seed_prefix)
+            for seed in (*previous_tail, *seed_tail)
         )
-    assert seed_prefix[: len(previous_prefix)] == previous_prefix
-    assert (
-        bound.config_spec.compiler_default_config
-        == old_bound.config_spec.compiler_default_config
-    )
-    if static_shapes and shape == 0:
-        # Static small-M planning already limits this axis below M256. Seed
-        # coverage must not expand the existing native layout admission.
-        assert not _block_size_value_reachable(bound.config_spec, 0, 256)
-        assert seeds == previous == []
-        return
-    grouped_previous = [
-        seed
-        for seed in previous_prefix
-        if seed.get("tcgen05_grouped_mode") == "worklist_nm"
+    # The ring helper receives the bounded original NM family before source128,
+    # physical-K, immutable, MN/panel and independent carriers are appended.
+    # Observe that boundary instead of treating every later C4/source128 seed
+    # as part of one trailing suffix. All those later families stay enabled.
+    assert len(legacy) == 8
+    assert all(seed.get("tcgen05_grouped_mode") == "worklist_nm" for seed in legacy)
+    assert [seed for seed in previous if seed in legacy] == legacy
+    assert not any(seed in previous for seed in added)
+    assert [seed for seed in seeds if seed in legacy or seed in added] == [
+        *legacy,
+        *added,
     ]
-    assert len(grouped_previous) == 8
+    assert [seed for seed in seeds if seed not in added] == previous
+    assert [seed for seed in seed_tail if seed not in added] == previous_tail
     assert len(seeds) == len(previous) + 4
-    added = seed_prefix[len(previous_prefix) :]
+    assert len(added) == 4
     assert {
         (
             seed["tcgen05_grouped_worklist_source_m_tile"],
@@ -213,17 +293,19 @@ def test_original_shapes_cover_output_ring_and_preserve_seed_prefix(
             CuteTcgen05GroupedWorklistHeuristic.get_seed_config(
                 bound.env, bound.host_function.device_ir
             )
-            == grouped_previous[0]
+            == legacy[0]
         )
-    population, normalized = _population(bound, values, list(seeds))
-    old_population, _ = _population(bound, values, previous)
+    population, normalized, normalized_added = _population(
+        bound, values, list(seeds), added
+    )
+    old_population, _, _ = _population(bound, values, previous, [])
     # checked_initial_population checks the exact 100-row base and each addition.
     assert population[0] == old_population[0]
-    normalized_added = [
-        seed for seed in normalized if seed.get("tcgen05_c_stages") == 4
-    ]
     assert len(normalized_added) == 4
     assert all(seed in population for seed in normalized_added)
+    # The full, unprojected registry is normalized and covered too. The shared
+    # helper checks exact nominal/coverage prefixes, RNG state and final pins.
+    assert all(seed in population for seed in normalized)
     for seed in added:
         assert seed["tcgen05_ab_stages"] == 3
         assert seed["tcgen05_c_stages"] == 4
@@ -255,15 +337,20 @@ def test_rank3_device_metadata_reuses_the_same_output_ring_family(
         torch.empty((9 if offsets else 8,), dtype=torch.int32),
     )
     kernel = _device_offsets_kernel if offsets else _device_split_sizes_kernel
-    bound = _bind(values, static_shapes=True, function=kernel.fn)
-    added = [
-        seed
-        for seed in bound.config_spec.compiler_seed_configs
-        if seed.get("tcgen05_grouped_mode") == "worklist_nm"
-        and seed.get("tcgen05_c_stages") == 4
-    ]
+    bound, _, added = _bind_with_legacy_projection(
+        values, static_shapes=True, function=kernel.fn
+    )
     # These source programs deliberately fix BK64; do not add an unreachable BK.
     assert len(added) == 2
+    assert {seed["tcgen05_grouped_worklist_source_m_tile"] for seed in added} == {
+        224,
+        256,
+    }
+    population, normalized, normalized_added = _population(
+        bound, values, list(bound.config_spec.compiler_seed_configs), added
+    )
+    assert len(normalized_added) == 2
+    assert all(seed in population for seed in (*normalized, *normalized_added))
     for seed in added:
         assert cast("list[int]", seed["block_sizes"])[2] == 64
         source = bound.to_code(seed)

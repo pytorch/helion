@@ -19,9 +19,10 @@ import torch
 
 import helion
 from helion._compiler.cute import cute_flash
-from helion._compiler.cute.attention_plan import FLASH_HEAD_DIM_PAIRS
+from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
+from helion._compiler.cute.attention_plan import flash_pair_head_dims_supported
 from helion._testing import patch_cute_mma_support
 import helion.language as hl
 
@@ -159,9 +160,14 @@ def _active(fragment: ConfigSpecFragment) -> tuple[object, ...]:
 
 
 def test_head_dim_pairs() -> None:
-    assert {(64, 64), (128, 128), (192, 128)} == FLASH_HEAD_DIM_PAIRS
+    assert {(192, 128)} == FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
     assert flash_head_dims_supported(192, 128)
-    assert not flash_head_dims_supported(192, 192)
+    assert flash_head_dims_supported(64, 64)
+    assert flash_head_dims_supported(128, 128)
+    # Symmetric 192 is a single-tile-body width, not a pair-body one.
+    assert flash_head_dims_supported(192, 192)
+    assert not flash_pair_head_dims_supported(192, 192)
+    assert flash_pair_head_dims_supported(192, 128)
     assert not flash_head_dims_supported(128, 64)
     assert not flash_head_dims_supported(256, 128)
 
@@ -190,13 +196,19 @@ def test_detector_keeps_the_symmetric_surface_unchanged() -> None:
 @pytest.mark.parametrize(
     ("head_dim", "head_dim_v", "seq"),
     (
-        pytest.param(192, 192, 512, id="192-192-no-tmem-room"),
         pytest.param(128, 64, 512, id="128-64-unsupported-pair"),
         pytest.param(192, 128, 384, id="192-128-odd-kv-tiles"),
     ),
 )
 def test_detector_rejects_other_pairs(head_dim: int, head_dim_v: int, seq: int) -> None:
     assert _cpu_surface(head_dim, head_dim_v, seq) == (False, None, None)
+
+
+def test_detector_admits_symmetric_192_on_the_single_tile_body() -> None:
+    """Two 192-wide accumulators do not fit the pair body's TMEM; the width
+    is hosted by the single-query-tile body instead (one score buffer per
+    stage, one accumulator), so the surface opens as a symmetric width."""
+    assert _cpu_surface(192, 192, 512) == (True, 192, None)
 
 
 # --------------------------------------------------------------------------
@@ -1046,3 +1058,60 @@ def test_structural_coverage_design_is_complete(is_causal: bool) -> None:
             assert resolved.o_over_q == (resolved.epi_tma or resolved.epi_stg)
             staged += resolved.o_over_q
         assert (staged > 0) == is_causal
+
+
+def test_shared_output_tile_does_not_admit_the_uneven_ring() -> None:
+    """``cute_flash_o_stage`` = 1 on the asymmetric pair: one staged 128-wide
+    tile beside the two 192-wide Q tiles still leaves no room for FA4's
+    uneven three-slot ring (96 + 128 + 32 KiB), so the byte model keeps the
+    aliased ring's depth, its bytes are the runtime struct's with the shared
+    tile, and the resolver keeps a tile per stage under the uneven ring."""
+    import dataclasses
+    import importlib
+
+    from helion._compiler.cute.flash_schedule import FlashScheduleSpec
+    from helion._compiler.cute.flash_schedule import build_fa4_schedule
+    from helion._compiler.cute.flash_schedule import fa4_schedule_fits
+    from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
+    from helion._compiler.cute.flash_schedule import verify_flash_schedule
+
+    flash_fa4_shared_storage = importlib.import_module(
+        "helion._compiler.cute._flash_runtime"
+    ).flash_fa4_shared_storage
+    uneven_shared = FlashScheduleSpec(
+        HEAD_DIM,
+        3,
+        stage_output=True,
+        head_dim_v=HEAD_DIM_V,
+        uneven_kv_ring=True,
+        output_tiles=1,
+    )
+    assert not fa4_schedule_fits(uneven_shared)
+    aliased_shared = dataclasses.replace(uneven_shared, uneven_kv_ring=False)
+    depth = max_fa4_kv_depth(aliased_shared)
+    assert max_fa4_kv_depth(uneven_shared) == depth
+    assert (
+        depth
+        == max_fa4_kv_depth(dataclasses.replace(aliased_shared, output_tiles=None)) + 1
+    )
+    schedule = verify_flash_schedule(
+        build_fa4_schedule(dataclasses.replace(aliased_shared, kv_depth=depth))
+    ).schedule
+    storage = flash_fa4_shared_storage(
+        HEAD_DIM, depth, epi_tma=True, head_dim_v=HEAD_DIM_V, o_stage=1
+    )
+    assert schedule.shared_memory_bytes == storage.size_in_bytes()
+    assert not cute_flash._flash_o_stage_legal(
+        topology="fa4",
+        epi_tma=True,
+        epi_stg=False,
+        o_over_q=False,
+        s_stage=2,
+        use_2cta_instrs=False,
+        separate_kv_rings=False,
+        has_row_epilogue=False,
+        row_bound_tiling="global",
+        uneven_kv_ring=True,
+        kv_split=1,
+        flex_tail_split=0,
+    )

@@ -29,7 +29,15 @@ pytestmark = skipUnlessBackends(["cute"])
 
 def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
     assert block_scaled_choices() == BLOCK_SCALED_CHOICES
-    assert block_scaled_choices(mxfp8=True)["cute_scaled_tile_n"] == (256, 128, 64)
+    assert block_scaled_choices(mxfp8=True)["cute_scaled_tile_n"] == (
+        256,
+        224,
+        128,
+        64,
+        32,
+        16,
+        8,
+    )
     raw_config: dict[str, object] = {"cute_scaled_mma": True, "cute_scaled_tile_n": 64}
     with pytest.raises(helion.exc.InvalidConfig):
         normalize_block_scaled_config(

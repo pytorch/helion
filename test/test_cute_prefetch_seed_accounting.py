@@ -16,6 +16,9 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
+from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+    CuteRolledClusterPacketHeuristic,
+)
 from helion._compiler.cute.prefetch_reduction_packets import _containers
 from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._compiler.inductor_lowering import ReductionLowering
@@ -28,7 +31,13 @@ from helion.language.memory_ops import store
 @pytest.fixture(autouse=True)
 def cpu_only():
     initialized = torch.cuda.is_initialized()
-    with _cpu_target(), _forbid_native_compile() as native:
+    with (
+        _cpu_target(),
+        _forbid_native_compile() as native,
+        patch.object(
+            CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
+        ),
+    ):
         yield
         assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized

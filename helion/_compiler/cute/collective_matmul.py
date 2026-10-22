@@ -15,12 +15,14 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import cast
 
+import sympy
 import torch
 
 from ... import exc
 from ...language import _tracing_ops
 from ...language import creation_ops
 from ...language import matmul_ops
+from ...language import tile_ops
 from ...language.memory_ops import load as language_load
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import ReadWrites
@@ -32,6 +34,8 @@ from ..device_ir import ForLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
 from ..reduction_strategy import PersistentReductionStrategy
 from ..tile_strategy import DeviceLoopState
+from ..variable_origin import BlockSizeOrigin
+from ..variable_origin import GridOrigin
 from ._ast_pass_utils import _bound_names
 from ._ast_pass_utils import _fresh_prefix
 from .collective_operand_packet import plan_collective_operand_packet
@@ -52,9 +56,13 @@ from .fold_noop_stores import _is_read_only
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 from .input_view_layout import input_view_copy_facts
+from .matmul_utils import SHAPE_QUERY_TARGETS
 from .matmul_utils import cute_resolve_active_block_id
 from .matmul_utils import cute_synthetic_lane_k_extent
+from .matmul_utils import loop_carries
+from .matmul_utils import strip_new_vars
 from .mma_support import cute_fp32_dot_uses_tf32
+from .packed_matmul import packed_axis_for_fact
 from .packed_matmul import packed_matmul_axis
 from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import build_recipe
@@ -63,15 +71,20 @@ from .scalar_recipe_rounding import preserve_fp32_multiply_rounding
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
     from torch.fx import Node
 
+    from ...autotuner.config_spec import MatmulFact
     from ..aten_lowering import LoweringContext
     from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
 
 
@@ -130,36 +143,87 @@ def _native_site_enabled(site: CollectiveMmaSite, config: Mapping[str, object]) 
     )
 
 
+def _loop_entry(
+    graphs: Sequence[GraphInfo], placeholder: Node
+) -> tuple[Node, Node] | None:
+    """The control-flow call and the outer value a placeholder receives."""
+    graph = next(info for info in graphs if info.graph is placeholder.graph)
+    parent_entry = control_flow_parent_entries(graphs).get(graph.graph_id)
+    if parent_entry is None:
+        return None
+    parent, argument_slot = parent_entry
+    captured = parent.args[argument_slot]
+    assert isinstance(captured, (list, tuple))
+    position = list(placeholder.graph.find_nodes(op="placeholder")).index(placeholder)
+    value = captured[position]
+    if not isinstance(value, torch.fx.Node):
+        return None
+    return parent, value
+
+
 def _is_direct_zero_seed(
-    graphs: Sequence[GraphInfo], node: Node, acc_node: Node
+    graphs: Sequence[GraphInfo], node: Node, acc_node: Node, k_block_id: int | None
 ) -> bool:
     """A zero created in this scope, excluding an enclosing loop's carry.
 
     Tracing a phi all the way to its original zero is insufficient: a later
     iteration of the enclosing loop may already hold a nonzero accumulator.
+    A captured zero therefore counts only when the loop never rebinds it, or
+    when the loop is this contraction's own K loop, which restarts from the
+    captured seed for every reduction.
     """
-    current = acc_node
-    while current.op == "call_function" and current.target is _tracing_ops._new_var:
-        assert isinstance(current.args[0], torch.fx.Node)
-        current = current.args[0]
+    current = strip_new_vars(acc_node)
     if current.op == "placeholder":
         graph = next(info for info in graphs if info.graph is node.graph)
-        parent_entry = control_flow_parent_entries(graphs).get(graph.graph_id)
-        if not isinstance(graph, ForLoopGraphInfo) or parent_entry is None:
+        if not isinstance(graph, ForLoopGraphInfo):
             return False
-        parent, argument_slot = parent_entry
-        captured = parent.args[argument_slot]
-        assert isinstance(captured, (list, tuple))
-        position = list(node.graph.find_nodes(op="placeholder")).index(current)
-        current = captured[position]
-        if not isinstance(current, torch.fx.Node):
+        carries = loop_carries(node.graph, graphs)
+        entry = _loop_entry(graphs, current)
+        if carries is None or entry is None:
             return False
+        if graph.block_ids != [k_block_id] and current in carries.values():
+            return False
+        current = entry[1]
     return current.target is creation_ops.full and _is_zero_init_acc_node(
         current, graphs=graphs
     )
 
 
-def has_collective_native_seed_candidate(graphs: Sequence[GraphInfo]) -> bool:
+def _contraction_accumulator(node: Node) -> Node | None:
+    """The accumulator operand a collective marker would read, if any."""
+    if node.target in (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    ):
+        accumulator = node.args[0]
+    elif node.target is matmul_ops.dot and len(node.args) >= 3:
+        accumulator = node.args[2]
+    else:
+        return None
+    return accumulator if isinstance(accumulator, torch.fx.Node) else None
+
+
+def _contraction_k_block_id(
+    env: CompileEnvironment, device_ir: DeviceIR, node: Node
+) -> int | None:
+    """The K block the seed heuristics attribute to ``node``.
+
+    This is the recorded fact's K, or the packed axis when the fact has none,
+    the same resolution the geometry uses.
+    """
+    fact_id = node.meta.get(matmul_ops.MATMUL_FACT_ID_META)
+    if not isinstance(fact_id, int):
+        return None
+    fact = env.config_spec.matmul_facts[fact_id]
+    if fact.k_block_id is not None:
+        return fact.k_block_id
+    packed = packed_axis_for_fact(env, device_ir, fact)
+    return None if packed is None else packed.block_id
+
+
+def has_collective_native_seed_candidate(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> bool:
     """Avoid duplicate native seeds when every contraction starts at zero.
 
     This is only a search hint. Code generation still proves the direct
@@ -167,27 +231,364 @@ def has_collective_native_seed_candidate(graphs: Sequence[GraphInfo]) -> bool:
     Use the same immediate-scope zero test so an outer carry originating at
     zero is not mistaken for a fresh zero on every iteration.
     """
+    graphs = device_ir.graphs
     for graph in graphs:
         for node in graph.graph.nodes:
-            if node.target in (
-                torch.ops.aten.addmm.default,
-                torch.ops.aten.baddbmm.default,
-            ):
-                accumulator = node.args[0]
-            elif node.target is matmul_ops.dot and len(node.args) >= 3:
-                accumulator = node.args[2]
-            else:
-                continue
-            if not isinstance(accumulator, torch.fx.Node):
+            accumulator = _contraction_accumulator(node)
+            if accumulator is None:
                 continue
             value = accumulator.meta.get("val")
             if (
                 isinstance(value, torch.Tensor)
                 and value.dtype == torch.float32
-                and not _is_direct_zero_seed(graphs, node, accumulator)
+                and not _is_direct_zero_seed(
+                    graphs,
+                    node,
+                    accumulator,
+                    _contraction_k_block_id(env, device_ir, node),
+                )
             ):
                 return True
     return False
+
+
+def _contraction_operands(node: Node) -> tuple[Node, Node] | None:
+    """The A and B operands a collective marker would stage, if both are nodes."""
+    operands = (
+        node.args[1:3]
+        if node.target in (torch.ops.aten.addmm.default, torch.ops.aten.baddbmm.default)
+        else node.args[:2]
+    )
+    lhs, rhs = operands
+    if not isinstance(lhs, torch.fx.Node) or not isinstance(rhs, torch.fx.Node):
+        return None
+    return lhs, rhs
+
+
+def _k_structure_admits(
+    graphs: Sequence[GraphInfo],
+    node: Node,
+    acc_node: Node,
+    k_block_id: int,
+    *,
+    k_factor: int,
+    full_slice: bool,
+    zero_seed: bool,
+) -> bool:
+    """The K-shape proofs shared by the marker and the seed heuristic.
+
+    A full-slice K is folded per thread, so it needs an unpacked contraction
+    that starts from a zero created for every reduction (``zero_seed``, from
+    ``_is_direct_zero_seed``). A tiled K loop must carry exactly this
+    contraction and nothing else.
+    """
+    if full_slice:
+        return k_factor == 1 and zero_seed
+    return (
+        _mma_loop_is_exclusive(node)
+        and _mma_result_can_be_deferred(node)
+        and _direct_loop_carry(graphs, node, acc_node, k_block_id)
+    )
+
+
+def _symbol_origin(
+    host_function: HostFunction | None, symbol: sympy.Basic
+) -> BlockSizeOrigin | GridOrigin | None:
+    """The block a traced scalar names: a tile's size or a loop coordinate."""
+    if host_function is None:
+        return None
+    origin_info = host_function.expr_to_origin.get(symbol)
+    origin = None if origin_info is None else origin_info.origin
+    return origin if isinstance(origin, (BlockSizeOrigin, GridOrigin)) else None
+
+
+def _traced_k_sized(
+    env: CompileEnvironment,
+    host_function: HostFunction | None,
+    size: int | torch.SymInt,
+    k_block_id: int,
+) -> bool:
+    """``cute_resolve_active_block_id`` from the traced origins alone.
+
+    A tile dimension is named by its block-size symbol and a full-slice K by
+    its static extent. The generator additionally matches aliases of the
+    block through the loops active at the contraction, which only adds
+    K-sized values.
+    """
+    if isinstance(size, torch.SymInt):
+        expr = size._sympy_()
+        if not isinstance(expr, sympy.Symbol):
+            return False
+        origin = _symbol_origin(host_function, expr)
+        return origin is not None and origin.block_id == k_block_id
+    return env.resolve_block_id(size) == k_block_id
+
+
+def _enclosing_scopes(
+    graphs: Sequence[GraphInfo], graph: GraphInfo
+) -> Iterator[tuple[GraphInfo, Node | None]]:
+    """``graph`` and the graphs enclosing it, innermost first.
+
+    Each graph is paired with the control-flow call that entered it, or
+    ``None`` for the outermost graph.
+    """
+    parents = control_flow_parent_entries(graphs)
+    while True:
+        entry = parents.get(graph.graph_id)
+        call = None if entry is None else entry[0]
+        yield graph, call
+        if call is None:
+            return
+        graph = next(item for item in graphs if item.graph is call.graph)
+
+
+def _enclosing_loop_blocks(graphs: Sequence[GraphInfo], graph: GraphInfo) -> set[int]:
+    """Block ids of every device loop enclosing ``graph``, itself included."""
+    return {
+        block_id
+        for info, _ in _enclosing_scopes(graphs, graph)
+        if isinstance(info, ForLoopGraphInfo)
+        for block_id in info.block_ids
+    }
+
+
+def _scalar_predicate(call: Node) -> bool:
+    """Whether an ``_if`` branches on a scalar rather than a tile predicate."""
+    predicate = call.args[0]
+    if not isinstance(predicate, torch.fx.Node):
+        return False
+    value = predicate.meta.get("val")
+    return isinstance(value, torch.Tensor) and value.ndim == 0
+
+
+def _reads_loop_position(
+    host_function: HostFunction | None,
+    node: Node,
+    varying: Collection[int],
+    kind: type[BlockSizeOrigin | GridOrigin],
+) -> bool:
+    """Whether a traced scalar names a ``kind`` origin of a loop in ``varying``."""
+    traced = node.meta.get("val")
+    if not isinstance(traced, torch.SymInt):
+        return False
+    for symbol in traced._sympy_().free_symbols:
+        origin = _symbol_origin(host_function, symbol)
+        if isinstance(origin, kind) and origin.block_id in varying:
+            return True
+    return False
+
+
+def _tile_coordinates(node: Node) -> list[Node]:
+    """The index operands whose tiles become per-element coordinates."""
+    if node.target is language_load and len(node.args) > 1:
+        indices = node.args[1]
+        if isinstance(indices, (list, tuple)):
+            return [index for index in indices if isinstance(index, torch.fx.Node)]
+    if node.target is tile_ops.tile_index and node.args:
+        tile = node.args[0]
+        if isinstance(tile, torch.fx.Node):
+            return [tile]
+    return []
+
+
+def _is_effectful_or_control_flow(node: Node) -> bool:
+    """A node the recipe proof can never replay as a pure scalar statement."""
+    if node.op != "call_function":
+        return False
+    target = node.target
+    return (
+        node.is_impure()
+        or target is _tracing_ops._phi
+        or target is _tracing_ops._if
+        or _tracing_ops.is_for_loop_target(target)
+        or isinstance(target, torch._ops.OpOverload)
+        and target._schema.is_mutable
+    )
+
+
+def _has_scalar_recipe(
+    graphs: Sequence[GraphInfo],
+    host_function: HostFunction | None,
+    value: Node,
+    *,
+    varying: Collection[int],
+) -> bool:
+    """A structural subset of the scalar recipe proof applied at lowering.
+
+    The lowering replays an operand or seed from pure dominating statements
+    whose free names are kernel arguments, block sizes and the M/N/K
+    coordinates; the target of any other enclosing loop is not among them.
+    A value produced by an effectful node or control flow, carried through a
+    loop, or depending on such a loop's position has no recipe under any
+    config. The position is the loop's grid index or tile begin/end/id, or
+    its tile used as a load coordinate; the tile's block size by itself is
+    replayed as a constant. Which pure expressions lower to replayable
+    statements, and whether those are ordered before intervening stores,
+    CTA-uniform and free of thread coordinates, is decided on the generated
+    code.
+    """
+    pending = [value]
+    seen: set[Node] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current.op == "placeholder":
+            graph = next(info for info in graphs if info.graph is current.graph)
+            entry = _loop_entry(graphs, current)
+            if entry is None:
+                return False
+            if isinstance(graph, ForLoopGraphInfo):
+                carries = loop_carries(current.graph, graphs)
+                if carries is None or current in carries.values():
+                    return False
+            pending.append(entry[1])
+            continue
+        if (
+            _is_effectful_or_control_flow(current)
+            or _reads_loop_position(host_function, current, varying, GridOrigin)
+            or any(
+                _reads_loop_position(host_function, index, varying, BlockSizeOrigin)
+                for index in _tile_coordinates(current)
+            )
+        ):
+            return False
+        # A tile coordinate is traced as the size of some tensor, often the
+        # carried accumulator; that reads its metadata, not its value.
+        if current.target not in SHAPE_QUERY_TARGETS:
+            pending.extend(current.all_input_nodes)
+    return True
+
+
+def _m_region_admits(
+    graphs: Sequence[GraphInfo],
+    graph: GraphInfo,
+    m_block_id: int,
+    root: Sequence[int],
+) -> bool:
+    """M placement and the control flow the lowering allows around the site.
+
+    M is a grid tile or the innermost enclosing device loop over exactly M.
+    The lowering inserts the collective at the row loop and refuses any
+    conditional between it and the reduction loop, so no ``if`` may sit
+    between the contraction and its M loop; a grid M's row lane wraps the
+    whole root body, so then no enclosing ``if`` is admitted at all. Branches
+    above the M loop need a scalar predicate, as for the marker. Whether a
+    grid M tile also has the single row lane the collective hoists above, and
+    whether the grid has no other lane loops, follows from the configured
+    thread layout and is decided by the marker.
+    """
+    inside_region = True
+    for info, call in _enclosing_scopes(graphs, graph):
+        if isinstance(info, ForLoopGraphInfo) and m_block_id in info.block_ids:
+            if info.block_ids != [m_block_id]:
+                return False
+            inside_region = False
+        if (
+            call is not None
+            and call.target is _tracing_ops._if
+            and (inside_region or not _scalar_predicate(call))
+        ):
+            return False
+    return m_block_id in root or not inside_region
+
+
+def fact_admits_collective_site(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+    *,
+    root: Sequence[int],
+    k_block_id: int,
+    k_factor: int,
+) -> bool:
+    """Whether a contraction attributed to ``fact`` passes the structural proofs.
+
+    These are the config-independent requirements of the marker and the late
+    lowering: an FP32 tensor accumulator of the operand rank; a full-slice K
+    that is unpacked, starts from a zero created for every reduction and
+    owns every value carrying its K coordinate; a tiled K loop that carries
+    exactly this contraction; M in the grid or an enclosing loop over exactly
+    M, with no conditional between the contraction and that placement and
+    only scalar predicates above it (``_m_region_admits``); and operands and
+    seed with a scalar recipe (``_has_scalar_recipe``). Block sizes, thread
+    layout, lane loops, static K extent, copy alignment and alias facts
+    depend on the config and remain with code generation, so an admitted
+    kernel can still refuse individual seeds.
+    """
+    fact_ids = {
+        index
+        for index, value in enumerate(env.config_spec.matmul_facts)
+        if value == fact
+    }
+    graphs = device_ir.graphs
+    host_function = device_ir.host_function
+    full_slice = env.block_sizes[k_block_id].reduction
+    m_block_id = fact.m_block_id
+    assert m_block_id is not None
+    for graph in graphs:
+        for node in graph.graph.nodes:
+            if node.meta.get(matmul_ops.MATMUL_FACT_ID_META) not in fact_ids:
+                continue
+            acc_node = _contraction_accumulator(node)
+            operands = _contraction_operands(node)
+            if acc_node is None or operands is None:
+                continue
+            value = acc_node.meta.get("val")
+            zero_seed = _is_direct_zero_seed(graphs, node, acc_node, k_block_id)
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != torch.float32
+                or value.ndim != fact.lhs_ndim
+                or not _k_structure_admits(
+                    graphs,
+                    node,
+                    acc_node,
+                    k_block_id,
+                    k_factor=k_factor,
+                    full_slice=full_slice,
+                    zero_seed=zero_seed,
+                )
+                or not _m_region_admits(graphs, graph, m_block_id, root)
+            ):
+                continue
+            if full_slice and (
+                _exclusive_synthetic_k_operands(
+                    node,
+                    *operands,
+                    k_sized=lambda size: _traced_k_sized(
+                        env, host_function, size, k_block_id
+                    ),
+                )
+                is None
+            ):
+                continue
+            varying = _enclosing_loop_blocks(graphs, graph) - {k_block_id, m_block_id}
+            replayed = list(operands)
+            if not full_slice and not zero_seed:
+                # The tiled K loop restarts from the value captured on entry,
+                # which the lowering must replay like an operand.
+                entry = _loop_entry(graphs, strip_new_vars(acc_node))
+                assert entry is not None
+                replayed.append(entry[1])
+            if all(
+                _has_scalar_recipe(graphs, host_function, item, varying=varying)
+                for item in replayed
+            ):
+                return True
+    return False
+
+
+def _enclosing_control_is_scalar(graphs: Sequence[GraphInfo], graph: GraphInfo) -> bool:
+    """Any dynamic branch enclosing a collective must be a scalar predicate.
+
+    A tile predicate would let only part of the CTA reach its barriers.
+    """
+    return all(
+        call is None or call.target is not _tracing_ops._if or _scalar_predicate(call)
+        for _, call in _enclosing_scopes(graphs, graph)
+    )
 
 
 def has_collective_matmul_candidate(graphs: Sequence[GraphInfo]) -> bool:
@@ -253,7 +654,7 @@ def has_collective_tmem_operand_candidate(graphs: Sequence[GraphInfo]) -> bool:
 
 
 def _direct_loop_carry(
-    cg: GenerateAST, node: Node, acc_node: Node, k_block_id: int
+    graphs: Sequence[GraphInfo], node: Node, acc_node: Node, k_block_id: int
 ) -> bool:
     """Require one result and a direct captured accumulator in this exact loop.
 
@@ -261,27 +662,19 @@ def _direct_loop_carry(
     read the same scalar that it assigns. This excludes a loop that repeatedly
     overwrites an output using an invariant (possibly nonzero) input.
     """
-    graph = next(info for info in cg.codegen_graphs if info.graph is node.graph)
+    graph = next(info for info in graphs if info.graph is node.graph)
     if not isinstance(graph, ForLoopGraphInfo) or graph.block_ids != [k_block_id]:
         return False
     outputs = tuple(node.graph.find_nodes(op="output"))
     if len(outputs) != 1 or outputs[0].args != ([node],):
         return False
-    current = acc_node
-    while current.op == "call_function" and current.target is _tracing_ops._new_var:
-        if len(current.args) != 1 or not isinstance(current.args[0], torch.fx.Node):
-            return False
-        current = current.args[0]
+    current = strip_new_vars(acc_node)
     if current.op != "placeholder" or current.graph is not node.graph:
         return False
-    parent_entry = control_flow_parent_entries(cg.codegen_graphs).get(graph.graph_id)
-    if parent_entry is None:
+    entry = _loop_entry(graphs, current)
+    if entry is None:
         return False
-    parent, argument_slot = parent_entry
-    captured = parent.args[argument_slot]
-    assert isinstance(captured, (tuple, list))
-    position = list(node.graph.find_nodes(op="placeholder")).index(current)
-    original_seed = captured[position]
+    parent, original_seed = entry
     return bool(parent.users) and all(
         user.target is operator.getitem
         and user.args == (parent, 0)
@@ -295,13 +688,18 @@ def _direct_loop_carry(
 
 
 def _exclusive_synthetic_k_operands(
-    cg: GenerateAST, node: Node, lhs_node: Node, rhs_node: Node, k_block_id: int
+    node: Node,
+    lhs_node: Node,
+    rhs_node: Node,
+    *,
+    k_sized: Callable[[int | torch.SymInt], bool],
 ) -> tuple[Node, ...] | None:
     """Prove that removing this synthetic K lane cannot change another value.
 
     The candidate may feed a later contraction or pointwise epilogue. Every
-    value still carrying its K coordinate must belong exclusively to the pure
-    operand slice; a second reduction or escaping operand keeps the old path.
+    value still carrying its K coordinate (``k_sized`` decides which sizes
+    do) must belong exclusively to the pure operand slice; a second reduction
+    or escaping operand keeps the old path.
     """
     dependencies: set[Node] = set()
     pending = [lhs_node, rhs_node]
@@ -319,9 +717,7 @@ def _exclusive_synthetic_k_operands(
             # scalar coordinates, even when one equals this full-slice K.
             continue
         value = current.meta.get("val")
-        if not isinstance(value, torch.Tensor) or not any(
-            cute_resolve_active_block_id(cg, size) == k_block_id for size in value.shape
-        ):
+        if not isinstance(value, torch.Tensor) or not any(map(k_sized, value.shape)):
             continue
         if current not in dependencies or any(
             user not in dependencies and user is not node for user in current.users
@@ -499,7 +895,7 @@ def _mark_collective(
         ):
             return None
     k_loop = k_states[-1]
-    zero_seed = _is_direct_zero_seed(cg.codegen_graphs, node, acc_node)
+    zero_seed = _is_direct_zero_seed(cg.codegen_graphs, node, acc_node, k_block_id)
     if (
         tf32
         and compute == "tcgen05"
@@ -515,14 +911,26 @@ def _mark_collective(
         static_k_extent = cute_synthetic_lane_k_extent(cg, k_block_id)
         synthetic_k_lane = k_loop.strategy._synthetic_cute_lane_var
         if (
-            k_factor != 1
-            or not zero_seed
+            not _k_structure_admits(
+                cg.codegen_graphs,
+                node,
+                acc_node,
+                k_block_id,
+                k_factor=k_factor,
+                full_slice=True,
+                zero_seed=zero_seed,
+            )
             or static_k_extent is None
             or not 1 < static_k_extent <= 128
             or synthetic_k_lane is None
             or (
                 dependencies := _exclusive_synthetic_k_operands(
-                    cg, node, lhs_node, rhs_node, k_block_id
+                    node,
+                    lhs_node,
+                    rhs_node,
+                    k_sized=lambda size: (
+                        cute_resolve_active_block_id(cg, size) == k_block_id
+                    ),
                 )
             )
             is None
@@ -532,9 +940,15 @@ def _mark_collective(
     elif (
         not isinstance(k_loop, DeviceLoopState)
         or k_loop.block_ids != [k_block_id]
-        or not _mma_loop_is_exclusive(node)
-        or not _mma_result_can_be_deferred(node)
-        or not _direct_loop_carry(cg, node, acc_node, k_block_id)
+        or not _k_structure_admits(
+            cg.codegen_graphs,
+            node,
+            acc_node,
+            k_block_id,
+            k_factor=k_factor,
+            full_slice=False,
+            zero_seed=zero_seed,
+        )
     ):
         return None
     grid_row_lane = None
@@ -605,20 +1019,9 @@ def _mark_collective(
     }
     if axes != {n_axis: bn, m_axis: collective_threads // bn}:
         return None
-    # Any dynamic branch enclosing the collective must be a scalar predicate.
-    # A tile predicate would let only part of the CTA reach its barriers.
-    parents = control_flow_parent_entries(cg.codegen_graphs)
     graph = next(graph for graph in cg.codegen_graphs if graph.graph is node.graph)
-    while graph.graph_id in parents:
-        parent, _ = parents[graph.graph_id]
-        if parent.target is _tracing_ops._if:
-            predicate = parent.args[0]
-            if not isinstance(predicate, torch.fx.Node):
-                return None
-            value = predicate.meta.get("val")
-            if not isinstance(value, torch.Tensor) or value.ndim != 0:
-                return None
-        graph = next(item for item in cg.codegen_graphs if item.graph is parent.graph)
+    if not _enclosing_control_is_scalar(cg.codegen_graphs, graph):
+        return None
     sites = df.cute_state.collective_mma_sites
     site = CollectiveMmaSite(
         len(sites),

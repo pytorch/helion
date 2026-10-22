@@ -44,6 +44,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -10577,11 +10578,13 @@ class TestCuteBackend(TestCase):
         family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
         # The row programs are searched only on small grids of a known
-        # batch; this 512-tile surface of an unknown batch leaves them out.
+        # batch; this 512-tile surface of an unknown batch leaves them out,
+        # as does the single-tile body's cooperative pair (a family of the
+        # value widths above 128).
         self.assertEqual(
             set(family.search_choices or ()),
             set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
-            - {"fa4_2cta_causal", "row_mma", "fa4_alt"},
+            - {"fa4_2cta_causal", "row_mma", "fa4_alt", "ws_2cta"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -10706,18 +10709,23 @@ class TestCuteBackend(TestCase):
             ),
             # the alternating-warpgroup family is a head_dim-128 body
             "fa4_alt": ("fa4", False, False, False, False, False, False, False),
+            # the single-tile body's cooperative pair (cta_group::2 atoms)
+            "ws_2cta": ("ws_overlap", False, False, True, False, False, False, False),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
         with patch.dict(os.environ, {}, clear=True):
             for family_name, expected in expected_flags.items():
                 with self.subTest(family=family_name):
+                    # (The pair is a family of the value widths above 128
+                    # with the standard dense output.)
                     cfg = resolve_flash_config(
-                        128 if family_name == "fa4_alt" else 64,
+                        {"fa4_alt": 128, "ws_2cta": 256}.get(family_name, 64),
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,
                         is_causal="causal" in family_name,
+                        standard_dense_output=family_name == "ws_2cta",
                     )
                     self.assertEqual(cfg.pipeline_family, family_name)
                     self.assertEqual(
@@ -14870,28 +14878,51 @@ class TestCuteBackend(TestCase):
             ):
                 spec = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale)).config_spec
                 seeds = [dict(seed.config) for seed in spec.autotune_seed_configs()]
-            expected = {
-                (128, 3, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 1): "pre_acc_wait",
-                (64, 23 - deep_ab_stages, 2): "missing",
-                (64, 23 - deep_ab_stages, 1): "missing",
-            }
             placements = {
                 (
                     seed["block_sizes"][2],
                     seed["tcgen05_ab_stages"],
                     seed.get("tcgen05_cluster_n", 1),
-                ): seed.get("tcgen05_aux_load_placement")
+                    seed.get("tcgen05_aux_load_placement"),
+                )
                 for seed in seeds
                 if seed["block_sizes"][:2] == [256, 256]
                 and seed.get("tcgen05_cluster_m") == 2
             }
-            self.assertEqual(
-                {key: placements.get(key, "missing") for key in expected},
-                expected,
-                scale_dtype,
-            )
+            # Preserve the legacy default-K/pre-wait seeds alongside the
+            # independently budgeted post-wait pipeline family.
+            for key in (
+                (128, 3, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 1, "pre_acc_wait"),
+            ):
+                self.assertIn(key, placements, scale_dtype)
+            for cluster_n in (1, 2):
+                self.assertNotIn(
+                    (64, 23 - deep_ab_stages, cluster_n, "pre_acc_wait"),
+                    placements,
+                    scale_dtype,
+                )
+            if scale_dtype == torch.float32:
+                state = spec._cute_tcgen05_config
+                fragments = state._matmul_block_fragments()
+                assert fragments is not None
+                self.assertGreater(fragments[2].high, 128)
+                self.assertTrue(
+                    any(seed["block_sizes"][2] == fragments[2].high for seed in seeds)
+                )
+                paired = next(
+                    seed
+                    for seed in seeds
+                    if seed.get("tcgen05_cta_group") == "two"
+                    and seed["block_sizes"] == [256, 256, 64]
+                    and seed["tcgen05_ab_stages"] == 12
+                )
+                self.assertEqual(paired["tcgen05_aux_load_placement"], "post_acc_wait")
+                self.assertIn((64, 12, 1, "post_acc_wait"), placements)
+                limit = state._paired_pipeline_stage_limit(paired)
+                assert limit is not None
+                self.assertGreaterEqual(limit, 12)
 
     def test_matmul_mma_tcgen05_f32_rowvec_seeds_keep_the_stage_within_smem(
         self,
@@ -16798,6 +16829,7 @@ class TestCuteBackend(TestCase):
     def test_grouped_device_split_cluster_bound_uses_source_profile(self) -> None:
         launcher = importlib.import_module("helion.runtime.cute.launcher")
         common_plan = {
+            "orientation": "nm",
             "group_count": 8,
             "m_size": 2048,
             "n_size": 512,
@@ -18845,6 +18877,7 @@ def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 class TestCuteConfigValuePriors(TestCase):
     """The cute backend supplies per-key value priors (the learned distribution
     used by generic kernels. Flash attention instead builds structural coverage
@@ -18950,10 +18983,11 @@ class TestCuteConfigValuePriors(TestCase):
 class TestCuteBackendRequirements(TestCase):
     """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
-    This module is ``importorskip``-gated on cutlass, so the environment under
-    test already satisfies the requirements (the gate must pass here).
+    An environment that runs the cute backend's tests (HELION_BACKEND=cute)
+    must satisfy the requirements; importing cutlass alone does not imply it.
     """
 
+    @onlyBackends(["cute"])
     def test_requirements_satisfied_in_this_environment(self) -> None:
         from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
@@ -18983,11 +19017,13 @@ class TestCuteBackendRequirements(TestCase):
             )
         self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
+    @onlyBackends(["cute"])
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
 
         check_cute_backend_requirements()  # must not raise in this environment
 
+    @onlyBackends(["cute"])
     def test_validate_environment_passes(self) -> None:
         from helion._compiler.backend import CuteBackend
 

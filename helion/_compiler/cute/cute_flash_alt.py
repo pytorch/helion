@@ -149,11 +149,13 @@ def emit_flash_fa4_alt_device_body(
     e2e_freq: int,
     e2e_res: int,
     kv_group: int = 1,
+    relu_output: bool = False,
 ) -> list[ast.stmt]:
     """Emit the alternating-warpgroup device body (see the module docstring).
 
     ``kv_group`` is the grouped-query divisor: K/V carry ``batch // kv_group``
     entries and are read at batch head ``flash_bh // kv_group``.
+    ``relu_output`` applies the output ReLU epilogue in the correction warps.
     """
     hd = head_dim
     assert hd in FA4_ALT_HEAD_DIMS
@@ -784,7 +786,7 @@ def emit_flash_fa4_alt_device_body(
     s.line(8, "flash_o_full_phase ^= 1")
     s.line(
         8,
-        f"_helion_flash_rt.fa4_correction_epilogue_to_smem_scoped(flash_pvt, tOtO, sO[None, None, flash_q_stage], flash_local_tidx, flash_inv_sum, {hd}, {cfg.corr_tile_size}, {io_dtype})",
+        f"_helion_flash_rt.fa4_correction_epilogue_to_smem_scoped(flash_pvt, tOtO, sO[None, None, flash_q_stage], flash_local_tidx, flash_inv_sum, {hd}, {cfg.corr_tile_size}, {io_dtype}{', relu_output=True' if relu_output else ''})",
     )
     s.line(8, "cute.arch.fence_view_async_shared()")
     s.line(8, "cute.arch.mbarrier_arrive(flash_corr_epi_full_ptr)")

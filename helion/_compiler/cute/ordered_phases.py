@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ...runtime.config import Config
+    from ..device_ir import DeviceIR
 
 
 def _require(condition: bool, detail: str) -> None:
@@ -110,22 +111,10 @@ def _contiguous_host_view(node: ast.AST, tensor_names: set[str]) -> bool:
     return True
 
 
-def generate_ordered_phases(
-    host: HostFunction,
-    config: Config,
-    emit_repro_caller: bool,
-    *,
-    store_transform: Callable[..., ast.AST] | None = None,
-    load_transform: Callable[..., ast.AST] | None = None,
-    extra_params: list[str] | None = None,
-) -> ast.Module:
-    """Bundle one complete root per explicit barrier phase.
-
-    Separate launches implement the existing grid-wide ordering contract.
-    The ordinary compiler has already checked each phase's memory dependencies;
-    this path does not infer additional synchronization for unmarked loops.
-    """
-    ir = host.device_ir
+def _ordered_phase_bundle(
+    host: HostFunction, ir: DeviceIR
+) -> tuple[HostFunction, MaterializedFissionPlan]:
+    """Prove the explicit barrier phases can launch as ordered single roots."""
     _require(not ir.implicit_dependency_starts, "implicit dependency phases")
     _require(
         all(
@@ -242,6 +231,34 @@ def generate_ordered_phases(
         materialized_names=tuple(captures),
         region_count=len(roots),
     )
+    return bundle, plan
+
+
+def ordered_phases_supported(host: HostFunction, ir: DeviceIR) -> bool:
+    """Whether ``pid_type="flat"`` can lower these barrier phases."""
+    try:
+        _ordered_phase_bundle(host, ir)
+    except exc.BackendUnsupported:
+        return False
+    return True
+
+
+def generate_ordered_phases(
+    host: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+) -> ast.Module:
+    """Bundle one complete root per explicit barrier phase.
+
+    Separate launches implement the existing grid-wide ordering contract.
+    The ordinary compiler has already checked each phase's memory dependencies;
+    this path does not infer additional synchronization for unmarked loops.
+    """
+    bundle, plan = _ordered_phase_bundle(host, host.device_ir)
     return generate_materialized_fission(
         bundle,
         config,

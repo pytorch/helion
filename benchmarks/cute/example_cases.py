@@ -789,6 +789,8 @@ def collect(module: str, shape_index: int) -> list[Case]:
                         m._nvfp4_w4a4_matmul_kernel,
                     ]:
                         kernel.settings.backend = "triton"
+                        # Its backend-dependent default was resolved for cute.
+                        kernel.settings.cute_rng_stream = "word0"
                         kernel.configs = []
                 shape = [(128, 256, 128), (512, 1024, 512), (1024, 2048, 1024)][i]
                 m.check_w4a16(*shape)
@@ -800,6 +802,11 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 backend = os.environ.get("HELION_BACKEND", "triton")
                 m.check_bf16in(rows, kbytes, backend)
                 m.check_fp4in(rows, kbytes, backend)
+                # The examples name the kernel after the backend; the inventory
+                # and each backend's worker must agree on one candidate name.
+                for case in cases[-2:]:
+                    (kernel,) = case.kernels.values()
+                    case.kernels = {"helion": kernel}
             elif module == "aot_compile_example":
                 rows, cols = [(256, 256), (1024, 1024), (4096, 4096)][i]
                 record(
