@@ -69,7 +69,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
                 cached configs with random configs to reach at least 2x population size. Outside
-                CuTe flash search, rows the compiler seed budget never trims are kept
+                CuTe flash and explicitly overflowing compiler palettes,
+                rows the compiler seed budget never trims are kept
                 even past that size.
                 When False, use only the seeds, default, and cached configs; random configs
                 are added only as a fallback when every one of them fails to compile
@@ -175,8 +176,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 # Outside flash, the budget already bounds the compiler
                 # seeds; rows past ``target`` are rows the budget never trims
                 # (explicit and protected seeds, the default, cached winners),
-                # so they are kept rather than sliced away.
-                if self.config_spec.cute_flash_search_enabled:
+                # so they are kept rather than sliced away. Flash and explicit
+                # overflow palettes retain DE's existing padded-batch slice.
+                if (
+                    self.config_spec.cute_flash_search_enabled
+                    or self.config_spec.compiler_seed_overflow_requested
+                ):
                     return pop[:target]
             return pop
 

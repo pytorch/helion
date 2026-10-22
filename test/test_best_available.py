@@ -2015,6 +2015,21 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         ):
             self.assertEqual(search._generate_initial_population_flat(), rows[:4])
 
+    def test_de_slices_padded_overflow_population_to_target(self):
+        generation = self._make_config_gen(CuteBackend())
+        source = self._make_mock_search(generation, cached_configs=[])
+        search = self._make_de_search(source)
+        search.population_size = 2
+        search.best_available_pad_random = True
+        rows = [[16, 64], [32, 64], [64, 64], [128, 64], [256, 64]]
+        with (
+            patch.object(search.config_spec, "compiler_seed_overflow_requested", True),
+            patch.object(
+                search, "_generate_best_available_population_flat", return_value=rows
+            ),
+        ):
+            self.assertEqual(search._generate_initial_population_flat(), rows[:4])
+
     def test_invalid_best_available_seed_is_logged_and_skipped(self):
         generation = self._make_config_gen(CuteBackend())
         search = self._make_mock_search(generation, cached_configs=[])

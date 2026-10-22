@@ -2104,10 +2104,12 @@ class PopulationBasedSearch(BaseSearch):
         seen: set[Config] = set()
         result: list[FlatConfig] = []
 
-        def admit(flat: FlatConfig, config: Config) -> None:
-            if config not in seen:
-                seen.add(config)
-                result.append(flat)
+        def admit(flat: FlatConfig, config: Config) -> bool:
+            if config in seen:
+                return False
+            seen.add(config)
+            result.append(flat)
+            return True
 
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
@@ -2206,14 +2208,12 @@ class PopulationBasedSearch(BaseSearch):
                     )
                 else:
                     transferred_config = generation.unflatten(flat)
-                if transferred_config in seen:
+                if not admit(flat, transferred_config):
                     duplicates += 1
                     self.log.debug(
                         f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
                     )
                     continue
-                seen.add(transferred_config)
-                result.append(flat)
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )
