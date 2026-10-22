@@ -4692,6 +4692,23 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         spec._cute_tcgen05_config.grouped_row_union_paired_clc_eligible = (
             grouped_row_union_paired_clc_carrier(env, device_ir) is not None
         )
+        search_inputs = cls._eligible_inputs(
+            env, device_ir, require_runtime_n_ptx=False
+        )
+        if (
+            search_inputs is not None
+            and spec._cute_tcgen05_config._preferred_persistent_pid_type() is not None
+        ):
+            _, search_analysis = search_inputs
+            source_m_tiles, _ = _tcgen05_grouped_worklist_source_analysis(
+                env, search_analysis
+            )
+            spec._cute_tcgen05_config.grouped_worklist_search_source_m_tiles = (
+                source_m_tiles
+            )
+            spec._cute_tcgen05_config.grouped_worklist_search_device_split_sizes = (
+                search_analysis.seed_facts.device_split_sizes
+            )
         if env.settings.disable_autotuner_heuristics:
             return frozenset({"input_tensor_metadata"})
         return cls.CACHE_SPECIALIZATION_FACTS
@@ -4701,6 +4718,8 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         cls,
         env: CompileEnvironment,
         device_ir: DeviceIR,
+        *,
+        require_runtime_n_ptx: bool = True,
     ) -> tuple[MatmulFact, Tcgen05GroupedWorklistAnalysis] | None:
         spec = env.config_spec
         fact = _tcgen05_grouped_worklist_fact(env)
@@ -4733,7 +4752,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             or analysis.seed_facts.n_hint % 32 != 0
         ):
             return None
-        if not tcgen05_runtime_n_ptx_compatible():
+        if require_runtime_n_ptx and not tcgen05_runtime_n_ptx_compatible():
             warn_tcgen05_runtime_n_ptx_fallback()
             return None
         return fact, analysis

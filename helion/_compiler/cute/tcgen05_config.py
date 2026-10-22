@@ -591,6 +591,11 @@ class CuteTcgen05Config:
             Tcgen05AbStagesThreeSearchConstraints | None
         ) = None
         self.grouped_worklist_smem_facts: Tcgen05GroupedWorklistSmemFacts | None = None
+        # Ordinary proposals may use the typed worklist lowering independently
+        # of runtime-N PTX compiler seeds. Filled only after DeviceIR proves
+        # the grouped contract and the source-tile/block domains.
+        self.grouped_worklist_search_source_m_tiles: tuple[int, ...] = ()
+        self.grouped_worklist_search_device_split_sizes: bool = False
         self.grouped_full_coverage_supported: bool = False
         self.grouped_full_coverage_eligible: bool = False
         self.grouped_row_union_supported: bool = False
@@ -3642,6 +3647,37 @@ class CuteTcgen05Config:
         ):
             return
         source_m_tile = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+        if self.grouped_worklist_search_source_m_tiles:
+            if source_m_tile not in self.grouped_worklist_search_source_m_tiles:
+                source_m_tile = self.grouped_worklist_search_source_m_tiles[0]
+                config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
+                    source_m_tile
+                )
+            # These values describe the lowering's supported role geometry,
+            # rather than a measured winning configuration. Keep BK, AB depth,
+            # source-M tile and consumer registers available for exploration.
+            config["num_warps"] = 8
+            config["num_stages"] = 7
+            config["tcgen05_cluster_n"] = 1
+            config["tcgen05_acc_stages"] = 2
+            config["tcgen05_c_stages"] = 2
+            config["tcgen05_num_epi_warps"] = 4
+            config["pid_type"] = self._preferred_persistent_pid_type()
+            config.pop("epilogue_subtile", None)
+            if self.grouped_worklist_search_device_split_sizes:
+                config.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
+                config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+                )
+                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05LayoutStrategy.DEFAULT.value
+                )
+                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+                config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+                config[TCGEN05_WARP_SPEC_STORE_WARPS_KEY] = 0
+                config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = TCGEN05_C_STORE_MODE_NORMAL
+                config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
+                config["num_sm_multiplier"] = 1
         if (
             type(source_m_tile) is not int
             or source_m_tile
@@ -4338,6 +4374,10 @@ class CuteTcgen05Config:
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        if fix_invalid and self.grouped_worklist_search_source_m_tiles:
+            # Project before the generic AB-stage validation so a valid deep
+            # worklist ring is checked against its own shape and SMEM model.
+            self._fix_grouped_worklist_search_config(config)
         self._normalize_dense_aligned_n(config, fix_invalid=fix_invalid)
         self._normalize_warp_mma_family(config, fix_invalid=fix_invalid)
         self._normalize_batch_raster(config, fix_invalid=fix_invalid)
@@ -7734,6 +7774,12 @@ class CuteTcgen05Config:
         ):
             fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
+        if self.grouped_worklist_search_source_m_tiles:
+            fragment = fields.get("tcgen05_ab_stages")
+            if isinstance(fragment, IntegerFragment):
+                fields["tcgen05_ab_stages"] = IntegerFragment(
+                    fragment.low, max(fragment.high, 7), fragment.default()
+                )
         seeds = self.config_spec.compiler_seed_configs
         if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
             fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(
@@ -7778,9 +7824,13 @@ class CuteTcgen05Config:
                     search_choices=choices,
                 )
             )
-        if modes:
+        worklist_search = bool(self.grouped_worklist_search_source_m_tiles)
+        if modes or worklist_search:
+            search_modes = (
+                (None, TCGEN05_GROUPED_MODE_WORKLIST_NM) if worklist_search else (None,)
+            )
             fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = _enum_fragment_with_seed_values(
-                (None,), modes, search_choices=(None,)
+                search_modes, modes, search_choices=search_modes
             )
         if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
             fields[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = EnumFragment(
@@ -7795,10 +7845,18 @@ class CuteTcgen05Config:
             bool,
             lambda value: value is True,
         )
-        if runtime_direct:
+        if runtime_direct or (
+            worklist_search and not self.grouped_worklist_search_device_split_sizes
+        ):
+            runtime_search = (
+                (False, True)
+                if worklist_search
+                and not self.grouped_worklist_search_device_split_sizes
+                else (False,)
+            )
             fields[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = (
                 _enum_fragment_with_seed_values(
-                    (False,), runtime_direct, search_choices=(False,)
+                    runtime_search, runtime_direct, search_choices=runtime_search
                 )
             )
         source_m_tiles = _compiler_seed_values(
@@ -7809,10 +7867,11 @@ class CuteTcgen05Config:
                 value in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
             ),
         )
-        if source_m_tiles:
+        if source_m_tiles or worklist_search:
+            source_search = (None, *self.grouped_worklist_search_source_m_tiles)
             fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
                 _enum_fragment_with_seed_values(
-                    (None,), source_m_tiles, search_choices=(None,)
+                    source_search, source_m_tiles, search_choices=source_search
                 )
             )
         mma_m_values = _compiler_seed_values(
@@ -7831,6 +7890,17 @@ class CuteTcgen05Config:
         fields.update(self.aux_load_mode_autotune_fragments())
         fields.update(self.aux_stages_autotune_fragments())
         fields.update(self.consumer_regs_autotune_fragments())
+        if worklist_search:
+            fields[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = EnumFragment(
+                (
+                    TCGEN05_CONSUMER_REGS_DEFAULT,
+                    *(
+                        value
+                        for value in TCGEN05_CONSUMER_REGS_CHOICES
+                        if value != TCGEN05_CONSUMER_REGS_DEFAULT
+                    ),
+                )
+            )
         fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):
             fields["pid_type"] = _enum_fragment_with_seed_values(
