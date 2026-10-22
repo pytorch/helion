@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -25,6 +26,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import filelock
 import pytest
 import torch
 import torch.distributed as dist
@@ -680,6 +682,10 @@ def skipIfLowVRAM(
     When called with only a reason, returns a decorator that skips tests on GPUs
     with less than ~30 GiB total VRAM. When provided with required_bytes, uses
     that value as the threshold.
+
+    The pytest-xdist workers of a run share one GPU, so these tests take turns:
+    otherwise two of them could both pass the free-memory check and then
+    allocate together.  Each releases its cached memory for the other workers.
     """
 
     threshold_bytes = (
@@ -703,7 +709,35 @@ def skipIfLowVRAM(
         return False
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(is_low_vram, reason=reason)
+    skip_if_low_vram = skipIfFn(is_low_vram, reason=reason)
+
+    def decorator(test_fn: Callable) -> Callable:
+        checked_fn = skip_if_low_vram(test_fn)
+
+        @functools.wraps(test_fn)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            with _vram_test_lock():
+                try:
+                    return checked_fn(*args, **kwargs)
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        return wrapper
+
+    return decorator
+
+
+@contextlib.contextmanager
+def _vram_test_lock() -> Generator[None, None, None]:
+    """Hold the skipIfLowVRAM lock shared by the xdist workers of this run."""
+    run_id = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if run_id is None:
+        yield
+        return
+    path = os.path.join(tempfile.gettempdir(), f"helion-vram-{run_id}.lock")
+    with filelock.FileLock(path):
+        yield
 
 
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
@@ -1785,9 +1819,9 @@ class RefEagerTestDisabled:
 
     def setUp(self) -> None:
         """Skip test if ref eager mode is enabled."""
-        super().setUp()  # type: ignore[misc]
         if os.environ.get("HELION_INTERPRET") == "1":
             self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
+        super().setUp()  # type: ignore[misc]
 
 
 class TestCase(unittest.TestCase):
@@ -1821,6 +1855,9 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+        # unittest does not call tearDown if setUp raises, including SkipTest.
+        # Close contexts even when a subclass skips after calling super().setUp().
+        self.addCleanup(self._test_stack.close)
 
         from torch._inductor.utils import fresh_cache
 

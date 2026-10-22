@@ -144,6 +144,8 @@ def _run_and_check(
     num_heads: int = 1,
     config_values: dict[str, object] | None = None,
     repeat_count: int = 3,
+    bound_out: list[helion.runtime.kernel.BoundKernel] | None = None,
+    output_out: list[torch.Tensor] | None = None,
 ) -> tuple[str, cute_flash.FlashAttentionConfig]:
     torch.manual_seed(
         1700
@@ -168,11 +170,15 @@ def _run_and_check(
     active_config = helion.Config(block_sizes=[1, 128, 128])
     active_config.config.update(values)
     bound = kernel.bind((q, k, v))
+    if bound_out is not None:
+        bound_out.append(bound)
     bound.set_config(active_config)
     code = bound.to_triton_code(active_config)
     output = bound(q, k, v)
     for _ in range(repeat_count - 1):
         assert torch.equal(output, bound(q, k, v))
+    if output_out is not None:
+        output_out.append(output)
     expected = torch.nn.functional.scaled_dot_product_attention(
         q,
         k,
@@ -544,3 +550,620 @@ def test_source_policy_variants_canonicalize_for_ws_overlap() -> None:
     assert resolved.sp_row_sum == "fragment"
     assert resolved.softmax_setup == "shared"
     assert resolved.epi_tma_setup == "shared"
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "family", "kv_stage"),
+    (
+        pytest.param(80, torch.bfloat16, False, "fa4", 9, id="d80-dense-depth9"),
+        pytest.param(96, torch.float16, True, "fa4", 7, id="d96-causal-depth7"),
+        pytest.param(32, torch.bfloat16, False, "fa4_deep_1cta", 4, id="d32-deep-1cta"),
+        pytest.param(112, torch.bfloat16, False, "ws_overlap", 2, id="d112-ws-overlap"),
+        pytest.param(80, torch.float16, False, "fa4_local_tma", 6, id="d80-local-tma"),
+        pytest.param(48, torch.bfloat16, True, "fa4", 12, id="d48-causal-depth12"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_head_dims_beyond_64_and_128_match_sdpa(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    family: str,
+    kv_stage: int,
+) -> None:
+    """Every multiple of 16 up to 128 is a fused head dim: exact SMEM tiles
+    (the swizzle the width admits), exact MMA extents, ``head_dim`` TMEM
+    output columns; the direct-store ring depth follows the byte model."""
+    _code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+            cute_flash.FLASH_KV_STAGE_KEY: kv_stage,
+        },
+    )
+    assert resolved.pipeline_family == family
+    assert resolved.kv_stage == kv_stage
+    assert resolved.corr_tile_size in (8, 16, 32, 64)
+    assert head_dim % resolved.corr_tile_size == 0
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "kv_stage", "epi_stg"),
+    (
+        pytest.param(144, torch.bfloat16, False, 2, True, id="d144-dense-staged"),
+        pytest.param(192, torch.float16, True, 1, True, id="d192-causal-staged"),
+        pytest.param(256, torch.bfloat16, True, 1, False, id="d256-causal"),
+        pytest.param(256, torch.float16, False, 1, False, id="d256-dense"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_head_dims_above_128_run_the_single_tile_body(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    kv_stage: int,
+    epi_stg: bool,
+) -> None:
+    """Above width 128 the pair body's TMEM (two score buffers beside two
+    accumulators) is full, so the resolver pins the single-query-tile body:
+    one 256-column accumulator, separate K and V rings as deep as the byte
+    model allows (one stage at 192 and 256), the staged output tile only
+    where it leaves room for that ring (not at 256 with 128-row tiles)."""
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        # (A pair-body family request is rejected outright at these widths;
+        # the single CTA's body is asked for by name, the default being its
+        # cooperative pair.)
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+            cute_flash.FLASH_KV_STAGE_KEY: 3,
+            cute_flash.FLASH_EPI_STG_KEY: True,
+        },
+    )
+    assert resolved.pipeline_family == "ws_overlap"
+    assert resolved.topology == "ws_overlap"
+    assert resolved.kv_stage == kv_stage
+    assert resolved.epi_stg == epi_stg
+    assert "'topology': 'ws_overlap'" in code
+    assert f"'head_dim': {head_dim}," in code
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "kv_stage"),
+    (
+        pytest.param(256, torch.bfloat16, True, 2, id="d256-causal"),
+        pytest.param(256, torch.float16, False, 2, id="d256-dense"),
+        pytest.param(192, torch.bfloat16, True, 3, id="d192-causal"),
+        pytest.param(144, torch.bfloat16, False, 3, id="d144-dense"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_head_dims_run_the_single_tile_cooperative_pair(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    kv_stage: int,
+) -> None:
+    """``ws_2cta``: two adjacent 128-row query tiles of one batch head form a
+    CTA pair that shares every K/V tile (64 rows per CTA, a 256-row
+    cooperative MMA), the leader issuing the MMAs; the causal pair walks the
+    union of its ranges and the lower tile masks the tile past its
+    diagonal. The half tiles admit a deeper ring than the single CTA's."""
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_KV_STAGE_KEY: 3,
+        },
+    )
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.topology == "ws_overlap"
+    assert resolved.use_2cta_instrs
+    assert resolved.kv_stage == kv_stage
+    assert not resolved.persistent
+    assert not resolved.epi_stg
+    assert "'use_2cta_instrs': True" in code
+    assert "_helion_cute_cluster_shape = (2, 1, 1)" in code
+    assert f"'head_dim': {head_dim}," in code
+
+
+@pytest.mark.parametrize("head_dim", (144, 160, 176, 208, 224, 240))
+@pytest.mark.parametrize("is_causal", (False, True), ids=("dense", "causal"))
+@pytest.mark.parametrize("family", ("ws_2cta", "ws_overlap"))
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_direct_store_at_widths_between_the_64_multiples(
+    head_dim: int, is_causal: bool, family: str
+) -> None:
+    """The direct output store loads TMEM in ``Ld32x32bOp`` repetitions of
+    gcd(head_dim, 64) columns: a 64-column repetition over a 144-wide tile
+    partitioned to three repetitions and wrote 384 bytes into 288-byte rows
+    (garbage leading columns in rows 1-31 of every warp, an overrun of the
+    last row). Both single-tile bodies, dense and causal, every width above
+    128 that is not a multiple of 64."""
+    _code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=1024,
+        num_heads=2,
+        repeat_count=2,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+            cute_flash.FLASH_EPI_STG_KEY: False,
+        },
+    )
+    assert resolved.pipeline_family == family
+    assert not resolved.epi_stg
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_odd_tile_count_above_128_keeps_the_single_cta_body() -> None:
+    """An odd query tile count has no pair for its last tile: the resolver
+    keeps the single CTA's body (the pair family is not on the surface)."""
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=1152,
+        num_heads=2,
+        repeat_count=2,
+    )
+    assert resolved.pipeline_family == "ws_overlap"
+    assert not resolved.use_2cta_instrs
+    assert "'use_2cta_instrs': False" in code
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_persistent_cluster_loop_matches_sdpa() -> None:
+    """On request the pair strides the cluster ids (one cluster per SM pair)
+    over the pair work items and carries its pipelines across tiles: 32
+    pairs per head at seq 4096, four heads, so every cluster walks more than
+    one pair of different KV lengths (the causal pairs launch longest
+    first)."""
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=4096,
+        num_heads=4,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+        },
+    )
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.persistent
+    assert "while flash_tile_id < _flash_total_tiles:" in code
+    assert "'total_tiles': 64," in code
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_two_pair_cluster_matches_sdpa() -> None:
+    """Two pairs per cluster sharing every K/V tile by TMA multicast across
+    the pairs (four consecutive query tiles; the causal group walks to its
+    highest tile)."""
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_PAIR_CLUSTER_KEY: 2,
+        },
+    )
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.pair_cluster == 2
+    assert "_helion_cute_cluster_shape = (4, 1, 1)" in code
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_residual_launch_group_matches_sdpa() -> None:
+    """An explicit launch group that does not divide the heads (six heads in
+    groups of four) takes FA4's residual group on the pair's decode."""
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=2048,
+        num_heads=6,
+        repeat_count=2,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 4,
+        },
+    )
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.causal_lpt_swizzle == 4
+    assert "flash_lpt_width = cutlass.Int32(2)" in code
+
+
+@pytest.mark.parametrize("pair_cluster", (1, 2))
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_odd_pair_count_matches_sdpa(pair_cluster: int) -> None:
+    """A tile count that is not a power of two (twelve tiles: six pairs,
+    three two-pair clusters) with three heads: the launch group clamps to
+    the grid, every pair's lower CTA skips the softmax of the tile above its
+    diagonal, and the two-pair cluster's multicast covers the odd cluster
+    count per head."""
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=1536,
+        num_heads=3,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_PAIR_CLUSTER_KEY: pair_cluster,
+        },
+    )
+    assert resolved.pipeline_family == "ws_2cta"
+    assert resolved.pair_cluster == pair_cluster
+    assert f"'total_tiles': {3 * 12 // (2 * pair_cluster)}," in code
+    assert "(flash_mma_tile_coord_v != 0) | (flash_kv != flash_m_tile_hi)" in code
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count() -> (
+    None
+):
+    """The persistent two-pair cluster's grid holds the four-CTA clusters the
+    device co-schedules (the driver's answer, 33 on a B200 rather than
+    ``148 // 4 = 37``: a cluster lives inside one GPC and the surplus
+    clusters re-ran the prologue as a second hardware wave): the emitted
+    wrapper bakes ``min(item count x 4, clusters x 4)`` into its grid, the
+    compiled-launcher key carries the count, and the kernel matches SDPA at
+    an odd cluster count per head (twenty tiles, five clusters) over eight
+    heads."""
+    import linecache
+
+    from helion.runtime import get_max_active_clusters
+    from helion.runtime import get_num_sm
+    from helion.runtime.cute.launcher import _cute_resident_clusters
+
+    bound_out: list[helion.runtime.kernel.BoundKernel] = []
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=2560,
+        num_heads=8,
+        repeat_count=3,
+        config_values={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+            cute_flash.FLASH_PAIR_CLUSTER_KEY: 2,
+            cute_flash.FLASH_PERSISTENT_KEY: True,
+        },
+        bound_out=bound_out,
+    )
+    assert resolved.pair_cluster == 2 and resolved.persistent
+    assert "'total_tiles': 40," in code
+    assert "while flash_tile_id < _flash_total_tiles:" in code
+    num_sm = get_num_sm(DEVICE)
+    clusters = get_max_active_clusters(DEVICE, 4)
+    assert 1 <= clusters <= num_sm // 4
+    # The emitted wrapper: its grid is the smaller of the item count's CTAs
+    # (forty items of four) and the resident clusters' CTAs.
+    (bound,) = bound_out
+    assert bound._run is not None
+    cute_kernel = bound._run.__globals__[f"_helion_{bound.kernel.name}"]
+    prefix = f"<helion_cute_launcher:{cute_kernel.__name__}_{id(cute_kernel):x}:"
+    sources = [
+        "".join(entry[2])
+        for filename, entry in linecache.cache.items()
+        if filename.startswith(prefix)
+    ]
+    assert len(sources) == 1, len(sources)
+    assert f"    grid_x = cutlass.Int32({min(40 * 4, clusters * 4)})" in sources[0]
+    # The compiled-launcher key carries the count (it varies with the GPC
+    # floorsweeping of same-SM-count devices); the pair and CPU builds carry
+    # nothing extra.
+    (cache_key,) = cute_kernel._helion_cute_compiled_launchers
+    assert cache_key[-1] == clusters
+    assert _cute_resident_clusters((4, 1, 1), DEVICE) == clusters
+    assert _cute_resident_clusters((2, 1, 1), DEVICE) is None
+    assert _cute_resident_clusters((4, 1, 1), None) is None
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "persistent"),
+    (
+        pytest.param(256, torch.bfloat16, True, False, id="d256-causal"),
+        pytest.param(256, torch.bfloat16, True, True, id="d256-causal-persistent"),
+        pytest.param(256, torch.float16, False, False, id="d256-dense"),
+        pytest.param(256, torch.float16, True, False, id="d256-causal-fp16"),
+        pytest.param(192, torch.bfloat16, True, False, id="d192-causal"),
+        pytest.param(160, torch.bfloat16, False, True, id="d160-dense-persistent"),
+        pytest.param(144, torch.bfloat16, True, False, id="d144-causal"),
+    ),
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_issue_knobs_run(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    persistent: bool,
+) -> None:
+    """The pair's issue-stream knobs: warp 2 of both CTAs runs the TMA ring
+    (the leader's warp 0 only waits on full barriers and issues the pair's
+    MMAs), the causal consumer loop splits at the diagonal (the mask runs
+    on the diagonal tiles alone) and the K ring is one slot deeper than V's.
+    The output is bitwise the knobs-off pair's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_PERSISTENT_KEY: persistent,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={
+            **base,
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        output_out=outputs,
+    )
+    assert resolved.use_2cta_instrs and resolved.persistent == persistent
+    assert resolved.ws_loader_warp and resolved.ws_k_stage_extra == 1
+    assert resolved.ws_mask_phases == is_causal
+    assert "if warp_idx == 2:" in code
+    assert f"k_stage={resolved.kv_stage + 1})" in code
+    assert ("flash_kv = flash_m_tile + flash_active_kv" in code) == is_causal
+    assert torch.equal(outputs[0], outputs[1])
+
+
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_cooperative_pair_persistent_loop_runs_past_the_resident_clusters() -> None:
+    """The persistent pair with its issue-stream knobs on more items than
+    the resident clusters (8 heads x 16 items of 256 rows = 128 items
+    against the 74 clusters of a 148-SM part): the load warp runs ahead
+    into the next item's prologue while the MMA warp and the consumers
+    finish the current one (the persistent wrap's per-item barrier orders
+    the ring across items). Bitwise the knobs-off pair's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta",
+        cute_flash.FLASH_PERSISTENT_KEY: True,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=4096,
+        num_heads=8,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=torch.bfloat16,
+        head_dim=256,
+        is_causal=True,
+        sequence_extent=4096,
+        num_heads=8,
+        repeat_count=3,
+        config_values={
+            **base,
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        output_out=outputs,
+    )
+    assert resolved.use_2cta_instrs and resolved.persistent
+    assert resolved.ws_loader_warp and resolved.ws_mask_phases
+    assert resolved.ws_k_stage_extra == 1
+    assert "if warp_idx == 2:" in code
+    assert torch.equal(outputs[0], outputs[1])
+
+
+_SINGLE_TILE_KNOB_CASES = (
+    pytest.param(
+        128,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d128-causal",
+    ),
+    pytest.param(
+        128,
+        torch.float16,
+        False,
+        {cute_flash.FLASH_PERSISTENT_KEY: True},
+        {cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1},
+        id="d128-dense-persistent-fp16",
+    ),
+    pytest.param(
+        64,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d64-causal",
+    ),
+    pytest.param(
+        192,
+        torch.bfloat16,
+        True,
+        {cute_flash.FLASH_EPI_STG_KEY: False},
+        {
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d192-causal-direct",
+    ),
+    # The load warp: the whole TMA ring (the prologue included, which the
+    # flat body otherwise issues ahead of the roles from warp 0) moves to
+    # warp 2 and warp 0 keeps the MMA stream.
+    pytest.param(
+        192,
+        torch.bfloat16,
+        True,
+        {},
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d192-causal-loader",
+    ),
+    pytest.param(
+        192,
+        torch.float16,
+        False,
+        {cute_flash.FLASH_EPI_STG_KEY: False},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d192-dense-loader-slot",
+    ),
+    pytest.param(
+        128,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d128-causal-all",
+    ),
+    pytest.param(
+        128,
+        torch.bfloat16,
+        False,
+        {cute_flash.FLASH_PERSISTENT_KEY: True, cute_flash.FLASH_EPI_STG_KEY: True},
+        {cute_flash.FLASH_WS_LOADER_WARP_KEY: True},
+        id="d128-dense-persistent-staged-loader",
+    ),
+    pytest.param(
+        64,
+        torch.bfloat16,
+        True,
+        {},
+        {
+            cute_flash.FLASH_WS_LOADER_WARP_KEY: True,
+            cute_flash.FLASH_WS_MASK_PHASES_KEY: True,
+            cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY: 1,
+        },
+        id="d64-causal-all",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "extra", "knobs"), _SINGLE_TILE_KNOB_CASES
+)
+# pyrefly: ignore [bad-argument-type]
+@onlyBackends(["cute"])
+def test_single_tile_body_issue_knobs_run(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    extra: dict[str, object],
+    knobs: dict[str, object],
+) -> None:
+    """The single CTA's two-stage body with the knobs its surfaces search
+    (the d64-d128 ws surfaces, the three-tile exact spaces, the mixed
+    d144-d256 causal surfaces): the TMA ring on its own warp, the diagonal
+    tiles in their own loop and the K ring one slot deeper than V's -- at
+    d192 a two-deep K ring beside a one-deep V ring, where the host K
+    layout must be two deep (a one-stage layout has no stage stride) and
+    the slot fits beside the direct store alone. Bitwise the knobs-off
+    body's."""
+    base = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+        **({"cute_flash_mma_interleave": False} if head_dim <= 128 else {}),
+        **extra,
+    }
+    outputs: list[torch.Tensor] = []
+    _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=1,
+        config_values=base,
+        output_out=outputs,
+    )
+    code, resolved = _run_and_check(
+        dtype=dtype,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        sequence_extent=2048,
+        num_heads=2,
+        repeat_count=3,
+        config_values={**base, **knobs},
+        output_out=outputs,
+    )
+    loader = cute_flash.FLASH_WS_LOADER_WARP_KEY in knobs
+    mask_phases = cute_flash.FLASH_WS_MASK_PHASES_KEY in knobs
+    slot = cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY in knobs
+    assert not resolved.use_2cta_instrs
+    if cute_flash.FLASH_PERSISTENT_KEY in extra:
+        assert resolved.persistent == extra[cute_flash.FLASH_PERSISTENT_KEY]
+    assert resolved.ws_loader_warp == loader
+    assert ("if warp_idx == 2:" in code) == loader
+    if loader:
+        role2 = code.index("    if warp_idx == 2:")
+        role0 = code.rindex("    if warp_idx == 0:", 0, role2)
+        assert "cute.copy(_flash_tma_" not in code[role0:role2]
+        assert "cute.copy(_flash_tma_q" in code[role2:]
+    assert resolved.ws_k_stage_extra == int(slot)
+    assert (f"k_stage={resolved.kv_stage + 1})" in code) == slot
+    assert resolved.ws_mask_phases == mask_phases
+    assert ("flash_kv = flash_m_tile + flash_active_kv" in code) == mask_phases
+    assert torch.equal(outputs[0], outputs[1])

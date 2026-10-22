@@ -568,7 +568,7 @@ def _prove(
     assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
     assert isinstance(acc, torch.fx.Node)
     _require(
-        _is_direct_zero_seed(ir.graphs, node, acc)
+        _is_direct_zero_seed(ir.graphs, node, acc, k_id)
         and _mma_loop_is_exclusive(node)
         and acc.meta["val"].dtype == torch.float32,
         "requires one exclusive FP32 accumulator with a local zero seed",

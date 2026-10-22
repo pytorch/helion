@@ -848,6 +848,9 @@ class TestFinalSelection(TestCase):
             search._autotune_budget_start = time.perf_counter() - 1349.0
             self.assertFalse(search._autotune_budget_exceeded())
             search._autotune_budget_start = time.perf_counter() - 1351.0
+            # The cutoff line is logged once per phase; a new scenario here
+            # stands for a new search.
+            search._budget_exceeded_logged = ()
             self.assertTrue(search._autotune_budget_exceeded())
             self.assertIn(
                 "0s for the generation in flight",
@@ -887,6 +890,9 @@ class TestFinalSelection(TestCase):
                 search._autotune_budget_start = time.perf_counter() - 167.0
                 self.assertFalse(search._autotune_budget_exceeded())
                 search._autotune_budget_start = time.perf_counter() - 169.0
+                # The cutoff line is logged once per phase; each scenario
+                # stands for a new search.
+                search._budget_exceeded_logged = ()
                 self.assertTrue(search._autotune_budget_exceeded())
                 message = str(search.log.call_args_list[-1].args[0])
                 self.assertIn(

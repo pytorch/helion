@@ -48,6 +48,23 @@ def fixed_l2_evict_last_store_policy_supported(
     )
 
 
+def readonly_packet_load_supported(
+    target_device_capability: tuple[int, int] | None,
+    cuda_version: str | None,
+) -> bool:
+    """Whether the ``nc_l2_first`` packet loads are legal for this target.
+
+    PTX 256-bit ``ld.global.v8.b32`` loads need SM100+ and CUDA 13 or newer.
+    """
+    major = cuda_version.split(".", 1)[0] if cuda_version else ""
+    return (
+        target_device_capability is not None
+        and target_device_capability >= (10, 0)
+        and major.isdigit()
+        and int(major) >= 13
+    )
+
+
 @dataclass(frozen=True)
 class _CuteDSLVersionProbe:
     version: Version | None = None

@@ -1893,6 +1893,18 @@ class ConfigGeneration:
         ]
         return copy.deepcopy(selected)
 
+    def _flash_coverage_parent_overridden(self, goal: tuple[str, object]) -> bool:
+        """Whether ``goal`` is a conditional child whose parent value the
+        overrides pin away (``FLASH_COVERAGE_CHILD_PARENTS``): unreachable by
+        the design's construction, so uncovered telemetry rather than a
+        defect (like a family the overrides make unreachable)."""
+        from .._compiler.cute.cute_flash import FLASH_COVERAGE_CHILD_PARENTS
+
+        return any(
+            key in self._override_values and self._override_values[key] != value
+            for key, value in FLASH_COVERAGE_CHILD_PARENTS.get(goal, ())
+        )
+
     def flash_structural_coverage_uncovered_values(
         self,
     ) -> list[tuple[str, object]]:
@@ -2126,8 +2138,11 @@ class ConfigGeneration:
         uncovered = [
             goal
             for goal in self._flash_coverage_uncovered_cache
-            if goal[0] != FLASH_PIPELINE_FAMILY_KEY
-            or goal[1] not in unreachable_families
+            if (
+                goal[0] != FLASH_PIPELINE_FAMILY_KEY
+                or goal[1] not in unreachable_families
+            )
+            and not self._flash_coverage_parent_overridden(goal)
         ]
         problems: list[str] = []
         if uncovered:

@@ -363,11 +363,6 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
-    # Host AST read/write names for this device loop body (siblings only; see
-    # ``_ReadWriteVisitor.visit_For`` in ast_read_writes.py).  Used to insert
-    # ``tl.debug_barrier()`` between loops when there is a global RAW dep.
-    host_loop_reads: frozenset[str] = dataclasses.field(default_factory=frozenset)
-    host_loop_writes: frozenset[str] = dataclasses.field(default_factory=frozenset)
     # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
     # tl.debug_barrier() must be emitted immediately before this for-loop's
     # outer prefix to make global writes from the previous sibling for-loop
@@ -382,10 +377,6 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "block_ids": [*self.block_ids],
-            "host_loop_reads": self.host_loop_reads,
-            "host_loop_writes": self.host_loop_writes,
-            # ``needs_barrier_before`` is excluded -- recomputed by GenerateAST
-            # per codegen run.
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -929,113 +920,6 @@ class KernelPhase:
     root_nodes: list[ast.For]
 
 
-def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
-    o = host.tensor_to_origin.get(t)
-    if o is None:
-        return None
-    return o.root_rw_name()
-
-
-def _fx_trace_tensor_arg_rw_names(
-    host: HostFunction, arg: object, seen: set[int] | None = None
-) -> list[str]:
-    """Map a load/store tensor FX arg to the list of host variable names it
-    aliases.  Returns an empty list when the arg cannot be resolved to any
-    host name (e.g. a purely device-internal temporary)."""
-    from ..language import _tracing_ops
-
-    if seen is None:
-        seen = set()
-    if isinstance(arg, tuple):
-        out: list[str] = []
-        for a in arg:
-            out.extend(_fx_trace_tensor_arg_rw_names(host, a, seen))
-        return out
-    if not isinstance(arg, torch.fx.Node):
-        return []
-    nid = id(arg)
-    if nid in seen:
-        return []
-    seen.add(nid)
-    val = arg.meta.get("val")
-    if isinstance(val, torch.Tensor):
-        n = _tensor_to_inter_loop_rw_name(host, val)
-        if n is not None:
-            return [n]
-    if arg.op == "call_function" and arg.target is _tracing_ops._host_tensor:
-        val = arg.meta.get("val")
-        if isinstance(val, torch.Tensor):
-            n = _tensor_to_inter_loop_rw_name(host, val)
-            if n is not None:
-                return [n]
-        return []
-    out2: list[str] = []
-    for a in arg.args:
-        out2.extend(_fx_trace_tensor_arg_rw_names(host, a, seen))
-    return out2
-
-
-def _atomic_funcs() -> frozenset[Callable[..., object]]:
-    from ..language import atomic_add
-    from ..language import atomic_and
-    from ..language import atomic_cas
-    from ..language import atomic_max
-    from ..language import atomic_min
-    from ..language import atomic_or
-    from ..language import atomic_xchg
-    from ..language import atomic_xor
-
-    return frozenset(
-        {
-            atomic_add,
-            atomic_and,
-            atomic_cas,
-            atomic_max,
-            atomic_min,
-            atomic_or,
-            atomic_xchg,
-            atomic_xor,
-        }
-    )
-
-
-def _reduction_fx_inter_loop_rw_names(
-    graph: torch.fx.Graph,
-    host: HostFunction,
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Infer host buffer names read/written in a rolled reduction FX subgraph.
-
-    Resolves every hl.load / hl.store / atomic_* tensor arg back to host-named buffers.
-    Args not resolving to a host name are device-internal temporaries (no cross-wavefront
-    coherence) and are excluded.
-    """
-    from ..language import memory_ops
-
-    atomic_funcs = _atomic_funcs()
-    reads: set[str] = set()
-    writes: set[str] = set()
-
-    for node in graph.find_nodes(
-        op="call_function", target=memory_ops.load, sort=False
-    ):
-        reads.update(_fx_trace_tensor_arg_rw_names(host, node.args[0]))
-
-    for node in graph.find_nodes(
-        op="call_function", target=memory_ops.store, sort=False
-    ):
-        writes.update(_fx_trace_tensor_arg_rw_names(host, node.args[0]))
-
-    for atomic_target in atomic_funcs:
-        for node in graph.find_nodes(
-            op="call_function", target=atomic_target, sort=False
-        ):
-            nms = _fx_trace_tensor_arg_rw_names(host, node.args[0])
-            reads.update(nms)
-            writes.update(nms)
-
-    return frozenset(reads), frozenset(writes)
-
-
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
@@ -1064,9 +948,10 @@ class DeviceIR:
         would repeat a read-modify-write ``cluster_n`` times.
         """
         if self._has_atomic_ops is None:
-            atomic_funcs = _atomic_funcs()
+            from helion.language.atomic_ops import ATOMIC_OPS
+
             self._has_atomic_ops = any(
-                node.op == "call_function" and node.target in atomic_funcs
+                node.op == "call_function" and node.target in ATOMIC_OPS
                 for info in self.graphs
                 for node in info.graph.nodes
             )
@@ -1105,14 +990,11 @@ class DeviceIR:
         block_index: int,
         node_args: list[torch.fx.Node],
     ) -> int:
-        reads, writes = _reduction_fx_inter_loop_rw_names(graph, HostFunction.current())
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
             block_ids=[block_index],
             node_args=node_args,
-            host_loop_reads=reads,
-            host_loop_writes=writes,
         )
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
@@ -2409,14 +2291,11 @@ class WalkDeviceAST(NodeVisitor):
                 ):
                     self.device_ir.noncanonical_task_origin_block_ids.add(block_id)
 
-            host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
                 inputs,
                 build_subgraph,
                 graph_info_cls=ForLoopGraphInfo,
                 block_ids=block_ids,
-                host_loop_reads=host_reads,
-                host_loop_writes=host_writes,
             )
             step_list = step if isinstance(step, list) else None
             if step_list is None or all(s is None for s in step_list):
@@ -3333,11 +3212,22 @@ def _register_load_store_tunables(
     from ..autotuner.config_spec import get_valid_eviction_policies
     from ..autotuner.config_spec import get_valid_load_cache_modifiers
     from ..autotuner.config_spec import get_valid_store_cache_modifiers
+    from .cute.cutedsl_compat import readonly_packet_load_supported
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
+        choices = get_valid_eviction_policies(env.backend_name)
+        search_choices = None
+        if "nc_l2_first" in choices and not readonly_packet_load_supported(
+            env.config_spec.target_device_capability, torch.version.cuda
+        ):
+            # Read-only packets lower to the ordinary load on this target, so
+            # searching them would only repeat "".  Explicit configs stay valid.
+            search_choices = tuple(
+                choice for choice in choices if choice != "nc_l2_first"
+            )
         env.config_spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
+            EnumFragment(choices=choices, search_choices=search_choices),
             length=loads_without_eviction_policy,
         )
 
@@ -3669,6 +3559,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     for node in graph.nodes:
                         node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
 
+            env = CompileEnvironment.current()
+            if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
+                from ..language.barrier import BARRIER_PID_TYPE_REASON
+                from .cute.ordered_phases import ordered_phases_supported
+
+                spec = env.config_spec
+                if len(device_ir.phases) > 1 and ordered_phases_supported(
+                    func, device_ir
+                ):
+                    # The single persistent launch shares one thread block
+                    # across phases (and cannot host the tcgen05 pipeline).
+                    # Ordered per-phase launches tune each phase alone; the
+                    # persistent launch stays the default.
+                    spec.allowed_pid_types = (
+                        *(p for p in spec.allowed_pid_types if p != "flat"),
+                        "flat",
+                    )
+                else:
+                    spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)
+
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
@@ -3933,6 +3843,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate,
                                 mma_candidates[0][3],
                                 allocation_graphs,
+                                allow_fp8_broadcasts=(
+                                    len(device_ir.root_ids) == 1
+                                    and env.cute_fission_plan is None
+                                ),
                                 capacity_bytes=(
                                     tcgen05_config.per_cta_smem_capacity_bytes(
                                         lhs.device

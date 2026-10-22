@@ -17,6 +17,7 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_k128_full_coverage import _bound as _generic_bound
+from test.test_cute_native_schedule_cuda import _row_union_bound
 from test.test_cute_shared_rhs_grouped import _OffsetPointer
 from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _target
@@ -143,6 +144,57 @@ def test_ordinary_profile_and_original_allocation(case):
     assert "cute.make_layout((2, 1, 1))" in rendered
     assert "cluster_shape_to_tma_atom_A((2, 2, 1)" in rendered
     assert "cute.select(tma_atom_b_smem_layout, mode=[0, 1, 2])" in rendered
+
+
+def test_transposed_row_union_advances_accumulator_once_per_output_tile():
+    args = (
+        torch.empty((5120, 512), dtype=torch.bfloat16),
+        torch.empty((512, 512), dtype=torch.bfloat16),
+        torch.tensor([0, 13, 13, 479, 1280, 1280, 3819, 5001, 5120], dtype=torch.int32),
+    )
+    bound, config = _row_union_bound(args, "cluster4")
+    source = bound.to_code(config)
+    ab = _plans(source)[0]
+    assert (ab["bm"], ab["bn"], ab["bk"]) == (256, 80, 64)
+    assert (ab["cluster_m"], ab["cluster_n"]) == (2, 2)
+    assert config.block_sizes == [128, 64, 128]
+    # Logical projected M=80 is not a physical M subtile of the 256-row MMA.
+    # Its producer must still progress through the accumulator ring per tile.
+    work_loops = []
+    for loop in ast.walk(ast.parse(source)):
+        if not isinstance(loop, ast.While):
+            continue
+        commits = [
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "producer_commit"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id.endswith("acc_producer_state")
+        ]
+        if commits:
+            assert len(commits) == 1
+            work_loops.append((loop, commits[0]))
+    assert len(work_loops) == 1
+    loop, commit = work_loops[0]
+    producer_state = commit.args[0]
+    assert isinstance(producer_state, ast.Name)
+    state = producer_state.id
+    commit_index = next(
+        index for index, stmt in enumerate(loop.body) if commit in ast.walk(stmt)
+    )
+    advance_stmt = loop.body[commit_index + 1]
+    assert isinstance(advance_stmt, ast.Expr)
+    assert ast.unparse(advance_stmt.value) == f"{state}.advance()"
+    assert (
+        sum(
+            isinstance(node, ast.Call) and ast.unparse(node) == f"{state}.advance()"
+            for node in ast.walk(loop)
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize(

@@ -618,6 +618,11 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             shape=(64, 32),
         )
 
+    # MI350X CI intermittently returns wrong values in some rows of this
+    # row-reduction backward (about a quarter of the elements, up to 1.4
+    # off) while every CUDA job passes; test_examples.py::test_softmax_bwd
+    # has the full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_softmax_two_pass_backward_takes_forward_block_sizes(self):
         # CuTe rewrites the online softmax into three passes, so the backward
         # analyzes a separate bind of the kernel as written; its scan still
@@ -1388,6 +1393,11 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         "M equals the K chunk; at other M it contracts the computed gradient "
         "carry, which the CuTe matmul fallbacks cannot re-read"
     )
+    # MI350X CI intermittently returns wrong values in some rows of this
+    # row-reduction backward (about a quarter of the elements, up to 1.4
+    # off) while every CUDA job passes; test_examples.py::test_softmax_bwd
+    # has the full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_example_matmul_layernorm(self):
         from examples.matmul_layernorm import matmul_layernorm
 

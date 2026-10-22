@@ -26,6 +26,10 @@ _FLASH_POLICY_STAT_TRANSPORTS = frozenset({"ring2", "single", "single_final"})
 _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
     {
         "ws_overlap",
+        # The single-tile body's cooperative pair (two 128-row query tiles of
+        # one batch head on a 2-CTA tcgen05 MMA): a measured policy may name
+        # it like any other codegen family.
+        "ws_2cta",
         "fa4",
         "row_mma",
         "fa4_deep_1cta",

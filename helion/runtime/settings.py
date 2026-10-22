@@ -751,11 +751,35 @@ class Settings(_Settings):
             "search and export. Default 1500 seconds; override with "
             "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS."
         ),
-        "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
+        "autotune_compile_timeout": (
+            "Timeout in seconds for one autotune precompile subprocess "
+            "(autotune_precompile); a CuTe render worker past it is given up "
+            "and its config rendered in-process instead (never failed for the "
+            "timeout alone). Default is 60 seconds. In-process compiles cannot "
+            "be interrupted by it; the autotune budget bounds them instead."
+        ),
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
-        "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
-        "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
+        "autotune_precompile": (
+            "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to "
+            "disable. Defaults to 'fork' on non-Windows platforms. With a pool "
+            "a batch of configs is generated, precompiled in parallel, then "
+            "timed; without one (disabled, or a backend such as CuTe that has "
+            "no pool) each config is compiled and timed in turn, so results "
+            "arrive as the batch runs and the autotune budget can stop it "
+            "between configs. CuTe generates each candidate's code in forked "
+            "workers ahead of its turn in 'fork' mode (its only mode; 'spawn' "
+            "disables the workers), so the serial part per config is the "
+            "module load, the DSL JIT at first call and the timing."
+        ),
+        "autotune_precompile_jobs": (
+            "Maximum concurrent Triton precompile processes, default to cpu "
+            "count. Also the number of CuTe render workers alive at once, "
+            "which default to the CPUs this process may run on, divided by "
+            "the autotuning processes of the host (LOCAL_WORLD_SIZE or the "
+            "process group size), capped at 32. Does not affect results or "
+            "the autotune cache key."
+        ),
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_best_of_k": (
             "When > 1, run autotuning K times with different random seeds and "
@@ -767,7 +791,14 @@ class Settings(_Settings):
             "vice versa. Default 1 (current single-trial behavior). Set "
             "HELION_AUTOTUNE_BEST_OF_K=N to override."
         ),
-        "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
+        "autotune_accuracy_check": (
+            "If True, validate candidate configs against the baseline kernel output "
+            "before accepting them during autotuning. Unless autotune_baseline_fn is "
+            "set, the baseline is the output of the config the kernel runs by default "
+            "(a compiler-promoted default when there is one, else the conservative "
+            "autotuning reference, which is also the fallback when the promoted "
+            "default fails to compile or run)."
+        ),
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
@@ -776,18 +807,42 @@ class Settings(_Settings):
         "autotune_budget_seconds": (
             "Wall-clock budget in seconds for the entire autotune. When the "
             "budget is exceeded the search returns the best config found so "
-            "far. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
+            "far. The budget is checked between generations and before each "
+            "config's compile (with a precompile pool also before each "
+            "config's timing; without one a config is timed right after its "
+            "compile). Once it is out nothing further is compiled or timed, "
+            "except that while no config has been measured successfully the "
+            "search still attempts up to 3 more candidates, so a budget that "
+            "runs out early returns a config when one of those works; the "
+            "overrun is bounded by those attempts (and, with a pool, by the "
+            "precompile wait of the batch in flight). Without a precompile "
+            "pool the initial population may take at most half of the search "
+            "phase (the budget minus the time kept for the final selection), "
+            "counted from the start of each of its batches: once a few "
+            "configs have been timed and one has succeeded, the measured cost "
+            "per config decides how many more are attempted and the rest are "
+            "skipped, never below a CuTe flash surface's structural coverage "
+            "rows, so slow-compiling kernels keep time for the search "
+            "generations. A population that fits its share is evaluated in "
+            "full. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
             "@helion.kernel(autotune_budget_seconds=N). Default None "
             "(no budget)."
         ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
-            "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
+            "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally. The "
+            "one-line summary of the initial population (configs measured, "
+            "failed, skipped for the budget, and the wall time per config) and "
+            "the end-of-run failure counts are logged either way."
         ),
         "autotune_adaptive_timeout": (
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
-            "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+            "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable. "
+            "Applies only to a Triton-style precompile pool: CuTe render workers keep "
+            "the configured autotune_compile_timeout (a worker past it is rendered "
+            "in-process), and a timeout fitted on one shape's render times would be "
+            "shared by every shape of the kernel."
         ),
         "pallas_collective_id": (
             "Optional Pallas collective namespace override. Distributed kernels "

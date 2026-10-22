@@ -8,8 +8,6 @@ from typing import Literal
 from typing import Protocol
 from typing import cast
 
-import torch
-
 from ... import exc
 
 if TYPE_CHECKING:
@@ -32,14 +30,17 @@ if TYPE_CHECKING:
     from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_mma_dag import MmaDagPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_bwd_match import FlexBwdMatch
     from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
+    from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
@@ -141,21 +142,47 @@ class CuteTcgen05GroupedPlan:
     # values on the host.
     source_m_tile: int | None = None
     m_size: int | None = None
+    # The typed device-layout initializer writes this guarded input feature
+    # extent into every group's N column. None keeps the generic panel decoder.
+    device_n_size: int | None = None
     device_layout_kind: Literal["split_sizes", "offsets"] | None = None
     # The source program drops negative-address rows before applying its
     # static M cap; its original signed offset difference remains unchanged.
     clipped_negative_start: bool = False
+    # A fixed rank-3 S2G descriptor encodes the clipped row interval through
+    # coordinates. It retains ALL_TILES tail semantics without a mutable map.
+    bounded_output_shift: bool = False
+    worker_balance: GroupedBalancedWorkersPlan | None = None
     full_coverage: Tcgen05GroupedFullCoveragePlan | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
         assert (self.orientation is Tcgen05Orientation.NM) == (self.valid_m is not None)
-        assert (self.orientation is Tcgen05Orientation.NM) == (
-            self.source_m_tile is not None
-        )
+        assert (
+            self.orientation is Tcgen05Orientation.NM or self.device_split_sizes
+        ) == (self.source_m_tile is not None)
         assert (self.direct_pointers is None) == (self.direct_strides is None)
-        assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
-        assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        assert (
+            self.d_mode is Tcgen05GroupedDMode.NONE or self.bounded_output_shift
+        ) == (self.d_tensormap is None)
+        if self.bounded_output_shift:
+            assert self.device_split_sizes
+            assert self.d_mode is Tcgen05GroupedDMode.ALL_TILES
+            assert not self.fixed_tensormaps
+            assert self.direct_pointers is None
+        if self.worker_balance is not None:
+            assert self.orientation is Tcgen05Orientation.MN
+            assert self.device_split_sizes
+            assert (
+                self.scheduler_mode is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+            )
+            assert self.direct_pointers is None
+            assert not self.fixed_tensormaps
+            assert self.full_coverage is None
+        assert not self.device_split_sizes or self.source_m_tile is not None
+        assert self.device_n_size is None or (
+            self.device_split_sizes and self.device_n_size > 0
+        )
         assert self.device_layout_kind in (None, "split_sizes", "offsets")
         assert not self.clipped_negative_start or self.device_layout_kind == "offsets"
         assert (self.device_layout_kind is not None) == self.device_split_sizes
@@ -885,13 +912,22 @@ class CuteDeviceFunctionState:
         self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
+        # whole-graph-set match, probed once per device function.
+        self.attention_flex_bwd_match: FlexBwdMatch | None = None
+        self.attention_flex_bwd_probed: bool = False
         # Set by the register-MMA GEMM detector (``cute_matmul_family=
         # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
         # its tile; the dedicated codegen emits the whole device body and
         # the launch runs ``32 * warps`` threads per CTA.
         self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
+        # the matched serial MMA state recurrence and its tile / warp /
+        # stage selection; the dedicated codegen owns the matched root and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.mma_dag_plan: MmaDagPlan | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan
