@@ -166,6 +166,7 @@ from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_tcgen05_fp8_acc1 import CuteTcgen05Fp8Acc1Heuristic
 from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
@@ -271,6 +272,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
         CuteRadixSelectionHeuristic,
+        CuteTcgen05Fp8Acc1Heuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
