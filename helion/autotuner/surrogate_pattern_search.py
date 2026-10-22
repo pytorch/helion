@@ -205,6 +205,9 @@ class LFBOPatternSearch(PatternSearch):
                 "Install them with: pip install helion[surrogate]"
             ) from _IMPORT_ERROR
 
+        from .cute_witnesses import register_active_cute_witnesses
+
+        register_active_cute_witnesses(kernel, method="lfbo")
         super().__init__(
             kernel=kernel,
             args=args,

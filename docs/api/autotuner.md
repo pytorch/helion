@@ -23,6 +23,40 @@ to benchmark in-process.
    :show-inheritance:
 ```
 
+Set `HELION_BENCHMARK_CUDAGRAPH=1` before starting autotuning to use Helion's
+existing CUDA graph benchmark mode.
+
+## Bounded CuTe witness seeds
+
+`cute_witness_seeds()` independently enables compiler-derived proposals for new
+LFBO searches and hybrids whose second stage uses LFBO:
+
+```python
+from helion.autotuner import cute_witness_seeds
+
+with cute_witness_seeds() as registrations:
+    output = my_kernel(*arguments)
+```
+
+Paired FP8 ACC1 proposals use legal tiles and the exact shared-memory budget.
+Unordered radix proposals use proved input geometry, packet widths, CTA thread
+counts and a 128-register-word resident-input bound. Both are validated and
+canonicalized with the live configuration specification after compiler
+promotion. No saved configuration bank or measured latency supplies proposals.
+
+At most twelve ACC1 or six radix witnesses are added, within an 83-compiler-seed
+allowance. This reserves sixteen nominal random slots and the default in a
+100-config population; mandatory compiler coverage can add further rows.
+Every original seed is retained, and an already exhausted allowance receives
+zero additions. The promoted default stays unchanged. Pure LLM receives no
+injected witnesses. With `initial_random_configs=0`, it keeps its single
+conservative initialization; this option does not add random seeds.
+The context returns registration records; it does not require callers to pass
+configurations or import private kernels.
+
+The native population, source and pure-LLM CPU checks run with
+`CUDA_VISIBLE_DEVICES='' python -m pytest -s test/test_cute_witness_seeds.py`.
+
 ## Choosing a source-optimization handoff point
 
 Ordinary kernel calls can run the complete workflow without custom orchestration:

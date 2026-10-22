@@ -11,6 +11,7 @@ from .config_fragment import ListOf as ListOf
 from .config_fragment import NumThreadsFragment as NumThreadsFragment
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
 from .config_spec import ConfigSpec as ConfigSpec
+from .cute_witnesses import cute_witness_seeds as cute_witness_seeds
 from .de_surrogate_hybrid import DESurrogateHybrid as DESurrogateHybrid
 from .differential_evolution import (
     DifferentialEvolutionSearch as DifferentialEvolutionSearch,

@@ -134,6 +134,11 @@ class LLMSeededSearch(BaseSearch):
         self._second_stage_search_cls = _resolve_second_stage_algorithm(
             self.second_stage_algorithm
         )
+        from .cute_witnesses import register_active_cute_witnesses
+        from .surrogate_pattern_search import LFBOPatternSearch
+
+        if issubclass(self._second_stage_search_cls, LFBOPatternSearch):
+            register_active_cute_witnesses(kernel, method="llm_lfbo")
         self._second_stage_supports_best_available_handoff = (
             _supports_best_available_handoff(self._second_stage_search_cls)
         )
