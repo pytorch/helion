@@ -1123,6 +1123,7 @@ class GraphAnalysis:
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
     memory_tiles: tuple[tuple[torch.fx.Node, LiveTile], ...]
+    custom_reduction_block_ids: frozenset[int] = frozenset()
     _memory_tiles_by_loop_axes: dict[frozenset[int], tuple[LiveTile, ...]] = (
         dataclasses.field(
             default_factory=dict,
@@ -1153,6 +1154,7 @@ class GraphAnalysis:
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
         custom_reduction_steps: list[tuple[LiveTile, ...]] = []
+        custom_reduction_block_ids: set[int] = set()
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
         operand_positions = matmul_operand_positions()
         promoted_lhs_nodes: set[torch.fx.Node] = set()
@@ -1196,6 +1198,8 @@ class GraphAnalysis:
             block_id = reduction_block_id(node)
             if block_id is not None:
                 reduction_axis_by_node_id[id(node)] = block_id
+                if node.target is _reduce:
+                    custom_reduction_block_ids.add(block_id)
                 if block_id not in seen_reductions:
                     seen_reductions.add(block_id)
                     reduction_occurrences.append(block_id)
@@ -1292,6 +1296,7 @@ class GraphAnalysis:
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
             memory_tiles=tuple(memory_tiles),
+            custom_reduction_block_ids=frozenset(custom_reduction_block_ids),
         )
 
     def reaches_output(self, node: torch.fx.Node, limit: int = 64) -> bool:

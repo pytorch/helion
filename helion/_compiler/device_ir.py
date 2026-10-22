@@ -49,7 +49,6 @@ from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
-from ..language.reduce_ops import _reduce
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -1490,12 +1489,7 @@ class DeviceIR:
                     row_reread=per["row_reread"],
                     reread_eviction_index=per["reread_eviction_index"],
                     fixed_tile_size_hint=fixed_tile_size_hint,
-                    is_custom=any(
-                        node.target is _reduce
-                        and analysis.by_id[gid].reduction_axis_by_node_id.get(id(node))
-                        == bid
-                        for node in self.graphs[gid].graph.nodes
-                    ),
+                    is_custom=bid in analysis.by_id[gid].custom_reduction_block_ids,
                 )
             )
 

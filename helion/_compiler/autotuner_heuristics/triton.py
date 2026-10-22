@@ -4435,6 +4435,19 @@ class _LivenessTileAllocation(NamedTuple):
     num_warps: int
 
 
+def _custom_reduction_grid_ids(spec: ConfigSpec) -> set[int]:
+    fact = spec.reduction_kernel_fact
+    grid = spec.kernel_grid_fact
+    if fact is None or grid is None:
+        return set()
+    return {
+        block_id
+        for reduction in fact.reductions
+        if reduction.is_custom
+        for block_id in grid.group_for_graph(reduction.graph_id)
+    }
+
+
 def _custom_persistent_reduction_loops(
     spec: ConfigSpec, config: Config
 ) -> tuple[list[int | None], bool]:
@@ -5273,12 +5286,16 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             spec, config
         )
         if not mixed:
+            custom_grid_ids = _custom_reduction_grid_ids(spec)
+            default_sizes = spec._base_default_config().block_sizes
             persistent["block_sizes"] = [
                 cls._block_floor(block)
+                if block.block_id in custom_grid_ids
+                else default
                 if block.block_id in spec.grid_block_ids
                 else value
-                for block, value in zip(
-                    spec.block_sizes, config.block_sizes, strict=True
+                for block, value, default in zip(
+                    spec.block_sizes, config.block_sizes, default_sizes, strict=True
                 )
             ]
             width = max(loop.size_hint for loop in spec.reduction_loops)
@@ -5335,8 +5352,9 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
             seed["reduction_loops"], mixed = _custom_persistent_reduction_loops(
                 spec, default
             )
+            custom_grid_ids = _custom_reduction_grid_ids(spec)
             seed["block_sizes"] = [
-                1 if not mixed and block.block_id in spec.grid_block_ids else value
+                1 if not mixed and block.block_id in custom_grid_ids else value
                 for block, value in zip(
                     spec.block_sizes, default.block_sizes, strict=True
                 )

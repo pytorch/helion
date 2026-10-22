@@ -1258,7 +1258,15 @@ def reduction_block_id(node: torch.fx.Node) -> int | None:
     value = source.meta["val"]
     assert isinstance(value, torch.Tensor)
     assert isinstance(dim, int)
-    return CompileEnvironment.current().get_block_id(value.size(dim))
+    env = CompileEnvironment.current()
+    block_id = env.get_block_id(value.size(dim))
+    if isinstance(inputs, (tuple, list)) and any(
+        env.get_block_id(payload.meta["val"].size(dim)) != block_id
+        for payload in inputs
+    ):
+        # Every payload must follow the same chunk coordinate to be rolled.
+        return None
+    return block_id
 
 
 class APIFuncLowering(Lowering):

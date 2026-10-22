@@ -1154,9 +1154,16 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(result, torch.full_like(result, other))
 
-            bound = reduce.bind((torch.empty((5, 17), device=DEVICE), other))
+            rolled = helion.kernel(
+                reduce.fn, backend="triton", static_shapes=False, autotune_effort="none"
+            )
+            bound = rolled.bind((torch.empty((5, 513), device=DEVICE), other))
             run = bound.compile_config(
                 helion.Config(block_sizes=[2], reduction_loops=[256])
+            )
+            self.assertIn(
+                "custom_reduce_padding",
+                bound.to_code(helion.Config(block_sizes=[2], reduction_loops=[256])),
             )
             torch.testing.assert_close(run(x, other), torch.full_like(result, other))
 
@@ -1180,6 +1187,63 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             reduce, (x,), block_sizes=[2], reduction_loops=[256]
         )
         torch.testing.assert_close(result, torch.full_like(result, float("inf")))
+
+    @skipIfRefEager("checks custom reduction tuple-axis admission")
+    def test_custom_tuple_with_fixed_payload_stays_persistent(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            sums = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            counts = torch.empty_like(sums)
+            for row in hl.grid(x.size(0)):
+                values = x[row, :]
+                ones = hl.full([256], 1.0, dtype=x.dtype)
+                total, count = hl.reduce(tuple_add_combine_fn, (values, ones), dim=0)
+                sums[row], counts[row] = total, count
+            return sums, counts
+
+        x = torch.randn(3, 256, device=DEVICE)
+        bound = reduce.bind((x,))
+        self.assertFalse(bound.config_spec.has_custom_reduction_loops)
+        _, (sums, counts) = code_and_output(reduce, (x,))
+        torch.testing.assert_close(sums, x.sum(1))
+        torch.testing.assert_close(counts, torch.full_like(counts, 256))
+
+    @skipIfRefEager("checks unrelated pointwise grid defaults")
+    def test_custom_baseline_preserves_unrelated_pointwise_tiles(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def mixed(x: torch.Tensor, y: torch.Tensor):
+            pointwise = torch.empty_like(x)
+            custom = torch.empty(y.size(0), device=y.device, dtype=y.dtype)
+            for row, col in hl.tile(x.shape):
+                pointwise[row, col] = x[row, col] + 1
+            for row in hl.tile(y.size(0)):
+                custom[row] = hl.reduce(add_combine_fn, y[row, :], dim=1)
+            return pointwise, custom
+
+        bound = mixed.bind(
+            (
+                torch.empty(128, 256, device=DEVICE),
+                torch.empty(5, 8192, device=DEVICE),
+            )
+        )
+        assert bound.host_function is not None
+        spec = bound.config_spec
+        default = spec._base_default_config()
+        pointwise_ids = bound.host_function.device_ir.grid_block_ids[0]
+        for seed in (
+            TritonReductionHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )[0],
+            TritonNarrowReductionHeuristic.get_seed_config(
+                bound.env, bound.host_function.device_ir
+            ),
+        ):
+            assert seed is not None
+            for block_id in pointwise_ids:
+                self.assertEqual(
+                    spec.block_sizes.config_get(seed.block_sizes, block_id),
+                    spec.block_sizes.config_get(default.block_sizes, block_id),
+                )
 
     @skipIfRefEager("checks mixed reduction heuristic seeds")
     def test_custom_baseline_preserves_unrelated_native_schedule(self) -> None:
