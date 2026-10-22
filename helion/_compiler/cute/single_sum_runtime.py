@@ -26,14 +26,48 @@ def single_sum_cast_kernel(
     accum = cute.make_rmem_tensor((4, vector), cutlass.Float32)
     accum.fill(cutlass.Float32(0))
     # Preserve all four independent FP32 chains, including their +0 identity.
-    for chunk in range(cute.ceil_div(rows, 4 * row_lanes)):
-        for slot in cutlass.range_constexpr(4):
-            row = (chunk * 4 + slot) * row_lanes + ty
-            if row < rows and column < columns:
-                offset_left = row * cutlass.Int32(left.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
-                values_left = _cute_resident_load_vector(left, offset_left, vector)
-                for lane in cutlass.range_constexpr(vector):
-                    accum[slot, lane] = accum[slot, lane] + values_left[lane]
+    # Rows are visited in groups: every load of a group is issued before its
+    # first addition so the latency-bound tail overlaps its memory traffic;
+    # each chain still adds its rows in ascending order.
+    chunks: cutlass.Constexpr = cute.ceil_div(rows, 4 * row_lanes)
+    group_chunks: cutlass.Constexpr = max(1, min(chunks, 64 // (4 * vector)))
+    loaded = cute.make_rmem_tensor((group_chunks * 4, vector), cutlass.Float32)
+    for group in range(cute.ceil_div(chunks, group_chunks)):
+        # The last row of the group bounds every row before it, so a thread
+        # whose group is complete issues its loads without per-row guards.
+        last_row = ((group * group_chunks + group_chunks - 1) * 4 + 3) * row_lanes + ty
+        if last_row < rows and column < columns:
+            for part in cutlass.range_constexpr(group_chunks):
+                chunk = group * group_chunks + part
+                for slot in cutlass.range_constexpr(4):
+                    row = (chunk * 4 + slot) * row_lanes + ty
+                    offset_left = row * cutlass.Int32(left.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
+                    values_left = _cute_resident_load_vector(left, offset_left, vector)
+                    for lane in cutlass.range_constexpr(vector):
+                        loaded[part * 4 + slot, lane] = values_left[lane]
+        else:
+            for part in cutlass.range_constexpr(group_chunks):
+                chunk = group * group_chunks + part
+                for slot in cutlass.range_constexpr(4):
+                    row = (chunk * 4 + slot) * row_lanes + ty
+                    if chunk < chunks and row < rows and column < columns:
+                        offset_left = (
+                            row * cutlass.Int32(left.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
+                        )
+                        values_left = _cute_resident_load_vector(
+                            left, offset_left, vector
+                        )
+                        for lane in cutlass.range_constexpr(vector):
+                            loaded[part * 4 + slot, lane] = values_left[lane]
+        for part in cutlass.range_constexpr(group_chunks):
+            chunk = group * group_chunks + part
+            for slot in cutlass.range_constexpr(4):
+                row = (chunk * 4 + slot) * row_lanes + ty
+                if chunk < chunks and row < rows and column < columns:
+                    for lane in cutlass.range_constexpr(vector):
+                        accum[slot, lane] = (
+                            accum[slot, lane] + loaded[part * 4 + slot, lane]
+                        )
     for slot in cutlass.range_constexpr(1, 4):
         for lane in cutlass.range_constexpr(vector):
             accum[0, lane] = accum[0, lane] + accum[slot, lane]

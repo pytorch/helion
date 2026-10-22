@@ -881,6 +881,10 @@ class CuteDeviceFunctionState:
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
         self.owned_root_block_dims: tuple[int, int, int] | None = None
+        # ``(needed, capacity)`` when the computed-fragment owner declined the
+        # current root because its shared memory exceeds the CTA capacity; a
+        # generic-lowering refusal of that root is then a config failure.
+        self.fragment_capacity_decline: tuple[int, int] | None = None
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
