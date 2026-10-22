@@ -10,9 +10,9 @@ import torch
 from ..language import _MEMORY_OPS
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.memory_ops import load
+from ..language.memory_ops import store_subscript_shape
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
-from .indexing_strategy import SubscriptIndexing
 from .inductor_lowering import ReductionLowering
 
 if TYPE_CHECKING:
@@ -76,13 +76,9 @@ def unused_block_ids(graphs: Sequence[GraphInfo], block_ids: set[int]) -> set[in
                 and node.target is not load
                 and isinstance(node.args[1], (list, tuple))
             ):
-                target = node.args[0]
-                if isinstance(target, (list, tuple)):
-                    target = target[0]  # StackTensor's shape/stride template
-                assert isinstance(target, torch.fx.Node)
-                tensor = target.meta["val"]
-                assert isinstance(tensor, torch.Tensor)
+                tensor = torch.fx.map_arg(node.args[0], lambda n: n.meta["val"])
+                assert isinstance(tensor, (torch.Tensor, tuple))
                 index = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
-                shape = SubscriptIndexing.compute_shape(tensor, [*index])
+                shape = store_subscript_shape(tensor, [*index])
                 unused.difference_update(map(env.get_block_id, shape))
     return unused

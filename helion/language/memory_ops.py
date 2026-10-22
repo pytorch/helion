@@ -263,6 +263,14 @@ def _(
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
+def store_subscript_shape(
+    tensor: torch.Tensor | tuple[object, ...], index: list[object]
+) -> list[int | torch.SymInt]:
+    target = tensor if isinstance(tensor, torch.Tensor) else tensor[0]
+    assert isinstance(target, torch.Tensor)
+    return SubscriptIndexing.compute_shape(target, index)
+
+
 @_decorators.register_fake(store)
 def _(
     tensor: torch.Tensor | tuple[object, ...],
@@ -273,9 +281,7 @@ def _(
     # Allocate the reduction dims of full slices as ``tensor[index] = value``
     # and ``hl.load`` do, so the slots of the store have blocks to address
     # them by.
-    target = tensor if isinstance(tensor, torch.Tensor) else tensor[0]
-    assert isinstance(target, torch.Tensor)
-    SubscriptIndexing.compute_shape(target, index)
+    store_subscript_shape(tensor, index)
     return None
 
 
