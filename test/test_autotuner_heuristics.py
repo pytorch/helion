@@ -11400,13 +11400,14 @@ class TestTritonReductionHeuristic(TestCase):
                     self.assertTrue(reduction.is_custom)
                     self.assertTrue(
                         any(
-                            len(step) == 2
-                            and all(tile.kind == "carry" for tile in step)
-                            and [tile.itemsize for tile in step]
+                            any(tile.kind not in ("carry", "global") for tile in step)
+                            and len(carries := [t for t in step if t.kind == "carry"])
+                            == 2
+                            and [tile.itemsize for tile in carries]
                             == [4, 8 if integer else 4]
                             and all(
                                 reduction.block_id in tile.dim_block_ids
-                                for tile in step
+                                for tile in carries
                             )
                             for step in fact.live_tile_steps
                         )

@@ -1246,16 +1246,17 @@ class GraphAnalysis:
 
         live_tile_steps: list[tuple[LiveTile, ...]] = []
         seen_steps: set[frozenset[int]] = set()
+        # Carries survive across the producer and combine steps of a rolled
+        # loop. Conservatively overlap all custom carries in this graph with
+        # its ordinary live values, rather than treating them as disjoint.
+        carried_tiles = tuple(tile for step in custom_reduction_steps for tile in step)
         for live in _live_node_steps(nodes, tile_details, last_use):
             if live:
                 step_key = frozenset(id(value) for value in live)
-                step = tuple(tile_details[value] for value in live)
+                step = tuple(tile_details[value] for value in live) + carried_tiles
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)
-        # shortcut: carries are a separate liveness bound until loop layouts
-        # describe their overlap with loaded inputs.
-        live_tile_steps.extend(custom_reduction_steps)
 
         def peak_role_tiles(
             details: dict[torch.fx.Node, LiveTile],
