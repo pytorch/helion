@@ -33,6 +33,14 @@ if __name__ == "__main__":
     sys.path.insert(0, str(REPO_ROOT))
 
 SCHEMA = "example-backend-comparison-v1"
+# A single-call CUDA-graph replay carries the graph launch latency quantized
+# to ~2 us steps, so kernels under a few tens of microseconds all read alike.
+# The primary latency is the per-call time of one graph holding this many
+# back-to-back calls, measured after a sustained pre-run so a power-capped GPU
+# sits at its steady clock (readings then agree to ~0.3% across processes,
+# while the L2-flushing cold bench swings 6-12% with the clock state). The
+# single-call replay time and the autotuner's cold bench stay as diagnostics.
+GRAPH_CALLS = 16
 
 
 def write_json(path: Path, value: object) -> None:
@@ -116,6 +124,17 @@ def worker(args: argparse.Namespace) -> None:
                 call, args.repetitions, expected, case, output_dtype=output_dtype
             )
         )
+        result.update(
+            baseline.measure_batched(
+                call,
+                args.repetitions,
+                GRAPH_CALLS,
+                expected,
+                case,
+                output_dtype=output_dtype,
+            )
+        )
+        result.update(baseline.measure_cold(call, args.repetitions))
         actual = call()
         result["post_measurement_output"] = baseline.metadata(actual)
         baseline.assert_correct(actual, expected, case, output_dtype=output_dtype)
@@ -151,6 +170,9 @@ def worker_environment(
         HELION_FORCE_AUTOTUNE="1",
         HELION_AUTOTUNE_RANDOM_SEED=str(seed),
         HELION_BENCHMARK_CUDAGRAPH="1",
+        # The catalogue times a 16-call back-to-back graph after an L2 flush;
+        # the autotuner's "replay" mode measures candidates the same way.
+        HELION_AUTOTUNE_L2_FLUSH="replay",
         HELION_CACHE_DIR=str(cache / "helion"),
         TRITON_CACHE_DIR=str(cache / "triton"),
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
@@ -277,7 +299,19 @@ def run(args: argparse.Namespace) -> None:
         "repetitions": args.repetitions,
         "autotune_seed": seed,
         **provenance(args.gpu),
-        "timer": "CUDA graph replay; do_bench(warmup=10, rep=50, return_mode=median)",
+        "timer": (
+            f"graph_calls_ms: per-call time of one CUDA graph of {GRAPH_CALLS} "
+            "back-to-back calls after a 500 ms sustained pre-run, median of "
+            "max(--repetitions, 7) "
+            "do_bench(warmup=10, rep=50, return_mode=median) readings; also bench_ms "
+            "(helion.autotuner.benchmarking.interleaved_bench, L2 flushed before every "
+            "call) and graph_ms (one call); graph_long_ms (primary where present): "
+            "the same reading of a graph grown by powers of two until one replay "
+            "takes >= 400 us (event times are quantized to 1.953 us), with "
+            "graph_long_calls"
+        ),
+        "graph_calls": GRAPH_CALLS,
+        "autotune_regime": "HELION_AUTOTUNE_L2_FLUSH=replay (flush, then a back-to-back batch)",
         "jobs": [],
     }
 
