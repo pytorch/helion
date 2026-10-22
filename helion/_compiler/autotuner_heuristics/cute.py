@@ -34,6 +34,7 @@ from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
 from ..compile_environment import FixedBlockSizeSource
 from ..compile_environment import _symint_sympy_expr
+from ..compile_environment import _to_sympy
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -798,8 +799,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         ``PersistentReductionStrategy`` applies ``cute_vector_widths`` only when
         V exactly covers each thread's slice, so the layout needs
         ``num_threads = N / V`` on the reduction block.  Requires a persistent
-        (unrolled) static power-of-two extent -- a dynamic extent is masked and
-        never vectorized, whatever its size hint -- and at least one full warp
+        (unrolled) static power-of-two extent: this persistent strategy cannot
+        vectorize a masked dynamic extent. Rolled seeds use a separate vector
+        path with alignment and tail guards. Requires at least one full warp
         of threads.
         """
         spec = env.config_spec
@@ -1010,12 +1012,13 @@ def _cute_tile_inner_block_dtype(
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             val = node.meta.get("val")
-            if isinstance(val, torch.Tensor) and val.ndim >= 1:
-                last = val.shape[-1]
-                if isinstance(last, torch.SymInt):
-                    last = _symint_sympy_expr(last)
-                if last == block_numel:
-                    return val.dtype
+            if (
+                isinstance(val, torch.Tensor)
+                and val.ndim >= 1
+                and val.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and _to_sympy(val.shape[-1]) == block_numel
+            ):
+                return val.dtype
     return None
 
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from examples.softmax import softmax_two_pass
 import pytest
+import sympy
 import torch
 
 from test._cute_binding import _cpu_bind
@@ -8,6 +12,10 @@ from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
+from helion._compiler.autotuner_heuristics.cute import _cute_tile_inner_block_dtype
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -15,17 +23,31 @@ from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 
+def _softmax(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for rows in hl.tile(x.size(0)):
+        out[rows, :] = torch.softmax(x[rows, :].float(), dim=-1).to(x.dtype)
+    return out
+
+
+def _masked_softmax(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for rows in hl.tile(x.size(0)):
+        value = x[rows, :]
+        mask = value > float("-inf")
+        value = torch.where(mask, value, float("-inf"))
+        out[rows, :] = torch.softmax(value.float(), dim=-1).to(x.dtype)
+    return out
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @skipUnlessBackends(["cute"])
 @skipIfRefEager("asserts generated CuTe source, which ref eager does not emit")
-def test_cute_dynamic_reduction_seeds_vector_memory(dtype: torch.dtype) -> None:
-    @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
-    def softmax(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        for rows in hl.tile(x.size(0)):
-            out[rows, :] = torch.softmax(x[rows, :].float(), dim=-1).to(x.dtype)
-        return out
-
+@pytest.mark.parametrize("fn", [_softmax, _masked_softmax])
+def test_cute_dynamic_reduction_seeds_vector_memory(dtype: torch.dtype, fn) -> None:
+    softmax = helion.kernel(
+        fn, backend="cute", static_shapes=False, autotune_effort="none"
+    )
     with _mock_cuda_unavailable():
         x = torch.empty(64, 4096, dtype=dtype)
         bound = _cpu_bind(softmax, (x,))
@@ -52,14 +74,8 @@ def test_cute_dynamic_reduction_seeds_vector_memory(dtype: torch.dtype) -> None:
 def test_dynamic_seed_handles_changed_extent_and_alignment(
     dtype: torch.dtype, layout: str
 ) -> None:
-    def softmax(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        for rows in hl.tile(x.size(0)):
-            out[rows, :] = torch.softmax(x[rows, :].float(), dim=-1).to(x.dtype)
-        return out
-
     kernel = helion.kernel(
-        softmax, backend="cute", static_shapes=False, autotune_effort="none"
+        _softmax, backend="cute", static_shapes=False, autotune_effort="none"
     )
     first = torch.randn(5, 4096, device="cuda", dtype=dtype)
     bound = kernel.bind((first,))
@@ -71,12 +87,13 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
     # Use public dispatch so a changed pointer/stride residue gets its own
     # binding rather than bypassing the runtime's alignment specialization.
     seeded = helion.kernel(
-        softmax,
+        _softmax,
         config=seed,
         backend="cute",
         static_shapes=False,
         autotune_effort="none",
     )
+    aligned = seeded.bind((first,))
     for width in (4096, 4100):
         if layout == "padded":
             x = torch.randn(5, width + 8, device="cuda", dtype=dtype)[:, :width]
@@ -87,4 +104,46 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
         actual = seeded(x)
         expected = torch.softmax(x.float(), dim=-1).to(dtype)
         torch.testing.assert_close(actual, expected)
-        assert seeded.bind((x,)) is seeded.bind((x,))
+        if layout == "offset":
+            assert seeded.bind((x,)) is not aligned
+        if layout == "contiguous" and width == 4096:
+            assert seeded.bind((x,)) is aligned
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@skipIfRefEager("checks dynamic tile heuristic code")
+def test_dynamic_two_pass_tile_seeds_execute(dtype: torch.dtype) -> None:
+    kernel = helion.kernel(
+        softmax_two_pass.fn, backend="cute", static_shapes=False, autotune_effort="none"
+    )
+    x = torch.randn(5, 4100, device="cuda", dtype=dtype)
+    bound = kernel.bind((x,))
+    assert bound.host_function is not None
+    for heuristic in (
+        CuteTileVecHeuristic,
+        CuteTileVecWarpReduceHeuristic,
+        CuteTileVecWarpPerRowHeuristic,
+    ):
+        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None
+        actual = bound.compile_config(seed)(x)
+        torch.testing.assert_close(
+            actual, torch.softmax(x.float(), -1).to(dtype), rtol=1e-2, atol=1e-4
+        )
+
+
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int64])
+def test_dtype_walk_ignores_index_and_mask_tensors(mask_dtype: torch.dtype) -> None:
+    graph = torch.fx.Graph()
+    index = graph.placeholder("index")
+    index.meta["val"] = torch.empty(4096, dtype=mask_dtype)
+    value = graph.placeholder("value")
+    value.meta["val"] = torch.empty(4096, dtype=torch.bfloat16)
+    env = SimpleNamespace(
+        block_sizes=[SimpleNamespace(numel=sympy.Integer(4096))],
+        is_jagged_tile=lambda block_id: False,
+    )
+    ir = SimpleNamespace(graphs=[SimpleNamespace(graph=graph)])
+    assert _cute_tile_inner_block_dtype(env, ir, 0) == torch.bfloat16
