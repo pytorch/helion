@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
+    from .simt_gemm import SimtGemmSite
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -776,6 +777,8 @@ class CuteDeviceFunctionState:
         # registered under this result var, even when user-visible names were
         # renamed through casts or epilogue nodes.
         self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
+        # Exact fp32 SIMT GEMM sites awaiting ``lower_simt_gemm``.
+        self.simt_gemm_sites: list[SimtGemmSite] = []
         self._fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
         # Rejected proofs are stable for this per-config codegen state. Keep
         # the tile shape in the key so callers cannot accidentally reuse a

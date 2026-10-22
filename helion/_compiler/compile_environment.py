@@ -1977,6 +1977,47 @@ class CompileEnvironment:
             return size
         return self.size_hint(size)
 
+    def tunable_default_hint(self, expr: sympy.Basic) -> int | None:
+        """``expr`` evaluated with every ``hl.register_tunable`` symbol at its default.
+
+        A tunable-sized extent (a split-K factor sizing a workspace's
+        reduction dim) is not an unknown runtime size: the kernel declared
+        its range and default, and seeds size their loops over it from that
+        default rather than from the generic unbacked hint of 8192. Only
+        expressions whose free symbols are all integer tunables qualify; the
+        result stays above one, clear of singleton special cases.
+        """
+        symbols = {
+            symbol for symbol in expr.free_symbols if isinstance(symbol, sympy.Symbol)
+        }
+        if not symbols or not symbols <= self.tunable_symbols:
+            return None
+        substitutions: dict[sympy.Symbol, sympy.Integer] = {}
+        for symbol in symbols:
+            value = self.config_value_expressions.get(symbol)
+            if (
+                value is None
+                or value.operation != "config"
+                or len(value.arguments) != 1
+            ):
+                return None
+            name = value.arguments[0]
+            fragment = (
+                self.config_spec.user_defined_tunables.get(name)
+                if isinstance(name, str)
+                else None
+            )
+            if fragment is None:
+                return None
+            default = fragment.default()
+            if type(default) is not int:
+                return None
+            substitutions[symbol] = sympy.Integer(max(default, 2))
+        hinted = sympy.sympify(expr.xreplace(substitutions))
+        if not isinstance(hinted, sympy.Integer):
+            return None
+        return max(int(hinted), 2)
+
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()

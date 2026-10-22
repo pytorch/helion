@@ -32,6 +32,7 @@ from typing import Literal
 from typing import NamedTuple
 from typing import cast
 
+import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -46,6 +47,8 @@ from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
 from ..indexing_strategy import subscript_tile_info
 from ..tile_strategy import DeviceLoopState
+from ..variable_origin import TileBeginOrigin
+from ..variable_origin import TileEndOrigin
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .aux_tensor import tcgen05_promoted_rowvec_epilogue
@@ -110,6 +113,9 @@ from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
 from .mma_support import tcgen05_supports_input_dtype
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .simt_gemm import mark_simt_gemm
+from .simt_gemm import simt_mma_requested
+from .simt_gemm import simt_owned_loop_declined
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
@@ -3589,6 +3595,73 @@ def _unwrap_lossless_mma_upcast(node: Node) -> Node:
     return node
 
 
+def _loop_subrange_parent_block_id(
+    env: CompileEnvironment, block_id: int
+) -> int | None:
+    """The tile a ``hl.tile(parent.begin, parent.end)`` loop block subdivides.
+
+    Such a loop's block size is ``tile_end(parent) - tile_begin(parent)``; both
+    symbols carry their tile origin, so the parent is recovered without any
+    shape reasoning.  Returns ``None`` for every other block.
+    """
+    size = env.block_sizes[block_id].size
+    if not isinstance(size, torch.SymInt):
+        return None
+    expr = size._sympy_()
+    if not isinstance(expr, sympy.Add) or len(expr.args) != 2:
+        return None
+    origins = HostFunction.current().expr_to_origin
+    begin_block = end_block = None
+    for term in expr.args:
+        coefficient, symbol = term.as_coeff_Mul()
+        info = origins.get(symbol) if isinstance(symbol, sympy.Symbol) else None
+        if info is None:
+            return None
+        origin = info.origin
+        if coefficient == 1 and isinstance(origin, TileEndOrigin):
+            end_block = origin.block_id
+        elif coefficient == -1 and isinstance(origin, TileBeginOrigin):
+            begin_block = origin.block_id
+        else:
+            return None
+    if begin_block is None or begin_block != end_block:
+        return None
+    return begin_block
+
+
+def _operand_dim_tiled_by_block(
+    env: CompileEnvironment,
+    block_id: int,
+    dim_size: int | torch.SymInt,
+    *,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether ``block_id`` tiles a matrix dimension of extent ``dim_size``.
+
+    The ordinary case is a tile whose block spans the dimension.  A split-K
+    kernel instead contracts over ``hl.tile(outer_k.begin, outer_k.end)``, a
+    loop that subdivides the enclosing ``outer_k`` grid tile; that block tiles
+    the dimension when its parent does.  Only the exact fp32 SIMT lowering
+    masks its K steps against the loop's own end today, so the sub-range form
+    is admitted for exact fp32 operands only; the tensor-core pipelines keep
+    prefetching against the full operand extent and stay out.
+    """
+    block_size = env.block_sizes[block_id].size
+    if not isinstance(block_size, int | torch.SymInt):
+        return False
+    if env.known_equal(block_size, dim_size):
+        return True
+    if dtype != torch.float32 or cute_fp32_dot_uses_tf32():
+        return False
+    parent = _loop_subrange_parent_block_id(env, block_id)
+    if parent is None:
+        return False
+    parent_size = env.block_sizes[parent].size
+    return isinstance(parent_size, int | torch.SymInt) and env.known_equal(
+        parent_size, dim_size
+    )
+
+
 def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
@@ -3617,9 +3690,8 @@ def _analyze_mma_operand(
     if block_ids is None:
         return None
     for dim, block_id in enumerate(block_ids):
-        block_size = env.block_sizes[block_id].size
-        if not isinstance(block_size, int | torch.SymInt) or not env.known_equal(
-            block_size, source_fake.size(dim)
+        if not _operand_dim_tiled_by_block(
+            env, block_id, source_fake.size(dim), dtype=source_fake.dtype
         ):
             return None
     if source_to_logical_order is not None:
@@ -7937,9 +8009,20 @@ def _emit_mma_pipeline(
     bn: int | None = None
     grid_state = cg.current_grid_state
     if analysis is not None:
-        if (
-            grid_state is not None
-            and tuple(grid_state.block_ids) == analysis.output_block_ids
+        if grid_state is not None and (
+            tuple(grid_state.block_ids) == analysis.output_block_ids
+            or (
+                simt_mma_requested(df.config)
+                and input_dtype == torch.float32
+                and not cute_fp32_dot_uses_tf32()
+                and tuple(
+                    block_id
+                    for block_id in grid_state.block_ids
+                    if block_id
+                    not in getattr(grid_state.strategy, "inactive_block_ids", ())
+                )
+                == analysis.output_block_ids
+            )
         ):
             m_block_id = analysis.m_block_id
             n_block_id = analysis.n_block_id
@@ -8465,6 +8548,68 @@ def _emit_mma_pipeline(
         acc_expr = None
     if analysis is None and mma_impl != "tcgen05" and _has_non_root_lane_loops(cg):
         return _unsupported_schedule("non-tcgen05 MMA does not own nested lane loops")
+    k_subrange_parent = _loop_subrange_parent_block_id(env, k_block_id)
+    k_loop_is_subrange = k_subrange_parent is not None
+    simt_gemm_admitted = (
+        mma_impl == "universal"
+        # The spliced GEMM initializes its accumulator ahead of the K loop:
+        # a sub-range K loop must subdivide a root (grid) tile, not a device
+        # loop that would re-enter it.
+        and (
+            k_subrange_parent is None
+            or (grid_state is not None and k_subrange_parent in grid_state.block_ids)
+        )
+        and simt_mma_requested(df.config)
+        and analysis is not None
+        and not analysis.has_leading_passthrough
+        and input_dtype == torch.float32
+        and not cute_fp32_dot_uses_tf32()
+        and acc_expr is None
+        and grouped_mode is None
+        and not row_union_requested
+        and lhs_fake.ndim == 2
+        and rhs_fake.ndim == 2
+        and m_block_id is not None
+        and n_block_id is not None
+        and bm is not None
+        and bn is not None
+        and m_offset_var is not None
+        and n_offset_var is not None
+    )
+    if k_loop_is_subrange and not simt_gemm_admitted:
+        # Every other lowering here (the tensor-core pipelines and the
+        # universal MmaUniversalOp staging) prefetches and masks against the
+        # operand's full K extent; a K loop that covers only one outer tile
+        # is lowered by the exact SIMT path or not at all.
+        return None
+    if simt_gemm_admitted:
+        assert m_block_id is not None and n_block_id is not None
+        assert bm is not None and bn is not None
+        assert m_offset_var is not None and n_offset_var is not None
+        return mark_simt_gemm(
+            cg,
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            m_size=m_size,
+            n_size=n_size,
+            m_offset_var=m_offset_var,
+            n_offset_var=n_offset_var,
+            k_offset_var=k_offset_var,
+            k_loop=device_loop,
+            lhs_access=_lhs_gmem_access,
+            rhs_access=_rhs_gmem_access,
+            lhs_k_contiguous=_lhs_major == "row",
+            rhs_k_contiguous=_rhs_major == "col",
+            lhs_arg_name=lhs_arg_name,
+            rhs_arg_name=rhs_arg_name,
+            lhs_load=lhs_info.load,
+            rhs_load=rhs_info.load,
+            m_local=m_local,
+            n_local=n_local,
+        )
     if rhs_info.rhs_is_grouped:
         if mma_impl != "tcgen05":
             return _unsupported_schedule("tcgen05 MMA was not selected")
@@ -16953,6 +17098,8 @@ def codegen_cute_mma(
         grouped_mode=grouped_mode,
     )
     if result is None:
+        if (declined := simt_owned_loop_declined(ctx.cg)) is not None:
+            raise declined
         return _unsupported_schedule("MMA pipeline was not admitted")
     return result
 
@@ -17250,6 +17397,8 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
                 "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
                 "to lower through the tcgen05 K-loop path",
             )
+        if (declined := simt_owned_loop_declined(state.codegen)) is not None:
+            raise declined
         return None
 
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None

@@ -1426,6 +1426,13 @@ class DeviceFunction:
                 disjoint_pairs=proven_disjoint_tensor_pairs,
                 rename_groups={k: v[0] for k, v in self._variable_renames.items()},
             )
+            from .cute.simt_gemm import lower_simt_gemm
+
+            kernel_body = lower_simt_gemm(
+                kernel_body,
+                self,
+                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+            )
             if any(
                 plan.get("kind") == "gathered_mma_tma"
                 for plan in self.codegen.cute_wrapper_plans

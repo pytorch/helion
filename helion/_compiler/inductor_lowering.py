@@ -1968,8 +1968,10 @@ def codegen_call_with_graph(
 ) -> list[object]:
     with compile_lock:
         from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+        from .cute.simt_gemm import prepare_cute_simt_gemm_loads
 
         prepare_cute_collective_lane_loop_suppression(cg, graph)
+        prepare_cute_simt_gemm_loads(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
