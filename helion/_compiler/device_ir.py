@@ -3478,6 +3478,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # size queries that identify physical tile coordinates.
         for graph in device_ir.graphs:
             resolve_reduction_sizes(graph.graph)
+        merged_rdims = merge_reduction_dims(device_ir.graphs)
         if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
             from .cute.philox_stream import rewrite_random_stream
 
@@ -3485,7 +3486,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
-        merged_rdims = merge_reduction_dims(device_ir.graphs)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions

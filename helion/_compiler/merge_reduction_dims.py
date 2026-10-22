@@ -172,11 +172,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
         nodes_by_name = {node.name: node for node in graph.nodes}
         for node in tagged_nodes:
             tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
-            original = nodes_by_name.get(tag.source)
-            # Random-op rewrites can replace the source after tracing. Its
-            # existing chain still works, but cannot use the original producer.
-            if original is None:
-                continue
+            original = nodes_by_name[tag.source]
             source = replacements.get(original, original)
             dims = tag.dims
             if not enabled or dims != [*range(dims[0], dims[-1] + 1)]:
