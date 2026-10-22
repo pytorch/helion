@@ -1094,7 +1094,9 @@ class DeviceIR:
             walk(root_id, [])
         return result
 
-    def register_rollable_reductions(self) -> None:
+    def register_rollable_reductions(
+        self, *, inactive_block_ids: frozenset[int] = frozenset()
+    ) -> None:
         """Analyze graphs for rollable reductions and register ReductionLoopSpec entries.
 
         This is analysis-only: it runs the roller to determine which graphs can
@@ -1150,7 +1152,9 @@ class DeviceIR:
             from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import stores_into_input_storage
 
-            self._register_cute_tile_vec_slots(env)
+            self._register_cute_tile_vec_slots(
+                env, inactive_block_ids=inactive_block_ids
+            )
             # Grid scans also reorder input reads across warps and need the
             # same cache-specialized alias facts as reduction kernels.
             # Collective MMA schedules prove operand loads disjoint from
@@ -1378,9 +1382,13 @@ class DeviceIR:
         # Reduction-dim slots are registered above; add the remaining
         # non-reduction tile slots after them (keeps the rdim slot at index 0).
         if env.backend_name == "cute":
-            self._register_cute_tile_vec_slots(env)
+            self._register_cute_tile_vec_slots(
+                env, inactive_block_ids=inactive_block_ids
+            )
 
-    def _register_cute_tile_vec_slots(self, env: CompileEnvironment) -> None:
+    def _register_cute_tile_vec_slots(
+        self, env: CompileEnvironment, *, inactive_block_ids: frozenset[int]
+    ) -> None:
         """Eagerly register cute_vector_widths slots for non-reduction tile blocks.
 
         Eager (not lazy in codegen) keeps the config-spec width fixed before the
@@ -1389,7 +1397,11 @@ class DeviceIR:
         """
         already_registered = set(env.config_spec.cute_vector_widths.valid_block_ids())
         for tile_bs in env.block_sizes:
-            if tile_bs.reduction or tile_bs.block_id in already_registered:
+            if (
+                tile_bs.reduction
+                or tile_bs.block_id in already_registered
+                or tile_bs.block_id in inactive_block_ids
+            ):
                 continue
             # Non-static size (jagged / AutoSize) never forms a lane loop.
             if not isinstance(tile_bs.size, (int, torch.SymInt)):
@@ -3608,6 +3620,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
+        unused_rdims: set[int] = set()
         if merged_rdims:
             # Merged dims can leave their per-dim rdims unused.  Stop treating
             # them as reductions, or they would gain unused tuning slots and
@@ -3616,9 +3629,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # extent would come from a subscript that kept the rdim in use.
             from .active_blocks import unused_block_ids
 
-            for block_id in unused_block_ids(device_ir.graphs, merged_rdims):
+            unused_rdims = unused_block_ids(device_ir.graphs, merged_rdims)
+            for block_id in unused_rdims:
                 CompileEnvironment.current().block_sizes[block_id].reduction = False
-        device_ir.register_rollable_reductions()
+        device_ir.register_rollable_reductions(
+            inactive_block_ids=frozenset(unused_rdims)
+        )
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
             from .cute.signed_bitfield import has_signed_byte_field

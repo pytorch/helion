@@ -295,6 +295,8 @@ class TestReductions(RefEagerTestBase, TestCase):
             # no tuning knobs for the per-dim rdims the merge left unused
             spec = bound.config_spec
             self.assertEqual(len(spec.cute_reduction_reloads.valid_block_ids()), 1)
+            self.assertEqual(len(spec.cute_vector_widths.valid_block_ids()), 2)
+            self.assertEqual(len(spec.cute_lane_layouts.valid_block_ids()), 2)
         self.assertEqual(
             "flatten(1, 2)" in bound.to_triton_code(bound.config_spec.default_config()),
             merges and not transpose,
