@@ -14,6 +14,7 @@ import dataclasses
 import functools
 import itertools
 import logging
+import math
 import operator
 import re
 from typing import TYPE_CHECKING
@@ -34,7 +35,6 @@ from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
-from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
@@ -71,6 +71,8 @@ from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
+from .cache_policy_loads import _CUTE_NC_L2_FIRST_SUFFIX
+from .cache_policy_loads import is_cache_policy_suffix
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index
@@ -93,6 +95,7 @@ from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
 from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
+from .indexing import unwrap_cute_broadcast_index
 from .iota_utils import cute_free_arange_lanes
 from .tile_ops import cute_masked_block_end
 from .tile_ops import cute_tile_begin_expr
@@ -121,6 +124,9 @@ log = logging.getLogger(__name__)
 
 
 _CUTE_ALIGNMENT_MAX_BYTES = 32
+# Persistent-reduction stores of these dtypes become one packet per lane loop;
+# the flush helper converts every lane at once (``persistent_branch_vec``).
+_CUTE_PACKET_STORE_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
 
 
 def _specialized_int(
@@ -182,11 +188,24 @@ def _persistent_vec_alignment_prepared_guard(
         if signature is None:
             continue
         residue = cast("tuple[int, object, object]", signature)[0]
-        namespace[f"extract_{index}"] = extract
-        checks.append(
-            f"extract_{index}(args).data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}"
-        )
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
+        checks.append(f"{source}.data_ptr() % {_CUTE_ALIGNMENT_MAX_BYTES} == {residue}")
     return eval(f"lambda args: {' and '.join(checks) or 'True'}", namespace)
+
+
+def _prepared_guard_source(
+    namespace: dict[str, object],
+    name: str,
+    extract: Callable[[Sequence[object]], Hashable],
+) -> str:
+    """The expression a generated prepared guard reads a source through:
+    ``args[i]`` for a plain argument (the extractor carries its index), else
+    a call of the extractor bound into ``namespace``."""
+    index = getattr(extract, "_helion_arg_index", None)
+    if type(index) is int:
+        return f"args[{index}]"
+    namespace[name] = extract
+    return f"{name}(args)"
 
 
 def register_persistent_vec_alignment_specializations(
@@ -524,10 +543,10 @@ def _tensor_storage_disjoint_prepared_guard(
     namespace: dict[str, object] = {}
     lines = ["def guard(args):"]
     for index, extract in enumerate(source_extractors):
-        namespace[f"extract_{index}"] = extract
+        source = _prepared_guard_source(namespace, f"extract_{index}", extract)
         lines.extend(
             (
-                f"    storage_{index} = extract_{index}(args).untyped_storage()",
+                f"    storage_{index} = {source}.untyped_storage()",
                 f"    start_{index} = storage_{index}.data_ptr()",
                 f"    end_{index} = start_{index} + storage_{index}.nbytes()",
             )
@@ -875,7 +894,9 @@ def _persistent_branch_vec_store_marker(
                 args=[
                     ast.Constant(value=block_id),
                     ast.Constant(value=vec_width),
-                    ast.Constant(value=_cute_scalar_storage_dtype(dtype)),
+                    ast.Constant(
+                        value=CompileEnvironment.current().backend.dtype_str(dtype)
+                    ),
                     pointer_expr,
                     value,
                     mask,
@@ -911,7 +932,7 @@ def _cute_vector_load_expr(
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
         # carrier form the L2 helper produces; drop the hint here.
         eviction_suffix = ""
@@ -1318,17 +1339,14 @@ def _persistent_vec_is_exact_aligned(
         ):
             return False
     else:
-        # Kernel-owned allocations are suitably aligned by the backend.  A
-        # nonzero or symbolic view offset cannot establish that guarantee.
-        if env.tensor_input_source(tensor) is not None:
-            return False
-        storage_offset = tensor.storage_offset()
-        if not isinstance(storage_offset, int) or storage_offset != 0:
-            return False
         strides = tensor.stride()
         sizes = tensor.shape
         element_size = tensor.element_size()
         required_alignment = vec_width * element_size
+        # Lacking an input source does not make a tensor kernel-owned: a
+        # host-side view of an input inherits that input's runtime base.
+        if not cute_tensor_base_is_aligned(env, tensor, required_alignment):
+            return False
 
     if len(strides) != len(rebased):
         return False
@@ -3597,6 +3615,26 @@ def _(state: CodegenState) -> ast.AST:
     )
     branch_vec_store_candidate: tuple[int, int] | None = None
 
+    if (
+        store_uses_pointer
+        and topk_lane_expr is None
+        and not value_readdressed
+        and tensor.dtype in _CUTE_PACKET_STORE_DTYPES
+    ):
+        packet_context = _cute_vector_load_ctx(
+            state, tensor, subscript, index_exprs, extra_mask, for_store=True
+        )
+        if packet_context is not None and packet_context[2] == "unroll":
+            width, block_id, _mode = packet_context
+            if width in (2, 4, 8, 16) and _persistent_vec_is_exact_aligned(
+                state,
+                _cute_lane_strategy(state, block_id),
+                index_exprs,
+                tensor,
+                width,
+            ):
+                branch_vec_store_candidate = (block_id, width)
+
     # Vectorized store: when this store's stride-1 axis is a vec-partitioned
     # lane loop (same predicates as the vec-load hoist, so the per-element
     # mask is provably uniform across the V lanes), collect the per-lane
@@ -4075,6 +4113,7 @@ class _CuteLaneIndexFacts:
     vec_lane_var: str
     vec_width: int
     aligned: bool
+    aligned_vars: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4336,6 +4375,7 @@ def _cute_lane_index_facts(
         vec_lane_var,
         vec_width,
         _cute_lane_base_is_vec_aligned(strategy, block_id, owner, vec_width),
+        frozenset((strategy.offset_var(block_id),)),
     )
 
 
@@ -4578,7 +4618,23 @@ def _cute_lane_uniform_compare(
     left_form = _cute_lane_affine_form(left, lane.index_var)
     right_form = _cute_lane_affine_form(right, lane.index_var)
     if left_form is None or right_form is None:
-        return False
+        # A tile-relative bound, ``index - tile_offset < extent``, can be
+        # uniform even though its scalar offset is not an integer literal.
+        # Tile offsets are multiples of V whenever the lane base is aligned.
+        # Prove the offset's residue instead of dropping this packet.
+        form = _cute_lane_affine_alignment(
+            ast.BinOp(left=left, op=ast.Sub(), right=right), lane
+        )
+        if form is None:
+            return False
+        coefficient, alignment = form
+        if coefficient == 0:
+            # Unknown scalar offsets may wrap a narrowed integer at distinct
+            # points. Do not infer cancellation through such casts.
+            return ast.dump(left) == ast.dump(right)
+        if coefficient == -1:
+            op = _CUTE_LANE_MIRRORED_COMPARE[op]
+        return op in (ast.Lt, ast.GtE) and alignment % lane.vec_width == 0
     if left_form[0] == right_form[0]:
         # ``index + a  op  index + b``: a constant comparison.
         return True
@@ -4592,6 +4648,43 @@ def _cute_lane_uniform_compare(
     if op in (ast.LtE, ast.Gt):
         return (bound + 1 - shift) % lane.vec_width == 0
     return False
+
+
+def _cute_lane_affine_alignment(
+    node: ast.expr, lane: _CuteLaneIndexFacts
+) -> tuple[int, int] | None:
+    """Coefficient of the lane index and a proved multiple of its offset."""
+    if isinstance(node, ast.Name):
+        if node.id == lane.index_var:
+            return 1, 0
+        return 0, lane.vec_width if node.id in lane.aligned_vars else 1
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return 0, abs(node.value)
+    if isinstance(node, ast.Call) and not node.keywords:
+        name = _cute_qualified_call_name(node.func)
+        if name in _CUTE_LANE_INT_CASTS and len(node.args) == 1:
+            return _cute_lane_affine_alignment(node.args[0], lane)
+        if name in ("operator.add", "operator.sub") and len(node.args) == 2:
+            return _cute_lane_affine_alignment(
+                ast.BinOp(
+                    left=node.args[0],
+                    op=ast.Add() if name == "operator.add" else ast.Sub(),
+                    right=node.args[1],
+                ),
+                lane,
+            )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        left = _cute_lane_affine_alignment(node.left, lane)
+        right = _cute_lane_affine_alignment(node.right, lane)
+        if left is None or right is None:
+            return None
+        coefficient = left[0] + (
+            right[0] if isinstance(node.op, ast.Add) else -right[0]
+        )
+        if coefficient not in (-1, 0, 1):
+            return None
+        return coefficient, math.gcd(left[1], right[1])
+    return None
 
 
 def _cute_lane_uniform_predicate(node: ast.expr, lane: _CuteLaneIndexFacts) -> bool:
@@ -5099,6 +5192,7 @@ def _cute_vector_load_ctx(
     extra_mask: ast.AST | None,
     *,
     allow_gathered_index: bool = False,
+    for_store: bool = False,
 ) -> tuple[int, int, str] | None:
     """Return (vec_width, lane_block_id, mode) when a vec load may be emitted.
 
@@ -5118,6 +5212,10 @@ def _cute_vector_load_ctx(
     keeps the packet only when every mask term other than the lane mask is
     uniform across the V lanes (``_cute_vector_load_mask_is_lane_only`` /
     ``_cute_lane_uniform_mask``), and falls back to scalar loads otherwise.
+
+    ``for_store`` (store sites only) also admits the
+    ``_CUTE_PACKET_STORE_DTYPES`` of a persistent reduction; the
+    branch-local persistent vectorizer flushes those packets.
     """
     from ..reduction_strategy import LoopedReductionStrategy
     from ..reduction_strategy import PersistentReductionStrategy
@@ -5127,8 +5225,11 @@ def _cute_vector_load_ctx(
         return None
     if "None" in index_exprs:
         return None
-    if tensor.dtype not in _CUTE_VECTOR_DTYPES and not _cute_is_unroll_dtype(
-        tensor.dtype
+    packet_store = for_store and tensor.dtype in _CUTE_PACKET_STORE_DTYPES
+    if (
+        tensor.dtype not in _CUTE_VECTOR_DTYPES
+        and not _cute_is_unroll_dtype(tensor.dtype)
+        and not packet_store
     ):
         return None
     # Only enable the vec path when the load's result eventually feeds a
@@ -5209,7 +5310,10 @@ def _cute_vector_load_ctx(
                     inner_block_id = bid
                     lane_axis_pos = expr_pos
                     lane_on_stride1 = tensor_dim == stride1_tensor_dim
-        elif isinstance(idx, torch.Tensor) and idx.ndim == 1:
+        elif isinstance(idx, torch.Tensor) and (
+            idx.ndim == 1
+            or sum(not env.known_equal(size, 1) for size in idx.shape) == 1
+        ):
             # ``hl.arange(K)`` reaches indexing lowering as a 1-D FakeTensor,
             # not as the SymInt that identifies K. Resolve its static extent
             # back to the persistent reduction block.
@@ -5232,6 +5336,7 @@ def _cute_vector_load_ctx(
                 and subscript_pos < len(raw_subscript)
                 else None
             )
+            raw_index = unwrap_cute_broadcast_index(raw_index)
             valid_iota = (
                 is_cute_unit_stride_iota_index(raw_index)
                 if isinstance(candidate, PersistentReductionStrategy)
@@ -5311,6 +5416,9 @@ def _cute_vector_load_ctx(
     if inner_block_id is None or lane_axis_pos is None:
         return None
     strategy = _cute_lane_strategy(state, inner_block_id)
+    if packet_store and not isinstance(strategy, PersistentReductionStrategy):
+        # Only the branch-local persistent vectorizer flushes these packets.
+        return None
     if isinstance(
         strategy,
         (LoopedReductionStrategy, PersistentReductionStrategy),
@@ -5340,6 +5448,10 @@ def _cute_vector_load_ctx(
                     isinstance(strategy, LoopedReductionStrategy)
                     and strategy._cute_reduction_vec_mode == "unroll"
                 )
+                # A packet store keeps a user mask only where the persistent
+                # vectorizer proves it uniform across the packet
+                # (``_uniform_guard``); other stores stay scalar.
+                and not packet_store
             )
         ):
             return None
@@ -5368,7 +5480,7 @@ def _cute_vector_load_ctx(
                 return None
             return vec_width, inner_block_id, "vec"
         if mode == "unroll":
-            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES and not packet_store:
                 return None
             capability = env.config_spec.target_device_capability
             max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
@@ -5499,9 +5611,9 @@ def _cute_vector_load_ctx(
             # (e.g. ``numel`` not a multiple of V), the masked-tail iter
             # could load garbage in some lanes.  Gate the per-element mask
             # path correctly by requiring ``numel % V == 0`` so partial-vec
-            # straddles are impossible.
-            numel = env.block_sizes[inner_block_id].numel
-            if not env.known_multiple(numel, vec_width):
+            # straddles are impossible.  A jagged axis has no static extent
+            # and stays scalar.
+            if not env.block_sizes[inner_block_id].known_multiple(vec_width):
                 return None
         if not _cute_tile_packet_is_aligned(
             env, tensor, stride1_tensor_dim, vec_width, flat=flat_multi
@@ -6007,6 +6119,36 @@ def reject_reads_of_collective_placeholders(state: CodegenState, what: str) -> N
             )
 
 
+def _cute_load_source_is_readonly(state: CodegenState) -> bool:
+    """Whether no write in the kernel can alias this load's source.
+
+    ``nc_l2_first`` reads through the noncoherent cache path, so every store
+    and atomic must be proven disjoint from the source
+    (``host_load_is_readonly``).  Inline assembly outside the scalar
+    arithmetic envelope could hide a store and declines the hint as well.
+    """
+    from ...language.inline_asm_ops import inline_asm_elementwise
+    from .cutedsl_compat import readonly_packet_load_supported
+    from .pure_lane_packets import is_pure_scalar_assembly
+    from .register_loads import host_load_is_readonly
+
+    env = CompileEnvironment.current()
+    graphs = state.codegen.codegen_graphs
+    return (
+        state.fx_node is not None
+        and readonly_packet_load_supported(
+            env.config_spec.target_device_capability, torch.version.cuda
+        )
+        and host_load_is_readonly(state.fx_node, env, graphs)
+        and not any(
+            node.target is inline_asm_elementwise
+            and not is_pure_scalar_assembly(node.args[0], node.args[1], node.args[4])
+            for graph in graphs
+            for node in graph.graph.nodes
+        )
+    )
+
+
 def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     """Whether a collective matmul makes this load a placeholder.
 
@@ -6251,6 +6393,9 @@ def _(state: CodegenState) -> object:
                 )
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
+            elif policy == "nc_l2_first":
+                if _cute_load_source_is_readonly(state):
+                    eviction_suffix = _CUTE_NC_L2_FIRST_SUFFIX
             elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):
                 # Inline-PTX L2 hints apply only to aligned 16-byte packets.
                 eviction_suffix = f"__{policy}__"

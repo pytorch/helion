@@ -995,7 +995,7 @@ class ReductionLowering(InductorLowering):
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
         if len(reduction_ranges) != 1:
-            raise NotImplementedError("multiple reduction dimensions")
+            raise exc.MultipleReductionDims
         # In Inductor IR, reduction_ranges holds sizes, not loop vars.
         # Support both symbolic and constant sizes by allocating/looking up
         # a matching reduction dimension in the current environment.

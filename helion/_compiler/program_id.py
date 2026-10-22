@@ -20,6 +20,8 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.device_state import Tcgen05GroupedSchedulerMode
+from .cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from .cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from .cute.strategies import TCGEN05_BATCH_RASTER_DEFAULT
 from .cute.strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
@@ -526,6 +528,17 @@ class ProgramIDs(abc.ABC):
                 *wrapped_body,
             ]
 
+        # One-shot teardown registered by the body's lowering (a tensor
+        # memory dealloc) runs once, after the tile loop.
+        cute_state = device_function.cute_state
+        post_loop: list[ast.stmt] = []
+        if cute_state.has_tcgen05_post_loop_marks:
+            statements = cast("list[ast.stmt]", wrapped_body)
+            post_loop = [s for s in statements if cute_state.is_tcgen05_post_loop(s)]
+            wrapped_body = [
+                s for s in statements if not cute_state.is_tcgen05_post_loop(s)
+            ]
+
         # Create the persistent loop that wraps the entire body
         persistent_loop = create(
             ast.For,
@@ -535,7 +548,7 @@ class ProgramIDs(abc.ABC):
             orelse=[],
             type_comment=None,
         )
-        return [persistent_loop]
+        return [persistent_loop, *post_loop]
 
     @property
     def virtual_program_id(self) -> str:
@@ -1564,11 +1577,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         return bool(plan is not None and plan.grouped is not None)
 
+    def _tcgen05_grouped_scheduler_grid_expr(self) -> str:
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.grouped is not None
+        if plan.grouped.worker_balance is not None:
+            return plan.grouped.worker_balance.grid
+        return "cute.arch.grid_dim()"
+
     def _tcgen05_uses_grouped_worklist_nm_scheduler_mailbox(self) -> bool:
         plan = self._tcgen05_plan()
         return bool(
             plan is not None
-            and plan.accumulator_view == "nm"
+            and (
+                plan.accumulator_view == "nm"
+                or (plan.grouped is not None and plan.grouped.device_split_sizes)
+            )
             and plan.has_scheduler_warp
             and plan.uses_role_local_persistent_body
             and plan.grouped is not None
@@ -2860,6 +2883,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 partition, post_loop_stmts
             )
         )
+        plan = self._tcgen05_plan()
+        if (
+            plan is not None
+            and plan.grouped is not None
+            and plan.grouped.worker_balance is not None
+            and not (omit_shared_loop and use_validated_role_local_body)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "balanced grouped workers require complete independent warp roles "
+                "without a shared persistent loop",
+            )
         if (
             use_validated_role_local_body
             and not omit_shared_loop
@@ -2968,6 +3003,34 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
         setup.extend(post_loop_stmts)
+        if (
+            plan is not None
+            and plan.grouped is not None
+            and plan.grouped.worker_balance is not None
+        ):
+            balance = plan.grouped.worker_balance
+            grid_indices = [
+                index
+                for index, stmt in enumerate(setup)
+                if isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == balance.grid
+            ]
+            assert len(grid_indices) == 1
+            boundary = grid_indices[0] + 1
+            # Metadata publication and the uniform count stay outside. DSL
+            # 4.8 rejects dynamic kernel returns, so every MMA resource, role
+            # loop and tail instead lives in one active-cluster branch.
+            setup = [
+                *setup[:boundary],
+                create(
+                    ast.If,
+                    test=expr_from_string(balance.active_predicate),
+                    body=setup[boundary:],
+                    orelse=[],
+                ),
+            ]
         return setup
 
     @dataclasses.dataclass
@@ -4039,7 +4102,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         assert plan is not None and plan.grouped is not None
         grouped = plan.grouped
-        assert grouped.valid_m is not None and grouped.store_m is not None
+        assert plan.accumulator_view != "nm" or (
+            grouped.valid_m is not None and grouped.store_m is not None
+        )
         runtime_table = self._tcgen05_uses_grouped_worklist_nm_runtime_table()
         scheduler_mailbox = self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
         runtime_clc = self._tcgen05_uses_grouped_worklist_nm_runtime_clc()
@@ -4257,7 +4322,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             )
             derived_metadata_stmts: list[ast.stmt] = []
-            if epi_role:
+            if epi_role and plan.accumulator_view == "nm":
                 derived_metadata_stmts.extend(
                     self._grouped_worklist_nm_valid_store_m_stmts(device_function)
                 )
@@ -4267,6 +4332,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(f"pid_1 = {grouped.cta_tile_idx_n}"),
                 )
             )
+            if plan.accumulator_view != "nm":
+                derived_metadata_stmts.extend(
+                    (
+                        statement_from_string(
+                            f"tile_offset_0 = {grouped.global_m_start} + "
+                            f"{grouped.cta_tile_idx_m} * cutlass.Int32({plan.source_tile_m})"
+                        ),
+                        statement_from_string(
+                            f"tile_offset_1 = {grouped.cta_tile_idx_n} * "
+                            f"cutlass.Int32({plan.source_tile_n})"
+                        ),
+                    )
+                )
             derived_metadata_stmts, required_metadata_names = (
                 _prune_dead_side_effect_free_generated_assignments(
                     derived_metadata_stmts, role_reads
@@ -4448,7 +4526,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentGroupTileScheduler.create("
                 f"{grouped.sched_params}, cute.arch.block_idx(), "
-                f"cute.arch.grid_dim(), ({plan.bm}, {plan.bn}, {plan.bk}), "
+                f"{self._tcgen05_grouped_scheduler_grid_expr()}, ({plan.bm}, {plan.bn * plan.cluster_n if plan.accumulator_view == 'mn' else plan.bn}, {plan.bk}), "
                 "cutlass.utils.create_initial_search_state(), "
                 f"{grouped.count}, {grouped.problem_sizes})"
             ),
@@ -4860,11 +4938,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             (_TCGEN05_GROUPED_SELECTED_MAILBOX_GROUP_IDX, group_idx_var),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M,
-                f"{group_info_var}.problem_shape_n",
+                f"{group_info_var}.problem_shape_{'n' if plan.accumulator_view == 'nm' else 'm'}",
             ),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N,
-                f"{group_info_var}.problem_shape_m",
+                f"{group_info_var}.problem_shape_{'m' if plan.accumulator_view == 'nm' else 'n'}",
             ),
             (
                 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K,
@@ -4942,6 +5020,183 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
 
+        def mn_panel_raster_stmts(swizzle: int | None = None) -> list[ast.stmt]:
+            """Permute matched cluster indices without changing group search."""
+            assert plan.accumulator_view == "mn"
+            assert (
+                grouped.device_split_sizes and grouped.device_layout_kind == "offsets"
+            )
+            if swizzle is None:
+                swizzle = self._tcgen05_l2_swizzle_size()
+            if swizzle == 1:
+                # The alternate width can select the legacy AlongM order.
+                return [create(ast.Pass)]
+            assert swizzle > 1
+            backend = CompileEnvironment.current().backend
+            local_index = device_function.new_var("tcgen05_grouped_panel_local_index")
+            if grouped.device_n_size is not None:
+                n_clusters_value = (
+                    grouped.device_n_size + plan.bn * plan.cluster_n - 1
+                ) // (plan.bn * plan.cluster_n)
+                if n_clusters_value <= swizzle:
+                    # One full-width panel: every row walks the same fixed N
+                    # cluster extent, so both divisions have a static divisor.
+                    return [
+                        statement_from_string(
+                            f"{local_index} = {sched_var}._current_work_linear_idx - "
+                            f"{sched_var}.search_state.tile_count_prev_group"
+                        ),
+                        statement_from_string(
+                            f"{cta_tile_idx_m_var} = {local_index} // "
+                            f"cutlass.Int32({n_clusters_value})"
+                        ),
+                        statement_from_string(
+                            f"{cta_tile_idx_n_var} = ({local_index} % "
+                            f"cutlass.Int32({n_clusters_value})) * cutlass.Int32({plan.cluster_n}) + "
+                            f"{cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                        ),
+                    ]
+                if n_clusters_value <= 2 * swizzle:
+                    m_clusters = device_function.new_var(
+                        "tcgen05_grouped_panel_m_clusters"
+                    )
+                    tail_index = device_function.new_var(
+                        "tcgen05_grouped_panel_tail_index"
+                    )
+                    tail_width = n_clusters_value - swizzle
+                    return [
+                        statement_from_string(
+                            f"{local_index} = {sched_var}._current_work_linear_idx - "
+                            f"{sched_var}.search_state.tile_count_prev_group"
+                        ),
+                        statement_from_string(
+                            f"{m_clusters} = "
+                            + backend.cdiv_expr(
+                                f"{group_info_var}.problem_shape_m",
+                                f"cutlass.Int32({plan.bm})",
+                                is_device=True,
+                            )
+                        ),
+                        create(
+                            ast.If,
+                            test=expr_from_string(
+                                f"{local_index} < cutlass.Int32({swizzle}) * {m_clusters}"
+                            ),
+                            body=[
+                                statement_from_string(
+                                    f"{cta_tile_idx_m_var} = {local_index} // cutlass.Int32({swizzle})"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_n_var} = ({local_index} % cutlass.Int32({swizzle})) * "
+                                    f"cutlass.Int32({plan.cluster_n}) + {cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                                ),
+                            ],
+                            orelse=[
+                                statement_from_string(
+                                    f"{tail_index} = {local_index} - cutlass.Int32({swizzle}) * {m_clusters}"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_m_var} = {m_clusters} - cutlass.Int32(1) - {tail_index} // cutlass.Int32({tail_width})"
+                                ),
+                                statement_from_string(
+                                    f"{cta_tile_idx_n_var} = (cutlass.Int32({swizzle}) + {tail_index} % cutlass.Int32({tail_width})) * "
+                                    f"cutlass.Int32({plan.cluster_n}) + {cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                                ),
+                            ],
+                        ),
+                    ]
+            m_clusters = device_function.new_var("tcgen05_grouped_panel_m_clusters")
+            n_clusters = device_function.new_var("tcgen05_grouped_panel_n_clusters")
+            panel_size = device_function.new_var("tcgen05_grouped_panel_size")
+            panel_span = device_function.new_var("tcgen05_grouped_panel_span")
+            panel_index = device_function.new_var("tcgen05_grouped_panel_index")
+            panel_linear = device_function.new_var("tcgen05_grouped_panel_linear")
+            panel_width = device_function.new_var("tcgen05_grouped_panel_width")
+            return [
+                statement_from_string(
+                    f"{local_index} = {sched_var}._current_work_linear_idx - "
+                    f"{sched_var}.search_state.tile_count_prev_group"
+                ),
+                statement_from_string(
+                    f"{m_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_m",
+                        f"cutlass.Int32({plan.bm})",
+                        is_device=True,
+                    )
+                ),
+                statement_from_string(
+                    f"{n_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_n",
+                        f"cutlass.Int32({plan.bn * plan.cluster_n})",
+                        is_device=True,
+                    )
+                ),
+                statement_from_string(
+                    f"{panel_size} = cutlass.min(cutlass.Int32({swizzle}), {n_clusters})"
+                ),
+                statement_from_string(f"{panel_span} = {panel_size} * {m_clusters}"),
+                statement_from_string(f"{panel_index} = {local_index} // {panel_span}"),
+                statement_from_string(f"{panel_linear} = {local_index} % {panel_span}"),
+                statement_from_string(
+                    f"{panel_width} = cutlass.min({panel_size}, {n_clusters} - {panel_index} * {panel_size})"
+                ),
+                statement_from_string(
+                    f"{cta_tile_idx_m_var} = {panel_linear} // {panel_width}"
+                ),
+                statement_from_string(
+                    f"{cta_tile_idx_n_var} = ({panel_index} * {panel_size} + "
+                    f"{panel_linear} % {panel_width}) * cutlass.Int32({plan.cluster_n}) + "
+                    f"{cta_tile_idx_n_var} % cutlass.Int32({plan.cluster_n})"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{panel_index} % cutlass.Int32(2) == cutlass.Int32(1)"
+                    ),
+                    body=[
+                        statement_from_string(
+                            f"{cta_tile_idx_m_var} = {m_clusters} - cutlass.Int32(1) - {cta_tile_idx_m_var}"
+                        )
+                    ],
+                    orelse=[],
+                ),
+            ]
+
+        def mn_panel_choice_stmts() -> list[ast.stmt]:
+            alternate = device_function.config.get(GROUPED_PANEL_ALTERNATE_KEY)
+            if alternate is None:
+                return mn_panel_raster_stmts()
+            ratio = device_function.config.get(GROUPED_PANEL_RATIO_KEY)
+            assert type(alternate) is int and type(ratio) is int
+            assert grouped.device_n_size is not None
+            n_clusters = (grouped.device_n_size + plan.bn * plan.cluster_n - 1) // (
+                plan.bn * plan.cluster_n
+            )
+            m_clusters = device_function.new_var(
+                "tcgen05_grouped_panel_choice_m_clusters"
+            )
+            backend = CompileEnvironment.current().backend
+            return [
+                statement_from_string(
+                    f"{m_clusters} = "
+                    + backend.cdiv_expr(
+                        f"{group_info_var}.problem_shape_m",
+                        f"cutlass.Int32({plan.bm})",
+                        is_device=True,
+                    )
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{m_clusters} <= cutlass.Int32({ratio * n_clusters})"
+                    ),
+                    body=mn_panel_raster_stmts(self._tcgen05_l2_swizzle_size()),
+                    orelse=mn_panel_raster_stmts(alternate),
+                ),
+            ]
+
         def publish_current_tile_leader_stmts() -> list[ast.stmt]:
             return [
                 statement_from_string(
@@ -4968,13 +5223,40 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ]
                 ),
                 statement_from_string(
-                    f"{cta_tile_idx_m_var} = {group_info_var}.cta_tile_idx_n"
+                    f"{cta_tile_idx_m_var} = "
+                    + (
+                        f"{group_info_var}.cta_tile_idx_n"
+                        if plan.accumulator_view == "nm"
+                        else self._tcgen05_logical_m_coord_expr(
+                            f"{group_info_var}.cta_tile_idx_m"
+                        )
+                    )
                 ),
                 statement_from_string(
                     f"{cta_tile_idx_n_var} = "
-                    f"{self._tcgen05_logical_m_coord_expr(f'{group_info_var}.cta_tile_idx_m')}"
+                    + (
+                        self._tcgen05_logical_m_coord_expr(
+                            f"{group_info_var}.cta_tile_idx_m"
+                        )
+                        if plan.accumulator_view == "nm"
+                        else f"{group_info_var}.cta_tile_idx_n"
+                    )
                 ),
-                *source_m_fast_raster_stmts(),
+                *(
+                    source_m_fast_raster_stmts()
+                    if plan.accumulator_view == "nm"
+                    else []
+                ),
+                *(
+                    mn_panel_choice_stmts()
+                    if plan.accumulator_view == "mn"
+                    and (
+                        self._tcgen05_l2_swizzle_size() > 1
+                        or device_function.config.get(GROUPED_PANEL_ALTERNATE_KEY)
+                        is not None
+                    )
+                    else []
+                ),
                 *[
                     statement_from_string(f"{slot(field)} = {value}")
                     for field, value in mailbox_values
@@ -5008,7 +5290,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             statement_from_string(
                 f"{sched_var} = cutlass.utils.StaticPersistentGroupTileScheduler.create("
                 f"{grouped.sched_params}, cute.arch.block_idx(), "
-                f"cute.arch.grid_dim(), ({plan.bm}, {plan.bn}, {plan.bk}), "
+                f"{self._tcgen05_grouped_scheduler_grid_expr()}, ({plan.bm}, {plan.bn * plan.cluster_n if plan.accumulator_view == 'mn' else plan.bn}, {plan.bk}), "
                 "cutlass.utils.create_initial_search_state(), "
                 f"{grouped.count}, {grouped.problem_sizes})"
             ),

@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._compat import get_triton_version
@@ -30,6 +32,10 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _merged_reduction_backend() -> bool:
+    return _get_backend() in ("triton", "cute")
 
 
 @helion.kernel()
@@ -84,6 +90,31 @@ def tile_row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
 
 
 @onlyBackends(["triton", "cute", "pallas", "metal"])
+@helion.kernel(static_shapes=True)
+def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
+    out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+    for tile in hl.tile(x.size(0)):
+        v = x[tile, :, :]
+        if op == "sum":
+            out[tile] = v.sum(dim=(1, 2))
+        elif op == "sum_dtype_same":
+            out[tile] = v.sum(dim=(1, 2), dtype=x.dtype)
+        elif op == "sum_fp16":
+            out[tile] = v.sum(dim=(1, 2), dtype=torch.float16)
+        elif op == "mean":
+            out[tile] = v.mean(dim=(-1, -2), keepdim=True).flatten()
+        elif op == "amax":
+            out[tile] = v.amax(dim=(2, 1))
+        elif op == "amin":
+            out[tile] = v.amin(dim=[1, -1], keepdim=True).flatten()
+        elif op == "sum_fp32":
+            out[tile] = v.to(torch.float32).sum(dim=(1, 2))
+        elif op == "centered":
+            # v has another user, so neither reduction is merged
+            out[tile] = (v - v.mean(dim=(1, 2), keepdim=True)).amax(dim=(1, 2))
+    return out
+
+
 class TestReductions(RefEagerTestBase, TestCase):
     @skipUnlessBackends(["cute", "triton"])
     def test_factored_reductions_preserve_computed_coordinates(self):
@@ -225,31 +256,19 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the compiled reduction_loops spec")
-    def test_reduction_over_multiple_dims(self):
-        @helion.kernel(static_shapes=True)
-        def reduce_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
-            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
-            for tile in hl.tile(x.size(0)):
-                v = x[tile, :, :]
-                if op == "sum":
-                    out[tile] = v.sum(dim=(1, 2))
-                elif op == "sum_dtype_same":
-                    out[tile] = v.sum(dim=(1, 2), dtype=x.dtype)
-                elif op == "sum_fp16":
-                    out[tile] = v.sum(dim=(1, 2), dtype=torch.float16)
-                elif op == "mean":
-                    out[tile] = v.mean(dim=(-1, -2), keepdim=True).flatten()
-                elif op == "amax":
-                    out[tile] = v.amax(dim=(2, 1))
-                elif op == "amin":
-                    out[tile] = v.amin(dim=[1, -1], keepdim=True).flatten()
-                elif op == "sum_fp32":
-                    out[tile] = v.to(torch.float32).sum(dim=(1, 2))
-                elif op == "centered":
-                    # v has another user, so neither reduction is merged
-                    out[tile] = (v - v.mean(dim=(1, 2), keepdim=True)).amax(dim=(1, 2))
-            return out
-
+    @parametrize(
+        "shape,dtype,transpose,loops",
+        (
+            ((6, 24, 64), torch.float32, False, [[None], [256]]),
+            ((6, 33, 33), torch.float32, False, [[None], [256]]),
+            ((6, 64, 256), torch.bfloat16, False, [[None], [1024]]),
+            ((6, 64, 24), torch.float32, True, [[None], [16]]),
+            # equal extents chained share one rdim, which can't loop
+            ((6, 33, 33), torch.float32, True, [[]]),
+        ),
+    )
+    @parametrize("op", ("sum", "mean", "amax", "amin", "centered"))
+    def test_reduction_over_multiple_dims(self, shape, dtype, transpose, loops, op):
         reductions = {
             "sum": lambda v: v.sum(dim=(1, 2)),
             "mean": lambda v: v.mean(dim=(1, 2)),
@@ -262,53 +281,49 @@ class TestReductions(RefEagerTestBase, TestCase):
         # The reduced dims merge into one rdim of their combined extent, padded
         # and looped as a whole; a transposed input, which can't flatten them
         # into a view, chains single-dim reductions instead.
-        for shape, dtype, transpose, loops in (
-            ((6, 24, 64), torch.float32, False, [[None], [256]]),
-            ((6, 33, 33), torch.float32, False, [[None], [256]]),
-            ((6, 64, 256), torch.bfloat16, False, [[None], [1024]]),
-            ((6, 64, 24), torch.float32, True, [[None], [16]]),
-            # equal extents chained share one rdim, which can't loop
-            ((6, 33, 33), torch.float32, True, [[]]),
-        ):
-            # CuTe can't lower the chained reductions yet
-            if transpose and _get_backend() == "cute":
-                continue
-            x = torch.randn(shape, device=DEVICE, dtype=dtype)
-            if transpose:
-                x = x.transpose(1, 2)
-            bound = reduce_tile.bind((x, "sum"))
+        # CuTe can't lower the chained reductions yet
+        if transpose and _get_backend() == "cute":
+            self.skipTest("CuTe cannot lower chained reductions")
+        x = torch.randn(shape, device=DEVICE, dtype=dtype)
+        if transpose:
+            x = x.transpose(1, 2)
+        bound = _reduce_multi_dim_tile.bind((x, "sum"))
+        merges = bound.env.backend.name in ("triton", "cute")
+        if merges:
             self.assertEqual(len(bound.config_spec.reduction_loops), len(loops[0]))
-            if _get_backend() == "cute":
-                # no tuning knobs for the per-dim rdims the merge left unused
-                spec = bound.config_spec
-                self.assertEqual(len(spec.cute_reduction_reloads.valid_block_ids()), 1)
-            self.assertEqual(
-                "flatten(1, 2)"
-                in bound.to_triton_code(bound.config_spec.default_config()),
-                not transpose,
-            )
-            for op, fn in reductions.items():
-                if op == "centered" and _get_backend() == "cute":
-                    continue
-                # One-signed inputs expose padded lanes leaking into max/min.
-                v = {"amax": -x.abs() - 1, "amin": x.abs() + 1}.get(op, x)
-                # Only "centered" chains a non-transposed input (its v has
-                # another user), and a chain over equal extents shares one
-                # rdim, which can't loop.
-                n_loops = len(reduce_tile.bind((v, op)).config_spec.reduction_loops)
-                if op != "centered":
-                    self.assertEqual(n_loops, len(loops[0]))
-                op_loops = loops if n_loops else [[]]
-                for reduction_loops in op_loops:
-                    with self.subTest(shape=shape, op=op, loops=reduction_loops):
-                        _, output = code_and_output(
-                            reduce_tile,
-                            (v, op),
-                            block_sizes=[2],
-                            reduction_loops=reduction_loops,
-                        )
-                        torch.testing.assert_close(output, fn(v))
+        if _get_backend() == "cute":
+            # no tuning knobs for the per-dim rdims the merge left unused
+            spec = bound.config_spec
+            self.assertEqual(len(spec.cute_reduction_reloads.valid_block_ids()), 1)
+        self.assertEqual(
+            "flatten(1, 2)" in bound.to_triton_code(bound.config_spec.default_config()),
+            merges and not transpose,
+        )
+        fn = reductions[op]
+        if op == "centered" and _get_backend() == "cute":
+            self.skipTest("CuTe cannot lower chained reductions")
+        # One-signed inputs expose padded lanes leaking into max/min.
+        v = {"amax": -x.abs() - 1, "amin": x.abs() + 1}.get(op, x)
+        # Only "centered" chains a non-transposed input (its v has
+        # another user), and a chain over equal extents shares one
+        # rdim, which can't loop.
+        n_loops = len(_reduce_multi_dim_tile.bind((v, op)).config_spec.reduction_loops)
+        if merges and op != "centered":
+            self.assertEqual(n_loops, len(loops[0]))
+        op_loops = (loops if merges else [[None] * n_loops]) if n_loops else [[]]
+        for reduction_loops in op_loops:
+            with self.subTest(shape=shape, op=op, loops=reduction_loops):
+                _, output = code_and_output(
+                    _reduce_multi_dim_tile,
+                    (v, op),
+                    block_sizes=[2],
+                    reduction_loops=reduction_loops,
+                )
+                torch.testing.assert_close(output, fn(v))
 
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager("checks the generated code")
+    def test_multi_dim_bool_count(self):
         @helion.kernel(static_shapes=True)
         def count(mask: torch.Tensor) -> torch.Tensor:
             out = torch.empty([mask.size(0)], device=mask.device, dtype=torch.int64)
@@ -319,38 +334,99 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Bool sums merge and count in int64, like eager.
         mask = torch.rand(6, 24, 40, device=DEVICE) > 0.5
         code, output = code_and_output(count, (mask,), block_sizes=[2])
-        self.assertIn("flatten(1, 2)", code)
+        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
         torch.testing.assert_close(output, mask.sum(dim=(1, 2)))
 
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager("checks the generated code")
+    def test_multi_dim_reduction_after_cast(self):
         # A cast before the reduction merges too: it is a pointwise op.
         x = torch.randn(6, 64, 256, device=DEVICE, dtype=torch.bfloat16)
-        code, output = code_and_output(reduce_tile, (x, "sum_fp32"), block_sizes=[2])
-        self.assertIn("flatten(1, 2)", code)
+        code, output = code_and_output(
+            _reduce_multi_dim_tile, (x, "sum_fp32"), block_sizes=[2]
+        )
+        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
         torch.testing.assert_close(output, x.float().sum(dim=(1, 2)).to(x.dtype))
 
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager("checks compiled reduction rounding")
+    @parametrize("transpose", (False, True))
+    def test_multi_dim_reduction_rounds_once(self, transpose):
         # Like eager, low-precision sums round once, not per dim: a bf16 row
         # of 257 ones sums to 256, so per-dim rounding gives 768, not 772.
         # An fp32 input is first cast to dtype=: 1 + 2**-11 rounds to 1 in
         # fp16, so eager gives 771; without that cast the result is 771.5.
         # Transposed inputs take the chained path, which must round once too.
-        for transpose in (False, True):
-            if transpose and _get_backend() == "cute":
-                continue
-            ones = torch.ones(6, 3, 257, device=DEVICE, dtype=torch.bfloat16)
-            near_one = torch.full((6, 3, 257), 1 + 2**-11, device=DEVICE)
-            if transpose:
-                ones = ones.transpose(1, 2).contiguous().transpose(1, 2)
-                near_one = near_one.transpose(1, 2).contiguous().transpose(1, 2)
-            for x, op, expected in (
-                (ones, "sum", ones.sum(dim=(1, 2))),
-                (ones, "sum_dtype_same", ones.sum(dim=(1, 2))),
-                (near_one, "sum_fp16", near_one.sum(dim=(1, 2), dtype=torch.float16)),
-            ):
-                with self.subTest(op=op, transpose=transpose):
-                    _, output = code_and_output(reduce_tile, (x, op), block_sizes=[2])
-                    torch.testing.assert_close(
-                        output, expected.to(x.dtype), rtol=0, atol=0
-                    )
+        if transpose and _get_backend() == "cute":
+            self.skipTest("CuTe cannot lower chained reductions")
+        ones = torch.ones(6, 3, 257, device=DEVICE, dtype=torch.bfloat16)
+        near_one = torch.full((6, 3, 257), 1 + 2**-11, device=DEVICE)
+        if transpose:
+            ones = ones.transpose(1, 2).contiguous().transpose(1, 2)
+            near_one = near_one.transpose(1, 2).contiguous().transpose(1, 2)
+        for x, op, expected in (
+            (ones, "sum", ones.sum(dim=(1, 2))),
+            (ones, "sum_dtype_same", ones.sum(dim=(1, 2))),
+            (near_one, "sum_fp16", near_one.sum(dim=(1, 2), dtype=torch.float16)),
+        ):
+            with self.subTest(op=op, transpose=transpose):
+                _, output = code_and_output(
+                    _reduce_multi_dim_tile, (x, op), block_sizes=[2]
+                )
+                torch.testing.assert_close(output, expected.to(x.dtype), rtol=0, atol=0)
+
+    @onlyBackends(["triton"])
+    @parametrize("op", ("amin", "amax"))
+    def test_multi_dim_bool_extrema(self, op):
+        @helion.kernel(static_shapes=True)
+        def reduce(mask: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
+            out = torch.empty((mask.size(0),), device=mask.device, dtype=torch.bool)
+            for row in hl.tile(mask.size(0)):
+                if op == "amin":
+                    out[row] = mask[row, :, :].amin((1, 2))
+                else:
+                    out[row] = mask[row, :, :].amax((1, 2))
+            return out
+
+        mask = torch.rand(5, 7, 9, device=DEVICE) > 0.5
+        mask[0] = True
+        mask[1] = False
+        _, output = code_and_output(reduce, (mask, op), block_sizes=[2])
+        expected = mask.amin((1, 2)) if op == "amin" else mask.amax((1, 2))
+        torch.testing.assert_close(output, expected)
+
+    @onlyBackends(["triton"])
+    @parametrize("case", ("nonadjacent", "partial", "size"))
+    def test_multi_dim_reduction_fallbacks(self, case):
+        @helion.kernel(static_shapes=True)
+        def reduce(x: torch.Tensor, case: hl.constexpr) -> torch.Tensor:
+            if case == "nonadjacent":
+                out = torch.empty(
+                    (x.size(0), x.size(2)), device=x.device, dtype=x.dtype
+                )
+            else:
+                out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                if case == "nonadjacent":
+                    out[row, :] = x[row, :, :, :].sum((1, 3))
+                elif case == "partial":
+                    out[row] = x[row, :3, :].sum((1, 2))
+                else:
+                    value = x[row, :, :]
+                    out[row] = value.sum((1, 2)) / value.size(1)
+            return out
+
+        shape = (5, 7, 9, 11) if case == "nonadjacent" else (5, 7, 9)
+        x = torch.randn(shape, device=DEVICE)
+        expected = (
+            x.sum((1, 3))
+            if case == "nonadjacent"
+            else x[:, :3, :].sum((1, 2))
+            if case == "partial"
+            else x.sum((1, 2)) / x.size(1)
+        )
+        _, output = code_and_output(reduce, (x, case), block_sizes=[2])
+        torch.testing.assert_close(output, expected)
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the generated code")
@@ -370,7 +446,10 @@ class TestReductions(RefEagerTestBase, TestCase):
             if not static_shapes and _get_backend() == "cute":
                 continue
             kernel = helion.kernel(static_shapes=static_shapes)(scaled_sum)
-            for reduction_loops in ([None], [256] if static_shapes else [16]):
+            for reduction_loops in (
+                [None],
+                [256] if static_shapes and _merged_reduction_backend() else [16],
+            ):
                 with self.subTest(static_shapes=static_shapes, loops=reduction_loops):
                     code, output = code_and_output(
                         kernel,
@@ -378,7 +457,10 @@ class TestReductions(RefEagerTestBase, TestCase):
                         block_sizes=[2],
                         reduction_loops=reduction_loops,
                     )
-                    self.assertEqual("flatten(1, 2)" in code, static_shapes)
+                    self.assertEqual(
+                        "flatten(1, 2)" in code,
+                        static_shapes and _merged_reduction_backend(),
+                    )
                     torch.testing.assert_close(
                         output, (x * scale[:, None, None]).sum((1, 2))
                     )
@@ -399,7 +481,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randint(-4, 5, (6, 24, 40), device=DEVICE).float()
         cleared = torch.ones_like(x)
         code, output = code_and_output(sum_and_clear, (x, cleared), block_sizes=[2])
-        self.assertIn("flatten(1, 2)", code)
+        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
         torch.testing.assert_close(output, x.sum(dim=(1, 2)))
         self.assertTrue((cleared == 0).all())
 
@@ -412,6 +494,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
             for tile in hl.tile(x.size(0)):
                 hl.atomic_add(acc, [tile, slice(None), slice(None)], x[tile, :, :])
+            hl.barrier()
             for tile in hl.tile(x.size(0)):
                 out[tile] = acc[tile, :, :].sum(dim=(1, 2))
             return out
@@ -431,6 +514,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
             for tile in hl.tile(x.size(0)):
                 x[tile, :, :] = x[tile, :, :] * 2
+            hl.barrier()
             for tile in hl.tile(x.size(0)):
                 out[tile] = x[tile, :, :].sum(dim=(1, 2))
             return out
@@ -482,7 +566,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         x = torch.randn(6, 24, 40, device=DEVICE)
         # var/std over several dims are not decomposed
-        with self.assertRaisesRegex(NotImplementedError, "multiple reduction dim"):
+        with self.assertRaises(helion.exc.MultipleReductionDims):
             var.bind((x,))
 
     # CuTe can't lower the chained reductions yet
@@ -2602,6 +2686,9 @@ def _integer_loop_code(x, *, minimum=False, threads=128, enabled=True, **kw):
         if enabled:
             config["cute_integer_loop_reduction"] = True
         return bound, bound.to_code(helion.Config(**config))
+
+
+instantiate_parametrized_tests(TestReductions)
 
 
 class TestIntegerLoopReductionCPU(unittest.TestCase):

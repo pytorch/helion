@@ -69,16 +69,48 @@ SPARSE_TILE_MASK_KINDS = frozenset(
         ROW_KV_BEGIN_MASK_KIND,
     }
 )
-# ``(q/k head dim, v/o head dim)`` pairs the fused flash path hosts. The
-# asymmetric pair is the MLA prefill shape (192-wide Q/K, 128-wide V/O); only
-# the FA4 topology carries it (sQ and the K ring scale with the first dim, the
-# V box, TMEM output and epilogue with the second).
-FLASH_HEAD_DIM_PAIRS = frozenset({(64, 64), (128, 128), (192, 128)})
+# Symmetric head dims the fused flash path hosts: any multiple of the tcgen05
+# K step (16 elements) up to 256. The SMEM tiles take the swizzle the width
+# admits (128 B at multiples of 64, 64 B at multiples of 32, else 32 B), the
+# TMA boxes and the MMA extents are exact, the TMEM output accumulators take
+# ``head_dim`` columns each, so no byte is padded or wasted. The FA4 pair
+# body (two 128-row query tiles per CTA: two 128-wide score buffers beside
+# two output accumulators in the 512 TMEM columns) hosts widths up to 128;
+# above that only the single-query-tile body (``ws_overlap``: one score
+# buffer per stage and one 256-column accumulator) fits.
+FLASH_HEAD_DIM_STEP = 16
+FLASH_HEAD_DIM_MAX = 256
+FLASH_PAIR_HEAD_DIM_MAX = 128
+# The one asymmetric ``(q/k head dim, v/o head dim)`` pair: the MLA prefill
+# shape (192-wide Q/K, 128-wide V/O); only the FA4 topology carries it (sQ and
+# the K ring scale with the first dim, the V box, TMEM output and epilogue
+# with the second).
+FLASH_ASYMMETRIC_HEAD_DIM_PAIRS = frozenset({(192, 128)})
+
+
+def flash_head_dim_supported(head_dim: int) -> bool:
+    """True when ``head_dim`` is a symmetric fused-flash head dim."""
+    return (
+        FLASH_HEAD_DIM_STEP <= head_dim <= FLASH_HEAD_DIM_MAX
+        and head_dim % FLASH_HEAD_DIM_STEP == 0
+    )
 
 
 def flash_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
     """True when ``(head_dim, head_dim_v)`` is a fused-flash head-dim pair."""
-    return (head_dim, head_dim_v) in FLASH_HEAD_DIM_PAIRS
+    if head_dim == head_dim_v:
+        return flash_head_dim_supported(head_dim)
+    return (head_dim, head_dim_v) in FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
+
+
+def flash_pair_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
+    """True when the FA4 pair body (two query tiles per CTA) hosts the pair:
+    its two score buffers and two ``head_dim_v``-wide output accumulators
+    share the 512 TMEM columns, so the value width is bounded by 128."""
+    return (
+        flash_head_dims_supported(head_dim, head_dim_v)
+        and head_dim_v <= FLASH_PAIR_HEAD_DIM_MAX
+    )
 
 
 @dataclasses.dataclass(frozen=True)

@@ -11,6 +11,7 @@ import hashlib
 from itertools import count
 from itertools import starmap
 import json
+import logging
 import math
 from math import inf
 import os
@@ -62,6 +63,9 @@ from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .precompile_future import _serialize_compiled_fn
 from .progress_bar import iter_with_progress
+from .render_pool import DEFAULT_MAX_JOBS as _RENDER_POOL_DEFAULT_MAX_JOBS
+from .render_pool import CudaDeviceFacts
+from .render_pool import RenderAhead
 from helion._dist_utils import _clone_symm_mem_tensor
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import get_signal_pad_ptrs_dev
@@ -454,6 +458,8 @@ class BenchmarkResult(NamedTuple):
     config: Config
     fn: Callable[..., object]
     perf: float
+    # "skipped": the autotune budget ran out before this config was compiled
+    # (or, with a precompile pool, timed); it was never attempted.
     status: Literal[
         "ok",
         "error",
@@ -463,6 +469,7 @@ class BenchmarkResult(NamedTuple):
         "deduplicated",
         "accuracy_error",
         "source_rejected",
+        "skipped",
     ]
     compile_time: float | None
     # Monotonic completion time, captured before later trials in the batch.
@@ -506,6 +513,37 @@ def _never_exceeded() -> bool:
     return False
 
 
+# Once the budget hook says stop, a batch still attempts at most this many
+# further candidates (compiles, and with a precompile pool timings) while the
+# search has no successful measurement, so a budget that runs out before the
+# first measurement returns a config when one of them works instead of
+# ``NoConfigFound``, and overruns the budget by a bounded amount otherwise.
+_BUDGET_EXEMPT_CANDIDATES = 3
+
+# Render workers that fail where the parent's own render of the same config
+# succeeds (code generation that reads tensor data, say) are given up after
+# this many in a row: they would only add fork overhead to the serial path.
+_RENDER_POOL_MAX_FORK_ONLY_FAILURES = 3
+
+
+def _local_rank_count() -> int:
+    """Autotuning processes sharing this host's CPUs (1 outside a process group)."""
+    local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+    if local_world_size:
+        return max(1, int(local_world_size))
+    if dist.is_initialized():
+        return max(1, dist.get_world_size())
+    return 1
+
+
+def _available_cpus() -> int:
+    """CPUs this process may run on (its affinity mask where there is one)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 class BenchmarkProvider(abc.ABC):
     """Abstract interface for benchmarking kernel configurations.
 
@@ -538,6 +576,10 @@ class BenchmarkProvider(abc.ABC):
     # default to ``self`` when an instance reads it before any caller
     # has installed a real hook via ``set_budget_exceeded_fn``.
     budget_exceeded_fn: Callable[[], bool] = staticmethod(_never_exceeded)
+    # The first compile error of the batch in progress (``None`` when every
+    # config compiled); kept for the search's batch summary and surfaced as
+    # the no-viable-config error when a budget cut ends the batch early.
+    batch_first_compile_error: Exception | None = None
 
     @abc.abstractmethod
     def __init__(
@@ -684,6 +726,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._benchmark_worker: BenchmarkWorker | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         self._no_viable_config_error: Exception | None = None
+        # Configs of the batch in progress whose compile has started; read by
+        # the budget hook ``PopulationBasedSearch._initial_population_budget``
+        # installs to price the initial population.
+        self.batch_configs_started: int = 0
+        # Render workers (see ``_render_ahead``): the CUDA facts they serve,
+        # captured once; whether they were given up (a fork failed, or they
+        # kept failing where the parent renders fine); the fork-only failure
+        # streak; and whether a worker timeout was already warned about.
+        self._cuda_facts: CudaDeviceFacts | None = None
+        self._render_pool_unavailable: bool = False
+        self._render_fork_only_failures: int = 0
+        self._render_timeout_warned: bool = False
         self._effective_source_hashes: set[str] = set()
         self._effective_source_results: dict[str, BenchmarkResult] = {}
         self._invalid_effective_source_hashes: set[str] = set()
@@ -1183,6 +1237,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path = None
         self._precompile_baseline_path = None
         self._precompile_result_counter = count()
+        self._cuda_facts = None
         self._effective_source_hashes.clear()
         self._effective_source_results.clear()
         self._invalid_effective_source_hashes.clear()
@@ -1243,6 +1298,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if dist.is_initialized():
             return False
         if len(self.mutated_arg_indices) > 0:
+            return False
+        if getattr(getattr(self.kernel.env, "device", None), "type", None) == "mtia":
+            # The MTIA runtime reserves the whole device for its first client,
+            # so a spawned worker cannot open it while this process holds it.
             return False
         if not self.kernel.supports_subprocess_benchmark():
             return False
@@ -1329,23 +1388,102 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path=self._precompile_args_path,
         )
 
-    def _budget_exceeded_synced(self) -> bool:
-        """Return whether any rank reports the autotune budget exhausted.
+    def _budget_step_synced(self, *, protected: bool) -> tuple[bool, bool]:
+        """Ask the budget hook before a compile or benchmark step.
 
-        The compile and benchmark loops below participate in distributed
-        collectives. The cutoff decision must be agreed across the
-        process group; otherwise one rank breaks early while peers keep
-        entering collectives and the group deadlocks. Single-process
-        autotune skips the all-gather because
+        Returns ``(exceeded, stop)``. ``exceeded`` is whether any rank's hook
+        reports the budget exhausted; ``stop`` is whether this step stops for
+        it. A ``protected`` step runs past an exhausted budget: it is one of
+        the few attempts the batch still makes while the search has no
+        successful measurement (see :meth:`benchmark`), so a budget that runs
+        out inside the first batch still yields a measured config instead of
+        ``NoConfigFound``. The compile and benchmark loops take part in
+        distributed collectives, so the decision is agreed across the process
+        group (one rank breaking early while its peers keep entering
+        collectives would deadlock the group); a protected step still asks
+        the hook (a hook that counts or logs sees every step) and still takes
+        part in the collective so every rank runs the same number of them.
+        Single-process autotune skips the all-gather because
         ``all_gather_object`` returns ``[obj]`` when distributed is not
         initialized.
         """
-        local = self.budget_exceeded_fn()
-        return any(
+        exceeded = any(
             all_gather_object(
-                local,
+                self.budget_exceeded_fn(),
                 process_group_name=self.kernel.env.process_group_name,
             )
+        )
+        return exceeded, exceeded and not protected
+
+    def _precompile_pool_enabled(self) -> bool:
+        """Whether batches precompile in a Triton-style subprocess pool."""
+        return bool(
+            self.settings.autotune_precompile
+            and self.config_spec.backend.supports_precompile()
+        )
+
+    @property
+    def compiles_ahead(self) -> bool:
+        """Whether a batch is compiled in full before any config is timed.
+
+        True with a precompile pool; the streaming path (no pool, with or
+        without render workers) compiles and times one config at a time.
+        """
+        return self._precompile_pool_enabled()
+
+    def _render_pool_enabled(self) -> bool:
+        """Whether candidates render in forked workers (``render_pool``).
+
+        Fork mode on a backend without a precompile pool whose code
+        generation is fork-safe (``supports_parallel_render``), for a real
+        bound kernel, until a fork fails.
+        """
+        if (
+            self.settings.autotune_precompile != "fork"
+            or self._precompile_pool_enabled()
+            or self._render_pool_unavailable
+        ):
+            return False
+        from ..runtime.kernel import BoundKernel
+
+        return (
+            isinstance(self.kernel, BoundKernel)
+            and self.config_spec.backend.supports_parallel_render()
+        )
+
+    def _render_jobs(self) -> int:
+        """Render workers alive at once.
+
+        The precompile job setting when given; otherwise the CPUs this
+        process may run on, shared between the autotuning processes of the
+        host when there is a process group, capped at
+        ``render_pool.DEFAULT_MAX_JOBS``.
+        """
+        jobs = self.settings.autotune_precompile_jobs
+        if jobs:
+            return max(1, jobs)
+        jobs = _available_cpus() // _local_rank_count()
+        return max(1, min(jobs, _RENDER_POOL_DEFAULT_MAX_JOBS))
+
+    def _render_ahead(self, configs: list[Config]) -> RenderAhead | None:
+        """Start rendering ``configs`` in forked workers, or None for inline."""
+        if len(configs) < 2 or not self._render_pool_enabled():
+            return None
+        from ..runtime.kernel import BoundKernel
+
+        kernel = self.kernel
+        assert isinstance(kernel, BoundKernel)
+        if self._cuda_facts is None:
+            self._cuda_facts = CudaDeviceFacts.capture(kernel.env.device)
+        return RenderAhead(
+            kernel,
+            configs,
+            jobs=self._render_jobs(),
+            timeout=self.settings.autotune_compile_timeout,
+            facts=self._cuda_facts,
+            result_path=self._next_precompile_result_path,
+            log=self.log,
+            already_compiled=kernel.has_compiled_config,
         )
 
     def benchmark(
@@ -1357,26 +1495,67 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     ) -> list[BenchmarkResult]:
         """Compile, precompile, validate, and time a batch of configs.
 
-        When ``budget_exceeded_fn`` reports the autotune wall-clock
-        budget exhausted, the compile and benchmark loops short-circuit
-        and leave any not-yet-handled slots at the default
-        ``perf=inf, status="error"`` so the caller still receives one
-        ``BenchmarkResult`` per input config in positional order. The
-        cutoff is synchronized across the process group via
-        ``_budget_exceeded_synced``.
+        With a precompile pool (``autotune_precompile`` set on a backend that
+        supports it) the whole batch is generated first, precompiled in
+        parallel, then timed. Without one (CuTe, or precompile disabled)
+        nothing is gained by compiling ahead, so each config is compiled and
+        timed in turn ("streaming"): results exist as soon as the first
+        config finishes, and a budget that runs out mid-batch leaves at most
+        one compiled-but-untimed config. A backend whose code generation is
+        fork-safe (``supports_parallel_render``, CuTe) renders the streamed
+        configs in forked workers ahead of their turn in fork mode (see
+        :mod:`helion.autotuner.render_pool`); the parent then only loads the
+        source, JIT-compiles at first call and times. Whatever a worker's
+        outcome (source, error, timeout past ``autotune_compile_timeout``, no
+        worker at all) the parent compiles the config in-process, loading
+        the worker's source when there is one and generating it otherwise,
+        so a worker never fails a config and the per-config control flow,
+        including the distributed collectives, is the same on every rank.
+        Workers that keep failing where the parent renders fine are given
+        up for the rest of the search.
+
+        The budget hook (``budget_exceeded_fn``) is asked before each
+        config's compile and, with a pool, before each config's timing; a
+        streamed config is timed right after its compile without a second
+        check. Once the hook says stop, no further config is compiled or
+        timed, and the configs the batch never got to come back as
+        ``perf=inf, status="skipped"`` in positional order, so the caller
+        still receives one ``BenchmarkResult`` per input config. The one
+        exception: while the search has no successful measurement, the
+        batch still attempts up to ``_BUDGET_EXEMPT_CANDIDATES`` more
+        candidates (compiles; with a pool also that many timings of already
+        compiled configs, and no further compile once something in the batch
+        is compiled) so a budget that runs out early returns a config when
+        one of those works instead of ``NoConfigFound``; a runtime failure
+        or a compile failure uses one of those attempts. The cutoff is
+        synchronized across the process group via ``_budget_step_synced``.
+        Without a pool a compiler seed's source is known only once the seed
+        itself is compiled: a representative of that source timed earlier
+        is not treated as a seed (no timeout retry), the seed is when its
+        turn comes.
 
         The precompile-phase wait (``PrecompileFuture.wait_for_all``)
         is not budget-aware: once the compile loop has queued
         precompile futures it drains all of them, so the effective
         wall-clock may overrun the configured budget by up to
-        ``len(queued) * autotune_compile_timeout`` seconds. Backends
-        that disable ``autotune_precompile`` (e.g. cute) skip that
-        wait entirely.
+        ``len(queued) * autotune_compile_timeout`` seconds.
+
+        ``compile_time`` is the precompile future's wall time with a pool;
+        when streaming it is the in-process ``compile_config`` wall time
+        (code generation and module load, not a later JIT at first call).
         """
         self._no_viable_config_error = None
+        self.batch_configs_started = 0
+        self.batch_first_compile_error = None
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
-        futures: list[PrecompileFuture] | None = None
+        inline_compile_times: dict[int, float] = {}
+        metrics = self._autotune_metrics
+        # Candidates attempted past the budget hook's stop (see
+        # ``_BUDGET_EXEMPT_CANDIDATES``) and the batch's first compile error,
+        # updated from the nested loops below.
+        exemptions = {"compile": 0, "timing": 0}
+        first_error: dict[str, Exception | None] = {"value": None}
 
         # Initialize results before source deduplication so source aliases and
         # unhandled budget-tail entries can be filled positionally.
@@ -1391,71 +1570,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         backend = self.config_spec.backend if deduplicate_sources else None
         source_hashes: dict[int, str] = {}
         seen_sources = self._effective_source_hashes
-
-        # Compilation phase
-        for i, config in enumerate(all_configs):
-            if self._budget_exceeded_synced():
-                break
-            # Defensive: if `capture_output().__enter__` itself raises, the
-            # except handler below still needs `captured` bound.
-            captured: list[str] = [""]
-            try:
-                with capture_output() as captured, _searching_candidates():
-                    compiled[i] = self.kernel.compile_config(config, allow_print=False)
-            except Exception as e:
-                results[i] = results[i]._replace(completed_at=time.perf_counter())
-                no_viable_config = (
-                    not compiled
-                    and i == len(all_configs) - 1
-                    and self._autotune_metrics.num_successful_candidate_measurements
-                    == 0
-                )
-                self._record_compile_failure(config)
-                source_hash = None
-                if deduplicate_sources:
-                    # No callable exists to carry generated-source identity, but
-                    # strict source ledgers still need an auditable terminal row.
-                    source_hash = _compile_config_failure_source_hash(config)
-                    if source_hash not in seen_sources:
-                        seen_sources.add(source_hash)
-                        self._autotune_metrics.num_unique_sources += 1
-                config_id = (
-                    self.log.register_config(config)
-                    if deduplicate_sources or self.log.trace_enabled
-                    else None
-                )
-                if config_id is not None:
-                    self.log.record_autotune_entry(
-                        AutotuneLogEntry(
-                            generation=self._autotune_metrics.num_generations,
-                            status="error",
-                            perf_ms=None,
-                            compile_time=None,
-                            config_id=config_id,
-                            config=config,
-                            source_hash=source_hash,
-                            completed_at=results[i].completed_at,
-                        )
-                    )
-                maybe_dump_triton_failure(
-                    self.kernel, config, e, captured_output=captured[0] or None
-                )
-                self.log.warning(
-                    "Skipping config that failed to compile: "
-                    f"{self.kernel.format_kernel_decorator(config, self.settings)}",
-                    exc_info=True,
-                )
-                if no_viable_config:
-                    if raise_if_no_viable_config:
-                        raise
-                    self._no_viable_config_error = e
-
         deduplicated_indices: set[int] = set()
         recorded_deduplicated_indices: set[int] = set()
         batch_repairs: dict[Config, BenchmarkResult] = {}
-        unique_compiled: dict[int, Callable[..., object]] = {}
         cached_source_results = self._effective_source_results
         invalid_sources = self._invalid_effective_source_hashes
+
+        streaming = not self._precompile_pool_enabled()
+        units: list[list[int]] = (
+            [[i] for i in range(len(all_configs))]
+            if streaming
+            else [list(range(len(all_configs)))]
+        )
+        # Forked workers render the streamed configs ahead of their compile.
+        renders = self._render_ahead(all_configs) if streaming else None
 
         def record_final_result(
             index: int,
@@ -1467,7 +1595,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             result = results[index]
             self.log.record_autotune_entry(
                 AutotuneLogEntry(
-                    generation=self._autotune_metrics.num_generations,
+                    generation=metrics.num_generations,
                     status=result.status,
                     perf_ms=result.perf if math.isfinite(result.perf) else None,
                     compile_time=(
@@ -1489,7 +1617,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 return
             self.log.record_autotune_entry(
                 AutotuneLogEntry(
-                    generation=self._autotune_metrics.num_generations,
+                    generation=metrics.num_generations,
                     status="started",
                     perf_ms=None,
                     compile_time=compile_time,
@@ -1499,223 +1627,441 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             )
 
-        for index, fn in compiled.items():
-            source_hash = (
-                backend.generated_source_hash(fn)
-                if deduplicate_sources and backend is not None
+        def record_compile_failure_row(index: int) -> None:
+            """Source ledger and trace rows for a config that never compiled."""
+            config = all_configs[index]
+            source_hash = None
+            if deduplicate_sources:
+                # No callable exists to carry generated-source identity, but
+                # strict source ledgers still need an auditable terminal row.
+                source_hash = _compile_config_failure_source_hash(config)
+                if source_hash not in seen_sources:
+                    seen_sources.add(source_hash)
+                    metrics.num_unique_sources += 1
+            config_id = (
+                self.log.register_config(config)
+                if deduplicate_sources or self.log.trace_enabled
                 else None
             )
-            if source_hash is None:
-                unique_compiled[index] = fn
-                continue
-            source_hashes[index] = source_hash
-            if self._is_compiler_seed_config(all_configs[index]):
-                self._compiler_seed_source_hashes.add(source_hash)
-            if source_hash not in seen_sources:
-                seen_sources.add(source_hash)
-                self._autotune_metrics.num_unique_sources += 1
-            cached_result = cached_source_results.get(source_hash)
-            if cached_result is not None:
-                results[index] = BenchmarkResult(
-                    config=all_configs[index],
-                    fn=cached_result.fn,
-                    perf=cached_result.perf,
-                    status="deduplicated",
-                    compile_time=None,
-                    completed_at=time.perf_counter(),
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=metrics.num_generations,
+                        status="error",
+                        perf_ms=None,
+                        compile_time=None,
+                        config_id=config_id,
+                        config=config,
+                        source_hash=source_hash,
+                        completed_at=results[index].completed_at,
+                    )
                 )
-                deduplicated_indices.add(index)
-                self._autotune_metrics.num_source_deduplications += 1
-                continue
-            unique_compiled[index] = fn
 
-        compiled = unique_compiled
-        fns = list(compiled.values())
-        valid_indices = list(compiled.keys())
-        configs = [all_configs[i] for i in valid_indices]
-
-        # Precompile phase
-        if self.settings.autotune_precompile:
-            futures = list(
-                starmap(
-                    self._create_precompile_future,
-                    zip(configs, fns, strict=True),
+        def compile_unit(unit: list[int]) -> None:
+            """Compile (code generation, or the load of a worker's render) one
+            unit's configs in this process."""
+            for i in unit:
+                # Past the budget, a few more candidates still compile while
+                # the search has no successful measurement (streaming times
+                # each at once; with a pool, only while nothing in the batch
+                # is compiled yet, since compiled configs are timed first).
+                protected = (
+                    metrics.num_successful_candidate_measurements == 0
+                    and exemptions["compile"] < _BUDGET_EXEMPT_CANDIDATES
+                    and (streaming or not compiled)
                 )
-            )
-            precompile_desc = (
-                f"{desc} precompiling" if self.settings.autotune_progress_bar else None
-            )
-            is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
-            precompile_status: list[Literal["ok", "error", "timeout"]] = []
-            for future, ok in zip(futures, is_workings, strict=True):
-                reason = future.failure_reason
-                if ok:
-                    precompile_status.append("ok")
-                elif reason == "timeout":
-                    precompile_status.append("timeout")
-                else:
-                    precompile_status.append("error")
-        else:
-            is_workings = [True] * len(configs)
-            precompile_status = ["ok"] * len(configs)
+                exceeded, stop = self._budget_step_synced(protected=protected)
+                if stop:
+                    break
+                if exceeded:
+                    exemptions["compile"] += 1
+                self.batch_configs_started += 1
+                config = all_configs[i]
+                # Whatever the worker's outcome, the config is compiled here
+                # (its source loaded when the worker produced one, generated
+                # otherwise), so the per-config control flow and the
+                # collectives below never depend on worker outcomes.
+                rendered = renders.take(i) if renders is not None else None
+                worker_failed = rendered is not None and rendered.status in (
+                    "error",
+                    "timeout",
+                )
+                if rendered is not None and rendered.status == "ok":
+                    assert renders is not None and rendered.code is not None
+                    renders.kernel.prime_rendered_code(config, rendered.code)
+                    self._render_fork_only_failures = 0
+                elif rendered is not None and rendered.status == "timeout":
+                    # Rendering in-process now costs the same render again; a
+                    # timeout alone never fails the config.
+                    self.log(
+                        f"Render worker exceeded {rendered.timeout:.0f}s "
+                        f"(autotune_compile_timeout) for {config!r}; rendering "
+                        "in-process.",
+                        level=logging.WARNING
+                        if not self._render_timeout_warned
+                        else logging.DEBUG,
+                    )
+                    self._render_timeout_warned = True
+                elif rendered is not None and rendered.status == "error":
+                    # The parent's render raises the real error, if any.
+                    self.log.debug(
+                        lambda config=config, rendered=rendered: (
+                            f"Render worker failed for {config!r}; rendering "
+                            f"in-process:\n{rendered.error}"
+                        )
+                    )
+                # Defensive: if `capture_output().__enter__` itself raises, the
+                # except handler below still needs `captured` bound.
+                captured: list[str] = [""]
+                compile_started = time.perf_counter()
+                try:
+                    with capture_output() as captured, _searching_candidates():
+                        compiled[i] = self.kernel.compile_config(
+                            config, allow_print=False
+                        )
+                    if rendered is not None and rendered.status == "ok":
+                        assert rendered.elapsed is not None
+                        inline_compile_times[i] = rendered.elapsed
+                    else:
+                        inline_compile_times[i] = time.perf_counter() - compile_started
+                    if worker_failed and renders is not None:
+                        # The worker failed where the parent did not: a
+                        # fork-only failure (code generation reading tensor
+                        # data, say). After a few in a row the workers only
+                        # cost fork overhead; render in-process from here on.
+                        assert rendered is not None
+                        self._render_fork_only_failures += 1
+                        if (
+                            self._render_fork_only_failures
+                            >= _RENDER_POOL_MAX_FORK_ONLY_FAILURES
+                        ):
+                            self._render_pool_unavailable = True
+                            renders.close()
+                            lines = (rendered.error or "").strip().splitlines()
+                            reason = lines[-1] if lines else rendered.status
+                            self.log.warning(
+                                "Render workers fail for this kernel where the "
+                                f"parent renders fine ({self._render_fork_only_failures}"
+                                f" in a row, last: {reason}); rendering autotune "
+                                "candidates in-process."
+                            )
+                except Exception as e:
+                    if worker_failed:
+                        # The parent fails too: a real failure of the config.
+                        self._render_fork_only_failures = 0
+                    results[i] = results[i]._replace(completed_at=time.perf_counter())
+                    no_viable_config = (
+                        not compiled
+                        and i == len(all_configs) - 1
+                        and metrics.num_successful_candidate_measurements == 0
+                    )
+                    self._record_compile_failure(config)
+                    record_compile_failure_row(i)
+                    maybe_dump_triton_failure(
+                        self.kernel, config, e, captured_output=captured[0] or None
+                    )
+                    self.log.warning(
+                        "Skipping config that failed to compile: "
+                        f"{self.kernel.format_kernel_decorator(config, self.settings)}",
+                        exc_info=True,
+                    )
+                    if first_error["value"] is None:
+                        first_error["value"] = e
+                    if no_viable_config:
+                        if raise_if_no_viable_config:
+                            raise
+                        self._no_viable_config_error = e
 
-        # Benchmark loop with progress reporting
-        iterator = iter_with_progress(
-            enumerate(zip(fns, is_workings, precompile_status, strict=True)),
-            total=len(configs),
-            description=f"{desc} exploring neighbors",
-            enabled=self.settings.autotune_progress_bar,
-        )
-        for index, (fn, is_working, reason) in iterator:
-            if self._budget_exceeded_synced():
-                break
-            config = configs[index]
-            if futures is not None:
-                future = futures[index]
-                compile_time = (
-                    future.elapsed
-                    if future.process is not None and future.started
+        def deduplicate_unit(unit: list[int]) -> dict[int, Callable[..., object]]:
+            """Split one unit's compiled configs into unique sources and aliases."""
+            unique_compiled: dict[int, Callable[..., object]] = {}
+            for index in unit:
+                fn = compiled.get(index)
+                if fn is None:
+                    continue
+                source_hash = (
+                    backend.generated_source_hash(fn)
+                    if deduplicate_sources and backend is not None
                     else None
                 )
-            else:
-                compile_time = None
-            status: Literal[
-                "ok",
-                "error",
-                "timeout",
-                "peer_compilation_fail",
-                "filtered",
-                "deduplicated",
-                "accuracy_error",
-                "source_rejected",
-            ]
-            # config_id is None when no log sink is active. A started row is
-            # emitted only for an actual benchmark attempt; source aliases that
-            # reuse a completed result get a standalone deduplicated row.
-            config_id = self.log.register_config(config)
-            result_index = valid_indices[index]
-            source_hash = source_hashes.get(result_index)
-            current_accuracy_failure = False
-            source_result = (
-                cached_source_results.get(source_hash)
-                if source_hash is not None
-                else None
-            )
-            if source_hash is not None and source_hash in invalid_sources:
-                status = "source_rejected"
-                results[result_index] = BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=inf,
-                    status=status,
-                    compile_time=compile_time,
-                    completed_at=time.perf_counter(),
-                )
-                self._autotune_metrics.num_source_deduplications += 1
-                record_final_result(result_index, config_id, compile_time)
-            elif source_result is not None:
-                status = "deduplicated"
-                results[result_index] = BenchmarkResult(
-                    config=config,
-                    fn=source_result.fn,
-                    perf=source_result.perf,
-                    status=status,
-                    compile_time=None,
-                    completed_at=time.perf_counter(),
-                )
-                deduplicated_indices.add(result_index)
-                self._autotune_metrics.num_source_deduplications += 1
-                self.log.debug(
-                    lambda config=config, source_hash=source_hash: (
-                        f"Reusing effective generated source {source_hash} "
-                        f"for {config!r}"
+                if source_hash is None:
+                    unique_compiled[index] = fn
+                    continue
+                source_hashes[index] = source_hash
+                if self._is_compiler_seed_config(all_configs[index]):
+                    self._compiler_seed_source_hashes.add(source_hash)
+                if source_hash not in seen_sources:
+                    seen_sources.add(source_hash)
+                    metrics.num_unique_sources += 1
+                cached_result = cached_source_results.get(source_hash)
+                if cached_result is not None:
+                    results[index] = BenchmarkResult(
+                        config=all_configs[index],
+                        fn=cached_result.fn,
+                        perf=cached_result.perf,
+                        status="deduplicated",
+                        compile_time=None,
+                        completed_at=time.perf_counter(),
+                    )
+                    deduplicated_indices.add(index)
+                    metrics.num_source_deduplications += 1
+                    continue
+                unique_compiled[index] = fn
+            return unique_compiled
+
+        def benchmark_unit(unique_compiled: dict[int, Callable[..., object]]) -> None:
+            """Precompile (with a pool) and time one unit's unique configs."""
+            fns = list(unique_compiled.values())
+            valid_indices = list(unique_compiled.keys())
+            unit_configs = [all_configs[i] for i in valid_indices]
+            futures: list[PrecompileFuture] | None = None
+
+            # Precompile phase
+            if self._precompile_pool_enabled():
+                futures = list(
+                    starmap(
+                        self._create_precompile_future,
+                        zip(unit_configs, fns, strict=True),
                     )
                 )
-                record_final_result(result_index, config_id, compile_time)
-                recorded_deduplicated_indices.add(result_index)
-            elif all(
-                all_gather_object(
-                    is_working,
-                    process_group_name=self.kernel.env.process_group_name,
+                precompile_desc = (
+                    f"{desc} precompiling"
+                    if self.settings.autotune_progress_bar
+                    else None
                 )
-            ):
-                record_started_result(result_index, config_id, compile_time)
-                self._last_benchmark_failure_status = None
-                accuracy_failure_count = len(self._accuracy_failure_config_ids)
-                compiler_seed_source = self._is_compiler_seed_config(config) or (
-                    source_hash is not None
-                    and source_hash in self._compiler_seed_source_hashes
+                is_workings = PrecompileFuture.wait_for_all(
+                    futures, desc=precompile_desc
                 )
-                if compiler_seed_source and source_hash is not None:
-                    perf = self._benchmark_function(
-                        config,
-                        fn,
-                        effective_source_hash=source_hash,
+                precompile_status: list[Literal["ok", "error", "timeout"]] = []
+                for future, ok in zip(futures, is_workings, strict=True):
+                    reason = future.failure_reason
+                    if ok:
+                        precompile_status.append("ok")
+                    elif reason == "timeout":
+                        precompile_status.append("timeout")
+                    else:
+                        precompile_status.append("error")
+            else:
+                is_workings = [True] * len(unit_configs)
+                precompile_status = ["ok"] * len(unit_configs)
+
+            # Benchmark loop with progress reporting (per config with a pool;
+            # the streaming path reports per unit instead).
+            iterator = iter_with_progress(
+                enumerate(zip(fns, is_workings, precompile_status, strict=True)),
+                total=len(unit_configs),
+                description=f"{desc} exploring neighbors",
+                enabled=self.settings.autotune_progress_bar and not streaming,
+            )
+            for index, (fn, is_working, reason) in iterator:
+                # A streamed config was compiled moments ago under this unit's
+                # budget check; its timing is the cheap half of the unit, so
+                # the budget is rechecked at the next unit instead. With a
+                # pool, a few already compiled configs are still timed past
+                # the budget while the search has no successful measurement.
+                if not streaming:
+                    protected = (
+                        metrics.num_successful_candidate_measurements == 0
+                        and exemptions["timing"] < _BUDGET_EXEMPT_CANDIDATES
+                    )
+                    exceeded, stop = self._budget_step_synced(protected=protected)
+                    if stop:
+                        break
+                    if exceeded:
+                        exemptions["timing"] += 1
+                config = unit_configs[index]
+                result_index = valid_indices[index]
+                if futures is not None:
+                    future = futures[index]
+                    compile_time = (
+                        future.elapsed
+                        if future.process is not None and future.started
+                        else None
                     )
                 else:
-                    perf = self._benchmark_function(config, fn)
-                current_accuracy_failure = (
-                    deduplicate_sources
-                    and len(self._accuracy_failure_config_ids) > accuracy_failure_count
+                    compile_time = inline_compile_times.get(result_index)
+                status: Literal[
+                    "ok",
+                    "error",
+                    "timeout",
+                    "peer_compilation_fail",
+                    "filtered",
+                    "deduplicated",
+                    "accuracy_error",
+                    "source_rejected",
+                ]
+                # config_id is None when no log sink is active. A started row
+                # is emitted only for an actual benchmark attempt; source
+                # aliases that reuse a completed result get a standalone
+                # deduplicated row.
+                config_id = self.log.register_config(config)
+                source_hash = source_hashes.get(result_index)
+                current_accuracy_failure = False
+                source_result = (
+                    cached_source_results.get(source_hash)
+                    if source_hash is not None
+                    else None
                 )
-                status = (
-                    "ok"
-                    if math.isfinite(perf)
-                    else (
-                        "accuracy_error"
-                        if current_accuracy_failure
-                        else self._last_benchmark_failure_status or "error"
+                if source_hash is not None and source_hash in invalid_sources:
+                    status = "source_rejected"
+                    results[result_index] = BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=inf,
+                        status=status,
+                        compile_time=compile_time,
+                        completed_at=time.perf_counter(),
                     )
-                )
-                results[result_index] = BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=perf,
-                    status=status,
-                    compile_time=compile_time,
-                    completed_at=time.perf_counter(),
-                )
-                # Keep the actual terminal outcome even when a later source
-                # alias repairs this candidate. The repair is logged as a
-                # separate deduplication event below.
-                record_final_result(result_index, config_id, compile_time)
-            else:
-                status = "timeout" if reason == "timeout" else "error"
-                if is_working:
-                    status = "peer_compilation_fail"
-                results[result_index] = BenchmarkResult(
-                    config=config,
-                    fn=fn,
-                    perf=inf,
-                    status=status,
-                    compile_time=compile_time,
-                    completed_at=time.perf_counter(),
-                )
-                record_final_result(result_index, config_id, compile_time)
-            result = results[result_index]
-            if result.status == "ok" and math.isfinite(result.perf):
-                self._autotune_metrics.num_successful_candidate_measurements += 1
-            if (
-                source_hash is not None
-                and result.status == "ok"
-                and math.isfinite(result.perf)
-            ):
-                cached_source_results[source_hash] = result
-                batch_repairs.update(
-                    self._resolve_effective_source_failures(source_hash, result)
-                )
-            if source_hash is not None and current_accuracy_failure:
-                invalid_sources.add(source_hash)
-                cached_source_results.pop(source_hash, None)
-                self._pending_effective_source_failures.pop(source_hash, None)
-            elif source_hash is not None and result.status in (
-                "error",
-                "timeout",
-                "peer_compilation_fail",
-            ):
-                self._remember_effective_source_failure(
-                    source_hash, config, config_id, compile_time
-                )
+                    metrics.num_source_deduplications += 1
+                    record_final_result(result_index, config_id, compile_time)
+                elif source_result is not None:
+                    status = "deduplicated"
+                    results[result_index] = BenchmarkResult(
+                        config=config,
+                        fn=source_result.fn,
+                        perf=source_result.perf,
+                        status=status,
+                        compile_time=None,
+                        completed_at=time.perf_counter(),
+                    )
+                    deduplicated_indices.add(result_index)
+                    metrics.num_source_deduplications += 1
+                    self.log.debug(
+                        lambda config=config, source_hash=source_hash: (
+                            f"Reusing effective generated source {source_hash} "
+                            f"for {config!r}"
+                        )
+                    )
+                    record_final_result(result_index, config_id, compile_time)
+                    recorded_deduplicated_indices.add(result_index)
+                elif all(
+                    all_gather_object(
+                        is_working,
+                        process_group_name=self.kernel.env.process_group_name,
+                    )
+                ):
+                    record_started_result(result_index, config_id, compile_time)
+                    self._last_benchmark_failure_status = None
+                    accuracy_failure_count = len(self._accuracy_failure_config_ids)
+                    compiler_seed_source = self._is_compiler_seed_config(config) or (
+                        source_hash is not None
+                        and source_hash in self._compiler_seed_source_hashes
+                    )
+                    if compiler_seed_source and source_hash is not None:
+                        perf = self._benchmark_function(
+                            config,
+                            fn,
+                            effective_source_hash=source_hash,
+                        )
+                    else:
+                        perf = self._benchmark_function(config, fn)
+                    current_accuracy_failure = (
+                        deduplicate_sources
+                        and len(self._accuracy_failure_config_ids)
+                        > accuracy_failure_count
+                    )
+                    status = (
+                        "ok"
+                        if math.isfinite(perf)
+                        else (
+                            "accuracy_error"
+                            if current_accuracy_failure
+                            else self._last_benchmark_failure_status or "error"
+                        )
+                    )
+                    results[result_index] = BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=perf,
+                        status=status,
+                        compile_time=compile_time,
+                        completed_at=time.perf_counter(),
+                    )
+                    # Keep the actual terminal outcome even when a later source
+                    # alias repairs this candidate. The repair is logged as a
+                    # separate deduplication event below.
+                    record_final_result(result_index, config_id, compile_time)
+                else:
+                    status = "timeout" if reason == "timeout" else "error"
+                    if is_working:
+                        status = "peer_compilation_fail"
+                    results[result_index] = BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=inf,
+                        status=status,
+                        compile_time=compile_time,
+                        completed_at=time.perf_counter(),
+                    )
+                    record_final_result(result_index, config_id, compile_time)
+                result = results[result_index]
+                if result.status == "ok" and math.isfinite(result.perf):
+                    metrics.num_successful_candidate_measurements += 1
+                if (
+                    source_hash is not None
+                    and result.status == "ok"
+                    and math.isfinite(result.perf)
+                ):
+                    cached_source_results[source_hash] = result
+                    batch_repairs.update(
+                        self._resolve_effective_source_failures(source_hash, result)
+                    )
+                if source_hash is not None and current_accuracy_failure:
+                    invalid_sources.add(source_hash)
+                    cached_source_results.pop(source_hash, None)
+                    self._pending_effective_source_failures.pop(source_hash, None)
+                elif source_hash is not None and result.status in (
+                    "error",
+                    "timeout",
+                    "peer_compilation_fail",
+                ):
+                    self._remember_effective_source_failure(
+                        source_hash, config, config_id, compile_time
+                    )
+            # A budget cut leaves the loop early; end the bar here.
+            iterator.close()
+
+        # Streaming reports progress per unit (the pool path per config inside
+        # ``benchmark_unit``); the bar is closed below whichever way the loop
+        # ends.
+        unit_progress = iter_with_progress(
+            units,
+            total=len(units),
+            description=f"{desc} exploring neighbors",
+            enabled=self.settings.autotune_progress_bar and streaming,
+        )
+        try:
+            for unit in unit_progress:
+                compile_unit(unit)
+                benchmark_unit(deduplicate_unit(unit))
+                if streaming and not any(results[i].completed_at is None for i in unit):
+                    continue
+                # The budget stopped this unit short (nothing is compiled
+                # ahead when streaming, so the rest of the batch is skipped
+                # too); with a pool there is only one unit.
+                break
+        finally:
+            unit_progress.close()
+            if renders is not None:
+                # Renders still in flight are for configs this batch will not
+                # compile (budget cut or an error); their workers go.
+                renders.close()
+                if renders.unavailable:
+                    self._render_pool_unavailable = True
+
+        # A budget cut can end the batch before its last config, where the
+        # compile error of an all-failing batch would have surfaced; the first
+        # error still does, as the no-viable-config error and in summaries.
+        self.batch_first_compile_error = first_error["value"]
+        if (
+            first_error["value"] is not None
+            and not compiled
+            and metrics.num_successful_candidate_measurements == 0
+            and self._no_viable_config_error is None
+        ):
+            if raise_if_no_viable_config:
+                raise first_error["value"]
+            self._no_viable_config_error = first_error["value"]
 
         # Repairs discovered in this batch update its positional results. The
         # provider also retains them for the search to apply to members and
@@ -1740,7 +2086,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             if config_id is not None:
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
+                        generation=metrics.num_generations,
                         status=result.status,
                         perf_ms=result.perf if math.isfinite(result.perf) else None,
                         compile_time=None,
@@ -1750,11 +2096,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         completed_at=result.completed_at,
                     )
                 )
-        # Budget-tail placeholders become terminal only when this batch ends.
+        # Configs the budget cutoff never got to (never compiled, or compiled
+        # but not timed) become terminal "skipped" rows when the batch ends.
+        completed_at = time.perf_counter()
         return [
             result
             if result.completed_at is not None
-            else result._replace(completed_at=time.perf_counter())
+            else result._replace(status="skipped", completed_at=completed_at)
             for result in results
         ]
 
@@ -2380,6 +2728,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     """Compose ordinary local providers and expose one scalar per config."""
 
     mutated_arg_indices: Sequence[int] = ()
+    # Candidates attempted past the budget while nothing was measured yet
+    # (see ``_BUDGET_EXEMPT_CANDIDATES``), across this provider's batches.
+    _budget_exempt_used: int = 0
 
     def __init__(
         self,
@@ -2496,6 +2847,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             self._original_configs_by_materialized_key.clear()
             self._anchor_fns_by_materialized_key.clear()
             self._effective_source_repairs.clear()
+            self._budget_exempt_used = 0
             self.budget_exceeded_fn = _never_exceeded
 
     def _cleanup_children(self) -> None:
@@ -2599,11 +2951,32 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         if not configs:
             return []
         if check_budget and self.budget_exceeded_fn():
-            return [
-                BenchmarkResult(
-                    config, _unset_fn, inf, "error", None, time.perf_counter()
+            # Like the single-shape provider: past the budget a few more
+            # candidates are still attempted while nothing has been measured.
+            exempt = 0
+            if self._autotune_metrics.num_successful_candidate_measurements == 0:
+                exempt = max(0, _BUDGET_EXEMPT_CANDIDATES - self._budget_exempt_used)
+            exempt = min(exempt, len(configs))
+            self._budget_exempt_used += exempt
+            attempted = (
+                self._benchmark(
+                    configs[:exempt],
+                    desc=desc,
+                    record_results=record_results,
+                    check_budget=False,
+                    raise_if_no_viable_config=raise_if_no_viable_config,
                 )
-                for config in configs
+                if exempt
+                else []
+            )
+            return [
+                *attempted,
+                *(
+                    BenchmarkResult(
+                        config, _unset_fn, inf, "skipped", None, time.perf_counter()
+                    )
+                    for config in configs[exempt:]
+                ),
             ]
 
         materialized: list[Config] = []

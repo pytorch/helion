@@ -220,9 +220,26 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     ...
 ```
 
-The budget is checked between generations and during the finishing
-phase. In-flight compiling and benchmarking completes before the
-search stops. The default is ``None`` (no budget).
+The budget is checked between generations and before each config's
+compile (with a precompile pool also before each config's timing;
+without one a config is timed right after its compile). Once it is out
+nothing further is compiled or timed, except that while no config has
+been measured successfully the search still attempts up to three more
+candidates, so a budget that runs out early returns a config when one
+of those works; the overrun is bounded by those attempts (and, with a
+pool, by the precompile wait of the batch in flight). Backends without
+a precompile pool (CuTe) compile and time one config at a time (CuTe
+generates each candidate's code in forked workers ahead of its turn, so
+only the module load, the JIT at first call and the timing are serial),
+and their initial population may take at most half of the search phase
+(the budget minus the time kept for the final selection), counted from
+the start of each of its batches: once a few configs have been timed
+and one has succeeded, the measured cost per config decides how many
+more are attempted and the rest are skipped, never below a CuTe flash
+surface's structural coverage rows, which keeps time for the search
+generations on kernels whose code generation is slow. A population that
+fits its share is evaluated in full. The default is ``None`` (no
+budget).
 
 ## Search Space Analysis
 

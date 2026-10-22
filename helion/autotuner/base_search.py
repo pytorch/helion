@@ -135,6 +135,12 @@ _FINAL_SELECTION_ROUNDS_ENV = "HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS"
 # found, so a small budget must stay mostly search; the phase is then sized
 # to whatever is left when it starts (``FinalSelectionConfig.fit_to_seconds``).
 _FINAL_SELECTION_RESERVE_FRACTION = 0.25
+# Under a wall-clock budget the initial population spends at most this share
+# of the search phase (the budget minus the final-selection reserve) before it
+# is cut to the configs attempted so far, so the search generations that
+# refine the population's best keep at least as much time as it took (see
+# ``PopulationBasedSearch._initial_population_budget``).
+_INITIAL_POPULATION_BUDGET_FRACTION = 0.5
 # Single-pass verification knobs the final selection does not read.
 _FINAL_SELECTION_IGNORED_ENVS = (
     _FINAL_REBENCHMARK_TARGET_MS_ENV,
@@ -434,7 +440,11 @@ class BaseSearch(BaseAutotuner):
         if not self.config_spec.backend.supports_precompile():
             # Backend.autotune() does this too, but a search can also be
             # constructed directly on a bound kernel.
-            self.settings.autotune_precompile = None
+            from .._compiler.backend import autotune_precompile_mode
+
+            self.settings.autotune_precompile = autotune_precompile_mode(
+                self.config_spec.backend, self.settings.autotune_precompile
+            )
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
@@ -537,8 +547,16 @@ class BaseSearch(BaseAutotuner):
                     settings.autotune_benchmark_subprocess
                 ),
                 "autotune_benchmark_timeout": settings.autotune_benchmark_timeout,
-                "autotune_precompile": settings.autotune_precompile,
-                "autotune_precompile_jobs": settings.autotune_precompile_jobs,
+                # Rendering candidates in forked workers (a backend without a
+                # precompile pool keeping the fork mode) changes no result.
+                "autotune_precompile": (
+                    settings.autotune_precompile
+                    if self.config_spec.backend.supports_precompile()
+                    else None
+                ),
+                # The number of precompile processes or render workers changes
+                # no result; the entry stays (as None) so existing keys hold.
+                "autotune_precompile_jobs": None,
                 "autotune_ignore_errors": settings.autotune_ignore_errors,
                 "autotune_best_of_k": settings.autotune_best_of_k,
                 "autotune_with_torch_compile_fusion": (
@@ -586,6 +604,7 @@ class BaseSearch(BaseAutotuner):
             return
         self._prepared = True
         self._autotune_budget_start = time.perf_counter()
+        self._budget_exceeded_logged = ()
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
@@ -718,6 +737,9 @@ class BaseSearch(BaseAutotuner):
     # Set once the search phase hands over to the final selection, which then
     # spends the budget share ``_budget_reserve_seconds`` kept back for it.
     _budget_reserve_released: bool = False
+    # Phases ("search", "final") whose budget cutoff has been logged: the
+    # check runs before every compile once the budget is out, the line once.
+    _budget_exceeded_logged: tuple[str, ...] = ()
     # Longest wall time between two generation-boundary budget checks of the
     # search phase (``_autotune_budget_exceeded_across_ranks``: the generation
     # loops and the flash qualification passes call it once per generation).
@@ -768,6 +790,13 @@ class BaseSearch(BaseAutotuner):
         )
         if elapsed < budget - reserve - in_flight:
             return False
+        # "best-so-far" holds even when nothing has been measured yet: the
+        # provider still attempts a few candidates past the budget (see
+        # ``LocalBenchmarkProvider.benchmark``) before the search returns.
+        phase = "search" if reserve > 0 else "final"
+        if phase in self._budget_exceeded_logged:
+            return True
+        self._budget_exceeded_logged = (*self._budget_exceeded_logged, phase)
         if reserve > 0:
             self.log(
                 f"Autotune budget {budget}s exceeded for the search phase "
@@ -846,6 +875,17 @@ class BaseSearch(BaseAutotuner):
             quantile: The quantile of compile times to use (e.g., 0.9 for 90th percentile).
         """
         if not self.settings.autotune_adaptive_timeout:
+            return
+        if not (
+            self.settings.autotune_precompile
+            and self.config_spec.backend.supports_precompile()
+        ):
+            # The adapted timeout kills precompile subprocesses. Render
+            # workers (CuTe) keep the configured timeout and only fall back
+            # to an in-process render past it, and the kernel's settings
+            # are shared by every bound shape of the kernel: a timeout fitted
+            # on one shape's render times would time out a larger shape's.
+            self.log.debug("No precompile pool; the compile timeout is not adapted")
             return
 
         # Collect valid compile times (non-None and positive)
@@ -992,8 +1032,8 @@ class BaseSearch(BaseAutotuner):
 
         # Check for handoff when enabled. If triggered, raise an internal stop
         # signal that find_handoff() catches after nested searches clean up
-        # their resources.
-        _observe_handoff(self, results)
+        # their resources. Configs the budget skipped were never trials.
+        _observe_handoff(self, [r for r in results if r.status != "skipped"])
         return results
 
     def benchmark(self, config: Config) -> BenchmarkResult:
@@ -1424,6 +1464,7 @@ class PopulationMember:
         "deduplicated",
         "accuracy_error",
         "source_rejected",
+        "skipped",
         "unknown",
     ] = "unknown"
     compile_time: float | None = None
@@ -1617,6 +1658,14 @@ class PopulationBasedSearch(BaseSearch):
     # rather than a search-algorithm knob, so it is not a constructor
     # argument and ``_final_rebenchmark_cache_policy`` carries it.
     final_selection: FinalSelectionConfig | None = None
+
+    # The first compile error of the last benchmarked batch (None when every
+    # config compiled), for the initial population's summary line.
+    _last_batch_first_error: Exception | None = None
+    # Set while the initial population is benchmarked (see
+    # ``_initial_population_batch``): the batch methods keep their signatures
+    # for callers that stub them and read the phase from here.
+    _benchmarking_initial_population: bool = False
 
     def __init__(
         self,
@@ -1868,11 +1917,16 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark multiple flat configurations in parallel.
 
-        The first ``len(to_check)`` entries of the returned list preserve
-        positional correspondence with ``to_check``.  Invalid configurations
-        that cannot be unflattened are represented as ``PopulationMember``
-        objects with ``perf == inf`` and ``status == "error"`` (they are not
-        benchmarked).
+        For an ordinary batch the returned list preserves positional
+        correspondence with ``to_check``.  Invalid configurations that cannot
+        be unflattened are represented as ``PopulationMember`` objects with
+        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+
+        Inside :meth:`_initial_population_batch` (or with a
+        ``random_fallback_target``) ``to_check`` is the initial population and
+        is benchmarked through :meth:`benchmark_initial_population` (budget
+        share, the drop of never-attempted configs, the summary line, the
+        random fallback when a target is given).
 
         Args:
             to_check: A list of flat configurations to benchmark.
@@ -1880,15 +1934,19 @@ class PopulationBasedSearch(BaseSearch):
                 initial population; see :meth:`benchmark_initial_population`.
 
         Returns:
-            A list of population members with the benchmark results, one per
-            entry in *to_check*.  When ``random_fallback_target`` is given and
-            every entry fails, the random fallback members are appended after
-            the positional entries, so the list is then longer than
-            ``to_check``.
+            For an ordinary batch, one population member per entry in
+            ``to_check`` in order.  For the initial population, the members
+            that were attempted (never-attempted configs are dropped, random
+            fallback members appended), followed by the invalid entries; the
+            positions no longer correspond to ``to_check``.
         """
+        initial_population = (
+            self._benchmarking_initial_population or random_fallback_target is not None
+        )
         from ..runtime.config import Config
 
         valid: list[PopulationMember] = []
+        invalid: list[PopulationMember] = []
         result: list[PopulationMember] = []
         for flat in to_check:
             m = self.make_unbenchmarked(flat)
@@ -1896,21 +1954,20 @@ class PopulationBasedSearch(BaseSearch):
                 valid.append(m)
                 result.append(m)
             else:
-                result.append(
+                invalid.append(
                     PopulationMember(
                         _unset_fn, [float("inf")], flat, Config(), status="error"
                     )
                 )
+                result.append(invalid[-1])
 
-        if random_fallback_target is None:
+        if not initial_population:
             self.benchmark_population(valid)
             return result
-        num_valid = len(valid)
         self.benchmark_initial_population(
             valid, random_fallback_target=random_fallback_target
         )
-        result.extend(valid[num_valid:])
-        return result
+        return [*valid, *invalid]
 
     def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
@@ -2189,16 +2246,32 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark multiple population members in parallel.  Members should be created with make_unbenchmarked.
 
+        Inside :meth:`_initial_population_batch` the batch runs under the
+        initial population's share of the autotune budget
+        (``_initial_population_budget``).
+
         Args:
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
             raise_if_no_viable_config: See :meth:`BaseSearch.benchmark_batch`.
         """
-        results = self.benchmark_batch(
-            [m.config for m in members],
-            desc=desc,
-            raise_if_no_viable_config=raise_if_no_viable_config,
+        initial_population = self._benchmarking_initial_population
+        budget = (
+            self._initial_population_budget(members)
+            if initial_population
+            else contextlib.nullcontext()
         )
+        with budget:
+            results = self.benchmark_batch(
+                [m.config for m in members],
+                desc=desc,
+                raise_if_no_viable_config=raise_if_no_viable_config,
+            )
+        if initial_population:
+            # For the batch summary (see ``_benchmark_initial_batch``).
+            self._last_batch_first_error = (
+                self.benchmark_provider.batch_first_compile_error
+            )
         for member, result in zip(members, results, strict=True):
             member.config = result.config
             member.flat_values = self.config_gen.flatten(result.config)
@@ -2211,6 +2284,159 @@ class PopulationBasedSearch(BaseSearch):
         if repairs:
             self._apply_effective_source_repairs(repairs, members)
         return members
+
+    @contextlib.contextmanager
+    def _initial_population_batch(self) -> Iterator[None]:
+        """Mark the batches run inside as the initial population.
+
+        :meth:`benchmark_population` then runs under the population's budget
+        share and :meth:`benchmark_flat_batch` routes through
+        :meth:`benchmark_initial_population`; both keep their signatures.
+        """
+        previous = self._benchmarking_initial_population
+        self._benchmarking_initial_population = True
+        try:
+            yield
+        finally:
+            self._benchmarking_initial_population = previous
+
+    def _initial_population_floor(self, total: int) -> int:
+        """Leading configs of an initial batch the budget share never cuts.
+
+        A CuTe flash population opens with the structural coverage design,
+        one witness per ordinary leaf (and a second for the qualification);
+        cutting into those rows would leave the structural qualification to
+        re-probe the missing leaves outside the share, or to fail when the
+        budget is not actually spent. Other surfaces have no floor.
+        """
+        if total <= 0 or not self.config_spec.cute_flash_search_enabled:
+            return 0
+        return min(total, self.config_gen.flash_structural_qualification_prefix_count())
+
+    @contextlib.contextmanager
+    def _initial_population_budget(
+        self, members: Sequence[PopulationMember]
+    ) -> Iterator[None]:
+        """Cut the initial population to what its share of the budget affords.
+
+        Only under ``autotune_budget_seconds``, and only without a precompile
+        pool: there configs compile and run one at a time, so the cost per
+        config is known after the first few and a cut wastes nothing compiled
+        ahead (with a pool the whole batch is precompiled first and keeps the
+        global budget check with its first-measurement exemption). The
+        provider asks the installed budget hook before each config; this hook
+        adds the population's own limit to the global one. Once two configs
+        (and the surface's floor, ``_initial_population_floor``) have been
+        attempted and one config has been measured successfully, the average
+        wall time per config so far predicts whether the next one would push
+        the batch past ``_INITIAL_POPULATION_BUDGET_FRACTION`` of the search
+        phase (the budget minus the final-selection reserve, counted from the
+        batch's start, so a random fallback batch gets its own share); if so
+        the population stops there, logged once with the measured cost. The
+        configs never attempted come back ``skipped`` and the caller drops
+        them. A population that fits its share is untouched, so cheap kernels
+        keep their full population and search trajectory.
+        """
+        budget = self.settings.autotune_budget_seconds
+        start = self._autotune_budget_start
+        provider = self.benchmark_provider
+        if (
+            budget is None
+            or start is None
+            or not isinstance(provider, LocalBenchmarkProvider)
+            or provider.compiles_ahead
+        ):
+            yield
+            return
+        share = _INITIAL_POPULATION_BUDGET_FRACTION * (
+            budget - self._budget_reserve_seconds()
+        )
+        total = len(members)
+        floor = self._initial_population_floor(total)
+        # Each batch of the phase (the seeds, then a random fallback) gets
+        # the share from its own start.
+        phase_start = time.perf_counter()
+        deadline = phase_start + share
+        metrics = self._autotune_metrics
+        cut = False
+
+        def exceeded() -> bool:
+            nonlocal cut
+            if self._autotune_budget_exceeded() or cut:
+                return True
+            attempted = provider.batch_configs_started
+            # The cut only ever follows a measured config: with nothing
+            # measured the provider would attempt a few more anyway, and
+            # the message below is only logged when it stops the batch.
+            if (
+                attempted < max(2, floor)
+                or metrics.num_successful_candidate_measurements == 0
+            ):
+                return False
+            now = time.perf_counter()
+            per_config = (now - phase_start) / attempted
+            if now + per_config <= deadline:
+                return False
+            cut = True
+            self.log(
+                f"Initial population cut to {attempted} of {total} configs: "
+                f"{per_config:.1f}s per config (compile and benchmark) against "
+                f"the {share:.0f}s the initial population may take of the "
+                f"{budget}s budget; the search goes on from the configs measured "
+                "so far."
+            )
+            return True
+
+        previous = provider.budget_exceeded_fn
+        provider.set_budget_exceeded_fn(exceeded)
+        try:
+            yield
+        finally:
+            provider.set_budget_exceeded_fn(previous)
+
+    def _benchmark_initial_batch(
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool,
+        visited: set[Config] | None,
+    ) -> None:
+        """Benchmark one batch of the initial population under its budget share.
+
+        Members the batch never attempted (``skipped``) are removed from
+        ``members`` and ``visited`` rather than kept as failures; the batch's
+        outcome is summarized in one log line whatever
+        ``autotune_ignore_errors`` says.
+        """
+        started = time.perf_counter()
+        with self._initial_population_batch():
+            self.benchmark_population(
+                members,
+                desc=desc,
+                raise_if_no_viable_config=raise_if_no_viable_config,
+            )
+        skipped = [member for member in members if member.status == "skipped"]
+        if skipped:
+            members[:] = [member for member in members if member.status != "skipped"]
+            if visited is not None:
+                for member in skipped:
+                    visited.discard(member.config)
+        attempted = len(members)
+        measured = sum(
+            1 for member in members if member.perfs and math.isfinite(member.perf)
+        )
+        elapsed = time.perf_counter() - started
+        per_config = f" ({elapsed / attempted:.1f}s per config)" if attempted else ""
+        first_error = self._last_batch_first_error
+        failed = f"{attempted - measured} failed to compile or run"
+        if attempted > measured and first_error is not None:
+            failed += f" (first: {type(first_error).__name__}: {first_error})"
+        self.log(
+            f"{desc}: {measured} of {attempted} configs measured in "
+            f"{elapsed:.0f}s{per_config}; {failed}; {len(skipped)} not attempted "
+            "within the autotune budget."
+        )
 
     def benchmark_initial_population(
         self,
@@ -2234,11 +2460,19 @@ class PopulationBasedSearch(BaseSearch):
         to ``members`` (and ``visited``) in place; when no fallback config can
         be generated, or the fallback also fails entirely, the compile error
         is raised exactly as for a random population.
+
+        Under ``autotune_budget_seconds`` the population is also cut to what
+        its share of the budget affords (``_initial_population_budget``);
+        configs the cut (or the budget itself) never attempted are dropped
+        from ``members`` and ``visited`` rather than kept as failures, and
+        the outcome is summarized in one log line whatever
+        ``autotune_ignore_errors`` says.
         """
-        self.benchmark_population(
+        self._benchmark_initial_batch(
             members,
             desc=desc,
             raise_if_no_viable_config=random_fallback_target is None,
+            visited=visited,
         )
         if random_fallback_target is None or any(
             math.isfinite(member.perf) for member in members
@@ -2267,7 +2501,12 @@ class PopulationBasedSearch(BaseSearch):
             "ran (the backend may not support the default config for this "
             f"kernel); continuing with {len(fallback)} random configs."
         )
-        self.benchmark_population(fallback, desc="Random fallback population")
+        self._benchmark_initial_batch(
+            fallback,
+            desc="Random fallback population",
+            raise_if_no_viable_config=True,
+            visited=visited,
+        )
         members.extend(fallback)
         return members
 
@@ -4003,20 +4242,15 @@ def population_statistics(population: list[PopulationMember]) -> str:
             working.append(member)
             if status not in {"ok", "error", "timeout"}:
                 status = "ok"
-        else:
-            if status not in {"error", "timeout"}:
-                status = "error"
-        if status == "timeout":
-            status_counts["timeout"] += 1
-        elif status == "error":
-            status_counts["error"] += 1
-        else:
-            status_counts["ok"] += 1
+        elif status not in {"error", "timeout", "skipped"}:
+            # "skipped": never attempted (the autotune budget ran out).
+            status = "error"
+        status_counts[status] += 1
     if len(working) == 0:
         raise exc.NoConfigFound
     count_parts = [
         f"{label}={status_counts[label]}"
-        for label in ("error", "timeout", "ok")
+        for label in ("error", "timeout", "skipped", "ok")
         if status_counts[label]
     ]
     perf_parts = (

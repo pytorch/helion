@@ -37,28 +37,20 @@ GEMM_CONFIG = helion.Config(
     range_warp_specializes=[None],
 )
 
-# FP4 E2M1 lookup table indexed by 4-bit encoding (0-15).
-FP4_E2M1_LUT = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+
+def _fp4_e2m1_lut(device: torch.device) -> Tensor:
+    """FP4 E2M1 values indexed by 4-bit encoding (0-15): sign, 2 exponent bits, 1
+    mantissa bit. Built on the device: a host table would need a copy per call,
+    which keeps the reference (eager or compiled) out of CUDA graphs."""
+    code = torch.arange(16, device=device)
+    exponent = (code >> 1) & 3
+    mantissa = (code & 1).to(torch.float32)
+    magnitude = torch.where(
+        exponent == 0,
+        0.5 * mantissa,
+        torch.exp2(exponent - 1.0) * (1.0 + 0.5 * mantissa),
+    )
+    return torch.where(code >= 8, -magnitude, magnitude)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -413,7 +405,7 @@ def unpack_and_dequantize_fp4(packed: Tensor, last_dim: bool = False) -> Tensor:
     packed_storage = _fp4_storage(packed)
     lo = (packed_storage & 0xF).to(torch.long)
     hi = ((packed_storage >> 4) & 0xF).to(torch.long)
-    lut = FP4_E2M1_LUT.to(device=packed_storage.device)
+    lut = _fp4_e2m1_lut(packed_storage.device)
     lo_f = lut[lo]
     hi_f = lut[hi]
     if last_dim:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import csv
 import functools
@@ -12,9 +13,12 @@ from pathlib import Path
 import tempfile
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import Callable
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
+import zlib
 
 import torch
 
@@ -23,17 +27,22 @@ from test._autotuner_test_utils import _cute_flash_test_config_spec
 from test._autotuner_test_utils import without_env_var
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
+from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.base_search import population_statistics
+from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
 from helion.autotuner.finite_search import FiniteSearch
@@ -42,10 +51,14 @@ from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.precompile_future import PrecompileFuture
 from helion.autotuner.search_space_logger import canonical_config_id
 import helion.language as hl
 from helion.runtime.settings import Settings
 from helion.runtime.settings import _get_backend
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @onlyBackends(["triton", "cute"])
@@ -897,6 +910,9 @@ class TestAutotuneBudget(TestCase):
         compiler_seed_alias = helion.Config(block_sizes=[2])
         provider.set_compiler_seed_configs([compiler_seed_alias])
 
+        # Without a precompile pool the representative is timed before the
+        # alias is compiled, so its source is not yet known to be a compiler
+        # seed's; the alias then reuses the representative's measurement.
         with patch.object(
             LocalBenchmarkProvider,
             "_benchmark_function",
@@ -905,10 +921,29 @@ class TestAutotuneBudget(TestCase):
             results = provider.benchmark([representative, compiler_seed_alias])
 
         self.assertEqual([result.perf for result in results], [1.0, 1.0])
-        benchmark.assert_called_once_with(
-            representative,
-            results[0].fn,
-            effective_source_hash="shared",
+        self.assertEqual([result.status for result in results], ["ok", "deduplicated"])
+        benchmark.assert_called_once_with(representative, results[0].fn)
+
+        # When the representative fails, the compiler seed alias is timed on
+        # its own and marks the shared source for the timeout retry.
+        provider._effective_source_hashes.clear()
+        provider._effective_source_results.clear()
+        provider._compiler_seed_source_hashes.clear()
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=[math.inf, 1.0],
+        ) as benchmark:
+            results = provider.benchmark([representative, compiler_seed_alias])
+
+        self.assertEqual([result.perf for result in results], [1.0, 1.0])
+        self.assertEqual(
+            [call.kwargs for call in benchmark.call_args_list],
+            [{}, {"effective_source_hash": "shared"}],
+        )
+        self.assertEqual(
+            [call.args[0] for call in benchmark.call_args_list],
+            [representative, compiler_seed_alias],
         )
 
     def test_compiler_seed_source_provenance_survives_batches(self) -> None:
@@ -1000,7 +1035,7 @@ class TestAutotuneBudget(TestCase):
 
         self.assertEqual([result.perf for result in results], [1.0, math.inf, math.inf])
         self.assertEqual(
-            [result.status for result in results], ["ok", "error", "error"]
+            [result.status for result in results], ["ok", "skipped", "skipped"]
         )
         self.assertEqual([result.config for result in results], configs)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 0)
@@ -1526,7 +1561,7 @@ class TestAutotuneBudget(TestCase):
         self.assertLessEqual(compiled_count[0], 2)
         self.assertLessEqual(compiled_finite, compiled_count[0])
         for r in results[compiled_count[0] :]:
-            self.assertEqual(r.status, "error")
+            self.assertEqual(r.status, "skipped")
             self.assertEqual(r.perf, float("inf"))
         for r in results:
             self.assertIsInstance(r, BenchmarkResult)
@@ -1534,10 +1569,9 @@ class TestAutotuneBudget(TestCase):
         self.assertGreater(budget_calls[0], 0)
 
     def test_benchmark_provider_short_circuits_benchmark_loop(self) -> None:
-        """If compilation finishes cleanly and the budget only fires
-        partway through the benchmark loop, remaining configs must be
-        left at the default ``perf=inf, status="error"`` slots while the
-        earlier benchmarked configs keep their measured perf.
+        """If the budget fires partway through the batch, the remaining
+        configs must come back as ``perf=inf, status="skipped"`` slots while
+        the earlier benchmarked configs keep their measured perf.
         """
         from helion.autotuner.benchmark_provider import BenchmarkResult
         from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -1574,9 +1608,9 @@ class TestAutotuneBudget(TestCase):
         # First few entries have finite measured perf.
         finite_count = sum(1 for r in results if math.isfinite(r.perf))
         self.assertEqual(finite_count, benchmark_count[0])
-        # The tail entries must be the inf/error defaults.
+        # The tail entries were never attempted.
         for r in results[benchmark_count[0] :]:
-            self.assertEqual(r.status, "error")
+            self.assertEqual(r.status, "skipped")
             self.assertEqual(r.perf, float("inf"))
         for r in results:
             self.assertIsInstance(r, BenchmarkResult)
@@ -1633,6 +1667,223 @@ class TestAutotuneBudget(TestCase):
 
         self.assertFalse(provider._subprocess_benchmark_enabled())
         self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
+
+    def test_mtia_device_disables_subprocess_benchmark(self) -> None:
+        # The MTIA runtime reserves the whole device for its first client,
+        # so a spawned worker cannot open it while this process holds it.
+        from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        self.assertIsNone(backend.get_do_bench())
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.kernel.env = SimpleNamespace(
+            process_group_name=None, device=SimpleNamespace(type="mtia")
+        )
+        provider.config_spec = SimpleNamespace(backend=backend)
+
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+
+    def test_missing_device_env_does_not_break_subprocess_check(self) -> None:
+        # Stub kernels mock env without a device; the MTIA carve-out must
+        # tolerate that instead of raising AttributeError.
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+
+    def test_exemption_is_bounded_when_nothing_compiles(self) -> None:
+        """Past the budget at most three more candidates are attempted while
+        nothing has been measured, and a cut batch still surfaces its first
+        compile error."""
+        for raise_if_no_viable_config in (False, True):
+            with self.subTest(raise_if_no_viable_config=raise_if_no_viable_config):
+                provider = self._make_stub_provider()
+                compiles: list[helion.Config] = []
+
+                def compile_config(config, allow_print, compiles=compiles):
+                    compiles.append(config)
+                    raise RuntimeError(f"nope {len(compiles)}")
+
+                provider.kernel.compile_config = compile_config
+                provider.set_budget_exceeded_fn(lambda: True)
+                configs = [helion.Config(block_sizes=[i]) for i in range(1, 9)]
+                if raise_if_no_viable_config:
+                    with self.assertRaisesRegex(RuntimeError, "nope 1"):
+                        provider.benchmark(configs, raise_if_no_viable_config=True)
+                else:
+                    results = provider.benchmark(
+                        configs, raise_if_no_viable_config=False
+                    )
+                    self.assertEqual(
+                        [r.status for r in results], ["error"] * 3 + ["skipped"] * 5
+                    )
+                    error = provider.take_no_viable_config_error()
+                    self.assertIsInstance(error, RuntimeError)
+                    self.assertEqual(str(error), "nope 1")
+                    self.assertIs(provider.batch_first_compile_error, error)
+                self.assertEqual(len(compiles), 3)
+
+    def test_exemption_counts_runtime_failures(self) -> None:
+        provider = self._make_stub_provider()
+        provider.set_budget_exceeded_fn(lambda: True)
+        perfs = iter([math.inf, 1.0, 1.0, 1.0])
+
+        def bench(self_, config, fn, **kwargs):
+            self_._autotune_metrics.num_configs_tested += 1
+            return next(perfs)
+
+        configs = [helion.Config(block_sizes=[i]) for i in range(1, 5)]
+        with patch.object(LocalBenchmarkProvider, "_benchmark_function", new=bench):
+            results = provider.benchmark(configs, raise_if_no_viable_config=False)
+        # The first attempt fails at runtime and uses one exemption; the
+        # second succeeds; nothing more is attempted.
+        self.assertEqual(
+            [r.status for r in results], ["error", "ok", "skipped", "skipped"]
+        )
+
+    def test_pool_timing_exemption_is_bounded(self) -> None:
+        provider = self._make_stub_provider()
+        compiles: list[helion.Config] = []
+        original_compile = provider.kernel.compile_config
+
+        def counting_compile(config, allow_print):
+            compiles.append(config)
+            return original_compile(config, allow_print)
+
+        provider.kernel.compile_config = counting_compile
+        provider.set_budget_exceeded_fn(lambda: len(compiles) >= 4)
+        timed: list[helion.Config] = []
+
+        def bench(self_, config, fn, **kwargs):
+            self_._autotune_metrics.num_configs_tested += 1
+            timed.append(config)
+            return math.inf
+
+        configs = [helion.Config(block_sizes=[i]) for i in range(1, 7)]
+        with (
+            _enable_pool_path(provider),
+            patch.object(LocalBenchmarkProvider, "_benchmark_function", new=bench),
+        ):
+            results = provider.benchmark(configs, raise_if_no_viable_config=False)
+        # Four compiled before the budget ran out (the pool compiles nothing
+        # more once the batch has compiled configs); three of them are still
+        # timed while nothing succeeds, the rest is skipped.
+        self.assertEqual(compiles, configs[:4])
+        self.assertEqual(timed, configs[:3])
+        self.assertEqual([r.status for r in results], ["error"] * 3 + ["skipped"] * 3)
+
+    def test_pool_leaves_untimed_aliases_positional_after_budget_expiry(
+        self,
+    ) -> None:
+        provider = self._make_stub_provider()
+
+        def generated_source_hash(fn):
+            return fn.source_hash
+
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=generated_source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            block_size = config.get("block_sizes")[0]
+            fn.source_hash = "first" if block_size == 1 else "shared-tail"
+            return fn
+
+        provider.kernel.compile_config = compile_config
+        benchmark_count = [0]
+        provider.set_budget_exceeded_fn(lambda: benchmark_count[0] >= 1)
+
+        def counting_benchmark(self_, config, fn, **kwargs):
+            self_._autotune_metrics.num_configs_tested += 1
+            benchmark_count[0] += 1
+            return 1.0
+
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+            helion.Config(block_sizes=[3]),
+        ]
+        with (
+            _enable_pool_path(provider),
+            patch.object(
+                LocalBenchmarkProvider, "_benchmark_function", new=counting_benchmark
+            ),
+        ):
+            results = provider.benchmark(configs)
+        # All three compiled; the two aliases of one source were never timed
+        # and stay positional, neither deduplicated against the other.
+        self.assertEqual([result.perf for result in results], [1.0, math.inf, math.inf])
+        self.assertEqual(
+            [result.status for result in results], ["ok", "skipped", "skipped"]
+        )
+        self.assertEqual([result.config for result in results], configs)
+        self.assertEqual(provider._autotune_metrics.num_source_deduplications, 0)
+
+    def test_pool_compiler_seed_alias_marks_source_before_the_representative(
+        self,
+    ) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=3,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        representative = helion.Config(block_sizes=[1])
+        compiler_seed_alias = helion.Config(block_sizes=[2])
+        provider.set_compiler_seed_configs([compiler_seed_alias])
+        # With a pool the whole batch compiles first, so the alias marks the
+        # shared source as a compiler seed's before the representative is
+        # timed and the representative gets the seed's timeout retry.
+        with (
+            _enable_pool_path(provider),
+            patch.object(
+                LocalBenchmarkProvider, "_benchmark_function", return_value=1.0
+            ) as benchmark,
+        ):
+            results = provider.benchmark([representative, compiler_seed_alias])
+        self.assertEqual([result.perf for result in results], [1.0, 1.0])
+        self.assertEqual([result.status for result in results], ["ok", "deduplicated"])
+        benchmark.assert_called_once_with(
+            representative, results[0].fn, effective_source_hash="shared"
+        )
+
+    def test_population_statistics_counts_skipped_separately(self) -> None:
+        members = [
+            PopulationMember(
+                lambda: None, [1.0], (), helion.Config(block_sizes=[1]), status="ok"
+            ),
+            PopulationMember(
+                lambda: None,
+                [math.inf],
+                (),
+                helion.Config(block_sizes=[2]),
+                status="skipped",
+            ),
+            PopulationMember(
+                lambda: None,
+                [math.inf],
+                (),
+                helion.Config(block_sizes=[4]),
+                status="error",
+            ),
+        ]
+        self.assertIn("error=1 skipped=1 ok=1", population_statistics(members))
 
 
 @onlyBackends(["triton", "cute"])
@@ -2039,6 +2290,559 @@ class TestAutotuneCacheSelection(TestCase):
                     ValueError, "Unknown HELION_AUTOTUNE_CACHE"
                 ):
                     bound.settings.autotuner_fn(bound, args)
+
+
+def _enable_pool_path(
+    provider: LocalBenchmarkProvider,
+) -> contextlib.AbstractContextManager[object]:
+    """Put a stub provider on the precompile-pool path with no-op futures."""
+    provider.settings.autotune_precompile = "fork"
+    provider.config_spec.backend.supports_precompile = lambda: True
+    provider._jobs = 1
+    return patch.object(
+        provider,
+        "_create_precompile_future",
+        side_effect=lambda config, fn: PrecompileFuture.skip(
+            provider._precompile_context(), config, True
+        ),
+    )
+
+
+_REAL_PERF_COUNTER = time.perf_counter
+
+
+class _StubClock:
+    """``time.perf_counter`` stand-in: real time plus the seconds the stubs charge.
+
+    The compile and benchmark stubs below return at once, so each adds the
+    cost it stands in for to ``offset``; the budget checks read the sum.
+    """
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def now(self) -> float:
+        return _REAL_PERF_COUNTER() + self.offset
+
+
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@onlyBackends(["triton", "cute"])
+class TestBudgetedInitialPopulation(TestCase):
+    """The autotune budget expiring inside the initial population.
+
+    Compiles and timings are stubbed and charged to a stub clock, so a "10 s"
+    compile returns at once and every search here runs in well under a
+    second.  Each config's timing is a deterministic function of the config,
+    so two searches with one seed walk the same trajectory; the rebenchmark
+    passes are disabled so the stubbed timings are the ones the search ranks.
+    """
+
+    COMPILE_SECONDS = 10.0
+    BENCHMARK_SECONDS = 2.0
+    PER_CONFIG_SECONDS = COMPILE_SECONDS + BENCHMARK_SECONDS
+
+    def _make_bound(
+        self, **settings: object
+    ) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
+        @helion.kernel(
+            autotune_log_level=logging.CRITICAL,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_fn=operator.add,
+            autotune_random_seed=1234,
+            **settings,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        return add.bind(args), args
+
+    @staticmethod
+    def _perf(config: helion.Config) -> float:
+        return 1.0 + (zlib.crc32(repr(config).encode()) % 1000) / 1000
+
+    def _run(
+        self,
+        search: PopulationBasedSearch,
+        bound: object,
+        clock: _StubClock,
+        *,
+        compile_fails: Callable[[helion.Config], bool] | None = None,
+    ) -> SimpleNamespace:
+        compiled: list[helion.Config] = []
+        benchmarked: list[helion.Config] = []
+        batches: list[tuple[list[helion.Config], list[BenchmarkResult]]] = []
+
+        def compile_config(
+            config: helion.Config, *, allow_print: bool = True
+        ) -> Callable[..., object]:
+            clock.offset += self.COMPILE_SECONDS
+            compiled.append(config)
+            if compile_fails is not None and compile_fails(config):
+                raise exc.BackendUnsupported("test", "config unsupported")
+            return lambda *args, **kwargs: None
+
+        def benchmark_function(
+            config: helion.Config, fn: object, **kwargs: object
+        ) -> float:
+            # The real one counts every attempt first.
+            search._autotune_metrics.num_configs_tested += 1
+            clock.offset += self.BENCHMARK_SECONDS
+            benchmarked.append(config)
+            return self._perf(config)
+
+        real_benchmark_batch = search.benchmark_batch
+
+        def benchmark_batch(
+            configs: list[helion.Config], **kwargs: object
+        ) -> list[BenchmarkResult]:
+            results = real_benchmark_batch(configs, **kwargs)
+            batches.append((list(configs), list(results)))
+            return results
+
+        # No final selection: the search phase owns the whole budget.
+        search.final_selection = None
+        log = Mock(wraps=search.log)
+        with (
+            patch("time.perf_counter", clock.now),
+            patch.object(bound, "compile_config", side_effect=compile_config),
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function",
+                side_effect=benchmark_function,
+            ),
+            patch.object(search, "benchmark_batch", benchmark_batch),
+            patch.object(search, "rebenchmark", lambda *args, **kwargs: None),
+            patch.object(search, "log", log),
+        ):
+            best = search.autotune()
+        return SimpleNamespace(
+            best=best,
+            compiled=compiled,
+            benchmarked=benchmarked,
+            batches=batches,
+            messages=[str(call.args[0]) for call in log.call_args_list],
+        )
+
+    def _searches(
+        self,
+        bound: object,
+        args: tuple[torch.Tensor, torch.Tensor],
+        *,
+        initial_population: int,
+        max_generations: int = 1,
+    ) -> list[PopulationBasedSearch]:
+        kwargs = {
+            "initial_population": initial_population,
+            "copies": 1,
+            "max_generations": max_generations,
+        }
+        return [
+            PatternSearch(bound, args, **kwargs),
+            LFBOTreeSearch(bound, args, **kwargs),
+        ]
+
+    def test_budget_expiring_inside_the_initial_population_keeps_measured(
+        self,
+    ) -> None:
+        budget = 100
+        bound, args = self._make_bound(autotune_budget_seconds=budget)
+        for search in self._searches(bound, args, initial_population=12):
+            with self.subTest(search=type(search).__name__):
+                run = self._run(search, bound, _StubClock())
+                initial_configs, initial_results = run.batches[0]
+                self.assertEqual(len(initial_configs), 12)
+                measured = [r for r in initial_results if math.isfinite(r.perf)]
+                skipped = [r for r in initial_results if r.status == "skipped"]
+                # Half the budget pays for 4 configs of 12 s; the rest of the
+                # population is never compiled.
+                self.assertEqual(len(measured), 4)
+                self.assertEqual(len(measured) + len(skipped), 12)
+                self.assertEqual(initial_results[:4], measured)
+                # The search went on past the initial population and returned
+                # the best config it measured.
+                self.assertGreater(len(run.benchmarked), 4)
+                self.assertEqual(run.best, min(run.benchmarked, key=self._perf))
+                self.assertLessEqual(
+                    len(run.compiled) * self.PER_CONFIG_SECONDS,
+                    budget + self.PER_CONFIG_SECONDS,
+                )
+                cut = [
+                    m for m in run.messages if m.startswith("Initial population cut")
+                ]
+                self.assertEqual(len(cut), 1)
+                self.assertIn("4 of 12", cut[0])
+                self.assertIn(f"{self.PER_CONFIG_SECONDS:.1f}s per config", cut[0])
+                summary = [
+                    m for m in run.messages if m.startswith("Initial population:")
+                ]
+                self.assertEqual(len(summary), 1)
+                self.assertIn("4 of 4 configs measured", summary[0])
+                self.assertIn("8 not attempted", summary[0])
+                exceeded = [
+                    m for m in run.messages if "budget" in m and "exceeded" in m
+                ]
+                # Checked before every compile once the budget is out, logged once.
+                self.assertEqual(len(exceeded), 1)
+                self.assertIn("returning best-so-far", exceeded[0])
+
+    def test_initial_population_is_sized_to_the_measured_per_config_cost(
+        self,
+    ) -> None:
+        for budget, population in ((400, 100), (1000, 100), (1000, 30)):
+            bound, args = self._make_bound(autotune_budget_seconds=budget)
+            affordable = int(0.5 * budget // self.PER_CONFIG_SECONDS)
+            expected = min(population, affordable)
+            for search in self._searches(bound, args, initial_population=population):
+                with self.subTest(
+                    search=type(search).__name__, budget=budget, population=population
+                ):
+                    run = self._run(search, bound, _StubClock())
+                    _initial_configs, initial_results = run.batches[0]
+                    measured = [r for r in initial_results if math.isfinite(r.perf)]
+                    self.assertEqual(len(measured), expected)
+                    cut = [
+                        m
+                        for m in run.messages
+                        if m.startswith("Initial population cut")
+                    ]
+                    self.assertEqual(len(cut), int(expected < population))
+
+    def test_an_ample_budget_keeps_the_search_trajectory(self) -> None:
+        for budget in (None, 10**6):
+            bound, args = self._make_bound(autotune_budget_seconds=budget)
+            for search in self._searches(
+                bound, args, initial_population=10, max_generations=3
+            ):
+                run = self._run(search, bound, _StubClock())
+                name = type(search).__name__
+                with self.subTest(search=name, budget=budget):
+                    _initial_configs, initial_results = run.batches[0]
+                    self.assertEqual(len(initial_results), 10)
+                    self.assertFalse(
+                        [r for r in initial_results if r.status == "skipped"]
+                    )
+                    self.assertFalse(
+                        [
+                            m
+                            for m in run.messages
+                            if "exceeded" in m or m.startswith("Initial population cut")
+                        ]
+                    )
+                trajectory = (run.compiled, run.benchmarked, run.best)
+                if budget is None:
+                    unbudgeted = getattr(self, "_unbudgeted", {})
+                    unbudgeted[name] = trajectory
+                    self._unbudgeted = unbudgeted
+                else:
+                    with self.subTest(search=name, budget=budget):
+                        self.assertEqual(trajectory, self._unbudgeted[name])
+
+    def test_compile_failures_are_summarized_even_when_errors_are_ignored(
+        self,
+    ) -> None:
+        bound, args = self._make_bound(
+            autotune_budget_seconds=1000, autotune_ignore_errors=True
+        )
+        (search,) = self._searches(bound, args, initial_population=10)[:1]
+        seen: dict[helion.Config, int] = {}
+
+        def every_other_compile_fails(config: helion.Config) -> bool:
+            return seen.setdefault(config, len(seen)) % 2 == 1
+
+        run = self._run(
+            search, bound, _StubClock(), compile_fails=every_other_compile_fails
+        )
+        summary = [m for m in run.messages if m.startswith("Initial population:")]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("5 of 10 configs measured", summary[0])
+        self.assertIn("5 failed to compile or run", summary[0])
+        # Five configs cost a compile only, five a compile and a benchmark.
+        per_config = (5 * self.COMPILE_SECONDS + 5 * self.PER_CONFIG_SECONDS) / 10
+        self.assertIn(f"{per_config:.1f}s per config", summary[0])
+        self.assertIn("0 not attempted", summary[0])
+
+    def _seed_configs(self, search: PopulationBasedSearch) -> set[helion.Config]:
+        return {
+            search.config_gen.canonicalize_flat(flat)[1]
+            for flat in search._generate_initial_population_flat()
+        }
+
+    def test_differential_evolution_quick_population_keeps_its_fallback(
+        self,
+    ) -> None:
+        # The quick profile's seed-only population: every seed fails to
+        # compile under a budget, so the random fallback has to survive the
+        # batch, get its own share of the budget, and lead the search.
+        bound, args = self._make_bound(autotune_budget_seconds=200)
+        search = DifferentialEvolutionSearch(
+            bound,
+            args,
+            population_size=6,
+            max_generations=1,
+            initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+            best_available_pad_random=False,
+        )
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            seeds = self._seed_configs(search)
+            run = self._run(
+                search,
+                bound,
+                _StubClock(),
+                compile_fails=lambda config: config in seeds,
+            )
+        self.assertNotIn(run.best, seeds)
+        self.assertEqual(run.best, min(run.benchmarked, key=self._perf))
+        self.assertFalse([m for m in search.population if m.status == "skipped"])
+        self.assertEqual(sum(math.isfinite(m.perf) for m in search.population), 6)
+        population_statistics(search.population)
+        summaries = [
+            m
+            for m in run.messages
+            if m.startswith(("Initial population:", "Random fallback population:"))
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertIn(
+            f"{len(seeds)} failed to compile or run (first: BackendUnsupported: "
+            "Backend 'test' does not support: config unsupported)",
+            summaries[0],
+        )
+        # Half of the 200 s budget counted from the fallback's own start (the
+        # seeds' 10 s compiles are not charged to it) pays for eight 12 s
+        # configs; the fallback is cut there, not after two configs.
+        self.assertIn(
+            "Random fallback population: 8 of 8 configs measured", summaries[1]
+        )
+
+    def test_differential_evolution_random_population_is_cut(self) -> None:
+        bound, args = self._make_bound(autotune_budget_seconds=100)
+        search = DifferentialEvolutionSearch(
+            bound,
+            args,
+            population_size=12,
+            max_generations=1,
+            initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+        )
+        run = self._run(search, bound, _StubClock())
+        initial_configs, initial_results = run.batches[0]
+        self.assertEqual(len(initial_configs), 24)
+        self.assertEqual(sum(1 for r in initial_results if math.isfinite(r.perf)), 4)
+        cut = [m for m in run.messages if m.startswith("Initial population cut")]
+        self.assertEqual(len(cut), 1)
+        self.assertIn("4 of 24", cut[0])
+        # The never-attempted configs are dropped rather than kept as failures.
+        self.assertEqual(len(search.population), 4)
+        self.assertFalse([m for m in search.population if m.status == "skipped"])
+        self.assertEqual(run.best, min(run.benchmarked, key=self._perf))
+
+    def test_cut_respects_the_initial_population_floor(self) -> None:
+        bound, args = self._make_bound(autotune_budget_seconds=100)
+        search = PatternSearch(
+            bound, args, initial_population=12, copies=1, max_generations=1
+        )
+        # Half the budget pays for four configs, but the surface needs seven.
+        with patch.object(search, "_initial_population_floor", return_value=7):
+            run = self._run(search, bound, _StubClock())
+        cut = [m for m in run.messages if m.startswith("Initial population cut")]
+        self.assertEqual(len(cut), 1)
+        self.assertIn("7 of 12", cut[0])
+        _initial_configs, initial_results = run.batches[0]
+        self.assertEqual(sum(1 for r in initial_results if math.isfinite(r.perf)), 7)
+
+    def test_initial_population_floor_follows_the_flash_qualification_prefix(
+        self,
+    ) -> None:
+        bound, args = self._make_bound()
+        search = PatternSearch(bound, args, initial_population=12)
+        self.assertEqual(search._initial_population_floor(12), 0)
+        flash = SimpleNamespace(
+            config_spec=SimpleNamespace(cute_flash_search_enabled=True),
+            config_gen=SimpleNamespace(
+                flash_structural_qualification_prefix_count=lambda: 9
+            ),
+        )
+        floor = PopulationBasedSearch._initial_population_floor
+        self.assertEqual(floor(flash, 12), 9)  # pyrefly: ignore[bad-argument-type]
+        self.assertEqual(floor(flash, 5), 5)  # pyrefly: ignore[bad-argument-type]
+        self.assertEqual(floor(flash, 0), 0)  # pyrefly: ignore[bad-argument-type]
+
+    def test_cut_batch_keeps_the_first_compile_error(self) -> None:
+        # Compiles that fail after 30 s each under a 100 s budget: the batch
+        # stops long before its last config, where the error used to surface,
+        # yet the real compile error is what the search raises.
+        bound, args = self._make_bound(autotune_budget_seconds=100)
+        search = PatternSearch(
+            bound, args, initial_population=12, copies=1, max_generations=1
+        )
+        with (
+            patch.object(self, "COMPILE_SECONDS", 30.0),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "does not support: config unsupported"
+            ),
+        ):
+            self._run(search, bound, _StubClock(), compile_fails=lambda config: True)
+
+
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@onlyBackends(["triton", "cute"])
+class TestBudgetStopsBatches(TestCase):
+    """``LocalBenchmarkProvider.benchmark`` around an exhausted budget.
+
+    Compiles and timings are stubbed; ``events`` records the order in which
+    the provider compiles and times configs.
+    """
+
+    def _prepare(
+        self, **settings: object
+    ) -> tuple[
+        PatternSearch, object, list[tuple[str, helion.Config]], list[helion.Config]
+    ]:
+        @helion.kernel(
+            autotune_log_level=logging.CRITICAL,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_fn=operator.add,
+            autotune_random_seed=1234,
+            autotune_progress_bar=False,
+            **settings,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        bound = add.bind(args)
+        search = PatternSearch(
+            bound, args, initial_population=6, copies=1, max_generations=1
+        )
+        search._prepare()
+        configs = [
+            search.config_gen.unflatten(flat)
+            for flat in search._pad_initial_population_with_unique_random([], 6)
+        ]
+        return search, bound, [], configs
+
+    @contextlib.contextmanager
+    def _stubbed(
+        self,
+        search: PatternSearch,
+        bound: object,
+        events: list[tuple[str, helion.Config]],
+        *,
+        perf: Callable[[helion.Config], float],
+    ) -> Iterator[None]:
+        def compile_config(
+            config: helion.Config, *, allow_print: bool = True
+        ) -> Callable[..., object]:
+            events.append(("compile", config))
+            return lambda *args, **kwargs: None
+
+        def benchmark_function(
+            config: helion.Config, fn: object, **kwargs: object
+        ) -> float:
+            # The real one counts every attempt first.
+            search._autotune_metrics.num_configs_tested += 1
+            events.append(("bench", config))
+            return perf(config)
+
+        with (
+            patch.object(bound, "compile_config", side_effect=compile_config),
+            patch.object(
+                search.benchmark_provider,
+                "_benchmark_function",
+                side_effect=benchmark_function,
+            ),
+        ):
+            yield
+
+    def test_without_a_pool_each_config_is_timed_right_after_its_compile(
+        self,
+    ) -> None:
+        search, bound, events, configs = self._prepare(autotune_precompile=None)
+        with self._stubbed(search, bound, events, perf=lambda config: 1.0):
+            results = search.benchmark_provider.benchmark(configs)
+        self.assertEqual(
+            events, [(kind, c) for c in configs for kind in ("compile", "bench")]
+        )
+        self.assertEqual([r.status for r in results], ["ok"] * len(configs))
+        # Streaming records the inline compile wall time.
+        self.assertTrue(all(r.compile_time is not None for r in results))
+        self.assertEqual(search.benchmark_provider.batch_configs_started, 6)
+
+    def test_an_exhausted_budget_still_measures_the_first_config(self) -> None:
+        search, bound, events, configs = self._prepare(
+            autotune_precompile=None, autotune_budget_seconds=1
+        )
+        search._autotune_budget_start = time.perf_counter() - 10.0
+        log = Mock(wraps=search.log)
+        with (
+            patch.object(search, "log", log),
+            self._stubbed(search, bound, events, perf=lambda config: 1.0),
+        ):
+            results = search.benchmark_provider.benchmark(configs)
+        self.assertEqual(events, [("compile", configs[0]), ("bench", configs[0])])
+        self.assertEqual(results[0].status, "ok")
+        self.assertEqual([r.status for r in results[1:]], ["skipped"] * 5)
+        self.assertTrue(all(math.isinf(r.perf) for r in results[1:]))
+        self.assertEqual(search.benchmark_provider.batch_configs_started, 1)
+        # The cutoff is logged, and its promise holds: a config was measured.
+        exceeded = [
+            str(call.args[0])
+            for call in log.call_args_list
+            if "exceeded" in str(call.args[0])
+        ]
+        self.assertEqual(len(exceeded), 1)
+        self.assertIn("returning best-so-far", exceeded[0])
+        # With a measurement in hand, a later batch is skipped outright.
+        events.clear()
+        with self._stubbed(search, bound, events, perf=lambda config: 1.0):
+            later = search.benchmark_provider.benchmark(configs[:2])
+        self.assertEqual(events, [])
+        self.assertEqual([r.status for r in later], ["skipped", "skipped"])
+
+    def test_with_a_pool_compiled_configs_are_timed_until_one_succeeds(
+        self,
+    ) -> None:
+        search, bound, events, configs = self._prepare(autotune_precompile="fork")
+        provider = search.benchmark_provider
+        if not provider.compiles_ahead:
+            self.skipTest("the backend has no precompile pool")
+        # The budget runs out after four compiles; the first compiled config
+        # then fails at runtime and the second works.
+        provider.set_budget_exceeded_fn(
+            lambda: sum(1 for kind, _ in events if kind == "compile") >= 4
+        )
+        perfs = {configs[0]: math.inf, configs[1]: 1.0}
+        with (
+            patch.object(
+                provider,
+                "_create_precompile_future",
+                side_effect=lambda config, fn: PrecompileFuture.skip(
+                    provider._precompile_context(), config, True
+                ),
+            ),
+            self._stubbed(
+                search, bound, events, perf=lambda config: perfs.get(config, 2.0)
+            ),
+        ):
+            results = provider.benchmark(configs)
+        self.assertEqual([c for kind, c in events if kind == "compile"], configs[:4])
+        self.assertEqual([c for kind, c in events if kind == "bench"], configs[:2])
+        self.assertEqual(
+            [r.status for r in results],
+            ["error", "ok", "skipped", "skipped", "skipped", "skipped"],
+        )
 
 
 if __name__ == "__main__":

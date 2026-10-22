@@ -30,7 +30,10 @@ This generalizes the CuTe flash-attention family in three directions:
   ``[rows, D, lanes]`` tensor; the per-CTA tiles are addressed with
   ``cute.domain_offset`` so partial tiles past the end of the tensor are
   zero-filled by TMA.  fp32 rows run the MMA as tf32 (Helion's default
-  ``dot_precision``).
+  ``dot_precision``). Explicit whole-row masks are admitted when they are
+  the jagged bounds already enforced by the gate; masked V tail rows are
+  zeroed in shared memory before PV so neighboring sequences cannot poison
+  valid output through ``0 * NaN``.
 * **Roles.** The body is warp-specialized: one TMA/MMA producer warp and
   ``cute_flash_gate_warpgroups`` 128-thread gate warpgroups that split every
   KV tile chunk-wise (the K/V ring depth ``cute_flash_kv_stage`` and the KV
@@ -406,6 +409,7 @@ class GatedRowAccess:
     # ``x[tile, :, :]``: every lane of the lane dim (the kernel batches the
     # matmuls over it); the fused body handles one lane per CTA.
     lane_all: bool = False
+    extra_mask: torch.fx.Node | None = None
 
     @property
     def lane_key(self) -> tuple[object, ...]:
@@ -448,6 +452,7 @@ class GatedAttentionMatch:
     q_begin: object = 0
     q_end: object = None
     lane_extent: int | None = None
+    v_row_bound: torch.fx.Node | None = None
 
     @property
     def leading_block_ids(self) -> tuple[int, ...]:
@@ -785,6 +790,7 @@ def _parse_row_access(
     *,
     row_block_id: int,
     leading_block_ids: tuple[int, ...],
+    allow_row_mask: bool = False,
 ) -> GatedRowAccess | None:
     """Match ``load/store(x, [tile.index + off, lane, :])`` on a rank-3 tensor."""
     if node.op != "call_function" or node.target not in (
@@ -799,10 +805,23 @@ def _parse_row_access(
     if not isinstance(indices, (list, tuple)) or len(indices) != 3:
         return None
     if node.target is memory_ops.load:
-        if len(node.args) < 4 or node.args[2] is not None or node.args[3] is not None:
+        if len(node.args) < 4 or node.args[3] is not None:
             return None
-    elif len(node.args) > 3 and node.args[3] is not None:
-        return None
+        extra_mask = node.args[2]
+    else:
+        extra_mask = node.args[3] if len(node.args) > 3 else None
+    if extra_mask is not None:
+        if not allow_row_mask or not isinstance(extra_mask, torch.fx.Node):
+            return None
+        mask_val = _node_val(extra_mask)
+        if (
+            not isinstance(mask_val, torch.Tensor)
+            or mask_val.dtype != torch.bool
+            or mask_val.ndim != 2
+            or env.get_block_id(mask_val.shape[0]) != row_block_id
+            or mask_val.shape[1] != 1
+        ):
+            return None
     if not _is_full_slice(indices[2]):
         return None
     if _is_full_slice(indices[1]):
@@ -889,6 +908,7 @@ def _parse_row_access(
         lane_constant,
         offset,
         tuple(consumed),
+        extra_mask=extra_mask,
     )
 
 
@@ -1549,7 +1569,12 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     if not isinstance(q_load, torch.fx.Node):
         return None
     q_access = _parse_row_access(
-        env, scope, q_load, row_block_id=q_block_id, leading_block_ids=leading_block_ids
+        env,
+        scope,
+        q_load,
+        row_block_id=q_block_id,
+        leading_block_ids=leading_block_ids,
+        allow_row_mask=True,
     )
     k_access = _parse_row_access(
         env,
@@ -1557,6 +1582,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         k_load,
         row_block_id=kv_block_id,
         leading_block_ids=leading_block_ids,
+        allow_row_mask=True,
     )
     v_access = _parse_row_access(
         env,
@@ -1564,6 +1590,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         v_load,
         row_block_id=kv_block_id,
         leading_block_ids=leading_block_ids,
+        allow_row_mask=True,
     )
     o_access = _parse_row_access(
         env,
@@ -1571,6 +1598,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         store_node,
         row_block_id=q_block_id,
         leading_block_ids=leading_block_ids,
+        allow_row_mask=True,
     )
     if q_access is None or k_access is None or v_access is None or o_access is None:
         return None
@@ -1743,6 +1771,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     # fused body skips it. Every other row-only term keeps the frontend
     # semantics: the gate zeroes P, so the zero accumulator is stored.
     store_skip_terms: list[torch.fx.Node] = []
+    jagged_mask_blocks: set[int] = set()
     gate = p_node
     while isinstance(gate, torch.fx.Node) and gate.op == "call_function":
         if gate.target is _tracing_ops._mask_to or gate.target in _CONVERT_TARGETS:
@@ -1759,17 +1788,57 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             resolved = _strip_views(term, scope)
             if not isinstance(resolved, torch.fx.Node):
                 continue
-            if checker.domains.get(resolved) != frozenset({_Q_ROW}):
-                continue
-            if _is_jagged_length_term(
+            for block_id, domain in (
+                (q_block_id, _Q_ROW),
+                (kv_block_id, _KV_COL),
+            ):
+                if checker.domains.get(resolved) != frozenset({domain}):
+                    continue
+                if _is_jagged_length_term(
+                    env,
+                    scope,
+                    resolved,
+                    row_offset=q_access.offset,
+                    q_block_id=block_id,
+                    leading_block_ids=leading_block_ids,
+                ):
+                    jagged_mask_blocks.add(block_id)
+                    if block_id == q_block_id:
+                        store_skip_terms.append(resolved)
+
+    # Explicit row masks must be the same sequence bounds already enforced
+    # by the gate. Q/K masked rows cannot affect retained scores or stores;
+    # masked V rows are zeroed before PV so 0 * NaN cannot poison valid rows.
+    v_row_bound: torch.fx.Node | None = None
+    for access, block_id, domain in (
+        (q_access, q_block_id, _Q_ROW),
+        (k_access, kv_block_id, _KV_COL),
+        (v_access, kv_block_id, _KV_COL),
+        (o_access, q_block_id, _Q_ROW),
+    ):
+        if access.extra_mask is None:
+            continue
+        mask = _strip_views(access.extra_mask, scope)
+        if (
+            block_id not in jagged_mask_blocks
+            or checker.check(access.extra_mask) != frozenset({domain})
+            or not isinstance(mask, torch.fx.Node)
+            or not _is_jagged_length_term(
                 env,
                 scope,
-                resolved,
-                row_offset=q_access.offset,
-                q_block_id=q_block_id,
+                mask,
+                row_offset=access.offset,
+                q_block_id=block_id,
                 leading_block_ids=leading_block_ids,
-            ):
-                store_skip_terms.append(resolved)
+            )
+        ):
+            return None
+        if access is v_access:
+            bound = scope.resolve(
+                mask.args[1] if mask.target in _LT_TARGETS else mask.args[0]
+            )
+            assert isinstance(bound, torch.fx.Node)
+            v_row_bound = bound
 
     # Whole-graph audit: every call in the root, ``if`` and loop graphs must be
     # a matched structural node, part of a checked program, or a pure leaf.
@@ -1821,6 +1890,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         p_node=p_node,
         store_skip_terms=tuple(store_skip_terms),
         scope=scope,
+        v_row_bound=v_row_bound,
     )
 
 
@@ -3032,7 +3102,13 @@ def _gated_prologue_loads(kv_stage: int, *, indent: str, q_tile: str) -> str:
     return "\n".join(indent + line for line in lines)
 
 
-def _gated_producer_body(kv_stage: int, item_section: str) -> str:
+def _gated_producer_body(
+    kv_stage: int,
+    item_section: str,
+    *,
+    kv_tile: int,
+    v_row_bound: str | None = None,
+) -> str:
     """Warp 0: per work item the tcgen05 MMAs and the steady-state K/V ring over
     a runtime KV count (item 0's Q load and first ring loads were issued during
     setup; later items issue their own at the head of the item)."""
@@ -3053,9 +3129,17 @@ def _gated_producer_body(kv_stage: int, item_section: str) -> str:
     # ONCE after the last PV (``tcgen05.commit`` fires when every prior MMA has
     # completed); a per-tile acquire would wait for a consumer release that
     # only happens in the epilogue.
+    v_mask = (
+        ""
+        if v_row_bound is None
+        else f"""
+                _helion_flash_rt.gated_zero_v_tail(
+                    sV, flash_v_full.index,
+                    {v_row_bound} - flash_kv * cutlass.Int32({kv_tile}))"""
+    )
     pv_current = f"""
                 flash_p_full = flash_p_ready_cons.wait_and_advance()
-                flash_v_full = flash_v_cons.wait_and_advance()
+                flash_v_full = flash_v_cons.wait_and_advance(){v_mask}
                 flash_first_acc = flash_o_started
                 if (flash_p_idx % 2) == 0:
                     for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
@@ -3691,6 +3775,11 @@ def _emit_gated_flash_device_body(
             lane_expr = f"cutlass.Int32({match.q.lane_constant})"
     predicate_value = emitter.emit(match.if_predicate)
     row_terms = [_to_b(emitter.emit(term)) for term in match.store_skip_terms]
+    v_row_bound = (
+        None
+        if match.v_row_bound is None
+        else f"cutlass.min({_to_i(emitter.emit(match.v_row_bound))}, {kv_end_expr})"
+    )
     p_value = emitter.emit(match.p_node)
     p_expr = emitter.finish_elem_section(p_value)
     # KV tiles past the columns the P mask provably zeroes are skipped.
@@ -3762,7 +3851,13 @@ def _emit_gated_flash_device_body(
         mma_dtype=mma_dtype,
         gate_warpgroups=plan.gate_warpgroups,
     )
-    core = _gated_producer_body(plan.kv_stage, item_section) + "\n" + consumer
+    core = (
+        _gated_producer_body(
+            plan.kv_stage, item_section, kv_tile=bn, v_row_bound=v_row_bound
+        )
+        + "\n"
+        + consumer
+    )
     # An inactive CTA still allocated TMEM: its gate warps arrive on the
     # teardown barrier so warp 1 can free it.
     inactive = (
