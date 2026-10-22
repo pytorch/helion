@@ -9,6 +9,10 @@ from typing import cast
 from ...runtime.config import Config
 from ..compile_environment import CompileEnvironment
 from ..cute.cute_mma_dag import AXIS_ROOT
+from ..cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from ..cute.cute_mma_dag import MMA_DAG_AUX_RING
+from ..cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
+from ..cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
@@ -19,6 +23,9 @@ from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from ..cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from ..cute.cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
+from ..cute.cute_mma_dag import MMA_DAG_SPLIT_FIXUP
+from ..cute.cute_mma_dag import MMA_DAG_SPLIT_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_DIRECT
 from ..cute.cute_mma_dag import MMA_DAG_STORE_KEY
@@ -28,11 +35,13 @@ from ..cute.cute_mma_dag import MMA_DAG_WARP
 from ..cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from ..cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute.cute_mma_dag import CuteMmaDagFacts
+from ..cute.cute_mma_dag import fixup_admitted
 from ..cute.cute_mma_dag import mma_dag_config_reason
 from ..cute.cute_mma_dag import mma_dag_pass_warps_lead
 from ..cute.cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute.cute_mma_dag import mma_dag_seed_configs
 from ..cute.cute_mma_dag import mma_dag_seed_variants
+from .cute_launch_bounds import MIN_BLOCKS_KEY
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -89,7 +98,12 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             program = match_mma_dag(device_ir.graphs)
             if program is None:
                 return None
-            return mma_dag_facts(program)
+            facts = mma_dag_facts(program)
+            if facts.chain_vecs and facts.tcgen05 is None:
+                # Only the tensor-memory region renderer lowers a fragment
+                # chain over a row vector: no mode would run the program.
+                return None
+            return facts
 
     @classmethod
     def register_facts(
@@ -113,6 +127,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         facts = spec.cute_mma_dag_facts
         if facts is None or spec.cute_mma_dag is None:
             return None
+        from ..cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_persistent_ctas
         from ..cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 
@@ -148,9 +163,16 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         # 278 vs 130; bwd_o_kda's per-iteration operand 127 vs 95) or a root
         # tile (fwd_o_anch 47 vs 35) keeps the warp mode first: the
         # tensor-memory chain of commit waits runs behind it there.
+        # The ranked tensor-memory seeds, then (region programs) the far
+        # corner of their tile / warp / stage box: see ``tcgen05_corner_seeds``.
+        tcgen05_ranked = tcgen05_seed_configs(facts)
+        tcgen05_top = tcgen05_ranked[: cls.SEED_TCGEN05]
         tensor_memory = [
             (MMA_DAG_TCGEN05, seed, MMA_DAG_EXCHANGE_AUTO)
-            for seed in tcgen05_seed_configs(facts)[: cls.SEED_TCGEN05]
+            for seed in [
+                *tcgen05_top,
+                *tcgen05_corner_seeds(facts, tcgen05_ranked, tcgen05_top),
+            ]
         ]
         ladder = mma_dag_seed_configs(facts)[: cls.SEED_TILES]
         warp = [(MMA_DAG_WARP, seed, MMA_DAG_EXCHANGE_AUTO) for seed in ladder]
@@ -251,7 +273,58 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 config[MMA_DAG_EXCHANGE_KEY] = exchange
             if index in persistent:
                 config[MMA_DAG_PERSISTENT_KEY] = persistent[index]
+            # A seed slicing the cluster-split axis names its cluster, and
+            # launches as a programmatic dependent: the region renderer's
+            # prologue (barriers, tensor memory, the cluster sync) then
+            # overlaps the previous kernel and its epilogue the next one's
+            # prologue (matmul_layernorm, 16-call per-call us on a B200:
+            # 4.10 -> 3.46 at (128, 256, 256), 7.17 -> 6.67 at (512, 1024,
+            # 1024), unchanged at 2048^3).
+            cluster = facts.cluster_of(sizes)
+            if cluster > 1:
+                config[MMA_DAG_CLUSTER_KEY] = cluster
+                if mode == MMA_DAG_TCGEN05:
+                    config["cute_pdl"] = True
+                    # Both ways of combining the split's rows: the cluster
+                    # (a portable one) first, the fixup grid behind it where
+                    # the program admits it; a split wider than a cluster is
+                    # the fixup grid alone.
+                    if cluster <= MMA_DAG_CLUSTER_MAX:
+                        seeds.append(
+                            Config.from_dict(
+                                {**config, MMA_DAG_SPLIT_KEY: MMA_DAG_SPLIT_CLUSTER}
+                            )
+                        )
+                    if fixup_admitted(facts):
+                        seeds.append(
+                            Config.from_dict(
+                                {**config, MMA_DAG_SPLIT_KEY: MMA_DAG_SPLIT_FIXUP}
+                            )
+                        )
+                    continue
             seeds.append(Config.from_dict(config))
+        if facts.aux_candidates:
+            # The top warp seed again with the loop-varying side loads staged
+            # through the operand ring (gated fwd_h behind the writer of its
+            # gates in the mamba2 ssd pipeline: the fresh-line stall of the
+            # per-thread loads leaves the serial chain).
+            for at, seed in enumerate(seeds):
+                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP:
+                    ring = {**seed.config, MMA_DAG_AUX_KEY: MMA_DAG_AUX_RING}
+                    seeds.insert(at + 1, Config.from_dict(ring))
+                    break
+        if spec.supports_config_key(MIN_BLOCKS_KEY):
+            # The top warp seed again with the one-CTA occupancy hint: ptxas
+            # otherwise budgets registers for the CTAs the shared-memory
+            # footprint admits, and a single-wave kernel gains nothing from
+            # that occupancy (chunk_scan at s1, 256 CTAs: 4.22 -> 3.95 us
+            # with the hint on the same tile / warps / stages; the search
+            # found it in one of three cold draws).
+            for at, seed in enumerate(seeds):
+                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP:
+                    hinted = {**seed.config, MIN_BLOCKS_KEY: 1}
+                    seeds.insert(at + 1, Config.from_dict(hinted))
+                    break
         return seeds or None
 
     @classmethod

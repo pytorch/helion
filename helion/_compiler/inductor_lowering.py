@@ -58,6 +58,7 @@ from .compile_environment import _symint_sympy_expr
 from .cute.cute_reshape import REBOUND_CHECK_TARGETS
 from .cute.cute_reshape import check_pointwise_rebound_block_ids
 from .cute.view_subtile import check_view_coord_consumers
+from .device_function import DeviceFunction
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -74,7 +75,6 @@ if TYPE_CHECKING:
     from .cute.layout import MatmulAxisModel
     from .cute.layout import MatmulExecutionPlan
     from .cute.layout import ThreadLayout
-    from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
@@ -1447,6 +1447,23 @@ class GenerateASTFromInductor(DefaultHandler):
                 x=self._to_ast(x),
             )
             return self._lift(cast_expr)
+        if (
+            dtype is torch.float32
+            and CompileEnvironment.current().backend.name == "cute"
+        ):
+            # A 16-bit value the mma_dag emitters hold exactly in fp32 (an
+            # unpacked tile element, a widening side load) widens to that
+            # value, not through a cast pair.  The record lives on the
+            # device function's cute state; a lowering driven by a stand-in
+            # device function (the flex score-mod lowering's tests) has none.
+            device_function = self.cg.device_function
+            x_ast = self._to_ast(x)
+            if isinstance(device_function, DeviceFunction) and isinstance(
+                x_ast, ast.Name
+            ):
+                exact = device_function.cute_state.mma_dag_exact_f32.get(x_ast.id)
+                if exact is not None:
+                    return self._lift(expr_from_string(exact))
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 

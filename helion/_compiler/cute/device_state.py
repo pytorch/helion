@@ -697,6 +697,10 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # A trailing grid dim of CTAs forming one thread-block cluster per
+        # program id (the ``cute_mma_dag`` cluster split of a full-slice
+        # axis); 1 for an ordinary launch.
+        self.grid_cluster_n: int = 1
         # Lane loops claimed by a register/shuffle ``hl.associative_scan``
         # lowering, mapped to the direction (``True`` = reverse) their lanes
         # are visited in.  A second scan over the same lane loop must agree
@@ -931,6 +935,11 @@ class CuteDeviceFunctionState:
         # stage selection; the dedicated codegen owns the matched root and
         # the launch runs ``32 * warps`` threads per CTA.
         self.mma_dag_plan: MmaDagPlan | None = None
+        # The mma_dag emitters' 16-bit-typed values whose fp32 widening is
+        # already at hand (name -> the exact fp32 expression: an unpacked
+        # tile element, a widening side load): the pointwise lowering's
+        # ``to_dtype(x, float32)`` takes it instead of a cast round trip.
+        self.mma_dag_exact_f32: dict[str, str] = {}
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

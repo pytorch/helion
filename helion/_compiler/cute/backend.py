@@ -1770,9 +1770,13 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
         from .cute_mma_dag import MMA_DAG_KEY
+        from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
+        from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
         from .cute_mma_dag import MMA_DAG_WARP
+        from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
 
         facts = config_spec.cute_mma_dag_facts
@@ -1802,6 +1806,16 @@ class CuteBackend(Backend):
                 ]
             except (KeyError, IndexError):
                 return True
+        if (
+            apply_mma_dag_cluster(
+                facts,
+                sizes,
+                config.config.get(MMA_DAG_CLUSTER_KEY, 1),
+                config.config.get(MMA_DAG_SPLIT_KEY, MMA_DAG_SPLIT_CLUSTER),
+            )
+            is not None
+        ):
+            return False
         return (
             mma_dag_config_reason(
                 facts,
@@ -2144,7 +2158,10 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_exchange"
             or key == "cute_mma_dag_pass_warps"
             or key == "cute_mma_dag_loads"
+            or key == "cute_mma_dag_aux"
             or key == "cute_mma_dag_persistent"
+            or key == "cute_mma_dag_cluster"
+            or key == "cute_mma_dag_split"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )

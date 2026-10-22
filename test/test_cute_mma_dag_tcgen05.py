@@ -760,14 +760,14 @@ def test_gated_epilogue_side_loads_go_out_under_the_last_mmas() -> None:
     loads = [line.strip() for line in guarded.splitlines() if line.strip()]
     assert len(loads) == 33
     assert re.fullmatch(
-        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
+        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4(?:, nc=True)?\)",
         loads[0],
     )
     assert re.fullmatch(
-        rf"md_ex1 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_cb1 \+ 0\) \* 4\)",
+        rf"md_ex1 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_cb1 \+ 0\) \* 4(?:, nc=True)?\)",
         loads[1],
     )
-    assert loads[32].startswith("md_ex32 = ") and "(md_cb1 + 31) * 4)" in loads[32]
+    assert loads[32].startswith("md_ex32 = ") and "(md_cb1 + 31) * 4" in loads[32]
     assert "ldg_" not in epilogue
     reads = collections.Counter(re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE))
     assert reads["md_ex0"] == 2
@@ -1175,12 +1175,13 @@ def test_epilogue_prefetch_keeps_the_rows_and_a_half_row_of_columns() -> None:
     loads = [line.strip() for line in guarded.splitlines() if line.strip()]
     assert len(loads) == 1 and "md_ex1" not in body
     assert re.fullmatch(
-        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row128\) \* 4\)",
+        rf"md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row128\) \* 4(?:, nc=True)?\)",
         loads[0],
     )
     assert epilogue.count(f"{WARP_RT}.ldg_f32(") == 128
     columns = re.findall(
-        rf"{WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\((\d+)\) \* 4\)", epilogue
+        rf"{WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\((\d+)\) \* 4(?:, nc=True)?\)",
+        epilogue,
     )
     assert columns == [str(j) for j in range(1, 128)]
     reads = collections.Counter(re.findall(r"= (md_ex\d+)$", epilogue, re.MULTILINE))
@@ -1211,7 +1212,7 @@ def test_the_program_order_loop_prefetches_the_epilogue_row_after_the_loop() -> 
     loop, epilogue = rest.split(f"{RT}.mbar_wait(md_accb, 4 - 0 - 1 & 1)", 1)
     assert "md_ex" not in loop.rstrip().rsplit("\n", 1)[0]
     assert re.fullmatch(
-        rf"    md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4\)",
+        rf"    md_ex0 = {WARP_RT}\.ldg_f32\(md_base_\d+ \+ cutlass\.Int64\(md_row64\) \* 4(?:, nc=True)?\)",
         loop.rstrip().rsplit("\n", 1)[1],
     )
     assert "ldg_" not in epilogue
@@ -1283,7 +1284,9 @@ def test_loop_invariant_scalar_side_loads_go_out_ahead_of_the_loop() -> None:
     bound = _bind_fn(helion_mamba2_chunk_state_kernel.fn, _chunk_state_inputs())
     body = _kernel_body(_source(bound, _config(64, 64, 128, warps=4, stages=1)))
     loop = body.index("for md_i in cutlass.range(")
-    scalar = re.findall(rf"md_sl\w* = {WARP_RT}\.ldg_bf16_as_f32\(md_base_\d+\)", body)
+    scalar = re.findall(
+        rf"md_sl\w* = {WARP_RT}\.ldg_bf16_as_f32\(md_base_\d+(?:, nc=True)?\)", body
+    )
     assert len(scalar) == 1, body
     assert body.index(scalar[0]) < loop
     assert f"{WARP_RT}.ldg_bf16_as_f32(md_base_" not in body[loop:]
@@ -1568,7 +1571,12 @@ def test_renders_wy_dl_sequential_loops_and_vector_carries() -> None:
     # Three rings, no staged region (A_inv's tile is hoisted by the
     # synchronous pass... through TMA: the root barrier), four vector
     # registers.
-    assert body.count("cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)") == 3
+    # md_cb, the two rings' full barriers and the streaming loop's empty
+    # barriers (loop 1: one batch of dots over ring tiles, nothing else).
+    assert body.count("cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)") == 4
+    assert re.search(
+        r"md_empty\d = cute\.arch\.alloc_smem\(cutlass\.Int64, 2, alignment=8\)", body
+    )
     for slot in range(4):
         assert f"md_vv{slot} = cutlass.Float32(0.0)" in body
     first, rest = _split_loop(body, "md_i")
@@ -4384,8 +4392,8 @@ def test_pass_warps_pace_sync_route_pass_tiles_on_the_free_barrier() -> None:
 def test_the_loads_knob_routes_derived_tile_inputs_through_the_ring() -> None:
     # ``cute_mma_dag_loads``: ``tma`` (first choice, the default) fetches
     # dk's seed tiles into the ring; ``lane`` keeps the per-lane global pair
-    # loads (and the shared memory); the knob is inert off the tensor-memory
-    # region programs with such inputs (pinned to ``tma``).
+    # loads (and the shared memory).  The warp mode has its own subject for
+    # the knob (its ring tiles by TMA, dk's qualify), so ``lane`` stays.
     bound = _bind_dk()
     spec = bound.config_spec
     assert spec.cute_mma_dag_loads is not None
@@ -4405,7 +4413,7 @@ def test_the_loads_knob_routes_derived_tile_inputs_through_the_ring() -> None:
             )
         )
     assert lane.config["cute_mma_dag_loads"] == "lane"
-    assert warp.config["cute_mma_dag_loads"] == "tma"
+    assert warp.config["cute_mma_dag_loads"] == "lane"
     body = _kernel_body(bound.to_code(lane))
     loop = _loop(body)
     assert loop.count(f"{WARP_RT}.ldg_v2_f32(") == 32
@@ -5988,3 +5996,592 @@ def test_stores_of_a_loop_with_nested_loops_stage_through_one_buffer() -> None:
             for store in program.stores
             if store.loop >= 0
         ] == [2, 2]
+
+
+# --------------------------------------------------------------------------
+# A full-slice GEMM with a row epilogue: addmm dots, keepdim reductions read
+# by fragment chains, and the thread-block cluster split of the ``:`` axis
+# --------------------------------------------------------------------------
+
+
+def _matmul_layernorm(
+    x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    n = hl.specialize(y.size(1))
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
+        mean = acc.sum(dim=-1, keepdim=True) / n
+        centered = acc - mean
+        var = (centered * centered).sum(dim=-1, keepdim=True) / n
+        normalized = centered * torch.rsqrt(var + 1e-5)
+        out[tile_m, :] = (
+            normalized * weight[:].to(torch.float32) + bias[:].to(torch.float32)
+        ).to(out.dtype)
+    return out
+
+
+def _bind_mln(
+    m: int, k: int, n: int, dtype: torch.dtype = torch.float16
+) -> BoundKernel:
+    args = (
+        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
+        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
+        torch.empty((n,), dtype=dtype, device=CPU_DEVICE),
+        torch.empty((n,), dtype=dtype, device=CPU_DEVICE),
+    )
+    return _bind_fn(_matmul_layernorm, args)
+
+
+def _mln_config(bm: int, bk: int, stages: int, cluster: int) -> helion.Config:
+    return _config(bm, bk, warps=4, stages=stages, cute_mma_dag_cluster=cluster)
+
+
+def test_full_slice_gemm_row_epilogue_is_matched() -> None:
+    bound = _bind_mln(2048, 2048, 2048)
+    program = _program(bound)
+    (dot,) = program.dots
+    assert dot.node.target is torch.ops.aten.addmm.default
+    assert dot.acc is not None and dot.acc_slot == dot.slot == 0
+    assert dot.b.trans and dot.b.cols.kind == dag.AXIS_RDIM
+    assert [r.orient for r in program.reduces] == ["rows", "rows"]
+    assert len(program.vec_ops) == 4 and len(program.stores) == 1
+    (store,) = program.stores
+    # The variance's value and the store's value read the row vectors.
+    chains = {
+        node.name: tuple(v.name for v in vecs)
+        for node, vecs in program.chain_vecs.items()
+    }
+    assert set(chains) == {program.reduces[1].value.name, store.value.name}
+    assert chains[store.value.name] == ("rsqrt", "mean")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.chain_vecs
+    assert facts.tcgen05 is not None and facts.tcgen05.regions
+    assert facts.axes[facts.split_axis].kind == dag.AXIS_RDIM
+    assert facts.axes[facts.split_axis].extent == 2048
+    # The warp mode has no lane map for a row vector read by a fragment chain.
+    reason = dag.mma_dag_config_reason(facts, {0: 64, 1: 64}, 4, 4, dag.MMA_DAG_WARP)
+    assert reason is not None and "row vector" in reason
+
+
+def test_cluster_split_knob_seeds_and_normalization() -> None:
+    bound = _bind_mln(2048, 2048, 2048)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_cluster is not None
+    assert spec.cute_mma_dag_cluster.choices == (1, 2, 4, 8, 16)
+    assert spec.cute_mma_dag_split is not None
+    assert spec.cute_mma_dag_split.choices == ("cluster", "fixup")
+    # The warp mode cannot run a fragment chain over a row vector: it is not
+    # a choice (a random config would only be repaired to ``off``).
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "tcgen05")
+    # The search samples the tensor-memory mode alone: the SIMT fallback's
+    # lane-restore pass declines most tilings of the full-row epilogue.
+    assert spec.cute_mma_dag.search_choices == ("tcgen05",)
+    assert spec.cute_mma_dag.random() == "tcgen05"
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and dag.fixup_admitted(facts)
+    # Without the split the 2048-column fragment exceeds a tcgen05 tile.
+    sizes: dict[int, object] = {0: 128, 1: 64}
+    assert dag.apply_mma_dag_cluster(facts, sizes, 1) is None
+    reason = dag.mma_dag_config_reason(facts, sizes, 4, 4, dag.MMA_DAG_TCGEN05)
+    assert reason is not None and "up to 256" in reason
+    assert dag.apply_mma_dag_cluster(facts, sizes, 8) is None
+    assert sizes[2] == 256 and facts.cluster_of(sizes) == 8
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 4, dag.MMA_DAG_TCGEN05) is None
+    # Sixteen CTAs exceed a portable cluster: the fixup grid splits that wide.
+    bad = dag.apply_mma_dag_cluster(facts, dict(sizes), 16)
+    assert bad is not None and "portable thread-block cluster" in bad
+    wide = dict(sizes)
+    assert dag.apply_mma_dag_cluster(facts, wide, 16, "fixup") is None
+    assert wide[2] == 128 and facts.cluster_of(wide) == 16
+    bad = dag.apply_mma_dag_cluster(facts, dict(sizes), 32, "fixup")
+    assert bad is not None and "must be one of" in bad
+    # Every seed and the promoted default slice the axis (eight CTAs, or the
+    # fixup grid's tiles) and launch as programmatic dependents; the cluster
+    # form leads, its fixup twin follows.
+    default = spec.default_config().config
+    assert default["cute_mma_dag"] == "tcgen05" and default["cute_mma_dag_cluster"] == 8
+    assert default["cute_mma_dag_split"] == "cluster"
+    assert default["cute_pdl"] is True
+    tensor_memory = [
+        c.config
+        for c in spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "tcgen05"
+    ]
+    assert tensor_memory and all(c["cute_mma_dag_cluster"] > 1 for c in tensor_memory)
+    assert all(c["cute_pdl"] is True for c in tensor_memory)
+    assert [c["cute_mma_dag_split"] for c in tensor_memory[:2]] == ["cluster", "fixup"]
+    assert (
+        tensor_memory[0]["cute_mma_dag_cluster"]
+        == tensor_memory[1]["cute_mma_dag_cluster"]
+        == 8
+    )
+    assert {c["cute_mma_dag_split"] for c in tensor_memory} == {"cluster", "fixup"}
+    assert all(
+        c["cute_mma_dag_cluster"] <= 8 or c["cute_mma_dag_split"] == "fixup"
+        for c in tensor_memory
+    )
+    assert not any(
+        c.config.get("cute_mma_dag") == "warp" for c in spec.compiler_seed_configs
+    )
+    with bound.env:
+        # A cluster too small for the axis is repaired to one that fits.
+        repaired = dict(_mln_config(64, 64, 2, 2).config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert repaired["cute_mma_dag"] == "tcgen05"
+        assert repaired["cute_mma_dag_cluster"] == 8
+        with pytest.raises(InvalidConfig, match="up to 256"):
+            spec.normalize(dict(_mln_config(64, 64, 2, 2).config))
+        with pytest.raises(InvalidConfig, match="must be one of"):
+            # The warp mode is no choice here (a chain reads a row vector).
+            spec.normalize({**_mln_config(64, 64, 2, 8).config, "cute_mma_dag": "warp"})
+        with pytest.raises(InvalidConfig, match="portable cluster"):
+            spec.normalize(dict(_mln_config(64, 64, 2, 16).config))
+        # A sixteen-way split is repaired to the fixup grid, not narrowed.
+        wide16 = dict(_mln_config(64, 64, 2, 16).config)
+        spec.normalize(wide16, _fix_invalid=True)
+        assert wide16["cute_mma_dag_cluster"] == 16
+        assert wide16["cute_mma_dag_split"] == "fixup"
+        spec.normalize(
+            {**_mln_config(64, 64, 2, 16).config, "cute_mma_dag_split": "fixup"}
+        )
+        with pytest.raises(InvalidConfig, match="must be one of"):
+            spec.normalize(
+                {**_mln_config(64, 64, 2, 8).config, "cute_mma_dag_split": "grid"}
+            )
+        off = {
+            "block_sizes": [64, 64],
+            "cute_mma_dag": "off",
+            "cute_mma_dag_cluster": 8,
+            "cute_mma_dag_split": "fixup",
+        }
+        spec.normalize(off, _fix_invalid=True)
+        assert off["cute_mma_dag"] == "off" and off["cute_mma_dag_cluster"] == 1
+        assert off["cute_mma_dag_split"] == "cluster"
+
+
+def test_cluster_split_codegen() -> None:
+    bound = _bind_mln(2048, 2048, 2048)
+    source = _source(bound, _mln_config(64, 64, 2, 8))
+    body = _kernel_body(source)
+    # The CTA's slice of the split axis (the trailing grid dim is the rank):
+    # every base along it and the B / output TMA coordinates start there.
+    assert "md_a2 = cutlass.Int32(cute.arch.block_idx()[1]) * 256" in body
+    assert "y.iterator.toint() + cutlass.Int64(md_a2) * 2" in body
+    assert "weight.iterator.toint() + cutlass.Int64(md_a2) * 2" in body
+    assert "md_tma1.get_ptr(), [cutlass.Int32(md_a2), " in body
+    assert f"{P}.mbarrier_init(md_clb, 1)" in body
+    _assert_in_order(
+        body,
+        [
+            f"{P}.fence_mbarrier_init()",
+            "cute.arch.cluster_arrive_relaxed()",
+            "cute.arch.cluster_wait()",
+            "for md_i in cutlass.range(0, 32):",
+            f"{P}.tcgen05_commit(md_empty0 + md_st0,",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 1) % 2, (md_rk0 + 1) // 2 + 1 & 1)",
+            "md_tma1.get_ptr(), [cutlass.Int32(md_a2), cutlass.Int32((md_i + 1) * 64)]",
+            f"{P}.tcgen05_commit(md_cb,",
+            "md_cn = md_cn + 1",
+            # The mean and the centered variance share one round: this
+            # CTA's row sum and its second moment about its own mean (the
+            # slice of 256 columns) pushed into every peer's two exchange
+            # buffers, the own barrier waited, the ranks' pairs combined in
+            # rank order from local shared memory (Chan's update).
+            "/ cutlass.Float32(256.0)",
+            f"{P}.mbarrier_arrive_expect_tx(md_cxb, 4096)",
+            f"{RT}.st_async_remote_f32(md_cx + (md_crank * 64 + md_row64) * 4, md_clb_addr + 0, 0,",
+            f"{RT}.st_async_remote_f32(md_cx + (md_crank * 64 + md_row64) * 4, md_clb_addr + 0, 7,",
+            f"{RT}.st_async_remote_f32(md_cx_1 + (md_crank * 64 + md_row64) * 4, md_clb_addr + 0, 0,",
+            f"{RT}.mbar_wait_cluster(md_cxb, 0)",
+            f"{WARP_RT}.lds_f32(md_cx + (0 + md_row64) * 4)",
+            f"{WARP_RT}.lds_f32(md_cx + (448 + md_row64) * 4)",
+            f"{WARP_RT}.lds_f32(md_cx_1 + (448 + md_row64) * 4)",
+            "* cutlass.Float32(128.0)",
+            "/ cutlass.Float32(512.0)",
+            "md_vv0 = ",
+            "md_vv1 = ",
+            "cute.arch.cluster_arrive()",
+            "cute.arch.cluster_wait()",
+            f"{P}.tcgen05_dealloc(",
+        ],
+    )
+    assert body.count(f"{RT}.st_async_remote_f32(") == 16
+    assert body.count(f"{RT}.mbar_wait_cluster(") == 1
+    assert "md_cx = md_s0 + 81920 + 2048 + 0" in body
+    assert "md_cx_1 = md_s0 + 81920 + 2048 + 2048" in body
+    assert "md_clc" not in body
+    assert f"{P}.mbarrier_init(md_clb + 1, 1)" in body
+    # The streaming K loop: warp 0 alone, no barrier or commit wait inside.
+    loop = body[
+        body.index("for md_i in cutlass.range(0, 32):") : body.index(
+            f"{P}.tcgen05_commit(md_cb,"
+        )
+    ]
+    assert "cute.arch.barrier()" not in loop and f"{RT}.mbar_wait(md_cb" not in loop
+    assert loop.count(f"{P}.tcgen05_mma(") == 4
+    # The launch: one cluster of eight CTAs per root tile.
+    host = source[source.index("def _matmul_layernorm(") :]
+    assert "_helion_cute_cluster_shape = (1, 8, 1)" in source
+    assert "_launcher(_helion__matmul_layernorm, (*(32,), 8), " in host, host
+
+
+def _fixup_arrival_model(
+    counter: int, tiles: int, rounds: int, order: list[tuple[int, int]]
+) -> tuple[int, list[int]]:
+    """The emitted arrival protocol in Python: ``order`` is the sequence of
+    (tile, round) arrivals of one launch (every tile arrives once per round,
+    a round's arrivals after every tile passed the previous round); returns
+    the counter after the launch and every tile's base."""
+    mask = 2**32 - 1
+    arrivals = rounds * tiles
+    period = 1 << (arrivals - 1).bit_length()
+    bases: dict[int, int] = {}
+    passed: dict[tuple[int, int], bool] = {}
+    for tile, round_index in order:
+        ticket = counter
+        counter = (counter + 1) & mask
+        if round_index == 0:
+            bases[tile] = ticket & (~(period - 1) & mask)
+        if round_index == rounds - 1 and period > arrivals:
+            if ticket == (bases[tile] + arrivals - 1) & mask:
+                counter = (counter + period - arrivals) & mask
+        target = (bases[tile] + (round_index + 1) * tiles) & mask
+        # The acquire spin: reached once counter - target (mod 2^32) < 2^31.
+        passed[tile, round_index] = ((counter - target) & mask) < 2**31
+        # A tile may only pass once every tile of the round arrived.
+        arrived = sum(
+            1
+            for t, r in order[: order.index((tile, round_index)) + 1]
+            if r == round_index
+        )
+        if arrived < tiles:
+            assert not passed[tile, round_index], (tile, round_index, counter, target)
+    assert all(
+        ((counter - ((bases[t] + (r + 1) * tiles) & mask)) & mask) < 2**31
+        for t in range(tiles)
+        for r in range(rounds)
+    )
+    return counter, [bases[t] for t in range(tiles)]
+
+
+def test_fixup_arrival_tickets_survive_the_counter_wrap() -> None:
+    # Unsigned tickets, a power-of-two launch period and a modular "reached"
+    # test: the base and the waits stay right when the counter crosses 2^31
+    # and 2^32, also when rounds x tiles is not a power of two (the last
+    # arrival pads the counter to the period).
+    import random
+
+    rng = random.Random(7)
+    for tiles, rounds in ((8, 1), (16, 1), (8, 2), (4, 3), (16, 2), (2, 5)):
+        arrivals = rounds * tiles
+        period = 1 << (arrivals - 1).bit_length()
+        for start in (0, 2**31 - period, 2**31, 2**32 - period, 2**32 - 2 * period):
+            counter = start
+            for _launch in range(4):
+                order: list[tuple[int, int]] = []
+                for round_index in range(rounds):
+                    tiles_in_round = list(range(tiles))
+                    rng.shuffle(tiles_in_round)
+                    order.extend((tile, round_index) for tile in tiles_in_round)
+                counter, bases = _fixup_arrival_model(counter, tiles, rounds, order)
+                assert len(set(bases)) == 1, (tiles, rounds, start, bases)
+                assert bases[0] % period == 0
+            assert counter == (start + 4 * period) % 2**32
+
+
+def test_the_fixup_form_is_offered_only_where_it_lowers() -> None:
+    # The fixup grid folds the row tile and the N tile into one launch dim:
+    # a program with a leading (batch) axis or two root axes does not admit
+    # it.  Such a program gets no split fragment, cluster choices up to a
+    # portable cluster, no fixup seed, and every "fixup" request repaired or
+    # refused -- the lowering's admission check is never the first to see it.
+    bound = _bind_mln(2048, 2048, 2048)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and dag.fixup_admitted(facts)
+    batched = dataclasses.replace(
+        facts, axes=(dag.AxisFacts(7, dag.AXIS_LEAD, 4), *facts.axes)
+    )
+    assert not dag.fixup_admitted(batched)
+    sizes: dict[int, object] = {0: 64, 1: 64}
+    reason = dag.apply_mma_dag_cluster(batched, sizes, 8, "fixup")
+    assert reason is not None and "one root tile axis and no leading axes" in reason
+    assert dag.apply_mma_dag_cluster(batched, sizes, 8, "cluster") is None
+    two_roots = dataclasses.replace(
+        facts, axes=(*facts.axes, dag.AxisFacts(8, dag.AXIS_ROOT, 16))
+    )
+    assert not dag.fixup_admitted(two_roots)
+    # The knobs of a program that does not admit the fixup form.
+    spec.enable_cute_mma_dag_search(batched)
+    assert spec.cute_mma_dag_split is None
+    assert spec.cute_mma_dag_cluster is not None
+    assert spec.cute_mma_dag_cluster.choices == (1, 2, 4, 8)
+    with bound.env:
+        config = {**_mln_config(64, 64, 2, 8).config, "cute_mma_dag_split": "fixup"}
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_split must be one of"):
+            spec.normalize(dict(config))
+        spec.normalize(config, _fix_invalid=True)
+        assert config["cute_mma_dag_split"] == "cluster"
+        # (The synthetic facts do not match the bound program's tcgen05
+        # geometry, so the repair may also re-slice the split axis.)
+        assert config["cute_mma_dag_cluster"] in (1, 8)
+        wide = {**_mln_config(64, 64, 2, 16).config, "cute_mma_dag_split": "fixup"}
+        spec.normalize(wide, _fix_invalid=True)
+        assert wide["cute_mma_dag_split"] == "cluster"
+        assert wide["cute_mma_dag_cluster"] in (1, 8)
+
+
+def test_fixup_split_codegen() -> None:
+    # ``cute_mma_dag_split = "fixup"``: the N tiles of a row tile folded into
+    # the one launch dim (N tile fastest), no cluster, the row sums combined
+    # through the launcher's workspace: partials stored, one release arrival
+    # per round on the row tile's counter (the first ticket fixes the launch's
+    # base), an acquire spin for the round's tiles, the tiles' partials added
+    # in tile order from L2.
+    bound = _bind_mln(2048, 2048, 2048)
+    config = _config(128, 64, warps=4, stages=4, cute_mma_dag_cluster=8)
+    config = helion.Config(**{**config.config, "cute_mma_dag_split": "fixup"})
+    source = _source(bound, config)
+    body = _kernel_body(source)
+    assert "md_ws: cutlass.Int64" in body
+    assert "cluster" not in body.replace("_helion_cute_cluster", "")
+    _assert_in_order(
+        body,
+        [
+            "md_crank = cutlass.Int32(cute.arch.block_idx()[0]) % 8",
+            "md_mtile = cutlass.Int32(cute.arch.block_idx()[0]) // 8",
+            "md_rows = cutlass.Int32(cute.arch.grid_dim()[0]) // 8",
+            "md_gen = cutlass.Uint32(0)",
+            "md_a1 = md_mtile * 128",
+            "md_a2 = md_crank * 256",
+            "for md_i in cutlass.range(0, 32):",
+            # The one round (mean and variance fused): this tile's row sum
+            # and second moment about its own mean to their slabs, one
+            # store per row each.
+            "/ cutlass.Float32(256.0)",
+            "md_fx = md_ws + cutlass.Int64(0 * md_rows + md_mtile) * 4096",
+            f"{WARP_RT}.stg_f32(md_fx + cutlass.Int64(md_crank * 128 + md_row128) * 4, ",
+            "md_fx_1 = md_ws + cutlass.Int64(1 * md_rows + md_mtile) * 4096",
+            f"{WARP_RT}.stg_f32(md_fx_1 + cutlass.Int64(md_crank * 128 + md_row128) * 4, ",
+            "cute.arch.barrier()",
+            "md_fc = md_ws + cutlass.Int64(md_rows) * 8192 + cutlass.Int64(md_mtile) * 4",
+            "if md_tidx == 0:",
+            f"md_ft = {RT}.atom_add_release_gpu_u32(md_fc, 1)",
+            # The launch's base: the unsigned ticket with the period's (eight
+            # arrivals, a power of two) low bits cleared; the round is reached
+            # when the counter passed base + 8 in modular arithmetic.
+            "md_gen = md_ft & cutlass.Uint32(4294967288)",
+            f"{RT}.spin_until_reached_acquire_gpu_u32(md_fc, md_gen + cutlass.Uint32(8))",
+            "cute.arch.barrier()",
+            f"{RT}.ldcg_f32(md_fx + cutlass.Int64(0 + md_row128) * 4)",
+            f"{RT}.ldcg_f32(md_fx + cutlass.Int64(896 + md_row128) * 4)",
+            f"{RT}.ldcg_f32(md_fx_1 + cutlass.Int64(0 + md_row128) * 4)",
+            f"{RT}.ldcg_f32(md_fx_1 + cutlass.Int64(896 + md_row128) * 4)",
+            # Chan's combine in tile order: the running mean over k tiles,
+            # the tile's mean, delta^2 * (k * 256) * 256 / ((k + 1) * 256).
+            "* cutlass.Float32(128.0)",
+            "/ cutlass.Float32(512.0)",
+            "md_vv0 = ",
+            "md_vv1 = ",
+            f"{P}.tcgen05_dealloc(",
+        ],
+    )
+    assert body.count(f"{RT}.atom_add_release_gpu_u32(") == 1
+    assert body.count(f"{RT}.ldcg_f32(") == 16
+    assert f"{RT}.st_async_remote_f32(" not in body and "md_clb" not in body
+    assert (
+        "md_gen = cutlass.Uint32(0)" in body
+        and " % " not in body.split("md_ft")[1][:200]
+    )
+    # The launch: sixteen row tiles times eight N tiles in one dim, the
+    # workspace plan (one round, two slabs) behind the tensor maps.
+    host = source[source.index("def _matmul_layernorm(") :]
+    assert "_helion_cute_cluster_shape" not in source
+    assert "_launcher(_helion__matmul_layernorm, ((16,)[0] * 8,), " in host, host
+    assert (
+        "{'kind': 'helion_mma_dag_fixup', 'param': 'md_ws', 'tiles': 8, "
+        "'rounds': 1, 'slabs': 2, 'rows': 128}" in source
+    )
+    # Sixteen tiles of 64-row fragments: the lanes 16-31 of the 16x32bx2
+    # halves hold their lane's row too, so lanes 0-15 alone store.
+    config = _config(64, 64, warps=4, stages=2, cute_mma_dag_cluster=16)
+    config = helion.Config(**{**config.config, "cute_mma_dag_split": "fixup"})
+    body = _kernel_body(_source(bound, config))
+    assert "md_a2 = md_crank * 128" in body
+    _assert_in_order(
+        body,
+        [
+            "if md_lane < 16:",
+            f"{WARP_RT}.stg_f32(md_fx + cutlass.Int64(md_crank * 64 + md_row64) * 4, ",
+            "md_gen = md_ft & cutlass.Uint32(4294967280)",
+            f"{RT}.spin_until_reached_acquire_gpu_u32(md_fc, md_gen + cutlass.Uint32(16))",
+        ],
+    )
+    assert body.count(f"{RT}.ldcg_f32(") == 32
+
+
+def test_whole_axis_keeps_the_plain_launch() -> None:
+    bound = _bind_mln(128, 256, 256)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_cluster is not None
+    source = _source(bound, _mln_config(64, 64, 2, 1))
+    body = _kernel_body(source)
+    assert "block_idx()[1]" not in body and "md_clb" not in body
+    assert "cluster" not in body
+    assert "_helion_cute_cluster_shape" not in source
+    # The row sums stay CTA-local; the chains read them as the thread's row.
+    _assert_in_order(
+        body,
+        [
+            f"{P}.tcgen05_ld(",
+            "cute.arch.shuffle_sync_bfly(",
+            "md_vv0 = ",
+            " - md_vv0",
+            "cute.arch.shuffle_sync_bfly(",
+            "md_vv1 = ",
+            " * md_vv1",
+        ],
+    )
+    assert f"{RT}.lds_cluster_f32(" not in body
+    # Two CTAs along the axis (128 columns each) are a legal slice too.
+    split = _kernel_body(_source(bound, _mln_config(64, 64, 2, 2)))
+    assert "md_a2 = cutlass.Int32(cute.arch.block_idx()[1]) * 128" in split
+    assert f"{P}.mbarrier_init(md_clb, 1)" in split
+
+
+def test_epilogue_side_vectors_load_in_packets() -> None:
+    # weight[:] / bias[:] along the fragment's columns: eight fp16 elements
+    # per 16-byte load at the thread's static columns, the elements read
+    # from registers; nothing else of the epilogue changes.
+    bound = _bind_mln(2048, 2048, 2048)
+    body = _kernel_body(_source(bound, _mln_config(64, 32, 4, 8)))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    # 128 columns per thread (a 64-row fragment reads half rows), two vectors.
+    assert epilogue.count(f"{WARP_RT}.ldg_v4_b32(") == 32
+    assert f"{WARP_RT}.ldg_f16_as_f32(" not in epilogue
+    assert epilogue.count(f"{WARP_RT}.unpack_f16x2(") == 128
+    # The first packet of each vector starts at the half-row's first column.
+    assert "cutlass.Int64((md_cb0 + 0)) * 2" in epilogue or "(md_cb0 + 0)" in epilogue
+    # A 128-row fragment holds whole rows: columns are plain integers.
+    body = _kernel_body(_source(bound, _mln_config(128, 32, 2, 8)))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    assert epilogue.count(f"{WARP_RT}.ldg_v4_b32(") == 64
+    assert f"{WARP_RT}.ldg_f16_as_f32(" not in epilogue
+
+
+def test_wide_row_stores_go_out_by_tma_slab_by_slab() -> None:
+    # A 256-column fp16 store row is 512 bytes: four 128-byte slabs staged in
+    # the swizzle-atom layout and stored as four TMA boxes by one thread,
+    # instead of every thread draining 16-byte packets.
+    bound = _bind_mln(2048, 2048, 2048)
+    body = _kernel_body(_source(bound, _mln_config(64, 32, 4, 8)))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    stores = [
+        line.strip()
+        for line in epilogue.splitlines()
+        if f"{P}.cp_async_bulk_tensor_global_shared_cta(" in line
+    ]
+    assert len(stores) == 4
+    assert f"{WARP_RT}.stg_v4_b32(" not in epilogue
+    assert f"{WARP_RT}.lds_v4_b32(" not in epilogue
+    # Slab k lands 64 columns further along the split axis, 8 KB (64 rows x
+    # 128 bytes) further in the staging buffer.
+    assert "[cutlass.Int32(md_a2), cutlass.Int32(md_a1)]" in stores[0]
+    assert "+ 8192), [cutlass.Int32(md_a2 + 64), cutlass.Int32(md_a1)]" in stores[1]
+    assert "+ 24576), [cutlass.Int32(md_a2 + 192), cutlass.Int32(md_a1)]" in stores[3]
+    assert f"{P}.cp_async_bulk_commit_group()" in epilogue
+
+
+def _gemm_full_slice(
+    x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    n = hl.specialize(y.size(1))
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
+        out[tile_m, :] = (
+            acc * weight[:].to(torch.float32) + bias[:].to(torch.float32)
+        ).to(out.dtype)
+    return out
+
+
+def test_a_wide_full_slice_gemm_takes_the_cluster_split_without_reductions() -> None:
+    # No row sums: the single-loop emitter would own the program, but a
+    # 2048-column fragment exceeds a tcgen05 tile, so the region renderer
+    # and its cluster split take it (the knob is offered, the default splits).
+    args = (
+        torch.empty((2048, 2048), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((2048, 2048), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((2048,), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((2048,), dtype=torch.float16, device=CPU_DEVICE),
+    )
+    bound = _bind_fn(_gemm_full_slice, args)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    assert not facts.chain_vecs
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    assert spec.cute_mma_dag_cluster is not None
+    default = spec.default_config().config
+    assert default["cute_mma_dag"] == "tcgen05" and default["cute_mma_dag_cluster"] == 8
+    body = _kernel_body(_source(bound, _mln_config(64, 64, 2, 8)))
+    assert "md_a2 = cutlass.Int32(cute.arch.block_idx()[1]) * 256" in body
+    # No row sum along the split axis: no exchange, no cluster barriers.
+    assert "md_clb" not in body and "cute.arch.cluster_" not in body
+    # A 256-column axis stays with the single-loop emitter.
+    small = (
+        torch.empty((128, 256), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256,), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256,), dtype=torch.float16, device=CPU_DEVICE),
+    )
+    facts = _bind_fn(_gemm_full_slice, small).config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert not facts.tcgen05.regions
+
+
+def test_cute_pdl_waits_after_the_prologue_and_releases_after_the_loop() -> None:
+    # The renderer places the programmatic-dependent-launch calls itself:
+    # the wait after the barrier / tensor-memory / cluster prologue (ahead
+    # of the first global access, the ring prologue's TMA), the release of
+    # the dependents after the last top-level loop (ahead of the epilogue);
+    # the launcher gets ``use_pdl`` through the alias plan.
+    bound = _bind_mln(2048, 2048, 2048)
+    config = helion.Config(
+        block_sizes=[64, 32],
+        cute_mma_dag="tcgen05",
+        cute_mma_dag_warps=4,
+        cute_mma_dag_stages=4,
+        cute_mma_dag_cluster=8,
+        cute_pdl=True,
+    )
+    source = _source(bound, config)
+    body = _kernel_body(source)
+    _assert_in_order(
+        body,
+        [
+            f"{P}.tcgen05_alloc(",
+            "cute.arch.cluster_wait()",
+            "cute.arch.griddepcontrol_wait()",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(",
+            "for md_i in cutlass.range(0, 64):",
+            f"{P}.tcgen05_commit(md_cb,",
+            "cute.arch.griddepcontrol_launch_dependents()",
+            f"{P}.tcgen05_ld(",
+        ],
+    )
+    assert body.count("cute.arch.griddepcontrol_wait()") == 1
+    assert body.count("cute.arch.griddepcontrol_launch_dependents()") == 1
+    assert "'use_pdl': True" in source
+    # Without the knob: no griddepcontrol calls, no use_pdl.
+    source = _source(bound, _mln_config(64, 32, 4, 8))
+    assert "griddepcontrol" not in source and "use_pdl" not in source
