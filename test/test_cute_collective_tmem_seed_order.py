@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -8,7 +9,7 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _initial_population
+from test.cute_population_contracts import _initial_population as _shared_population
 from test.cute_population_contracts import _legacy_registered_seeds
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
@@ -16,6 +17,8 @@ from test.test_cute_collective_tmem_seed import _dependent_contractions
 from test.test_cute_collective_tmem_seed import _dependent_inputs
 
 from helion._testing import skipUnlessBackends
+
+_initial_population = partial(_shared_population, random_seed=46291)
 
 pytestmark = skipUnlessBackends(["cute"])
 

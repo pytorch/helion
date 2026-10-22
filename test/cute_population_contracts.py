@@ -206,10 +206,12 @@ def _initial_population(
     seeds: list[helion.Config] | None = None,
     count: int | None = None,
     user_seeds: list[helion.Config] | None = None,
+    random_seed: int | None = None,
 ) -> list[helion.Config]:
     state = random.getstate()
     try:
-        random.seed(46291)
+        if random_seed is not None:
+            random.seed(random_seed)
         profile = get_effort_profile("full").pattern_search
         assert profile is not None
         with (
@@ -234,7 +236,12 @@ def _initial_population(
             assert result[0] == search.config_gen.unflatten(
                 search.config_gen.default_flat()
             )
+            assert len(result) == len(set(result))
+            assert all(
+                search.config_gen.unflatten(search.config_gen.flatten(config)) == config
+                for config in result
+            )
             return result
-
     finally:
-        random.setstate(state)
+        if random_seed is not None:
+            random.setstate(state)

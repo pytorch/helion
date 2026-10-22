@@ -71,9 +71,9 @@ def test_full_random_population_reaches_coupled_pipeline_chunk_geometries(
     legacy = _initial_population(
         bound, args, seeds=_legacy_registered_seeds(bound), count=100
     )
-    actual = _initial_population(bound, args)
+    actual = _initial_population(bound, args, count=100)
     assert len(actual) == len(legacy)
-    assert actual == _initial_population(bound, args)
+    assert actual == _initial_population(bound, args, count=100)
     for stages in (2, 4):
         before = [
             seed for seed in legacy if seed.get("cute_collective_stages") == stages
