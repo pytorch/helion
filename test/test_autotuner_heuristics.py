@@ -11834,7 +11834,13 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
     # heuristic's register_facts. Their planning imports must stay importable
     # without cutlass; only device helper modules may import it at module top.
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    # The child needs the parent's import path too: a packaged test binary has
+    # no site-packages for it to fall back on.
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        PYTHONPATH=os.pathsep.join([str(root), *sys.path]),
+    )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     # Ref eager binding builds no device IR; the child always binds normally.
