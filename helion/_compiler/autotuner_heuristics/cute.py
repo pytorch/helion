@@ -2527,8 +2527,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         result = cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
-        # Keep this measured preference limited to FP16 and the canonical
-        # M/N/K slot layout. Reorder only after all derived schedules exist.
+        # H100 PCIe measurements cover FP16 with canonical M/N/K slots;
+        # BF16 and other layouts retain their ordering. Apply the same narrow
+        # preference across models, after all derived schedules exist.
         if (
             result
             and len(spec.matmul_facts) == 1

@@ -63,6 +63,7 @@ def _legacy_order(
 
 
 def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
+    """Undo schedule interleaving while retaining independent seed preferences."""
     assert bound.host_function is not None
     with (
         bound.env,

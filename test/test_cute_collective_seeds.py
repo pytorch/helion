@@ -246,6 +246,62 @@ def test_collective_async_priority_preserves_candidates_and_default(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    k = hl.register_block_size(a.size(1))
+    n = hl.register_block_size(b.size(1))
+    m = hl.register_block_size(a.size(0))
+    out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+    for rows, columns in hl.tile([a.size(0), b.size(1)], block_size=[m, n]):
+        acc = hl.zeros([rows, columns], dtype=torch.float32)
+        for inner in hl.tile(a.size(1), block_size=k):
+            acc = hl.dot(a[rows, inner], b[inner, columns], acc)
+        out[rows, columns] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize("missing_async", [False, True])
+def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) -> None:
+    kernel = helion.kernel(
+        matmul.fn if missing_async else _reverse_registered_matmul.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    args = (
+        torch.empty(128, 256, dtype=torch.float16),
+        torch.empty(256, 64, dtype=torch.float16),
+    )
+    heuristic = CuteCollectiveMatmulHeuristic
+    original = []
+    interleave = heuristic._interleave_bounded_k_seeds
+
+    def capture(spec, seeds, parameters):
+        result = interleave(spec, seeds, parameters)
+        if missing_async:
+            sibling = helion.Config.from_dict(
+                result[0].config | {"cute_collective_copy": "async"}
+            )
+            result = [seed for seed in result if seed != sibling]
+        original[:] = result
+        return result
+
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        assert bound.host_function is not None
+        with (
+            bound.env,
+            patch.object(heuristic, "_interleave_bounded_k_seeds", side_effect=capture),
+        ):
+            actual = heuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        assert actual == original
+        assert actual
+        if not missing_async:
+            assert actual[0].num_threads != [4, 32, 1]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _serial_state_recurrence(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     bh, n, _c, d = k.shape
     dv = v.size(3)
