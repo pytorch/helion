@@ -3392,7 +3392,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
-    """Seed a power-of-two chunk within half the extent and the backend limit.
+    """Seed prev_power_of_2(min(size_hint // 2, max_reduction_loop)).
 
     For large N this lattice (few outer iters, large lane_extent) tends to
     schedule better than the narrow-chunk lattice (many outer iters,
@@ -3405,6 +3405,10 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
     name = "cute_reduction_wide_chunk"
     backend = "cute"
 
+    @staticmethod
+    def _chunk_size(size_hint: int, max_reduction_loop: int | None) -> int:
+        return prev_power_of_2(min(size_hint // 2, max_reduction_loop or size_hint))
+
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         if not is_canonical_row_reduction(env):
@@ -3412,14 +3416,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
-        return (
-            prev_power_of_2(
-                min(
-                    rl_spec.size_hint // 2, spec.max_reduction_loop or rl_spec.size_hint
-                )
-            )
-            > max_threads
-        )
+        return cls._chunk_size(rl_spec.size_hint, spec.max_reduction_loop) > max_threads
 
     @classmethod
     def get_seed_config(
@@ -3429,9 +3426,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        chunk = prev_power_of_2(
-            min(size_hint // 2, spec.max_reduction_loop or size_hint)
-        )
+        chunk = cls._chunk_size(size_hint, spec.max_reduction_loop)
         seed: dict[str, Any] = {
             "block_sizes": [1],
             "num_threads": _seq_config_list(spec.num_threads, {}),
