@@ -120,8 +120,9 @@ class RuntimeInputSpecialization:
     discovery registers the same named projection more than once.
     ``reusable_tensor_properties`` is an optional promise that the classifier's
     result depends only on the named storage properties (plus tensor metadata
-    already covered by eager dispatch guards), never on tensor contents.  It
-    lets code generation consume the result recorded in the bound kernel key.
+    already covered by eager dispatch guards), never on tensor contents; or,
+    for ``int`` argument sources, only on the argument's value (``int_value``).
+    It lets code generation consume the result recorded in the bound kernel key.
     ``prepared_guard_factory`` optionally builds, from the source projections
     and an expected classifier result, a cheaper predicate over the raw call
     arguments that holds exactly when the classifier would produce that result
@@ -137,7 +138,7 @@ class RuntimeInputSpecialization:
         dataclasses.field(compare=False, repr=False)
     )
     reusable_tensor_properties: frozenset[
-        typing.Literal["data_ptr", "storage_span"]
+        typing.Literal["data_ptr", "storage_span", "int_value"]
     ] = frozenset()
     prepared_guard_factory: PreparedGuardFactory | None = dataclasses.field(
         default=None, compare=False, repr=False

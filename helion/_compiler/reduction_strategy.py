@@ -224,6 +224,49 @@ def _strategies_concurrent_with_block(
     return result
 
 
+def _cute_blocks_share_a_value(
+    env: CompileEnvironment, first: int, second: int
+) -> bool:
+    """Whether some tile value of the kernel carries both blocks as dims.
+
+    Two full-slice axes held by one value (rope's ``q[tile_b, :, tile_t,
+    :half]`` holds the head axis and the half-dim axis) need the cross
+    product of their coordinates, which only distinct thread axes (or a lane
+    loop) provide; axes that never meet in a value (the q heads and the k
+    heads) may index one thread axis.  A literal dim is matched to a block
+    by its extent, as the literal-dim holders do; an extent several blocks
+    share counts as both (fails closed).
+    """
+    from .host_function import HostFunction
+
+    def blocks_of(size: object) -> set[int]:
+        if isinstance(size, torch.SymInt):
+            block_id = env.get_block_id(size)
+            if block_id is not None:
+                return {block_id}
+        if not isinstance(size, (int, torch.SymInt)):
+            return set()
+        return {
+            info.block_id
+            for info in env.block_sizes
+            if info.reduction
+            and isinstance(info.size, (int, torch.SymInt))
+            and env.known_equal(info.size, size)
+        }
+
+    for graph_info in HostFunction.current().device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            found: set[int] = set()
+            for size in value.shape:
+                found |= blocks_of(size)
+            if first in found and second in found:
+                return True
+    return False
+
+
 def _cute_vec_kernel_mode() -> str:
     """Return the vec-lattice mode for looped reductions: always ``"unroll"``.
 
@@ -400,6 +443,9 @@ class ReductionStrategy(TileStrategy):
         plus the two tile-sized dims that ``tile.index[:, None]`` slices
         allocate).
         """
+        if getattr(self, "_cute_axis_partner", None) is not None:
+            # Indexes a sibling's axis (``_cute_sibling_axis_partner``).
+            return False
         count = self._reduction_thread_count()
         if count <= 0:
             return False
@@ -989,6 +1035,9 @@ class ReductionStrategy(TileStrategy):
         a warp. Others keep the natural strategy order.
         """
         env = CompileEnvironment.current()
+        partner = getattr(self, "_cute_axis_partner", None)
+        if partner is not None:
+            return partner._get_thread_axis()
         if (axis := self.fn.tile_strategy.thread_axis_for_strategy(self)) is not None:
             return axis
         if env.backend.reduction_axis_first():
@@ -1241,6 +1290,12 @@ class PersistentReductionStrategy(ReductionStrategy):
         )
         self._cute_hint_bucket = hint_bucket
         self.offset_vars[block_index] = "0"
+        # The ``num_threads`` entry the config spells for this block (0 when
+        # it leaves the count to the backend).
+        self._cute_requested_threads = 0
+        # A concurrent sibling persistent block whose thread axis this block
+        # indexes instead of claiming one (``_cute_sibling_axis_partner``).
+        self._cute_axis_partner: PersistentReductionStrategy | None = None
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
@@ -1264,6 +1319,8 @@ class PersistentReductionStrategy(ReductionStrategy):
                     block_index,
                     0,
                 )
+                if isinstance(requested, int):
+                    self._cute_requested_threads = requested
                 if isinstance(requested, int) and 0 < requested < self._thread_count:
                     self._thread_count = requested
                 elif (
@@ -1296,6 +1353,12 @@ class PersistentReductionStrategy(ReductionStrategy):
             # so they never co-execute and must not be multiplied into this
             # reduction's thread budget. Drop them before adjusting.
             concurrent = _strategies_concurrent_with_block(tile_dispatch, block_index)
+            if env.backend.name == "cute":
+                partner = self._cute_sibling_axis_partner(env, concurrent, size_hint)
+                if partner is not None:
+                    # The shared axis is already in the budget as the partner.
+                    self._cute_axis_partner = partner
+                    concurrent = [s for s in concurrent if s is not partner]
             self._thread_count = env.backend.adjust_reduction_thread_count(
                 self._thread_count, concurrent
             )
@@ -1486,6 +1549,58 @@ class PersistentReductionStrategy(ReductionStrategy):
     def _reduction_thread_count(self) -> int:
         return self._thread_count
 
+    def _cute_sibling_axis_partner(
+        self,
+        env: CompileEnvironment,
+        concurrent: list[TileStrategy],
+        size_hint: int,
+    ) -> PersistentReductionStrategy | None:
+        """A concurrent sibling full-slice block whose thread axis this block
+        shares, or ``None``.
+
+        Two full-slice axes of one pure pointwise tile body (rope's q heads
+        and k heads) are independent per-thread lane loops.  When one owns a
+        thread axis, every statement of the other runs once per thread of
+        that axis, repeating its loads and stores ``threads`` times; when the
+        config spells the same explicit thread count for both, this block
+        indexes the sibling's axis instead (``thread_idx()[axis]`` is a head
+        of each), each thread walking its own share of both axes.  Only a
+        kernel without reductions qualifies (``pointwise_facts``: there is no
+        cross-thread combine to keep per axis), and both static extents must
+        be multiples of the shared count so no thread falls outside either.
+        ``concurrent`` already excludes the strategies of mutually exclusive
+        branches (``_strategies_concurrent_with_block``).
+        """
+        requested = self._cute_requested_threads
+        if (
+            not env.config_spec.pointwise_facts
+            or requested <= 1
+            or self._thread_count != requested
+            or size_hint % requested
+        ):
+            return None
+        numel = env.block_sizes[self.block_index].numel
+        if not isinstance(numel, (int, sympy.Integer)) or int(numel) != size_hint:
+            return None
+        for strategy in concurrent:
+            if (
+                isinstance(strategy, PersistentReductionStrategy)
+                and strategy is not self
+                and strategy._cute_axis_partner is None
+                and strategy._cute_requested_threads == requested
+                and strategy._thread_count == requested
+            ):
+                partner_numel = env.block_sizes[strategy.block_index].numel
+                if (
+                    isinstance(partner_numel, (int, sympy.Integer))
+                    and int(partner_numel) % requested == 0
+                    and not _cute_blocks_share_a_value(
+                        env, self.block_index, strategy.block_index
+                    )
+                ):
+                    return strategy
+        return None
+
     def use_shared_thread_extent(self, extent: int) -> None:
         if self._synthetic_cute_lane_var is not None or (
             extent > _CUTE_WARP_REDUCTION_THREADS
@@ -1665,6 +1780,26 @@ class PersistentReductionStrategy(ReductionStrategy):
                     base_index_var=base_index_var,
                     elide_outer_loop=True,
                 )
+                # The vector-loop sinking pass (``cute/sink_vector_loops.py``,
+                # ``cute_vloop_sink``) interchanges this constexpr V-loop into
+                # the lane loops of the other full-slice axes it encloses, so a
+                # load addressed by one of their lanes can become one packet
+                # (the branch-local persistent vectorizer widens the markers
+                # inside each sunk V-loop; this pass widens none itself).
+                from .cute.device_state import CuteVloopWrapperFact
+
+                self.fn.cute_state.vloop_sink_wrappers[synthetic_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=vec_width,
+                        lane_var=synthetic_lane_var,
+                        vec_lane_var=synthetic_lane_var,
+                        base_index_var=base_index_var,
+                        index_var=self.index_var(block_idx),
+                        mask_var=self._mask_var,
+                        uniform_vector_mask=self._mask_var is None,
+                    )
+                )
                 index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
             else:
                 # A scalar synthetic lane over a grid of one-vector tile
@@ -1718,6 +1853,10 @@ class PersistentReductionStrategy(ReductionStrategy):
                     current_grid.thread_axis_sizes.get(axis, 1),
                     self._thread_count,
                 )
+                current_grid.block_thread_axes[block_idx] = axis
+            elif self._cute_axis_partner is not None:
+                # The partner sized the axis; this block's coordinate is the
+                # same thread index.
                 current_grid.block_thread_axes[block_idx] = axis
             if self._cute_resident_reduction:
                 # ``materialize_resident_reductions`` rewrites this loop and

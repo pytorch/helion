@@ -1109,6 +1109,9 @@ class DeviceIR:
                 mark_narrowed_fp32_multiplies(graph_info.graph)
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if env.backend_name == "cute":
+            from .cute.flat_gather_lane import (
+                register_flat_gather_factor_specializations,
+            )
             from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import (
                 register_persistent_vec_alignment_specializations,
@@ -1117,6 +1120,9 @@ class DeviceIR:
             # Explicit tile loops can also use vector memory transactions,
             # even when no persistent reduction block or contraction exists.
             register_persistent_vec_alignment_specializations(env)
+            # A flat gather scaled by an ``int`` argument packs its lanes
+            # only when the argument is a multiple of the packet width.
+            register_flat_gather_factor_specializations(env, self)
             if rdims:
                 # Reduction kernels reorder input reads across warps. Grid
                 # kernels add these storage-dependent dispatch guards below
