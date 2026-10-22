@@ -2086,7 +2086,9 @@ class PopulationBasedSearch(BaseSearch):
         cached configs, and protected seeds (the promoted
         ``compiler_default_config`` and ``ConfigSpec.autotune_seed_configs``).
         Specs with ``cute_flash_search_enabled`` ignore the limit, since their
-        seed set is the structural design the flash search measures.
+        seed set is the structural design the flash search measures. Explicit
+        compiler_seed_overflow_requested also bypasses the budget: those
+        candidates are required by the backend population contract.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
@@ -2117,6 +2119,7 @@ class PopulationBasedSearch(BaseSearch):
 
         if (
             generation.config_spec.cute_flash_search_enabled
+            or generation.config_spec.compiler_seed_overflow_requested
             or compiler_seed_limit is None
             or compiler_seed_limit <= 0
         ):
@@ -2167,7 +2170,8 @@ class PopulationBasedSearch(BaseSearch):
             )
 
         for flat, transferred_config in generation.user_seed_flat_config_pairs(
-            self._best_available_seed_configs, self.log
+            self._best_available_seed_configs,
+            lambda message: self.log(f"Best-available seed: {message}"),
         ):
             admit(flat, transferred_config)
         admit(default_flat, default_config)

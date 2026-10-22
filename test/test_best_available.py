@@ -1953,6 +1953,16 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             },
         )
 
+    def test_compiler_seed_limit_keeps_requested_overflow(self):
+        generation = self._make_config_gen(CuteBackend())
+        spec = generation.config_spec
+        spec.compiler_seed_configs = self._seed_grid()
+        spec.compiler_seed_overflow_requested = True
+        search = self._make_mock_search(generation, cached_configs=[])
+        self.assertEqual(
+            self._populate(search, compiler_seed_limit=2), self._populate(search)
+        )
+
     def test_compiler_seed_limit_does_not_cap_flash(self):
         with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
             spec = ConfigSpec(
@@ -2013,7 +2023,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             rows = self._populate(search)
         self.assertEqual(rows, [generation.default_flat()])
         search.log.assert_any_call(
-            "Failed to transfer autotune seed config 1: bad seed"
+            "Best-available seed: Failed to transfer autotune seed config 1: bad seed"
         )
 
     @staticmethod

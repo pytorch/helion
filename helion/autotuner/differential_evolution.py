@@ -68,7 +68,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
-                cached configs with random configs to reach 2x population size. Outside
+                cached configs with random configs to reach at least 2x population size. Outside
                 CuTe flash search, rows the compiler seed budget never trims are kept
                 even past that size.
                 When False, use only the seeds, default, and cached configs; random configs
@@ -187,7 +187,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         )
 
     def initial_two_generations(self) -> None:
-        # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
+        # Start with at least twice the target size, retaining requested seeds
+        # and cached winners even when they exceed that target.
         initial_population_name = self.initial_population_strategy.name
         with self._initial_population_batch():
             initial_members = self.benchmark_flat_batch(
