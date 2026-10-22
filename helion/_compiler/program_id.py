@@ -3720,6 +3720,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
             and not device_function.cute_state.tcgen05_pdl_wait_in_prefetch
         )
+        # ``cute_pdl`` (``cute_mma``'s ``tcgen05_pdl_launch``): the TMA-load
+        # warp waits before its first load and the epilogue warps before
+        # their first auxiliary load; every other global access follows one
+        # of those waits through the pipelines.  (The two-CTA TMA role waits
+        # below regardless; the epilogue-role wait is new for it.)  Kernel
+        # shapes whose reads this does not cover get an entry wait from
+        # ``DeviceFunction._cute_pdl_applies`` instead.
+        general_pdl = (
+            device_function.config.get("cute_pdl") is True
+            and not materialized_pdl
+            and CompileEnvironment.current().cute_fission_plan is None
+            and (
+                tma_load_role
+                or role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            )
+        )
         if emit_pdl_wait and (
             (
                 self._tcgen05_is_two_cta()
@@ -3732,8 +3748,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
             # The one-CTA family waits only when a materialized producer is
-            # launched ahead of it, so its plain generated code is unchanged.
+            # launched ahead of it (or ``cute_pdl`` asks for the dependent
+            # launch), so its plain generated code is unchanged.
             or (materialized_pdl and tma_load_role)
+            or general_pdl
         ):
             # PDL parity with Quack/CUTLASS: TMA producers wait before
             # touching scheduler state or issuing global-memory TMA work.

@@ -29,9 +29,11 @@ from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _target
 
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY as KEY
+from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.grouped_row_union import index_domain
+from helion._compiler.cute.grouped_row_union import schedule_supported
 from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import skipUnlessBackends
@@ -165,7 +167,7 @@ def test_false_retains_old_config_and_source(case: tuple, mode: str | None) -> N
     "updates",
     [
         {KEY: 1},
-        {"block_sizes": [128, 64, 64]},
+        {"block_sizes": [256, 64, 128]},
         {"tcgen05_ab_stages": 3},
         {"tcgen05_grouped_mode": "worklist_nm"},
         {"tcgen05_grouped_full_coverage": "fixed_tma_dense_local"},
@@ -399,6 +401,44 @@ def test_dense_index_envelope() -> None:
     assert not index_domain(1 << 30, 640, 128, 128)
     assert not index_domain(4, 640, 128, 129)
     assert not index_domain(True, 640, 128, 128)
+    # The legacy carrier also runs the one-CTA dense tiles: bm 64/128,
+    # bn 16/32/64, bk 64/128, each dividing its extent.
+    assert index_domain(4, 640, 128, 128, (128, 16, 128))
+    assert index_domain(4, 640, 128, 128, (64, 32, 64))
+    assert not index_domain(4, 640, 128, 128, (128, 8, 128))
+    assert not index_domain(4, 640, 128, 128, (256, 64, 128))
+    assert not index_domain(4, 640, 128, 128, (128, 16, 32))
+    assert not index_domain(4, 640, 120, 128, (128, 16, 128))
+    assert not index_domain(4, 600, 128, 128, (64, 16, 128))
+    assert schedule_supported({KEY: True}, (128, 16, 128))
+    assert schedule_supported({KEY: True}, (64, 32, 64))
+    assert not schedule_supported({KEY: True}, (128, 8, 128))
+    assert not schedule_supported({KEY: True}, (32, 64, 128))
+    # Physical profiles keep owning their geometry.
+    assert not schedule_supported(
+        {KEY: True, SCHEDULE_KEY: TRANSPOSED.name}, (128, 16, 128)
+    )
+
+
+@pytest.mark.parametrize("blocks", [(128, 16, 128), (128, 32, 64), (128, 32, 128)])
+@skipUnlessBackends(["cute"])
+def test_narrow_dense_tiles_keep_the_row_union_schedule(
+    case: tuple, blocks: tuple[int, int, int]
+) -> None:
+    bound = case[0]
+    config = _selected(bound)
+    config.config["block_sizes"] = list(blocks)
+    normalized = bound.config_spec.normalized_config(config)
+    assert normalized.config[KEY] is True
+    assert normalized.config["block_sizes"] == list(blocks)
+    source = bound.to_code(normalized)
+    bm, bn, bk = blocks
+    # The row-union epilogue (interval tables, per-row group predicates) runs
+    # on the narrower tile, and the persistent schedule covers 640 / bm by
+    # 128 / bn tiles.
+    assert "row_union_starts" in source and "row_union_ends" in source
+    assert f"PersistentTileSchedulerParams(({640 // bm}, {128 // bn}, 1)" in source
+    assert f"make_smem_layout_a(tiled_mma, ({bm}, {bn}, {bk})" in source
 
 
 @skipUnlessBackends(["cute"])
@@ -596,3 +636,24 @@ def test_packet_predicate_stores_only_selected_in_bounds_elements(
         for value, (row, column) in zip(values, coords, strict=True)
     ]
     assert output == expected
+
+
+@skipUnlessBackends(["cute"])
+def test_grouped_kernels_wait_at_entry_under_cute_pdl(case: tuple) -> None:
+    """The grouped persistent kernels read the group layout in their prologue,
+    ahead of any role-local wait, so ``cute_pdl`` gives them the entry wait
+    (the body's first statement) and the launch attribute."""
+    bound = case[0]
+    for config in (_old_config(None), _selected(bound)):
+        with_knob = deepcopy(config)
+        with_knob.config["cute_pdl"] = True
+        source = bound.to_code(with_knob)
+        assert "'use_pdl': True" in source
+        body = source[source.index("@cute.kernel") :]
+        lines = [line for line in body.splitlines()[1:] if line.strip()]
+        signature_end = next(
+            i for i, line in enumerate(lines) if line.rstrip().endswith(":")
+        )
+        assert lines[signature_end + 1].strip() == "cute.arch.griddepcontrol_wait()"
+        plain = bound.to_code(config)
+        assert "griddepcontrol" not in plain[plain.index("@cute.kernel") :]

@@ -52,6 +52,10 @@ class Tcgen05LifecycleContext:
     # disagree about who frees.  The permit is relinquished right after the
     # allocation on both paths.
     free_tmem_in_epilogue: bool = False
+    # ``cute_pdl`` on a one-CTA kernel: release the dependent grid after the
+    # MMA warp has issued its last MMA (the two-CTA path always does), so
+    # the next kernel's launch and prologue overlap this kernel's drain.
+    pdl_release: bool = False
 
     def _allocator_with_columns_line(self) -> str:
         return (
@@ -105,7 +109,7 @@ class Tcgen05LifecycleContext:
                     skip_advances=self.skip_ab_producer_advance,
                 )
             )
-        if self.is_two_cta:
+        if self.is_two_cta or self.pdl_release:
             # PDL parity with Quack/CUTLASS: after all MMAs are issued, hint
             # dependent kernels before this role starts the final acc drain.
             post_loop_lines.append(

@@ -91,6 +91,10 @@ from .grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from .grouped_panel_raster import grouped_device_panel_index_domain
 from .grouped_panel_raster import grouped_panel_ratio_index_domain
 from .grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
+from .grouped_row_union import LEGACY_BLOCK_K as LEGACY_ROW_UNION_BLOCK_K
+from .grouped_row_union import LEGACY_BLOCK_M as LEGACY_ROW_UNION_BLOCK_M
+from .grouped_row_union import LEGACY_BLOCK_N as LEGACY_ROW_UNION_BLOCK_N
+from .grouped_row_union import LEGACY_BLOCKS as LEGACY_ROW_UNION_BLOCKS
 from .grouped_row_union import PAIRED_CLC
 from .grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
 from .grouped_row_union import STARTUP_PREFILL_KEY
@@ -375,6 +379,21 @@ class _MmaOperandInfo:
     rhs_segment_group: _Rank3RhsSegmentGroupInfo | None = None
     rhs_packed_group: _Rank3RhsPackedGroupInfo | None = None
     source_to_logical_order: tuple[int, ...] | None = None
+    # The 16-bit float dtype the program casts a loaded integer tile to
+    # (``w[tile_k, tile_n].to(torch.bfloat16)`` on an int16 input), or None
+    # for an operand the matmul reads as loaded.  Only the register-MMA
+    # family consumes such an operand (it converts in registers on the way
+    # to shared memory); the tcgen05 pipeline feeds TMA packets straight to
+    # the tensor core and never sees a cast operand (``allow_integer_casts``
+    # on ``analyze_cute_mma_node`` is opt-in for exactly that reason).
+    cast_dtype: torch.dtype | None = None
+
+    @property
+    def mma_dtype(self) -> torch.dtype:
+        """The dtype the tensor core multiplies: the cast target, else the source."""
+        return (
+            self.cast_dtype if self.cast_dtype is not None else self.source_fake.dtype
+        )
 
     def __post_init__(self) -> None:
         if self.source_to_logical_order is None:
@@ -3662,16 +3681,69 @@ def _operand_dim_tiled_by_block(
     )
 
 
+# Integer operand dtypes the register-MMA family converts in registers, and
+# the PTX source type of the ``cvt`` that widens them (``cvt.rn.f32.<kind>``).
+_MMA_INTEGER_CAST_SOURCES: dict[torch.dtype, str] = {
+    torch.int16: "s16",
+    torch.uint16: "u16",
+}
+_MMA_INTEGER_CAST_TARGETS: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
+
+
+def _unwrap_integer_operand_cast(node: Node) -> tuple[Node, torch.dtype] | None:
+    """``(load, dtype)`` for a bare ``load.to(bf16 | fp16)`` of an int16 tile.
+
+    The program itself rounds every loaded integer to the half format before
+    the contraction, so lowering the cast on the way to shared memory feeds
+    the tensor core exactly the values the program computes.  Same-width
+    sources only: a 16-byte packet of int16 words converts to one 16-byte
+    packet of half words, so the family's packet geometry is unchanged.
+    """
+    if node.op != "call_function" or node.target not in (
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.aten._to_copy.default,
+    ):
+        return None
+    source = node.args[0] if node.args else None
+    if not isinstance(source, Node):
+        return None
+    if node.target is torch.ops.prims.convert_element_type.default:
+        if len(node.args) != 2 or node.kwargs:
+            return None
+        dtype = node.args[1]
+    else:
+        if len(node.args) != 1 or set(node.kwargs) != {"dtype"}:
+            return None
+        dtype = node.kwargs["dtype"]
+    if not isinstance(dtype, torch.dtype) or dtype not in _MMA_INTEGER_CAST_TARGETS:
+        return None
+    source_value = source.meta.get("val")
+    if (
+        not isinstance(source_value, torch.Tensor)
+        or source_value.dtype not in _MMA_INTEGER_CAST_SOURCES
+        or source_value.dtype.itemsize != dtype.itemsize
+    ):
+        return None
+    return source, dtype
+
+
 def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
+    *,
+    allow_integer_casts: bool = False,
 ) -> _MmaOperandInfo | None:
     permute = _unwrap_mma_operand_permute(node)
     if permute is None:
         return None
     load_value, source_to_logical_order = permute
+    cast_dtype: torch.dtype | None = None
     if source_to_logical_order is None:
         load_value = _unwrap_lossless_mma_upcast(load_value)
+        if allow_integer_casts:
+            unwrapped = _unwrap_integer_operand_cast(load_value)
+            if unwrapped is not None:
+                load_value, cast_dtype = unwrapped
     info = _direct_load_tensor(load_value)
     if info is None:
         return None
@@ -3681,7 +3753,7 @@ def _analyze_mma_operand(
     value_fake = node.meta.get("val")
     if not isinstance(value_fake, torch.Tensor):
         return None
-    if source_fake.dtype not in _MMA_SUPPORTED_DTYPES:
+    if cast_dtype is None and source_fake.dtype not in _MMA_SUPPORTED_DTYPES:
         return None
     subscript = load_node.args[1] if len(load_node.args) > 1 else None
     if not isinstance(subscript, (list, tuple)) or len(subscript) != source_fake.ndim:
@@ -3713,6 +3785,7 @@ def _analyze_mma_operand(
         ),
         block_ids=block_ids,
         source_to_logical_order=source_to_logical_order,
+        cast_dtype=cast_dtype,
     )
 
 
@@ -3720,12 +3793,14 @@ def _analyze_mma_operands(
     lhs_node: Node,
     rhs_node: Node,
     env: CompileEnvironment,
+    *,
+    allow_integer_casts: bool = False,
 ) -> _MmaOperandAnalysis | None:
-    lhs = _analyze_mma_operand(lhs_node, env)
-    rhs = _analyze_mma_operand(rhs_node, env)
+    lhs = _analyze_mma_operand(lhs_node, env, allow_integer_casts=allow_integer_casts)
+    rhs = _analyze_mma_operand(rhs_node, env, allow_integer_casts=allow_integer_casts)
     if lhs is None or rhs is None:
         return None
-    if lhs.source_fake.dtype != rhs.source_fake.dtype:
+    if lhs.mma_dtype != rhs.mma_dtype:
         return None
     if not env.known_equal(lhs.matrix_cols, rhs.matrix_rows):
         return None
@@ -4214,8 +4289,15 @@ def analyze_cute_mma_node(
     *,
     device_ir: DeviceIR | None = None,
     graphs: Sequence[GraphInfo] | None = None,
+    allow_integer_casts: bool = False,
 ) -> _CuteMmaNode | None:
-    """Match a codegen-able MMA and analyze its matrix operand structure."""
+    """Match a codegen-able MMA and analyze its matrix operand structure.
+
+    ``allow_integer_casts`` also matches an operand that is a bare
+    ``load.to(bf16 | fp16)`` of an int16 tile (``_MmaOperandInfo.cast_dtype``);
+    only the register-MMA family lowers such an operand, so the tcgen05
+    callers keep the default and never see one.
+    """
     target = _decode_cute_mma_target(node, device_ir=device_ir, graphs=graphs)
     if target is None:
         return None
@@ -4225,6 +4307,7 @@ def analyze_cute_mma_node(
         target.lhs,
         target.rhs,
         CompileEnvironment.current(),
+        allow_integer_casts=allow_integer_casts,
     )
     if operands is None and device_ir is not None:
         operands = _analyze_rank3_rhs_grouped_search_operands(
@@ -4607,7 +4690,11 @@ def _prove_rank3_rhs_grouped_mma(
             proof
             if proof is not None
             and _grouped_row_union_metadata(
-                cg, node, proof, schedule=physical_schedule(config)
+                cg,
+                node,
+                proof,
+                schedule=physical_schedule(config),
+                blocks=_configured_row_union_blocks(cg, axes),
             )
             is not None
             else None
@@ -4660,6 +4747,35 @@ def _grouped_full_coverage_semantics(
     )
 
 
+# The smallest tiles the row-union schedule serves: the capability probes
+# that decide whether the knob is offered at all admit every problem some
+# configured tile can serve; the configured tile is checked at planning and
+# at codegen.
+_SMALLEST_ROW_UNION_BLOCKS = (
+    min(LEGACY_ROW_UNION_BLOCK_M),
+    min(LEGACY_ROW_UNION_BLOCK_N),
+    min(LEGACY_ROW_UNION_BLOCK_K),
+)
+
+
+def _configured_row_union_blocks(
+    cg: GenerateAST, axes: _GroupedMmaAxes
+) -> tuple[int, int, int]:
+    """The configured (bm, bn, bk) of a grouped MMA, the legacy tile when the
+    planner has no device function (a graph view) or a block size is not a
+    static integer under the current config."""
+    device_function = getattr(cg, "device_function", None)
+    if device_function is None:
+        return LEGACY_ROW_UNION_BLOCKS
+    sizes = tuple(
+        device_function.resolved_block_size(block_id)
+        for block_id in (axes.m_block_id, axes.n_block_id, axes.k_block_id)
+    )
+    if all(isinstance(size, int) for size in sizes):
+        return cast("tuple[int, int, int]", sizes)
+    return LEGACY_ROW_UNION_BLOCKS
+
+
 def _grouped_row_union_metadata(
     cg: GenerateAST,
     node: Node,
@@ -4667,6 +4783,7 @@ def _grouped_row_union_metadata(
     *,
     specialize: bool = True,
     schedule: RowUnionSchedule | None = None,
+    blocks: tuple[int, int, int] = LEGACY_ROW_UNION_BLOCKS,
 ) -> tuple[int, int, int, int] | None:
     """Retain every grouped purity/alias/offset proof before rescheduling.
 
@@ -4703,7 +4820,7 @@ def _grouped_row_union_metadata(
     m, k = map(size, lhs.shape)
     n = size(rhs.shape[1])
     if size(proof.layout_tensor.shape[0]) != groups + 1 or not (
-        row_union_index_domain(groups, m, n, k)
+        row_union_index_domain(groups, m, n, k, blocks)
         if schedule is None
         else schedule.index_domain(groups, m, n, k)
     ):
@@ -4853,6 +4970,7 @@ def analyze_tcgen05_grouped_worklist(
                             node,
                             proof,
                             specialize=False,
+                            blocks=_SMALLEST_ROW_UNION_BLOCKS,
                         )
                         is not None
                     ),
@@ -4863,6 +4981,7 @@ def analyze_tcgen05_grouped_worklist(
                             proof,
                             specialize=False,
                             schedule=PAIRED_CLC,
+                            blocks=_SMALLEST_ROW_UNION_BLOCKS,
                         )
                         is not None
                     ),
@@ -4873,6 +4992,7 @@ def analyze_tcgen05_grouped_worklist(
                             proof,
                             specialize=False,
                             schedule=TRANSPOSED,
+                            blocks=_SMALLEST_ROW_UNION_BLOCKS,
                         )
                         is not None
                     ),
@@ -5684,6 +5804,7 @@ def prepare_cute_collective_lane_loop_suppression(
                     node,
                     proof,
                     schedule=physical_schedule(cg.device_function.config),
+                    blocks=(bm, bn, bk),
                 ) is None or not row_union_schedule_supported(
                     cg.device_function.config.config, (bm, bn, bk)
                 ):
@@ -8154,6 +8275,7 @@ def _emit_mma_pipeline(
                 fx_node,
                 rhs_rank3_grouped_proof,
                 schedule=physical_schedule(df.config),
+                blocks=(bm, bn, bk),
             )
             if (
                 metadata is None
@@ -8998,6 +9120,33 @@ def _emit_mma_pipeline(
     )
     # The clustered CtaGroup.ONE bridge flag is compile-proof only: ProgramID
     # still emits the host guard because this runtime path is not validated.
+    # ``cute_pdl`` on a tcgen05 kernel: launched as a programmatic dependent
+    # of the previous kernel in the stream. The flat one-CTA kernel waits
+    # (every warp) ahead of its first TMA load, the plain persistent kernel
+    # in its TMA-load and epilogue roles ahead of their first global reads
+    # (``program_id``'s ``general_pdl``), and the MMA warp releases the
+    # dependents after its last MMA. ``DeviceFunction._cute_pdl_applies``
+    # (``cute_state.cute_pdl_entry_wait``) checks that every global read of
+    # the generated body sits behind a wait on its own path and otherwise
+    # puts a wait at the top of the body: the grouped kernels (layout reads
+    # in the prologue), the scheduler-warp persistent kernel and any body
+    # with a root-body read ahead of the K loop get that entry wait. The
+    # materialized-operand and CLC kernels place their own waits; the knob
+    # is theirs to keep off.
+    tcgen05_pdl_launch = (
+        mma_impl == "tcgen05"
+        and df.config.get("cute_pdl") is True
+        and not df.config.get("tcgen05_materialized_pdl", False)
+        # A materialized-fission bundle's stages carry their own protocol
+        # (``tcgen05_materialized_pdl``); the knob stays inert on them.
+        and CompileEnvironment.current().cute_fission_plan is None
+    )
+    # The two-CTA kernel releases after its MMAs through
+    # ``Tcgen05LifecycleContext.is_two_cta``; the one-CTA flat kernel's
+    # release is emitted below.
+    tcgen05_pdl = tcgen05_pdl_launch and not tcgen05_is_two_cta
+    if tcgen05_pdl_launch:
+        df.cute_state.cute_pdl_entry_wait = True
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -13664,8 +13813,10 @@ def _emit_mma_pipeline(
             # ``use_pdl`` only added to the dict when True so the
             # static-path kernels' wrapper-plan literals stay
             # byte-identical to the pre-G2-H golden.
-            if tcgen05_matmul_plan.is_clc_persistent or df.config.get(
-                "tcgen05_materialized_pdl", False
+            if (
+                tcgen05_matmul_plan.is_clc_persistent
+                or df.config.get("tcgen05_materialized_pdl", False)
+                or tcgen05_pdl_launch
             ):
                 ab_tma_plan["use_pdl"] = True
             cg.cute_wrapper_plans.append(ab_tma_plan)
@@ -14571,6 +14722,18 @@ def _emit_mma_pipeline(
                             )
                             df.cute_state.tcgen05_pdl_wait_in_prefetch = True
                         else:
+                            if tcgen05_pdl and not tcgen05_use_role_local_tma_producer:
+                                # ``cute_pdl`` on the flat one-CTA kernel: every
+                                # warp passes this point after the prologue and
+                                # before the first TMA load; the epilogue's
+                                # global accesses follow it in program order.
+                                # (``_cute_pdl_applies`` adds an entry wait
+                                # instead when a global read precedes it.)
+                                initial_prefetch.append(
+                                    statement_from_string(
+                                        "cute.arch.griddepcontrol_wait()"
+                                    )
+                                )
                             # Each stage's gates are assigned directly ahead of
                             # its own prefetch block.
                             for (
@@ -15508,6 +15671,21 @@ def _emit_mma_pipeline(
             per_tile_stmts.append(suffix_stmt)
             if tcgen05_use_role_local_mma_exec:
                 mma_exec_role_stmts.append(suffix_stmt)
+            elif tcgen05_pdl:
+                # ``cute_pdl`` on the flat kernel: the MMA warp has issued
+                # its last MMA; release the dependent grid here, ahead of
+                # the epilogue's CTA-wide syncs (the persistent kernel's
+                # MMA role releases after its tile loop, see
+                # ``Tcgen05LifecycleContext.pdl_release``).
+                suffix.append(
+                    statement_from_string(
+                        _tcgen05_emit_optional_gate(
+                            "cute.arch.griddepcontrol_launch_dependents()",
+                            tcgen05_mma_owner_active,
+                            indent="",
+                        )
+                    )
+                )
             if tcgen05_m_subtile_count > 1:
                 suffix_stmt2 = statement_from_string(
                     _tcgen05_emit_optional_gate(
@@ -15574,6 +15752,7 @@ def _emit_mma_pipeline(
             use_merged_pipeline_init=tcgen05_use_merged_pipeline_init,
             tmem_allocator_warp=tcgen05_tmem_allocator_warp,
             free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
+            pdl_release=tcgen05_pdl and tcgen05_use_role_local_mma_exec,
         )
         tcgen05_pure_matmul_object = (
             Tcgen05PureMatmulObjectModel(
