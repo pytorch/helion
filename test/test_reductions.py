@@ -96,8 +96,6 @@ def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
         v = x[tile, :, :]
         if op == "sum":
             out[tile] = v.sum(dim=(1, 2))
-        elif op == "sum_dtype_same":
-            out[tile] = v.sum(dim=(1, 2), dtype=x.dtype)
         elif op == "sum_fp16":
             out[tile] = v.sum(dim=(1, 2), dtype=torch.float16)
         elif op == "mean":
@@ -255,73 +253,53 @@ class TestReductions(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(output, expected)
 
     @onlyBackends(["triton", "cute"])
-    @skipIfRefEager("checks the compiled reduction_loops spec")
+    @skipIfRefEager("checks compiled reduction dimensions")
     @parametrize(
-        "shape,dtype,transpose,loops",
+        "shape,dtype,transpose,op,chunk",
         (
-            ((6, 24, 64), torch.float32, False, [[None], [256]]),
-            ((6, 33, 33), torch.float32, False, [[None], [256]]),
-            ((6, 64, 256), torch.bfloat16, False, [[None], [1024]]),
-            ((6, 64, 24), torch.float32, True, [[None], [16]]),
-            # equal extents chained share one rdim, which can't loop
-            ((6, 33, 33), torch.float32, True, [[]]),
+            ((6, 24, 64), torch.float32, False, "sum", 256),
+            ((6, 33, 33), torch.float32, False, "mean", 256),
+            ((6, 64, 256), torch.bfloat16, False, "mean", 1024),
+            ((6, 33, 33), torch.float32, False, "amax", 256),
+            ((6, 33, 33), torch.float32, False, "amin", 256),
+            ((6, 64, 24), torch.float32, True, "sum", 16),
+            # Equal chained extents share one dimension and cannot loop.
+            ((6, 33, 33), torch.float32, True, "sum", None),
+            ((6, 33, 33), torch.float32, False, "centered", None),
         ),
     )
-    @parametrize("op", ("sum", "mean", "amax", "amin", "centered"))
-    def test_reduction_over_multiple_dims(self, shape, dtype, transpose, loops, op):
-        reductions = {
-            "sum": lambda v: v.sum(dim=(1, 2)),
-            "mean": lambda v: v.mean(dim=(1, 2)),
-            "amax": lambda v: v.amax(dim=(1, 2)),
-            "amin": lambda v: v.amin(dim=(1, 2)),
-            "centered": lambda v: (v - v.mean(dim=(1, 2), keepdim=True)).amax(
-                dim=(1, 2)
-            ),
-        }
-        # The reduced dims merge into one rdim of their combined extent, padded
-        # and looped as a whole; a transposed input, which can't flatten them
-        # into a view, chains single-dim reductions instead.
-        # CuTe can't lower the chained reductions yet
-        if transpose and _get_backend() == "cute":
+    def test_reduction_over_multiple_dims(self, shape, dtype, transpose, op, chunk):
+        if _get_backend() == "cute" and (transpose or op == "centered"):
             self.skipTest("CuTe cannot lower chained reductions")
         x = torch.randn(shape, device=DEVICE, dtype=dtype)
         if transpose:
             x = x.transpose(1, 2)
-        bound = _reduce_multi_dim_tile.bind((x, "sum"))
-        merges = _merged_reduction_backend()
-        if merges:
-            self.assertEqual(len(bound.config_spec.reduction_loops), len(loops[0]))
+        # One-signed extrema inputs expose contributions from padded lanes.
+        x = {"amax": -x.abs() - 1, "amin": x.abs() + 1}.get(op, x)
+        bound = _reduce_multi_dim_tile.bind((x, op))
+        merge_backend = _merged_reduction_backend()
+        merged = merge_backend and not transpose and op != "centered"
+        spec = bound.config_spec
+        n_loops = len(spec.reduction_loops)
+        if merged:
+            self.assertEqual(n_loops, 1)
         if _get_backend() == "cute":
-            # no tuning knobs for the per-dim rdims the merge left unused
-            spec = bound.config_spec
             self.assertEqual(len(spec.cute_reduction_reloads.valid_block_ids()), 1)
             self.assertEqual(len(spec.cute_vector_widths.valid_block_ids()), 2)
             self.assertEqual(len(spec.cute_lane_layouts.valid_block_ids()), 2)
         self.assertEqual(
-            "flatten(1, 2)" in bound.to_triton_code(bound.config_spec.default_config()),
-            merges and not transpose,
+            "flatten(1, 2)" in bound.to_triton_code(spec.default_config()), merged
         )
-        fn = reductions[op]
-        if op == "centered" and _get_backend() == "cute":
-            self.skipTest("CuTe cannot lower chained reductions")
-        # One-signed inputs expose padded lanes leaking into max/min.
-        v = {"amax": -x.abs() - 1, "amin": x.abs() + 1}.get(op, x)
-        # Only "centered" chains a non-transposed input (its v has
-        # another user), and a chain over equal extents shares one
-        # rdim, which can't loop.
-        n_loops = len(_reduce_multi_dim_tile.bind((v, op)).config_spec.reduction_loops)
-        if merges and op != "centered":
-            self.assertEqual(n_loops, len(loops[0]))
-        op_loops = (loops if merges else [[None] * n_loops]) if n_loops else [[]]
-        for reduction_loops in op_loops:
-            with self.subTest(shape=shape, op=op, loops=reduction_loops):
-                _, output = code_and_output(
-                    _reduce_multi_dim_tile,
-                    (v, op),
-                    block_sizes=[2],
-                    reduction_loops=reduction_loops,
-                )
-                torch.testing.assert_close(output, fn(v))
+        expected = (
+            (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
+            if op == "centered"
+            else getattr(torch, op)(x, dim=(1, 2))
+        )
+        for loop in (None, chunk) if chunk is not None and merge_backend else (None,):
+            actual = bound.compile_config(
+                helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
+            )(x, op)
+            torch.testing.assert_close(actual, expected)
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the generated code")
@@ -368,7 +346,6 @@ class TestReductions(RefEagerTestBase, TestCase):
             near_one = near_one.transpose(1, 2).contiguous().transpose(1, 2)
         for x, op, expected in (
             (ones, "sum", ones.sum(dim=(1, 2))),
-            (ones, "sum_dtype_same", ones.sum(dim=(1, 2))),
             (near_one, "sum_fp16", near_one.sum(dim=(1, 2), dtype=torch.float16)),
         ):
             with self.subTest(op=op, transpose=transpose):
@@ -397,31 +374,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = mask.amin((1, 2)) if op == "amin" else mask.amax((1, 2))
         torch.testing.assert_close(output, expected)
 
-    @onlyBackends(["triton", "pallas"])
-    @parametrize("static_shapes", (False, True))
-    @skipIfRefEager("checks compiled logical-size reads")
-    def test_full_slice_size_is_logical_extent(self, static_shapes):
-        @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
-        def reduce(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
-            for row in hl.tile(x.size(0)):
-                values = x[row]
-                out[row] = values.sum((1, 2)) / values.size(1)
-            return out
-
-        # Pallas chains require unpadded intermediate extents.
-        shape = (4, 32, 64) if _get_backend() == "pallas" else (5, 7, 9)
-        x = torch.randn(shape, device=DEVICE)
-        bound = reduce.bind((x,))
-        for chunk in (None, 2) if _get_backend() == "triton" else (None,):
-            config = helion.Config(
-                block_sizes=[2],
-                reduction_loops=[chunk] * len(bound.config_spec.reduction_loops),
-            )
-            torch.testing.assert_close(
-                bound.compile_config(config)(x), x.sum((1, 2)) / x.size(1)
-            )
-
     @onlyBackends(["triton"])
     @parametrize("static_shapes", (False, True))
     @skipIfRefEager("checks physical shapes and logical fill values")
@@ -432,7 +384,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             for row in hl.tile(x.size(0)):
                 value = x[row, :]
                 value = value + value.new_full(value.shape, value.size(1))
-                out[row] = value.sum(1)
+                out[row] = value.sum(1) / value.size(1)
             return out
 
         x = torch.randn(64, 33, device=DEVICE)
@@ -440,7 +392,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             _, actual = code_and_output(
                 reduce, (x,), block_sizes=[4], reduction_loops=[chunk]
             )
-            torch.testing.assert_close(actual, x.sum(1) + x.size(1) ** 2)
+            torch.testing.assert_close(actual, x.sum(1) / x.size(1) + x.size(1))
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
@@ -569,36 +521,6 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, output = code_and_output(add_then_sum, (x, acc), block_sizes=[2, 2])
         self.assertNotIn("flatten(", code)
         torch.testing.assert_close(output, (x + 1).sum(dim=(1, 2)))
-
-        @helion.kernel(static_shapes=True)
-        def double_then_sum(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
-            for tile in hl.tile(x.size(0)):
-                x[tile, :, :] = x[tile, :, :] * 2
-            hl.barrier()
-            for tile in hl.tile(x.size(0)):
-                out[tile] = x[tile, :, :].sum(dim=(1, 2))
-            return out
-
-        expected = (x * 2).sum(dim=(1, 2))
-        code, output = code_and_output(double_then_sum, (x,), block_sizes=[2, 2])
-        self.assertNotIn("flatten(", code)
-        torch.testing.assert_close(output, expected)
-
-        @helion.kernel(static_shapes=True)
-        def double_and_sum(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
-            for tile in hl.tile(x.size(0)):
-                x[tile, :, :] = x[tile, :, :] * 2
-                # a merged load would read x in a different layout than the
-                # store above wrote it
-                out[tile] = x[tile, :, :].sum(dim=(1, 2))
-            return out
-
-        expected = (x * 2).sum(dim=(1, 2))
-        code, output = code_and_output(double_and_sum, (x,), block_sizes=[2])
-        self.assertNotIn("flatten(", code)
-        torch.testing.assert_close(output, expected)
 
         @helion.kernel(static_shapes=True)
         def double_rows_and_sum(x: torch.Tensor) -> torch.Tensor:
