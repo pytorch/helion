@@ -38,7 +38,9 @@ def _codegen_skip_reason(backend: str) -> str | None:
     return None
 
 
-def _cpu_bind(kernel, args, *, capability=(10, 0), num_sm=148):
+def _cpu_bind(
+    kernel, args, *, capability: tuple[int, int] = (10, 0), num_sm: int | None = None
+):
     if reason := _codegen_skip_reason(kernel.settings.backend):
         raise SkipTest(reason)
     with ExitStack() as stack:
@@ -48,10 +50,17 @@ def _cpu_bind(kernel, args, *, capability=(10, 0), num_sm=148):
                 "helion._compiler.compile_environment.target_device_capability",
                 capability,
             ),
-            ("helion.runtime.get_num_sm", num_sm),
+            ("helion.runtime.get_num_sm", 148 if num_sm is None else num_sm),
             ("helion._compat._is_hip", False),
         ):
             stack.enter_context(patch(name, return_value=value))
+        if num_sm is not None:
+            stack.enter_context(
+                patch(
+                    "helion.autotuner.config_spec.num_compute_units",
+                    return_value=num_sm,
+                )
+            )
         return kernel._bind_isolated(args)
 
 

@@ -272,10 +272,12 @@ def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) 
         torch.empty(256, 64, dtype=torch.float16),
     )
     heuristic = CuteCollectiveMatmulHeuristic
-    original = []
+    original: list[helion.Config] = []
     interleave = heuristic._interleave_bounded_k_seeds
 
-    def capture(spec, seeds, parameters):
+    def capture(
+        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
+    ) -> list[helion.Config]:
         result = interleave(spec, seeds, parameters)
         if missing_async:
             sibling = helion.Config.from_dict(
