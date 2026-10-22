@@ -43,6 +43,7 @@ from .. import exc
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
+from ..language.reduce_ops import _reduce
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -1245,7 +1246,6 @@ class ReductionLowering(InductorLowering):
 
 def reduction_block_id(node: torch.fx.Node) -> int | None:
     """Return the block reduced by a native or single-axis custom reduction."""
-    from ..language.reduce_ops import _reduce
 
     lowering = node.meta.get("lowering")
     if isinstance(lowering, ReductionLowering):

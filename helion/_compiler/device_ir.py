@@ -49,6 +49,7 @@ from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language.reduce_ops import _reduce
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -1458,7 +1459,6 @@ class DeviceIR:
 
         The reduction seed resolves every candidate against the full live-step timeline.
         """
-        from ..language.reduce_ops import _reduce
 
         env = CompileEnvironment.current()
         spec = env.config_spec

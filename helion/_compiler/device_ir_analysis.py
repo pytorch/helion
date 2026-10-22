@@ -32,6 +32,7 @@ from ..autotuner.config_spec import RootGridFact
 from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
 from ..language._decorators import is_api_func
+from ..language.reduce_ops import _reduce
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
@@ -1140,7 +1141,6 @@ class GraphAnalysis:
         resolve_placeholder: Callable[[torch.fx.Node], torch.fx.Node],
     ) -> GraphAnalysis:
         from ..language import memory_ops
-        from ..language.reduce_ops import _reduce
 
         graph = graph_info.graph
         nodes = tuple(graph.nodes)
@@ -1199,7 +1199,11 @@ class GraphAnalysis:
                 if block_id not in seen_reductions:
                     seen_reductions.add(block_id)
                     reduction_occurrences.append(block_id)
-                if node.target is _reduce:
+                if (
+                    node.target is _reduce
+                    and env.backend_name == "triton"
+                    and node.args[2] is not None
+                ):
                     inputs = node.args[1]
                     sources = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
                     # Each payload needs its own carry, even when inputs alias.
@@ -1915,7 +1919,6 @@ class DeviceIRAnalysis:
         from ..language.inline_asm_ops import inline_asm_elementwise
         from ..language.inline_triton_ops import inline_triton
         from ..language.inline_triton_ops import triton_kernel
-        from ..language.reduce_ops import _reduce
         from ..language.scan_ops import _associative_scan
 
         reduction_fact = spec.reduction_kernel_fact

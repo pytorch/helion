@@ -173,7 +173,7 @@ def _emit_reduction_padding(
     assert chunk_var is not None
     dynamic = not numel.is_number
     if not dynamic:
-        padded_extent = max(1, env.backend.static_rdim_size(int(numel)))
+        padded_extent = env.backend.static_rdim_size(int(numel))
         padded = str(padded_extent)
         if padded_extent == int(numel):
             return padded, dynamic

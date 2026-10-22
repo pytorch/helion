@@ -10,6 +10,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.cute.canonicalize_reductions import _independent_combines
 from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
@@ -1169,14 +1170,16 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             custom = torch.empty_like(native)
             for row in hl.tile(x.size(0)):
                 native[row] = x[row, :].sum(1)
-                custom[row] = hl.reduce(add_combine_fn, y[row, :], dim=1)
+            for other_row in hl.tile(y.size(0)):
+                custom[other_row] = hl.reduce(add_combine_fn, y[other_row, :], dim=1)
             return native, custom
 
         bound = mixed.bind(
-            (torch.empty(5, 65536, device=DEVICE), torch.empty(5, 65, device=DEVICE))
+            (torch.empty(5, 65536, device=DEVICE), torch.empty(5, 8192, device=DEVICE))
         )
         assert bound.host_function is not None
         env, ir = bound.env, bound.host_function.device_ir
+        self.assertTrue(bound.config_spec.has_custom_reduction_loops)
         seeds = TritonReductionHeuristic.get_seed_configs(env, ir)
         with patch.object(
             type(bound.config_spec),
@@ -1201,6 +1204,20 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                         native_seed.reduction_loops, block_id
                     ),
                 )
+
+        narrow = TritonNarrowReductionHeuristic.get_seed_config(env, ir)
+        default = bound.config_spec._base_default_config()
+        for block_id in native_ids:
+            self.assertEqual(
+                bound.config_spec.reduction_loops.config_get(
+                    narrow.reduction_loops, block_id
+                ),
+                bound.config_spec.reduction_loops.config_get(
+                    default.reduction_loops, block_id
+                ),
+            )
+        self.assertEqual(narrow.block_sizes, default.block_sizes)
+        self.assertEqual(narrow.num_warps, default.num_warps)
 
     @skipIfRefEager("checks generated reduction-loop code")
     def test_nonzero_identity_and_nonidentity_padding(self) -> None:
