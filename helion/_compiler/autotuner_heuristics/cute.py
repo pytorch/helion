@@ -1000,6 +1000,21 @@ def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     return 1
 
 
+def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
+    """Find row/inner axes in loop order, independent of registration order."""
+    blocks = env.config_spec.block_sizes
+    if len(blocks) != 2:
+        return None
+    paths = env.config_spec.cute_tile_loop_paths
+    if len(paths) != 1 or not paths[0][0]:
+        return None
+    block_ids = blocks.valid_block_ids()
+    axes = tuple(bid for level in paths[0] for bid in level if bid in block_ids)
+    if len(axes) != 2 or set(axes) != set(block_ids):
+        return None
+    return axes[0], axes[1]
+
+
 def _cute_tile_inner_block_dtype(
     env: CompileEnvironment, device_ir: DeviceIR, block_id: int
 ) -> torch.dtype | None:
@@ -1558,13 +1573,10 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
             return False
         # The inner tile block must have a vec slot registered
         # (added by ``register_rollable_reductions`` for cute tile blocks).
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        inner_block_id = blocks[1]
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         # Need a recognisable dtype to seed V.
@@ -1576,13 +1588,10 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
@@ -1591,12 +1600,14 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         # SM100 warp + L2 hit cadence) when reachable, else cap at the
         # inner tile's fragment.high.  ``num_threads`` is sized so the
         # lane_extent equals V (one vec load per thread per outer iter).
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
         # Threads = block_n // V so each thread owns V contiguous elts.
         nt_n = max(1, block_n // vec)
         seed: dict[str, Any] = {
-            "block_sizes": [1, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: nt_n}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -1777,10 +1788,7 @@ class CuteScanTileHeuristic(AutotunerHeuristic):
         # runs on the innermost grid block and needs the strip extent to be a
         # multiple of the vector width; a strip elsewhere (a column-major
         # input) or of another width (98 columns) would seed scalar code.
-        if (
-            strip_block != spec.block_sizes[-1].block_ids[0]
-            or strip_spec.size_hint % vec
-        ):
+        if strip_block != device_ir.grid_block_ids[0][-1] or strip_spec.size_hint % vec:
             return None
         strip = min(strip_spec.max_size, cls.STRIP_THREADS * vec)
         rows = min(rows, scan_spec.max_size)
@@ -1871,13 +1879,10 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        inner_block_id = blocks[1]
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
@@ -1889,7 +1894,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # against the launch cost (and an autotuner-picked warp lattice
         # can hold the row).  We use the inner block fragment's high
         # bound as a proxy for the reduction extent.
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         return bn_high >= vec * 32
 
     @classmethod
@@ -1897,13 +1902,10 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
@@ -1911,12 +1913,14 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # Each thread owns V contiguous elements; one warp = 32 threads
         # = 32 * V elements per outer-tile iter. Cap by the fragment's
         # high bound so the seed is reachable for short reduction axes.
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = vec * 32
         if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
-            "block_sizes": [1, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -2885,10 +2889,11 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        inner = cast("Any", spec.block_sizes[1])
-        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        inner_block_id = blocks[1]
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return None
         if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
@@ -2939,9 +2944,14 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n = plan
         spec = env.config_spec
-        inner_block_id = spec.block_sizes[1].block_id
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [1, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads, {inner_block_id: threads}
             ),
@@ -3019,9 +3029,14 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n, max_per_thread = plan
         spec = env.config_spec
-        inner_block_id = spec.block_sizes[1].block_id
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [1, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads, {inner_block_id: threads}
             ),
@@ -3079,10 +3094,11 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        inner = cast("Any", spec.block_sizes[1])
-        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        inner_block_id = blocks[1]
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return None
         if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
@@ -3118,9 +3134,14 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             return None
         n, vec = plan
         spec = env.config_spec
-        outer_block_id, inner_block_id = (item.block_id for item in spec.block_sizes)
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [cls._ROWS_PER_CTA, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: cls._ROWS_PER_CTA, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads,
                 {
@@ -3186,25 +3207,22 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        outer_block_id, inner_block_id = blocks
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return False
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         if bn_high < vec * 32:
             return False
         # Outer (M) fragment must admit M=2 (warp-per-row launches 2
         # warps per CTA so each row is one warp).
-        bm_fragment = spec.block_sizes[0]._fragment(spec)
+        bm_fragment = spec.block_sizes.block_id_lookup(outer_block_id)._fragment(spec)
         return bm_fragment.low <= 2 <= bm_fragment.high
 
     @classmethod
@@ -3212,23 +3230,22 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return None
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = vec * 32
         if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
-            "block_sizes": [2, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 2, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -7239,11 +7256,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
     """Seed config for skinny-M FP8 GEMM kernels.
 
-    For small M (1-16) the optimal config is very different from a large GEMM:
-    a single row per grid block (``block_sizes[0]=1``), a modest N tile, a warp
-    of threads on the N axis, and a wide FP8 vector load. Seeding this anchors
-    the autotuner in the valid small-tile region instead of letting the random
-    population burn its budget on configs like ``block_sizes=[4096, 2048]`` or
+    For small M (1-16), seed a small outer tile and a wide inner tile.
+    With M untiled, this means one N column per grid block with a 256-element
+    K tile, 32 K threads, and wide FP8 vector loads.
+    Seeding this anchors the autotuner in the valid small-tile region instead
+    of letting the random population burn its budget on configs like
+    ``block_sizes=[4096, 2048]`` or
     1024-thread launches that are structurally wrong for a 1-row problem (and
     frequently overflow shared memory).
 
@@ -7252,9 +7270,10 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
     faster kernel than with heuristics disabled, with ~25% fewer wasted
     compile failures.
 
-    Seeds ``block_sizes=[1, 256]``, ``num_threads=[0, 32]``,
-    ``cute_vector_widths=[4, 8]`` (the autotune-winning config for
-    M=1, K=4096, N=4096).
+    Of the two tunable axes in M/N/K order, the first gets block size 1,
+    automatic threads (0), and vector width 4; the second gets block size
+    256, 32 threads, and vector width 8. This is the autotune-winning N/K
+    config for M=1, K=4096, N=4096.
     """
 
     name = "cute_fp8_gemm_skinny_m"
@@ -7277,20 +7296,44 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
         )
         if not is_fp8:
             return False
+        block_ids = spec.block_sizes.valid_block_ids()
+        axes = tuple(
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
         # Check for skinny M (small batch / decode scenario):
         # M <= 16 is the skinny-M case.
-        return fact.static_m is not None and fact.static_m <= 16
+        return (
+            fact.static_m is not None
+            and fact.static_m <= 16
+            and len(axes) == 2
+            and set(axes) == set(block_ids)
+        )
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+        spec = env.config_spec
+        fact = spec.matmul_facts[0]
+        block_ids = spec.block_sizes.valid_block_ids()
+        first, second = (
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
+        assert first is not None and second is not None
         # Best config from autotune benchmarks for M=1, K=4096, N=4096
         # (1.5x speedup over baseline; the M=1 search reliably converges here).
         seed: dict[str, Any] = {
-            "block_sizes": [1, 256],
-            "num_threads": [0, 32],
-            "cute_vector_widths": [4, 8],
+            "block_sizes": _seq_config_list(spec.block_sizes, {first: 1, second: 256}),
+            "num_threads": _seq_config_list(spec.num_threads, {first: 0, second: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {first: 4, second: 8}
+            ),
         }
         try:
             return Config(**seed)
