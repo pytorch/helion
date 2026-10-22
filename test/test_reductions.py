@@ -380,11 +380,14 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_full_slice_size_as_shape_and_fill(self, static_shapes):
         @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
         def reduce(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            out = torch.empty((x.size(0), 3), device=x.device, dtype=x.dtype)
             for row in hl.tile(x.size(0)):
                 value = x[row, :]
-                value = value + value.new_full(value.shape, value.size(1))
-                out[row] = value.sum(1) / value.size(1)
+                n = value.size(1)
+                value = value + value.new_full(value.shape, n)
+                total = value.sum(1)
+                for step in hl.tile(3, block_size=1):
+                    out[row, step] = total[:, None] / n
             return out
 
         x = torch.randn(64, 33, device=DEVICE)
@@ -392,7 +395,8 @@ class TestReductions(RefEagerTestBase, TestCase):
             _, actual = code_and_output(
                 reduce, (x,), block_sizes=[4], reduction_loops=[chunk]
             )
-            torch.testing.assert_close(actual, x.sum(1) / x.size(1) + x.size(1))
+            expected = x.sum(1) / x.size(1) + x.size(1)
+            torch.testing.assert_close(actual, expected[:, None].expand(-1, 3))
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
@@ -481,8 +485,8 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertTrue((cleared == 0).all())
 
     @onlyBackends(["triton"])
-    @skipIfRefEager("checks multi-dim chains after random-op rewriting")
-    def test_multi_dim_reduction_of_rewritten_random_source(self):
+    @skipIfRefEager("checks dynamic RNG shapes and multi-dim chains")
+    def test_multi_dim_reduction_of_random_source(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
         def reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             samples = torch.empty_like(x)

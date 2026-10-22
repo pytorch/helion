@@ -166,9 +166,12 @@ def _keep_shape_size_reads(node: Node) -> None:
 def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
     """Read a full slice's logical extent, independent of padding or chunk size."""
     env = CompileEnvironment.current()
-    for node in list(
-        graph.find_nodes(op="call_function", target=torch.ops.aten.sym_size.int)
-    ):
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in (
+            torch.ops.aten.sym_size.int,
+            _get_symnode,
+        ):
+            continue
         block_id = env.get_block_id(node.meta["val"])
         if block_id is None or not env.block_sizes[block_id].reduction:
             continue
