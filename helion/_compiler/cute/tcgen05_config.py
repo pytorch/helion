@@ -3290,6 +3290,91 @@ class CuteTcgen05Config:
         seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
         return Config(**seed_config)
 
+    def _paired_acc1_witness_configs(self) -> list[Config]:
+        """Bounded FP8 witnesses from shape and the proved paired SMEM budget.
+
+        Keep one deepest ring at the widest legal K packet per (M,N) geometry.
+        There are at most six geometries and two auxiliary placements. The
+        existing seeds retain their other K packets and shallow rings.
+        """
+        facts = self.pipeline_smem_facts
+        extents = self.matmul_compile_time_static_extents
+        if facts is None or facts.input_dtype_bytes != 1 or extents is None:
+            return []
+        selected: dict[tuple[int, int, str], Config] = {}
+        for seed in self._paired_pipeline_seed_configs(acc_stages=1):
+            view = self._matmul_config_view(seed.config)
+            if view is None:
+                continue
+            blocks, mi, ni, ki = view
+            bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+            placement = cast(
+                "str", seed.get("tcgen05_aux_load_placement", "post_acc_wait")
+            )
+            # The ordinary post-wait placement is the sole witness when the
+            # exact allocation facts contain no staged row. Existing compiler
+            # seeds still retain every placement they previously generated.
+            if not facts.rows and placement != "post_acc_wait":
+                continue
+            key = (bm, bn, placement)
+            previous = selected.get(key)
+            priority = (bk, cast("int", seed.get("tcgen05_ab_stages", 2)))
+            if previous is not None:
+                prior_view = self._matmul_config_view(previous.config)
+                assert prior_view is not None
+                prior_blocks, _mi, _ni, prior_ki = prior_view
+                if priority <= (
+                    prior_blocks[prior_ki],
+                    previous.get("tcgen05_ab_stages", 2),
+                ):
+                    continue
+            selected[key] = seed
+        assert len(selected) <= 12
+        m, n, _k = cast("tuple[int, int, int]", extents)
+        # Prefer witnesses with enough independent tiles for one device wave;
+        # underfilled shapes use the smallest output tiles first. K packet and
+        # ring depth remain derived by the compiler above.
+        capacity = max(1, self.device_sm_count // 2)
+
+        def order(
+            item: tuple[tuple[int, int, str], Config],
+        ) -> tuple[int, int, int, int, str]:
+            (bm, bn, placement), _seed = item
+            tiles = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
+            return (int(tiles < capacity), abs(tiles - capacity), bm, bn, placement)
+
+        return [seed for _key, seed in sorted(selected.items(), key=order)]
+
+    def _with_paired_acc1_witnesses(
+        self, seeds: list[Config], *, enabled: bool | None = None
+    ) -> list[Config]:
+        """Add ACC1 coverage without expanding a 100-config initial budget.
+
+        The original seed set is retained. At most twelve new witnesses fit
+        before its prefix; sixteen random slots and the default are reserved.
+        If the original set exhausts that allowance, no witnesses are added.
+        """
+        if enabled is None:
+            configured = os.environ.get("HELION_GRAPH_AUTOTUNE_ACC1_SEEDS", "0")
+            if configured not in ("0", "1"):
+                raise InvalidConfig("HELION_GRAPH_AUTOTUNE_ACC1_SEEDS must be 0 or 1")
+            enabled = configured == "1"
+        if not enabled:
+            return seeds
+        original = list(dict.fromkeys(seeds))
+        allowance = max(0, 83 - len(original))
+        if allowance == 0:
+            return original
+        witnesses = [
+            seed for seed in self._paired_acc1_witness_configs() if seed not in original
+        ][:allowance]
+        if not witnesses:
+            return original
+        # Front-load the bounded witnesses, then retain every original seed.
+        # Their small prefix fits the recorded reserve and cannot crowd out a
+        # different original family in the nominal initial population.
+        return [*witnesses, *original]
+
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
         seeds.extend(self._small_grid_seed_configs())
