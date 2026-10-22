@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
+from test._cute_binding import _forbid_cuda_work
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
@@ -202,8 +202,7 @@ def test_collective_async_priority_preserves_candidates_and_default(
 
     with (
         _mock_cuda_unavailable(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        _forbid_cuda_work(),
     ):
         bound = _cpu_bind(kernel, args, capability=capability, num_sm=num_sm)
         assert bound.host_function is not None
@@ -287,7 +286,7 @@ def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) 
         original[:] = result
         return result
 
-    with _mock_cuda_unavailable(), _forbid_native_compile():
+    with _mock_cuda_unavailable(), _forbid_cuda_work():
         bound = _cpu_bind(kernel, args)
         assert bound.host_function is not None
         with (
