@@ -398,6 +398,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     @onlyBackends(["triton", "pallas"])
     @parametrize("static_shapes", (False, True))
     @parametrize("multi", (False, True))
+    @skipIfRefEager("checks compiled logical-size reads")
     def test_full_slice_size_is_logical_extent(self, static_shapes, multi):
         def reduce(x: torch.Tensor, dims: hl.constexpr) -> torch.Tensor:
             out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
@@ -424,6 +425,51 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )
             actual = bound.compile_config(config)(x, dims)
             torch.testing.assert_close(actual, x.sum(dims) / x.size(1))
+
+    @onlyBackends(["triton"])
+    @parametrize("static_shapes", (False, True))
+    @parametrize("method", ("expand", "zeros", "view", "broadcast"))
+    @skipIfRefEager("checks physical shapes after resolving logical sizes")
+    def test_full_slice_size_in_shape_operations(self, static_shapes, method):
+        def reduce(x: torch.Tensor, method: hl.constexpr) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                value = x[row, :]
+                if method == "expand":
+                    value = value.expand(value.shape)
+                elif method == "zeros":
+                    value = value + value.new_zeros(value.shape)
+                elif method == "view":
+                    value = value.view(value.shape)
+                else:
+                    value = torch.broadcast_to(value, value.shape)
+                out[row] = value.sum(1)
+            return out
+
+        kernel = helion.kernel(
+            reduce, static_shapes=static_shapes, autotune_effort="none"
+        )
+        x = torch.randn(64, 33, device=DEVICE)
+        bound = kernel.bind((x, method))
+        for chunk in (None, 8):
+            actual = bound.compile_config(
+                helion.Config(block_sizes=[4], reduction_loops=[chunk])
+            )(x, method)
+            torch.testing.assert_close(actual, x.sum(1))
+
+    @onlyBackends(["triton"])
+    def test_multi_dim_reduction_of_scalar_constant(self):
+        @helion.kernel(autotune_effort="none")
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                value = torch.tensor([[2.0]], device=x.device)
+                out[row] = value.sum((0, 1))
+            return out
+
+        x = torch.empty(5, device=DEVICE)
+        _, actual = code_and_output(reduce, (x,), block_sizes=[2])
+        torch.testing.assert_close(actual, torch.full_like(x, 2.0))
 
     @onlyBackends(["triton"])
     @parametrize("case", ("nonadjacent", "partial", "size"))

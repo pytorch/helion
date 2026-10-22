@@ -11,6 +11,7 @@ from ..language import _MEMORY_OPS
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
+from .device_ir import ForLoopGraphInfo
 from .indexing_strategy import SubscriptIndexing
 from .inductor_lowering import ReductionLowering
 
@@ -25,8 +26,6 @@ def active_block_ids(
     graphs: Sequence[GraphInfo], root_blocks: Iterable[int], env: CompileEnvironment
 ) -> frozenset[int]:
     """Keep shape/index symbols, explicit loops and actual reduction lowerings."""
-    from .device_ir import ForLoopGraphInfo
-
     result = set(root_blocks)
 
     def visit(value: object) -> None:

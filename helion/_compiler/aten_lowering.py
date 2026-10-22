@@ -21,6 +21,7 @@ from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _to_sympy
+from .host_function import HostFunction
 from .node_masking import apply_masking
 from .node_masking import broadcasts_onto_masked_lanes
 from .node_masking import cached_masked_value
@@ -146,6 +147,11 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
             node.args = (env.sympy_debug(_to_sympy(size)),)
             node.kwargs = {}
             node.meta["val"] = size
+            origins = HostFunction.current().expr_to_origin
+            node.meta["helion_host_scalar"] = all(
+                symbol in origins and origins[symbol].origin.is_host()
+                for symbol in _to_sympy(size).free_symbols
+            )
             node.meta.pop("lowering", None)
 
 
@@ -212,7 +218,9 @@ def codegen_where(ctx: LoweringContext, node: Node) -> object:
 @full_lowering.register_codegen("common")
 def codegen_full(ctx: LoweringContext, node: Node) -> object:
     env = CompileEnvironment.current()
-    size = map_arg(node.args[0], lambda n: n.meta["val"])
+    # The result metadata retains tile/reduction axes even when a size read
+    # used to request the factory has been resolved to its logical extent.
+    size = cast("torch.Tensor", node.meta["val"]).shape
     dtype = node.kwargs.get("dtype", torch.get_default_dtype())
     assert isinstance(dtype, torch.dtype)
     device = node.kwargs.get("device", env.device)
@@ -222,7 +230,6 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     if isinstance(value_ast, (int, float, bool)):
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
-    # pyrefly: ignore [not-iterable]
     shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
     return expr_from_string(
         env.backend.full_expr(shape_dims, "{value}", dtype),

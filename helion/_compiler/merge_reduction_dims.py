@@ -46,16 +46,34 @@ if TYPE_CHECKING:
 
 
 _META_KEY = "helion_multi_dim_reduction"
+_MERGE_OPS = {
+    op.name(): op
+    for op in (
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.mean.dim,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+    )
+}
 
 
 @dataclass(frozen=True)
 class _ReductionChain:
-    source: Node
-    op: torch._ops.OpOverload
+    source: str
+    op: str
     dims: list[int]
     keepdim: bool
     kwargs: dict[str, Any]
-    nodes: frozenset[Node]
+    nodes: frozenset[str]
+
+
+def _tensor_proxy_node(
+    tensor: torch.Tensor,
+    tracer: proxy_tensor.PythonKeyTracer | proxy_tensor._GraphAppendingTracerEx,
+) -> Node:
+    slot = cast("Any", proxy_tensor.get_proxy_slot(tensor, tracer))
+    proxy = slot if isinstance(slot, torch.fx.Proxy) else slot.proxy
+    return proxy.node
 
 
 def chain_reduction_dims(
@@ -84,9 +102,7 @@ def chain_reduction_dims(
         source_node = None
         previous_tail: Node | None = None
         if mode is not None:
-            source_node = cast(
-                "Any", proxy_tensor.get_proxy_slot(source, mode.tracer)
-            ).proxy.node
+            source_node = _tensor_proxy_node(source, mode.tracer)
             previous_tail = next(reversed(source_node.graph.nodes))
         # Like eager, cast the input to a low-precision dtype= first, then
         # accumulate in fp32 across every reduced dim and round once.
@@ -113,17 +129,18 @@ def chain_reduction_dims(
         # Bool extrema use the integer chain above; merging the original
         # bool op would bypass that conversion and recreate any/all lowering.
         if mode is not None and not bool_extrema:
-            node = cast(
-                "Any", proxy_tensor.get_proxy_slot(result, mode.tracer)
-            ).proxy.node
-            chain_nodes: set[Node] = set()
+            node = _tensor_proxy_node(result, mode.tracer)
+            assert source_node is not None
+            if source_node.graph is not node.graph:
+                return result
+            chain_nodes: set[str] = set()
             for created in reversed(node.graph.nodes):
                 if created is previous_tail:
                     break
-                chain_nodes.add(created)
+                chain_nodes.add(created.name)
             node.meta[_META_KEY] = _ReductionChain(
-                source=cast("Node", source_node),
-                op=op,
+                source=source_node.name,
+                op=op.name(),
                 dims=sorted(dims),
                 keepdim=keepdim,
                 kwargs=merge_kwargs,
@@ -151,11 +168,13 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
     for graph_info in graphs:
         graph = graph_info.graph
         flat_nodes: dict[tuple[Node, int, int], Node] = {}
+        nodes_by_name = {node.name: node for node in graph.nodes}
         for node in [*graph.nodes]:
             if _META_KEY not in node.meta:
                 continue
             tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
-            source = replacements.get(tag.source, tag.source)
+            original = nodes_by_name[tag.source]
+            source = replacements.get(original, original)
             dims = tag.dims
             if (
                 not enabled
@@ -188,7 +207,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                     # Emit the single-axis ATen op directly: decomposing it
                     # again would recreate the chain being replaced.
                     graph,
-                    tag.op,
+                    _MERGE_OPS[tag.op],
                     (merged, [dims[0]], tag.keepdim),
                     tag.kwargs,
                     node.meta,
@@ -304,14 +323,14 @@ class _Merger:
             return "merge"
         return None
 
-    def chain(self, result: Node, chain_nodes: frozenset[Node]) -> set[Node] | None:
+    def chain(self, result: Node, chain_nodes: frozenset[str]) -> set[Node] | None:
         """The nodes of the chain ending at ``result``, or None if the merged
         producers have other users, which would then load them twice."""
         chain: set[Node] = set()
         stack = [result]
         while stack:
             n = stack.pop()
-            if n in chain_nodes and n not in chain and n not in self.kinds:
+            if n.name in chain_nodes and n not in chain and n not in self.kinds:
                 chain.add(n)
                 stack.extend(n.all_input_nodes)
         if all(
@@ -350,7 +369,7 @@ class _Merger:
                 tensor_dim += 1  # a scalar index drops its dim
                 continue
             if out_dim in merged:
-                if k != slice(None):
+                if not isinstance(k, slice) or k != slice(None):
                     return None
                 slices.append((i, tensor_dim))
             elif not (k is None or isinstance(k, (slice, torch.SymInt))):
