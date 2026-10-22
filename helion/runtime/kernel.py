@@ -2938,11 +2938,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
 
     def has_compiled_config(self, config: ConfigLike) -> bool:
-        """Whether ``compile_config(config)`` would hit this kernel's compile cache."""
-        return (
-            self._normalized_config_copy(self._normalize_config(config))
-            in self._compile_cache
-        )
+        """Whether ``compile_config(config)`` would hit this kernel's compile cache.
+
+        A config the strict normalization rejects (a search candidate carrying
+        a knob its other knobs do not admit, e.g. a grouped register profile
+        on a schedule without one) is not compiled: it answers ``False`` and
+        the compile path reports the rejection for that one config, instead
+        of the rejection aborting the batch that asked.
+        """
+        try:
+            normalized = self._normalized_config_copy(self._normalize_config(config))
+        except exc.InvalidConfig:
+            return False
+        return normalized in self._compile_cache
 
     def prime_rendered_code(self, config: ConfigLike, code: str) -> None:
         """Hand :meth:`compile_config` the source a render worker made for ``config``.
