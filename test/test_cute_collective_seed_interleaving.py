@@ -332,6 +332,10 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
     assert len(legacy) == len(actual)
     assert set(legacy) == set(actual)
     assert legacy[0] == expected[0]
+    preferred = helion.Config.from_dict(
+        expected[0].config | {"cute_collective_copy": "async"}
+    )
+    assert actual == [preferred, *[seed for seed in expected if seed != preferred]]
     assert legacy != expected
     assert all("gain" not in seed.config for seed in actual)
     # The computed A admits TMEM schedules; an unrelated gain must not change

@@ -2527,6 +2527,8 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         result = cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
+        # Keep this measured preference limited to FP16 and the canonical
+        # M/N/K slot layout. Reorder only after all derived schedules exist.
         if (
             result
             and len(spec.matmul_facts) == 1
@@ -2537,8 +2539,11 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             preferred = Config.from_dict(
                 result[0].config | {"cute_collective_copy": "async"}
             )
-            if preferred in result:
-                result.insert(0, result.pop(result.index(preferred)))
+            index = next(
+                (i for i, seed in enumerate(result) if seed == preferred), None
+            )
+            if index is not None:
+                result.insert(0, result.pop(index))
         return result
 
 

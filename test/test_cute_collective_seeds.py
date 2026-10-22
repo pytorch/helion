@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
@@ -201,22 +200,12 @@ def test_collective_async_priority_preserves_candidates_and_default(
         original[:] = result
         return result
 
-    with ExitStack() as stack:
-        stack.enter_context(_mock_cuda_unavailable())
-        stack.enter_context(_forbid_native_compile())
-        stack.enter_context(
-            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
-        )
-        for name, value in (
-            ("helion.runtime.kernel.target_device_capability", capability),
-            (
-                "helion._compiler.compile_environment.target_device_capability",
-                capability,
-            ),
-            ("helion.runtime.get_num_sm", num_sm),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        bound = kernel._bind_isolated(args)
+    with (
+        _mock_cuda_unavailable(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(kernel, args, capability=capability, num_sm=num_sm)
         assert bound.host_function is not None
         with bound.env:
             ir = bound.host_function.device_ir
