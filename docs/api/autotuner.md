@@ -23,6 +23,82 @@ to benchmark in-process.
    :show-inheritance:
 ```
 
+## Verified CUDA graph scoring
+
+`cuda_graph_scoring()` opts new standalone CuTe or Triton searches into device
+timing with external CUDA events inside one captured graph. Candidate, finalist
+and mirrored refinement jobs run in the existing killable benchmark worker.
+Every replay clears L2 before the start event. Capture or replay failures reject
+the score; there is no eager timer fallback.
+
+Save this example as `graph_tune.py` and run it with
+`CUDA_VISIBLE_DEVICES=0 HELION_SKIP_CACHE=1 python graph_tune.py`, assigning an
+idle GPU to the process:
+
+```python
+from __future__ import annotations
+
+import torch
+import helion
+import helion.language as hl
+from helion.autotuner import cuda_graph_scoring
+
+
+@helion.kernel(backend="cute", autotune_effort="quick")
+def add_one(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        output[tile] = x[tile] + 1
+    return output
+
+
+def main() -> None:
+    x = torch.randn(4096, device="cuda")
+    with cuda_graph_scoring() as scoring:
+        output = add_one(x)
+    torch.testing.assert_close(output, x + 1)
+    print(scoring.evidence)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+The context must cover the complete tuning call. Configured kernels and cache
+hits keep their normal execution path. Baseline construction remains Helion's
+stock reference and mutation check and does not rank candidates. Graph scoring
+requires read-only inputs; it compares their exact bits, strides and offsets.
+After capture, floating outputs are poisoned with NaN, then the retained replay
+output is checked against the baseline using the ordinary tolerances. The
+returned evidence records captures, sample counts, poisoning and both checks.
+
+Custom correctness checks use `check_output(pristine_arguments, output,
+baseline_output)`. The callback, `poison_output(output)` and
+`check_inputs(pristine_arguments, arguments)` must be importable module-level
+functions so the worker can reconstruct them. The exact input bit/layout check
+always runs; a custom input callback adds further checks. A custom settings accuracy
+callback requires an explicit `check_output` callback. Multi-shape, distributed,
+mutating-input and handoff searches are unsupported by this option.
+
+For unordered selection, supply an oracle that checks membership, valid ties,
+unique indices, short-row padding and each payload's original bits at its
+selected index. Use
+`helion.autotuner.graph_scoring.poison_indexed_output` to poison floating values
+with NaN and Int32 indices with INT32_MIN. The oracle must reject INT32_MIN,
+including when every row is padding, so an empty replay cannot retain a stale
+capture result.
+
+Focused CPU checks exercise native provider dispatch and callback serialization,
+using mocked device capture. A separate CUDA smoke executes candidate, finalist
+and mirrored jobs through the real worker:
+
+```bash
+CUDA_VISIBLE_DEVICES='' python -m pytest -s \
+  test/test_cuda_graph_scoring.py
+CUDA_VISIBLE_DEVICES=0 python -m pytest -s \
+  test/test_cuda_graph_scoring_gpu.py::test_native_graph_worker_smoke
+```
+
 ## Choosing a source-optimization handoff point
 
 Ordinary kernel calls can run the complete workflow without custom orchestration:

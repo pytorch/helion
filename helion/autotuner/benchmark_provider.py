@@ -48,6 +48,12 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .graph_scoring import CudaGraphScoring
+from .graph_scoring import GraphScoringUnavailable
+from .graph_scoring import assert_preserved_input_bits
+from .graph_scoring import checked_result as checked_graph_result
+from .graph_scoring import current_cuda_graph_scoring
+from .graph_scoring import run_graph_job
 from .kernel_args import release_private_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
@@ -652,6 +658,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # the picklability flag must resolve even before setup()/__init__ set it.
     _args_unpicklable: bool = False
     _subprocess_wrapper_unloadable: bool = False
+    _graph_scoring: CudaGraphScoring | None = None
 
     def __init__(
         self,
@@ -679,6 +686,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path: str | None = None
         self._args_unpicklable: bool = False
         self._subprocess_wrapper_unloadable: bool = False
+        self._graph_scoring = current_cuda_graph_scoring()
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
@@ -707,6 +715,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        if self._graph_scoring is not None:
+            assert self._baseline_post_args is not None
+            assert_preserved_input_bits(self.args, self._baseline_post_args)
+            if (
+                self._graph_scoring.policy.check_inputs
+                is not assert_preserved_input_bits
+            ):
+                self._graph_scoring.policy.check_inputs(
+                    self.args, self._baseline_post_args
+                )
+            # torch.equal treats an unchanged NaN as a mutation. Graph scoring
+            # uses the exact bits/layout check above for its read-only contract.
+            self.mutated_arg_indices = ()
+            self._graph_scoring.require_provider(self)
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
@@ -861,7 +883,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         # Use custom baseline function if provided
         if self.settings.autotune_baseline_fn is not None:
-            new_args = _clone_args(self.args, self.kernel.env.process_group_name)
+            new_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                preserve_storage=self._graph_scoring is not None,
+            )
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
                 synchronize_device()
@@ -896,6 +922,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             new_args,
             self.kernel.env.process_group_name,
             idx_to_clone=mutated_arg_idxs,
+            preserve_storage=self._graph_scoring is not None,
         )
         return baseline_output, mutated_arg_idxs, baseline_post_args
 
@@ -929,7 +956,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         failure: tuple[Exception, Config, str] | None = None
         shrinks = 0
         while True:
-            new_args = _clone_args(self.args, self.kernel.env.process_group_name)
+            new_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                preserve_storage=self._graph_scoring is not None,
+            )
             try:
                 with _searching_candidates():
                     baseline_fn = self.kernel.compile_config(config, allow_print=False)
@@ -1149,7 +1180,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             else:
                 self._precompile_args_path = args_path
-        if self._subprocess_accuracy_check_enabled():
+        if self._subprocess_accuracy_check_enabled() or self._graph_scoring is not None:
             baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
             torch.save(self._baseline_output, baseline_path)
             self._precompile_baseline_path = baseline_path
@@ -1234,6 +1265,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
+        if self._graph_scoring is not None:
+            self._graph_scoring.require_provider(self)
+            return True
         if not self.settings.autotune_benchmark_subprocess:
             return False
         if self._args_unpicklable:
@@ -1789,6 +1823,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 result = self._benchmark_function_subprocess(config, fn)
             if result is not None:
                 return result
+            if self._graph_scoring is not None:
+                raise GraphScoringUnavailable(
+                    "Graph candidate timing cannot fall back in-process"
+                )
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
@@ -2061,6 +2099,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._record_compile_failure(config)
             return inf
 
+        if self._graph_scoring is not None:
+            # The graph job checks its retained replay output and inputs before
+            # returning a score, including with a custom module-level oracle.
+            return float(latency)
+
         if self.settings.autotune_accuracy_check:
             try:
                 accuracy_result = self._run_subprocess_accuracy_check_job(fn)
@@ -2189,6 +2232,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         args_slot: int | None = None,
         timeout: float | None = None,
     ) -> float | None:
+        if self._graph_scoring is not None:
+            return checked_graph_result(
+                run_graph_job(
+                    self,
+                    [fn],
+                    warmup=warmup,
+                    rep=rep,
+                    fixed_repetitions=fixed_repetitions,
+                    args_slot=args_slot,
+                    timeout=timeout,
+                )
+            )
         if self._precompile_args_path is None or self._subprocess_wrapper_unloadable:
             return None
         try:
@@ -2334,10 +2389,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 except BenchmarkTimeout as e:
                     self.log.warning(f"{desc} subprocess failed: {e}")
                     self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
-                    timings.append(IsolatedBenchmarkFailure("timeout"))
+                    timings.append(
+                        IsolatedBenchmarkFailure(
+                            "error" if self._graph_scoring is not None else "timeout"
+                        )
+                    )
                     continue
                 except BenchmarkSubprocessError as e:
                     self.log.warning(f"{desc} subprocess failed: {e}")
+                    if self._graph_scoring is not None:
+                        timings.append(IsolatedBenchmarkFailure("error"))
+                        continue
                     timing = None
                 except Exception as e:
                     e.__traceback__ = None
@@ -2349,6 +2411,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         timings.append(IsolatedBenchmarkFailure("error"))
                         continue
                     self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    if self._graph_scoring is not None:
+                        timings.append(IsolatedBenchmarkFailure("error"))
+                        continue
                     timing = None
                 # A wrapper-load failure disables the worker because later
                 # candidates may depend on the same unavailable source module.
@@ -2357,6 +2422,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # fresh timings with stale population measurements.
                 if self._subprocess_wrapper_unloadable:
                     return None
+                if self._graph_scoring is not None and timing is None:
+                    timings.append(IsolatedBenchmarkFailure("error"))
+                    continue
                 timings.append(None if timing is None else float(timing))
             finally:
                 if fresh_process and self._benchmark_worker is not None:

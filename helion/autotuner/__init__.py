@@ -26,6 +26,7 @@ from .external import autotune as autotune
 from .finite_search import CachedFiniteSearch as CachedFiniteSearch
 from .finite_search import FiniteSearch as FiniteSearch
 from .finite_search import from_cache as from_cache
+from .graph_scoring import cuda_graph_scoring as cuda_graph_scoring
 from .handoff import HandoffCandidate as HandoffCandidate
 from .handoff import HandoffMeasurement as HandoffMeasurement
 from .handoff import HandoffPoint as HandoffPoint

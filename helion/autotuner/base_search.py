@@ -58,6 +58,9 @@ from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
 from .effort_profile import get_effort_profile
+from .graph_scoring import GraphScoringUnavailable
+from .graph_scoring import current_cuda_graph_scoring
+from .graph_scoring import run_graph_job
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
 from .logger import AutotuneLogEntry
@@ -422,6 +425,13 @@ class BaseSearch(BaseAutotuner):
             args: The arguments to be passed to the kernel.
         """
         super().__init__()
+        if current_cuda_graph_scoring() is not None and (
+            isinstance(args, _MultiShapeAutotuneArgs)
+            or benchmark_provider_cls is not LocalBenchmarkProvider
+        ):
+            raise GraphScoringUnavailable(
+                "Graph scoring requires the local single-shape provider"
+            )
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         if isinstance(self.settings.autotune_config_overrides, CuteStructuralConfig):
@@ -2553,6 +2563,9 @@ class PopulationBasedSearch(BaseSearch):
     def _final_rebenchmark_use_isolated(self) -> bool:
         from ..runtime.settings import _env_get_bool
 
+        if current_cuda_graph_scoring() is not None:
+            return True
+
         # Default to ISOLATED finalist timing on cute: the interleaved bench
         # lets L2 cache-POLICY state leak between candidates that read the
         # same input tensors (an ``l2_last`` candidate pins its inputs in L2
@@ -3117,6 +3130,13 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
+        graph_scoring = (
+            isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+            and self.benchmark_provider._graph_scoring is not None
+        )
+        if graph_scoring:
+            use_isolated = True
+            use_interleaved = False
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             provider_timings = self.benchmark_provider.rebenchmark(
                 [member.config for member in members],
@@ -3171,6 +3191,10 @@ class PopulationBasedSearch(BaseSearch):
                     trace_results=isolated_results,
                 )
                 return
+            if graph_scoring:
+                raise GraphScoringUnavailable(
+                    "Graph refinement cannot fall back in-process"
+                )
             if candidate_private_args and dist.is_initialized():
                 self.log.warning(
                     "Candidate-private mutated-argument isolation is unavailable "
@@ -3347,12 +3371,28 @@ class PopulationBasedSearch(BaseSearch):
             clear_jit_fast_path_caches(members[index].fn, self.log)
 
         try:
-            trace = mirrored_bench_generic(
-                [functools.partial(member.fn, *benchmark_args) for member in members],
-                repeat=repeat,
-                desc=desc if self.settings.autotune_progress_bar else None,
-                after_call=after_call,
-            )
+            if (
+                isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+                and self.benchmark_provider._graph_scoring is not None
+            ):
+                result = run_graph_job(
+                    self.benchmark_provider,
+                    [member.fn for member in members],
+                    repeat=repeat,
+                    timeout=float(self.settings.autotune_benchmark_timeout)
+                    * len(members),
+                )
+                trace = cast("MirroredBenchmarkTrace", result["trace"])
+            else:
+                trace = mirrored_bench_generic(
+                    [
+                        functools.partial(member.fn, *benchmark_args)
+                        for member in members
+                    ],
+                    repeat=repeat,
+                    desc=desc if self.settings.autotune_progress_bar else None,
+                    after_call=after_call,
+                )
             trace = dataclasses.replace(
                 trace,
                 target_ms=target_ms,
