@@ -29,7 +29,7 @@ from helion.autotuner.config_spec import ReductionLoopSpec
         (CuteRolledRowLadderHeuristic, 16, 1048576, 65536),
     ],
 )
-def test_reduction_chunks_survive_normalization(
+def test_reduction_chunks_survive_seed_transfer(
     heuristic: type[CuteReductionWideChunkHeuristic | CuteRolledRowLadderHeuristic],
     rows: int,
     columns: int,
@@ -60,9 +60,10 @@ def test_reduction_chunks_survive_normalization(
     assert chunk > 0 and chunk & (chunk - 1) == 0
     assert spec.max_reduction_loop is not None and chunk <= spec.max_reduction_loop
     assert seed.config["cute_vector_widths"][1] == (4 if dtype == torch.float32 else 8)
-    normalized = seed.config.copy()
-    spec.normalize(normalized)
-    assert normalized["reduction_loops"] == [chunk]
+    spec.compiler_seed_configs = [seed]
+    pairs = spec.create_config_generation().seed_flat_config_pairs()
+    assert len(pairs) == 1
+    assert pairs[0][1].config["reduction_loops"] == [chunk]
 
 
 @pytest.mark.parametrize(
