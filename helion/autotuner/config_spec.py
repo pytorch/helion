@@ -6781,9 +6781,18 @@ class ConfigSpec:
         """Raise search floors for grid block dimensions based on problem size.
 
         Very small block sizes produce enormous grids that the autotuner
-        wastes time exploring.  This heuristic sets a floor so the total
-        number of blocks per dimension stays within a reasonable range
-        derived from ``num_compute_units``.
+        wastes time exploring.  This heuristic floors each root grid so its
+        program count (the product of its dimensions' block counts) stays
+        within a budget derived from ``num_compute_units``.
+
+        The budget is shared across the dimensions of one grid by water
+        filling: a dimension that cannot use its even share of the budget
+        (``B=4`` in a ``[B, L]`` grid) is left unfloored and hands its unused
+        share to the remaining dimensions, so ``L`` may still tile down to 1
+        when the whole grid fits the budget.  Each root grid (``KernelGridFact``
+        roots, or the fissioned pointwise launches) owns a full budget; with
+        no recorded grid topology every grid axis belongs to one grid, the
+        legacy rule.
 
         The raised minimum never exceeds the default block size that
         ``_fragment`` would compute, so memory and shared-memory
@@ -6792,33 +6801,64 @@ class ConfigSpec:
         if not self.grid_block_ids:
             return
 
-        n_cus = num_compute_units()
-        n_dims = len(self.grid_block_ids)
-        max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
-        independent_max_blocks: dict[int, int] = {
-            block_id: math.ceil((n_cus * 64) ** (1.0 / len(grid)))
-            for grid in self.cute_pointwise_region_grid_groups
-            for block_id in grid
-        }
+        budget = num_compute_units() * 64
+        for grid in self._grid_floor_groups():
+            specs: list[BlockSizeSpec] = []
+            for grid_bid in grid:
+                try:
+                    spec = self.block_sizes.block_id_lookup(grid_bid)
+                except KeyError:
+                    continue
+                if spec.size_hint > 0:
+                    specs.append(spec)
+            remaining = float(budget)
+            # Smallest dimensions first: they are the ones that may not use
+            # their even share, and the surplus flows to the larger ones.
+            # Dimensions of one extent take the same share at once, so a
+            # symmetric grid floors every axis alike (for a uniform grid this
+            # is exactly the legacy per-axis rule, ceil(budget ** (1 / n))).
+            ordered = sorted(specs, key=lambda s: s.size_hint)
+            index = 0
+            while index < len(ordered):
+                size = ordered[index].size_hint
+                tied = [spec for spec in ordered[index:] if spec.size_hint == size]
+                share = remaining ** (1.0 / (len(ordered) - index))
+                index += len(tied)
+                if size <= share:
+                    # The whole dimension fits in its share at block size 1.
+                    remaining = max(remaining / size ** len(tied), 1.0)
+                    continue
+                max_blocks = math.ceil(share)
+                remaining = max(remaining / max_blocks ** len(tied), 1.0)
+                for spec in tied:
+                    default = spec._fragment(self).default_val
+                    min_block = min(size // max_blocks, default)
+                    if min_block >= 2:
+                        min_block = 1 << (min_block.bit_length() - 1)
+                        min_block = min(min_block, spec.max_size)
+                        spec.autotuner_min = assert_integer_power_of_two(
+                            max(min_block, spec.autotuner_min)
+                        )
 
-        for grid_bid in self.grid_block_ids:
-            try:
-                spec = self.block_sizes.block_id_lookup(grid_bid)
-            except KeyError:
-                continue
-            if spec.size_hint <= 0:
-                continue
-            default = spec._fragment(self).default_val
-            min_block = spec.size_hint // independent_max_blocks.get(
-                grid_bid, max_blocks_per_dim
-            )
-            min_block = min(min_block, default)
-            if min_block >= 2:
-                min_block = 1 << (min_block.bit_length() - 1)
-                min_block = min(min_block, spec.max_size)
-                spec.autotuner_min = assert_integer_power_of_two(
-                    max(min_block, spec.autotuner_min)
-                )
+    def _grid_floor_groups(self) -> list[tuple[int, ...]]:
+        """Root grids for the occupancy floor, each owning a full budget."""
+        independent = [
+            tuple(grid) for grid in self.cute_pointwise_region_grid_groups if grid
+        ]
+        covered = {block_id for grid in independent for block_id in grid}
+        if self.kernel_grid_fact is not None:
+            roots = [
+                tuple(block_id for block_id in root if block_id not in covered)
+                for root in self.kernel_grid_fact.grid_groups
+            ]
+            known = covered | {block_id for root in roots for block_id in root}
+            # Axes added after the topology was recorded (a promoted output
+            # axis) share one grid with every other unassigned axis.
+            rest = tuple(b for b in self.grid_block_ids if b not in known)
+        else:
+            roots = []
+            rest = tuple(b for b in self.grid_block_ids if b not in covered)
+        return [grid for grid in (*independent, *roots, rest) if grid]
 
     def create_config_generation(
         self,
