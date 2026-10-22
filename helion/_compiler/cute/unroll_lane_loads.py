@@ -1,6 +1,7 @@
 """Trace-time lane unrolling with every unrolled lane's loads issued first.
 
-A synthetic grid lane loop (``DeviceGridState.wrap_body``) walks a thread's
+A synthetic lane loop (``DeviceGridState.wrap_body`` for a grid axis, the
+device-loop body for a ``hl.tile`` axis inside the kernel) walks a thread's
 elements of one tile axis one at a time, and the CuTe DSL lowers its
 ``range(N)`` to an ``scf.for``::
 

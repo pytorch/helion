@@ -1021,6 +1021,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_simt_mma_layout",
         "cute_pdl",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "epilogue_subtile",
     }
 )
@@ -1163,6 +1164,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1305,6 +1307,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -1777,6 +1780,9 @@ class ConfigSpec:
         # Config with a native GEMM. Keep its ordinary SIMT layout knobs in
         # the native search schema; MMA-owned axes retain their auto layout.
         self.cute_pointwise_region_block_ids: frozenset[int] = frozenset()
+        # Root-grid axes fixed at one element per tile -> static tile count
+        # (``cute_tiles_per_block`` packs several of their tiles per CTA).
+        self.cute_tile_pack_counts: dict[int, int] = {}
         # Separately launched pointwise grids whose axes have one root owner.
         # Their search floors use the rank of that launch, independently of
         # any native MMA region sharing the complete kernel configuration.
@@ -5166,6 +5172,39 @@ class ConfigSpec:
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
 
+    def _normalize_cute_tiles_per_block(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_tiles_per_block`` packs that many one-element grid tiles per
+        CTA as thread sub-groups: a flat pid type, no CTA cluster split, no L2
+        grouping (its pid decode has no pack term), and a packable root-grid
+        axis whose static tile count it divides."""
+        from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+        from .._compiler.cute.tile_packing import l2_grouped
+
+        pack = config.get("cute_tiles_per_block", 1)
+        if type(pack) is not int or pack not in TILES_PER_BLOCK_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_tiles_per_block must be one of {TILES_PER_BLOCK_CHOICES}"
+                )
+            pack = 1
+        if pack > 1 and not (
+            config.get("pid_type", "flat") == "flat"
+            and config.get("cute_cluster_n", 1) == 1
+            and not l2_grouped(config)
+            and any(count % pack == 0 for count in self.cute_tile_pack_counts.values())
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_tiles_per_block needs a flat pid type, no cluster split, "
+                    "no L2 grouping and a one-element grid axis whose tile count "
+                    "it divides"
+                )
+            pack = 1
+        if "cute_tiles_per_block" in config or pack != 1:
+            config["cute_tiles_per_block"] = pack
+
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5187,23 +5226,21 @@ class ConfigSpec:
                     f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
                 )
             unroll = 1
-        if not sink and not self._cute_config_forms_grid_lane_loop(config):
+        if not sink and not self._cute_config_forms_lane_loop(config):
             unroll = 1
         if "cute_lane_unroll" in config or unroll != 1:
             config["cute_lane_unroll"] = unroll
 
-    def _cute_config_forms_grid_lane_loop(self, config: dict[str, object]) -> bool:
-        """Whether some grid tile axis gets a per-thread lane loop: an explicit
-        thread count below its static block size that divides it (the
-        condition ``PerThreadNDTileStrategy`` allocates a lane variable on)."""
+    def _cute_config_forms_lane_loop(self, config: dict[str, object]) -> bool:
+        """Whether some tile axis (of the grid or of a device loop) gets a
+        per-thread lane loop: an explicit thread count below its static block
+        size that divides it (the condition ``PerThreadNDTileStrategy``
+        allocates a lane variable on)."""
         # Runs before the sequences are normalized: a single-block kernel may
         # still spell them as scalars.
         nt_list = _as_sequence(config.get("num_threads"))
         bs_list = _as_sequence(config.get("block_sizes"))
-        thread_block_ids = self.num_threads.valid_block_ids()
-        for block_id in self.grid_block_ids:
-            if block_id not in thread_block_ids:
-                continue
+        for block_id in self.num_threads.valid_block_ids():
             nt = self.num_threads.config_get(nt_list, block_id, 0)
             bs = self.block_sizes.config_get(bs_list, block_id, 1)
             if (
@@ -5916,6 +5953,7 @@ class ConfigSpec:
             )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_tiles_per_block(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
             self._normalize_cute_simt_mma(config, fix_invalid=_fix_invalid)
@@ -8029,6 +8067,18 @@ class ConfigSpec:
                 ):
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
                         choices=(0, 1, 2, 3, 4, 6)
+                    )
+                # Several one-element grid tiles per CTA (thread sub-groups):
+                # tiny-tile kernels are CTA-dispatch bound.
+                if (
+                    self.supports_config_key("cute_tiles_per_block")
+                    and self.cute_tile_pack_counts
+                    and not self.matmul_facts
+                ):
+                    from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+
+                    fields["cute_tiles_per_block"] = EnumFragment(
+                        choices=TILES_PER_BLOCK_CHOICES
                     )
             # The fused flash bodies (forward and backward) emit their own
             # epilogues; the subtiled store split rewrites the graphs the

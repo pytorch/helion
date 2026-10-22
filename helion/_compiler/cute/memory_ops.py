@@ -124,6 +124,10 @@ log = logging.getLogger(__name__)
 
 
 _CUTE_ALIGNMENT_MAX_BYTES = 32
+# Byte-sized storage dtypes whose scalar loads at consecutive literal offsets
+# merge into one vector load (``literal_offset_loads``): the merge needs the
+# same cache-key-backed base alignment the packet lowerings read.
+_CUTE_BYTE_PACKED_DTYPES = frozenset({torch.uint8, torch.int8, torch.float4_e2m1fn_x2})
 # Persistent-reduction stores of these dtypes become one packet per lane loop;
 # the flush helper converts every lane at once (``persistent_branch_vec``).
 _CUTE_PACKET_STORE_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
@@ -224,7 +228,11 @@ def register_persistent_vec_alignment_specializations(
     sources = tuple(
         source
         for tensor in env.input_sources
-        if (tensor.dtype in _CUTE_VECTOR_DTYPES or _cute_is_unroll_dtype(tensor.dtype))
+        if (
+            tensor.dtype in _CUTE_VECTOR_DTYPES
+            or tensor.dtype in _CUTE_BYTE_PACKED_DTYPES
+            or _cute_is_unroll_dtype(tensor.dtype)
+        )
         and (source := env.tensor_input_source(tensor)) is not None
     )
     if not sources:

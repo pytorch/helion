@@ -16,7 +16,6 @@ from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _mxfp8
 from test.test_cute_mxfp8_mma import _wrapper_plan
 
-import helion
 from helion._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from helion._compiler.cute.block_scaled_config import block_scaled_choices
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
@@ -27,7 +26,7 @@ from helion.runtime import cute_cuda_graph
 pytestmark = skipUnlessBackends(["cute"])
 
 
-def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
+def test_cpu_n64_is_in_both_config_vocabularies() -> None:
     assert block_scaled_choices() == BLOCK_SCALED_CHOICES
     assert block_scaled_choices(mxfp8=True)["cute_scaled_tile_n"] == (
         256,
@@ -39,10 +38,9 @@ def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
         8,
     )
     raw_config: dict[str, object] = {"cute_scaled_mma": True, "cute_scaled_tile_n": 64}
-    with pytest.raises(helion.exc.InvalidConfig):
-        normalize_block_scaled_config(
-            dict(raw_config), available=True, capability=(10, 3), fix_invalid=False
-        )
+    normalize_block_scaled_config(
+        dict(raw_config), available=True, capability=(10, 3), fix_invalid=False
+    )
     normalize_block_scaled_config(
         raw_config, available=True, capability=(10, 3), fix_invalid=False, mxfp8=True
     )

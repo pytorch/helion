@@ -206,6 +206,8 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
             SimpleNamespace(
                 block_id=b,
                 pid_var=f"pid_{b}",
+                pack=1,
+                pack_axis=0,
                 num_pids_expr=lambda *, is_device, value=extents[b]: str(value),
             )
             for b in order

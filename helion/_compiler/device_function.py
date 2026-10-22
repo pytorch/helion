@@ -1561,6 +1561,15 @@ class DeviceFunction:
                 kernel_body = vectorize_affine_tile_lanes(
                     kernel_body, self, constexpr_values
                 )
+            from .cute.literal_offset_loads import merge_literal_offset_loads
+
+            kernel_body = merge_literal_offset_loads(kernel_body, self)
+            # Replace a byte-by-byte fp4 x fp4 decode-multiply-add chain over
+            # two merged 8-byte vectors with the exact f16x2 group dot
+            # (``quantized_helpers.float4_e2m1fn_x16_dot_float32``).
+            from .cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
+
+            kernel_body = fuse_fp4_pair_dot(kernel_body)
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1663,11 +1672,11 @@ class DeviceFunction:
             from .cute.unroll_lane_loads import LaneUnrollNotApplied
             from .cute.unroll_lane_loads import unroll_lane_loads
 
-            # ``cute_lane_unroll`` without vector-loop sinking: unroll the
-            # grid lane loops at trace time with every unrolled lane's
-            # loads (packets and scalars alike) issued before the first
-            # lane's compute.  The knob-off code is regenerated when no
-            # loop takes the unroll.
+            # were persistent markers, now packets): unroll the lane loops (of
+            # the grid or of a device loop) at trace time with every unrolled
+            # lane's loads (packets and scalars alike) issued before the first
+            # lane's compute.  The knob-off code is regenerated when no loop
+            # takes the unroll.
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
             if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
                 kernel_body, unrolled = unroll_lane_loads(

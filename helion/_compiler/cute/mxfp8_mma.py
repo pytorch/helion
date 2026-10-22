@@ -667,4 +667,5 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         accumulator_stages,
         prefetch_output_registers,
         tma_output,
+        pdl=df.config.get("cute_pdl", False) is True,
     )

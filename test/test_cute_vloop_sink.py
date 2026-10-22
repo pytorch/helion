@@ -834,10 +834,10 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     bound = _cpu_bind(col_reduce_sum_static, (x,))
 
-    def normalized_unroll(num_threads: list[int]) -> int:
+    def normalized_unroll(block_sizes: list[int], num_threads: list[int]) -> int:
         config = bound.config_spec.normalized_config(
             helion.Config(
-                block_sizes=[4096, 16],
+                block_sizes=block_sizes,
                 num_threads=num_threads,
                 cute_vector_widths=[1, 4],
                 cute_vloop_sink=False,
@@ -847,10 +847,13 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
         return config.config["cute_lane_unroll"]
 
     # Without sinking the unroll belongs to the loads-first lane unroll
-    # (``cute/unroll_lane_loads.py``), which needs a grid lane loop: four
-    # threads over 16 columns form one, sixteen do not.
-    assert normalized_unroll([128, 4]) == 8
-    assert normalized_unroll([128, 16]) == 1
+    # (``cute/unroll_lane_loads.py``), which needs a lane loop on some tile
+    # axis, of the grid or of a device loop: four threads over 16 columns
+    # form one, as do 128 threads over 4096 rows; one thread per element on
+    # every axis does not.
+    assert normalized_unroll([4096, 16], [128, 4]) == 8
+    assert normalized_unroll([4096, 16], [128, 16]) == 8
+    assert normalized_unroll([128, 16], [128, 16]) == 1
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalize(
             helion.Config(

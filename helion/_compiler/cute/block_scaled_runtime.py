@@ -11,12 +11,15 @@ TMEM is disjoint from the accumulator, including while the epilogue drains it.
 from __future__ import annotations
 
 from math import gcd
+from typing import TYPE_CHECKING
+from typing import NamedTuple
 from typing import cast
 
 from cuda.bindings.driver import (  # pyrefly: ignore [missing-import]
     CUstream,  # noqa: TC002
 )
 import cutlass
+from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.nvgpu import cpasync
@@ -30,6 +33,9 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 from cutlass.utils.layout import LayoutEnum
 
 from .block_scaled_config import block_scaled_workspace_shape
+
+if TYPE_CHECKING:
+    from ._mlir_compat import ir
 
 
 @dsl_user_op
@@ -152,6 +158,435 @@ def _transpose_sf_stage_inplace(
                 ] = words_b[chunk, n_chunk, segment]
 
 
+@dsl_user_op
+def _ldmatrix_trans_b8(
+    address: cutlass.Int32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> tuple[cutlass.Uint32, cutlass.Uint32]:
+    """``ldmatrix.m16n16.x1.trans.b8`` (sm_100a): lanes 0-15 address the
+    sixteen 16-byte rows of a block; lane ``L`` receives rows ``4 (L % 4)``
+    to ``4 (L % 4) + 3`` of column ``L // 4`` as the bytes of the first word
+    and of column ``L // 4 + 8`` as the second."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [cutlass.Uint32.mlir_type, cutlass.Uint32.mlir_type]
+        ),
+        [address.ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m16n16.x1.trans.shared.b8 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    low = llvm.extractvalue(cutlass.Uint32.mlir_type, result, [0], loc=loc, ip=ip)
+    high = llvm.extractvalue(cutlass.Uint32.mlir_type, result, [1], loc=loc, ip=ip)
+    return cutlass.Uint32(low), cutlass.Uint32(high)
+
+
+class _LdsmUnit(NamedTuple):
+    """One lane's loads of a sixteen-row-by-quad unit (``_ldsm_loads``)."""
+
+    row0: cutlass.Int32
+    word0: cutlass.Int32
+    word1: cutlass.Int32
+    # The scale words as stored and with the padding groups masked.
+    stored0: cutlass.Uint32
+    stored1: cutlass.Uint32
+    scales0: cutlass.Uint32
+    scales1: cutlass.Uint32
+    low0: cutlass.Uint32
+    high0: cutlass.Uint32
+    low1: cutlass.Uint32
+    high1: cutlass.Uint32
+
+
+class _TransformSide(NamedTuple):
+    """One operand of the fused consumer as the transform warps see it."""
+
+    transpose: bool
+    rows: int
+    bk: int
+    half: cutlass.Int32
+    sf_words: cute.Tensor
+    sf_pairs: cute.Tensor
+    sf_stage_words: int
+    words64: cute.Tensor
+    words32: cute.Tensor
+    stage_bytes: int
+    raw_base: cutlass.Int32
+    raw_stage_bytes: int
+
+
+def _transpose_units(rows: int, bk: int) -> int:
+    """Units of ``_ldsm_loads``: sixteen rows by one scale quad (32 k-bytes)."""
+    return (rows // 16) * (bk // 64)
+
+
+def _ldsm_loads(
+    ttid: cutlass.Int32,
+    threads: int,
+    rows: int,
+    bk: int,
+    stage: cutlass.Int32,
+    raw_base: cutlass.Int32,
+    raw_stage_bytes: int,
+    raw_mask: int,
+    sf_words: cute.Tensor,
+    sf_stage_words: int,
+    sf_half: cutlass.Int32,
+    tail: tuple[cutlass.Int32 | int, int, int],
+) -> list[_LdsmUnit]:
+    """Loads of one raw ``[k-byte][row]`` stage (row pitch ``rows`` bytes
+    under the TMA swizzle of that width): per unit, the scale words of the
+    lane's two rows and two transposed 16x16-byte ldmatrix blocks, which
+    give lane ``L`` k-bytes ``16 c + 4 (L % 4) ..`` of rows ``L // 4`` and
+    ``L // 4 + 8`` of the unit as 32-bit words.  A warp owns whole units
+    (``_transpose_units`` is a multiple of the warps), and all of a stage's
+    loads are issued before its first store (``_ldsm_stores``): the
+    shared-memory accesses alias for the compiler, so a store would
+    serialize the following loads behind the earlier loads' latency.
+    ``tail`` is ``(k step, last k step, valid groups of the last quad)``; a
+    nonzero last entry masks the padding groups' scale bytes
+    (``_mask_tail_scales``)."""
+    warp = ttid // 32
+    lane = ttid % 32
+    warps = threads // 32
+    quads = bk // 64
+    units = _transpose_units(rows, bk)
+    assert units % warps == 0
+    ki, last_step, keep = tail
+    loads: list[_LdsmUnit] = []
+    for item in range(units // warps):
+        unit = warp + warps * item
+        block = unit // quads
+        quad = unit % quads
+        row0 = block * 16 + lane // 4
+        sf_row0 = sf_half + row0
+        sf_row1 = sf_row0 + 8
+        # Word w of a 512-byte scale block holds groups 4q .. 4q+3 of
+        # row (w // 4) + 32 (w % 4) of a 128-row chunk.
+        word0 = stage * sf_stage_words + (
+            quad * 128 + (sf_row0 % 32) * 4 + sf_row0 // 32
+        )
+        word1 = stage * sf_stage_words + (
+            quad * 128 + (sf_row1 % 32) * 4 + sf_row1 // 32
+        )
+        stored0 = cutlass.Uint32(sf_words[word0])
+        stored1 = cutlass.Uint32(sf_words[word1])
+        scales0 = stored0
+        scales1 = stored1
+        if keep:
+            scales0 = _mask_tail_scales(scales0, quad, ki, last_step, quads - 1, keep)
+            scales1 = _mask_tail_scales(scales1, quad, ki, last_step, quads - 1, keep)
+        address = (
+            raw_base
+            + stage * raw_stage_bytes
+            + (quad * 32 + lane % 16) * rows
+            + block * 16
+        )
+        address0 = address ^ (((address >> 7) & raw_mask) << 4)
+        address = address + 16 * rows
+        address1 = address ^ (((address >> 7) & raw_mask) << 4)
+        low0, high0 = _ldmatrix_trans_b8(address0)
+        low1, high1 = _ldmatrix_trans_b8(address1)
+        loads.append(
+            _LdsmUnit(
+                row0,
+                word0,
+                word1,
+                stored0,
+                stored1,
+                scales0,
+                scales1,
+                low0,
+                high0,
+                low1,
+                high1,
+            )
+        )
+    return loads
+
+
+def _ldsm_stores(
+    loads: list[_LdsmUnit],
+    ttid: cutlass.Int32,
+    threads: int,
+    bk: int,
+    stage: cutlass.Int32,
+    sf_words: cute.Tensor,
+    words32: cute.Tensor,
+    stage_bytes: int,
+    row_bytes: int,
+    chunk_mask: int,
+) -> None:
+    """Stores of ``_ldsm_loads``: each 32-bit word goes to its swizzled
+    K-major slot with the sign of its group folded in, and a scale word
+    whose stored bytes differ from the unsigned masked ones (signs set, or
+    padding groups) is written back by the first of the four lanes of its
+    row (the words belong to this warp alone)."""
+    warp = ttid // 32
+    lane = ttid % 32
+    warps = threads // 32
+    quads = bk // 64
+    sign_mask = cutlass.Uint32(0x88888888)
+    sub = (lane % 4) // 2
+    for item, unit in enumerate(loads):
+        quad = (warp + warps * item) % quads
+        words = ((unit.low0, unit.high0), (unit.low1, unit.high1))
+        for chunk in range(2):
+            low, high = words[chunk]
+            shift = 8 * (sub + 2 * chunk) + 7
+            low = low ^ (((unit.scales0 >> shift) & cutlass.Uint32(1)) * sign_mask)
+            high = high ^ (((unit.scales1 >> shift) & cutlass.Uint32(1)) * sign_mask)
+            kb = quad * 32 + chunk * 16 + 4 * (lane % 4)
+            offset0 = unit.row0 * row_bytes + kb
+            offset0 = offset0 ^ (((offset0 >> 7) & chunk_mask) << 4)
+            offset1 = (unit.row0 + 8) * row_bytes + kb
+            offset1 = offset1 ^ (((offset1 >> 7) & chunk_mask) << 4)
+            words32[(stage * stage_bytes + offset0) // 4] = low
+            words32[(stage * stage_bytes + offset1) // 4] = high
+        _clear_scale_signs(lane, unit.word0, unit.stored0, unit.scales0, sf_words)
+        _clear_scale_signs(lane, unit.word1, unit.stored1, unit.scales1, sf_words)
+
+
+@cute.jit
+def _mask_tail_scales(
+    value: cutlass.Uint32,
+    quad: cutlass.Int32,
+    ki: cutlass.Int32 | int,
+    last_step: int,
+    last_quad: int,
+    keep: int,
+) -> cutlass.Uint32:
+    """Zero the scale bytes of the groups past K in the last quad of the last
+    K step (``keep`` valid groups there): the sources' padding bytes are
+    arbitrary, and a NaN scale would poison its row even against the
+    zero-filled padding data."""
+    if ki == last_step and quad == last_quad:
+        value = cutlass.Uint32(value & cutlass.Uint32((1 << (8 * keep)) - 1))
+    return value
+
+
+@cute.jit
+def _mask_tail_scale_pair(
+    pair: cutlass.Uint64,
+    quad: cutlass.Int32,
+    ki: cutlass.Int32 | int,
+    last_step: int,
+    last_quad: int,
+    keep: int,
+) -> cutlass.Uint64:
+    """``_mask_tail_scales`` for a pair of words of one quad."""
+    if ki == last_step and quad == last_quad:
+        mask = (1 << (8 * keep)) - 1
+        pair = cutlass.Uint64(pair & cutlass.Uint64(mask | (mask << 32)))
+    return pair
+
+
+@cute.jit
+def _clear_scale_signs(
+    lane: cutlass.Int32,
+    word: cutlass.Int32,
+    stored: cutlass.Uint32,
+    masked: cutlass.Uint32,
+    sf_words: cute.Tensor,
+) -> None:
+    """Write scale word ``word`` back as the masked value without its sign
+    bits, from the first of the four lanes that share it, when that differs
+    from the stored word (signs set, or padding bytes masked): the MMA reads
+    the scales from shared memory, not from the lanes' registers."""
+    cleaned = cutlass.Uint32(masked & cutlass.Uint32(0x7F7F7F7F))
+    if lane % 4 == 0:
+        if stored != cleaned:
+            sf_words[word] = cleaned
+
+
+@cute.jit
+def _direct_scale_load(
+    index: cutlass.Int32,
+    guarded: bool,
+    stage: cutlass.Int32,
+    sf_words: cute.Tensor,
+    sf_stage_words: int,
+    tail: tuple[cutlass.Int32 | int, int, int],
+) -> tuple[cutlass.Uint64, cutlass.Uint64]:
+    """Scale words ``2 index`` and ``2 index + 1`` of a direct side's stage as
+    one 64-bit value (0 past the end), as stored and with the padding groups
+    masked; ``tail`` as in ``_ldsm_loads`` (both words of a pair belong to
+    one quad)."""
+    ki, last_step, keep = tail
+    stored = cutlass.Uint64(0)
+    masked = cutlass.Uint64(0)
+    if cutlass.const_expr(not guarded) or index < sf_stage_words // 2:
+        word = stage * sf_stage_words + 2 * index
+        low = cutlass.Uint64(cutlass.Uint32(sf_words[word]))
+        high = cutlass.Uint64(cutlass.Uint32(sf_words[word + 1]))
+        stored = cutlass.Uint64(low | (high << 32))
+        masked = stored
+        if cutlass.const_expr(keep != 0):
+            masked = _mask_tail_scale_pair(
+                stored,
+                (2 * index) // 128,
+                ki,
+                last_step,
+                sf_stage_words // 128 - 1,
+                keep,
+            )
+    return stored, masked
+
+
+@cute.jit
+def _direct_scale_fold(
+    stored: cutlass.Uint64,
+    pair: cutlass.Uint64,
+    index: cutlass.Int32,
+    stage: cutlass.Int32,
+    sf_pairs: cute.Tensor,
+    sf_stage_words: int,
+    words: cute.Tensor,
+    stage_bytes: int,
+    row_bytes: int,
+    chunk_mask: int,
+    half: cutlass.Int32,
+    rows: int,
+) -> None:
+    """Write a direct side's scale word pair back as the masked value without
+    its sign bits when that differs from the stored pair, and fold the signs
+    into the side's K-major qwords (rows ``half`` .. ``half + rows`` of the
+    128-row scale chunk are this tile's).  Word w of a 512-byte scale block
+    holds groups 4q .. 4q+3 of row (w // 4) + 32 (w % 4) of a 128-row chunk."""
+    cleaned = cutlass.Uint64(pair & cutlass.Uint64(0x7F7F7F7F7F7F7F7F))
+    if stored != cleaned:
+        sf_pairs[stage * (sf_stage_words // 2) + index] = cleaned
+    signs = cutlass.Uint64(pair & cutlass.Uint64(0x8080808080808080))
+    if signs != 0:
+        for w in cutlass.range_constexpr(2):
+            word = 2 * index + w
+            quad = word // 128
+            position = word % 128
+            col = (position // 4) + 32 * (position % 4) - half
+            if col >= 0 and col < rows:
+                for sub in cutlass.range_constexpr(4):
+                    if (signs >> (32 * w + 8 * sub + 7)) & cutlass.Uint64(1):
+                        g = quad * 4 + sub
+                        offset = col * row_bytes + g * 8
+                        offset = offset ^ (((offset >> 7) & chunk_mask) << 4)
+                        slot = (stage * stage_bytes + offset) // 8
+                        words[slot] = cutlass.Uint64(words[slot]) ^ cutlass.Uint64(
+                            0x8888888888888888
+                        )
+
+
+def _transform_stage(
+    ttid: cutlass.Int32,
+    threads: int,
+    raw_pipe: pipeline.PipelineTmaAsync,
+    ab_pipe: pipeline.PipelineAsyncUmma,
+    raw_state: pipeline.PipelineState,
+    ab_state: pipeline.PipelineState,
+    sides: tuple[_TransformSide, _TransformSide],
+    tail: tuple[cutlass.Int32 | int, int, int],
+) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+    """Transform one stage: wait for its raw data and K-major buffer, issue
+    every load, then the stores, then commit it.  ``tail`` is ``(k step,
+    last k step, valid groups of the last quad)`` for the padding-scale mask.
+    Returns the advanced states: the caller's loop carries them only through
+    an assignment."""
+    raw_pipe.consumer_wait(raw_state)
+    ab_pipe.producer_acquire(ab_state)
+    stage = raw_state.index
+    transposed: list[list[_LdsmUnit]] = []
+    direct: list[list[tuple[cutlass.Uint64, cutlass.Uint64]]] = []
+    for side in sides:
+        if side.transpose:
+            transposed.append(
+                _ldsm_loads(
+                    ttid,
+                    threads,
+                    side.rows,
+                    side.bk,
+                    stage,
+                    side.raw_base,
+                    side.raw_stage_bytes,
+                    side.rows // 16 - 1,
+                    side.sf_words,
+                    side.sf_stage_words,
+                    side.half,
+                    tail,
+                )
+            )
+            direct.append([])
+        else:
+            pairs = side.sf_stage_words // 2
+            direct.append(
+                [
+                    _direct_scale_load(
+                        ttid + threads * item,
+                        pairs % threads != 0,
+                        stage,
+                        side.sf_words,
+                        side.sf_stage_words,
+                        tail,
+                    )
+                    for item in range((pairs + threads - 1) // threads)
+                ]
+            )
+            transposed.append([])
+    for index, side in enumerate(sides):
+        row_bytes = side.bk // 2
+        chunk_mask = row_bytes // 16 - 1
+        if side.transpose:
+            _ldsm_stores(
+                transposed[index],
+                ttid,
+                threads,
+                side.bk,
+                stage,
+                side.sf_words,
+                side.words32,
+                side.stage_bytes,
+                row_bytes,
+                chunk_mask,
+            )
+        else:
+            for item, (stored, pair) in enumerate(direct[index]):
+                _direct_scale_fold(
+                    stored,
+                    pair,
+                    ttid + threads * item,
+                    stage,
+                    side.sf_pairs,
+                    side.sf_stage_words,
+                    side.words64,
+                    side.stage_bytes,
+                    row_bytes,
+                    chunk_mask,
+                    side.half,
+                    side.rows,
+                )
+    cute.arch.fence_view_async_shared()
+    ab_pipe.producer_commit(ab_state)
+    raw_pipe.consumer_release(raw_state)
+    raw_state.advance()
+    ab_state.advance()
+    return raw_state, ab_state
+
+
+def _raw_tile_layout(bk: int, rows: int) -> cute.ComposedLayout:
+    """``[bk/2][rows]`` bytes with ``rows`` contiguous, swizzled like a TMA
+    box of that width (SW64 for 64-byte rows, SW128 for 128)."""
+    bits = {64: 2, 128: 3}.get(rows, 3)
+    return cute.make_composed_layout(
+        cute.make_swizzle(bits, 4, 3),
+        0,
+        cute.make_layout((bk // 2, rows), stride=(rows, 1)),
+    )
+
+
 class Sm100BlockScaledGemm:
     """One native tile family with independently tunable K and stage depth."""
 
@@ -181,6 +616,8 @@ class Sm100BlockScaledGemm:
         lhs_scale_column_stride: int = 0,
         rhs_scale_row_stride: int = 1,
         rhs_scale_column_stride: int = 0,
+        pdl: bool = False,
+        fused: dict[str, tuple[str, int]] | None = None,
     ) -> None:
         assert operand_format in ("nvfp4", "mxfp8")
         self.operand_format = operand_format
@@ -204,6 +641,30 @@ class Sm100BlockScaledGemm:
         self.lhs_scale_column_stride = lhs_scale_column_stride
         self.rhs_scale_row_stride = rhs_scale_row_stride
         self.rhs_scale_column_stride = rhs_scale_column_stride
+        # Fused preparation: no workspace kernel.  Each packed side is read
+        # from its source tensor by TMA, a K-contiguous side ("direct",
+        # (mode, row stride in bytes)) straight into its K-major stage and a
+        # row-contiguous side ("transpose", (mode, k-byte stride in bytes))
+        # into a raw [k-byte][row] staging tile that the transform warps
+        # transpose into K-major words by ldmatrix.  The scales are read from their
+        # swizzled source layout; the transform warps clear the sign bits
+        # and fold them into the data, as the preparation kernel does.
+        self.fused = fused is not None
+        self.lhs_mode, self.lhs_stride = fused["lhs"] if fused else ("direct", 0)
+        self.rhs_mode, self.rhs_stride = fused["rhs"] if fused else ("direct", 0)
+        assert not self.fused or (operand_format == "nvfp4" and cluster_m == 1)
+        assert not (self.fused and fused_scales)
+        # Transform warps of the fused consumer (warps 6 and up).
+        self.transform_threads = 256 if self.fused else 0
+        # Warps 0-5 are the fixed roles; MXFP8 fused scales add their
+        # scale warp (warp 6), the fused NVFP4 consumer its transform warps.
+        self.threads = (224 if fused_scales else 192) + self.transform_threads
+        # Programmatic dependent launch: the preparation kernel triggers its
+        # dependents at its start, so this kernel's prologue (barrier and
+        # pipeline init, TMEM allocation, descriptor prefetch) overlaps the
+        # preparation; the TMA producer waits for its completion before the
+        # first workspace load.
+        self.pdl = pdl
         self.operand_dtype = (
             cutlass.Float4E2M1FN if operand_format == "nvfp4" else cutlass.Float8E4M3FN
         )
@@ -215,7 +676,9 @@ class Sm100BlockScaledGemm:
         self.scale_chunk_k = 4 * self.scale_vector_size
         assert m > 0 and n > 0 and k > 0 and k % self.scale_vector_size == 0
         assert bn in (
-            (8, 16, 32, 64, 128, 224, 256) if operand_format == "mxfp8" else (128, 256)
+            (8, 16, 32, 64, 128, 224, 256)
+            if operand_format == "mxfp8"
+            else (64, 128, 256)
         )
         assert bn != 8 or cluster_m == 1
         assert bk in (64, 128, 256)
@@ -293,7 +756,68 @@ class Sm100BlockScaledGemm:
             cute.recast_ptr(workspace_pointer + self.sb_offset, dtype=cutlass.Int16),
             cute.make_layout((256, self.kp // 64, self.np // 128)),
         )
-        self._launch(qa, qb, sa, sb, output, alpha, stream)
+        self._launch(qa, qb, sa, sb, output, alpha, stream, qa, qb)
+
+    @cute.jit
+    def fused_entry(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        output: cute.Tensor,
+        alpha: cutlass.Float32,
+        stream: CUstream,
+    ) -> None:
+        """Consume the packed sources and swizzled scales directly."""
+        assert self.operand_format == "nvfp4" and self.fused
+        groups_padded = (self.k // 16 + 3) // 4 * 4
+        assert groups_padded == self.kp // 16
+        a_pointer = cast("cute.Pointer", a.iterator)
+        b_pointer = cast("cute.Pointer", b.iterator)
+        if cutlass.const_expr(self.lhs_mode == "direct"):
+            qa = cute.make_tensor(
+                cute.recast_ptr(a_pointer, dtype=cutlass.Float4E2M1FN),
+                cute.make_layout(
+                    (self.m, self.k, 1), stride=(2 * self.lhs_stride, 1, 0)
+                ),
+            )
+            ra = qa
+        else:
+            qa = cute.make_tensor(
+                cute.recast_ptr(a_pointer, dtype=cutlass.Float4E2M1FN),
+                cute.make_layout((self.m, self.k, 1), stride=(self.k, 1, 0)),
+            )
+            ra = cute.make_tensor(
+                cute.recast_ptr(a_pointer, dtype=cutlass.Uint8),
+                cute.make_layout((self.k // 2, self.m), stride=(self.lhs_stride, 1)),
+            )
+        if cutlass.const_expr(self.rhs_mode == "direct"):
+            qb = cute.make_tensor(
+                cute.recast_ptr(b_pointer, dtype=cutlass.Float4E2M1FN),
+                cute.make_layout(
+                    (self.n, self.k, 1), stride=(2 * self.rhs_stride, 1, 0)
+                ),
+            )
+            rb = qb
+        else:
+            qb = cute.make_tensor(
+                cute.recast_ptr(b_pointer, dtype=cutlass.Float4E2M1FN),
+                cute.make_layout((self.n, self.k, 1), stride=(self.k, 1, 0)),
+            )
+            rb = cute.make_tensor(
+                cute.recast_ptr(b_pointer, dtype=cutlass.Uint8),
+                cute.make_layout((self.k // 2, self.n), stride=(self.rhs_stride, 1)),
+            )
+        sfa = cute.make_tensor(
+            cute.recast_ptr(cast("cute.Pointer", sa.iterator), dtype=cutlass.Int16),
+            cute.make_layout((256, self.kp // 64, self.mp // 128)),
+        )
+        sfb = cute.make_tensor(
+            cute.recast_ptr(cast("cute.Pointer", sb.iterator), dtype=cutlass.Int16),
+            cute.make_layout((256, self.kp // 64, self.np // 128)),
+        )
+        self._launch(qa, qb, sfa, sfb, output, alpha, stream, ra, rb)
 
     @cute.jit
     def mxfp8(
@@ -326,7 +850,7 @@ class Sm100BlockScaledGemm:
             cute.recast_ptr(workspace_pointer + self.sb_offset, dtype=cutlass.Int16),
             cute.make_layout((256, self.kp // self.scale_chunk_k, self.np // 128)),
         )
-        self._launch(qa, qb, sa, sb, output, alpha, stream)
+        self._launch(qa, qb, sa, sb, output, alpha, stream, qa, qb)
 
     @cute.jit
     def mxfp8_packed(
@@ -350,7 +874,7 @@ class Sm100BlockScaledGemm:
             cute.recast_ptr(b.iterator, dtype=self.operand_dtype),
             cute.make_layout((self.n, self.k, 1), stride=(*b_strides, 0)),
         )
-        self._launch(qa, qb, sa, sb, output, alpha, stream)
+        self._launch(qa, qb, sa, sb, output, alpha, stream, qa, qb)
 
     @cute.jit
     def _launch(
@@ -362,6 +886,8 @@ class Sm100BlockScaledGemm:
         output: cute.Tensor,
         alpha: cutlass.Float32,
         stream: CUstream,
+        ra: cute.Tensor,
+        rb: cute.Tensor,
     ) -> None:
         mma = blackwell_helpers.make_blockscaled_trivial_tiled_mma(
             self.operand_dtype,
@@ -554,6 +1080,23 @@ class Sm100BlockScaledGemm:
             + (0 if self.fused_scales else cute.cosize(sal) // self.stages)
             + (0 if self.fused_scales else cute.cosize(sbl) // self.stages)
         )
+        # Raw staging tiles of the transposed sides: [bk/2 k-bytes][rows]
+        # under the TMA swizzle of the row width (64 or 128 bytes), which
+        # spreads the transform warps' ldmatrix rows over the banks.
+        ral = _raw_tile_layout(self.bk, self.bm)
+        rbl = _raw_tile_layout(self.bk, self.bn)
+        ra_atom, ra_tma = a_atom, a_tma
+        rb_atom, rb_tma = b_atom, b_tma
+        if cutlass.const_expr(self.fused and self.lhs_mode == "transpose"):
+            ra_atom, ra_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(self.group), ra, ral, ral.shape
+            )
+        if cutlass.const_expr(self.fused and self.rhs_mode == "transpose"):
+            rb_atom, rb_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(self.group), rb, rbl, rbl.shape
+            )
+        # Fused: the raw tile replaces the K-major tile in the TMA byte count
+        # (same size), the rest is unchanged.
         self.kernel(
             output,
             alpha,
@@ -574,11 +1117,18 @@ class Sm100BlockScaledGemm:
             d_atom,
             d_tma,
             d_layout,
+            ra_atom,
+            ra_tma,
+            rb_atom,
+            rb_tma,
+            ral,
+            rbl,
         ).launch(
             grid=(self.clusters * self.cluster_m, 1, 1),
-            block=(224 if self.fused_scales else 192, 1, 1),
+            block=(self.threads, 1, 1),
             cluster=(self.cluster_m, 1, 1),
             stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.kernel
@@ -603,6 +1153,12 @@ class Sm100BlockScaledGemm:
         d_atom: cute.CopyAtom | None,
         d_tma: cute.Tensor | None,
         d_layout: cute.Layout | cute.ComposedLayout | None,
+        ra_atom: cute.CopyAtom,
+        ra_tma: cute.Tensor,
+        rb_atom: cute.CopyAtom,
+        rb_tma: cute.Tensor,
+        ral: cute.ComposedLayout,
+        rbl: cute.ComposedLayout,
     ) -> None:
         output_pointer = cast("cute.Pointer", output.iterator)
         output_strides = cast(
@@ -664,18 +1220,79 @@ class Sm100BlockScaledGemm:
         c_barriers = cute.arch.alloc_smem(
             cutlass.Int64, 2 * self.accumulator_stages, alignment=8
         )
-        ab_pipe = pipeline.PipelineTmaUmma.create(
-            num_stages=self.stages,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                (1 + 32 * self.cluster_m) if self.sf_inplace else 1,
-            ),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.tx_bytes,
-            barrier_storage=ab_barriers,
-            cta_layout_vmnk=cluster,
-            defer_sync=True,
+        lhs_transpose = self.fused and self.lhs_mode == "transpose"
+        rhs_transpose = self.fused and self.rhs_mode == "transpose"
+        # Fused: raw [k-byte][row] staging tiles of the transposed sides and a
+        # TMA -> transform-warps pipeline in front of the transform -> UMMA one.
+        # 1024-byte alignment: the swizzle is a function of the address.
+        rap = cute.arch.alloc_smem(
+            cutlass.Uint8,
+            cute.cosize(ral) * self.stages if lhs_transpose else 16,
+            alignment=1024,
         )
+        rbp = cute.arch.alloc_smem(
+            cutlass.Uint8,
+            cute.cosize(rbl) * self.stages if rhs_transpose else 16,
+            alignment=1024,
+        )
+        raw_a = cute.make_tensor(
+            cute.recast_ptr(rap, ral.inner, dtype=cutlass.Uint8),
+            cute.make_layout(
+                (self.bk // 2, self.bm, self.stages),
+                stride=(self.bm, 1, cute.cosize(ral)),
+            ),
+        )
+        raw_b = cute.make_tensor(
+            cute.recast_ptr(rbp, rbl.inner, dtype=cutlass.Uint8),
+            cute.make_layout(
+                (self.bk // 2, self.bn, self.stages),
+                stride=(self.bn, 1, cute.cosize(rbl)),
+            ),
+        )
+        raw_barriers = cute.arch.alloc_smem(
+            cutlass.Int64, 2 * self.stages if self.fused else 2, alignment=8
+        )
+        if cutlass.const_expr(self.fused):
+            # The TMA-async consumer releases a stage from one lane per warp;
+            # multicast signaling sizes the empty barrier by those lanes
+            # (eight warps), not by the 256 threads of the group.
+            raw_pipe = pipeline.PipelineTmaAsync.create(
+                num_stages=self.stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.transform_threads
+                ),
+                tx_count=self.tx_bytes,
+                barrier_storage=raw_barriers,
+                cta_layout_vmnk=cluster,
+                enable_multicast_signaling=True,
+                defer_sync=True,
+            )
+            ab_pipe = pipeline.PipelineAsyncUmma.create(
+                num_stages=self.stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.transform_threads
+                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                barrier_storage=ab_barriers,
+                cta_layout_vmnk=cluster,
+                defer_sync=True,
+            )
+        else:
+            # Unused: the TMA producer feeds the UMMA pipeline directly.
+            raw_pipe = cast("pipeline.PipelineTmaAsync", None)
+            ab_pipe = pipeline.PipelineTmaUmma.create(
+                num_stages=self.stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    (1 + 32 * self.cluster_m) if self.sf_inplace else 1,
+                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                tx_count=self.tx_bytes,
+                barrier_storage=ab_barriers,
+                cta_layout_vmnk=cluster,
+                defer_sync=True,
+            )
         if cutlass.const_expr(self.fused_scales and self.sf_tma):
             if cutlass.const_expr(self.sf_inplace):
                 assert cute.cosize(sal) == 128 * (self.bk // 128) * self.stages * 4
@@ -807,7 +1424,7 @@ class Sm100BlockScaledGemm:
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster, is_relaxed=True)
         allocator = utils.TmemAllocator(
             barrier_for_retrieve=pipeline.NamedBarrier(
-                barrier_id=1, num_threads=224 if self.fused_scales else 192
+                barrier_id=1, num_threads=self.threads
             ),
             is_two_cta=self.cluster_m == 2,
         )
@@ -856,7 +1473,22 @@ class Sm100BlockScaledGemm:
             if cutlass.const_expr(not self.fused_scales or self.sf_tma):
                 cpasync.prefetch_descriptor(sa_atom)
                 cpasync.prefetch_descriptor(sb_atom)
+            if cutlass.const_expr(lhs_transpose):
+                cpasync.prefetch_descriptor(ra_atom)
+            if cutlass.const_expr(rhs_transpose):
+                cpasync.prefetch_descriptor(rb_atom)
+            if cutlass.const_expr(self.pdl):
+                # This warp's TMA reads the preparation kernel's workspace,
+                # or (fused) the sources the preceding grid in the stream may
+                # still be writing; the only other global reads before the
+                # MMA are the fused-scales scale warp's, which waits itself.
+                cute.arch.griddepcontrol_wait()
             state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.stages
+            )
+            # Fused: the K-major stages are refilled only once the MMA has
+            # released them, which the raw pipeline alone does not track.
+            free_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.stages
             )
             thread_mma = mma.get_slice(v)
@@ -977,49 +1609,97 @@ class Sm100BlockScaledGemm:
                     )
                 else:
                     raw_dsa, raw_dsb = None, None
+                # Placeholders where a side is not transposed (never copied).
+                dra, gra = da, ga
+                drb, grb = db, gb
+                if cutlass.const_expr(lhs_transpose):
+                    gra = cute.local_tile(ra_tma, (self.bk // 2, self.bm), (None, mi))
+                    dra, gra = cpasync.tma_partition(
+                        ra_atom,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(raw_a, 0, 2),
+                        cute.group_modes(gra, 0, 2),
+                    )
+                if cutlass.const_expr(rhs_transpose):
+                    grb = cute.local_tile(rb_tma, (self.bk // 2, self.bn), (None, ni))
+                    drb, grb = cpasync.tma_partition(
+                        rb_atom,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(raw_b, 0, 2),
+                        cute.group_modes(grb, 0, 2),
+                    )
                 for ki in cutlass.range(self.kp // self.bk, unroll=1):
-                    if cutlass.const_expr(self.sf_inplace):
-                        # The same empty signal protects operands and scales.
-                        # Raw SF TMA may overwrite a stage only after UTCCP/MMA
-                        # has finished consuming its prior contents.
-                        ab_pipe.producer_acquire(state)
-                    if cutlass.const_expr(self.sf_tma):
-                        assert raw_gsa is not None and raw_gsb is not None
-                        assert raw_dsa is not None and raw_dsb is not None
+                    if cutlass.const_expr(self.fused):
+                        raw_pipe.producer_acquire(state)
+                        ab_pipe.producer_acquire(free_state)
+                        barrier = raw_pipe.producer_get_barrier(state)
+                    else:
                         if cutlass.const_expr(self.sf_inplace):
-                            assert raw_sf_full is not None
-                            raw_sf_full.arrive_and_expect_tx(
-                                state.index, raw_sf_full.tx_count
+                            # The same empty signal protects operands and scales.
+                            # Raw SF TMA may overwrite a stage only after UTCCP/MMA
+                            # has finished consuming its prior contents.
+                            ab_pipe.producer_acquire(state)
+                        if cutlass.const_expr(self.sf_tma):
+                            assert raw_gsa is not None and raw_gsb is not None
+                            assert raw_dsa is not None and raw_dsb is not None
+                            if cutlass.const_expr(self.sf_inplace):
+                                assert raw_sf_full is not None
+                                raw_sf_full.arrive_and_expect_tx(
+                                    state.index, raw_sf_full.tx_count
+                                )
+                                raw_barrier = raw_sf_full.get_barrier(state.index)
+                            else:
+                                assert raw_sf_pipe is not None
+                                raw_sf_pipe.producer_acquire(state)
+                                raw_barrier = raw_sf_pipe.producer_get_barrier(state)
+                            cute.copy(
+                                sa_atom,
+                                raw_gsa[None, ki],
+                                raw_dsa[None, state.index],
+                                tma_bar_ptr=raw_barrier,
                             )
-                            raw_barrier = raw_sf_full.get_barrier(state.index)
-                        else:
-                            assert raw_sf_pipe is not None
-                            raw_sf_pipe.producer_acquire(state)
-                            raw_barrier = raw_sf_pipe.producer_get_barrier(state)
-                        cute.copy(
-                            sa_atom,
-                            raw_gsa[None, ki],
-                            raw_dsa[None, state.index],
-                            tma_bar_ptr=raw_barrier,
-                        )
-                        cute.copy(
-                            sb_atom,
-                            raw_gsb[None, ki],
-                            raw_dsb[None, state.index],
-                            tma_bar_ptr=raw_barrier,
-                        )
+                            cute.copy(
+                                sb_atom,
+                                raw_gsb[None, ki],
+                                raw_dsb[None, state.index],
+                                tma_bar_ptr=raw_barrier,
+                            )
+                            if cutlass.const_expr(not self.sf_inplace):
+                                assert raw_sf_pipe is not None
+                                raw_sf_pipe.producer_commit(state)
                         if cutlass.const_expr(not self.sf_inplace):
-                            assert raw_sf_pipe is not None
-                            raw_sf_pipe.producer_commit(state)
-                    if cutlass.const_expr(not self.sf_inplace):
-                        ab_pipe.producer_acquire(state)
-                    barrier = ab_pipe.producer_get_barrier(state)
-                    cute.copy(
-                        a_atom, ga[None, ki], da[None, state.index], tma_bar_ptr=barrier
-                    )
-                    cute.copy(
-                        b_atom, gb[None, ki], db[None, state.index], tma_bar_ptr=barrier
-                    )
+                            ab_pipe.producer_acquire(state)
+                        barrier = ab_pipe.producer_get_barrier(state)
+                    if cutlass.const_expr(lhs_transpose):
+                        cute.copy(
+                            ra_atom,
+                            gra[None, ki],
+                            dra[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
+                    else:
+                        cute.copy(
+                            a_atom,
+                            ga[None, ki],
+                            da[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
+                    if cutlass.const_expr(rhs_transpose):
+                        cute.copy(
+                            rb_atom,
+                            grb[None, ki],
+                            drb[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
+                    else:
+                        cute.copy(
+                            b_atom,
+                            gb[None, ki],
+                            db[None, state.index],
+                            tma_bar_ptr=barrier,
+                        )
                     if cutlass.const_expr(not self.fused_scales):
                         assert gsa is not None and gsb is not None
                         assert dsa is not None and dsb is not None
@@ -1035,12 +1715,117 @@ class Sm100BlockScaledGemm:
                             dsb[None, state.index],
                             tma_bar_ptr=barrier,
                         )
-                    ab_pipe.producer_commit(state)
+                    if cutlass.const_expr(self.fused):
+                        raw_pipe.producer_commit(state)
+                        free_state.advance()
+                    else:
+                        ab_pipe.producer_commit(state)
                     state.advance()
-            ab_pipe.producer_tail(state.clone())
-            if cutlass.const_expr(self.sf_tma and not self.sf_inplace):
-                assert raw_sf_pipe is not None
-                raw_sf_pipe.producer_tail(state.clone())
+            if cutlass.const_expr(self.fused):
+                raw_pipe.producer_tail(state)
+            else:
+                ab_pipe.producer_tail(state.clone())
+                if cutlass.const_expr(self.sf_tma and not self.sf_inplace):
+                    assert raw_sf_pipe is not None
+                    raw_sf_pipe.producer_tail(state.clone())
+        if cutlass.const_expr(self.fused):
+            if warp >= 6:
+                # Transform warps (``_transform_stage``).  A direct side's
+                # scale words are cleared of their sign bits and the signs
+                # folded into its K-major qwords in place; a transposed
+                # side's raw [k-byte][row] tile goes through ldmatrix into
+                # the K-major stage with its signs folded and cleared on the
+                # way.  Every load of a stage is issued before its first
+                # store.
+                ttid = tid - 192
+                raw_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.stages
+                )
+                ab_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.stages
+                )
+                a_bytes = cute.size_in_bytes(self.operand_dtype, al)
+                b_bytes = cute.size_in_bytes(self.operand_dtype, bl)
+                a_words = cute.make_tensor(
+                    cute.recast_ptr(ap, dtype=cutlass.Uint64),
+                    cute.make_layout((a_bytes // 8,)),
+                )
+                b_words = cute.make_tensor(
+                    cute.recast_ptr(bp, dtype=cutlass.Uint64),
+                    cute.make_layout((b_bytes // 8,)),
+                )
+                a_words32 = cute.make_tensor(
+                    cute.recast_ptr(ap, dtype=cutlass.Uint32),
+                    cute.make_layout((a_bytes // 4,)),
+                )
+                b_words32 = cute.make_tensor(
+                    cute.recast_ptr(bp, dtype=cutlass.Uint32),
+                    cute.make_layout((b_bytes // 4,)),
+                )
+                sfa_words = cute.make_tensor(
+                    cute.recast_ptr(sap, dtype=cutlass.Uint32),
+                    cute.make_layout((cute.cosize(sal) // 4,)),
+                )
+                sfb_words = cute.make_tensor(
+                    cute.recast_ptr(sbp, dtype=cutlass.Uint32),
+                    cute.make_layout((cute.cosize(sbl) // 4,)),
+                )
+                sfa_pairs = cute.make_tensor(
+                    cute.recast_ptr(sap, dtype=cutlass.Uint64),
+                    cute.make_layout((cute.cosize(sal) // 8,)),
+                )
+                sfb_pairs = cute.make_tensor(
+                    cute.recast_ptr(sbp, dtype=cutlass.Uint64),
+                    cute.make_layout((cute.cosize(sbl) // 8,)),
+                )
+                for tile_index in cutlass.range(
+                    first_tile, self.tile_count, tile_stride, unroll=1
+                ):
+                    half = cutlass.Int32(0)
+                    if cutlass.const_expr(self.bn == 64):
+                        half = cutlass.Int32((tile_index % self.n_tiles % 2) * 64)
+                    sides = (
+                        _TransformSide(
+                            lhs_transpose,
+                            self.bm,
+                            self.bk,
+                            cutlass.Int32(0),
+                            sfa_words,
+                            sfa_pairs,
+                            cute.cosize(sal) // self.stages // 4,
+                            a_words,
+                            a_words32,
+                            a_bytes // self.stages,
+                            cutlass.Int32(rap.toint()),
+                            cute.cosize(ral),
+                        ),
+                        _TransformSide(
+                            rhs_transpose,
+                            self.bn,
+                            self.bk,
+                            half,
+                            sfb_words,
+                            sfb_pairs,
+                            cute.cosize(sbl) // self.stages // 4,
+                            b_words,
+                            b_words32,
+                            b_bytes // self.stages,
+                            cutlass.Int32(rbp.toint()),
+                            cute.cosize(rbl),
+                        ),
+                    )
+                    for _ki in cutlass.range(self.kp // self.bk, unroll=1):
+                        raw_state, ab_state = _transform_stage(
+                            ttid,
+                            self.transform_threads,
+                            raw_pipe,
+                            ab_pipe,
+                            raw_state,
+                            ab_state,
+                            sides,
+                            (_ki, self.kp // self.bk - 1, self.k // 16 % 4),
+                        )
+                ab_pipe.producer_tail(ab_state)
         if warp == 4:
             if leader:
                 ra = mma.make_fragment_A(a)
@@ -1104,6 +1889,11 @@ class Sm100BlockScaledGemm:
             assert sf_pipe is not None
             if warp == 6:
                 lane = tid % 32
+                if cutlass.const_expr(self.pdl and not self.sf_tma):
+                    # This warp reads the packed scales from global memory
+                    # (with sf_tma they arrive through warp 5's TMA, behind
+                    # its wait).
+                    cute.arch.griddepcontrol_wait()
                 if cutlass.const_expr(not self.sf_tma):
                     raw_sa = cute.recast_ptr(sa_tma.iterator, dtype=cutlass.Int32)
                     raw_sb = cute.recast_ptr(sb_tma.iterator, dtype=cutlass.Int32)

@@ -434,6 +434,8 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
                 SimpleNamespace(
                     block_id=block,
                     pid_var=f"pid_{block}",
+                    pack=1,
+                    pack_axis=0,
                     num_pids_expr=lambda *, is_device, value=extents[block]: str(value),
                 )
                 for block in order

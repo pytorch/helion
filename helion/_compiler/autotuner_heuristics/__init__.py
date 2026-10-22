@@ -168,6 +168,7 @@ from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
 from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
+from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
 from .cute_warp_atomic import CuteWarpAtomicHeuristic
@@ -240,6 +241,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteTilePackWarpPerRowHeuristic,
         CuteColumnReductionHeuristic,
         CuteSiblingRowHeuristic,
         CuteNestedRowHeuristic,
