@@ -48,6 +48,16 @@ log = logging.getLogger(__name__)
 _warned_block_ptr_fallback = False
 
 
+def is_block_size_index(index: object) -> bool:
+    """Whether an index denotes a tile extent rather than a scalar coordinate."""
+    if not isinstance(index, torch.SymInt) or not isinstance(
+        symbol := _symint_expr(index), sympy.Symbol
+    ):
+        return False
+    origin = HostFunction.current().expr_to_origin.get(symbol)
+    return origin is not None and isinstance(origin.origin, BlockSizeOrigin)
+
+
 class TileWithOffsetInfo(NamedTuple):
     block_id: int
     offset: int | torch.SymInt
@@ -1892,13 +1902,10 @@ class SubscriptIndexing(NamedTuple):
                 output_size.append(tile_info.resolved_block_size_var(env))
             elif isinstance(k, torch.SymInt):
                 input_size.popleft()
-                symbol = _symint_expr(k)
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                    if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        # Always use block size for consistency with type propagation.
-                        # This ensures shapes match what _device_indexing_size computes.
-                        output_size.append(k)
+                if is_block_size_index(k):
+                    # Always use block size for consistency with type propagation.
+                    # This ensures shapes match what _device_indexing_size computes.
+                    output_size.append(k)
                 # Note: if not BlockSizeOrigin, this is a scalar index that eliminates the dim
             elif isinstance(k, slice):
                 size = input_size.popleft()

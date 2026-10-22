@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import cast
 
-import sympy
 import torch
 from torch._prims_common import canonicalize_dims
 from torch.fx import Node
@@ -29,10 +28,9 @@ from ..language import _MEMORY_OPS
 from ..language._tracing_ops import _host_tensor
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
-from .compile_environment import _symint_expr
 from .host_function import HostFunction
+from .indexing_strategy import is_block_size_index
 from .loop_dependency_checker import _storage_ids
-from .variable_origin import BlockSizeOrigin
 from .variable_origin import FlattenOrigin
 
 if TYPE_CHECKING:
@@ -366,7 +364,7 @@ class _Merger:
                 k = k.meta["val"]
                 if isinstance(k, torch.Tensor):
                     return None  # tensor indices may add or broadcast dims
-            if isinstance(k, (int, torch.SymInt)) and not self._is_tile(k):
+            if isinstance(k, (int, torch.SymInt)) and not is_block_size_index(k):
                 tensor_dim += 1  # a scalar index drops its dim
                 continue
             if out_dim in merged:
@@ -394,17 +392,6 @@ class _Merger:
         if block_id is not None and (info := self.env.block_sizes[block_id]).reduction:
             return cast("int | torch.SymInt", info.size)
         return size
-
-    @staticmethod
-    def _is_tile(k: int | torch.SymInt) -> bool:
-        """Whether index ``k`` is a tile's block size (which keeps its dim, see
-        ``SubscriptIndexing.compute_shape``) rather than a scalar."""
-        if not isinstance(k, torch.SymInt) or not isinstance(
-            symbol := _symint_expr(k), sympy.Symbol
-        ):
-            return False
-        origin = HostFunction.current().expr_to_origin.get(symbol)
-        return origin is not None and isinstance(origin.origin, BlockSizeOrigin)
 
     def clone(self, node: Node) -> Node:
         """``node`` with the merged dims flattened into one."""

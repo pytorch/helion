@@ -661,10 +661,8 @@ def _is_proven_multiple(value: object, alignment: int, config: Config | None) ->
         from ..host_function import HostFunction
 
         expression = _symint_expr(symbolic_value)
-        if expression is not None and all(
-            (origin := HostFunction.current().expr_to_origin.get(symbol)) is not None
-            and origin.origin.is_host()
-            for symbol in expression.free_symbols
+        if expression is not None and HostFunction.current().is_host_scalar_expr(
+            expression
         ):
             return (
                 CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
