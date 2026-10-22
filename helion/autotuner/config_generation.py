@@ -2429,6 +2429,8 @@ class ConfigGeneration:
         self,
         user_seed_configs: Sequence[Config],
         log_func: Callable[[str], None] | None = None,
+        *,
+        seed_description: str = "autotune",
     ) -> list[tuple[FlatConfig, Config]]:
         """Return user-provided seed configs as flat and normalized configs."""
         result: list[tuple[FlatConfig, Config]] = []
@@ -2444,7 +2446,9 @@ class ConfigGeneration:
                 AssertionError,
             ) as e:
                 if log_func is not None:
-                    log_func(f"Failed to transfer autotune seed config {i + 1}: {e}")
+                    log_func(
+                        f"Failed to transfer {seed_description} seed config {i + 1}: {e}"
+                    )
                 continue
             if normalized in seen:
                 continue

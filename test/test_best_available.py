@@ -1882,8 +1882,8 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 self.assertEqual(len(set(configs)), 4)
                 self.assertIn(default, configs)
                 search.log.assert_any_call(
-                    "Compiler seed budget of 4 rows (explicit seeds, compiler "
-                    "seeds, default) did not admit 21 of 25 compiler seed configs"
+                    "Base compiler seed budget of 4 rows (explicit seeds, compiler "
+                    "seeds, default) did not admit 21 of 25 compiler seed configs before any requested overflow"
                 )
 
     def test_compiler_seed_limit_fills_budget_with_default(self):
@@ -1953,15 +1953,14 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             },
         )
 
-    def test_compiler_seed_limit_keeps_requested_overflow(self):
+    def test_base_budget_is_separate_from_requested_overflow(self):
         generation = self._make_config_gen(CuteBackend())
         spec = generation.config_spec
         spec.compiler_seed_configs = self._seed_grid()
-        spec.compiler_seed_overflow_requested = True
         search = self._make_mock_search(generation, cached_configs=[])
-        self.assertEqual(
-            self._populate(search, compiler_seed_limit=2), self._populate(search)
-        )
+        expected = self._populate(search, compiler_seed_limit=2)
+        spec.compiler_seed_overflow_requested = True
+        self.assertEqual(self._populate(search, compiler_seed_limit=2), expected)
 
     def test_compiler_seed_limit_does_not_cap_flash(self):
         with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
@@ -2015,21 +2014,6 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         ):
             self.assertEqual(search._generate_initial_population_flat(), rows[:4])
 
-    def test_de_slices_padded_overflow_population_to_target(self):
-        generation = self._make_config_gen(CuteBackend())
-        source = self._make_mock_search(generation, cached_configs=[])
-        search = self._make_de_search(source)
-        search.population_size = 2
-        search.best_available_pad_random = True
-        rows = [[16, 64], [32, 64], [64, 64], [128, 64], [256, 64]]
-        with (
-            patch.object(search.config_spec, "compiler_seed_overflow_requested", True),
-            patch.object(
-                search, "_generate_best_available_population_flat", return_value=rows
-            ),
-        ):
-            self.assertEqual(search._generate_initial_population_flat(), rows[:4])
-
     def test_invalid_best_available_seed_is_logged_and_skipped(self):
         generation = self._make_config_gen(CuteBackend())
         search = self._make_mock_search(generation, cached_configs=[])
@@ -2038,7 +2022,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
             rows = self._populate(search)
         self.assertEqual(rows, [generation.default_flat()])
         search.log.assert_any_call(
-            "Best-available seed: Failed to transfer autotune seed config 1: bad seed"
+            "Failed to transfer best-available seed config 1: bad seed"
         )
 
     @staticmethod

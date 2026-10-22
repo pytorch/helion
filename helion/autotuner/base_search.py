@@ -2087,8 +2087,8 @@ class PopulationBasedSearch(BaseSearch):
         ``compiler_default_config`` and ``ConfigSpec.autotune_seed_configs``).
         Specs with ``cute_flash_search_enabled`` ignore the limit, since their
         seed set is the structural design the flash search measures. Explicit
-        compiler_seed_overflow_requested also bypasses the budget: those
-        candidates are required by the backend population contract.
+        PatternSearch may append a requested compiler overflow palette after
+        this base population is built.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
@@ -2121,7 +2121,6 @@ class PopulationBasedSearch(BaseSearch):
 
         if (
             generation.config_spec.cute_flash_search_enabled
-            or generation.config_spec.compiler_seed_overflow_requested
             or compiler_seed_limit is None
             or compiler_seed_limit <= 0
         ):
@@ -2166,14 +2165,22 @@ class PopulationBasedSearch(BaseSearch):
             admit(flat, transferred_config)
         if skipped:
             self.log(
-                f"Compiler seed budget of {compiler_seed_limit} rows (explicit "
+                f"Base compiler seed budget of {compiler_seed_limit} rows (explicit "
                 f"seeds, compiler seeds, default) did not admit {skipped} of "
-                f"{len(seed_pairs)} compiler seed configs"
+                f"{len(seed_pairs)} compiler seed configs before any requested overflow"
+            )
+
+        required_rows = len(result) + (default_config not in seen)
+        if compiler_seed_limit is not None and required_rows > compiler_seed_limit:
+            self.log(
+                f"Required seed/default rows raise the {compiler_seed_limit}-row "
+                f"base budget to {required_rows}"
             )
 
         for flat, transferred_config in generation.user_seed_flat_config_pairs(
             self._best_available_seed_configs,
-            lambda message: self.log(f"Best-available seed: {message}"),
+            self.log,
+            seed_description="best-available",
         ):
             admit(flat, transferred_config)
         admit(default_flat, default_config)
