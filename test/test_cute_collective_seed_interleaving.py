@@ -64,7 +64,7 @@ def _schedule(config: helion.Config) -> tuple[object, ...]:
     )
 
 
-def test_full_random_population_reaches_coupled_pipeline_chunk_geometries(
+def test_hundred_row_population_reaches_coupled_pipeline_chunk_geometries(
     partitioned_case: tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     bound, args = partitioned_case
