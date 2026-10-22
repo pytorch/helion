@@ -2134,11 +2134,6 @@ class PopulationBasedSearch(BaseSearch):
         # Keep them before the raw fragment default so expensive fallback defaults
         # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
         seed_pairs = generation.seed_flat_config_pairs(self.log)
-        # A budgeted-out seed may still be discovered later by mutation. Keep
-        # its final-verification protection without benchmarking it up front.
-        self._pinned_finalist_configs.update(
-            copy.deepcopy(config) for _, config in seed_pairs
-        )
         protected: set[Config] = set()
         quota: int | None = None
         if compiler_seed_limit is not None and seed_pairs:

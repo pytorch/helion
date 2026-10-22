@@ -1918,7 +1918,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                     [self._normalize(generation, config) for config in explicit],
                 )
 
-    def test_skipped_compiler_seed_stays_pinned_if_discovered_later(self):
+    def test_compiler_seed_budget_pins_only_admitted_rows(self):
         generation = self._make_config_gen(CuteBackend())
         spec = generation.config_spec
         spec.compiler_seed_configs = self._seed_grid()
@@ -1928,7 +1928,15 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         skipped = self._normalize(generation, spec.compiler_seed_configs[-1])
         self.assertNotIn(skipped, [generation.unflatten(row) for row in rows])
-        self.assertIn(skipped, search._pinned_finalist_configs)
+        self.assertNotIn(skipped, search._pinned_finalist_configs)
+        self.assertEqual(
+            search._pinned_finalist_configs,
+            {generation.unflatten(row) for row in rows},
+        )
+        search._final_rebenchmark_top_k.return_value = 3
+        self.assertEqual(
+            PopulationBasedSearch._final_selection_shortlist_estimate(search), 6
+        )
 
     def test_compiler_seed_limit_keeps_protected_seeds(self):
         generation = self._make_config_gen(CuteBackend())
