@@ -476,11 +476,14 @@ def test_narrow_surrogate_preserves_all_f32_rank_order_and_equal_classes(dtype) 
 @pytest.mark.parametrize("largest", [False, True])
 def test_legacy_defaults_and_initial_random_prefix_are_unchanged(largest) -> None:
     args = (*_args(), largest, False)
-    with patch.object(
-        CuteRadixSelectionHeuristic, "register_facts", return_value=frozenset()
-    ):
-        before = _cpu_bind(_payload_selection, args)
-    after = _cpu_bind(_payload_selection, args)
+    # This contract isolates additive coverage from optional native seed hints.
+    # Resident-seed population and finalist inclusion have separate tests.
+    with patch.object(CuteRadixSelectionHeuristic, "get_seed_configs", return_value=[]):
+        with patch.object(
+            CuteRadixSelectionHeuristic, "register_facts", return_value=frozenset()
+        ):
+            before = _cpu_bind(_payload_selection, args)
+        after = _cpu_bind(_payload_selection, args)
     assert before.config_spec.default_config() == after.config_spec.default_config()
     assert (
         before.config_spec.compiler_seed_configs

@@ -1,4 +1,4 @@
-"""Additive coverage for a proved unordered radix selection region."""
+"""Coverage and bounded seeds for a proved unordered radix selection region."""
 
 from __future__ import annotations
 
@@ -74,8 +74,75 @@ class CuteRadixSelectionHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        # Modes/geometry enter through additive coverage, never old seed rows.
-        return False
+        graph = env.config_spec.cute_radix_selection_graph
+        return graph is not None and graph.largest
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        from ..cute.radix_selection import radix_schedule
+        from ..cute.radix_selection import validate_radix_schedule
+        from ..cute.radix_selection_codegen import has_exact_cached_payload_consumer
+
+        spec = env.config_spec
+        graph = spec.cute_radix_selection_graph
+        if graph is None or not graph.largest:
+            return []
+        seeds = []
+        # One resident packet/CTA geometry for each supported packet width and
+        # output owner. The row width selects the smallest covering CTA; the
+        # proved register budget rejects oversized resident allocations.
+        for packet_bits in sorted(PIPELINE_CHOICES["cute_radix_packet_bits"]):
+            packet = max(1, packet_bits // (graph.x.element_size() * 8))
+            threads = next(
+                (
+                    size
+                    for size in sorted(GEOMETRY_CHOICES["cute_radix_threads"])
+                    if size * packet >= graph.cols
+                ),
+                max(GEOMETRY_CHOICES["cute_radix_threads"]),
+            )
+            for inverse in (False, True):
+                if inverse and not has_exact_cached_payload_consumer(graph):
+                    continue
+                config = dict(spec.autotune_reference_config())
+                config.update(
+                    cute_selection_algorithm="radix",
+                    cute_radix_threads=threads,
+                    cute_radix_cluster_ctas=1,
+                    cute_radix_candidate_capacity=0,
+                    cute_radix_histogram_mode="direct",
+                    cute_radix_packet_bits=packet_bits,
+                    cute_radix_candidate_key_cache=False,
+                    cute_radix_scalar_candidates=False,
+                    cute_radix_valid_domain=True,
+                    cute_radix_ticket_stores=True,
+                    cute_radix_cached_payload_inverse=inverse,
+                    cute_radix_resident_input=True,
+                    cute_radix_boundary_early_exit=graph.k < graph.logical_cols,
+                    cute_radix_defer_output=True,
+                    cute_radix_partial_scan=threads > 256,
+                )
+                plan = radix_schedule(graph, config)
+                if plan.resident_elements * (1 if plan.resident_keys_only else 2) > 128:
+                    continue
+                try:
+                    validate_radix_schedule(spec, config)
+                    spec.normalize(config)
+                except InvalidConfig:
+                    continue
+                seeds.append(Config.from_dict(config))
+        # These unpromoted hints fit within the ordinary initial population;
+        # they require no search-method-specific registration or budget changes.
+        return list(dict.fromkeys(seeds))[:6]
 
 
 def register_radix_selection_coverage(
