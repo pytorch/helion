@@ -1087,6 +1087,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1226,6 +1227,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1380,6 +1382,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
+        "cute_fragment_cta_topk",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
         "cute_topk_coarse_keys",
@@ -1598,7 +1601,13 @@ class ConfigSpec:
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
         self.cute_scaled_mma_available = False
+        self.cute_mxfp8_fused_scales_available = False
+        self.cute_mxfp8_sf_tma_available = False
+        self.cute_mxfp8_problem_shape: tuple[int, int, int] | None = None
+        self.cute_mxfp8_output_element_size = 0
+        self.cute_mxfp8_tma_output_available = False
         self.cute_mxfp8_mma_available = False
+        self.cute_mxfp8_partition_key: str | None = None
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_warp_aggregated_atomics_enabled = False
@@ -1764,6 +1773,8 @@ class ConfigSpec:
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_topk_network_search_enabled = False
+        self.cute_fragment_cta_topk_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_cta_topk_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_search_enabled = False
@@ -1921,6 +1932,9 @@ class ConfigSpec:
         self._cute_flash_bwd_fast_math: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        # A compiler may request complete initial coverage of its normalized
+        # seeds after the unchanged nominal and declared-coverage population.
+        self.compiler_seed_overflow_requested: bool = False
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
         self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
         self.cute_matmul_min_blocks_search_enabled: bool = False
@@ -4259,6 +4273,25 @@ class ConfigSpec:
             fix_invalid=fix_invalid,
         )
 
+    def _normalize_cute_fragment_cta_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_cta_topk"
+        self._normalize_cute_fragment_option(
+            config,
+            key,
+            self.cute_fragment_cta_topk_root_ids,
+            "a supported complete Int64 value-only selection",
+            fix_invalid=fix_invalid,
+        )
+        if config.get(key) and config.get("cute_fragment_topk_network") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    "CTA selection requires cute_fragment_topk_network=True"
+                )
+
     def _normalize_cute_fragment_atomic_aggregation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4552,7 +4585,7 @@ class ConfigSpec:
             self.cute_fragment_reduction_root_ids,
             "a supported computed scalar reduction",
             fix_invalid=fix_invalid,
-            choices=("serial", "warp"),
+            choices=("serial", "warp", "cta", "cta_unroll"),
         )
 
     def _normalize_cute_fragment_scan(
@@ -5311,6 +5344,11 @@ class ConfigSpec:
             or config.get("pid_type", self.allowed_pid_types[0]) != "flat"
         ):
             return
+        key = self.cute_mxfp8_partition_key
+        if key is not None and (
+            type(config.get(key)) is not int or config.get(key) != 1
+        ):
+            raise InvalidConfig(f"native complete MXFP8 reduction requires {key}=1")
         fields = self._flat_fields()
         for key in _CUTE_MXFP8_ROOT_LOWERING_KEYS.intersection(config):
             if key in self.user_defined_tunables:
@@ -5601,6 +5639,7 @@ class ConfigSpec:
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_cta_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -6175,6 +6214,9 @@ class ConfigSpec:
                 capability=self.target_device_capability,
                 fix_invalid=_fix_invalid,
                 mxfp8=self.cute_mxfp8_mma_available,
+                fused_scales_available=self.cute_mxfp8_fused_scales_available,
+                sf_tma_available=self.cute_mxfp8_sf_tma_available,
+                tma_output_available=self.cute_mxfp8_tma_output_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -6898,6 +6940,7 @@ class ConfigSpec:
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_fragment_cta_topk",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_topk_coarse_keys",
@@ -7196,6 +7239,8 @@ class ConfigSpec:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_topk_network_search_enabled:
                 fields["cute_fragment_topk_network"] = BooleanFragment()
+            if self.cute_fragment_cta_topk_search_enabled:
+                fields["cute_fragment_cta_topk"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_integer_loop_reduction_search_enabled:
@@ -7232,7 +7277,7 @@ class ConfigSpec:
                 )
             if self.cute_fragment_reduction_search_enabled:
                 fields["cute_fragment_reduction"] = EnumFragment(
-                    choices=("serial", "warp")
+                    choices=("serial", "warp", "cta", "cta_unroll")
                 )
             if self.cute_pointwise_region_block_ids:
                 fields["cute_pointwise_pid_type"] = EnumFragment(
@@ -7790,7 +7835,16 @@ class ConfigSpec:
                     (
                         key,
                         EnumFragment(
-                            choices=tuple(value for value in choices if value != 64)
+                            choices=(False,)
+                            if key == "cute_scaled_fused_scales"
+                            and not self.cute_mxfp8_fused_scales_available
+                            else (False,)
+                            if key in ("cute_scaled_sf_tma", "cute_scaled_sf_inplace")
+                            and not self.cute_mxfp8_sf_tma_available
+                            else ("default",)
+                            if key == "cute_scaled_epilogue_mode"
+                            and not self.cute_mxfp8_tma_output_available
+                            else tuple(value for value in choices if value != 64)
                             if self.cute_mxfp8_mma_available
                             and key == "cute_scaled_tile_k"
                             else choices
@@ -8045,9 +8099,16 @@ class ConfigSpec:
         )
         legacy_hash = self._cache_fingerprint_from_structural_hash(structural_hash)
         policy = coverage_policy(self.compiler_coverage_groups)
-        if policy is None:
-            return legacy_hash
-        return hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        result = (
+            legacy_hash
+            if policy is None
+            else hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+        )
+        if self.compiler_seed_overflow_requested and self.compiler_seed_configs:
+            return hashlib.sha256(
+                repr((result, "compiler_seed_overflow:v1")).encode("utf-8")
+            ).hexdigest()
+        return result
 
     def projected_cache_fingerprint_hash(
         self, *, advanced_controls_files: list[str] | None = None

@@ -2592,6 +2592,28 @@ def _generate_ast(
             )
 
             validate_warp_producer_regions(env, func.device_ir, config)
+        if env.backend_name == "cute" and config.get(
+            "tcgen05_grouped_prefix_adaptive_n", False
+        ):
+            from .cute.grouped_prefix_adaptive_n_codegen import (
+                generate_grouped_prefix_adaptive_n_candidate,
+            )
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "grouped prefix-adaptive N requires complete ordinary codegen"
+                )
+            return generate_grouped_prefix_adaptive_n_candidate(
+                func, config, emit_repro_caller
+            )
         if (
             env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"

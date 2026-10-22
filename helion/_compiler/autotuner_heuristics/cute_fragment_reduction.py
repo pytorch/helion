@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from .registry import CompilerHeuristicSpecializationFact
 
 KEY = "cute_fragment_reduction"
-MODES = ("serial", "warp")
+MODES = ("serial", "warp", "cta", "cta_unroll")
 
 
 def fragment_warp_reduction_supported(node: Node) -> bool:
@@ -120,11 +120,11 @@ def register_fragment_reduction_coverage(
     spec.register_compiler_coverage_group(
         CompilerCoverageGroup(
             mechanism="cute.computed_fragment_reduction",
-            version=1,
+            version=3,
             key=KEY,
             domain=MODES,
             legacy="serial",
-            witnesses=(CoverageWitness(carrier, "warp"),),
+            witnesses=tuple(CoverageWitness(carrier, mode) for mode in MODES[1:]),
             supplemental_witnesses=(CoverageWitness(supplemental_carrier, "warp"),)
             if supplemental_carrier is not None
             else (),

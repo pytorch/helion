@@ -1855,6 +1855,9 @@ class TestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self._test_stack = contextlib.ExitStack()
+        # unittest does not call tearDown if setUp raises, including SkipTest.
+        # Close contexts even when a subclass skips after calling super().setUp().
+        self.addCleanup(self._test_stack.close)
 
         from torch._inductor.utils import fresh_cache
 

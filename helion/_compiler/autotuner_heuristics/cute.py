@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+from functools import partial
 from itertools import zip_longest
 import math
 from typing import TYPE_CHECKING
@@ -40,6 +41,8 @@ from ..cute.grouped_full_coverage import FULL_COVERAGE_PIPELINES
 from ..cute.grouped_full_coverage import full_coverage_index_domain
 from ..cute.grouped_full_coverage import full_coverage_pipeline_supported
 from ..cute.grouped_full_coverage import full_coverage_smem_upper_bound
+from ..cute.grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from ..cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from ..cute.grouped_row_union import PAIRED_CLC
 from ..cute.grouped_row_union import PAIRED_CLC_SCHEDULE
 from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
@@ -66,6 +69,10 @@ from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
 from ..cute.tcgen05_config import CuteTcgen05Config
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
@@ -73,6 +80,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
@@ -80,6 +88,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
 from ..cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES,
 )
@@ -94,7 +103,9 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ..cute.tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+from ..cute.tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
 from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
@@ -989,6 +1000,21 @@ def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     return 1
 
 
+def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
+    """Find row/inner axes in loop order, independent of registration order."""
+    blocks = env.config_spec.block_sizes
+    if len(blocks) != 2:
+        return None
+    paths = env.config_spec.cute_tile_loop_paths
+    if len(paths) != 1 or not paths[0][0]:
+        return None
+    block_ids = blocks.valid_block_ids()
+    axes = tuple(bid for level in paths[0] for bid in level if bid in block_ids)
+    if len(axes) != 2 or set(axes) != set(block_ids):
+        return None
+    return axes[0], axes[1]
+
+
 def _cute_tile_inner_block_dtype(
     env: CompileEnvironment, device_ir: DeviceIR, block_id: int
 ) -> torch.dtype | None:
@@ -1547,13 +1573,10 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
             return False
         # The inner tile block must have a vec slot registered
         # (added by ``register_rollable_reductions`` for cute tile blocks).
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        inner_block_id = blocks[1]
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         # Need a recognisable dtype to seed V.
@@ -1565,13 +1588,10 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
@@ -1580,12 +1600,14 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         # SM100 warp + L2 hit cadence) when reachable, else cap at the
         # inner tile's fragment.high.  ``num_threads`` is sized so the
         # lane_extent equals V (one vec load per thread per outer iter).
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
         # Threads = block_n // V so each thread owns V contiguous elts.
         nt_n = max(1, block_n // vec)
         seed: dict[str, Any] = {
-            "block_sizes": [1, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: nt_n}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -1766,10 +1788,7 @@ class CuteScanTileHeuristic(AutotunerHeuristic):
         # runs on the innermost grid block and needs the strip extent to be a
         # multiple of the vector width; a strip elsewhere (a column-major
         # input) or of another width (98 columns) would seed scalar code.
-        if (
-            strip_block != spec.block_sizes[-1].block_ids[0]
-            or strip_spec.size_hint % vec
-        ):
+        if strip_block != device_ir.grid_block_ids[0][-1] or strip_spec.size_hint % vec:
             return None
         strip = min(strip_spec.max_size, cls.STRIP_THREADS * vec)
         rows = min(rows, scan_spec.max_size)
@@ -1860,13 +1879,10 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        inner_block_id = blocks[1]
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
@@ -1878,7 +1894,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # against the launch cost (and an autotuner-picked warp lattice
         # can hold the row).  We use the inner block fragment's high
         # bound as a proxy for the reduction extent.
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         return bn_high >= vec * 32
 
     @classmethod
@@ -1886,13 +1902,10 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
@@ -1900,12 +1913,14 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # Each thread owns V contiguous elements; one warp = 32 threads
         # = 32 * V elements per outer-tile iter. Cap by the fragment's
         # high bound so the seed is reachable for short reduction axes.
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = vec * 32
         if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
-            "block_sizes": [1, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -2874,10 +2889,11 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        inner = cast("Any", spec.block_sizes[1])
-        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        inner_block_id = blocks[1]
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return None
         if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
@@ -2928,9 +2944,14 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n = plan
         spec = env.config_spec
-        inner_block_id = spec.block_sizes[1].block_id
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [1, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads, {inner_block_id: threads}
             ),
@@ -3008,9 +3029,14 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
             return None
         n, threads, vec, cluster_n, max_per_thread = plan
         spec = env.config_spec
-        inner_block_id = spec.block_sizes[1].block_id
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [1, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads, {inner_block_id: threads}
             ),
@@ -3068,10 +3094,11 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             )
         ):
             return None
-        inner = cast("Any", spec.block_sizes[1])
-        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        inner_block_id = blocks[1]
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return None
         if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
@@ -3107,9 +3134,14 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
             return None
         n, vec = plan
         spec = env.config_spec
-        outer_block_id, inner_block_id = (item.block_id for item in spec.block_sizes)
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
         seed: dict[str, Any] = {
-            "block_sizes": [cls._ROWS_PER_CTA, n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: cls._ROWS_PER_CTA, inner_block_id: n}
+            ),
             "num_threads": _seq_config_list(
                 spec.num_threads,
                 {
@@ -3175,25 +3207,22 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             )
         ):
             return False
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return False
+        outer_block_id, inner_block_id = blocks
         if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
             return False
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return False
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         if bn_high < vec * 32:
             return False
         # Outer (M) fragment must admit M=2 (warp-per-row launches 2
         # warps per CTA so each row is one warp).
-        bm_fragment = spec.block_sizes[0]._fragment(spec)
+        bm_fragment = spec.block_sizes.block_id_lookup(outer_block_id)._fragment(spec)
         return bm_fragment.low <= 2 <= bm_fragment.high
 
     @classmethod
@@ -3201,23 +3230,22 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        inner_block_id = (
-            cast("Any", spec.block_sizes[1]).block_ids[0]
-            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
-            else None
-        )
-        if inner_block_id is None:
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
             return None
+        outer_block_id, inner_block_id = blocks
         dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return None
-        bn_high = spec.block_sizes[1]._fragment(spec).high
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = vec * 32
         if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
-            "block_sizes": [2, block_n],
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 2, inner_block_id: block_n}
+            ),
             "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, {inner_block_id: vec}
@@ -4558,6 +4586,414 @@ def _tcgen05_grouped_output_ring_seeds(
     return dedupe_configs(result)
 
 
+def _tcgen05_grouped_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+    source_m_tile: int,
+    physical_k: int | None = None,
+) -> list[Config]:
+    """Seed complete device pipelines using their physical allocation sizes.
+
+    Physical rows and the CTA group determine each ring's actual footprint.
+    Cover both a deep ring and an independent ONE ring that can occupy two
+    CTAs per SM; kernel names and routing-vector contents are irrelevant.
+    """
+    if (
+        min(groups, n, k, dtype_bytes, output_dtype_bytes) <= 0
+        or n % 32
+        or capacity_bytes <= _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    ):
+        return []
+    result: list[Config] = []
+    budget = capacity_bytes - _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    logical_choices = (
+        (64,) if physical_k is not None else TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+    )
+    for block_k in logical_choices:
+        effective_k = physical_k if physical_k is not None else block_k
+        if k % effective_k or not _block_size_value_reachable(spec, 2, block_k):
+            continue
+        for cluster_m in (1, 2):
+            config = _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                block_k,
+                1,
+                TCGEN05_CONSUMER_REGS_DEFAULT,
+                runtime_direct=False,
+            )
+            config.config["tcgen05_cluster_m"] = cluster_m
+            if physical_k is not None:
+                config.config[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = physical_k
+            if cluster_m == 1:
+                config.config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+                config.config[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = False
+            profile = resolve_tcgen05_grouped_worklist_mma_profile(
+                config.config, block_k=effective_k
+            )
+            if profile is None:
+                continue
+
+            footprint = partial(
+                tcgen05_grouped_worklist_smem_bytes,
+                group_count=groups,
+                device_split_sizes=True,
+                sched_stage_count=1,
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=effective_k,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                acc_stages=2,
+                c_stages=2,
+                cluster_m=cluster_m,
+            )
+
+            max_stages = min(7, k // effective_k)
+            while max_stages > 0 and footprint(ab_stages=max_stages) > budget:
+                max_stages -= 1
+            if max_stages == 0:
+                continue
+            config.config["tcgen05_ab_stages"] = max_stages
+            result.append(config)
+            immutable_supported = (
+                b_major == "k"
+                and n % profile.mma_m == 0
+                and groups * n * k <= (1 << 31) - 1
+            )
+            if immutable_supported:
+                immutable = deepcopy(config)
+                immutable.config[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = True
+                result.append(immutable)
+            if cluster_m != 1:
+                continue
+            resident_stages = min(2, max_stages)
+            while (
+                resident_stages > 0
+                and 2 * footprint(ab_stages=resident_stages) > budget
+            ):
+                resident_stages -= 1
+            if resident_stages:
+                resident = deepcopy(config)
+                resident.config["tcgen05_ab_stages"] = resident_stages
+                resident.config["num_sm_multiplier"] = 2
+                result.append(resident)
+                if immutable_supported:
+                    resident_immutable = deepcopy(resident)
+                    resident_immutable.config[
+                        TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
+                    ] = True
+                    result.append(resident_immutable)
+    return _filter_reachable_block_size_configs(spec, dedupe_configs(result))
+
+
+def _tcgen05_grouped_mn_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: str,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    """Seed resource-checked physical M,N tiles on typed device worklists.
+
+    These are additive proposals. Row geometry, output buffering, and optional
+    worker balancing remain choices measured by the autotuner.
+    """
+    if (
+        not spec._cute_tcgen05_config.grouped_device_worklist_supported
+        or not spec._cute_tcgen05_config.grouped_d_shift_supported
+        or not spec._cute_tcgen05_config.matmul_operands_tma_provable
+        or min(groups, n, k, capacity_bytes) <= 0
+        or dtype_bytes != 2
+        or output_dtype_bytes not in (2, 4)
+        or b_major != "k"
+        or n % 32
+        or k % 64
+        or groups * n > (1 << 31) - 1
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+
+    seeds: list[Config] = []
+    for row_tile in (128, 256):
+        for column_tile in (128, 192, 224, 256):
+            epi_m, epi_n = tcgen05_grouped_worklist_epilogue_shape(
+                bm=row_tile,
+                bn=column_tile,
+                cluster_m=2,
+                output_dtype_bytes=output_dtype_bytes,
+                orientation="mn",
+            )
+            subtiles = (row_tile // 2 // epi_m) * (column_tile // epi_n)
+            preferred_c_stages = max(
+                value for value in (2, 3, 4) if value == 2 or subtiles % value == 0
+            )
+            for cluster_n in (1, 2):
+                if cluster_n == 2 and n % (column_tile * cluster_n):
+                    continue
+                for c_stages in (2, 3, 4):
+                    if c_stages != 2 and subtiles % c_stages:
+                        continue
+                    ab_stages = 32
+                    while ab_stages >= 2:
+                        required = tcgen05_grouped_worklist_smem_bytes(
+                            group_count=groups,
+                            device_split_sizes=True,
+                            sched_stage_count=1,
+                            bm=row_tile,
+                            bn=column_tile,
+                            bk=64,
+                            dtype_bytes=dtype_bytes,
+                            output_dtype_bytes=output_dtype_bytes,
+                            ab_stages=ab_stages,
+                            acc_stages=2,
+                            c_stages=c_stages,
+                            cluster_m=2,
+                            orientation="mn",
+                            immutable_ab_tensormaps=True,
+                            immutable_d_tensormap=True,
+                        )
+                        if required <= capacity_bytes:
+                            break
+                        ab_stages -= 1
+                    if ab_stages < 2:
+                        continue
+                    candidate = _tcgen05_grouped_worklist_config(
+                        row_tile, 64, ab_stages, 256, runtime_direct=False
+                    )
+                    candidate.config.update(
+                        {
+                            "tcgen05_cluster_m": 2,
+                            "tcgen05_cluster_n": cluster_n,
+                            "tcgen05_c_stages": c_stages,
+                            "cute_min_blocks_per_mp": 1,
+                            "tcgen05_grouped_worklist_orientation": "mn",
+                            "tcgen05_grouped_worklist_mma_n": column_tile,
+                            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+                            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+                        }
+                    )
+                    variants = [candidate]
+                    if spec._cute_tcgen05_config.grouped_balanced_workers_supported:
+                        balanced = deepcopy(candidate)
+                        balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = (
+                            True
+                        )
+                        variants.append(balanced)
+                    seeds.extend(variants)
+                    if (
+                        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
+                        and c_stages == preferred_c_stages
+                    ):
+                        for variant in variants:
+                            for swizzle in (4, 8):
+                                panel = deepcopy(variant)
+                                panel.config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                                    swizzle
+                                )
+                                seeds.append(panel)
+                            for alternate in (2, 4):
+                                adaptive = deepcopy(variant)
+                                adaptive.config.update(
+                                    {
+                                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 8,
+                                        GROUPED_PANEL_ALTERNATE_KEY: alternate,
+                                        GROUPED_PANEL_RATIO_KEY: 1,
+                                    }
+                                )
+                                seeds.append(adaptive)
+    return dedupe_configs(seeds)
+
+
+def _tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec: ConfigSpec) -> list[Config]:
+    """Append both worker policies for one resource-derived paired recipe."""
+    model = spec._cute_tcgen05_config
+    profile = model.grouped_prefix_adaptive_n_profile
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: True,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+        }
+    )
+    # Explicit native roles/rings replace the generic warp and stage aliases.
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    static = deepcopy(seed)
+    static.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = False
+    result = [seed, static]
+    cluster_size = cast("int", static["tcgen05_cluster_m"]) * cast(
+        "int", static["tcgen05_cluster_n"]
+    )
+    reserved_sms = round(spec.num_sm / (16 * cluster_size)) * cluster_size
+    if (
+        0 < reserved_sms < spec.num_sm
+        and reserved_sms <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+    ):
+        reserved = deepcopy(static)
+        reserved.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = reserved_sms
+        result.append(reserved)
+    return result
+
+
+def _tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec: ConfigSpec) -> list[Config]:
+    """Offer the native M256 pair after the existing compiler seed palette."""
+    model = spec._cute_tcgen05_config
+    profile = model.get_grouped_prefix_adaptive_n_profile(
+        {"tcgen05_grouped_worklist_source_m_tile": 256}
+    )
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: False,
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 0,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+            GROUPED_PANEL_ALTERNATE_KEY: 4,
+            GROUPED_PANEL_RATIO_KEY: 1,
+        }
+    )
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    balanced = deepcopy(seed)
+    balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = True
+    return [seed, balanced]
+
+
+def _tcgen05_grouped_prefix_adaptive_n_seeds(spec: ConfigSpec) -> list[Config]:
+    """Preserve M128 recipes, then append the M256 worker policies."""
+    return [
+        *_tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec),
+        *_tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec),
+    ]
+
+
+def _tcgen05_grouped_source128_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    return _tcgen05_grouped_device_tile_seeds(
+        spec,
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        dtype_bytes=dtype_bytes,
+        output_dtype_bytes=output_dtype_bytes,
+        capacity_bytes=capacity_bytes,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+    )
+
+
+def _tcgen05_grouped_physical_k_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    if not spec._cute_tcgen05_config.grouped_ab_k_fusion_supported:
+        return []
+    return dedupe_configs(
+        [
+            config
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            )
+            for config in _tcgen05_grouped_device_tile_seeds(
+                spec,
+                groups=groups,
+                n=n,
+                k=k,
+                b_major=b_major,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                capacity_bytes=capacity_bytes,
+                source_m_tile=source_m_tile,
+                physical_k=128,
+            )
+        ]
+    )
+
+
 def _tcgen05_grouped_worklist_hardware_identity(
     env: CompileEnvironment,
 ) -> GroupedWorklistHardwareIdentity | None:
@@ -4663,6 +5099,69 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             )
         )
         seed_facts = analysis.seed_facts
+        spec._cute_tcgen05_config.grouped_device_worklist_supported = (
+            seed_facts.device_split_sizes
+        )
+        spec._cute_tcgen05_config.grouped_ab_k_fusion_supported = (
+            analysis.ab_k_fusion_supported
+        )
+        spec._cute_tcgen05_config.grouped_d_shift_supported = analysis.d_shift_supported
+        # The pure typed device-worklist palette can exceed the nominal search
+        # population as physical layouts/panel policies compose. Keep its legal
+        # normalized seeds after that unchanged prefix; no sampler budget grows.
+        spec.compiler_seed_overflow_requested = (
+            spec.compiler_seed_overflow_requested
+            or (
+                analysis.d_shift_supported
+                and seed_facts.device_split_sizes
+                and analysis.device_layout_kind == "offsets"
+                and seed_facts.b_major == "k"
+            )
+        )
+        # The same native K64 proof supplies closed work ownership, a fresh
+        # output, live compact metadata, and signed input/output allocations.
+        spec._cute_tcgen05_config.grouped_balanced_workers_supported = (
+            analysis.d_shift_supported
+        )
+        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported = (
+            analysis.d_shift_supported
+            and analysis.device_layout_kind == "offsets"
+            and seed_facts.device_split_sizes
+            and seed_facts.b_major == "k"
+        )
+        from ..cute.grouped_prefix_adaptive_n import (
+            grouped_prefix_adaptive_n_analysis_eligible,
+        )
+        from ..cute.grouped_prefix_adaptive_n import (
+            resolve_grouped_prefix_adaptive_n_profile,
+        )
+
+        model = spec._cute_tcgen05_config
+        prefix_profiles = {}
+        if model.search_enabled and model._matmul_block_indices() is not None:
+            for source_m in (128, 256):
+                if not grouped_prefix_adaptive_n_analysis_eligible(
+                    analysis,
+                    matmul_operands_tma_provable=model.matmul_operands_tma_provable,
+                    source_m_tile=source_m,
+                ):
+                    continue
+                prefix_profile = resolve_grouped_prefix_adaptive_n_profile(
+                    int(analysis.grouped_tensor.shape[0]),
+                    analysis.packed_tensor.dtype.itemsize,
+                    (analysis.output_dtype or analysis.packed_tensor.dtype).itemsize,
+                    CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
+                    source_m_tile=source_m,
+                )
+                if prefix_profile is not None:
+                    prefix_profiles[source_m] = prefix_profile
+        model.grouped_prefix_adaptive_n_profiles = prefix_profiles
+        model.grouped_prefix_adaptive_n_profile = prefix_profiles.get(128)
+        model.grouped_prefix_adaptive_n_supported = bool(prefix_profiles)
+        model.grouped_prefix_adaptive_n_search_enabled = bool(prefix_profiles) and all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
         if analysis.input_kind == "external_worklist":
             from ..cute.grouped_worklist import (
                 register_tcgen05_grouped_worklist_runtime_specialization,
@@ -4739,7 +5238,10 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             or analysis.seed_facts.n_hint % 32 != 0
         ):
             return None
-        if not tcgen05_runtime_n_ptx_compatible():
+        if (
+            not tcgen05_runtime_n_ptx_compatible()
+            and not analysis.seed_facts.device_split_sizes
+        ):
             warn_tcgen05_runtime_n_ptx_fallback()
             return None
         return fact, analysis
@@ -4752,7 +5254,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
     ) -> list[Config]:
         eligible = cls._eligible_inputs(env, device_ir)
         if eligible is None:
-            return []
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(env.config_spec)
         fact, analysis = eligible
         spec = env.config_spec
         seed_facts = analysis.seed_facts
@@ -4760,7 +5262,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             env, analysis
         )
         if not source_m_tiles:
-            return []
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(spec)
         families: list[list[Config]] = []
         target_policy = get_grouped_worklist_target_policy(
             None
@@ -4860,13 +5362,106 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                     ),
                 ]
             )
-        return seeds
+            source128_seeds = _tcgen05_grouped_source128_seeds(
+                spec,
+                groups=seed_facts.groups_hint,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                dtype_bytes=fact.lhs_dtype.itemsize,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
+                capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                    env.device
+                ),
+            )
+            spec._cute_tcgen05_config.grouped_source128_search_enabled = bool(
+                source128_seeds
+            )
+            seeds = dedupe_configs([*seeds, *source128_seeds])
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_physical_k_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+            # Larger routed-row profiles need the same resource-checked
+            # device pipelines as source128, including immutable K-major
+            # weights. Append them after the established seed/default prefix.
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            ):
+                seeds = dedupe_configs(
+                    [
+                        *seeds,
+                        *_tcgen05_grouped_device_tile_seeds(
+                            spec,
+                            groups=seed_facts.groups_hint,
+                            n=seed_facts.n_hint,
+                            k=seed_facts.k_hint,
+                            b_major=seed_facts.b_major,
+                            dtype_bytes=fact.lhs_dtype.itemsize,
+                            output_dtype_bytes=(
+                                analysis.output_dtype or fact.lhs_dtype
+                            ).itemsize,
+                            capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                                env.device
+                            ),
+                            source_m_tile=source_m_tile,
+                        ),
+                    ]
+                )
+        if spec._cute_tcgen05_config.grouped_d_shift_supported:
+            shifted = []
+            for seed in seeds:
+                if seed.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY) is True:
+                    candidate = deepcopy(seed)
+                    candidate.config[TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY] = True
+                    shifted.append(candidate)
+            seeds = dedupe_configs([*seeds, *shifted])
+        if seed_facts.device_split_sizes:
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_mn_device_tile_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+        return dedupe_configs([*seeds, *_tcgen05_grouped_prefix_adaptive_n_seeds(spec)])
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
         fact = _tcgen05_grouped_worklist_fact(env)
         return (
-            tcgen05_runtime_n_ptx_compatible()
+            (
+                tcgen05_runtime_n_ptx_compatible()
+                or env.config_spec._cute_tcgen05_config.grouped_device_worklist_supported
+            )
             and fact is not None
             and fact.static_k is not None
             and super().should_promote(env)
@@ -4874,14 +5469,26 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return cls._eligible_inputs(env, device_ir) is not None
+        return (
+            cls._eligible_inputs(env, device_ir) is not None
+            or env.config_spec._cute_tcgen05_config.grouped_prefix_adaptive_n_search_enabled
+        )
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         configs = cls._seed_configs(env, device_ir)
-        return configs[0] if configs else None
+        # The optional recipe adds live-search candidates, while the existing
+        # promotion/default path keeps its established source and first seed.
+        return next(
+            (
+                config
+                for config in configs
+                if config.get(TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY) is not True
+            ),
+            None,
+        )
 
     @classmethod
     def get_seed_configs(
@@ -6649,11 +7256,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
     """Seed config for skinny-M FP8 GEMM kernels.
 
-    For small M (1-16) the optimal config is very different from a large GEMM:
-    a single row per grid block (``block_sizes[0]=1``), a modest N tile, a warp
-    of threads on the N axis, and a wide FP8 vector load. Seeding this anchors
-    the autotuner in the valid small-tile region instead of letting the random
-    population burn its budget on configs like ``block_sizes=[4096, 2048]`` or
+    For small M (1-16), seed a small outer tile and a wide inner tile.
+    With M untiled, this means one N column per grid block with a 256-element
+    K tile, 32 K threads, and wide FP8 vector loads.
+    Seeding this anchors the autotuner in the valid small-tile region instead
+    of letting the random population burn its budget on configs like
+    ``block_sizes=[4096, 2048]`` or
     1024-thread launches that are structurally wrong for a 1-row problem (and
     frequently overflow shared memory).
 
@@ -6662,9 +7270,10 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
     faster kernel than with heuristics disabled, with ~25% fewer wasted
     compile failures.
 
-    Seeds ``block_sizes=[1, 256]``, ``num_threads=[0, 32]``,
-    ``cute_vector_widths=[4, 8]`` (the autotune-winning config for
-    M=1, K=4096, N=4096).
+    Of the two tunable axes in M/N/K order, the first gets block size 1,
+    automatic threads (0), and vector width 4; the second gets block size
+    256, 32 threads, and vector width 8. This is the autotune-winning N/K
+    config for M=1, K=4096, N=4096.
     """
 
     name = "cute_fp8_gemm_skinny_m"
@@ -6687,20 +7296,44 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
         )
         if not is_fp8:
             return False
+        block_ids = spec.block_sizes.valid_block_ids()
+        axes = tuple(
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
         # Check for skinny M (small batch / decode scenario):
         # M <= 16 is the skinny-M case.
-        return fact.static_m is not None and fact.static_m <= 16
+        return (
+            fact.static_m is not None
+            and fact.static_m <= 16
+            and len(axes) == 2
+            and set(axes) == set(block_ids)
+        )
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+        spec = env.config_spec
+        fact = spec.matmul_facts[0]
+        block_ids = spec.block_sizes.valid_block_ids()
+        first, second = (
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
+        assert first is not None and second is not None
         # Best config from autotune benchmarks for M=1, K=4096, N=4096
         # (1.5x speedup over baseline; the M=1 search reliably converges here).
         seed: dict[str, Any] = {
-            "block_sizes": [1, 256],
-            "num_threads": [0, 32],
-            "cute_vector_widths": [4, 8],
+            "block_sizes": _seq_config_list(spec.block_sizes, {first: 1, second: 256}),
+            "num_threads": _seq_config_list(spec.num_threads, {first: 0, second: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {first: 4, second: 8}
+            ),
         }
         try:
             return Config(**seed)
