@@ -21,6 +21,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+from helion.language._tracing_ops import _host_tensor
 
 
 def _softmax(x: torch.Tensor) -> torch.Tensor:
@@ -139,7 +140,7 @@ def test_dtype_walk_ignores_index_and_mask_tensors(mask_dtype: torch.dtype) -> N
     graph = torch.fx.Graph()
     index = graph.placeholder("index")
     index.meta["val"] = torch.empty(4096, dtype=mask_dtype)
-    value = graph.placeholder("value")
+    value = graph.call_function(_host_tensor, ())
     value.meta["val"] = torch.empty(4096, dtype=torch.bfloat16)
     env = SimpleNamespace(
         block_sizes=[SimpleNamespace(numel=sympy.Integer(4096))],
@@ -147,3 +148,20 @@ def test_dtype_walk_ignores_index_and_mask_tensors(mask_dtype: torch.dtype) -> N
     )
     ir = SimpleNamespace(graphs=[SimpleNamespace(graph=graph)])
     assert _cute_tile_inner_block_dtype(env, ir, 0) == torch.bfloat16
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
+def test_dtype_walk_uses_the_memory_payload_before_a_conversion(
+    dtype: torch.dtype,
+) -> None:
+    graph = torch.fx.Graph()
+    value = graph.call_function(_host_tensor, ())
+    value.meta["val"] = torch.empty(4096, dtype=dtype)
+    converted = graph.call_function(torch.ops.aten._to_copy.default, (value,))
+    converted.meta["val"] = torch.empty(4096, dtype=torch.float32)
+    env = SimpleNamespace(
+        block_sizes=[SimpleNamespace(numel=sympy.Integer(4096))],
+        is_jagged_tile=lambda block_id: False,
+    )
+    ir = SimpleNamespace(graphs=[SimpleNamespace(graph=graph)])
+    assert _cute_tile_inner_block_dtype(env, ir, 0) == dtype

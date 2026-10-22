@@ -27,6 +27,7 @@ from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
 from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
+from ...language._tracing_ops import _host_tensor
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import load as language_load
 from ...language.scan_ops import _associative_scan
@@ -993,30 +994,19 @@ def _cute_tile_inner_block_dtype(
     vector seeds, which share the same device-graph walk.
     """
     bs = env.block_sizes[block_id]
-    if env.is_jagged_tile(block_id):
-        # Jagged lengths have no static numel. Their tile symbol still
-        # identifies data values in the traced body; ignore index/mask tensors.
-        for graph_info in device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                val = node.meta.get("val")
-                if (
-                    isinstance(val, torch.Tensor)
-                    and val.ndim >= 1
-                    and val.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                    and isinstance(val.shape[-1], torch.SymInt)
-                    and val.shape[-1]._sympy_() == bs.var._sympy_()
-                ):
-                    return val.dtype
-        return None
-    block_numel = bs.numel
+    extent = _to_sympy(bs.var) if env.is_jagged_tile(block_id) else bs.numel
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
+            # Index/mask intermediates are not memory payloads. Keep the
+            # source dtype, including unsupported integer/FP8 inputs, rather
+            # than inferring it from a later floating-point conversion.
+            if node.target not in (_host_tensor, language_load):
+                continue
             val = node.meta.get("val")
             if (
                 isinstance(val, torch.Tensor)
                 and val.ndim >= 1
-                and val.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                and _to_sympy(val.shape[-1]) == block_numel
+                and _to_sympy(val.shape[-1]) == extent
             ):
                 return val.dtype
     return None
