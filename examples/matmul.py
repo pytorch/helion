@@ -137,17 +137,25 @@ class AddMMFunction(torch.autograd.Function):
         def scale_by_alpha(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
             return alpha * acc
 
-        grad_bias = (beta * grad_out) if ctx.needs_input_grad[0] else None
-        grad_mat1 = (
-            matmul(grad_out, mat2.T, scale_by_alpha)
-            if ctx.needs_input_grad[1]
-            else None
-        )
-        grad_mat2 = (
-            matmul(mat1.T, grad_out, scale_by_alpha)
-            if ctx.needs_input_grad[2]
-            else None
-        )
+        # Like torch.addmm's backward, scale only when alpha / beta are not
+        # 1.0: grad_out is grad_bias itself and the GEMMs need no epilogue.
+        grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_bias = grad_out if beta == 1.0 else beta * grad_out
+        grad_mat1 = None
+        if ctx.needs_input_grad[1]:
+            grad_mat1 = (
+                matmul(grad_out, mat2.T)
+                if alpha == 1.0
+                else matmul(grad_out, mat2.T, scale_by_alpha)
+            )
+        grad_mat2 = None
+        if ctx.needs_input_grad[2]:
+            grad_mat2 = (
+                matmul(mat1.T, grad_out)
+                if alpha == 1.0
+                else matmul(mat1.T, grad_out, scale_by_alpha)
+            )
         return grad_bias, grad_mat1, grad_mat2, None, None
 
 
