@@ -82,12 +82,12 @@ def chain_reduction_dims(
         source = x
         mode = proxy_tensor.get_proxy_mode()
         source_node = None
-        existing_nodes: set[Node] = set()
+        previous_tail: Node | None = None
         if mode is not None:
             source_node = cast(
                 "Any", proxy_tensor.get_proxy_slot(source, mode.tracer)
             ).proxy.node
-            existing_nodes = set(source_node.graph.nodes)
+            previous_tail = next(reversed(source_node.graph.nodes))
         # Like eager, cast the input to a low-precision dtype= first, then
         # accumulate in fp32 across every reduced dim and round once.
         out_dtype = cast("torch.dtype", kwargs.get("dtype") or x.dtype)
@@ -119,14 +119,18 @@ def chain_reduction_dims(
             node = cast(
                 "Any", proxy_tensor.get_proxy_slot(result, mode.tracer)
             ).proxy.node
-            chain_nodes = frozenset(node.graph.nodes) - existing_nodes
+            chain_nodes: set[Node] = set()
+            for created in reversed(node.graph.nodes):
+                if created is previous_tail:
+                    break
+                chain_nodes.add(created)
             node.meta[_META_KEY] = _ReductionChain(
                 source=cast("Node", source_node),
                 op=op,
                 dims=sorted(dims),
                 keepdim=keepdim,
                 kwargs=merge_kwargs,
-                nodes=chain_nodes,
+                nodes=frozenset(chain_nodes),
             )
         return result
 
@@ -159,7 +163,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             # A full-slice tensor's size is the original extent, even when
             # its reduction is later rolled in chunks. Keep scalar size reads
             # outside the rolled graph by specializing their static extents.
-            if env.settings.static_shapes:
+            if enabled:
                 _specialize_reduced_sizes(source, dims)
             if (
                 not enabled
@@ -211,7 +215,11 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 b for s in merger.sizes if (b := env.get_block_id(s)) is not None
             )
             # Erase the replaced chain and the producers only it used
-            dead = chain | {n for n, k in merger.kinds.items() if k == "merge"}
+            dead = (
+                chain
+                | {n for n, k in merger.kinds.items() if k == "merge"}
+                | {cast("Node", n.args[0]) for n in merger.flat_loads}
+            )
             while unused := [n for n in dead if not n.users]:
                 for n in unused:
                     graph.erase_node(n)
@@ -232,12 +240,8 @@ def _specialize_reduced_sizes(source: Node, dims: list[int]) -> None:
         if not extent.is_Integer:
             continue
         for consumer in list(user.users):
-            consumer.args = map_arg(
-                consumer.args,
-                lambda n, size=int(extent), source=user: size if n is source else n,
-            )
-            consumer.kwargs = map_arg(
-                consumer.kwargs,
+            consumer.args, consumer.kwargs = map_arg(
+                (consumer.args, consumer.kwargs),
                 lambda n, size=int(extent), source=user: size if n is source else n,
             )
         source.graph.erase_node(user)

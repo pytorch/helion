@@ -8024,13 +8024,11 @@ class TestCuteAllAxisGatherCPU(TestCase):
                         )
                     )
             self.assertEqual(prove(), ())
-        # The unchanged lowerer rejects truly multiple reduction dimensions.
+        # Implicit full reductions still reach the single-axis lowerer.
         for op, mode, keep in (("min", "empty", True), ("max", "none", False)):
             with (
                 self.subTest(op=op),
-                self.assertRaisesRegex(
-                    NotImplementedError, "multiple reduction dimensions"
-                ),
+                self.assertRaises(exc.MultipleReductionDims),
             ):
                 _bounded_gather_codegen(
                     _all_axis_bounded_gather, (torch.ones(2, 4, 8), op, mode, keep)

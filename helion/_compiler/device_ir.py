@@ -3605,11 +3605,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
-        if merged_rdims and CompileEnvironment.current().backend.name == "cute":
+        if merged_rdims:
             # Merged dims can leave their per-dim rdims unused.  Stop treating
-            # them as reductions, or CuTe would give each a reduction strategy
-            # (claiming a thread axis) and tuning slots, and its seed
-            # heuristics would count them.
+            # them as reductions, or they would gain unused tuning slots and
+            # rolling analysis. CuTe would also claim a thread axis for each.
             # Only rdims nothing uses are demoted: a later slice of the same
             # extent would come from a subscript that kept the rdim in use.
             from .cute.active_blocks import unused_block_ids
