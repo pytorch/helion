@@ -5341,12 +5341,10 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
-        seed: dict[str, Any] = {
-            "block_sizes": [1],
-            "reduction_loops": [None],
-        }
+        seed: dict[str, Any]
         mixed = False
-        if spec.has_custom_reduction_loops:
+        custom_loops = spec.has_custom_reduction_loops
+        if custom_loops:
             default = spec._base_default_config()
             seed = dict(default.config)
             seed["reduction_loops"], mixed = _custom_persistent_reduction_loops(
@@ -5359,6 +5357,8 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
                     spec.block_sizes, default.block_sizes, strict=True
                 )
             ]
+        else:
+            seed = {"block_sizes": [1], "reduction_loops": [None]}
         # Emit 'last' only where the backend supports it; backends that restrict
         # eviction to ("",) keep the spec default so the seed stays valid.
         eviction = spec.load_eviction_policies
@@ -5369,7 +5369,7 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
             and "last" in eviction.inner.choices
         ):
             seed["load_eviction_policies"] = ["last"] * eviction.length
-        if spec.has_custom_reduction_loops:
+        if custom_loops:
             return _materialize_config(seed, config_spec=spec)
         return Config(**seed)
 

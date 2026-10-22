@@ -1188,6 +1188,24 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.full_like(result, float("inf")))
 
+    @skipIfRefEager("checks masks after a native sum")
+    def test_custom_reduction_masks_shifted_negative_rows(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                shifted = values - values.sum(1, keepdim=True)
+                out[row] = hl.reduce(max_combine_fn, shifted, dim=1, other=0.0)
+            return out
+
+        x = torch.full((3, 514), -7.0, device=DEVICE)
+        for chunk in (None, 256):
+            _, result = code_and_output(
+                reduce, (x,), block_sizes=[2], reduction_loops=[chunk]
+            )
+            torch.testing.assert_close(result, (x - x.sum(1, keepdim=True)).amax(1))
+
     @skipIfRefEager("checks custom reduction tuple-axis admission")
     def test_custom_tuple_with_fixed_payload_stays_persistent(self) -> None:
         @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
@@ -1204,6 +1222,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
         x = torch.randn(3, 256, device=DEVICE)
         bound = reduce.bind((x,))
         self.assertFalse(bound.config_spec.has_custom_reduction_loops)
+        self.assertFalse(bound.config_spec.reduction_loops)
         _, (sums, counts) = code_and_output(reduce, (x,))
         torch.testing.assert_close(sums, x.sum(1))
         torch.testing.assert_close(counts, torch.full_like(counts, 256))

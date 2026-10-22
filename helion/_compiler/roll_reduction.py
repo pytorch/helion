@@ -107,9 +107,10 @@ class ReductionRoller:
         if node.target is _reduce and (
             CompileEnvironment.current().backend_name != "triton"
             or node.args[2] is None
+            or reduction_block_id(node) is None
         ):
             raise NotImplementedError(
-                "custom reduction rolling requires Triton and a single reduction axis"
+                "custom reduction rolling requires Triton and matching single-axis payloads"
             )
 
         if node.target is _associative_scan:
