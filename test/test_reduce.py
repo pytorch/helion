@@ -1283,13 +1283,19 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
         spec = bound.config_spec
         default = spec._base_default_config()
         pointwise_ids = bound.host_function.device_ir.grid_block_ids[0]
+        narrow = TritonNarrowReductionHeuristic.get_seed_config(
+            bound.env, bound.host_function.device_ir
+        )
+        assert narrow is not None
+        self.assertEqual(
+            narrow.config["load_eviction_policies"],
+            default.config["load_eviction_policies"],
+        )
         for seed in (
             TritonReductionHeuristic.get_seed_configs(
                 bound.env, bound.host_function.device_ir
             )[0],
-            TritonNarrowReductionHeuristic.get_seed_config(
-                bound.env, bound.host_function.device_ir
-            ),
+            narrow,
         ):
             assert seed is not None
             for block_id in pointwise_ids:

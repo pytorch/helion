@@ -5362,11 +5362,12 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
             ]
         else:
             seed = {"block_sizes": [1], "reduction_loops": [None]}
-        # Emit 'last' only where the backend supports it; backends that restrict
-        # eviction to ("",) keep the spec default so the seed stays valid.
+        # Emit 'last' only where the backend supports it. A promoted custom
+        # seed must also preserve loads in any unrelated grid roots.
         eviction = spec.load_eviction_policies
         if (
             not mixed
+            and (not custom_loops or len(device_ir.root_ids) == 1)
             and eviction.length
             and isinstance(eviction.inner, EnumFragment)
             and "last" in eviction.inner.choices
