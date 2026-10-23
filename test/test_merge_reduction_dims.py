@@ -16,7 +16,7 @@ def test_reduction_metadata_survives_copy_and_pickle() -> None:
     graph = make_fx(
         lambda value: op(value, [0, 1]) + op(x, [0, 1]),
         decomposition_table=_get_custom_decomp_table(),
-    )(x)
+    )(x.clone())
     tags = [
         node.meta[_META_KEY] for node in graph.graph.nodes if _META_KEY in node.meta
     ]
