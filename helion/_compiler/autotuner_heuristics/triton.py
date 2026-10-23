@@ -5228,7 +5228,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     ) -> list[Config]:
         """Seed custom reductions with a persistent baseline and a liveness proposal.
 
-        The persistent baseline remains the default when autotuning is disabled.
+        Without native reductions, the persistent baseline is the untuned default.
+        Mixed kernels keep the native liveness proposal primary.
         """
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
