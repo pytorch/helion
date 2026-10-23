@@ -14,7 +14,7 @@ def test_reduction_metadata_survives_copy_and_pickle() -> None:
     op = torch.ops.aten.sum.dim_IntList
     x = torch.randn(2, 3)
     graph = make_fx(
-        lambda value: op(value, [0, 1]),
+        lambda value: op(value, [0, 1]) + op(x, [0, 1]),
         decomposition_table=_get_custom_decomp_table(),
     )(x)
     tags = [
@@ -24,4 +24,4 @@ def test_reduction_metadata_survives_copy_and_pickle() -> None:
     for tag in tags:
         assert pickle.loads(pickle.dumps(tag)) == tag
     cloned = copy.deepcopy(graph)
-    torch.testing.assert_close(cloned(x), op(x, [0, 1]))
+    torch.testing.assert_close(cloned(x), 2 * op(x, [0, 1]))

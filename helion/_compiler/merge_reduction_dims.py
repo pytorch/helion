@@ -99,7 +99,13 @@ def chain_reduction_dims(
         mode = proxy_tensor.get_proxy_mode()
         source_node = None
         previous_tail: Node | None = None
-        if mode is not None:
+        # make_fx lifts captured constants while tracing the single-axis ops;
+        # they do not have a source proxy to tag yet.
+        if (
+            mode is not None
+            and proxy_tensor.get_proxy_slot(source, mode.tracer, default=None)
+            is not None
+        ):
             source_node = _tensor_proxy_node(source, mode.tracer)
             previous_tail = next(reversed(source_node.graph.nodes))
         # Like eager, cast the input to a low-precision dtype= first, then
@@ -126,9 +132,8 @@ def chain_reduction_dims(
         # Tag the chain with its source so merge_reduction_dims can replace it.
         # Bool extrema use the integer chain above; merging the original
         # bool op would bypass that conversion and recreate any/all lowering.
-        if mode is not None and not bool_extrema:
+        if mode is not None and source_node is not None and not bool_extrema:
             node = _tensor_proxy_node(result, mode.tracer)
-            assert source_node is not None
             if source_node.graph is not node.graph:
                 return result
             chain_nodes: set[str] = set()
@@ -168,6 +173,10 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
         tagged_nodes = [node for node in graph.nodes if _META_KEY in node.meta]
         if not tagged_nodes:
             continue
+        if not enabled:
+            for node in tagged_nodes:
+                node.meta.pop(_META_KEY)
+            continue
         flat_nodes: dict[tuple[Node, int, int], Node] = {}
         nodes_by_name = {node.name: node for node in graph.nodes}
         for node in tagged_nodes:
@@ -175,7 +184,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             original = nodes_by_name[tag.source]
             source = replacements.get(original, original)
             dims = tag.dims
-            if not enabled or dims != [*range(dims[0], dims[-1] + 1)]:
+            if dims != [*range(dims[0], dims[-1] + 1)]:
                 continue
             if excluded is None:
                 # Leave store and atomic targets unmerged: a merged load reads
