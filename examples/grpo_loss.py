@@ -27,18 +27,26 @@ import torch
 import helion
 from helion._testing import DEVICE
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Helper Functions
 # ----------------
 
 
-def extract_selected_logits_pytorch(
-    logits: torch.Tensor, completion_ids: torch.Tensor, temperature: float
-) -> torch.Tensor:
-    # Gather only the needed elements; avoid full-tensor cast and huge index grids
-    sel = logits.gather(dim=2, index=completion_ids.unsqueeze(-1)).squeeze(-1)
-    return sel.to(torch.float32) / temperature
+def eager_selected_logits(
+    logits: torch.Tensor, completion_ids: torch.Tensor
+) -> torch.Tensor | None:
+    """The completion tokens' logits for the Pallas backend, gathered eagerly.
+
+    The GPU backends gather them inside the kernels (one load per token from
+    the flat logits); Pallas takes neither int64 kernel arguments nor a gather
+    over the whole vocabulary table, so it keeps the reference's eager gather.
+    """
+    if _get_backend() != "pallas":
+        return None
+    sel = logits[:, :-1, :].gather(dim=2, index=completion_ids.unsqueeze(-1))
+    return sel.squeeze(-1).to(torch.float32)
 
 
 def get_log_probs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
@@ -141,7 +149,8 @@ def torch_grpo_loss(
 )
 def grpo_loss_forward(
     logits: torch.Tensor,  # [B, L+1, V] input logits
-    selected_logits: torch.Tensor,  # [B, L] pre-computed selected logits
+    completion_ids: torch.Tensor,  # [B, L] completion token IDs
+    selected_logits: torch.Tensor | None,  # [B, L] eagerly gathered (Pallas)
     old_logp: torch.Tensor | None,  # [B, L] old log probabilities
     ref_logp: torch.Tensor | None,  # [B, L] reference log probabilities
     advantages: torch.Tensor,  # [B] advantages
@@ -156,7 +165,9 @@ def grpo_loss_forward(
 
     Args:
         logits: Logits tensor of shape [B, L+1, V]
-        selected_logits: Pre-computed selected logits of shape [B, L]
+        completion_ids: Completion token IDs of shape [B, L]
+        selected_logits: The completion tokens' logits [B, L], gathered eagerly
+            (eager_selected_logits), or None to gather them in the kernel
         old_logp: Old log probabilities of shape [B, L] or None
         ref_logp: Reference log probabilities of shape [B, L] or None
         advantages: Advantages of shape [B]
@@ -172,12 +183,15 @@ def grpo_loss_forward(
     B, L_ADD_1, V = logits.shape
     L = L_ADD_1 - 1
 
+    # The completion token's logit is gathered from this flat view.
+    logits_flat = logits.view(-1)
     logits = logits[:, :-1, :]  # [B, L, V]
 
-    loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
-    is_clipped = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
-    kl_loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
-    lse = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    # The kernel writes every element of its outputs.
+    loss = torch.empty([B, L], dtype=torch.float32, device=logits.device)
+    is_clipped = torch.empty([B, L], dtype=torch.float32, device=logits.device)
+    kl_loss = torch.empty([B, L], dtype=torch.float32, device=logits.device)
+    lse = torch.empty([B, L], dtype=torch.float32, device=logits.device)
 
     for tile_b, tile_l in hl.tile([B, L]):
         max_logits = hl.full([tile_b, tile_l], float("-inf"), dtype=torch.float32)
@@ -195,7 +209,14 @@ def grpo_loss_forward(
         log_sum_exp = max_logits + torch.log(sum_exp)  # [tile_b, tile_l]
         lse[tile_b, tile_l] = log_sum_exp
 
-        logp = selected_logits[tile_b, tile_l] - log_sum_exp
+        if selected_logits is None:
+            # The completion token's logit: a gather from the flat logits.
+            rows = tile_b.index[:, None] * L_ADD_1 + tile_l.index[None, :]
+            flat_index = rows.to(torch.int64) * V + completion_ids[tile_b, tile_l]
+            selected_logit = hl.load(logits_flat, [flat_index]).to(torch.float32)
+        else:
+            selected_logit = selected_logits[tile_b, tile_l]
+        logp = selected_logit / temperature - log_sum_exp
 
         if old_logp is None:
             old_logp_val = logp
@@ -214,13 +235,14 @@ def grpo_loss_forward(
         if completion_mask is not None:
             per_token_loss *= completion_mask[tile_b, tile_l]
 
+        kl = hl.zeros([tile_b, tile_l], dtype=torch.float32)
         if beta != 0.0 and ref_logp is not None:
             ref_logp_val = ref_logp[tile_b, tile_l]
             kl = torch.exp(ref_logp_val - logp) - (ref_logp_val - logp) - 1
             if completion_mask is not None:
                 kl *= completion_mask[tile_b, tile_l]
             per_token_loss += beta * kl
-            kl_loss[tile_b, tile_l] = kl
+        kl_loss[tile_b, tile_l] = kl
 
         loss[tile_b, tile_l] = per_token_loss
         is_clipped[tile_b, tile_l] = (per_token_loss1 < per_token_loss2).float()
@@ -236,8 +258,8 @@ def grpo_loss_forward(
 def grpo_loss_backward(
     grad_output: torch.Tensor,  # [B, L] gradient from downstream
     logits: torch.Tensor,  # [B, L+1, V] original logits
-    selected_logits: torch.Tensor,  # [B, L] pre-computed selected logits
-    completion_ids: torch.Tensor,  # [B, L] completion token IDs (needed for gradients)
+    completion_ids: torch.Tensor,  # [B, L] completion token IDs
+    selected_logits: torch.Tensor | None,  # [B, L] eagerly gathered (Pallas)
     old_logp: torch.Tensor | None,  # [B, L] old log probabilities
     ref_logp: torch.Tensor | None,  # [B, L] reference log probabilities
     advantages: torch.Tensor,  # [B] advantages
@@ -254,8 +276,9 @@ def grpo_loss_backward(
     Args:
         grad_output: Gradient from downstream layers [B, L]
         logits: Original logits tensor [B, L+1, V]
-        selected_logits: Pre-computed selected logits [B, L]
-        completion_ids: Completion token IDs [B, L] (needed for gradients)
+        completion_ids: Completion token IDs [B, L]
+        selected_logits: The completion tokens' logits [B, L], gathered eagerly
+            (eager_selected_logits), or None to gather them in the kernel
         old_logp: Old log probabilities [B, L] or None
         ref_logp: Reference log probabilities [B, L] or None
         advantages: Advantages [B]
@@ -272,16 +295,24 @@ def grpo_loss_backward(
     B, L_ADD_1, V = logits.shape
     L = L_ADD_1 - 1
 
+    logits_flat = logits.view(-1)
     logits_fwd = logits[:, :-1, :]  # [B, L, V]
 
-    grad_logits = torch.zeros_like(logits)
+    # The kernel writes the first L rows; the host zeroes the last one.
+    grad_logits = torch.empty_like(logits)
 
     for tile_b, tile_l in hl.tile([B, L]):
         completion_id = completion_ids[tile_b, tile_l]
 
         log_sum_exp = lse[tile_b, tile_l]
 
-        logp = selected_logits[tile_b, tile_l] - log_sum_exp
+        if selected_logits is None:
+            rows = tile_b.index[:, None] * L_ADD_1 + tile_l.index[None, :]
+            flat_index = rows.to(torch.int64) * V + completion_id
+            selected_logit = hl.load(logits_flat, [flat_index]).to(torch.float32)
+        else:
+            selected_logit = selected_logits[tile_b, tile_l]
+        logp = selected_logit / temperature - log_sum_exp
 
         if old_logp is None:
             old_logp_val = logp
@@ -354,12 +385,11 @@ class GrpoLossFunction(torch.autograd.Function):
         eps_high: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass of GRPO loss."""
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         loss, kl_loss, is_clipped, lse = grpo_loss_forward(
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -373,8 +403,8 @@ class GrpoLossFunction(torch.autograd.Function):
 
         ctx.save_for_backward(  # type: ignore[attr-defined]
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,
@@ -399,8 +429,8 @@ class GrpoLossFunction(torch.autograd.Function):
 
         (
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,
@@ -411,8 +441,8 @@ class GrpoLossFunction(torch.autograd.Function):
         grad_logits = grpo_loss_backward(
             grad_loss,
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,
@@ -468,6 +498,7 @@ def helion_grpo_loss(
     Returns:
         Tuple of (loss, kl_loss, is_clipped)
     """
+    assert logits.is_contiguous() and completion_ids.is_contiguous()
     result = cast(
         "tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
         GrpoLossFunction.apply(
