@@ -68,6 +68,7 @@ from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .merge_reduction_dims import _MERGE_OPS
 from .merge_reduction_dims import chain_reduction_dims
 from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
@@ -169,12 +170,7 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
-    for op in (
-        torch.ops.aten.sum.dim_IntList,
-        torch.ops.aten.mean.dim,
-        torch.ops.aten.amax.default,
-        torch.ops.aten.amin.default,
-    ):
+    for op in _MERGE_OPS.values():
         decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
 
