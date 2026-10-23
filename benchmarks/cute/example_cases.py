@@ -376,7 +376,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
             if module == "fused_linear_jsd":
                 beta, ignore_index, temperature, sw, tw, sx, tx = cases[0].args
                 # The example's forward precomputes the input and weight
-                # gradients for its backward (Liger-style chunking), so a
+                # gradients for its backward (chunked over batch rows), so a
                 # forward-only reference does strictly less work. The timed
                 # alternatives take the same two gradients; the first one still
                 # provides the expected loss.
@@ -656,19 +656,12 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 beta = (
                     torch.rand(batch, heads, 1, device="cuda") if correction else None
                 )
-
-                def recurrent(
-                    q: torch.Tensor,
-                    k: torch.Tensor,
-                    v: torch.Tensor,
-                    state: torch.Tensor,
-                    alpha: torch.Tensor,
-                    beta: torch.Tensor | None,
-                ) -> Any:
-                    return recurrent_step(q, k, v, state.clone(), alpha, beta)
-
+                # Both return (output, new_state) and leave ``state`` untouched,
+                # so the timed region is the step itself: no state clone.
                 record(
-                    recurrent, recurrent_step_reference, (q, k, v, state, alpha, beta)
+                    recurrent_step,
+                    recurrent_step_reference,
+                    (q, k, v, state, alpha, beta),
                 )
         else:
             description = f"workload {i + 1}; see tensor metadata"

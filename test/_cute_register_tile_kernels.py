@@ -1,7 +1,8 @@
 """Small column-reduction kernels shared by the register-tile codegen (CPU) and
 numerics (GPU) tests.  Every kernel reduces a ``[m, n]`` tile along its strided
 axis while the stride-1 axis stays a free tile, the shape the CuTe register-tile
-lowering (``helion/_compiler/cute/register_tile_reductions.py``) targets."""
+lowering (``helion/_compiler/cute/register_tile_reductions.py``) targets.  The
+in-place recurrent step at the end exists only for the aliasing-rejection test."""
 
 from __future__ import annotations
 
@@ -109,6 +110,38 @@ def col_sum_guarded(x: torch.Tensor, flag: int) -> torch.Tensor:
         if flag > 0:
             s = s * 2.0
         out[tile_n] = s.to(x.dtype)
+    return out
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def recurrent_step_in_place(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """The fused linear-attention recurrent step with the updated ``[D, dv]``
+    tile written back into ``state`` (the example's ``recurrent_step_fused``
+    returns a new state instead): the same-index read-modify-write that the
+    aliasing gate must reject when an input views the state storage."""
+    BH = q.size(0)
+    DV = v.size(1)
+    out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+        idx = tile_bh.id
+        s = state[idx, :, tile_dv].float() * alpha[idx]
+        k_vec = k[idx, :].float()
+        v_vec = v[idx, tile_dv].float()
+        s = s + k_vec[:, None] * v_vec[None, :]
+        state[idx, :, tile_dv] = s.to(state.dtype)
+        q_vec = q[idx, :].float()
+        out[idx, tile_dv] = (q_vec[:, None] * s).sum(0).to(out.dtype)
     return out
 
 

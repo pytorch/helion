@@ -76,7 +76,8 @@ def _check_recurrent_step(
     **extra: Any,
 ) -> str:
     """Run the fused recurrent step with a register-tile config on two input
-    sets (a stale output cannot pass twice) and return the generated code."""
+    sets (a stale output or new state cannot pass twice) and return the
+    generated code."""
     kernel = helion.kernel(
         recurrent_step_fused.fn,
         backend="cute",
@@ -106,17 +107,20 @@ def _check_recurrent_step(
     # The kernel computes in fp32 and rounds the state and the output once.
     rtol, atol = (1e-3, 1e-3) if dtype is torch.float32 else (2e-2, 2e-1)
     for _ in range(2):
-        out = compiled(q, k, v, state, alpha)
+        out, new_state = compiled(q, k, v, state, alpha)
         torch.cuda.synchronize()
         expected_state = (
             alpha.float()[:, None, None] * initial.float()
             + k.float()[:, :, None] * v.float()[:, None, :]
         )
         expected_out = (q.float()[:, :, None] * expected_state).sum(1)
-        torch.testing.assert_close(state.float(), expected_state, rtol=rtol, atol=atol)
+        torch.testing.assert_close(
+            new_state.float(), expected_state, rtol=rtol, atol=atol
+        )
         torch.testing.assert_close(out.float(), expected_out, rtol=rtol, atol=atol)
+        assert torch.equal(state, initial)
         q.copy_(torch.rand_like(q, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
-        state.copy_(initial)
+        v.copy_(torch.rand_like(v, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
     return code
 
 
@@ -169,7 +173,7 @@ def test_bf16_register_tile_flushes_u16_packets() -> None:
         vec=8,
     )
     assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in code
-    assert code.count("_cute_store_u16_vec(state.iterator") == 1
+    assert code.count("_cute_store_u16_vec(new_state.iterator") == 1
 
 
 def _col_sum_reference(x: torch.Tensor) -> torch.Tensor:

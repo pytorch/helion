@@ -42,7 +42,7 @@ pytestmark = skipUnlessBackends(["cute"])
 BH, D, DV = 8, 128, 128
 COLUMN_REDUCE = "_cute_grouped_reduce_shared_columns("
 WARP_FOLD = "fold='warp'"
-STATE_STORE = "_cute_store_u32_vec(state.iterator"
+STATE_STORE = "_cute_store_u32_vec(new_state.iterator"
 KNOBS: dict[str, Any] = {
     "cute_register_tile_warp_fold": True,
     "cute_register_tile_store_first": True,

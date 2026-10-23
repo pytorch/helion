@@ -2739,8 +2739,10 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         assert torch.equal(out, plain), (block_n, warps)
 
 
-def _se_block() -> ModuleType:
-    return importlib.import_module("examples.se_block")
+def _se_block(kernel: str) -> Callable[..., torch.Tensor]:
+    """The tf32 form of examples/se_block.py's backward (``TF32_SE_BLOCK`` in
+    test_cute_mma_dag): the example itself now runs half-operand matmuls."""
+    return _probe_kernels().TF32_SE_BLOCK[kernel]
 
 
 def _se_block_inputs(m: int = 512, n: int = 256) -> dict[str, torch.Tensor]:
@@ -2773,7 +2775,7 @@ def test_se_block_backward_matches_the_triton_backend(
     # the derived pass from the staged source tiles (``pass``).  Bit-equal
     # either way.
     t = _se_block_inputs()
-    fn = getattr(_se_block(), kernel).fn
+    fn = _se_block(kernel)
     if kernel == "se_block_bwd_dw":
         args: tuple[object, ...] = (t["grad"], t["x"], t["s"])
     else:
@@ -2939,7 +2941,7 @@ def test_a_vector_along_ragged_rows_matches_torch(
 def _half_addmm_db(
     grad_out: torch.Tensor, x: torch.Tensor, d: torch.Tensor, c: torch.Tensor
 ) -> torch.Tensor:
-    """squeeze_and_excitation_net's ``bwd_db``: ``torch.addmm(acc, c[tile_m,
+    """the pre-split squeeze_and_excitation_net ``bwd_db`` body (grad_d recomputed per K tile): ``torch.addmm(acc, c[tile_m,
     tile_k].T, grad_d)`` with an fp32 accumulator over half operands -- the
     B operand a half pass chain, the A operand a transposed half tile."""
     m, n = grad_out.size()
