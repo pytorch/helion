@@ -471,6 +471,14 @@ class TritonBackend(Backend):
         if reduction_type == "sum":
             return f"tl.sum({input_name}, {dim})"
         if reduction_type in {"max", "min"}:
+            from ..compile_environment import CompileEnvironment
+
+            if CompileEnvironment.current().settings.fast_math:
+                # fast_math does not promise NaN propagation.  tl.max/tl.min
+                # combine with maxnum/minnum, which Intel GPUs reduce with a
+                # sub-group op; the NaN-propagating combine below has no
+                # hardware form there and falls back to a shuffle tree.
+                return f"tl.{reduction_type}({input_name}, {dim})"
             # tl.max/tl.min drop NaN; torch.amax/amin propagate it.
             return (
                 f"helion_triton_helpers.{reduction_type}_propagate_nan"
