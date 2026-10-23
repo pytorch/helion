@@ -2658,13 +2658,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        from examples.grpo_loss import extract_selected_logits_pytorch
-
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
-
+        from examples.grpo_loss import eager_selected_logits
         from examples.grpo_loss import torch_grpo_loss
+
+        # None on the GPU backends (the kernel gathers), eager on Pallas.
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         expected_loss, expected_kl, expected_clipped = torch_grpo_loss(
             logits.float(),
@@ -2681,6 +2679,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2725,18 +2724,17 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        # Pre-compute selected logits and run forward pass to get lse
-        from examples.grpo_loss import extract_selected_logits_pytorch
+        # Run the forward pass to get lse
+        from examples.grpo_loss import eager_selected_logits
         from examples.grpo_loss import grpo_loss_forward
 
         from helion._testing import code_and_output
 
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         forward_args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2777,8 +2775,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (
             grad_output,
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,

@@ -661,6 +661,15 @@ class CuteTcgen05Config:
         # floors, which ``_normalize_warp_mma_family`` clamps back to the
         # recorded tcgen05 floors for tcgen05-family configs.
         self.warp_mma_admitted: bool = False
+        # False when an operand is an in-register integer cast only the
+        # register-MMA family lowers (``_MmaOperandInfo.cast_dtype``): the
+        # search offers ``cute_matmul_family="warp_mma"`` alone and a
+        # tcgen05-family request fails closed with the reason.
+        self.tcgen05_family_admitted: bool = True
+        # True when the kernel is a materialized-fission bundle (several
+        # launches with their own dependent-launch protocol): ``cute_pdl``
+        # is not searched for it.
+        self.fission_bundle: bool = False
         self.tcgen05_min_search_m: int = 64
         self.tcgen05_min_search_n: int = 8
         # Block id of the leading passthrough (batch) axis, when any.
@@ -1782,7 +1791,8 @@ class CuteTcgen05Config:
         rasterization knobs of the (replaced) Helion grid, the per-block thread /
         vector / lane-layout knobs, the indexing choice and the occupancy hint."""
         for key, fragment in self.optional_fragments(for_search=True).items():
-            if key in (WARP_MMA_FAMILY_KEY, WARP_MMA_WARPS_KEY):
+            if key in (WARP_MMA_FAMILY_KEY, WARP_MMA_WARPS_KEY, "cute_pdl"):
+                # The family's own knobs, and the dependent launch it honors.
                 continue
             if key in config:
                 config[key] = fragment.default()
@@ -1839,6 +1849,20 @@ class CuteTcgen05Config:
                     f"{WARP_MMA_FAMILY_KEY} must be one of {list(MATMUL_FAMILIES)!r}, "
                     f"got {family!r}"
                 )
+        if not self.tcgen05_family_admitted and family != MATMUL_FAMILY_WARP_MMA:
+            # An in-register integer cast operand: TMA packets cannot carry
+            # the cast to the tensor core, so the tcgen05 family (explicit or
+            # the implied default) cannot run this kernel.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{WARP_MMA_FAMILY_KEY}={family or MATMUL_FAMILY_TCGEN05!r} "
+                    "cannot load this kernel's cast matmul operand (a bare "
+                    "``.to(bfloat16 | float16)`` of an int16 tile); the "
+                    f"register-MMA family {MATMUL_FAMILY_WARP_MMA!r} converts "
+                    "it in registers"
+                )
+            config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_WARP_MMA
+            family = MATMUL_FAMILY_WARP_MMA
         view = self._matmul_config_view(config)
         if family == MATMUL_FAMILY_WARP_MMA:
             problem = self._warp_mma_problem()
@@ -3435,6 +3459,16 @@ class CuteTcgen05Config:
                     if clc_aux_tma_narrow_n_seed is not None:
                         seeds.append(clc_aux_tma_narrow_n_seed)
         return seeds
+
+    def _pdl_searched(self) -> bool:
+        """Whether ``cute_pdl`` is on this kernel's tcgen05 search surface."""
+        capability = self.config_spec.target_device_capability
+        return (
+            self.config_spec.supports_config_key("cute_pdl")
+            and not self.fission_bundle
+            and capability is not None
+            and capability >= (9, 0)
+        )
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
@@ -6193,9 +6227,15 @@ class CuteTcgen05Config:
         return self._is_validated_clc_persistence_search_candidate(projected_config)
 
     def implicit_default_keys_to_preserve(self, config: dict[str, object]) -> set[str]:
+        preserve_keys: set[str] = set()
+        if "cute_pdl" in self.optional_fragments():
+            # The dependent-launch knob is one of this kernel's optional
+            # tcgen05 fields: a normalized config carries its default like the
+            # other optional knobs, so a flat transfer round-trips exactly.
+            preserve_keys.add("cute_pdl")
         if not self._is_clc_aux_tma_config(config):
-            return set()
-        preserve_keys = {"l2_groupings"}
+            return preserve_keys
+        preserve_keys.add("l2_groupings")
         if self._clc_aux_tma_matmul_k_range_index() is not None:
             preserve_keys.update(
                 {
@@ -7042,8 +7082,41 @@ class CuteTcgen05Config:
         # where the plan admitted the family (``warp_mma_admitted``); every
         # tcgen05-enabled kernel validates the keys so an explicit request on
         # a non-admitted problem is refused with the reason.
+        if (
+            self.search_enabled
+            and self.config_spec.supports_config_key("cute_pdl")
+            and not self.fission_bundle
+        ):
+            # Programmatic dependent launch of the tcgen05 kernel
+            # (``cute_mma``'s ``tcgen05_pdl_launch``) and of the
+            # register-MMA family: the next kernel in the stream launches
+            # and runs its prologue while this one drains.
+            # ``griddepcontrol`` needs sm_90; the CLC and
+            # materialized-operand kernels place their own waits and leave
+            # the knob inert, and a fission bundle's stages carry their own
+            # dependent-launch protocol (the knob is dropped from the stage
+            # that releases its dependents at entry), so it is not offered
+            # there.  Normalization fills the default like every other
+            # optional knob, so a flat transfer carries the field.  Only the
+            # tcgen05 search surface owns the knob here: every other CuTe
+            # kernel keeps the generic ``cute_pdl`` boolean of its own
+            # branch (``ConfigSpec._flat_fields``), untouched.
+            fragments["cute_pdl"] = EnumFragment(
+                (False, True),
+                search_choices=(False, True)
+                if not for_search or self._pdl_searched()
+                else (False,),
+            )
         if not for_search or self.warp_mma_admitted:
-            fragments[WARP_MMA_FAMILY_KEY] = EnumFragment(MATMUL_FAMILIES)
+            # Validation accepts both spellings (normalization refuses the
+            # tcgen05 family with the reason where it is not admitted); the
+            # search draws only from the admitted families.
+            families = (
+                MATMUL_FAMILIES
+                if not for_search or self.tcgen05_family_admitted
+                else (MATMUL_FAMILY_WARP_MMA,)
+            )
+            fragments[WARP_MMA_FAMILY_KEY] = EnumFragment(families)
             fragments[WARP_MMA_WARPS_KEY] = EnumFragment(WARP_MMA_WARP_CHOICES)
         if len(self.materialized_matmul_block_ids) >= 2:
             fragments["tcgen05_region_ab_stages"] = ListOf(

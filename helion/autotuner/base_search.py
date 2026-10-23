@@ -55,6 +55,8 @@ from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
+from .benchmarking import do_bench_generic
+from .benchmarking import final_selection_l2_flush_mode
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
 from .effort_profile import get_effort_profile
@@ -1536,6 +1538,7 @@ class _WorkerFinalSelectionMeasurer:
         *,
         private_copies: bool,
         timeout_s: float,
+        l2_flush_mode: str | None = None,
     ) -> None:
         self.provider = provider
         self.fns = list(fns)
@@ -1544,6 +1547,14 @@ class _WorkerFinalSelectionMeasurer:
             index if private_copies else None for index in range(len(self.fns))
         ]
         self.timeout_s = timeout_s
+        self.l2_flush_mode = l2_flush_mode
+        # what the worker's timer really does with L2: do_bench honours the
+        # regime, the wall-clock bench (do_bench_generic) always flushes
+        self.regime_label = (
+            "call (wall clock, always flushed)"
+            if provider._subprocess_benchmark_uses_wall_clock()
+            else l2_flush_mode or "call"
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -1574,6 +1585,7 @@ class _WorkerFinalSelectionMeasurer:
                 desc=desc,
                 args_slots=[self.slots[index]],
                 timeout=self.timeout_s,
+                l2_flush_mode=self.l2_flush_mode,
             )
         except BenchmarkWorkerUnkillable as error:
             # the batch held this one finalist
@@ -1596,6 +1608,7 @@ class _InProcessFinalSelectionMeasurer:
         *,
         process_group_name: str | None,
         log: AutotuningLogger,
+        l2_flush_mode: str | None = None,
     ) -> None:
         self.fns = list(fns)
         # the private clones stay alive (with their sacrificial clone) until exit
@@ -1608,6 +1621,18 @@ class _InProcessFinalSelectionMeasurer:
         self.steady_bench = steady_bench
         self.process_group_name = process_group_name
         self.log = log
+        # Only the shared timers know the L2 regimes; a backend's own steady
+        # bench (Metal) times in its one regime, and the wall-clock bench
+        # (Pallas) accepts the regime but always flushes.
+        self.l2_flush_mode = (
+            l2_flush_mode if steady_bench in (do_bench, do_bench_generic) else None
+        )
+        if steady_bench is do_bench:
+            self.regime_label = l2_flush_mode or "call"
+        elif steady_bench is do_bench_generic:
+            self.regime_label = "call (wall clock, always flushed)"
+        else:
+            self.regime_label = "backend bench"
 
     def __enter__(self) -> Self:
         return self
@@ -1628,6 +1653,9 @@ class _InProcessFinalSelectionMeasurer:
 
     def _bench(self, index: int, warmup_ms: int, rep_ms: int) -> float:
         run = functools.partial(self.fns[index], *self.args_by_fn[index])
+        kwargs: dict[str, object] = {}
+        if self.l2_flush_mode is not None:
+            kwargs["l2_flush_mode"] = self.l2_flush_mode
         try:
             timing = self.steady_bench(
                 run,
@@ -1635,6 +1663,7 @@ class _InProcessFinalSelectionMeasurer:
                 rep=rep_ms,
                 return_mode="median",
                 process_group_name=self.process_group_name,
+                **kwargs,
             )
         finally:
             clear_jit_fast_path_caches(self.fns[index], self.log)
@@ -3038,8 +3067,10 @@ class PopulationBasedSearch(BaseSearch):
         self, finalists: Sequence[PopulationMember], policy: FinalSelectionConfig
     ) -> _FinalSelectionMeasurer:
         """Steady-window timer for the finalists: the killable benchmark worker
-        when the search benchmarks in one, otherwise in-process."""
+        when the search benchmarks in one, otherwise in-process. Both time in
+        the final selection's L2 regime (``final_selection_l2_flush_mode``)."""
         provider = self.benchmark_provider
+        l2_flush_mode = final_selection_l2_flush_mode()
         window_s = (policy.warmup_ms + policy.rep_ms) / 1000.0
         thermal_s = (policy.thermal_warmup_ms + policy.rep_ms) / 1000.0
         # The timer sizes its repetitions from an estimate pass, so a kernel
@@ -3058,6 +3089,7 @@ class PopulationBasedSearch(BaseSearch):
                     [member.fn for member in finalists],
                     private_copies=private_copies,
                     timeout_s=timeout_s,
+                    l2_flush_mode=l2_flush_mode,
                 )
         else:
             private_copies = False
@@ -3078,6 +3110,7 @@ class PopulationBasedSearch(BaseSearch):
             self._steady_bench(),
             process_group_name=self.kernel.env.process_group_name,
             log=self.log,
+            l2_flush_mode=l2_flush_mode,
         )
 
     def _run_final_selection(
@@ -3113,8 +3146,10 @@ class PopulationBasedSearch(BaseSearch):
                 return None
             return float(result)
 
+        regime_label = final_selection_l2_flush_mode()
         try:
             with self._final_selection_measurer(finalists, policy) as measurer:
+                regime_label = getattr(measurer, "regime_label", regime_label)
                 if policy.thermal_warmup_ms > 0:
                     measurer.warm(finalists.index(incumbent), policy.thermal_warmup_ms)
                 screened = policy.screens(count)
@@ -3222,6 +3257,7 @@ class PopulationBasedSearch(BaseSearch):
             pinned_configs,
             policy,
             wall_s=time.perf_counter() - start,
+            regime_label=regime_label,
         )
         return after
 
@@ -3237,6 +3273,7 @@ class PopulationBasedSearch(BaseSearch):
         policy: FinalSelectionConfig,
         *,
         wall_s: float,
+        regime_label: str,
     ) -> None:
         result_by_index = dict(zip(survivors, results, strict=True))
 
@@ -3274,13 +3311,15 @@ class PopulationBasedSearch(BaseSearch):
             marks = ("*" if member is selected else " ") + (
                 "P" if member.config in pinned_configs else " "
             )
+            # four significant digits: microsecond kernels differ in the
+            # fourth decimal of a millisecond reading
             median_text = (
-                self.format_performance(median)
+                f"{median:.4g}{self.performance_suffix}"
                 if median is not None
                 else verdict(index) or "n/a"
             )
-            rounds_text = " ".join(f"{sample:.4f}" for sample in samples)
-            screen_text = "" if screen[index] is None else f"{screen[index]:.4f}"
+            rounds_text = " ".join(f"{sample:.4g}" for sample in samples)
+            screen_text = "" if screen[index] is None else f"{screen[index]:.4g}"
             search_text = (
                 self.format_performance(member.perfs[0]) if member.perfs else "n/a"
             )
@@ -3291,12 +3330,13 @@ class PopulationBasedSearch(BaseSearch):
         self.log(
             f"Final selection: {len(finalists)} shortlisted, {len(survivors)} "
             f"finalists x {policy.rounds} rounds of {policy.warmup_ms}+{policy.rep_ms} ms "
-            f"windows in {wall_s:.1f}s; selected "
+            f"windows (L2 {regime_label}) in {wall_s:.1f}s; selected "
             f"{self.format_performance(selected.perf)} (* selected, P pinned seed):\n"
             + "\n".join(lines)
         )
         self._autotune_metrics.final_selection = {
             "policy": dataclasses.asdict(policy),
+            "l2_flush_mode": regime_label,
             "shortlisted": len(finalists),
             "finalists": len(survivors),
             "wall_s": wall_s,

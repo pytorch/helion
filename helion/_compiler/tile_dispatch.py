@@ -654,6 +654,11 @@ class TileStrategyDispatch:
         whereas sharing a threaded reduction's axis would let a lookup of the
         block's axis extent read the other reduction's threads.
         """
+        partner = getattr(target, "_cute_axis_partner", None)
+        if partner is not None:
+            # A sibling full-slice block indexing another's axis
+            # (``PersistentReductionStrategy._cute_sibling_axis_partner``).
+            return self.thread_axis_for_strategy(partner)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
@@ -733,7 +738,11 @@ class TileStrategyDispatch:
             return 0
         reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]
         return max(
-            sum(1 for s in reductions if s._reduction_thread_count() > 1),
+            sum(
+                1
+                for s in reductions
+                if s._reduction_thread_count() > 1 and s.thread_axes_used() > 0
+            ),
             1 if any(s.thread_axes_used() > 0 for s in reductions) else 0,
         )
 

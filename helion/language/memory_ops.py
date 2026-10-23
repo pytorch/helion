@@ -1227,6 +1227,11 @@ def _cute_scalar_load_expr(
 
 # Maximum bytes per vector load/store transaction (LDG.128/STG.128).
 _CUTE_VECTOR_MAX_BYTES = 16
+# A lane of the sunk flat-gather path (``cute_vloop_sink``) may span up to
+# four consecutive 16-byte packets, loaded under one predicate: a wider lane
+# puts more of a row in flight per thread without a second sweep over the
+# rows for the next chunk of columns.
+_FLAT_GATHER_SINK_MAX_BYTES = 64
 
 # Dtype -> (cutlass scalar type name, max vector width).  Used for the
 # ``vec`` mode that issues an explicit

@@ -20,6 +20,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -358,6 +359,10 @@ def _kernel_fn(kernel: str) -> Callable[..., object]:
 def _config(
     block_sizes: list[int], warps: int, stages: int, **extra: object
 ) -> helion.Config:
+    # The warp mode's ring tiles ride per-thread packets unless a test asks
+    # for the TMA ring (``cute_mma_dag_loads="tma"``).
+    if extra.get("cute_mma_dag", "warp") == "warp":
+        extra.setdefault("cute_mma_dag_loads", "lane")
     return helion.Config(
         block_sizes=block_sizes,
         cute_mma_dag="warp",
@@ -761,9 +766,23 @@ def test_side_loads_varying_with_a_nested_loop_match_the_triton_backend(
     h = _randn(g, 4, 128, 128, dtype=torch.bfloat16)
     gate = _randn(g, 4, 128, dtype=torch.float32)
     for fn in (kernels._inner_varying_gate, kernels._inner_varying_row_gate):
-        _source, out = _run_cute(fn, (do, h, gate), _config([64, 64], warps, stages))
         ref = _run_triton(fn, (do, h, gate), [64, 64])
-        assert torch.equal(out[0], ref[0]), fn.__name__
+        for aux in ("register", "ring"):
+            for loads in ("lane", "tma"):
+                config = _config(
+                    [64, 64],
+                    warps,
+                    stages,
+                    cute_mma_dag_aux=aux,
+                    cute_mma_dag_loads=loads,
+                )
+                source, out = _run_cute(fn, (do, h, gate), config)
+                # Only the inner-varying vector has the aux ring as a subject;
+                # the TMA ring re-entered by the outer loop keeps its phases.
+                ringed = aux == "ring" and fn is kernels._inner_varying_gate
+                assert (f"{RT}.cp_async_16(md_aux1" in source) == ringed, fn.__name__
+                assert ("cp_async_bulk_tensor" in source) == (loads == "tma")
+                assert torch.equal(out[0], ref[0]), (fn.__name__, aux, loads)
 
 
 @pytest.mark.parametrize("mode", range(5))
@@ -1618,3 +1637,300 @@ def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
     (ref,) = _run_triton(fn, args, block_sizes)
     assert torch.isinf(ref).any() and torch.isfinite(ref).any()
     assert torch.equal(out[0], ref)
+
+
+# --------------------------------------------------------------------------
+# Tile loops whose bound varies with the CTA's root tile (mamba2 chunk scan)
+# --------------------------------------------------------------------------
+
+
+def _causal_scaled(a: torch.Tensor, s: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A causal K loop whose bound is the row tile's end: the pass over
+    ``a`` (its scale adds one, so a zero-filled element would not vanish)
+    must zero the K positions past the bound of a partial last trip."""
+    m, k = a.size()
+    _, n = b.size()
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(64, 64)
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[block_m, block_n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile((tile_m.id + 1) * block_m, block_size=block_k):
+            a_local = (
+                a[tile_m, tile_k].to(torch.float32)
+                * (s[tile_k].to(torch.float32)[None, :] + 1.0)
+            ).to(a.dtype)
+            acc = hl.dot(a_local, b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def _causal_scaled_reference(
+    a: torch.Tensor, s: torch.Tensor, b: torch.Tensor, block_m: int
+) -> torch.Tensor:
+    m, k = a.size()
+    scaled = (a.float() * (s.float()[None, :] + 1.0)).to(a.dtype).float()
+    end = (torch.arange(m, device=a.device) // block_m + 1) * block_m
+    keep = (torch.arange(k, device=a.device)[None, :] < end[:, None]).float()
+    return ((scaled * keep) @ b.float()).to(a.dtype)
+
+
+@pytest.mark.parametrize(
+    ("block_m", "warps", "stages"), [(16, 4, 2), (32, 2, 2), (64, 4, 2), (128, 8, 2)]
+)
+def test_varying_bound_loops_mask_the_partial_trip(
+    block_m: int, warps: int, stages: int
+) -> None:
+    # 256 rows: the row tiles walk 1..256/64 trips, so the trip count is per CTA.
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    a = _randn(g, 256, 256, dtype=torch.bfloat16)
+    s = torch.rand(256, device=DEVICE, generator=g).to(torch.bfloat16)
+    b = _randn(g, 256, 64, dtype=torch.bfloat16)
+    source, (out,) = _run_cute(
+        _causal_scaled, (a, s, b), _config([block_m, 64, 64], warps, stages)
+    )
+    assert "for md_i in cutlass.range(0, md_trips0):" in source
+    assert ("< md_end0 else cutlass.Float32(0.0)" in source) == (block_m < 64)
+    expected = _causal_scaled_reference(a, s, b, block_m)
+    _assert_close((out,), (expected,), scaled=True)
+    # Without the mask every CTA would walk whole 64-wide trips.
+    if block_m < 64:
+        unmasked = _causal_scaled_reference(a, s, b, 64)
+        assert not torch.allclose(unmasked.float(), expected.float(), atol=1.0)
+
+
+def test_mamba2_chunk_scan_matches_the_triton_backend() -> None:
+    module = importlib.import_module("examples.mamba2_chunk_scan")
+    fn = module.helion_mamba2_chunk_scan_kernel.fn
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    batch, heads, groups, seq, chunk, d, ds = 2, 8, 2, 512, 64, 64, 64
+    chunks = seq // chunk
+    bf16 = torch.bfloat16
+    dt = torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g).to(bf16)
+    da = (
+        -torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g)
+        .cumsum(-1)
+        .to(bf16)
+    )
+    args = (
+        _randn(g, batch, chunks, groups, chunk, chunk, dtype=bf16),
+        _randn(g, batch, seq, heads, d, dtype=bf16),
+        dt,
+        da,
+        _randn(g, batch, seq, groups, ds, dtype=bf16),
+        _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
+        _randn(g, heads, dtype=bf16),
+    )
+    refs = _run_triton(fn, args, [32, 64, 64])
+    for block_m, warps, stages in ((16, 2, 2), (32, 4, 2), (64, 8, 4)):
+        source, outs = _run_cute(fn, args, _config([block_m, 64, 64], warps, stages))
+        assert ("md_end0 else" in source) == (block_m < 64)
+        _assert_close(outs, refs, scaled=True)
+        # The aux ring stages dt / dA_cumsum through shared memory: the same
+        # fp32 values reach the same arithmetic.
+        source, ringed = _run_cute(
+            fn, args, _config([block_m, 64, 64], warps, stages, cute_mma_dag_aux="ring")
+        )
+        assert f"{RT}.lds_v4_b32(md_aux0" in source
+        for lhs, rhs in zip(ringed, outs, strict=True):
+            assert torch.equal(lhs, rhs)
+        # The TMA ring (one bulk tensor copy per ring tile) reaches the same
+        # values, with either side-load form.
+        for aux in ("register", "ring"):
+            source, bulk = _run_cute(
+                fn,
+                args,
+                _config(
+                    [block_m, 64, 64],
+                    warps,
+                    stages,
+                    cute_mma_dag_loads="tma",
+                    cute_mma_dag_aux=aux,
+                ),
+            )
+            assert "cp_async_bulk_tensor_shared_cta_global" in source
+            assert f"{RT}.cp_async_16(md_t2" not in source
+            # The epilogue's x tile is staged ahead of the loops and read
+            # from shared memory (no per-lane global pair after the loop).
+            epilogue = source[source.rindex("for md_i in cutlass.range(") :]
+            assert f"{RT}.lds_b32(md_d0 + " in epilogue
+            assert f"{RT}.ldg_b32(" not in epilogue
+            for lhs, rhs in zip(bulk, outs, strict=True):
+                assert torch.equal(lhs, rhs)
+
+
+def test_the_aux_ring_survives_the_early_nested_prologue() -> None:
+    # An outer tile loop whose innermost ring loop scales the A operand by a
+    # per-row gate and stores the accumulator after it: the outer loop's
+    # epilogue issues the nested ring's prologue for its next iteration, and
+    # that prologue copies the gate words of the aux ring too (it used to
+    # leave the previous iteration's words in the slot).  Ring and register
+    # forms are bit-equal and match Triton.
+    from test.test_cute_mma_dag import _nested_gated_probe
+
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    c, d, dv = 512, 128, 128
+    args = (
+        _randn(g, c, d, dtype=torch.bfloat16),
+        _randn(g, c, dv, dtype=torch.bfloat16),
+        _randn(g, c, dtype=torch.bfloat16),
+    )
+    refs = _run_triton(_nested_gated_probe, args, [64, 64, 64])
+    for stages in (2, 4):
+        source, register = _run_cute(
+            _nested_gated_probe, args, _config([64, 64, 64], 4, stages)
+        )
+        assert "if md_i + 1 < 2:" in source
+        source, ring = _run_cute(
+            _nested_gated_probe,
+            args,
+            _config([64, 64, 64], 4, stages, cute_mma_dag_aux="ring"),
+        )
+        early = source[source.index("if md_i + 1 < 2:") :]
+        assert f"{RT}.cp_async_4(md_aux1 + " in early
+        for lhs, rhs in zip(ring, register, strict=True):
+            assert torch.equal(lhs, rhs)
+        _assert_close(ring, refs)
+
+
+def _tensor_with_address_bit_31(
+    shape: tuple[int, ...], dtype: torch.dtype, g: torch.Generator
+) -> torch.Tensor | None:
+    """A random tensor whose data pointer has bit 31 set (the caching
+    allocator walks upward, so one of a few 256 MB allocations does), or
+    None when none turns up within 3 GB."""
+    keep = []
+    for _ in range(12):
+        block = torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE)
+        keep.append(block)
+        ptr = block.data_ptr()
+        if (ptr >> 31) & 1:
+            numel = 1
+            for size in shape:
+                numel *= size
+            flat = block[: numel * dtype.itemsize].view(dtype)
+            flat.copy_(torch.randn(numel, device=DEVICE, generator=g).to(dtype))
+            return flat.view(shape)
+    return None
+
+
+def test_the_aux_ring_word_alignment_survives_address_bit_31() -> None:
+    # The aux ring copies a 16-bit side load as the aligned 4-byte word
+    # holding it and reads the element at the address's low two bits.  Both
+    # took ``cutlass.Int32(address) % 4``: a signed remainder, -2 for an odd
+    # element whenever bit 31 of the address is set (half of all allocations),
+    # which copied the next word and read ahead of the slot.  The low bits
+    # are masked now; a gate tensor at such an address matches the register
+    # form bit for bit.
+    from test.test_cute_mma_dag import _nested_gated_probe
+
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    c, d, dv = 512, 128, 128
+    gate = _tensor_with_address_bit_31((c,), torch.bfloat16, g)
+    if gate is None:
+        pytest.skip("no allocation with address bit 31 set within 3 GB")
+    args = (
+        _randn(g, c, d, dtype=torch.bfloat16),
+        _randn(g, c, dv, dtype=torch.bfloat16),
+        gate,
+    )
+    source, register = _run_cute(_nested_gated_probe, args, _config([64, 64, 64], 4, 2))
+    source, ring = _run_cute(
+        _nested_gated_probe, args, _config([64, 64, 64], 4, 2, cute_mma_dag_aux="ring")
+    )
+    assert (
+        "- (cutlass.Int32(md_aw" in source
+        and "% 4" not in source.split("md_aux1")[1][:400]
+    )
+    for lhs, rhs in zip(ring, register, strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(ring, _run_triton(_nested_gated_probe, args, [64, 64, 64]))
+
+
+def test_a_partial_trip_does_not_read_the_other_operand_past_the_bound() -> None:
+    # chunk_scan at 32-row tiles: the first row tile of a chunk runs its
+    # causal K loop to 32 with a 64-deep K block, so x's rows 32-63 of the
+    # chunk sit in the ring slot past the bound.  cb's pass zeroes its side;
+    # x's rows are now zeroed in shared memory too, so an Inf planted in
+    # the chunk's last row (read legitimately only by the second row tile)
+    # leaves the first row tile's output finite, as in the reference.
+    module = importlib.import_module("examples.mamba2_chunk_scan")
+    fn = module.helion_mamba2_chunk_scan_kernel.fn
+    g = torch.Generator(device=DEVICE).manual_seed(1)
+    batch, heads, groups, seq, chunk, d, ds = 1, 4, 1, 256, 64, 64, 64
+    chunks = seq // chunk
+    bf16 = torch.bfloat16
+    dt = torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g).to(bf16)
+    da = (
+        -torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g)
+        .cumsum(-1)
+        .to(bf16)
+    )
+    x = _randn(g, batch, seq, heads, d, dtype=bf16)
+    x[0, chunk - 1, :, 0] = float("inf")
+    args = (
+        _randn(g, batch, chunks, groups, chunk, chunk, dtype=bf16),
+        x,
+        dt,
+        da,
+        _randn(g, batch, seq, groups, ds, dtype=bf16),
+        _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
+        _randn(g, heads, dtype=bf16),
+    )
+    (ref,) = _run_triton(fn, args, [32, 64, 64])
+    assert torch.isfinite(ref[0, :32]).all()
+    for loads in ("lane", "tma"):
+        # (Not ``_run_cute``: its launch-to-launch ``torch.equal`` cannot
+        # hold with the NaNs the second row tile legitimately produces.)
+        kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+        bound = kernel.bind(args)
+        config = _config([32, 64, 64], 4, 2, cute_mma_dag_loads=loads)
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(config)
+        source = bound.to_code(normalized)
+        assert f"{RT}.mma_" in source
+        assert source.count(">= md_end0:") == 4
+        out = bound.compile_config(normalized)(*args)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out[0, :32]).all()
+        assert torch.equal(torch.isfinite(out), torch.isfinite(ref))
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(
+            out[finite].float(), ref[finite].float(), atol=2e-2, rtol=2e-2
+        )
+
+
+@pytest.mark.parametrize(
+    ("has_h0", "bm", "bn", "warps", "stages"),
+    [(False, 16, 16, 2, 8), (True, 32, 16, 4, 4), (False, 64, 64, 4, 2)],
+)
+def test_the_aux_ring_matches_the_register_form_on_the_gated_chain(
+    has_h0: bool, bm: int, bn: int, warps: int, stages: int
+) -> None:
+    # fwd_h's per-chunk decay scalar and gc rows ride the ring as per-thread
+    # word slots (the mamba2 ssd pipeline's configs).
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16)
+    args = _fwd_args(t, "gated", has_h0)
+    fn = _kernel_fn("fwd")
+    source, ring = _run_cute(
+        fn, args, _config([bm, bn], warps, stages, cute_mma_dag_aux="ring")
+    )
+    assert f"{RT}.cp_async_4(md_aux0" in source and f"{RT}.lds_f32(md_aux0" in source
+    _source, register = _run_cute(fn, args, _config([bm, bn], warps, stages))
+    for lhs, rhs in zip(ring, register, strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(ring, _run_triton(fn, args, [bm, bn]))
+    # The TMA ring with each side-load form (the aux copies sit behind the
+    # issuing thread's bulk copies in the same prologue stage).
+    for aux in ("register", "ring"):
+        source, bulk = _run_cute(
+            fn,
+            args,
+            _config(
+                [bm, bn], warps, stages, cute_mma_dag_loads="tma", cute_mma_dag_aux=aux
+            ),
+        )
+        assert "cp_async_bulk_tensor_shared_cta_global" in source
+        for lhs, rhs in zip(bulk, register, strict=True):
+            assert torch.equal(lhs, rhs)

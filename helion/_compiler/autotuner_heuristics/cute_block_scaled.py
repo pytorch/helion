@@ -79,6 +79,15 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
             )
             if env.config_spec.cute_mxfp8_mma_available
             else (
+                # 2-CTA pair, bn=128, bk=256, 5 stages: the cold-autotune
+                # winners of nvfp4 W4A4 at 512^3 (persistent) and 1024^3.
+                (2, 128, 256, 5, True),
+                (2, 128, 256, 5, False),
+                # bn=64 single CTAs: twice the CTAs of the 2-CTA bn=128 pair
+                # for the same K steps; wins at 1024x2048x1024 and 512^3
+                # where the pair leaves most SMs idle.
+                (1, 64, 256, 5, False),
+                (1, 64, 256, 5, True),
                 (2, 256, 256, 5, True),
                 (1, 128, 64, 3, True),
                 (2, 256, 256, 4, True),
@@ -104,6 +113,19 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
             )
             for cluster, n, k, stages, persistent in variants
         ]
+        if not env.config_spec.cute_mxfp8_mma_available:
+            # The bn=64 seeds again with 16-row preparation tiles (twice the
+            # transpose blocks; the 1024x2048x1024 winner), and again with the
+            # preparation fused into the consumer (no workspace kernel).
+            narrow = [seed for seed in seeds if seed.config["cute_scaled_tile_n"] == 64]
+            seeds.extend(
+                Config.from_dict(seed.config | {"cute_scaled_prepare_rows": 16})
+                for seed in narrow
+            )
+            seeds.extend(
+                Config.from_dict(seed.config | {"cute_scaled_prepare": "fused"})
+                for seed in narrow
+            )
         if env.config_spec.cute_mxfp8_fused_scales_available:
             fused_variants = (
                 (2, 32, 256, 4, 64, True),
