@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from copy import deepcopy
+from functools import partial
 import random
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -252,3 +253,8 @@ def _initial_population(
     finally:
         if state is not None:
             random.setstate(state)
+
+
+_seeded_population = partial(
+    _initial_population, random_seed=46291, assert_canonical=False
+)

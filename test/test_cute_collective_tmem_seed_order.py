@@ -9,8 +9,8 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _initial_population as _shared_population
 from test.cute_population_contracts import _legacy_registered_seeds as _shared_legacy
+from test.cute_population_contracts import _seeded_population as _initial_population
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
 from test.test_cute_collective_tmem_seed import _dependent_contractions
@@ -19,9 +19,6 @@ from test.test_cute_collective_tmem_seed import _dependent_inputs
 from helion._testing import skipUnlessBackends
 
 _legacy_registered_seeds = partial(_shared_legacy, require_no_parameters=True)
-_initial_population = partial(
-    _shared_population, random_seed=46291, assert_canonical=False
-)
 
 pytestmark = skipUnlessBackends(["cute"])
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from functools import partial
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -9,16 +8,12 @@ import pytest
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _initial_population as _shared_population
+from test.cute_population_contracts import _seeded_population as _initial_population
 from test.test_cute_collective_tf32 import _jagged_inputs
 from test.test_cute_collective_tf32 import _kernel
 
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
-
-_initial_population = partial(
-    _shared_population, random_seed=46291, assert_canonical=False
-)
 
 pytestmark = skipUnlessBackends(["cute"])
 
