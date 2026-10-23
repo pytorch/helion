@@ -5353,7 +5353,9 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
             mixed = any(not reduction.is_custom for reduction in fact.reductions)
             custom_grid_ids = _custom_reduction_grid_ids(spec)
             seed["block_sizes"] = [
-                1 if not mixed and block.block_id in custom_grid_ids else value
+                TritonReductionHeuristic._block_floor(block)
+                if not mixed and block.block_id in custom_grid_ids
+                else value
                 for block, value in zip(
                     spec.block_sizes, default.block_sizes, strict=True
                 )

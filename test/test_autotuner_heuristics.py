@@ -11457,6 +11457,13 @@ class TestTritonReductionHeuristic(TestCase):
         with patch("helion._hardware.get_hardware_info", return_value=MI350_HARDWARE):
             bound = custom_rows.bind((x, False, True))
             self.assertEqual(bound.config_spec.default_config().reduction_loops, [None])
+            bound.config_spec.block_sizes[0].min_size = 4
+            seed = TritonNarrowReductionHeuristic.get_seed_config(
+                bound.env, bound.host_function.device_ir
+            )
+            assert seed is not None
+            self.assertEqual(seed.block_sizes, [4])
+            bound.config_spec.normalize(seed.config)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
