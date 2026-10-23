@@ -126,11 +126,13 @@ def register_lowering(
 def _keep_shape_size_reads(node: Node) -> None:
     """Keep physical tile extents in shape parameters."""
     physical: Node | None = None
+    changed = False
 
     def physical_size(arg: Node) -> Node:
-        nonlocal physical
+        nonlocal physical, changed
         if arg is not node:
             return arg
+        changed = True
         if physical is None:
             with node.graph.inserting_before(node):
                 physical = node.graph.call_function(
@@ -152,6 +154,7 @@ def _keep_shape_size_reads(node: Node) -> None:
             parameters = list(user.target._signature.parameters)
         else:
             continue
+        changed = False
         args, kwargs = list(user.args), dict(user.kwargs)
         for position, name in enumerate(parameters):
             if name not in {"size", "shape", "length", "output_size"}:
@@ -160,7 +163,8 @@ def _keep_shape_size_reads(node: Node) -> None:
                 args[position] = map_arg(args[position], physical_size)
             elif name in kwargs:
                 kwargs[name] = map_arg(kwargs[name], physical_size)
-        user.args, user.kwargs = tuple(args), kwargs
+        if changed:
+            user.args, user.kwargs = tuple(args), kwargs
 
 
 def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
