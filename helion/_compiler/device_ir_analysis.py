@@ -1175,6 +1175,7 @@ class GraphAnalysis:
             ):
                 promoted_lhs_nodes.add(lhs)
 
+        rolled_ids = set(env.config_spec.reduction_loops.valid_block_ids())
         for index, node in enumerate(nodes):
             for input_node in node.all_input_nodes:
                 last_use[input_node] = index
@@ -1207,10 +1208,7 @@ class GraphAnalysis:
                 if block_id not in seen_reductions:
                     seen_reductions.add(block_id)
                     reduction_occurrences.append(block_id)
-                if (
-                    node.target is _reduce
-                    and block_id in env.config_spec.reduction_loops.valid_block_ids()
-                ):
+                if node.target is _reduce and block_id in rolled_ids:
                     sources = custom_reduction_sources(node)
                     # Each payload needs its own carry, even when inputs alias.
                     custom_reduction_steps.append(
