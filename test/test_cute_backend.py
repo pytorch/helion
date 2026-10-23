@@ -77,6 +77,9 @@ get_cute_mma_support = importlib.import_module(
 _cute_grouped_reduce_shared_tree = importlib.import_module(
     "helion._compiler.cute.reduce_helpers"
 )._cute_grouped_reduce_shared_tree
+_cute_grouped_reduce_shared_two_stage = importlib.import_module(
+    "helion._compiler.cute.reduce_helpers"
+)._cute_grouped_reduce_shared_two_stage
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
 _compiler_backend = importlib.import_module("helion._compiler.backend")
 flash_fa4_shared_storage = importlib.import_module(
@@ -485,6 +488,52 @@ def cute_shared_tree_matmul_sum(lhs, rhs, out):
     )
     if lane_in_group < 3:
         out[row, cutlass.Int32(0)] = result
+
+
+@cute.kernel
+def cute_interleaved_reduce_sum(
+    inp, out, pre: cutlass.Constexpr[int], span: cutlass.Constexpr[int]
+):
+    """``pre`` interleaved siblings per ``span``-thread group, two groups:
+    thread ``t`` of group ``g`` holds ``inp[g, t % pre, t // pre]``."""
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane_in_group = lane % span
+    lane_mod_pre = lane_in_group % pre
+    group = lane // span
+    result = _cute_grouped_reduce_shared_two_stage(
+        inp[group, lane_mod_pre, lane_in_group // pre],
+        "sum",
+        cutlass.Float32(0.0),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=pre,
+        group_span=span,
+        group_count=2,
+    )
+    out[group, lane_mod_pre, lane_in_group // pre] = result
+
+
+@cute.kernel
+def cute_interleaved_reduce_max(
+    inp, out, pre: cutlass.Constexpr[int], span: cutlass.Constexpr[int]
+):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane_in_group = lane % span
+    lane_mod_pre = lane_in_group % pre
+    group = lane // span
+    result = _cute_grouped_reduce_shared_two_stage(
+        inp[group, lane_mod_pre, lane_in_group // pre],
+        "max",
+        cutlass.Float32(float("-inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=pre,
+        group_span=span,
+        group_count=2,
+    )
+    out[group, lane_mod_pre, lane_in_group // pre] = result
 
 
 @helion.kernel(backend="cute")
@@ -12252,6 +12301,39 @@ class TestCuteBackend(TestCase):
                 out = torch.empty_like(expected)
                 default_cute_launcher(kernel, (1,), x, out, block=(3, 16, 1))
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_interleaved_shared_reduce_helper(self) -> None:
+        """``pre`` siblings interleaved below the reduce axis: the warp form
+        (``pre < 32``, a partial butterfly) and the block form (``pre >= 32``,
+        every thread writes) both reduce each sibling over its ``span // pre``
+        threads, for every group of the CTA, and broadcast the result."""
+        from helion._compiler.cute.reduce_helpers import _use_interleaved_shared_reduce
+
+        for pre, span in [
+            (2, 64),
+            (4, 128),
+            (16, 256),
+            (32, 64),
+            (64, 512),
+            (256, 512),
+        ]:
+            self.assertTrue(_use_interleaved_shared_reduce(pre, span))
+            x = torch.randn(2, pre, span // pre, device=DEVICE, dtype=torch.float32)
+            for kernel, expected in (
+                (cute_interleaved_reduce_sum, x.sum(dim=2, keepdim=True)),
+                (cute_interleaved_reduce_max, x.amax(dim=2, keepdim=True)),
+            ):
+                with self.subTest(kernel=kernel.__name__, pre=pre, span=span):
+                    out = torch.full_like(x, float("nan"))
+                    default_cute_launcher(
+                        kernel, (1,), x, out, pre, span, block=(2 * span, 1, 1)
+                    )
+                    torch.testing.assert_close(
+                        out, expected.expand_as(x), rtol=1e-5, atol=1e-5
+                    )
+        self.assertFalse(_use_interleaved_shared_reduce(1, 64))
+        self.assertFalse(_use_interleaved_shared_reduce(3, 48))
+        self.assertFalse(_use_interleaved_shared_reduce(48, 96))
 
     def test_permute_transposes_tile_values(self) -> None:
         """The slot re-binds the transposed tile's dims: the store exchanges

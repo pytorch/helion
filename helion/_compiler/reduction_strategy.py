@@ -3839,11 +3839,22 @@ class BlockReductionStrategy(ReductionStrategy):
             return None
         logical_axes.add(reduce_axis)
         logical_axis_sizes: dict[int, int] = {}
+        # A grid axis packed several tiles per CTA (``cute_tiles_per_block``)
+        # lives above the reduce axis as independent sub-groups: it must count
+        # toward the group count and the linear lane, or the sub-groups would
+        # share the helper's shared-memory slots.
+        packed_block = None
+        if env.backend.name == "cute":
+            from .cute.tile_packing import packed_grid_block
+
+            packed = packed_grid_block(env, self.fn.config)
+            packed_block = None if packed is None else packed[0]
         for block_id, axis, extent, _info in active_thread_blocks:
             if (
                 block_id in mapped_block_ids
                 or block_id >= self.block_index
                 or axis < reduce_axis
+                or block_id == packed_block
             ):
                 # Even a broadcast input (for example a rank-one validity
                 # count) is executed by the physical row threads below this

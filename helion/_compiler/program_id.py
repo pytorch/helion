@@ -429,6 +429,11 @@ class PIDInfo(NamedTuple):
     block_size_var: str
     numel: sympy.Expr | str  # Can be a sympy.Expr or a string for data-dependent bounds
     block_id: int
+    # ``cute_tiles_per_block``: this axis's tiles are packed ``pack`` per CTA
+    # on thread axis ``pack_axis`` (the pid count shrinks by ``pack``, which
+    # divides the static tile count).
+    pack: int = 1
+    pack_axis: int = 0
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
@@ -441,6 +446,9 @@ class PIDInfo(NamedTuple):
             numel_str = self.numel
         else:
             numel_str = context.sympy_expr(self.numel)
+        if self.pack > 1:
+            assert self.block_size_var == "1"
+            return f"(({numel_str}) // {self.pack})"
         if self.block_size_var == "1":
             return numel_str
         if not is_device:
@@ -458,6 +466,8 @@ class PIDInfo(NamedTuple):
         ):
             return None
         numel = int(self.numel)
+        if self.pack > 1:
+            return numel // self.pack
         if self.block_size_var == "1":
             return numel
         block_size = DeviceFunction.current().resolved_int_constexpr(
@@ -578,6 +588,13 @@ class ProgramIDs(abc.ABC):
                 expr = f"({expr}) // ({divisor})"
             if i + 1 < len(self.pid_info):
                 expr = f"({expr}) % ({num_blocks[i]})"
+            if pid.pack > 1:
+                # Thread sub-group ``pack_axis`` of this CTA owns its own tile.
+                index_dtype = CompileEnvironment.current().index_type()
+                expr = (
+                    f"({expr}) * {pid.pack}"
+                    f" + {index_dtype}(cute.arch.thread_idx()[{pid.pack_axis}])"
+                )
             statements.append(statement_from_string(f"{pid.pid_var} = {expr}"))
         return statements
 

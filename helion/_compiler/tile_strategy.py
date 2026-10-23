@@ -9981,6 +9981,18 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         self.mma_mode = mma_mode
         self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
+        # ``cute_tiles_per_block``: grid axis -> tiles packed per CTA (its
+        # thread axis extent); see ``cute/tile_packing.py``.  Resolved here,
+        # before layout planning, so the planner sees the packed axis as a
+        # multi-row CTA and can order it above the inner tile axes (one warp
+        # per tile when the inner extent is a warp).
+        self._cute_pack_by_block: dict[int, int] = {}
+        if not mma_mode and CompileEnvironment.current().backend_name == "cute":
+            from .cute.tile_packing import packed_grid_block
+
+            packed = packed_grid_block(CompileEnvironment.current(), fn.config)
+            if packed is not None and packed[0] in block_ids:
+                self._cute_pack_by_block[packed[0]] = packed[1]
         # Per-block vec width for the lane loop (1 = scalar).  Populated
         # from the autotuner-selected ``cute_vector_widths`` config when
         # the block has a lane loop and its ``elements_per_thread`` is
@@ -10248,6 +10260,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         the cluster split)."""
         if block_id in self.inactive_block_ids:
             return 1
+        if block_id in self._cute_pack_by_block:
+            return 1  # every thread sub-group owns one tile of one element
         idx = self.block_ids.index(block_id)
         nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
@@ -10263,6 +10277,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return 1
         if self.mma_mode:
             return 1  # MMA handles element distribution, no CUDA threads needed
+        if block_id in self._cute_pack_by_block:
+            return self._cute_pack_by_block[block_id]
         idx = self.block_ids.index(block_id)
         nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
@@ -10431,11 +10447,17 @@ class PerThreadNDTileStrategy(NDTileStrategy):
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         self._demote_blocks_beyond_thread_axes(state)
-        if not self._lane_var_by_block and not self._shared_thread_extents:
+        env = CompileEnvironment.current()
+        # ``cute_tiles_per_block``: a packed grid axis is a thread axis of
+        # this strategy even when no lane loop is needed.
+        if (
+            not self._lane_var_by_block
+            and not self._shared_thread_extents
+            and not self._cute_pack_by_block
+        ):
             return super().codegen_grid(state)
 
         block_ids = self.block_ids
-        env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
@@ -10480,6 +10502,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             pid_var = device_function.new_var(f"pid_{i}", dce=True)
+            pack = self._cute_pack_by_block.get(block_idx, 1)
 
             begin_offset_expr = ""
             if begin != 0:
@@ -10520,6 +10543,9 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 idx_expr = env.backend.lane_index_expr(
                     offset_var, elements_per_thread, axis=axis
                 )
+                if pack > 1:
+                    # The pid already carries this sub-group's tile.
+                    idx_expr = offset_var
                 thread_extent = self._thread_extent_for_axis(block_idx, block_size)
                 static_extent = (
                     thread_extent
@@ -10654,6 +10680,13 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     axis,
                     static_extent,
                 )
+                if pack > 1:
+                    # The body may only name the tile begin (``tile.begin``);
+                    # the launch must still raise the sub-group axis.
+                    self.fn.cute_state.grid_thread_extents[offset_var] = (
+                        axis,
+                        static_extent,
+                    )
 
             # Bound by the *thread* extent rather than the block size: this
             # axis advances ``elements_per_thread`` per thread, so the threads
@@ -10696,6 +10729,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     )
                 )
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
+            if pack > 1:
+                pid = pid._replace(pack=pack, pack_axis=axis)
             pids.append(pid)
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):

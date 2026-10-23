@@ -166,6 +166,7 @@ _CUTE_PER_THREAD_HELPERS = frozenset(
         "_cute_argreduce_index",
         "_cute_atomic_max_float32",
         "_cute_atomic_min_float32",
+        "_cute_float4_e2m1fn_x16_dot_float32",
         "_cute_fp8e4m3fn_to_float32",
         "_cute_gelu_erf_exact_f32x2",
         "_cute_sigmoid_approx_ftz_f32",
@@ -2132,6 +2133,7 @@ class CuteBackend(Backend):
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
+            or key == "cute_tiles_per_block"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
             or key
@@ -2491,6 +2493,7 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
+            "_cute_float4_e2m1fn_x16_dot_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_dot_float32 as _cute_float4_e2m1fn_x16_dot_float32",
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",

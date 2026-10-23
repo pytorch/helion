@@ -428,3 +428,201 @@ def test_raw_byte_loads_participate_in_alias_proof() -> None:
     assert _tensor_roots([value], "load") == {"A"}
     unknown = ast.parse("cute.arch.load(pointer, cutlass.Uint8)", mode="eval").body
     assert _tensor_roots([unknown], "load") is None
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _one_scale_pairs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sb: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """W4A16: a BF16/FP16 activation times a decoded E2M1 weight, one scale."""
+    m, groups, _ = a.shape
+    _, pairs, n = b.shape
+    for row, col in hl.tile([m, n]):
+        acc = hl.zeros([row, col], dtype=torch.float32)
+        for group in hl.tile(groups):
+            right_scale = sb[group, col].to(torch.float32)
+            for byte in hl.static_range(pairs):
+                b0, b1 = hl.float4_e2m1fn_x2_to_float32(b[group, byte, col])
+                a0 = a[row, group, 2 * byte].to(torch.float32)
+                a1 = a[row, group, 2 * byte + 1].to(torch.float32)
+                acc = acc + (
+                    (
+                        a0.unsqueeze(2) * b0.unsqueeze(0)
+                        + a1.unsqueeze(2) * b1.unsqueeze(0)
+                    )
+                    * right_scale.unsqueeze(0)
+                ).sum(1)
+        out[row, col] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scaled_narrow_pairs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sa: torch.Tensor,
+    sb: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """A scale on the BF16 side: ``a * sa`` needs twelve bits, not exact."""
+    m, groups, _ = a.shape
+    _, pairs, n = b.shape
+    for row, col in hl.tile([m, n]):
+        acc = hl.zeros([row, col], dtype=torch.float32)
+        for group in hl.tile(groups):
+            left_scale = sa[row, group].to(torch.float32)
+            right_scale = sb[group, col].to(torch.float32)
+            for byte in hl.static_range(pairs):
+                b0, b1 = hl.float4_e2m1fn_x2_to_float32(b[group, byte, col])
+                a0 = a[row, group, 2 * byte].to(torch.float32)
+                a1 = a[row, group, 2 * byte + 1].to(torch.float32)
+                acc = acc + (
+                    (
+                        a0.unsqueeze(2) * b0.unsqueeze(0)
+                        + a1.unsqueeze(2) * b1.unsqueeze(0)
+                    )
+                    * left_scale.unsqueeze(2)
+                    * right_scale.unsqueeze(0)
+                ).sum(1)
+        out[row, col] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _narrow_narrow_pairs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sb: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Both operands BF16: nothing is decoded E2M1, so no scale may attach."""
+    m, groups, _ = a.shape
+    _, k, n = b.shape
+    pairs = k // 2
+    for row, col in hl.tile([m, n]):
+        acc = hl.zeros([row, col], dtype=torch.float32)
+        for group in hl.tile(groups):
+            right_scale = sb[group, col].to(torch.float32)
+            for byte in hl.static_range(pairs):
+                b0 = b[group, 2 * byte, col].to(torch.float32)
+                b1 = b[group, 2 * byte + 1, col].to(torch.float32)
+                a0 = a[row, group, 2 * byte].to(torch.float32)
+                a1 = a[row, group, 2 * byte + 1].to(torch.float32)
+                acc = acc + (
+                    (
+                        a0.unsqueeze(2) * b0.unsqueeze(0)
+                        + a1.unsqueeze(2) * b1.unsqueeze(0)
+                    )
+                    * right_scale.unsqueeze(0)
+                ).sum(1)
+        out[row, col] = acc
+    return out
+
+
+def _dot_nodes(bound: BoundKernel) -> list[torch.fx.Node]:
+    assert bound.host_function is not None
+    return [
+        node
+        for graph in bound.host_function.device_ir.graphs
+        for node in graph.graph.nodes
+        if node.target is dot
+    ]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@skipUnlessBackends(["cute"])
+def test_one_scale_narrow_operand_is_exposed(dtype: torch.dtype) -> None:
+    """``a_bf16 * w_fp4 * sb``: the activation goes in unchanged, the scaled
+    weight is narrowed to the activation's dtype, and the contraction gets an
+    ordinary (non-native) MMA fact."""
+    args = (
+        torch.empty((73, 7, 16), dtype=dtype),
+        torch.empty((7, 8, 41), dtype=torch.float4_e2m1fn_x2),
+        torch.empty((7, 41), dtype=torch.float8_e4m3fn),
+        torch.empty((73, 41), dtype=torch.float32),
+    )
+    with _cpu_target():
+        bound = _one_scale_pairs._bind_isolated(args)
+        source = bound.to_code(_config("scalar"))
+    (node,) = _dot_nodes(bound)
+    lhs, rhs = node.args[0], node.args[1]
+    assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
+    assert len(interleaved_matrix_terms(lhs, lhs=True)) == 16
+    assert len(interleaved_matrix_terms(rhs, lhs=False)) == 16
+    assert lhs.meta["val"].dtype is rhs.meta["val"].dtype is dtype
+    facts = bound.config_spec.matmul_facts
+    assert len(facts) == 1
+    assert facts[0].lhs_dtype is facts[0].rhs_dtype is dtype
+    assert facts[0].static_k == 7 * 16
+    assert not bound.config_spec.cute_scaled_mma_available
+    assert "dot_product" in source
+
+
+@skipUnlessBackends(["cute"])
+def test_w4a16_example_exposes_a_bf16_contraction() -> None:
+    from examples.nvfp4_gemm import _nvfp4_matmul_single_pass_kernel
+
+    inputs = (
+        torch.empty((512, 64, 16), dtype=torch.bfloat16),
+        torch.empty((64, 8, 512), dtype=torch.float4_e2m1fn_x2),
+        torch.empty((4 * 16 * 512,), dtype=torch.float8_e4m3fn),
+        torch.empty((512, 512), dtype=torch.bfloat16),
+        1.0,
+    )
+    kernel = helion.kernel(
+        _nvfp4_matmul_single_pass_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with _cpu_target():
+        bound = kernel._bind_isolated(inputs)
+        source = bound.to_code(_config())
+    assert len(_dot_nodes(bound)) == 1
+    facts = bound.config_spec.matmul_facts
+    assert len(facts) == 1
+    assert facts[0].lhs_dtype is facts[0].rhs_dtype is torch.bfloat16
+    assert facts[0].static_k == 64 * 16
+    assert not bound.config_spec.cute_scaled_mma_available
+    assert "cute.gemm(" in source
+    with bound.env:
+        seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert any(seed.get("cute_collective_compute") == "tcgen05" for seed in seeds)
+
+
+@pytest.mark.parametrize("kernel", [_scaled_narrow_pairs, _narrow_narrow_pairs])
+@skipUnlessBackends(["cute"])
+def test_refuses_scale_on_narrow_operand(kernel: object) -> None:
+    sb = torch.empty((7, 41), dtype=torch.float8_e4m3fn)
+    if kernel is _scaled_narrow_pairs:
+        args = (
+            torch.empty((73, 7, 16), dtype=torch.bfloat16),
+            torch.empty((7, 8, 41), dtype=torch.float4_e2m1fn_x2),
+            torch.empty((73, 7), dtype=torch.float8_e4m3fn),
+            sb,
+            torch.empty((73, 41), dtype=torch.float32),
+        )
+    else:
+        args = (
+            torch.empty((73, 7, 16), dtype=torch.bfloat16),
+            torch.empty((7, 16, 41), dtype=torch.bfloat16),
+            sb,
+            torch.empty((73, 41), dtype=torch.float32),
+        )
+    with _cpu_target():
+        bound = kernel._bind_isolated(args)  # pyrefly: ignore[missing-attribute]
+    assert _dot_nodes(bound) == []
+    assert bound.config_spec.matmul_facts == []
+
+
+def test_all_fp4_and_e4m3_encodings_fit_fp16_exactly() -> None:
+    scales = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    exact = _FP4[:, None] * scales[None, :]
+    torch.testing.assert_close(
+        exact.half().float(), exact, rtol=0, atol=0, equal_nan=True
+    )

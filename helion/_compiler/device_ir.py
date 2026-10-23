@@ -3599,6 +3599,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
             from .cute.signed_bitfield import has_signed_byte_field
+            from .cute.tile_packing import tile_pack_counts
+
+            config_spec.cute_tile_pack_counts = tile_pack_counts(
+                CompileEnvironment.current(), device_ir
+            )
 
             config_spec.cute_signed_bitfield_bf16_available = (
                 config_spec.target_device_capability == (10, 0)

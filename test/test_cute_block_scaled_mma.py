@@ -253,7 +253,7 @@ def test_all_native_seeds_round_trip_and_emit() -> None:
             bound.env, bound.host_function.device_ir
         )
         generation = ConfigGeneration(bound.config_spec)
-        assert len(seeds) == 8
+        assert len(seeds) == 16
         for seed in seeds:
             bound.config_spec.normalize(seed)
             restored = generation.unflatten(generation.flatten(seed))
@@ -269,7 +269,8 @@ def test_all_native_seeds_round_trip_and_emit() -> None:
         ("cute_scaled_mma", 1),
         ("cute_scaled_cluster_m", True),
         ("cute_scaled_tile_k", 32),
-        ("cute_scaled_tile_n", 64),
+        ("cute_scaled_tile_n", 32),
+        ("cute_scaled_prepare_rows", 8),
         ("cute_scaled_stages", 1),
         ("cute_scaled_persistent", 0),
     ],

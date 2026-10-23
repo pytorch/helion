@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Hashable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from torch.cuda import _POOL_HANDLE
@@ -594,7 +595,7 @@ def _append_cute_wrapper_plan(
             not in (
                 (8, 16, 32, 64, 128, 224, 256)
                 if plan.get("format") == "mxfp8"
-                else (128, 256)
+                else (64, 128, 256)
             )
             or plan_int("bk") not in (64, 128, 256)
             or plan_int("stages") not in (2, 3, 4, 5, 6, 8, 10, 12)
@@ -4416,6 +4417,24 @@ _CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] =
 _CUTE_STAGED_OPERAND_ALIGNMENT = 16
 
 
+def _block_scaled_aligned_inputs(plan: Mapping[str, object]) -> tuple[str, ...]:
+    """Index keys of a block-scaled plan's inputs read with an alignment
+    assumption: MXFP8 TMA reads the original FP8 allocations; the fused NVFP4
+    consumer TMAs the packed sources and their scales; the linear preparation
+    reads a side with a proved qword recipe as 8-byte words."""
+    if plan.get("format") == "mxfp8":
+        if plan.get("sf_tma") is True:
+            return ("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx")
+        return ("lhs_idx", "rhs_idx")
+    if plan.get("prepare") == "fused":
+        return ("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx")
+    return tuple(
+        f"{side}_idx"
+        for side in ("lhs", "rhs")
+        if plan.get(f"{side}_qword_address") is not None
+    )
+
+
 def _cute_staged_plan_operands(
     cute_kernel: object,
 ) -> tuple[tuple[int, bool], ...]:
@@ -4424,12 +4443,8 @@ def _cute_staged_plan_operands(
     for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
         kind = str(plan.get("kind"))
         roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
-        if kind == "block_scaled_mma" and plan.get("format") == "mxfp8":
-            # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
-            # Preserve their values when a replacement binding is under-aligned.
-            roles = (("lhs_idx", "rhs_idx"), ())
-            if plan.get("sf_tma") is True:
-                roles = (("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx"), ())
+        if kind == "block_scaled_mma":
+            roles = (_block_scaled_aligned_inputs(plan), ())
             if plan.get("tma_output") is True:
                 roles = (roles[0], ("out_idx",))
         if roles is None:
