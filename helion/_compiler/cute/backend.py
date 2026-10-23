@@ -43,6 +43,7 @@ from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from .thread_budget import MAX_THREAD_BLOCK_DIMS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
 from .thread_budget import check_thread_limit
@@ -4270,7 +4271,7 @@ class CuteBackend(Backend):
                     block_ids in device_ir.grid_block_ids
                     and config.get("cute_collective_compute", "warp") == "warp"
                 ):
-                    caps = [1024, 1024, 64]
+                    caps = list(MAX_THREAD_BLOCK_DIMS)
                     for _fact, root in placements:
                         order = spec.loop_orders.config_get(
                             config.loop_orders, root[0]

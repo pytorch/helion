@@ -2284,7 +2284,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         }
         axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
         non_matmul_axes = blocks.keys() - axis_ids
-        matmul_roots = {tuple(root) for _, root, _, _ in sites}
+        matmul_roots = {root for _, root, _, _ in sites}
         # A sibling reduction can claim an extra CUDA thread axis. Preserve
         # existing epilogue admission within the matmul's own root.
         reduction = spec.reduction_kernel_fact

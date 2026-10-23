@@ -271,12 +271,17 @@ def test_inactive_leading_sibling_axis_keeps_the_collective_launch(
 @skipIfRefEager("requires compiler seeds")
 def test_epilogue_reduction_keeps_its_existing_seed_admission() -> None:
     @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-    def mixed(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    def mixed(
+        a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, flag: int
+    ) -> torch.Tensor:
         out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
         for m, n in hl.tile([a.size(0), b.size(1)]):
             acc = hl.zeros([m, n], dtype=torch.float32)
             acc = torch.addmm(acc, a[m, :] * 0.5, b[:, n])
-            out[m, n] = (acc + bias[m, :].sum(-1)[:, None]).to(out.dtype)
+            if flag > 0:
+                out[m, n] = (acc + bias[m, :].sum(-1)[:, None]).to(out.dtype)
+            else:
+                out[m, n] = acc.to(out.dtype)
         return out
 
     with _mock_cuda_unavailable():
@@ -286,6 +291,7 @@ def test_epilogue_reduction_keeps_its_existing_seed_admission() -> None:
                 torch.empty(64, 128, dtype=torch.float16),
                 torch.empty(128, 64, dtype=torch.float16),
                 torch.empty(64, 129),
+                1,
             ),
         )
         assert bound.host_function is not None

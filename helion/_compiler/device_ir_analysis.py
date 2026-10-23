@@ -1383,6 +1383,15 @@ class DeviceIRAnalysis:
                 continue
             edges: list[tuple[int, frozenset[int]]] = []
             for node in graph.nodes:
+                if node.target is _tracing_ops._if:
+                    child_ids = node.args[1:3]
+                elif node.target is _tracing_ops._while_loop:
+                    child_ids = (*node.args[:2], *node.args[3:])
+                else:
+                    child_ids = ()
+                for child_id in child_ids:
+                    if isinstance(child_id, int) and child_id in by_id:
+                        graph_parent_of[child_id] = graph.graph_id
                 if (
                     node.op != "call_function"
                     or not _tracing_ops.is_for_loop_target(node.target)
