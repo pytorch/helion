@@ -790,11 +790,14 @@ def _outline_cross_loop_region(
     noinline: bool = False,
 ) -> ast.stmt:
     """Outline a scheduled region while keeping its computation opaque."""
+    # Warp specialization changes kernel-wide thread participation. Keep
+    # scheduler helpers inline so Triton lowers their explicit and implicit
+    # barriers for the caller's active warp group rather than the physical CTA.
     helper_name, arguments = device_function.register_triton_outlined_helper(
         name_hint,
         body,
         extra_argument_names=extra_argument_names,
-        noinline=noinline,
+        noinline=noinline and not any(device_function.config.range_warp_specializes),
     )
     return statement_from_string(f"{helper_name}({', '.join(arguments)})")
 
