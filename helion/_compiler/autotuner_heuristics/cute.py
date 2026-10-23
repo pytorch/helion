@@ -3391,6 +3391,10 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
         return dedupe_configs(seeds)
 
 
+def _reduction_chunk_size(size_hint: int, max_chunk: int | None) -> int:
+    return prev_power_of_2(min(size_hint // 2, max_chunk or size_hint))
+
+
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
     """Seed prev_power_of_2(min(size_hint // 2, max_reduction_loop)).
 
@@ -3405,10 +3409,6 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
     name = "cute_reduction_wide_chunk"
     backend = "cute"
 
-    @staticmethod
-    def _chunk_size(size_hint: int, max_reduction_loop: int | None) -> int:
-        return prev_power_of_2(min(size_hint // 2, max_reduction_loop or size_hint))
-
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         if not is_canonical_row_reduction(env):
@@ -3416,7 +3416,10 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
-        return cls._chunk_size(rl_spec.size_hint, spec.max_reduction_loop) > max_threads
+        return (
+            _reduction_chunk_size(rl_spec.size_hint, spec.max_reduction_loop)
+            > max_threads
+        )
 
     @classmethod
     def get_seed_config(
@@ -3426,7 +3429,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        chunk = cls._chunk_size(size_hint, spec.max_reduction_loop)
+        chunk = _reduction_chunk_size(size_hint, spec.max_reduction_loop)
         seed: dict[str, Any] = {
             "block_sizes": [1],
             "num_threads": _seq_config_list(spec.num_threads, {}),
@@ -3482,7 +3485,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
         if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
             rows_per_cta = 1
-        chunk = min(prev_power_of_2(size_hint // 2), 65536)
+        chunk = _reduction_chunk_size(size_hint, 65536)
         chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
         if chunk >= size_hint:
             return None
