@@ -907,7 +907,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             search.args = args
             search.copies = copies
             search.config_gen = SimpleNamespace(
-                flash_structural_starting_path_limit=lambda **_kwargs: 17,
+                flash_structural_starting_path_limit=lambda **_: 17,
                 flash_structural_family_probe_path_limit=lambda _cap, _generations: 18,
             )
 
@@ -6709,7 +6709,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.best_available_pad_random = True
         search.log = Mock()
         search._pinned_finalist_configs = set()
-        search._generate_best_available_population_flat = lambda: [[5], [0], [3]]
+        search._generate_best_available_population_flat = lambda **_: [
+            [5],
+            [0],
+            [3],
+        ]
 
         search.initial_population = 1
         partial = search._generate_initial_population_flat()
@@ -6753,7 +6757,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         # Config 1 is both a structural row and a pinned compiler seed. Config 3
         # is another pinned seed; configs 0 and 4 model optional cache rows.
         search._pinned_finalist_configs = {configs[1], configs[3]}
-        search._generate_best_available_population_flat = lambda: [
+        search._generate_best_available_population_flat = lambda **_: [
             [1],
             [3],
             [0],
@@ -6823,7 +6827,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         best_search._pinned_finalist_configs = {configs[0]}
         # Config 2 aliases an exact row; config 3 models a legal cache row that
         # is outside the active search values used by the exact enumeration.
-        best_search._generate_best_available_population_flat = lambda: [
+        best_search._generate_best_available_population_flat = lambda **_: [
             [0],
             [2],
             [3],
@@ -6870,7 +6874,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search._pinned_finalist_configs = {configs[3]}
         # Configs 1 and 2 are optional cache aliases of required rows. Config 4
         # must not displace the exact space after structural and pinned rows.
-        search._generate_best_available_population_flat = lambda: [
+        search._generate_best_available_population_flat = lambda **_: [
             [3],
             [1],
             [2],

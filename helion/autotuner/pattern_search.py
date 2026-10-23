@@ -84,6 +84,8 @@ class PatternSearch(PopulationBasedSearch):
             kernel: The kernel to be autotuned.
             args: The arguments to be passed to the kernel.
             initial_population: The number of random configurations to generate for the initial population.
+                Also the FROM_BEST_AVAILABLE compiler seed budget (see
+                _generate_best_available_population_flat).
             copies: Count of top Configs to run pattern search on.
             max_generations: The maximum number of generations to run.
             min_improvement_delta: Relative stop threshold; stop if abs(best/current - 1) < this.
@@ -95,7 +97,7 @@ class PatternSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
                 cached configs with random configs to reach initial_population size.
-                When False, use only the default and cached configs; random configs
+                When False, use only the seeds, default, and cached configs; random configs
                 are added only as a fallback when every one of them fails to compile
                 or run (see PopulationBasedSearch.benchmark_initial_population).
             num_neighbors_cap: Maximum number of neighbors to explore per generation. -1 means no cap.
@@ -230,12 +232,9 @@ class PatternSearch(PopulationBasedSearch):
             self.initial_population_strategy
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
-            pop = (
-                self._generate_best_available_population_flat()
-                if generation is None
-                else self._generate_best_available_population_flat(
-                    generation=config_gen
-                )
+            pop = self._generate_best_available_population_flat(
+                generation=generation,
+                compiler_seed_limit=self.initial_population,
             )
             if config_gen.config_spec.cute_flash_search_enabled:
                 design = config_gen.flash_deterministic_population_configs()

@@ -2090,7 +2090,10 @@ class PopulationBasedSearch(BaseSearch):
         return list(population)
 
     def _generate_best_available_population_flat(
-        self, *, generation: ConfigGeneration | None = None
+        self,
+        *,
+        generation: ConfigGeneration | None = None,
+        compiler_seed_limit: int | None = None,
     ) -> list[FlatConfig]:
         """
         Generate initial population using default config, explicit seed configs,
@@ -2105,19 +2108,37 @@ class PopulationBasedSearch(BaseSearch):
         ``ConfigSpec.compiler_default_config``. Explicit seed configs are not
         suppressed by cache-skip settings. No random configs are added.
 
+        A positive compiler_seed_limit is a row budget for explicit seeds,
+        compiler seeds, and the default (raised to the explicit seeds plus
+        two). Compiler seeds are admitted in list order until it is reached.
+        Never trimmed: explicit and caller best-available seeds, the default,
+        cached configs, and protected seeds (the promoted
+        ``compiler_default_config`` and ``ConfigSpec.autotune_seed_configs``).
+        Specs with ``cute_flash_search_enabled`` ignore the limit, since their
+        seed set is the structural design the flash search measures.
+        A backend-requested compiler overflow palette also bypasses the limit,
+        since the backend requires all of those candidates to be measured.
+
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (default), plus any valid unique explicit/compiler
-            seed configs and up to autotune_best_available_max_configs cached
-            configs.
+            Includes the default, valid unique explicit and caller best-available
+            seeds, compiler seeds subject to the limit, and up to
+            autotune_best_available_max_configs cached configs.
         """
         projected = generation is not None and generation._initial_sampling
         generation = self.config_gen if generation is None else generation
         max_configs = self.settings.autotune_best_available_max_configs
-
+        default_flat = generation.default_flat()
+        default_config = generation.unflatten(default_flat)
         seen: set[Config] = set()
         result: list[FlatConfig] = []
-        pinned_configs: set[Config] = set()
+
+        def admit(flat: FlatConfig, config: Config) -> bool:
+            if config in seen:
+                return False
+            seen.add(config)
+            result.append(flat)
+            return True
 
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
@@ -2125,41 +2146,75 @@ class PopulationBasedSearch(BaseSearch):
         for flat, transferred_config in generation.user_seed_flat_config_pairs(
             self._autotune_seed_configs(), self.log
         ):
-            if transferred_config not in seen:
-                seen.add(transferred_config)
-                pinned_configs.add(transferred_config)
-                result.append(flat)
+            admit(flat, transferred_config)
+
+        if (
+            generation.config_spec.cute_flash_search_enabled
+            or generation.config_spec.compiler_seed_overflow_requested
+            or compiler_seed_limit is None
+            or compiler_seed_limit <= 0
+        ):
+            compiler_seed_limit = None
+        else:
+            compiler_seed_limit = max(compiler_seed_limit, len(result) + 2)
 
         # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
         # they encode backend/compiler heuristics and complement user seed configs.
         # Keep them before the raw fragment default so expensive fallback defaults
         # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
-        for flat, transferred_config in generation.seed_flat_config_pairs(self.log):
-            if transferred_config not in seen:
-                seen.add(transferred_config)
-                pinned_configs.add(transferred_config)
-                result.append(flat)
+        seed_pairs = generation.seed_flat_config_pairs(self.log)
+        protected: set[Config] = set()
+        quota: int | None = None
+        if compiler_seed_limit is not None and seed_pairs:
+            spec = generation.config_spec
+            promoted = spec.compiler_default_config
+            protected = {
+                config
+                for _, config in generation.user_seed_flat_config_pairs(
+                    [
+                        *([] if promoted is None else [promoted]),
+                        *spec.autotune_seed_configs(),
+                    ]
+                )
+            } & {config for _, config in seed_pairs}
+            protected.add(default_config)
+            # Rows left for the other compiler seeds once the default and the
+            # protected seeds are reserved.
+            quota = compiler_seed_limit - len(result) - len(protected - seen)
+        skipped = 0
+        for flat, transferred_config in seed_pairs:
+            if (
+                quota is not None
+                and transferred_config not in seen
+                and transferred_config not in protected
+            ):
+                if quota <= 0:
+                    skipped += 1
+                    continue
+                quota -= 1
+            admit(flat, transferred_config)
+        if skipped:
+            self.log(
+                f"Base compiler seed budget of {compiler_seed_limit} rows (explicit "
+                f"seeds, compiler seeds, default) did not admit {skipped} of "
+                f"{len(seed_pairs)} compiler seed configs"
+            )
 
-        for config in self._best_available_seed_configs:
-            try:
-                flat = generation.flatten(config)
-                transferred_config = generation.unflatten(flat)
-                if transferred_config not in seen:
-                    seen.add(transferred_config)
-                    pinned_configs.add(transferred_config)
-                    result.append(flat)
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
-                self.log(f"Failed to transfer explicit seed config: {e}")
-
-        default_flat = generation.default_flat()
-        default_config = generation.unflatten(default_flat)
-        if default_config not in seen:
-            seen.add(default_config)
-            pinned_configs.add(default_config)
-            result.append(default_flat)
-        self._pinned_finalist_configs.update(
-            copy.deepcopy(config) for config in pinned_configs
-        )
+        for flat, transferred_config in generation.user_seed_flat_config_pairs(
+            self._best_available_seed_configs,
+            self.log,
+            seed_description="best-available",
+        ):
+            admit(flat, transferred_config)
+        required_rows = len(result) + (default_config not in seen)
+        if compiler_seed_limit is not None and required_rows > compiler_seed_limit:
+            self.log(
+                f"Required seed/default rows raise the {compiler_seed_limit}-row "
+                f"base budget to {required_rows}"
+            )
+        admit(default_flat, default_config)
+        # Every row so far is a seed or the default; cached rows are not pinned.
+        self._pinned_finalist_configs.update(copy.deepcopy(config) for config in seen)
         self.log("Starting with seed/default configs")
 
         cached_entries = (
@@ -2189,14 +2244,12 @@ class PopulationBasedSearch(BaseSearch):
                     )
                 else:
                     transferred_config = generation.unflatten(flat)
-                if transferred_config in seen:
+                if not admit(flat, transferred_config):
                     duplicates += 1
                     self.log.debug(
                         f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
                     )
                     continue
-                seen.add(transferred_config)
-                result.append(flat)
                 self.log.debug(
                     f"Cached config {i + 1} (transferred): {transferred_config}"
                 )

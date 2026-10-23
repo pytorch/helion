@@ -6625,7 +6625,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     continue
         finally:
             random.setstate(random_state)
-        search._generate_best_available_population_flat = lambda: [
+        search._generate_best_available_population_flat = lambda **_: [
             config_gen.flatten(config) for config in cached_configs
         ]
         cached_quick_population = {

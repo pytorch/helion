@@ -251,11 +251,12 @@ def test_small_and_nonpositive_targets_keep_old_prefix(count) -> None:
 
 
 @pytest.mark.parametrize("pad", (False, True))
-def test_oversized_best_available_is_not_sliced(pad) -> None:
+@pytest.mark.parametrize("count", (-1, 0, 1, 2, 100))
+def test_compiler_seed_budget_preserves_explicit_seeds_and_coverage(pad, count) -> None:
     search = make_search(
         make_spec(many_seeds=True),
         strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
-        count=100,
+        count=count,
         pad=pad,
         seeds=(
             Config(block_sizes=[64], old_choice=240),
@@ -263,8 +264,17 @@ def test_oversized_best_available_is_not_sliced(pad) -> None:
         ),
     )
     search.set_best_available_seed_configs([Config(block_sizes=[64], old_choice=242)])
+    rng = random.getstate()
     rows = search._generate_initial_population_flat()
-    assert len(rows) == 124 + 5
+    if not pad:
+        assert random.getstate() == rng
+    assert len(rows) == (max(count, 4) + 1 + 5 if count > 0 else 124)
+    configs = [search.config_gen.unflatten(row) for row in rows]
+    assert {240, 241, 242}.issubset(config["old_choice"] for config in configs)
+    assert search.config_gen.unflatten(search.config_gen.default_flat()) in configs
+    if count > 0:
+        for key, domain in DOMAINS.items():
+            assert {config[key] for config in configs} == set(domain)
 
 
 def test_explicit_seed_modes_are_not_projected_or_globally_vetoed() -> None:

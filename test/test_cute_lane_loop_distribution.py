@@ -4354,7 +4354,7 @@ def _read_previous_then_store(
     # of a thread's packet reads the last element of the previous thread's.
     n = x.size(0)
     for tile in hl.tile(n):
-        y[tile] = hl.load(x, [tile.index - 1], extra_mask=tile.index >= 1)
+        y[tile] = hl.load(x, [tile.index - 1], extra_mask=tile.index > tile.begin)
         x[tile] = v[tile]
     return y
 
