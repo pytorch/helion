@@ -9,6 +9,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_cuda_work
+from test._cute_binding import _mock_cuda_unavailable
+from test.test_cute_shared_rhs_grouped import _target as _cpu_codegen_target
+
 import helion
 from helion._compat import requires_cuda_version
 from helion._compiler.cute.cute_mma import _TCGEN05_INSTR_DESC_N_FIELD_SHIFT
@@ -1053,40 +1058,44 @@ def test_grouped_worklist_nm_can_retain_scheduler_mailbox() -> None:
 
 
 def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
-    _require_codegen_cuda()
-
     config = _selected_config(
         64,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
         ab_stages=7,
     )
-    args = _make_args(
-        (224, 256),
-        n=224,
-        k=64,
-        source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
-    )
-    _selected_kernel.reset()
-    bound = _selected_kernel.bind(args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
-    bound.env.config_spec._tcgen05_ab_stages_three_search_constraints = None
     with (
-        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
-        patch_cute_mma_support(),
-        patch.object(
-            CuteTcgen05Config,
-            "per_cta_smem_capacity_bytes",
-            return_value=1,
-        ),
-        pytest.raises(
-            helion.exc.BackendUnsupported,
-            match=(
-                "tcgen05 grouped N,M worklist generated allocations require .* "
-                "exceeding the 1-byte capacity"
-            ),
-        ),
+        _forbid_cuda_work(),
+        _mock_cuda_unavailable(),
+        _cpu_codegen_target(),
+        patch(f"{__name__}.DEVICE", torch.device("cpu")),
     ):
-        bound.to_triton_code(config)
+        args = _make_args(
+            (224, 256),
+            n=224,
+            k=64,
+            source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        )
+        _selected_kernel.reset()
+        bound = _cpu_bind(_selected_kernel, args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec._tcgen05_ab_stages_three_search_constraints = None
+        with (
+            patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch_cute_mma_support(),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_smem_capacity_bytes",
+                return_value=1,
+            ),
+            pytest.raises(
+                helion.exc.BackendUnsupported,
+                match=(
+                    "tcgen05 grouped worklist proved allocations require "
+                    "246784 bytes of per-CTA SMEM, exceeding the 1-byte capacity"
+                ),
+            ),
+        ):
+            bound.to_triton_code(config)
 
 
 def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:

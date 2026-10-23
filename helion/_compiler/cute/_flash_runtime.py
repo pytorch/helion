@@ -25,6 +25,7 @@ from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
+from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ._mlir_compat import ir
 from .epilogue_helpers import rcp_approx_ftz as rcp_approx_ftz
@@ -159,6 +160,29 @@ def flash_gated_shared_storage(
         ]
 
     return SharedStorage
+
+
+@cute.jit
+def gated_zero_v_tail(
+    value: cute.Tensor, stage: cutlass.Int32, valid_rows: cutlass.Int32
+) -> None:
+    """Honor a sequence row mask before the staged V tensor feeds PV MMA."""
+    value = transform_partitioned_tensor_layout(value)
+    # Positive zero has the same all-zero bits in every supported input dtype;
+    # use ordinary integer stores for tf32's storage-only scalar type too.
+    zero_type = cutlass.Uint16 if value.element_type.width == 16 else cutlass.Uint32
+    value = cute.make_tensor(
+        cute.recast_ptr(value.iterator, dtype=zero_type), value.layout
+    )
+    rows = cute.size(value, mode=[1])
+    columns = cute.size(value, mode=[0])
+    if valid_rows < rows:
+        lane = cute.arch.lane_idx()
+        for row in cutlass.range(cutlass.max(valid_rows, 0), rows, 1, unroll=1):
+            for column in cutlass.range(lane, columns, 32, unroll=1):
+                value[column, row, stage] = zero_type(0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
 
 
 @functools.cache

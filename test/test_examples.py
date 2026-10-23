@@ -1757,6 +1757,37 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_hstu_attn_masks_sequence_tails(self):
+        max_seq_len, heads, head_dim = 16, 1, 16
+        total_seq_len = 5
+        q = torch.zeros((32, heads, head_dim), dtype=torch.bfloat16, device=DEVICE)[
+            :total_seq_len
+        ]
+        k = torch.zeros_like(q)
+        v_storage = torch.full(
+            (32, heads, head_dim),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        v = v_storage[:total_seq_len]
+        v.fill_(1)
+        seq_offsets = torch.tensor([0, 3, 5], dtype=torch.int64, device=DEVICE)
+        # Zero scores must produce zero output even when storage beyond the
+        # final sequence contains NaNs: masking scores after a load is too late.
+        with _core_silu_decomposition():
+            check_example(
+                "jagged_hstu_attn",
+                (max_seq_len, 1.0 / head_dim**2, q, k, v, seq_offsets),
+                torch.zeros_like(v),
+                fn_name="_helion_jagged_attention_kernel",
+                block_sizes=[16, 16],
+                atol=0,
+                rtol=0,
+            )
+
     @parametrize(
         "helion_precision,torch_precision,atol,rtol",
         [
