@@ -1425,11 +1425,12 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                 a, b = hl.reduce(
                     tuple_add_combine_fn,
                     (x[row, :], x[row, :]),
-                    dim=1,
+                    dim=-1,
                     other=(2, 3),
+                    keep_dims=True,
                 )
-                first[row] = a
-                second[row] = b
+                first[row] = a.squeeze(-1)
+                second[row] = b.squeeze(-1)
             return first, second
 
         storage = torch.randint(-10, 10, (5, 8192), device=DEVICE).float()

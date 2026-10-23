@@ -71,6 +71,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             dim=ast.Constant(value=dim),
         )
     if state.proxy_arg(4):
+        result = state.codegen.lift(result, dce=True, prefix="custom_reduce_result")
         inputs = cast("tuple[torch.Tensor, ...]", state.proxy_arg(1))
         return [
             expr_from_string("{result}[{index}]", result=result, index=ast.Constant(i))
