@@ -99,8 +99,8 @@ def chain_reduction_dims(
         mode = proxy_tensor.get_proxy_mode()
         source_node = None
         previous_tail: Node | None = None
-        # make_fx lifts captured constants while tracing the single-axis ops;
-        # they do not have a source proxy to tag yet.
+        # Plain make_fx lifts captured constants in the single-axis ops;
+        # Helion's tracing patch can create their proxies during this lookup.
         if (
             mode is not None
             and proxy_tensor.get_proxy_slot(source, mode.tracer, default=None)
@@ -191,13 +191,12 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 # them in a different layout than they are written, and CuTe
                 # may promote an atomic target's dtype after merging, which
                 # its flattened view would miss.
-                graph_list = list(graphs)
                 excluded = {
                     storage
-                    for info in graph_list
+                    for info in graphs
                     for n in info.graph.nodes
                     if n.target in _MEMORY_OPS and n.target is not load
-                    for storage in _storage_ids(graph_list, info.graph_id, n.args[0])
+                    for storage in _storage_ids(graphs, info.graph_id, n.args[0])
                 }
             merger = _Merger(source, dims, flat_views, flat_nodes, excluded)
             if (

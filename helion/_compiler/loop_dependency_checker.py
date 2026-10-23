@@ -4,6 +4,8 @@ import ast
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .device_ir import GraphInfo
 
 
@@ -172,7 +174,7 @@ def _is_fresh_allocation(call: ast.Call) -> bool:
     return func.attr in _FRESH_TENSOR_METHODS
 
 
-def _storage_ids(graphs: list[GraphInfo], graph_id: int, obj: object) -> set[int]:
+def _storage_ids(graphs: Sequence[GraphInfo], graph_id: int, obj: object) -> set[int]:
     import torch
 
     from .device_ir import NodeArgsGraphInfo
