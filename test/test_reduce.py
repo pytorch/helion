@@ -1448,6 +1448,36 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                 padded_pair(x), (x.sum(1) + padding * 2, x.sum(1) + padding * 3)
             )
 
+    @skipIfRefEager("checks the remaining rollable reduction axis")
+    def test_tuple_outputs_preserve_another_rolled_axis(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            first = torch.empty(x.size(0), device=x.device)
+            second = torch.empty_like(first)
+            for row in hl.tile(x.size(0)):
+                left, right = hl.reduce(
+                    tuple_add_combine_fn, (x[row, :, :], x[row, :, :]), dim=2
+                )
+                first[row] = left.sum(1)
+                second[row] = right.sum(1)
+            return first, second
+
+        x = torch.randn(3, 17, 33, device=DEVICE)
+        bound = reduce.bind((x,))
+        fact = bound.config_spec.reduction_kernel_fact
+        assert fact is not None
+        self.assertEqual(
+            set(bound.config_spec.reduction_loops.valid_block_ids()),
+            {
+                reduction.block_id
+                for reduction in fact.reductions
+                if not reduction.is_custom
+            },
+        )
+        _, output = code_and_output(reduce, (x,), block_sizes=[1], reduction_loops=[8])
+        for actual in output:
+            torch.testing.assert_close(actual, x.sum((1, 2)), atol=1e-4, rtol=1e-4)
+
     @skipIfRefEager("checks generated reduction-loop code")
     def test_mixed_reduction_fusion(self) -> None:
         @helion.kernel(backend="triton", autotune_effort="none")

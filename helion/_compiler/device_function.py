@@ -2467,8 +2467,7 @@ class DeviceFunction:
     ) -> str:
         """Register a global helper function and return its generated name."""
         name = self.namespace.create_name(helper_graph_info.name, None)
-        self.helper_manager.register_helper_function(helper_graph_info, name)
-        return name
+        return self.helper_manager.register_helper_function(helper_graph_info, name)
 
     def register_triton_outlined_helper(
         self,

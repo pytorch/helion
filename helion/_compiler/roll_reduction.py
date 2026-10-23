@@ -243,13 +243,11 @@ class ReductionRoller:
         return num_rdims > 0
 
     def _count_rdim_axes_in_val(self, val: object) -> int:
-        """Count how many tensor axes reference ``self.rdim``.
+        """Count the most axes referencing ``self.rdim`` in any output tensor.
 
-        Handles single tensors and ``(tuple, list)`` of tensors (e.g. the
-        ``var_mean`` op returns two tensors). Non-tensor values (scalars)
-        contribute 0. The caller raises when the count exceeds 1, since
-        the roller's per-axis chunking only makes sense for one rdim per
-        node.
+        Tuple outputs share the chunk coordinate, so count each separately.
+        A tensor with repeated occurrences still needs unsupported multi-axis
+        chunking. Non-tensor values contribute 0.
         """
         if not isinstance(val, (torch.Tensor, tuple, list)):
             return 0
@@ -261,8 +259,9 @@ class ReductionRoller:
 
         if isinstance(val, torch.Tensor):
             return count_for_tensor(val)
-        return sum(
-            count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)
+        return max(
+            (count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)),
+            default=0,
         )
 
     def _count_rdim_axes_in_subscript(self, target: object, index: object) -> int:

@@ -175,10 +175,10 @@ class HelperFunctionManager:
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo, final_name: str
-    ) -> None:
-        """Register a helper function to be generated at global scope."""
+    ) -> str:
+        """Register a global helper and reuse its first generated name."""
         self.helper_functions[helper_graph_info.name] = helper_graph_info
-        self._final_names[helper_graph_info.name] = final_name
+        return self._final_names.setdefault(helper_graph_info.name, final_name)
 
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
