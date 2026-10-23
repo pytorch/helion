@@ -416,10 +416,12 @@ class TestReductions(RefEagerTestBase, TestCase):
     @skipIfRefEager("checks the generated code")
     def test_merged_reduction_dims_need_a_fixed_layout(self):
         def scaled_sum(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            out = torch.empty([x.size(0), 3], device=x.device, dtype=x.dtype)
             for tile in hl.tile(x.size(0)):
                 # scale broadcasts over the merged dims as one size-1 dim
-                out[tile] = (x[tile] * scale[tile, None, None]).sum(dim=(1, 2))
+                total = (x[tile] * scale[tile, None, None]).sum(dim=(1, 2))
+                for step in hl.tile(3, block_size=1):
+                    out[tile, step] = total[:, None]
             return out
 
         x = torch.randn(6, 24, 40, device=DEVICE)
@@ -446,7 +448,8 @@ class TestReductions(RefEagerTestBase, TestCase):
                         static_shapes and _merged_reduction_backend(),
                     )
                     torch.testing.assert_close(
-                        output, (x * scale[:, None, None]).sum((1, 2))
+                        output,
+                        (x * scale[:, None, None]).sum((1, 2))[:, None].expand(-1, 3),
                     )
 
     @onlyBackends(["triton", "cute"])

@@ -238,6 +238,15 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 for n in unused:
                     graph.erase_node(n)
                     dead.remove(n)
+    if replacements:
+        from .device_ir import NodeArgsGraphInfo
+
+        # Captured arguments are stored separately from FX uses.
+        for graph_info in graphs:
+            if isinstance(graph_info, NodeArgsGraphInfo):
+                graph_info.node_args = [
+                    replacements.get(arg, arg) for arg in graph_info.node_args
+                ]
     return replaced
 
 
@@ -333,7 +342,11 @@ class _Merger:
         stack = [result]
         while stack:
             n = stack.pop()
-            if n.name in chain_nodes and n not in chain and n not in self.kinds:
+            if (
+                (n is result or n.name in chain_nodes)
+                and n not in chain
+                and n not in self.kinds
+            ):
                 chain.add(n)
                 stack.extend(n.all_input_nodes)
         if all(
