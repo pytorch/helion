@@ -258,6 +258,7 @@ def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
     return out
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("missing_async", [False, True])
 def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) -> None:
     kernel = helion.kernel(
