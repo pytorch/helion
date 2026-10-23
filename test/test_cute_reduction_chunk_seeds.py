@@ -55,15 +55,14 @@ def test_reduction_chunks_survive_seed_transfer(
     assert heuristic.is_eligible(env, device_ir)
     seed = heuristic.get_seed_config(env, device_ir)
     assert seed is not None
-    chunk = seed.config["reduction_loops"][0]
-    assert chunk == expected_chunk
-    assert chunk > 0 and chunk & (chunk - 1) == 0
-    assert spec.max_reduction_loop is not None and chunk <= spec.max_reduction_loop
-    assert seed.config["cute_vector_widths"][1] == (4 if dtype == torch.float32 else 8)
+    assert seed.config["reduction_loops"] == [expected_chunk]
+    assert spec.max_reduction_loop is not None
+    assert expected_chunk <= spec.max_reduction_loop
+    assert seed.config["cute_vector_widths"] == [1, 4 if dtype == torch.float32 else 8]
     spec.compiler_seed_configs = [seed]
     pairs = spec.create_config_generation().seed_flat_config_pairs()
     assert len(pairs) == 1
-    assert pairs[0][1].config["reduction_loops"] == [chunk]
+    assert pairs[0][1].config["reduction_loops"] == [expected_chunk]
 
 
 @pytest.mark.parametrize(

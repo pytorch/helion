@@ -3392,7 +3392,10 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
 
 
 def _reduction_chunk_size(size_hint: int, max_chunk: int | None) -> int:
-    return prev_power_of_2(min(size_hint // 2, max_chunk or size_hint))
+    chunk = size_hint // 2
+    if max_chunk is not None:
+        chunk = min(chunk, max_chunk)
+    return prev_power_of_2(chunk)
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
