@@ -60,7 +60,6 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         loop.strategy, LoopedReductionStrategy
     ):
         result = _codegen_rolled_reduce(state, loop, input_tensor, combine_func)
-        state.fx_node.meta["delayed_result"] = True
     else:
         dim = cast("int | None", state.proxy_arg(2))
         keep_dims = state.proxy_arg(3)
