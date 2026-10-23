@@ -8564,11 +8564,13 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
         fact = base.reduction_kernel_fact
-        if fact is not None and any(
-            reduction.is_custom and reduction.block_id == self.block_id
-            for reduction in fact.reductions
-        ):
-            # Keep custom reductions persistent even when heuristics decline.
+        axis_reductions = (
+            [r for r in fact.reductions if r.block_id == self.block_id]
+            if fact is not None
+            else []
+        )
+        if axis_reductions and all(r.is_custom for r in axis_reductions):
+            # Keep custom axes persistent unless a native occurrence shares them.
             default = high
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.

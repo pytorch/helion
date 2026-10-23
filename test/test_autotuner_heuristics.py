@@ -5332,6 +5332,24 @@ class TestTritonReductionHeuristicUnit(TestCase):
         )
         return env
 
+    def test_custom_default_preserves_native_axis_ownership(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=65536)
+        fact = spec.reduction_kernel_fact
+        assert fact is not None
+        native = fact.reductions[0]
+        custom = native._replace(graph_id=1, is_custom=True)
+        for reductions, expected in (
+            ((native,), 4096),
+            ((custom,), None),
+            ((native, custom), 4096),
+            ((custom, native), 4096),
+        ):
+            with self.subTest(reductions=reductions):
+                spec.reduction_kernel_fact = fact._replace(reductions=reductions)
+                self.assertEqual(
+                    spec.autotune_reference_config().reduction_loops, [expected]
+                )
+
     def test_seed_is_persistent_with_reduction_warps(self) -> None:
         # The unified allocator may batch rows when live bytes and launch supply
         # permit it. The reduction remains persistent and its 1024-wide lane work
