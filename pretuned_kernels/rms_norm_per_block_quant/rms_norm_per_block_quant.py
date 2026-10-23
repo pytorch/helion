@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # float8_e4m3fn numeric traits, used by the torch-native reference below. The
@@ -243,7 +244,7 @@ def _make_inputs(
 ) -> tuple[torch.Tensor, ...]:
     in_dtype = torch.bfloat16
     out_dtype = torch.float8_e4m3fn
-    inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=in_dtype)
+    inp = torch.randn(num_tokens, hidden_size, device=DEVICE, dtype=in_dtype)
     result = torch.empty(inp.shape, device=inp.device, dtype=out_dtype)
     scale = torch.empty(
         (num_tokens, hidden_size // group_size),

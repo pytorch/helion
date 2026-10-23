@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -233,7 +234,7 @@ def use_cudagraph() -> bool:
 def _compute_cos_sin_cache(
     max_position_embeddings: int,
     rotary_dim: int,
-    device: str = "cuda",
+    device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     inv_freq = 1.0 / (
@@ -258,13 +259,13 @@ def _make_inputs(
     is_neox = True
     rotary_dim = head_dim
     total_dim = (num_q_heads + 2 * num_kv_heads) * head_dim
-    qkv = torch.empty(num_tokens, total_dim, dtype=in_dtype, device="cuda").uniform_(
+    qkv = torch.empty(num_tokens, total_dim, dtype=in_dtype, device=DEVICE).uniform_(
         -0.1, 0.1
     )
-    positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
-    q_weight = torch.empty(head_dim, dtype=in_dtype, device="cuda").uniform_(0.8, 1.2)
-    k_weight = torch.empty(head_dim, dtype=in_dtype, device="cuda").uniform_(0.8, 1.2)
-    cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim).to(in_dtype)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=DEVICE)
+    q_weight = torch.empty(head_dim, dtype=in_dtype, device=DEVICE).uniform_(0.8, 1.2)
+    k_weight = torch.empty(head_dim, dtype=in_dtype, device=DEVICE).uniform_(0.8, 1.2)
+    cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim, DEVICE, in_dtype)
     return (
         qkv,
         num_q_heads,
