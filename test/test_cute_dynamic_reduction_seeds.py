@@ -171,7 +171,12 @@ def test_dtype_walk_ignores_non_memory_index_and_mask_nodes(
     mask_dtype: torch.dtype,
 ) -> None:
     graph = torch.fx.Graph()
-    index = graph.placeholder("index")
+    if mask_dtype == torch.bool:
+        index = graph.call_function(
+            torch.ops.aten.gt.Scalar, (graph.placeholder("source"), 0)
+        )
+    else:
+        index = graph.call_function(torch.ops.aten.arange.default, (4096,))
     index.meta["val"] = torch.empty(4096, dtype=mask_dtype)
     value = graph.call_function(_host_tensor, ())
     value.meta["val"] = torch.empty(4096, dtype=torch.bfloat16)
