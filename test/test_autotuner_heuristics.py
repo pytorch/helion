@@ -11418,6 +11418,10 @@ class TestTritonReductionHeuristic(TestCase):
                     self.assertEqual(
                         bound.config_spec.default_config().reduction_loops, [None]
                     )
+                    self.assertEqual(
+                        bound.config_spec.autotune_reference_config().reduction_loops,
+                        [None],
+                    )
                     generation = bound.config_spec.create_config_generation()
                     tiny_population = generation.random_population_flat(1)
                     self.assertEqual(

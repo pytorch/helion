@@ -8563,6 +8563,13 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        fact = base.reduction_kernel_fact
+        if fact is not None and any(
+            reduction.is_custom and reduction.block_id == self.block_id
+            for reduction in fact.reductions
+        ):
+            # Keep custom reductions persistent even when heuristics decline.
+            default = high
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.
             # Reserve the next power of two for None, retaining the old default
