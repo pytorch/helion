@@ -2540,11 +2540,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             preferred = Config.from_dict(
                 result[0].config | {"cute_collective_copy": "async"}
             )
-            index = next(
-                (i for i, seed in enumerate(result) if seed == preferred), None
-            )
-            if index is not None:
-                result.insert(0, result.pop(index))
+            if preferred in result:
+                result.remove(preferred)
+                result.insert(0, preferred)
         return result
 
 
