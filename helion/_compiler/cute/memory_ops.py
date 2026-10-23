@@ -36,9 +36,9 @@ from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
-from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
+from ...language.memory_ops import _FLAT_GATHER_SINK_MAX_BYTES
 from ...language.memory_ops import CuteTileVecStoreSite
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
 from ...language.memory_ops import _cute_access_regions
@@ -71,6 +71,7 @@ from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
+from ..utils import compute_slice_size
 from .cache_policy_loads import _CUTE_NC_L2_FIRST_SUFFIX
 from .cache_policy_loads import is_cache_policy_suffix
 from .cute_epilogue import _ZERO_ARG_TARGETS
@@ -117,6 +118,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopOrGridState
     from ..tile_strategy import PerThreadFlattenedTileStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
+    from .device_state import CuteVloopWrapperFact
 
     CuteLaneTileStrategy = PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy
 
@@ -3814,6 +3816,29 @@ def _(state: CodegenState) -> ast.AST:
         return ast.Constant(value=None)
 
     store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
+    if (
+        store_uses_pointer
+        and topk_lane_expr is None
+        and not value_readdressed
+        and (
+            flat_gather := _cute_flat_gather_sink_pointer(
+                state, tensor, subscript, index_exprs, tensor_name
+            )
+        )
+        is not None
+    ):
+        from .device_state import CuteVloopStoreFact
+
+        pointer, wrapper, _whole_chunks = flat_gather
+        store_expr = f"({pointer}).store({{value}})"
+        state.device_function.cute_state.vloop_sink_stores[pointer] = (
+            CuteVloopStoreFact(
+                vec_lane_var=wrapper.vec_lane_var,
+                tensor_name=tensor_name,
+                vec_width=wrapper.vec_width,
+                dtype=tensor.dtype,
+            )
+        )
     assign_expr = expr_from_string(store_expr, value=value)
     _cute_tag_access_regions(assign_expr, tensor_name, regions)
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
@@ -5395,6 +5420,34 @@ def _cute_vector_load_ctx(
                     inner_block_id = bid
                     lane_axis_pos = expr_pos
                     lane_on_stride1 = tensor_dim == stride1_tensor_dim
+        elif isinstance(idx, slice) and idx != slice(None):
+            # A bounded unit-step slice (``x[tile_b, :, tile_t, :half]`` /
+            # ``half:``) addresses the reduction block of its extent at an
+            # offset of ``start`` elements (the indexing lowering spells it
+            # ``start + index``).  The persistent vectorizer admits such a
+            # site when the offset is a multiple of the vector width
+            # (``_persistent_vec_is_exact_aligned``); the rolled hoist
+            # replaces the whole lane coordinate and cannot carry an offset,
+            # so only a persistent block qualifies.
+            if tensor_dim < tensor.ndim and idx.step in (None, 1):
+                from ..reduction_strategy import PersistentReductionStrategy
+
+                slice_size = compute_slice_size(idx, tensor.shape[tensor_dim])
+                matches = [
+                    cand_bid
+                    for cand_bid in _matching_block_ids(env, slice_size)
+                    if env.block_sizes[cand_bid].reduction
+                    and isinstance(
+                        _cute_lane_strategy(state, cand_bid),
+                        PersistentReductionStrategy,
+                    )
+                ]
+                if matches and (
+                    tensor_dim == stride1_tensor_dim or inner_block_id is None
+                ):
+                    inner_block_id = matches[0]
+                    lane_axis_pos = expr_pos
+                    lane_on_stride1 = tensor_dim == stride1_tensor_dim
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor_dim < tensor.ndim:
                 # Same extent matching as the mask builder: ``known_equal``
@@ -5644,6 +5697,131 @@ def _cute_vector_load_ctx(
     return None
 
 
+def _cute_flat_gather_sink_pointer(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: Sequence[str],
+    tensor_name: str,
+) -> tuple[str, CuteVloopWrapperFact, bool] | None:
+    """Pointer of a flattened gather with the lane block's index as its own term.
+
+    ``x_flat[(rows[:, None] + tile_k.index[None, :])[:, :, None] * M +
+    tile_m.index[None, None, :]]`` indexes the tensor's stride-1 dim with one
+    integer tensor whose value is ``row + tile_m.index`` (see
+    ``cute/flat_gather_lane.py``): along ``tile_m`` the addresses are
+    contiguous.  When ``tile_m`` is a grid axis the strategy partitioned into
+    a lane loop and a constexpr V-loop, the tensor's base is aligned for a
+    V-wide packet and ``row`` is a multiple of V elements, the per-lane
+    address is ``base + (row * stride) + (index_m * stride)``: the same value
+    as the lifted index (the sum is taken modulo the index width either way)
+    with the block's per-element index variable visible to
+    ``cute/sink_vector_loops.py``, which then loads V lanes at once.  Returns
+    the pointer expression, the V-loop fact and whether the sink may load a
+    chunk straddling the tile's extent (``whole_chunks_in_tensor``), or None
+    when any part of the proof fails (the ordinary lifted-index pointer is
+    used).
+    """
+    from ..tile_strategy import DeviceGridState
+    from .flat_gather_lane import match_flat_gather_lane
+    from .flat_gather_lane import row_is_multiple_of
+
+    env = CompileEnvironment.current()
+    if state.device_function.config.config.get("cute_vloop_sink") is not True:
+        # Only the sink consumes this pointer form; the lane-loop passes that
+        # run without it (barrier placement, lane confinement) know the
+        # lifted form.
+        return None
+    wrappers = state.device_function.cute_state.vloop_sink_wrappers
+    if (
+        state.fx_node is None
+        or not wrappers
+        or not isinstance(state.codegen.current_grid_state, DeviceGridState)
+        or tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
+        or "None" in index_exprs
+        or len(index_exprs) != tensor.ndim
+    ):
+        return None
+    raw_subscript = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
+    if not isinstance(raw_subscript, (list, tuple)) or len(raw_subscript) != len(
+        subscript
+    ):
+        return None
+    tensor_positions = [
+        pos for pos, idx in enumerate(subscript) if isinstance(idx, torch.Tensor)
+    ]
+    if len(tensor_positions) != 1:
+        return None
+    (position,) = tensor_positions
+    tensor_dim = sum(1 for idx in subscript[:position] if idx is not None)
+    stride = tensor.stride(tensor_dim)
+    if not (isinstance(stride, int) and stride == 1):
+        return None
+    split = match_flat_gather_lane(raw_subscript[position], env)
+    if split is None:
+        return None
+    wrapper = next(
+        (fact for fact in wrappers.values() if fact.block_id == split.lane_block_id),
+        None,
+    )
+    if (
+        wrapper is None
+        or wrapper.vec_width <= 1
+        or wrapper.vec_width * tensor.dtype.itemsize > _FLAT_GATHER_SINK_MAX_BYTES
+        or _cute_active_index_var(state, split.lane_block_id) != wrapper.index_var
+        or not cute_reduction_vector_layout_aligned(
+            env, tensor, tensor_dim, wrapper.vec_width
+        )
+        or not row_is_multiple_of(split.row, wrapper.vec_width, env)
+    ):
+        return None
+    # A chunk of a tile whose extent is not a multiple of V (a jagged feature
+    # tile) may straddle the extent; with V-aligned chunk bases and a lane
+    # extent that is a multiple of V, a chunk whose first lane the program
+    # reads still lies inside the tensor, so the sink may load it under the
+    # mask of its first lane and keep the per-lane selects.
+    whole_chunks_in_tensor = (
+        not wrapper.uniform_vector_mask
+        and wrapper.chunk_base_aligned
+        and env.specialized_multiple(tensor.shape[tensor_dim], wrapper.vec_width)
+    )
+    if not wrapper.uniform_vector_mask and not whole_chunks_in_tensor:
+        return None
+    row_ast = state.env.get(split.row)
+    if not isinstance(row_ast, ast.AST):
+        return None
+    if not isinstance(row_ast, ast.Name):
+        row_ast = state.codegen.lift(row_ast, dce=True, prefix="index")
+    index_type = env.index_type()
+    stride_expr = f"{index_type}({tensor_name}.layout.stride[{tensor_dim}])"
+    terms = [
+        f"({index_type}({index}) * {index_type}({tensor_name}.layout.stride[{dim}]))"
+        for dim, index in enumerate(index_exprs)
+        if dim != tensor_dim
+    ]
+    terms.extend(
+        (
+            f"({index_type}({row_ast.id}) * {stride_expr})",
+            f"({index_type}({wrapper.index_var}) * {stride_expr})",
+        )
+    )
+    pointer = f"({tensor_name}.iterator + {' + '.join(terms)})"
+    return ast.unparse(ast.parse(pointer, mode="eval")), wrapper, whole_chunks_in_tensor
+
+
+def _cute_scalar_load_through_pointer(
+    pointer: str, dtype: torch.dtype, eviction_suffix: str
+) -> str:
+    """``_cute_scalar_load_expr`` for an explicit pointer of a 2- or 4-byte dtype."""
+    if is_cache_policy_suffix(eviction_suffix):
+        # The L2 policy helper only exists in 16-byte vector form.
+        eviction_suffix = ""
+    if eviction_suffix and dtype.itemsize >= 4:
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        return f"cute.arch.load({pointer}, {dtype_str}{eviction_suffix})"
+    return f"({pointer}).load()"
+
+
 def _cute_record_sinkable_scalar_load(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -5716,7 +5894,7 @@ def _cute_record_sinkable_scalar_load(
     if (
         wrapper is None
         or not wrapper.uniform_vector_mask
-        or wrapper.vec_width * tensor.dtype.itemsize > _CUTE_VECTOR_MAX_BYTES
+        or wrapper.vec_width * tensor.dtype.itemsize > _FLAT_GATHER_SINK_MAX_BYTES
         or index_exprs[lane_axis_pos] != wrapper.index_var
         or not cute_reduction_vector_layout_aligned(
             env, tensor, stride1_dim, wrapper.vec_width
@@ -6657,15 +6835,36 @@ def _(state: CodegenState) -> object:
                 if vector_load is not None:
                     load_expr = ast.unparse(vector_load)
     if load_expr is None:
-        load_expr = _cute_scalar_load_expr(
-            tensor_name,
-            index_exprs,
-            tensor.dtype,
-            eviction_suffix=eviction_suffix,
+        flat_gather = _cute_flat_gather_sink_pointer(
+            state, tensor, subscript, index_exprs, tensor_name
         )
-        _cute_record_sinkable_scalar_load(
-            state, tensor, subscript, index_exprs, tensor_name, eviction_suffix
-        )
+        if flat_gather is not None:
+            from .device_state import CuteVloopLoadFact
+
+            pointer, wrapper, whole_chunks = flat_gather
+            load_expr = _cute_scalar_load_through_pointer(
+                pointer, tensor.dtype, eviction_suffix
+            )
+            state.device_function.cute_state.vloop_sink_loads[pointer] = (
+                CuteVloopLoadFact(
+                    vec_lane_var=wrapper.vec_lane_var,
+                    tensor_name=tensor_name,
+                    vec_width=wrapper.vec_width,
+                    dtype=tensor.dtype,
+                    eviction_suffix=eviction_suffix,
+                    whole_chunks_in_tensor=whole_chunks,
+                )
+            )
+        else:
+            load_expr = _cute_scalar_load_expr(
+                tensor_name,
+                index_exprs,
+                tensor.dtype,
+                eviction_suffix=eviction_suffix,
+            )
+            _cute_record_sinkable_scalar_load(
+                state, tensor, subscript, index_exprs, tensor_name, eviction_suffix
+            )
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:

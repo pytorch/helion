@@ -4251,6 +4251,37 @@ class ConfigSpec:
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
 
+    def _cute_config_forms_one_vector_lane(
+        self,
+        config: dict[str, object],
+        rl_spec: ReductionLoopSpec,
+        available: int,
+    ) -> bool:
+        """Whether ``config`` spells out one vector per thread for the
+        persistent reduction ``rl_spec``: an explicit thread count that fits
+        the remaining budget and a vector width whose product is the extent
+        (``PersistentReductionStrategy`` keeps a V-wide fragment per thread
+        exactly then).  That lane is the requested geometry (a pointwise
+        kernel's stride-1 slice, rope's half head dim), not a thread count the
+        budget shrank, so it stays persistent beside wide tile axes.
+        """
+        nt_list = cast("list[int]", config.get("num_threads", []) or [])
+        vec_list = cast("list[int]", config.get("cute_vector_widths", []) or [])
+        requested = self.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+        if (
+            not isinstance(requested, int)
+            or requested <= 0
+            or requested > available
+            or rl_spec.size_hint % requested
+        ):
+            return False
+        if rl_spec.block_id not in self.cute_vector_widths.valid_block_ids():
+            return False
+        vec = self.cute_vector_widths.config_get(vec_list, rl_spec.block_id, 1)
+        return (
+            isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
+        )
+
     def _cute_config_forms_register_tile(
         self,
         config: dict[str, object],
@@ -6325,6 +6356,8 @@ class ConfigSpec:
                             and self._cute_config_forms_register_tile(
                                 config, spec, available
                             )
+                        ) or self._cute_config_forms_one_vector_lane(
+                            config, spec, available
                         ):
                             continue
                         chunk = min(spec.size_hint, available)

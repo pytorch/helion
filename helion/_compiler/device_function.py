@@ -1672,19 +1672,27 @@ class DeviceFunction:
             from .cute.unroll_lane_loads import LaneUnrollNotApplied
             from .cute.unroll_lane_loads import unroll_lane_loads
 
+            # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
+            # nest whose lane loops the sinking pass left rolled (their loads
             # were persistent markers, now packets): unroll the lane loops (of
             # the grid or of a device loop) at trace time with every unrolled
             # lane's loads (packets and scalars alike) issued before the first
             # lane's compute.  The knob-off code is regenerated when no loop
             # takes the unroll.
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
-            if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
+            sinking = bool(self.config.config.get("cute_vloop_sink"))
+            if lane_unroll > 1 and not (
+                sinking and self.cute_state.vloop_sink_unrolled
+            ):
                 kernel_body, unrolled = unroll_lane_loads(
                     kernel_body,
                     lane_unroll,
                     lambda name: self.new_var(name, dce=False),
                 )
-                if not unrolled:
+                # With sinking the knob belongs to the sunk nest's lane loops
+                # (``_normalize_cute_vloop_sink``); a nest that offers none
+                # keeps its code rather than regenerating knob-off.
+                if not unrolled and not sinking:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
             # Preserve the global FMA decisions above. This optional pass
@@ -2241,6 +2249,16 @@ class DeviceFunction:
             source = env.tensor_input_source(arg.fake_value)
             runtime = env.runtime_value_for_tensor(arg.fake_value)
             if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
+                if source is not None or not input_metadata_specialized:
+                    continue
+                # A tensor the host function allocates (``torch.empty_like``)
+                # has no runtime value at compile time; its layout is what
+                # the traced allocation computed from the specialized input
+                # metadata, so a literal traced stride is the stride of every
+                # call this bound kernel serves.
+                for dim, fake_stride in enumerate(arg.fake_value.stride()):
+                    if type(fake_stride) is int:
+                        result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
                 cache_safe = source is not None and (

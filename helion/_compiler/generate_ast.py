@@ -2269,10 +2269,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _sink_grid_vector_loops(self) -> None:
         cute_state = self.device_function.cute_state
         fired = False
+        unrolled = False
         if cute_state.vloop_sink_wrappers:
             from .cute.sink_vector_loops import sink_grid_vector_loops
 
-            self.device_function.body, fired = sink_grid_vector_loops(
+            self.device_function.body, fired, unrolled = sink_grid_vector_loops(
                 list(self.device_function.body),
                 wrappers=cute_state.vloop_sink_wrappers,
                 loads=cute_state.vloop_sink_loads,
@@ -2290,7 +2291,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg in self.device_function.arguments
                     if isinstance(arg, TensorArg)
                 },
+                proven_disjoint_tensor_pairs=(
+                    self.device_function.proven_disjoint_tensor_pairs()
+                ),
+                stores=cute_state.vloop_sink_stores,
             )
+            cute_state.vloop_sink_unrolled = unrolled
         if not fired and cute_state.vloop_sink_layout_applied:
             # The knob shaped the thread layout but nothing was sunk.  The
             # knob must not change the code by itself, so start over with it

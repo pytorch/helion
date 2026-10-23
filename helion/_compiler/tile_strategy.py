@@ -33,6 +33,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cute.masked_packet_load_names import MASKED_PACKET_LOAD_HELPER_NAMES
 from .cute.persistent_branch_vec import PACKET_STORE_BYTES
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
@@ -5744,9 +5745,14 @@ def _is_proven_relocatable_call(
         "cute.arch.warp_idx",
     }:
         return True
-    if name == "cute.arch.load" or name in _CUTE_CACHE_LOAD_HELPER_NAMES:
-        # The packet load and its L2-policy helper forms, the load-side twin
-        # of the ``_cute_store_*`` convention ``_is_store_call`` relies on.
+    if (
+        name == "cute.arch.load"
+        or name in _CUTE_CACHE_LOAD_HELPER_NAMES
+        or name in MASKED_PACKET_LOAD_HELPER_NAMES
+    ):
+        # The packet load, its L2-policy helper forms and the predicated
+        # packet loads of the V-loop sink, the load-side twin of the
+        # ``_cute_store_*`` convention ``_is_store_call`` relies on.
         # Only the listed helpers: the memory passes collect and measure
         # exactly these, so any other ``_cute_load_*`` stays unproven.
         return allow_load
@@ -10726,6 +10732,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         uniform_vector_mask=isinstance(begin, int)
                         and begin == 0
                         and env.specialized_multiple(numel, vec_width),
+                        chunk_base_aligned=isinstance(begin, int) and begin == 0,
                     )
                 )
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
@@ -11075,6 +11082,36 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             )
             if mask_statement is not None:
                 index_setup.append(mask_statement)
+            wrapper = vec_wrappers.get(self._lane_var_by_block.get(block_idx, ""))
+            if wrapper is not None and env.backend_name == "cute":
+                from .cute.device_state import CuteVloopWrapperFact
+
+                # The device-loop twin of the grid fact: the V-loop sink
+                # (``cute/sink_vector_loops.py``) finds this loop's constexpr
+                # V-loop wherever it nests.  A chunk base
+                # ``offset + ... * V`` is V-aligned only from a zero origin,
+                # and cannot straddle an extent that is a multiple of V.
+                self.fn.cute_state.vloop_sink_wrappers[wrapper.vec_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=self._cute_lane_vec_width_by_block.get(block_idx, 1),
+                        lane_var=self._lane_var_by_block[block_idx],
+                        vec_lane_var=wrapper.vec_lane_var,
+                        base_index_var=wrapper.base_index_var,
+                        index_var=index_var,
+                        mask_var=self.mask_vars.get(block_idx),
+                        uniform_vector_mask=isinstance(begin, int)
+                        and begin == 0
+                        and step in (None, 1)
+                        and env.specialized_multiple(
+                            proxy_end,
+                            self._cute_lane_vec_width_by_block.get(block_idx, 1),
+                        ),
+                        chunk_base_aligned=isinstance(begin, int)
+                        and begin == 0
+                        and step in (None, 1),
+                    )
+                )
             body = [for_node]
         assert for_node is not None
         # Run index/mask setup once per loop-offset and per-lane before user body.

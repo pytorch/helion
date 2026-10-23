@@ -649,6 +649,10 @@ class CuteVloopWrapperFact:
     # outside the extent: a bound on the per-element index is equivalent to
     # the same bound on the chunk base.
     uniform_vector_mask: bool
+    # The tile starts at zero with a unit step, so every per-thread chunk
+    # base is a multiple of ``vec_width`` (the extent may still be dynamic:
+    # a jagged tile's chunks can straddle it).
+    chunk_base_aligned: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -667,6 +671,29 @@ class CuteVloopLoadFact:
     dtype: torch.dtype
     # The site's cache-policy marker, applied to the vector form of the load.
     eviction_suffix: str
+    # Every V-aligned chunk whose first element the program reads lies
+    # inside the tensor (its extent along the lane dim is a multiple of V
+    # and the chunk bases are V-aligned), so a chunk straddling a dynamic
+    # tile extent may be loaded whenever its first lane is in bounds.
+    whole_chunks_in_tensor: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteVloopStoreFact:
+    """A scalar tile store that a sunk V-loop may turn into one vector store.
+
+    The store-side twin of ``CuteVloopLoadFact``: recorded by the store
+    lowering (keyed by the scalar pointer expression) when the site
+    addresses the vectorized axis at its stride-1 dim with the plain
+    per-element index inside loops nested in the V-loop.  The sink pass
+    collects the V per-lane values and flushes them after the V-loop with
+    one ``_cute_store_u32_vec`` / ``_cute_store_u16_vec``.
+    """
+
+    vec_lane_var: str
+    tensor_name: str
+    vec_width: int
+    dtype: torch.dtype
 
 
 class CuteDeviceFunctionState:
@@ -681,9 +708,14 @@ class CuteDeviceFunctionState:
         # loads (by pointer expression) for ``cute/sink_vector_loops.py``.
         self.vloop_sink_wrappers: dict[str, CuteVloopWrapperFact] = {}
         self.vloop_sink_loads: dict[str, CuteVloopLoadFact] = {}
+        self.vloop_sink_stores: dict[str, CuteVloopStoreFact] = {}
         # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
         # no V-loop is sunk after all, codegen restarts with the knob off.
         self.vloop_sink_layout_applied = False
+        # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
+        # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
+        # applies to the sunk lane loops once their packets are placed.
+        self.vloop_sink_unrolled = False
         # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
         # matmul product sum or a lane-loop reduction marker) assumed for the
         # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
