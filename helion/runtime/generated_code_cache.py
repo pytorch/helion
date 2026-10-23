@@ -250,10 +250,10 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
 
 
 # Settings that cannot change generated code. Search policy selects a config
-# already included in the source key, and the cache toggle is always enabled
-# when a key is computed. Every other field, including future ones, is keyed.
+# already included in the source key, and the cache level does not change the
+# generated source. Every other field, including future ones, is keyed.
 _NON_CODEGEN_SETTING_PREFIXES = ("autotun",)
-_NON_CODEGEN_SETTINGS = frozenset({"generated_code_cache"})
+_NON_CODEGEN_SETTINGS = frozenset({"cache_level"})
 
 
 def _compilation_settings_key(settings: Settings) -> object:
@@ -310,7 +310,7 @@ def _argument_key(value: object) -> object:
 def binding_input_key(kernel: Kernel, args: Sequence[object]) -> str | None:
     """Fingerprint the kernel's dependencies and the arguments' structure."""
     if (
-        not kernel.settings.generated_code_cache
+        kernel.settings.cache_level != "code"
         or kernel.settings.backend != "triton"
         or torch.compiler.is_compiling()
     ):
@@ -650,7 +650,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     """
     state = bound._generated_code
     if (
-        not bound.settings.generated_code_cache
+        bound.settings.cache_level != "code"
         or should_skip_cache()
         or bound.settings.backend != "triton"
         or bound.env._is_distributed

@@ -22,9 +22,13 @@ and {py:class}`~helion.autotuner.local_cache.StrictLocalAutotuneCache`.
 
 ### Generated Triton source cache
 
-For Triton kernels, opt in to caching the selected configuration's
-generated source with `generated_code_cache=True` or
-`HELION_GENERATED_CODE_CACHE=1`.
+The default `cache_level="config"` retains the existing autotuned configuration
+cache. For Triton kernels, opt in to also caching the selected configuration's
+generated source with `cache_level="code"` or `HELION_CACHE_LEVEL=code`.
+An explicit `cache_level` takes precedence over the environment variable.
+Setting `cache_level="code"` on a non-Triton kernel raises `ValueError`.
+The global `HELION_CACHE_LEVEL=code` setting instead logs a warning for
+non-Triton kernels and leaves them at `cache_level="config"`.
 
 With the default `@helion.kernel` and no `config=`, the default adaptive
 autotuner selects the config, and the cache only skips source generation:
@@ -37,7 +41,7 @@ compiles the frontend to choose between them):
 ```python
 @helion.kernel(
     config=helion.Config(block_sizes=[64]),
-    generated_code_cache=True,
+    cache_level="code",
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
     ...

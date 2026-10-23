@@ -254,13 +254,13 @@ class TestGeneratedCodeEviction(TestCase):
             self.assertEqual(cache.load_generated_code("entry"), source)
 
     def test_settings_key_uses_explicit_denylist(self) -> None:
-        settings = helion.Settings()
+        settings = helion.Settings(backend="triton")
         key = cache._compilation_settings_key(settings)
         self.assertIsNot(key, cache._UNCACHEABLE)
         for name, value in (
             ("autotune_random_seed", settings.autotune_random_seed + 1),
             ("autotune_effort", "none"),
-            ("generated_code_cache", not settings.generated_code_cache),
+            ("cache_level", "code" if settings.cache_level == "config" else "config"),
         ):
             self.assertEqual(
                 cache._compilation_settings_key(settings.copy(**{name: value})), key

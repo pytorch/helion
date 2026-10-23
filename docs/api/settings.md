@@ -76,8 +76,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 ### Core Compilation Settings
 
-`generated_code_cache=True` (or `HELION_GENERATED_CODE_CACHE=1`) enables the
-opt-in persistent source cache for selected Triton configs. With the default
+`cache_level="config"` is the default and preserves the existing autotuned
+configuration cache. `cache_level="code"` (or `HELION_CACHE_LEVEL=code`) also
+enables the opt-in persistent source cache for selected Triton configs.
+Explicit settings take precedence over `HELION_CACHE_LEVEL`.
+An explicit `cache_level="code"` on a non-Triton kernel raises `ValueError`;
+the global environment setting instead logs a warning and uses
+`cache_level="config"` for that kernel. With the default
 `@helion.kernel` and no `config=`, adaptive autotuning still runs frontend
 compilation in every process and the cache only skips source generation.
 With a single explicit config, a custom config selector or disabled autotuning,

@@ -98,7 +98,7 @@ class TestGeneratedCodeDependencies(TestCase):
         kernel = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_global)
         key = self._key(kernel)
@@ -122,7 +122,7 @@ class TestGeneratedCodeDependencies(TestCase):
         kernel = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_values)
         key = self._key(kernel)
@@ -137,21 +137,21 @@ class TestGeneratedCodeDependencies(TestCase):
         opaque = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_opaque)
         self.assertIsNone(self._key(opaque))
         dynamic = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_dynamic)
         self.assertIsNone(self._key(dynamic))
         missing = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_missing)
         with patch.dict(_nested_missing.__globals__):
@@ -160,7 +160,7 @@ class TestGeneratedCodeDependencies(TestCase):
         supported = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="none",
         )(_nested_global)
         with patch.object(supported.settings, "fast_math", _OPAQUE):

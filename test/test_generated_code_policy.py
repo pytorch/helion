@@ -30,6 +30,92 @@ def _policy_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+class TestCacheLevelSettings(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._test_stack.enter_context(
+            patch.dict("os.environ", {"HELION_CACHE_LEVEL": ""})
+        )
+
+    def test_default_and_explicit_cache_levels(self) -> None:
+        self.assertEqual(helion.Settings(backend="triton").cache_level, "config")
+        for level in ("config", "code"):
+            with self.subTest(level=level):
+                kernel = helion.kernel(backend="triton", cache_level=level)(
+                    _policy_kernel.fn
+                )
+                self.assertEqual(kernel.settings.cache_level, level)
+
+    def test_environment_and_explicit_precedence(self) -> None:
+        with patch.dict("os.environ", {"HELION_CACHE_LEVEL": "code"}):
+            self.assertEqual(helion.Settings(backend="triton").cache_level, "code")
+            kernel = helion.kernel(backend="triton", cache_level="config")(
+                _policy_kernel.fn
+            )
+            self.assertEqual(kernel.settings.cache_level, "config")
+        with patch.dict("os.environ", {"HELION_CACHE_LEVEL": "config"}):
+            self.assertEqual(
+                helion.Settings(backend="triton", cache_level="code").cache_level,
+                "code",
+            )
+
+    def test_invalid_cache_level(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cache_level"):
+            helion.Settings(backend="triton", cache_level="invalid")
+        with patch.dict("os.environ", {"HELION_CACHE_LEVEL": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "HELION_CACHE_LEVEL"):
+                helion.Settings(backend="triton")
+            self.assertEqual(
+                helion.Settings(backend="triton", cache_level="config").cache_level,
+                "config",
+            )
+
+    def test_explicit_code_cache_rejects_unsupported_backend(self) -> None:
+        with self.assertRaisesRegex(ValueError, "triton"):
+            helion.kernel(backend="cute", cache_level="code")(_policy_kernel.fn)
+
+    def test_environment_code_cache_warns_for_unsupported_backend(self) -> None:
+        with (
+            patch.dict("os.environ", {"HELION_CACHE_LEVEL": "code"}),
+            self.assertLogs("helion.runtime.settings", level="WARNING") as logs,
+        ):
+            kernel = helion.kernel(backend="cute")(_policy_kernel.fn)
+        self.assertEqual(kernel.settings.cache_level, "config")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("HELION_CACHE_LEVEL", logs.output[0])
+        self.assertIn("cute", logs.output[0])
+        with (
+            patch.dict("os.environ", {"HELION_CACHE_LEVEL": "code"}),
+            self.assertNoLogs("helion.runtime.settings", level="WARNING"),
+        ):
+            self.assertEqual(kernel.settings.copy().cache_level, "config")
+            self.assertEqual(
+                helion.Settings(**kernel.settings.to_dict()).cache_level, "config"
+            )
+
+    def test_explicit_config_cache_suppresses_backend_warning(self) -> None:
+        with (
+            patch.dict("os.environ", {"HELION_CACHE_LEVEL": "code"}),
+            self.assertNoLogs("helion.runtime.settings", level="WARNING"),
+        ):
+            kernel = helion.kernel(backend="cute", cache_level="config")(
+                _policy_kernel.fn
+            )
+        self.assertEqual(kernel.settings.cache_level, "config")
+
+    def test_copy_and_serialization_keep_effective_cache_level(self) -> None:
+        with patch.dict("os.environ", {"HELION_CACHE_LEVEL": "code"}):
+            settings = helion.Settings(backend="triton")
+        self.assertEqual(settings.copy().cache_level, "code")
+        self.assertEqual(helion.Settings(**settings.to_dict()).cache_level, "code")
+        self.assertEqual(settings.copy(cache_level="config").cache_level, "config")
+        with self.assertRaisesRegex(ValueError, "triton"):
+            settings.copy(backend="cute")
+        self.assertEqual(
+            settings.copy(backend="cute", cache_level="config").cache_level, "config"
+        )
+
+
 class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -66,7 +152,7 @@ class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
         return SimpleNamespace(__file__=str(path), _policy_kernel=lambda x: x + 1)
 
     def _kernel(self, **settings: object) -> Kernel:
-        return helion.kernel(backend="triton", generated_code_cache=True, **settings)(
+        return helion.kernel(backend="triton", cache_level="code", **settings)(
             _policy_kernel.fn
         )
 

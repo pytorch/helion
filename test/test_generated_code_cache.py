@@ -110,7 +110,7 @@ def _runner(kernel: Kernel, args: tuple[object, ...]):
 
 def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
     settings.setdefault("autotune_effort", "none")
-    kernel = helion.kernel(backend="triton", generated_code_cache=True, **settings)(
+    kernel = helion.kernel(backend="triton", cache_level="code", **settings)(
         _cached_scale.fn
     )
     return _runner(kernel, (x, scale))
@@ -118,7 +118,7 @@ def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
 
 def _cached_bound(fn: Callable[..., torch.Tensor], *args: object):
     kernel = helion.kernel(
-        backend="triton", generated_code_cache=True, autotune_effort="none"
+        backend="triton", cache_level="code", autotune_effort="none"
     )(fn)
     return _runner(kernel, args)
 
@@ -586,13 +586,13 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         self.assertFalse((self.cache_root / "generated_code").exists())
 
     def test_opaque_dependency_keeps_frontend(self) -> None:
-        kernel = helion.kernel(_cached_opaque.fn, generated_code_cache=True)
+        kernel = helion.kernel(_cached_opaque.fn, backend="triton", cache_level="code")
         self.assertIsNone(cache.binding_input_key(kernel, (torch.ones(16),)))
 
     def test_global_values_invalidate_frontend_identity(self) -> None:
         def bind():
             kernel = helion.kernel(
-                backend="triton", generated_code_cache=True, autotune_effort="none"
+                backend="triton", cache_level="code", autotune_effort="none"
             )(_cached_shift.fn)
             return kernel.bind((torch.ones(16),))
 
@@ -665,7 +665,7 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         # (partitioned or cloud SKUs); the source key bakes both in, so the
         # pre-frontend binding key must too. No frontend or CUDA is needed.
         kernel = helion.kernel(
-            backend="triton", generated_code_cache=True, autotune_effort="none"
+            backend="triton", cache_level="code", autotune_effort="none"
         )(_cached_scale.fn)
         x = torch.ones(16)
         signature = kernel._base_specialization_key((x, 2))
@@ -703,7 +703,7 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
     def test_ineligible_configs_use_codegen(self, skip: str) -> None:
         bound = _bound(torch.ones(16))
         if skip == "disabled":
-            bound.settings.generated_code_cache = False
+            bound.settings.cache_level = "config"
         if skip == "skip_cache":
             os.environ["HELION_SKIP_CACHE"] = "1"
         config = bound._normalized_config_copy(helion.Config(block_sizes=[32]))

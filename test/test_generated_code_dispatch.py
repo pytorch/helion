@@ -68,7 +68,7 @@ def _dynamic_2d_kernel(**settings: object) -> Kernel:
     return helion.kernel(
         backend="triton",
         static_shapes=False,
-        generated_code_cache=True,
+        cache_level="code",
         autotuner_fn=_select,
         **settings,
     )(_add_one_2d)
@@ -97,7 +97,7 @@ def _scaled_mm_kernel() -> Kernel:
     return helion.kernel(
         backend="triton",
         static_shapes=False,
-        generated_code_cache=True,
+        cache_level="code",
         config=helion.Config(block_sizes=[16, 32, 32]),
     )(_scaled_mm)
 
@@ -164,7 +164,7 @@ class TestGeneratedCodeDispatch(TestCase):
 
     def _kernel(self, fn: object = _runtime_scale, **settings: object) -> Kernel:
         settings.setdefault("config", _CONFIG)
-        settings.setdefault("generated_code_cache", True)
+        settings.setdefault("cache_level", "code")
         return helion.kernel(backend="triton", static_shapes=False, **settings)(fn)
 
     def _frontend_count(self):
@@ -274,9 +274,7 @@ class TestGeneratedCodeDispatch(TestCase):
         self._kernel(_specialized_rows)(x, 2)
         runner = _runner(self._kernel(_specialized_rows), (x, 2))
         self.assertIsInstance(runner, _CachedBoundKernel)
-        native = self._kernel(_specialized_rows, generated_code_cache=False).bind(
-            (x, 2)
-        )
+        native = self._kernel(_specialized_rows, cache_level="config").bind((x, 2))
         runner_extractors = runner._specialize_extra()
         native_extractors = native._specialize_extra()
         self.assertEqual(
@@ -436,9 +434,7 @@ class TestGeneratedCodeDispatch(TestCase):
         ):
             runner = _runner(self._kernel(_specialized_rows), (x, 2))
             self.assertIsInstance(runner, _CachedBoundKernel)
-            native = self._kernel(_specialized_rows, generated_code_cache=False).bind(
-                (x, 2)
-            )
+            native = self._kernel(_specialized_rows, cache_level="config").bind((x, 2))
             runner_values = [runner._guard_fact_value(fact) for fact in facts]
             self.assertNotIn(None, runner_values)
             self.assertEqual(

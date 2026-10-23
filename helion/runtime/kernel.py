@@ -1710,7 +1710,7 @@ class Kernel(Generic[_R]):
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
 
-        With ``generated_code_cache``, a warm cache hit runs frontend
+        With ``cache_level="code"``, a warm cache hit runs frontend
         compilation here to return an ordinary binding, while calling the
         kernel directly (``kernel(*args)``) does not.
 

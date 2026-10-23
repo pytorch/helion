@@ -92,7 +92,7 @@ class TestGeneratedCodeHandoff(TestCase):
     def _kernel(self, *, handoff: bool = False):
         return helion.kernel(
             backend="triton",
-            generated_code_cache=True,
+            cache_level="code",
             autotune_effort="quick",
             autotuner_fn=self.selector,
             autotune_handoff=handoff,

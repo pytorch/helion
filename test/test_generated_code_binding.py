@@ -62,9 +62,9 @@ class TestGeneratedCodeBinding(_GeneratedCodeBindingTestCase):
                 static_shapes=False,
                 config=helion.Config(block_sizes=[32]),
                 disable_autotuner_heuristics=True,
-                generated_code_cache=enabled,
+                cache_level=level,
             )(_runtime_scale)
-            for enabled in (False, True)
+            for level in ("config", "code")
         ]
         keys = []
         for kernel in kernels:
@@ -137,7 +137,7 @@ class TestGeneratedCodeLegacyCapture(_GeneratedCodeBindingTestCase):
             backend="triton",
             static_shapes=True,
             config=helion.Config(block_sizes=[32]),
-            generated_code_cache=True,
+            cache_level="code",
             torch_compile_fusion=False,
         )(_runtime_scale)
 
