@@ -3879,9 +3879,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for candidate, _lhs, _rhs, node in mma_candidates
                         },
                     )
-        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
-        if grid_policy.raise_independent_axis_block_size_minimums:
-            config_spec.raise_grid_block_minimums()
         if (
             len(device_ir.root_ids) > 1
             and CompileEnvironment.current().cute_fission_plan is None
@@ -3926,6 +3923,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         env = CompileEnvironment.current()
         analysis = DeviceIRAnalysis.build(device_ir, env)
         config_spec.kernel_grid_fact = analysis.kernel_grid_fact
+        # After the grid topology is recorded: the floors budget each root
+        # grid separately, so this must see ``kernel_grid_fact``.
+        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
+        if grid_policy.raise_independent_axis_block_size_minimums:
+            config_spec.raise_grid_block_minimums()
         if env.backend.name == "cute":
             from .cute.loop_nesting import boundary_only_grid_blocks
             from .cute.loop_nesting import tile_loop_paths
