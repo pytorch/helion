@@ -25,6 +25,10 @@ from ._flash_row_mma_runtime import pack_bf16x2  # noqa: F401
 from ._flash_row_mma_runtime import pack_f16x2  # noqa: F401
 from ._flash_row_mma_runtime import stg_f32  # noqa: F401
 
+# ``ld.global`` qualifier of a load: the read-only (non-coherent) path for a
+# tensor no store of the launch writes, else the default path.
+_NC = {False: "", True: ".nc"}
+
 
 @dsl_user_op
 def ldmatrix_x2(
@@ -140,13 +144,13 @@ def mma_tf32(
 
 @dsl_user_op
 def ldg_b32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> cutlass.Uint32:
-    """``ld.global.b32``: one 4-byte word."""
+    """``ld.global.b32``: one 4-byte word (``nc``: the read-only path)."""
     result = llvm.inline_asm(
         T.i32(),
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        "ld.global.b32 $0, [$1];",
+        f"ld.global{_NC[nc]}.b32 $0, [$1];",
         "=r,l,~{memory}",
         has_side_effects=True,
         loc=loc,
@@ -157,14 +161,124 @@ def ldg_b32(
 
 
 @dsl_user_op
-def ldg_f32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+def cp_async_16_ca(
+    smem_address: object, gmem_address: object, *, loc: object = None, ip: object = None
+) -> None:
+    """``cp.async.ca.shared.global`` of one 16-byte packet (L1-allocating)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global [$0], [$1], 16;",
+        "r,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def cp_async_4(
+    smem_address: object, gmem_address: object, *, loc: object = None, ip: object = None
+) -> None:
+    """``cp.async.ca.shared.global`` of one 4-byte word (a side-load element
+    or a pair of 16-bit ones) into a per-thread shared slot."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global [$0], [$1], 4;",
+        "r,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def lds_s32(
+    smem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Int32:
+    """``ld.shared.s32``: one int32 value."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
+        "ld.shared.s32 $0, [$1];",
+        "=r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int32(result)
+
+
+def _lds_b16_as_f32(
+    kind: str, smem_address: object, *, loc: object, ip: object
 ) -> cutlass.Float32:
-    """``ld.global.f32``: one fp32 value."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
+        f"{{ .reg .b16 h; ld.shared.b16 h, [$1]; cvt.f32.{kind} $0, h; }}",
+        "=f,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def lds_f16_as_f32(
+    smem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``ld.shared.b16`` of an fp16 element, widened to fp32 (exact)."""
+    return _lds_b16_as_f32("f16", smem_address, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def lds_bf16_as_f32(
+    smem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``ld.shared.b16`` of a bf16 element, widened to fp32 (exact)."""
+    return _lds_b16_as_f32("bf16", smem_address, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v4_b32(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.b32``: one 16-byte packet (eight 16-bit elements) as
+    four words."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return _words(result, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_f32(
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``ld.global.f32``: one fp32 value (``nc``: the read-only path)."""
     result = llvm.inline_asm(
         T.f32(),
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        "ld.global.f32 $0, [$1];",
+        f"ld.global{_NC[nc]}.f32 $0, [$1];",
         "=f,l,~{memory}",
         has_side_effects=True,
         loc=loc,
@@ -176,13 +290,13 @@ def ldg_f32(
 
 @dsl_user_op
 def ldg_v2_f32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> tuple[object, ...]:
     """``ld.global.v2.f32``: two consecutive fp32 values (8-byte aligned)."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        "ld.global.v2.f32 {$0, $1}, [$2];",
+        f"ld.global{_NC[nc]}.v2.f32 {{$0, $1}}, [$2];",
         "=f,=f,l,~{memory}",
         has_side_effects=True,
         loc=loc,
@@ -193,12 +307,12 @@ def ldg_v2_f32(
 
 
 def _ldg_b16_as_f32(
-    kind: str, gmem_address: object, *, loc: object, ip: object
+    kind: str, gmem_address: object, *, nc: bool, loc: object, ip: object
 ) -> cutlass.Float32:
     result = llvm.inline_asm(
         T.f32(),
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        f"{{ .reg .b16 h; ld.global.b16 h, [$1]; cvt.f32.{kind} $0, h; }}",
+        f"{{ .reg .b16 h; ld.global{_NC[nc]}.b16 h, [$1]; cvt.f32.{kind} $0, h; }}",
         "=f,l,~{memory}",
         has_side_effects=True,
         loc=loc,
@@ -210,18 +324,18 @@ def _ldg_b16_as_f32(
 
 @dsl_user_op
 def ldg_f16_as_f32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> cutlass.Float32:
     """One fp16 element loaded and widened to fp32 (exact)."""
-    return _ldg_b16_as_f32("f16", gmem_address, loc=loc, ip=ip)
+    return _ldg_b16_as_f32("f16", gmem_address, nc=nc, loc=loc, ip=ip)
 
 
 @dsl_user_op
 def ldg_bf16_as_f32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> cutlass.Float32:
     """One bf16 element loaded and widened to fp32 (exact)."""
-    return _ldg_b16_as_f32("bf16", gmem_address, loc=loc, ip=ip)
+    return _ldg_b16_as_f32("bf16", gmem_address, nc=nc, loc=loc, ip=ip)
 
 
 def _unpack_x2(

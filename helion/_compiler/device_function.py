@@ -2123,7 +2123,10 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel
             # with a (1, cluster_n, 1) thread-block cluster.
@@ -2374,7 +2377,10 @@ class DeviceFunction:
             call_grid_expr = expr_from_string(
                 f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The cluster splits each row across ``cluster_n`` CTAs on a new
             # trailing grid dim.  Only a 1-D grid can host the cluster dim.

@@ -79,6 +79,11 @@ from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cute_mma_dag import AXIS_LEAD
 from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
@@ -95,6 +100,10 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_FIXUP
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
@@ -104,6 +113,8 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
+from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
+from .._compiler.cute.cute_mma_dag import fixup_admitted
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
@@ -1735,9 +1746,16 @@ class ConfigSpec:
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
+        self.cute_mma_dag_aux: EnumFragment | None = None
         # The tcgen05 mode's persistent launch (CTAs per SM); None where the
         # mode or its one-tile-per-CTA region programs leave it no subject.
         self.cute_mma_dag_persistent: EnumFragment | None = None
+        # The tcgen05 region renderer's thread-block cluster over a
+        # full-slice fragment axis; None where the program has no such axis.
+        self.cute_mma_dag_cluster: EnumFragment | None = None
+        # How the split's CTAs combine their row reductions: one cluster's
+        # distributed shared memory, or the fixup grid's global workspace.
+        self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
@@ -3268,9 +3286,26 @@ class ConfigSpec:
         """
         self.cute_mma_dag_facts = facts
         modes = MMA_DAG_MODES
+        if facts.chain_vecs:
+            # No warp config runs a fragment chain over a row vector: the
+            # choice would only be repaired to ``off`` (and the random half
+            # of a search spent on the SIMT lowering).
+            modes = tuple(mode for mode in modes if mode != MMA_DAG_WARP)
         if facts.tcgen05 is not None:
             modes = (*modes, MMA_DAG_TCGEN05)
-        self.cute_mma_dag = EnumFragment(choices=modes)
+        search = modes
+        if facts.split_axis >= 0 and MMA_DAG_TCGEN05 in modes:
+            # A full-slice fragment program: its row reductions over the
+            # whole axis have the region renderer's lowering, while the SIMT
+            # fallback's lane-restore pass declines most tilings (50 of 55
+            # random "off" configs at 2048^3 and 49 of 56 at 512x1024x1024
+            # failed to compile, every tensor-memory config compiled), so
+            # the search samples the tensor-memory mode; "off" stays a legal
+            # value (the repair fallback, explicit configs).
+            search = tuple(mode for mode in modes if mode != MMA_DAG_OFF)
+        self.cute_mma_dag = EnumFragment(
+            choices=modes, search_choices=search if search != modes else None
+        )
         self.cute_mma_dag_warps = EnumFragment(
             choices=(
                 MMA_DAG_DEFAULT_WARPS,
@@ -3287,9 +3322,29 @@ class ConfigSpec:
         self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
         self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
+        if facts.aux_candidates:
+            self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
         if facts.tcgen05 is not None and not facts.tcgen05.regions:
             self.cute_mma_dag_persistent = EnumFragment(
                 choices=MMA_DAG_PERSISTENT_CHOICES
+            )
+        if (
+            facts.tcgen05 is not None
+            and facts.tcgen05.regions
+            and facts.split_axis >= 0
+        ):
+            # The split count: a portable cluster's (<= 8), and the fixup
+            # grid's wider ones where the program admits the fixup form.
+            admitted = fixup_admitted(facts)
+            self.cute_mma_dag_cluster = EnumFragment(
+                choices=tuple(
+                    choice
+                    for choice in MMA_DAG_CLUSTER_CHOICES
+                    if admitted or choice <= MMA_DAG_CLUSTER_MAX
+                )
+            )
+            self.cute_mma_dag_split = (
+                EnumFragment(choices=MMA_DAG_SPLIT_CHOICES) if admitted else None
             )
 
     def _normalize_cute_mma_dag(
@@ -3310,8 +3365,13 @@ class ConfigSpec:
             (MMA_DAG_EXCHANGE_KEY, self.cute_mma_dag_exchange),
             (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
+            (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
         ):
-            assert fragment is not None
+            if fragment is None:
+                # The aux knob has no subject here: inert, no choices.
+                assert key == MMA_DAG_AUX_KEY
+                config[key] = MMA_DAG_AUX_CHOICES[0]
+                continue
             value = config.setdefault(key, fragment.default())
             if value not in fragment.choices or type(value) is bool:
                 if fix_invalid:
@@ -3333,6 +3393,53 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
             config[MMA_DAG_PERSISTENT_KEY] = 0
+        cluster_fragment = self.cute_mma_dag_cluster
+        cluster = config.setdefault(MMA_DAG_CLUSTER_KEY, 1)
+        allowed = (1,) if cluster_fragment is None else cluster_fragment.choices
+        if cluster not in allowed or type(cluster) is not int:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY} must be one of {allowed!r}, got {cluster!r}"
+                )
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 and config[MMA_DAG_CLUSTER_KEY] != 1:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_CLUSTER_KEY} needs the tcgen05 mode")
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        split_fragment = self.cute_mma_dag_split
+        split = config.setdefault(MMA_DAG_SPLIT_KEY, MMA_DAG_SPLIT_CLUSTER)
+        split_allowed = (
+            (MMA_DAG_SPLIT_CLUSTER,)
+            if split_fragment is None
+            else split_fragment.choices
+        )
+        if split not in split_allowed:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_SPLIT_KEY} must be one of {split_allowed!r}, got {split!r}"
+                )
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        if (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_CLUSTER
+            and cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX
+        ):
+            # A portable thread-block cluster holds eight CTAs: a wider split
+            # combines its rows through the fixup grid (offered only where
+            # the program admits it; the cluster choices stop at eight
+            # elsewhere, so this is the admitted case).
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY}={config[MMA_DAG_CLUSTER_KEY]} needs "
+                    f"{MMA_DAG_SPLIT_KEY}={MMA_DAG_SPLIT_FIXUP!r} (a portable cluster "
+                    f"holds at most {MMA_DAG_CLUSTER_MAX} CTAs)"
+                )
+            config[MMA_DAG_SPLIT_KEY] = (
+                MMA_DAG_SPLIT_FIXUP
+                if split_fragment is not None
+                else MMA_DAG_SPLIT_CLUSTER
+            )
+            if split_fragment is None:
+                config[MMA_DAG_CLUSTER_KEY] = 1
         if config[MMA_DAG_KEY] == MMA_DAG_OFF:
             # The warp count, stage depth and data routes are inert without
             # the mode.
@@ -3342,7 +3449,10 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
             config[MMA_DAG_PERSISTENT_KEY] = 0
+            config[MMA_DAG_CLUSTER_KEY] = 1
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
             return
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
@@ -3356,11 +3466,21 @@ class ConfigSpec:
         for axis in facts.axes:
             if axis.kind == AXIS_LEAD and axis.block_id in indices:
                 block_sizes[indices[axis.block_id]] = 1
-        sizes_by_block = {
+        sizes_by_block: dict[int, object] = {
             block_id: block_sizes[index] for block_id, index in indices.items()
         }
         warps, stages = config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY]
         mode = cast("str", config[MMA_DAG_KEY])
+        reason = apply_mma_dag_cluster(
+            facts,
+            sizes_by_block,
+            config[MMA_DAG_CLUSTER_KEY],
+            config[MMA_DAG_SPLIT_KEY],
+        )
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
+            config[MMA_DAG_CLUSTER_KEY] = 1
         reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
         if reason is not None:
             if not fix_invalid:
@@ -3379,11 +3499,41 @@ class ConfigSpec:
                 config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+                config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
                 config[MMA_DAG_PERSISTENT_KEY] = 0
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
             for block_id, index in indices.items():
                 block_sizes[index] = new_sizes[block_id]
+            # The repaired split axis slice names the split count (1 when
+            # the repair kept the whole axis, or fell back to the warp mode);
+            # beyond a portable cluster it is the fixup grid's.
+            config[MMA_DAG_CLUSTER_KEY] = facts.cluster_of(new_sizes)
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_FIXUP
+        if config[MMA_DAG_CLUSTER_KEY] == 1:
+            # The whole axis in one CTA: the combine mode has no subject.
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        elif (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_FIXUP
+            and apply_mma_dag_cluster(
+                facts,
+                {},
+                config[MMA_DAG_CLUSTER_KEY],
+                MMA_DAG_SPLIT_FIXUP,
+            )
+            is not None
+        ):
+            # The repaired split does not admit the fixup form (a program
+            # with a leading axis or two root axes, or too many tiles): the
+            # cluster form takes a portable count, else the whole axis.
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) <= MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+            else:
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
         # snapshot to stage.
@@ -3391,6 +3541,8 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+        if not facts.aux_candidates:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
             mma_dag_pass_warps_reason(
                 facts,
@@ -3401,12 +3553,18 @@ class ConfigSpec:
             is not None
         ):
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
-        # The loads route has a subject only in the tensor-memory region
-        # programs whose derived values read tiles.
-        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 or not (
-            facts.tcgen05 is not None and facts.tcgen05.aux_items
-        ):
+        # The loads route has a subject in the tensor-memory region programs
+        # whose derived values read tiles, and in the warp mode when a ring
+        # tile's source is one a tensor map can fetch or an epilogue value
+        # reads a loop-invariant tile (staged ahead of the loops).
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            loads_subject = facts.tcgen05 is not None and bool(facts.tcgen05.aux_items)
+        else:
+            loads_subject = facts.tma_ring or facts.fixed_derived
+        if not loads_subject:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         # Inert knobs: the body is replaced, so equal kernels share one
         # autotune identity (the occupancy hint stays searchable).  The
         # persistent tcgen05 launch is the generic persistent_interleaved
@@ -7917,8 +8075,14 @@ class ConfigSpec:
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
+                if self.cute_mma_dag_aux is not None:
+                    fields[MMA_DAG_AUX_KEY] = self.cute_mma_dag_aux
                 if self.cute_mma_dag_persistent is not None:
                     fields[MMA_DAG_PERSISTENT_KEY] = self.cute_mma_dag_persistent
+                if self.cute_mma_dag_cluster is not None:
+                    fields[MMA_DAG_CLUSTER_KEY] = self.cute_mma_dag_cluster
+                if self.cute_mma_dag_split is not None:
+                    fields[MMA_DAG_SPLIT_KEY] = self.cute_mma_dag_split
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
