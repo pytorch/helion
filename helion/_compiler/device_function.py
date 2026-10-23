@@ -2466,6 +2466,8 @@ class DeviceFunction:
         self, helper_graph_info: HelperFunctionGraphInfo
     ) -> str:
         """Register a global helper function and return its generated name."""
+        if (name := self.helper_manager.registered_name(helper_graph_info)) is not None:
+            return name
         name = self.namespace.create_name(helper_graph_info.name, None)
         return self.helper_manager.register_helper_function(helper_graph_info, name)
 

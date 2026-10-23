@@ -180,6 +180,9 @@ class HelperFunctionManager:
         self.helper_functions[helper_graph_info.name] = helper_graph_info
         return self._final_names.setdefault(helper_graph_info.name, final_name)
 
+    def registered_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str | None:
+        return self._final_names.get(helper_graph_info.name)
+
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
         helper_defs = []
