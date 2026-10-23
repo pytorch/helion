@@ -1,0 +1,52 @@
+# TEMPORARY: validation-only workflow for the XPU benchmark enablement PR.
+# It runs the same job Benchmark Dispatch's `run_xpu` toggle runs, but on
+# pull_request so the plumbing (runner, image, torch xpu wheel, device args)
+# can be exercised in CI. REVERT THIS FILE BEFORE MERGE.
+name: XPU Benchmark PR Test (temporary)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-xpu:
+    uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        # Match the default kernels in benchmark_dispatch.yml.
+        kernels:
+          - flash_attention
+          - gdn_fwd_h
+          - cross_entropy
+          - grouped_gemm
+          - gemm
+          - welford
+          - layer_norm-bwd
+          - int4_gemm
+          - softmax
+          - layer_norm
+          - mamba2_chunk_state
+          - rms_norm-bwd
+          - rope
+          - jsd
+          - mamba2_chunk_scan
+          - kl_div
+          - rms_norm
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.client.xpu
+      python-version: "3.12"
+      image: intel/omix:0.4.0-devel-ubuntu26.04
+      runtime-version: xpu
+      # -e ZE_AFFINITY_MASK (no value) inherits the runner host's device
+      # affinity so the container targets the GPU the host assigned it.
+      container-options: --device=/dev/dri --group-add video --ipc=host -e ZE_AFFINITY_MASK
+      alias: b60
+      kernels: ${{ matrix.kernels }}

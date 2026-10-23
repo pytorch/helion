@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_xpu:
+        description: 'Run benchmark on XPU (Intel B60)'
+        required: false
+        type: boolean
+        default: false
       run_tpu:
         description: 'Run benchmark on TPU v7'
         required: false
@@ -193,6 +198,35 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
+  gen-matrix-xpu:
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    if: ${{ github.event.inputs.run_xpu == 'true' }}
+    with:
+      max-runners: 1
+      kernels: ${{ github.event.inputs.kernels }}
+
+  run-xpu:
+    needs: gen-matrix-xpu
+    uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gen-matrix-xpu.outputs.matrix) }}
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.client.xpu
+      python-version: "3.12"
+      image: intel/omix:0.4.0-devel-ubuntu26.04
+      runtime-version: xpu
+      # -e ZE_AFFINITY_MASK (no value) inherits the runner host's device
+      # affinity so the container targets the GPU the host assigned it.
+      container-options: --device=/dev/dri --group-add video --ipc=host -e ZE_AFFINITY_MASK
+      alias: b60
+      kernels: ${{ matrix.kernels }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}
+
   run-tpu:
     if: ${{ github.event.inputs.run_tpu == 'true' }}
     uses: ./.github/workflows/benchmark_tpu.yml
@@ -271,7 +305,7 @@ jobs:
 
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-xpu, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
     runs-on: ubuntu-latest
     permissions:
       actions: write
