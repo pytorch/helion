@@ -23,14 +23,10 @@ from dataclasses import dataclass
 from dataclasses import field
 import functools
 import math
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 
 import torch
-
-if TYPE_CHECKING:
-    from torch.nn.attention.flex_attention import BlockMask
 
 MaskMod = Callable[..., torch.Tensor]
 ScoreMod = Callable[..., torch.Tensor]
@@ -159,7 +155,7 @@ def make_block_diffusion(seq_len: int, block_size: int) -> MaskMod:
         kv_noised = kv_idx < seq_len
         q_block = (q_idx % seq_len) // block_size
         kv_block = (kv_idx % seq_len) // block_size
-        block_diagonal = (q_block == kv_block) & (q_noised ^ ~kv_noised)
+        block_diagonal = (q_block == kv_block) & (q_noised == kv_noised)
         offset_block_causal = (q_block > kv_block) & q_noised & ~kv_noised
         block_causal = (q_block >= kv_block) & ~q_noised & ~kv_noised
         return block_diagonal | offset_block_causal | block_causal
@@ -289,19 +285,10 @@ class Variant:
     make_mods: Callable[[torch.device], tuple[ScoreMod | None, MaskMod | None]]
     notes: str = ""
     extras: dict[str, Any] = field(default_factory=dict)
-    dv: int | None = None
-    suite: str = "legacy"
-    shape_id: str | None = None
-    mask_batch: int = 1
-    mask_heads: int = 1
 
     @property
     def enable_gqa(self) -> bool:
         return self.hkv != self.hq
-
-    @property
-    def value_dim(self) -> int:
-        return self.d if self.dv is None else self.dv
 
 
 def _sandwich_tables(
@@ -643,14 +630,14 @@ def make_qkv(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device=device).manual_seed(seed)
 
-    def rand(b: int, h: int, s: int, d: int) -> torch.Tensor:
+    def rand(b: int, h: int, s: int) -> torch.Tensor:
         return torch.randn(
-            (b, h, s, d), device=device, dtype=variant.dtype, generator=gen
+            (b, h, s, variant.d), device=device, dtype=variant.dtype, generator=gen
         )
 
-    q = rand(variant.b, variant.hq, variant.m, variant.d)
-    k = rand(variant.b, variant.hkv, variant.n, variant.d)
-    v = rand(variant.b, variant.hkv, variant.n, variant.value_dim)
+    q = rand(variant.b, variant.hq, variant.m)
+    k = rand(variant.b, variant.hkv, variant.n)
+    v = rand(variant.b, variant.hkv, variant.n)
     return q, k, v
 
 
@@ -659,16 +646,16 @@ def build_block_mask(
     mask_mod: MaskMod | None,
     device: torch.device,
     block_size: int | tuple[int, int] = 128,
-) -> BlockMask:
-    """BlockMask with the variant's batch/head dependence; noop when None."""
+) -> object:
+    """BlockMask for the variant (broadcast B=1, H=1); noop mask when None."""
     from torch.nn.attention.flex_attention import create_block_mask
     from torch.nn.attention.flex_attention import noop_mask
 
     compiled = torch.compile(create_block_mask)
     return compiled(
         mask_mod if mask_mod is not None else noop_mask,
-        variant.mask_batch,
-        variant.mask_heads,
+        None,
+        None,
         variant.m,
         variant.n,
         device=str(device),
@@ -680,39 +667,24 @@ def build_block_mask(
 def _cached_pair_count(name: str, device_str: str) -> int:
     variant = VARIANTS[name]
     device = torch.device(device_str)
-    return _pair_count(variant, device)
-
-
-def _pair_count(variant: Variant, device: torch.device) -> int:
     _, mask_mod = variant.make_mods(device)
     if mask_mod is None:
         return variant.b * variant.hq * variant.m * variant.n
     total = 0
-    b = torch.arange(variant.mask_batch, device=device)[:, None, None, None]
-    h = torch.arange(variant.mask_heads, device=device)[None, :, None, None]
-    kv = torch.arange(variant.n, device=device)[None, None, None, :]
-    chunk = max(1, (1 << 24) // (variant.n * variant.mask_batch * variant.mask_heads))
+    b = torch.zeros((), dtype=torch.int32, device=device)
+    h = torch.zeros((), dtype=torch.int32, device=device)
+    kv = torch.arange(variant.n, device=device)[None, :]
+    chunk = max(1, (1 << 24) // variant.n)
     for q0 in range(0, variant.m, chunk):
-        qi = torch.arange(q0, min(q0 + chunk, variant.m), device=device)[
-            None, None, :, None
-        ]
-        visible = mask_mod(b, h, qi, kv).expand(
-            variant.mask_batch, variant.mask_heads, qi.size(-2), variant.n
-        )
-        total += int(visible.sum().item())
-    return (
-        total * (variant.b // variant.mask_batch) * (variant.hq // variant.mask_heads)
-    )
+        qi = torch.arange(q0, min(q0 + chunk, variant.m), device=device)[:, None]
+        total += int(mask_mod(b, h, qi, kv).sum().item())
+    return total * variant.b * variant.hq
 
 
 def variant_flops(variant: Variant, device: torch.device) -> float:
-    """QK plus PV FLOPs over visible pairs, identical for every implementation."""
-    pairs = (
-        _cached_pair_count(variant.name, str(device))
-        if VARIANTS.get(variant.name) is variant
-        else _pair_count(variant, device)
-    )
-    return 2.0 * (variant.d + variant.value_dim) * pairs
+    """4*D flops per unmasked (q, kv) pair -- identical for every impl."""
+    pairs = _cached_pair_count(variant.name, str(device))
+    return 4.0 * variant.d * pairs
 
 
 def reference_output(
@@ -729,7 +701,7 @@ def reference_output(
     n = k.shape[2]
     groups = hq // k.shape[1]
     scale = 1.0 / math.sqrt(d)
-    out = torch.empty((b_sz, hq, m, v.size(-1)), device=q.device, dtype=torch.float32)
+    out = torch.empty_like(q, dtype=torch.float32)
     kv_idx = torch.arange(n, device=q.device)[None, :]
     for b in range(b_sz):
         b_t = torch.tensor(b, device=q.device)
