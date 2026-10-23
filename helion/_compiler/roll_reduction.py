@@ -234,7 +234,16 @@ class ReductionRoller:
                 num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         else:
             val = node.meta.get("val", None)
-            num_rdims = self._count_rdim_axes_in_val(val)
+            # Custom tuple outputs share one chunk coordinate. Other tuple
+            # operations keep their existing conservative rolling guard.
+            values = (
+                val
+                if node.target is _reduce and isinstance(val, (tuple, list))
+                else (val,)
+            )
+            num_rdims = max(
+                (self._count_rdim_axes_in_val(value) for value in values), default=0
+            )
 
         if num_rdims > 1:
             raise NotImplementedError(
@@ -243,11 +252,13 @@ class ReductionRoller:
         return num_rdims > 0
 
     def _count_rdim_axes_in_val(self, val: object) -> int:
-        """Count the most axes referencing ``self.rdim`` in any output tensor.
+        """Count how many tensor axes reference ``self.rdim``.
 
-        Tuple outputs share the chunk coordinate, so count each separately.
-        A tensor with repeated occurrences still needs unsupported multi-axis
-        chunking. Non-tensor values contribute 0.
+        Handles single tensors and ``(tuple, list)`` of tensors (e.g. the
+        ``var_mean`` op returns two tensors). Non-tensor values (scalars)
+        contribute 0. The caller raises when the count exceeds 1, since
+        the roller's per-axis chunking only makes sense for one rdim per
+        node.
         """
         if not isinstance(val, (torch.Tensor, tuple, list)):
             return 0
@@ -259,9 +270,8 @@ class ReductionRoller:
 
         if isinstance(val, torch.Tensor):
             return count_for_tensor(val)
-        return max(
-            (count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)),
-            default=0,
+        return sum(
+            count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)
         )
 
     def _count_rdim_axes_in_subscript(self, target: object, index: object) -> int:
