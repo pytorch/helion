@@ -67,6 +67,19 @@ def list_backends() -> list[str]:
     return list(_REGISTRY.keys())
 
 
+def find_backend_for_device(device_type: str) -> str | None:
+    """Return the name of the registered backend that declares ``device_type``.
+
+    A backend participates in device routing only when its ``device_types``
+    class attribute is non-empty.  When several backends declare the same
+    device type, the first registered wins (registration order is stable).
+    """
+    for name, backend_cls in _REGISTRY.items():
+        if device_type in backend_cls.device_types:
+            return name
+    return None
+
+
 def all_reserved_launch_param_names() -> frozenset[str]:
     """Union of reserved launch param names across all registered backends.
 

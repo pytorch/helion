@@ -20,11 +20,15 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler import backend_registry
 from helion._compiler.autotuner_heuristics.cute import (
     _tcgen05_grouped_worklist_seed_family,
 )
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.backend_registry import _REGISTRY
+from helion._compiler.backend_registry import find_backend_for_device
+from helion._compiler.backend_registry import register_compiler_backend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
@@ -975,6 +979,42 @@ class TestConfigAPI(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
+    def test_backend_explicit_semantics_across_construction_paths(self) -> None:
+        # Pin the environment so the implicit cases below are genuine even
+        # when the suite runs with HELION_BACKEND set globally.
+        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
+        try:
+            self._check_backend_explicit_semantics()
+        finally:
+            if saved_backend_env is not None:
+                os.environ["HELION_BACKEND"] = saved_backend_env
+
+    def _check_backend_explicit_semantics(self) -> None:
+        # Only a genuine user choice marks the backend explicit: a keyword,
+        # a direct assignment after construction, or HELION_BACKEND at
+        # construction time. A plain default-constructed Settings (and copies
+        # of it) stays implicit so device routing may pick a backend that
+        # declares the active device type.
+        self.assertFalse(helion.Settings()._backend_explicit)
+        self.assertTrue(helion.Settings(backend="triton")._backend_explicit)
+
+        assigned = helion.Settings()
+        assigned.backend = "triton"
+        self.assertTrue(assigned._backend_explicit)
+
+        with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
+            self.assertTrue(helion.Settings()._backend_explicit)
+        # A blank value falls back to the default like _get_backend does and
+        # stays implicit.
+        with patch.dict(os.environ, {"HELION_BACKEND": ""}, clear=False):
+            self.assertFalse(helion.Settings()._backend_explicit)
+
+        # copy() goes through dataclasses.replace, which feeds every field
+        # back through __init__; only an overridden "backend" is explicit.
+        self.assertFalse(helion.Settings().copy()._backend_explicit)
+        self.assertTrue(helion.Settings(backend="triton").copy()._backend_explicit)
+        self.assertTrue(helion.Settings().copy(backend="triton")._backend_explicit)
+
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
             os.environ,
@@ -1357,6 +1397,53 @@ class TestSettingsEnv(TestCase):
             settings.autotune_search_acf,
             ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
         )
+
+
+@onlyBackends(["triton"])
+class TestDeviceRouting(TestCase):
+    def test_routing_swaps_only_the_implicit_default_backend(self) -> None:
+        class _MetaTritonBackend(TritonBackend):
+            @property
+            def name(self) -> str:
+                return "_test_meta_routing"
+
+            device_types = frozenset({"meta"})
+
+        # register_compiler_backend also discards triton/tileir from
+        # _REPAIRED_CODEGEN_NAMES (the subclass shares triton's codegen_name);
+        # restore both alongside the registry entry.
+        saved_repaired_names = backend_registry._REPAIRED_CODEGEN_NAMES
+        register_compiler_backend(_MetaTritonBackend)
+        # Pin the environment so the implicit cases below are genuine: a
+        # HELION_BACKEND set in the outer environment (e.g. someone running
+        # the suite as `HELION_BACKEND=triton pytest`) would suppress routing.
+        saved_backend_env = os.environ.pop("HELION_BACKEND", None)
+        try:
+            # A device type no registered backend declares does not route...
+            self.assertIsNone(find_backend_for_device("cpu"))
+
+            # Implicit default 'triton' + a registered backend declaring the
+            # device type: the code generator is routed while settings.backend
+            # keeps the user-facing 'triton'.
+            env = CompileEnvironment(torch.device("meta"), helion.Settings())
+            self.assertEqual(env.backend.name, "_test_meta_routing")
+            self.assertEqual(env.settings.backend, "triton")
+
+            # An explicit backend choice suppresses routing...
+            env = CompileEnvironment(
+                torch.device("meta"), helion.Settings(backend="triton")
+            )
+            self.assertEqual(env.backend.name, "triton")
+
+            # ...and so does HELION_BACKEND.
+            with patch.dict(os.environ, {"HELION_BACKEND": "triton"}, clear=False):
+                env = CompileEnvironment(torch.device("meta"), helion.Settings())
+            self.assertEqual(env.backend.name, "triton")
+        finally:
+            if saved_backend_env is not None:
+                os.environ["HELION_BACKEND"] = saved_backend_env
+            _REGISTRY.pop("_test_meta_routing", None)
+            backend_registry._REPAIRED_CODEGEN_NAMES = saved_repaired_names
 
 
 @onlyBackends(["triton", "cute"])
