@@ -675,6 +675,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # (never trigger autotuning for aot_kernel)
         config = self._get_heuristic_config(self.args)
         if config is not None:
+            # Configs tuned on another GPU can exceed this one's limits.  Their
+            # first launch fits them to the device; torch.compile, which renders
+            # the config instead of launching it, checks it first if flagged
+            # here.  Compile mode exports the heuristic's configs as they are.
+            if self.mode != "compile" and self._heuristic_is_for_other_device():
+                self.kernel._config_from_other_device = True
             return config
 
         # No heuristic available - use default config with warning (once per kernel)
@@ -827,6 +833,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
             file=sys.stderr,
         )
         return results
+
+    def _heuristic_is_for_other_device(self) -> bool:
+        """Whether the heuristic file was written for another compute capability.
+
+        ``find_heuristic_file`` falls back to files for older compute
+        capabilities when this device has none of its own.
+        """
+        heuristic_file = self._find_heuristic_file()
+        if heuristic_file is None or not heuristic_file.name.startswith("_helion_aot_"):
+            return False
+        hw = get_hardware_info()
+        stem = heuristic_file.stem.split("__policy_")[0]
+        return not stem.endswith(f"_{hw.device_kind}_{hw.compute_capability}")
 
     def _find_heuristic_file(self) -> Path | None:
         """Find the heuristic file for this kernel using shared lookup."""
