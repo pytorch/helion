@@ -466,6 +466,42 @@ def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
     )
 
 
+def _insert_before_first_use(
+    statements: list[ast.stmt],
+    names: frozenset[str],
+    inserted: list[ast.stmt],
+) -> bool:
+    """Insert ``inserted`` right before the first statement that uses ``names``.
+
+    Descends into an ``if`` whose test does not use ``names`` when every
+    later use lies in exactly one of its branches, so the inserted statements
+    dominate every use while the other branch skips them.  Loops are not
+    entered.  Returns False when ``statements`` never use ``names``.
+    """
+
+    def uses_names(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Name) and child.id in names
+            for child in ast.walk(node)
+        )
+
+    uses = [
+        index for index, statement in enumerate(statements) if uses_names(statement)
+    ]
+    if not uses:
+        return False
+    first = statements[uses[0]]
+    if len(uses) == 1 and isinstance(first, ast.If) and not uses_names(first.test):
+        in_body = any(uses_names(statement) for statement in first.body)
+        in_orelse = any(uses_names(statement) for statement in first.orelse)
+        if in_body != in_orelse and _insert_before_first_use(
+            first.body if in_body else first.orelse, names, inserted
+        ):
+            return True
+    statements[uses[0] : uses[0]] = inserted
+    return True
+
+
 def _release_sync(device_function: DeviceFunction) -> list[ast.stmt]:
     """CTA sync before a release publication, completing TMA stores first."""
     return [
@@ -1969,6 +2005,66 @@ def emit_cross_loop_schedule(
             readiness_consumers_by_root.setdefault(
                 readiness_consumer.consumer_root, []
             ).append((plan, readiness_consumer))
+    consumer_access_by_dependency = {
+        dependency.dependency_id: dependency_graph.accesses[
+            dependency.consumer_access_id
+        ]
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
+
+    def dependent_argument_names(
+        plan: ReadinessCounterPlan,
+        readiness_consumer: ReadinessConsumer,
+    ) -> frozenset[str] | None:
+        """Kernel arguments (with every alias of their storage) that the
+        consumer's covered accesses touch or that the counter's producer roots
+        write, or None when one is not a named host tensor.  A root body must
+        reach that storage only through these names: a pointer or view bound
+        outside the body would be missed."""
+        tensor_names: set[str] = set()
+        for (
+            dependency_id,
+            _producer_site,
+            _consumer_site,
+        ) in readiness_consumer.covered_obligations:
+            access = consumer_access_by_dependency.get(dependency_id)
+            if access is None or access.tensor_name is None:
+                return None
+            tensor_names.add(access.tensor_name)
+        # The dependency analysis records only loads, stores and atomics, so
+        # the body can also read the producers' output through an op it does
+        # not record (hl.load_float4_e2m1fn_x16_to_float16): any statement
+        # that names storage a producer root writes counts as a use.
+        producer_roots = {producer.producer_root for producer in plan.producers}
+        for access in dependency_graph.accesses:
+            if access.root in producer_roots and access.kind == "store":
+                if access.tensor_name is None:
+                    return None
+                tensor_names.add(access.tensor_name)
+        origins = HostFunction.current().tensor_to_origin
+        tensor_arguments = [
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorArg)
+        ]
+        storages = {
+            argument.fake_value.untyped_storage(): None
+            for argument in tensor_arguments
+            if (origin := origins.get(argument.fake_value)) is not None
+            and origin.root_rw_name() in tensor_names
+        }
+        # Device-built tensor descriptors are preamble locals, not arguments.
+        names = frozenset(
+            argument.name
+            for argument in (
+                *tensor_arguments,
+                *device_function._tensor_descriptor_args.values(),
+            )
+            if argument.fake_value.untyped_storage() in storages
+        )
+        return names or None
+
     nested_loop_counters_by_consumer: dict[
         int,
         list[tuple[ReadinessCounterPlan, ReadinessConsumer]],
@@ -2886,6 +2982,22 @@ def emit_cross_loop_schedule(
             body.append(statement_from_string(f"{pid_task} = {pid_task_expression}"))
             scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
         readiness_tokens: list[str] = []
+        # A dynamically dispatched root that publishes nothing waits where it
+        # first uses a producer's data instead of at task entry: work before
+        # that use overlaps the wait, and a branch that never uses it skips
+        # the wait.  Its completion certifies nothing, so no later root
+        # relies on the wait.
+        sinks_waits = (
+            static_pipeline_plan.dispatch_mode == "dynamic"
+            and not any(device_function.config.range_warp_specializes)
+            and not producer_counters
+            and root not in nested_producer_roots
+            and root not in root_barrier_indices
+            and root not in static_pipeline_plan.continuation_roots
+            and root not in nested_loop_counters_by_consumer
+            and peer is None
+        )
+        sunk_waits: list[tuple[frozenset[str], list[ast.stmt]]] = []
         for (
             incoming_readiness_counter,
             incoming_consumer,
@@ -2899,6 +3011,7 @@ def emit_cross_loop_schedule(
             counter = readiness_counter(incoming_readiness_counter, readiness_key)
             target = readiness_target(incoming_readiness_counter, readiness_key)
             total = incoming_consumer.keys_by_consumer.is_total_function()
+            wait: list[ast.stmt]
             if any(device_function.config.range_warp_specializes):
                 # Triton's warp specialization rejects a while loop in a task
                 # loop: spin in one asm block and gate the task PID on its token.
@@ -2932,14 +3045,21 @@ def emit_cross_loop_schedule(
                     prefix="tile_dependency_readiness_wait",
                 )
             if not total:
-                body.append(
+                wait = [
                     create(
                         ast.If,
                         test=expr_from_string(membership),
                         body=wait,
                         orelse=[],
                     )
-                )
+                ]
+            sunk_names = (
+                dependent_argument_names(incoming_readiness_counter, incoming_consumer)
+                if sinks_waits
+                else None
+            )
+            if sunk_names is not None:
+                sunk_waits.append((sunk_names, wait))
             else:
                 body.extend(wait)
         peer_counter_spins, peer_tokens = peer_counter_waits(
@@ -2956,6 +3076,7 @@ def emit_cross_loop_schedule(
             scheduled_logical_pid = " + ".join([scheduled_logical_pid, *peer_tokens])
         nested_loop_consumers = nested_loop_counters_by_consumer.get(root, ())
         if nested_loop_consumers:
+            assert not sunk_waits
             # Instrument the original logical loop before segmentation.
             # Split ranges then retain the original site-coordinate
             # expression instead of rebasing publication IDs per segment.
@@ -2985,17 +3106,21 @@ def emit_cross_loop_schedule(
                 *scheduled_root_body,
             ]
         else:
+            cloned_root_body = _clone_opaque_statements(
+                body_with_nested_loop_publications(
+                    root,
+                    root_body,
+                    scheduled_coordinates,
+                )
+            )
+            for sunk_names, wait in sunk_waits:
+                if not _insert_before_first_use(cloned_root_body, sunk_names, wait):
+                    cloned_root_body[0:0] = wait
             tile_body = [
                 statement_from_string(
                     f"{owner.shared_pid_var} = {scheduled_logical_pid}"
                 ),
-                *_clone_opaque_statements(
-                    body_with_nested_loop_publications(
-                        root,
-                        root_body,
-                        scheduled_coordinates,
-                    )
-                ),
+                *cloned_root_body,
             ]
         if root in kernel_scope_roots:
             body.extend(tile_body)

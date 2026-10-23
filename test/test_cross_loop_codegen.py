@@ -24,6 +24,7 @@ from helion._compiler.cross_loop_codegen import (
 )
 from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
+from helion._compiler.cross_loop_codegen import _insert_before_first_use
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.program_id import PIDInfo
@@ -1164,6 +1165,45 @@ class TestCrossLoopCodegenHelpers(TestCase):
         rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
         self.assertFalse(_dry_pass_binds(rewritten, guards, set()))
 
+    def test_sunk_wait_dominates_every_use(self) -> None:
+        def place(source: str) -> str:
+            body = ast.parse(source).body
+            wait = ast.parse("wait()").body
+            if not _insert_before_first_use(body, frozenset({"z", "z_desc"}), wait):
+                return "unused"
+            return ast.unparse(body)
+
+        # Independent work runs first; the wait enters the one branch that uses z.
+        self.assertEqual(
+            place(
+                "n = tl.load(routes)\n"
+                "if n > 0:\n    e = n + 1\n    a = tl.load(z + e)\n"
+                "else:\n    b = n\n"
+            ),
+            "n = tl.load(routes)\n"
+            "if n > 0:\n    e = n + 1\n    wait()\n    a = tl.load(z + e)\n"
+            "else:\n    b = n",
+        )
+        # A use in the test, in both branches or after the if keeps it outside.
+        for source in (
+            "if tl.load(z) > 0:\n    a = 1\n",
+            "if c:\n    a = tl.load(z)\nelse:\n    b = z_desc.load([0])\n",
+            "if c:\n    a = tl.load(z)\nb = tl.load(z + 1)\n",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(place(source).startswith("wait()\n"))
+        # Loops are never entered.
+        self.assertEqual(
+            place("for i in tl.range(0, 4):\n    a = tl.load(z + i)\n"),
+            "wait()\nfor i in tl.range(0, 4):\n    a = tl.load(z + i)",
+        )
+        # Every name counts, including a descriptor of the same storage.
+        self.assertEqual(
+            place("a = z_desc.load([0])\nb = tl.load(z)\n"),
+            "wait()\na = z_desc.load([0])\nb = tl.load(z)",
+        )
+        self.assertEqual(place("a = tl.load(x)\n"), "unused")
+
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
@@ -1596,6 +1636,184 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     "cp.async.bulk.wait_group 0; fence.proxy.async.global", code
                 )
                 self.assertIn("async_load_fence", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_readiness_wait_runs_where_the_task_first_uses(self) -> None:
+        def gated(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+            tmp = torch.empty_like(x)
+            out = torch.zeros_like(x)
+            for producer_m in hl.tile(x.size(0), block_size=1):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    tmp[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[1, 32]):
+                if keep[consumer_m.begin] > 0:
+                    out[consumer_m, consumer_n] = tmp[consumer_m, consumer_n] * 2
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE)
+        keep = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0], device=DEVICE, dtype=torch.int32)
+        expected = torch.where(keep[:, None] > 0, (x + 1) * 2, 0)
+        kernel = helion.kernel(gated, static_shapes=True, autotune_effort="none")
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                code, out = code_and_output(
+                    kernel,
+                    (x, keep),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+
+                torch.testing.assert_close(out, expected)
+                root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+                # Only a dynamic consumer waits inside its root, in the branch
+                # that reads tmp, after the keep load.
+                sunk = "tile_dependency_readiness_wait" in root
+                self.assertEqual(sunk, pipeline == "dynamic")
+                if sunk:
+                    branch = root.index("if v_")
+                    self.assertLess(root.index("tl.load(keep"), branch)
+                    self.assertLess(
+                        branch, root.index("tile_dependency_readiness_wait")
+                    )
+                    self.assertLess(
+                        root.rindex("tile_dependency_readiness_wait"),
+                        root.index("tl.load(tmp"),
+                    )
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_readiness_wait_precedes_device_descriptor_reads(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def read_twice(x: torch.Tensor) -> torch.Tensor:
+            tmp = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for producer_m in hl.tile(x.size(0), block_size=32):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    tmp[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[consumer_m, consumer_n] = (
+                    tmp[consumer_m, consumer_n] * 2 + tmp[consumer_m, consumer_n]
+                )
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE)
+        code, out = code_and_output(
+            read_twice,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+            range_num_stages=[0, 0, 0],
+            # The first read of tmp goes through a descriptor built in the
+            # kernel preamble, which is not a kernel argument.
+            indexing=["pointer", "pointer", "tensor_descriptor", "pointer", "pointer"],
+            host_tensor_descriptors=False,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 3)
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        self.assertLess(
+            root.rindex("tile_dependency_readiness_wait"), root.index("tmp_desc.load")
+        )
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="FP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_readiness_wait_precedes_unrecorded_reads(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def scaled_fp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            q = torch.empty_like(packed)
+            s = torch.empty_like(scale)
+            out = torch.empty(
+                [packed.size(0), 16], dtype=torch.float32, device=packed.device
+            )
+            for producer in hl.tile(packed.size(0), block_size=32):
+                busy = scale[producer]
+                for _ in hl.static_range(64):
+                    busy = busy * 0.5 + 0.25
+                q[producer, :] = packed[producer, :]
+                s[producer] = busy * 0.0 + scale[producer]
+            # Two consumer tasks per producer task: a readiness wait, not a
+            # final-arrival continuation.
+            for consumer in hl.tile(packed.size(0), block_size=16):
+                # The dependency analysis does not record this read of q, so
+                # the readiness edge covers only s.
+                lanes = hl.load_float4_e2m1fn_x16_to_float16(q, consumer.index)
+                factor = s[consumer]
+                for lane in hl.static_range(16):
+                    out[consumer, lane] = lanes[lane].to(torch.float32) * factor
+            return out
+
+        packed = torch.randint(0, 256, (4096, 8), dtype=torch.uint8, device=DEVICE)
+        scale = torch.rand(4096, device=DEVICE) + 0.5
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=DEVICE,
+        )
+        packed_i64 = packed.long()
+        lanes = torch.stack((lut[packed_i64 & 0xF], lut[packed_i64 >> 4]), dim=-1)
+        expected = lanes.reshape(4096, 16) * scale[:, None]
+        code, out = code_and_output(
+            scaled_fp4,
+            (packed, scale),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=4,
+        )
+
+        torch.testing.assert_close(out, expected)
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        # Producer storage counts as used even where the read is unrecorded:
+        # the wait still sinks past the index math, but not past the q read.
+        self.assertLess(
+            root.index("indices_"), root.index("tile_dependency_readiness_wait")
+        )
+        self.assertLess(
+            root.rindex("tile_dependency_readiness_wait"), root.index("tl.load(q")
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_publishing_root_keeps_readiness_wait_at_task_entry(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def chain(x: torch.Tensor) -> torch.Tensor:
+            first = torch.empty_like(x)
+            second = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for producer_m in hl.tile(x.size(0), block_size=1):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    first[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for middle_m, middle_n in hl.tile(x.size(), block_size=[1, 32]):
+                second[middle_m, middle_n] = first[middle_m, middle_n] * 2
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[1, 32]):
+                out[consumer_m, consumer_n] = second[consumer_m, consumer_n] + 3
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE)
+        code, out = code_and_output(
+            chain,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        # The middle root publishes to the last one, which relies on the middle
+        # root having waited for the first: its wait stays at task entry.
+        task = _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        root = _generated_function(code, "tile_dependency_root_1")
+        self.assertIn("tile_dependency_readiness_wait", ast.unparse(task))
+        self.assertNotIn("tile_dependency_readiness_wait", ast.unparse(root))
 
     @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
