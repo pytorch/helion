@@ -1,0 +1,949 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import inspect
+import json
+import operator
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+from typing import Callable
+import unittest
+from unittest.mock import Mock
+from unittest.mock import patch
+
+import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
+
+import helion
+from helion._testing import TestCase
+from helion._utils import counters
+from helion.autotuner.base_search import BaseAutotuner
+from helion.autotuner.benchmark_provider import _searching_candidates
+from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import EnumFragment
+import helion.language as hl
+from helion.runtime import generated_code_cache as cache
+from helion.runtime.kernel import Kernel
+from helion.runtime.kernel import KernelCompiler
+from helion.runtime.kernel import PyCodeCache
+from helion.runtime.ref_mode import is_ref_mode_enabled
+
+
+@helion.kernel(backend="triton")
+def _cached_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
+    scale = hl.specialize(scale)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
+
+
+_SHIFT = 1
+
+
+class _OpaqueState:
+    enabled = True
+
+
+_OPAQUE = _OpaqueState()
+
+
+@helion.kernel(backend="triton")
+def _cached_opaque(x: torch.Tensor) -> torch.Tensor:
+    if _OPAQUE.enabled:
+        return x
+    return x
+
+
+@helion.kernel(backend="triton")
+def _cached_shift(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + _SHIFT
+    return out
+
+
+@helion.kernel(backend="triton")
+def _cached_tunable(x: torch.Tensor) -> torch.Tensor:
+    use_add = hl.register_tunable("use_add", BooleanFragment())
+    scale = hl.register_tunable("scale", EnumFragment((2, 3)))
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        if use_add:
+            out[tile] = x[tile] + scale
+        else:
+            out[tile] = x[tile] * scale
+    return out
+
+
+_TUNABLE_CONFIG = helion.Config(block_sizes=[32], use_add=True, scale=3)
+
+
+@helion.kernel(backend="triton")
+def _cached_apply(
+    x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = fn(x[tile])
+    return out
+
+
+def _double(value: torch.Tensor) -> torch.Tensor:
+    return value * 2
+
+
+def _runner(kernel: Kernel, args: tuple[object, ...]):
+    """The binding eager dispatch uses: on a warm cache a disk runner.
+
+    ``Kernel.bind`` returns an ordinary binding, compiling the frontend if the
+    process only has a runner; ``kernel(*args)`` keeps the runner.
+    """
+    with kernel._bind_lock:
+        return kernel._bind(args)
+
+
+def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
+    settings.setdefault("autotune_effort", "none")
+    kernel = helion.kernel(backend="triton", cache_level="code", **settings)(
+        _cached_scale.fn
+    )
+    return _runner(kernel, (x, scale))
+
+
+def _cached_bound(fn: Callable[..., torch.Tensor], *args: object):
+    kernel = helion.kernel(
+        backend="triton", cache_level="code", autotune_effort="none"
+    )(fn)
+    return _runner(kernel, args)
+
+
+# Loads this test module in a fresh process with the CPU tests' patched keys.
+_FRESH_PROCESS_PRELUDE = """
+import importlib.util
+from pathlib import Path
+import sys
+from unittest.mock import patch
+import torch
+
+spec = importlib.util.spec_from_file_location(sys.argv[2], sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+for name in ("helion_key", "torch_key_wrapper", "triton_key_wrapper"):
+    setattr(module.cache, name, lambda name=name: {"helion_key": "helion-v1", "torch_key_wrapper": "torch-v1", "triton_key_wrapper": "triton-v1"}[name])
+module.cache.supports_torch_compile_fusion = lambda: True
+"""
+
+
+def _source_loader(root: Path, sources: list[str]):
+    def load(source: str, *, extra: str = ""):
+        sources.append(source)
+        path = root / f"module_{len(sources)}.py"
+        path.write_text(source)
+        # Importing/launching the generated module belongs to the CUDA test.
+        return SimpleNamespace(
+            __file__=str(path),
+            _cached_scale=lambda *args: None,
+            _cached_tunable=lambda *args: None,
+            _runtime_scale=operator.mul,
+        )
+
+    return load
+
+
+@unittest.skipIf(
+    is_ref_mode_enabled(helion.Settings()),
+    "generated source caching requires frontend compilation",
+)
+class _GeneratedCodeCacheTestCase(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        root = self._test_stack.enter_context(tempfile.TemporaryDirectory())
+        self.cache_root = Path(root)
+        self._test_stack.enter_context(
+            patch.dict(os.environ, {"HELION_CACHE_DIR": root, "HELION_SKIP_CACHE": "0"})
+        )
+
+
+@instantiate_parametrized_tests
+class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # CPU tests exercise the real frontend/codegen, but never import Triton.
+        for name, value in (
+            ("helion_key", "helion-v1"),
+            ("torch_key_wrapper", "torch-v1"),
+            ("triton_key_wrapper", "triton-v1"),
+        ):
+            self._test_stack.enter_context(
+                patch.object(cache, name, return_value=value)
+            )
+        self._test_stack.enter_context(
+            patch.object(cache, "supports_torch_compile_fusion", return_value=True)
+        )
+
+    def test_fresh_binding_skips_codegen(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        x = torch.ones(16)
+        first = _bound(x)
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            first.set_config(config)
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                second = _bound(x)
+            self.assertEqual(compile_fn.call_count, 0)
+            with patch.object(
+                second,
+                "to_triton_code",
+                side_effect=AssertionError("codegen cache miss"),
+            ):
+                second.set_config(config)
+        self.assertEqual(sources[0], sources[1])
+        self.assertEqual(
+            counters["generated_code_cache"], {"miss": 1, "hit": 1, "frontend_hit": 1}
+        )
+
+    def test_dependency_discovery_order_does_not_change_binding(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        getclosurevars = inspect.getclosurevars
+
+        def reverse_dependencies(fn):
+            closure = getclosurevars(fn)
+            return closure._replace(
+                globals=dict(reversed(closure.globals.items())),
+                nonlocals=dict(reversed(closure.nonlocals.items())),
+            )
+
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            with (
+                patch.object(cache.inspect, "getclosurevars", reverse_dependencies),
+                patch.object(
+                    KernelCompiler,
+                    "compile",
+                    side_effect=AssertionError("frontend ran"),
+                ),
+            ):
+                _bound(x).set_config(config)
+        self.assertEqual(sources[0], sources[1])
+
+    def test_only_selected_config_is_saved(self) -> None:
+        bound = _bound(torch.ones(16))
+        winner = helion.Config(block_sizes=[32])
+        other = helion.Config(block_sizes=[64])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            bound.compile_config(winner)
+            bound.compile_config(other)
+            self.assertFalse((self.cache_root / "generated_code").exists())
+            with patch.object(
+                bound,
+                "to_triton_code",
+                side_effect=AssertionError("winner regenerated"),
+            ):
+                bound.set_config(winner)
+            fresh = _bound(torch.ones(16))
+            with patch.object(
+                fresh, "to_triton_code", side_effect=AssertionError("winner cache miss")
+            ):
+                fresh.set_config(winner)
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(sources[0], sources[2])
+        entries = list((self.cache_root / "generated_code").glob("*.json"))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(json.loads(entries[0].read_text())["source"], sources[0])
+
+    def test_repeated_set_config_skips_persisted_entries(self) -> None:
+        bound = _bound(torch.ones(16))
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            # An autotuning candidate is compiled without being persisted.
+            bound.compile_config(config)
+            with (
+                patch.object(
+                    cache,
+                    "generated_code_cache_key",
+                    side_effect=cache.generated_code_cache_key,
+                ) as source_key,
+                patch.object(
+                    cache, "save_binding", side_effect=cache.save_binding
+                ) as save_binding,
+                patch.object(
+                    cache, "_save_entry", side_effect=cache._save_entry
+                ) as save_entry,
+            ):
+                for _ in range(3):
+                    bound.set_config(config)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(source_key.call_count, 1)
+        self.assertEqual(save_binding.call_count, 1)
+        # One source, guard schema and binding entry, despite repeated set_config.
+        self.assertEqual(save_entry.call_count, 3)
+        self.assertEqual(
+            len(list((self.cache_root / "generated_code").rglob("*.json"))), 3
+        )
+
+    def test_source_cache_hit_ignores_primed_code_outside_search(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            bound.prime_rendered_code(config, "# unused worker source")
+            with patch.object(
+                bound, "to_triton_code", side_effect=AssertionError("source cache miss")
+            ):
+                bound.set_config(config)
+        self.assertEqual(sources, [sources[0], sources[0]])
+        self.assertTrue(bound.has_compiled_config(config))
+
+    def test_primed_config_rerenders_before_persisting(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            worker_source = sources[0] + "\n# rendered in worker\n"
+            bound.prime_rendered_code(config, worker_source)
+            with patch.object(
+                bound, "to_triton_code", wraps=bound.to_triton_code
+            ) as render:
+                with _searching_candidates():
+                    measured = bound.compile_config(config)
+                    self.assertIs(bound.compile_config(config), measured)
+                render.assert_not_called()
+                bound.set_config(config)
+                render.assert_called_once()
+                bound.set_config(config)
+                render.assert_called_once()
+        self.assertEqual(sources, [sources[0], worker_source, sources[0]])
+
+    def test_failed_parent_render_retries_before_loading_cached_source(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            bound = _bound(x).kernel.bind((x, 2))
+            worker_source = sources[0] + "\n# rendered in worker\n"
+            bound.prime_rendered_code(config, worker_source)
+            with _searching_candidates():
+                bound.compile_config(config)
+            with (
+                patch.object(
+                    bound, "to_triton_code", side_effect=RuntimeError("render failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "render failed"),
+            ):
+                bound.set_config(config)
+            self.assertFalse(bound.has_compiled_config(config))
+            with patch.object(
+                bound, "to_triton_code", wraps=bound.to_triton_code
+            ) as render:
+                bound.set_config(config)
+                render.assert_called_once()
+        self.assertEqual(sources, [sources[0], worker_source, sources[0]])
+
+    def test_search_seed_does_not_change_source_key(self) -> None:
+        first = _bound(torch.ones(16), autotune_random_seed=1)
+        second = _bound(torch.ones(16), autotune_random_seed=2)
+        config = helion.Config(block_sizes=[32])
+        key = cache.generated_code_cache_key(
+            first, first._normalized_config_copy(config)
+        )
+        self.assertIsNotNone(key)
+        self.assertEqual(
+            key,
+            cache.generated_code_cache_key(
+                second, second._normalized_config_copy(config)
+            ),
+        )
+
+    def test_dynamic_shapes_skip_frontend(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        x = torch.ones(16)
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x, static_shapes=False).set_config(config)
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                fresh = _bound(x, static_shapes=False)
+                fresh.set_config(config)
+        self.assertEqual(sources[0], sources[1])
+
+    def test_other_config_materializes_frontend(self) -> None:
+        x = torch.ones(16)
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(helion.Config(block_sizes=[32]))
+            fresh = _bound(x)
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                fresh.set_config(helion.Config(block_sizes=[64]))
+            self.assertEqual(compile_fn.call_count, 1)
+        self.assertNotEqual(sources[0], sources[1])
+
+    def test_frontend_introspection_after_inputs_expire(self) -> None:
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(torch.ones(16)).set_config(helion.Config(block_sizes=[32]))
+        fresh = _bound(torch.ones(16))
+        self.assertIn("tl.store", fresh.to_code(helion.Config(block_sizes=[64])))
+
+    def test_preset_selector_still_runs(self) -> None:
+        calls = []
+        config = helion.Config(block_sizes=[32])
+
+        class PresetSearch(BaseAutotuner):
+            def autotune(self, *, skip_cache=False):
+                calls.append(skip_cache)
+                return config
+
+        def selector(bound, args):
+            return PresetSearch()
+
+        x = torch.ones(16)
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(
+                x, static_shapes=False, autotuner_fn=selector, autotune_effort="quick"
+            ).autotune((x, 2), force=False)
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                _bound(
+                    x,
+                    static_shapes=False,
+                    autotuner_fn=selector,
+                    autotune_effort="quick",
+                ).autotune((x, 2), force=False)
+        self.assertEqual(calls, [False, False])
+
+    def test_changed_decorator_config_takes_precedence(self) -> None:
+        x = torch.ones(16)
+        first = helion.Config(block_sizes=[32])
+        second = helion.Config(block_sizes=[64])
+        selector = Mock(side_effect=AssertionError("explicit config ignored"))
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x, config=first, autotuner_fn=selector).autotune((x, 2), force=False)
+            fresh = _bound(x, config=second, autotuner_fn=selector)
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                self.assertEqual(fresh.autotune((x, 2), force=False), second)
+            self.assertEqual(compile_fn.call_count, 1)
+        self.assertNotEqual(sources[0], sources[1])
+
+    def test_cached_kernel_call_and_reset(self) -> None:
+        x = torch.ones(16)
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(helion.Config(block_sizes=[32]))
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                fresh = _bound(x)
+                self.assertIsNone(fresh.kernel(x, 2))
+                with self.assertRaisesRegex(TypeError, "missing a required argument"):
+                    fresh(x)
+                fresh.kernel.reset()
+                self.assertIsNone(fresh(x, 2))
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                rebound = fresh.kernel.bind((x, 3))
+            self.assertEqual(compile_fn.call_count, 1)
+            self.assertIsNot(rebound, fresh)
+
+    def _binding_entry(self, part: str) -> Path:
+        directory = self.cache_root / "generated_code"
+        if part == "source":
+            return next(directory.glob("*.json"))
+        return next((directory / f"{part}s").glob("*.json"))
+
+    @parametrize("damaged", ["binding", "schema", "source"])
+    @parametrize("evicted", [False, True])
+    def test_broken_binding_artifact_compiles_normally(
+        self, damaged: str, evicted: bool
+    ) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            path = self._binding_entry(damaged)
+            if evicted:
+                path.unlink()
+            else:
+                path.write_text("{")
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                fresh = _bound(x)
+            self.assertEqual(compile_fn.call_count, 1)
+            fresh.set_config(config)
+            # The normal compilation republished the entry.
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                _bound(x).set_config(config)
+
+    def test_binding_entries_use_size_index_and_lru(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            directory = self.cache_root / "generated_code"
+            paths = [
+                self._binding_entry(part) for part in ("source", "schema", "binding")
+            ]
+            # Source, guard schema and binding writes all update the size index.
+            self.assertEqual(
+                int((directory / ".size").read_text().split()[0]),
+                sum(path.stat().st_size for path in directory.rglob("*.json")),
+            )
+            for path in paths:
+                os.utime(path, ns=(1, 1))
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                _bound(x).set_config(config)
+        # A hit refreshes every entry it read, so eviction keeps the binding.
+        for path in paths:
+            self.assertGreater(path.stat().st_mtime_ns, 1)
+
+    def test_skip_cache_does_not_publish_binding(self) -> None:
+        x = torch.ones(16)
+        bound = _bound(x)
+        sources: list[str] = []
+        os.environ["HELION_SKIP_CACHE"] = "1"
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            bound.set_config(helion.Config(block_sizes=[32]))
+        self.assertFalse((self.cache_root / "generated_code").exists())
+
+    def test_opaque_dependency_keeps_frontend(self) -> None:
+        kernel = helion.kernel(_cached_opaque.fn, backend="triton", cache_level="code")
+        self.assertIsNone(cache.binding_input_key(kernel, (torch.ones(16),)))
+
+    def test_global_values_invalidate_frontend_identity(self) -> None:
+        def bind():
+            kernel = helion.kernel(
+                backend="triton", cache_level="code", autotune_effort="none"
+            )(_cached_shift.fn)
+            return kernel.bind((torch.ones(16),))
+
+        first = bind()
+        config = helion.Config(block_sizes=[32])
+        key = cache.generated_code_cache_key(
+            first, first._normalized_config_copy(config)
+        )
+        self._test_stack.enter_context(
+            patch.dict(_cached_shift.fn.__globals__, {"_SHIFT": 2})
+        )
+        second = bind()
+        other = cache.generated_code_cache_key(
+            second, second._normalized_config_copy(config)
+        )
+        # Even runtime globals conservatively invalidate a pre-frontend artifact.
+        self.assertTrue(key is not None and key != other)
+        self.assertEqual(first.to_code(config), second.to_code(config))
+
+    @parametrize(
+        "change",
+        [
+            "shape",
+            "stride",
+            "dtype",
+            "scale",
+            "config",
+            "settings",
+            "version",
+            "hardware",
+        ],
+    )
+    def test_key_invalidation(self, change: str) -> None:
+        config = helion.Config(block_sizes=[32])
+        x = torch.ones(16)
+        first = _bound(x)
+        key = cache.generated_code_cache_key(
+            first, first._normalized_config_copy(config)
+        )
+        settings: dict[str, object] = {}
+        scale = 2
+        if change == "shape":
+            x = torch.ones(32)
+        elif change == "stride":
+            x = torch.ones(32)[::2]
+        elif change == "dtype":
+            x = x.to(torch.float64)
+        elif change == "scale":
+            scale = 3
+        elif change == "config":
+            config = helion.Config(block_sizes=[64])
+        elif change == "settings":
+            settings["fast_math"] = True
+        elif change == "version":
+            self._test_stack.enter_context(
+                patch.object(cache, "triton_key_wrapper", lambda: "triton-v2")
+            )
+        else:
+            self._test_stack.enter_context(
+                patch.object(cache, "get_device_name", lambda device: "different GPU")
+            )
+        second = _bound(x, scale, **settings)
+        other = cache.generated_code_cache_key(
+            second, second._normalized_config_copy(config)
+        )
+        self.assertTrue(key is not None and other is not None and (key != other))
+
+    def test_binding_key_identifies_cuda_capability_and_sm_count(self) -> None:
+        # Devices sharing a name can differ in compute capability and SM count
+        # (partitioned or cloud SKUs); the source key bakes both in, so the
+        # pre-frontend binding key must too. No frontend or CUDA is needed.
+        kernel = helion.kernel(
+            backend="triton", cache_level="code", autotune_effort="none"
+        )(_cached_scale.fn)
+        x = torch.ones(16)
+        signature = kernel._base_specialization_key((x, 2))
+        hardware: dict[str, object] = {"capability": (9, 0), "sm": 132}
+        with (
+            patch.object(
+                cache, "_find_argument_device", return_value=torch.device("cuda", 0)
+            ),
+            patch.object(cache, "get_device_name", return_value="NVIDIA H100"),
+            patch.object(
+                cache, "target_device_capability", lambda device: hardware["capability"]
+            ),
+            patch.object(cache, "device_num_sm", lambda device: hardware["sm"]),
+        ):
+            key = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            self.assertIsNotNone(key)
+            self.assertEqual(
+                cache.compiled_kernel_cache_key(kernel, (x, 2), signature), key
+            )
+            hardware["sm"] = 114
+            fewer_sms = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            hardware["capability"] = (8, 0)
+            other_arch = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            self.assertEqual(len({key, fewer_sms, other_arch}), 3)
+            # An unresolvable CUDA capability is a miss, never an exception.
+            hardware["capability"] = None
+            self.assertIsNone(
+                cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            )
+        cpu_key = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+        self.assertIsNotNone(cpu_key)
+        self.assertNotEqual(cpu_key, key)
+
+    @parametrize("skip", ["disabled", "descriptor", "skip_cache"])
+    def test_ineligible_configs_use_codegen(self, skip: str) -> None:
+        bound = _bound(torch.ones(16))
+        if skip == "disabled":
+            bound.settings.cache_level = "config"
+        if skip == "skip_cache":
+            os.environ["HELION_SKIP_CACHE"] = "1"
+        config = bound._normalized_config_copy(helion.Config(block_sizes=[32]))
+        if skip == "descriptor":
+            config = helion.Config(block_sizes=[32], indexing="tensor_descriptor")
+        self.assertIsNone(cache.generated_code_cache_key(bound, config))
+        self.assertFalse((self.cache_root / "generated_code").exists())
+
+    @parametrize(
+        "contents",
+        ["{", "null", "{}", '{"source": 1}', '{"source": "pass", "sha256": "bad"}'],
+    )
+    def test_corrupt_entry_is_a_miss(self, contents: str) -> None:
+        directory = self.cache_root / "generated_code"
+        directory.mkdir()
+        (directory / "test.json").write_text(contents)
+        self.assertIsNone(cache.load_generated_code("test"))
+        cache.save_generated_code("test", "def add(x):\n    return x + 1\n")
+        self.assertEqual(
+            cache.load_generated_code("test"), "def add(x):\n    return x + 1\n"
+        )
+
+    def test_atomic_writes_and_failed_publish(self) -> None:
+        sources = [f"def f():\n    return {i}\n" for i in range(8)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(
+                pool.map(
+                    lambda source: cache.save_generated_code("shared", source), sources
+                )
+            )
+        self.assertIn(cache.load_generated_code("shared"), sources)
+        directory = self.cache_root / "generated_code"
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in directory.iterdir()
+                if path.name not in {".lock", ".size"}
+            ),
+            ["shared.json"],
+        )
+        with patch.object(cache.os, "replace", side_effect=OSError("read-only cache")):
+            cache.save_generated_code("shared", "replacement")
+        self.assertIn(cache.load_generated_code("shared"), sources)
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in directory.iterdir()
+                if path.name not in {".lock", ".size"}
+            ),
+            ["shared.json"],
+        )
+
+    @parametrize("hash_seed", ["0", "1"])
+    def test_cpu_reload_in_fresh_process(self, hash_seed: str) -> None:
+        bound = _bound(torch.ones(16))
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            bound.set_config(helion.Config(block_sizes=[32]))
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+sources = []
+with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("frontend cache miss")), patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)):
+    bound = module._bound(torch.ones(16))
+    with patch.object(bound, "to_triton_code", side_effect=AssertionError("codegen cache miss")):
+        bound.set_config(module.helion.Config(block_sizes=[32]))
+assert module.counters["generated_code_cache"]["hit"] == 1
+"""
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                __file__,
+                _cached_scale.fn.__module__,
+                str(self.cache_root),
+            ],
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": hash_seed},
+            timeout=30,
+        )
+
+    def test_object_reprs_keep_keys_in_fresh_processes(self) -> None:
+        # A fragment without a repr of its own prints its address in the
+        # frontend debug string, a callable argument's code object in the
+        # specialization key. Padding moves both between the two processes.
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+padding = [module.BooleanFragment() for _ in range(int(sys.argv[3]))]
+padding.extend(compile("0", "padding", "eval") for _ in range(int(sys.argv[3])))
+for bound, config in (
+    (
+        module._cached_bound(module._cached_tunable.fn, torch.ones(16)),
+        module._TUNABLE_CONFIG,
+    ),
+    (
+        module._cached_bound(module._cached_apply.fn, torch.ones(16), module._double),
+        module.helion.Config(block_sizes=[32]),
+    ),
+):
+    config = bound._normalized_config_copy(config)
+    print(module.cache.generated_code_cache_key(bound, config))
+    print(bound._generated_code.artifact_key)
+"""
+        )
+        keys = [
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    code,
+                    __file__,
+                    _cached_tunable.fn.__module__,
+                    padding,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONHASHSEED": hash_seed},
+                timeout=60,
+            ).stdout.splitlines()[-4:]
+            for padding, hash_seed in (("0", "0"), ("64", "1"))
+        ]
+        self.assertNotIn("None", keys[0])
+        self.assertEqual(keys[0], keys[1])
+
+    def test_tunable_fragment_source_hit_in_fresh_process(self) -> None:
+        # Both sides run in fresh processes: state left by earlier tests in
+        # this pytest process must not decide whether the key matches.
+        parent = self.cache_root / "parent"
+        child = self.cache_root / "child"
+        parent.mkdir()
+        child.mkdir()
+        save = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+sources = []
+with patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)):
+    bound = module._cached_bound(module._cached_tunable.fn, torch.ones(16))
+    bound.set_config(module._TUNABLE_CONFIG)
+assert len(sources) == 1, sources
+"""
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                save,
+                __file__,
+                _cached_tunable.fn.__module__,
+                str(parent),
+            ],
+            check=True,
+            timeout=60,
+        )
+        # Without saved bindings the fresh process runs the frontend and must
+        # still find the source the other process saved.
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+padding = [module.BooleanFragment() for _ in range(64)]
+sources = []
+with (
+    patch("helion.runtime.cached_kernel.load_cached_kernel", return_value=None) as load_binding,
+    patch.object(sys.modules[module.Kernel.__module__], "generate_ast", side_effect=AssertionError("codegen cache miss")),
+    patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)),
+):
+    bound = module._cached_bound(module._cached_tunable.fn, torch.ones(16))
+    bound.set_config(module._TUNABLE_CONFIG)
+assert load_binding.call_count == 1
+assert module.counters["generated_code_cache"]["hit"] == 1
+assert sources == [Path(sys.argv[4]).read_text()], sources
+"""
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                __file__,
+                _cached_tunable.fn.__module__,
+                str(child),
+                str(parent / "module_1.py"),
+            ],
+            check=True,
+            timeout=60,
+        )
+
+
+@instantiate_parametrized_tests
+class TestGeneratedCodeCacheCUDA(_GeneratedCodeCacheTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+    @parametrize("static_shapes", [True, False])
+    def test_cuda_reload_in_fresh_process(self, static_shapes: bool) -> None:
+        os.environ["HELION_CACHE_DIR"] = str(self.cache_root)
+        os.environ.pop("HELION_SKIP_CACHE", None)
+        x = torch.randn(16, device=torch.device("cuda"))
+        bound = _bound(x, static_shapes=static_shapes)
+        bound.set_config(helion.Config(block_sizes=[32]))
+        torch.testing.assert_close(bound(x, 2), x * 2)
+        code = """
+import importlib.util
+import sys
+from unittest.mock import patch
+import torch
+
+spec = importlib.util.spec_from_file_location(sys.argv[2], sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+x = torch.randn(16, device=torch.device("cuda"))
+with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("frontend cache miss")):
+    bound = module._bound(x, static_shapes=sys.argv[3] == "True")
+    with patch.object(bound, "to_triton_code", side_effect=AssertionError("codegen cache miss")):
+        bound.set_config(module.helion.Config(block_sizes=[32]))
+        torch.testing.assert_close(bound(x, 2), x * 2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = bound(x, 2)
+        x.fill_(3)
+        graph.replay()
+        torch.testing.assert_close(out, x * 2)
+"""
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                __file__,
+                _cached_scale.fn.__module__,
+                str(static_shapes),
+            ],
+            check=True,
+            timeout=30,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

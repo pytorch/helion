@@ -51,8 +51,10 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
+CacheLevel = Literal["config", "code"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
+log = logging.getLogger(__name__)
 
 
 def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
@@ -410,6 +412,14 @@ class _Settings:
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
+    cache_level: CacheLevel = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_literal,
+            "HELION_CACHE_LEVEL",
+            "config",
+            mapping={name: name for name in get_args(CacheLevel)},
+        )
+    )
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -710,6 +720,19 @@ class Settings(_Settings):
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
+        ),
+        "cache_level": (
+            "Cache level: 'config' (default) keeps the existing autotuned config "
+            "cache; 'code' also caches selected Triton configurations' generated "
+            "source on disk. "
+            "Inputs that a saved binding accepts, including new shapes with "
+            "static_shapes=False, skip frontend compilation and codegen. "
+            "Tensor-descriptor configs, distributed kernels and unsupported Python "
+            "dependencies retain normal compilation; descriptor layout guards are "
+            "saved with the binding. Set HELION_CACHE_LEVEL=code to enable "
+            "globally; unsupported backends warn and use 'config'. Explicit "
+            "cache_level='code' requires the Triton backend. "
+            "Set HELION_SKIP_CACHE=1 to skip reads and writes."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "
@@ -1052,6 +1075,23 @@ class Settings(_Settings):
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
         self._cute_structural_origins = CuteStructuralOrigins(**origins)
+
+        if self.cache_level not in get_args(CacheLevel):
+            raise ValueError(
+                f"cache_level must be 'config' or 'code', got {self.cache_level!r}"
+            )
+        if self.cache_level == "code" and self.backend != "triton":
+            if "cache_level" in settings:
+                raise ValueError(
+                    "cache_level='code' requires backend='triton', "
+                    f"got backend={self.backend!r}"
+                )
+            log.warning(
+                "HELION_CACHE_LEVEL=code is not supported for backend=%r; "
+                "using cache_level='config'",
+                self.backend,
+            )
+            self.cache_level = "config"
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile

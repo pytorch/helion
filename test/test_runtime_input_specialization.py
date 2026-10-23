@@ -557,6 +557,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         kernel._prepared_call = None
         kernel._specialize_extra = {signature: [extractor]}
         kernel._compiler_seed_specialize_extra = {signature: ()}
+        kernel._published_guards = {signature: None}
         kernel._has_specialization_extras = True
         kernel._bound_kernels = {
             BoundKernelInMemoryCacheKey(signature, (facts_a,)): bound
@@ -619,7 +620,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             replacement_calls += 1
             return "replacement-b"
 
-        kernel.bind = lambda _args: replacement
+        kernel._dispatch_bind = lambda _args: replacement
         value.data = unaligned.data
         self.assertEqual(bound(value), "replacement-b")
         self.assertEqual(replacement_calls, 1)
@@ -731,7 +732,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
 
         kernel = SimpleNamespace(
             _reset_generation=2,
-            bind=lambda _args: replacement,
+            _dispatch_bind=lambda _args: replacement,
         )
         bound = cast("Any", object.__new__(BoundKernel))
         bound.kernel = kernel
