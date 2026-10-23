@@ -68,6 +68,7 @@ def prove_dense_gemm_facts(
         or gemm is None
         or not gemm.owns_output_ring
         or not base.rhs_k_major
+        or not base.lhs_k_major
         or gemm.output.dtype != torch.bfloat16
     ):
         return None

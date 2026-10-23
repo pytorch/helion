@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..device_function import DeviceFunction
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
@@ -73,6 +74,11 @@ WARP_MMA_MAX_BN = 64
 # Static shared memory one CTA may stage (the DSL opt-in maximum is 227 KiB;
 # the margin covers the allocator's alignment padding).
 WARP_MMA_SMEM_BUDGET = 200 * 1024
+# Registers a thread may hold in not-yet-converted integer cast packets (four
+# 32-bit words per packet) before the pending ones are converted to shared
+# memory; one more chunk of each operand is issued past it at most.
+_CAST_PACKET_WORDS_IN_FLIGHT = 64
+
 # The register-MMA tiles re-read their operands once per tile and run the
 # K loop on one warp's mma.sync chain; both scale with the problem's
 # multiply-adds while the tcgen05 pipeline amortizes them.  256^3 (16.8M
@@ -290,10 +296,16 @@ class CuteWarpMmaGemmMatch:
     bk: int
     warps: int
     stores: tuple[WarpMmaStoreMatch, ...]
+    # The half dtype an operand is cast to on the way to shared memory (a
+    # bare ``load.to(bf16 | fp16)`` of an int16 tile), or None when the
+    # operand is read as loaded (``_MmaOperandInfo.cast_dtype``).
+    lhs_cast: torch.dtype | None = None
+    rhs_cast: torch.dtype | None = None
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.lhs_fake.dtype
+        """The dtype the tensor core multiplies (the cast target, else A's)."""
+        return self.lhs_cast if self.lhs_cast is not None else self.lhs_fake.dtype
 
     @property
     def threads(self) -> int:
@@ -383,9 +395,6 @@ def detect_warp_mma_gemm(
     traded for another lowering).
     """
     from ..host_function import HostFunction
-    from ..indexing_strategy import exact_tile_block_ids
-    from .aux_tensor import analyze_tcgen05_matmul_store_chains
-    from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .cute_mma import _tcgen05_tma_matrix_major
     from .cute_mma import analyze_cute_mma_node
 
@@ -405,7 +414,9 @@ def detect_warp_mma_gemm(
         if getattr(graph_info, "block_ids", None) != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node, graphs=graphs)
+            candidate = analyze_cute_mma_node(
+                node, graphs=graphs, allow_integer_casts=True
+            )
             if (
                 candidate is not None
                 and env.canonical_block_id(candidate.operands.k_block_id) == k_block_id
@@ -436,8 +447,19 @@ def detect_warp_mma_gemm(
     if root != expected_root:
         raise _decline("the root grid must tile (batch,) M, N in that order")
     lhs_fake, rhs_fake = lhs.source_fake, rhs.source_fake
-    if lhs_fake.dtype != rhs_fake.dtype or warp_mma_dtype_kind(lhs_fake.dtype) is None:
+    # A cast operand (``cast_dtype``) is multiplied as its cast target; the
+    # family converts the loaded int16 words in registers on the way to
+    # shared memory, so the source's layout and strides are what the packet
+    # path reads (same element width).
+    mma_dtype = lhs.mma_dtype
+    if mma_dtype != rhs.mma_dtype or warp_mma_dtype_kind(mma_dtype) is None:
         raise _decline("operands must share an fp16, bf16 or e4m3 dtype")
+    for operand in (lhs, rhs):
+        if (
+            operand.cast_dtype is not None
+            and operand.source_fake.dtype.itemsize != operand.cast_dtype.itemsize
+        ):
+            raise _decline("a cast operand must keep its element width")
     lhs_major = _tcgen05_tma_matrix_major(lhs_fake)
     rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
     m = _static_int(env, lhs.matrix_rows)
@@ -462,7 +484,7 @@ def detect_warp_mma_gemm(
         static_n=n,
         static_k=k,
         leading=batch,
-        dtype=lhs_fake.dtype,
+        dtype=mma_dtype,
         lhs_major=lhs_major,
         rhs_major=rhs_major,
         num_sms=_device_sm_count(lhs_fake.device),
@@ -478,13 +500,87 @@ def detect_warp_mma_gemm(
         raise _decline("the tile sizes must be static")
     warps = _config_int(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
     tile_reason = warp_mma_tile_reason(
-        m=m, n=n, k=k, bm=bm, bn=bn, bk=bk, warps=warps, dtype=lhs_fake.dtype
+        m=m, n=n, k=k, bm=bm, bn=bn, bk=bk, warps=warps, dtype=mma_dtype
     )
     if tile_reason is not None:
         raise _decline(tile_reason)
     # (The operand stride and batch-stride alignment gates are part of the
     # admission above.)
     rhs_k_major = rhs_major == "col"
+    stores = warp_mma_store_matches(graphs, mma_node, operands, env=env)
+    _require_complete_root(
+        graphs,
+        k_block_ids=block_ids,
+        store_nodes={store.store_node for store in stores},
+    )
+    fn.cute_state.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
+        mma_node=mma_node,
+        lhs_fake=lhs_fake,
+        rhs_fake=rhs_fake,
+        lhs_strides=lhs_strides,
+        rhs_strides=rhs_strides,
+        rhs_k_major=rhs_k_major,
+        batch=batch,
+        m=m,
+        n=n,
+        k=k,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        warps=warps,
+        stores=stores,
+        lhs_cast=lhs.cast_dtype,
+        rhs_cast=rhs.cast_dtype,
+    )
+    return True
+
+
+def warp_mma_store_matches(
+    graphs: Sequence[GraphInfo],
+    mma_node: Node,
+    operands: object,
+    *,
+    env: CompileEnvironment | None = None,
+) -> tuple[WarpMmaStoreMatch, ...]:
+    """Every store of the matmul's accumulator as the family renders it, or
+    ``BackendUnsupported`` with the reason.
+
+    The whole-problem outputs, their epilogue chains and the aux operands
+    (rowvec / row0 / colvec / exact, at most four per store) are the
+    family's store contract; the search planning calls this on the
+    ``DeviceIR`` graphs for a cast-operand candidate (which only this family
+    can lower) so the search never offers a family that fails at codegen.
+    """
+    from ..indexing_strategy import exact_tile_block_ids
+    from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .cute_mma import _MmaOperandAnalysis
+
+    assert isinstance(operands, _MmaOperandAnalysis)
+    if env is None:
+        env = CompileEnvironment.current()
+    lhs, rhs = operands.lhs, operands.rhs
+    m = _static_int(env, lhs.matrix_rows)
+    n = _static_int(env, rhs.matrix_cols)
+    if m is None or n is None:
+        raise _decline("the problem extents must be static")
+    m_block_id = env.canonical_block_id(operands.m_block_id)
+    n_block_id = env.canonical_block_id(operands.n_block_id)
+    leading_block_id = operands.leading_passthrough_block_id
+    if leading_block_id is None:
+        expected_root: tuple[int, ...] = (m_block_id, n_block_id)
+        expected_shape: tuple[int | None, ...] = (m, n)
+    else:
+        leading_operand = lhs if lhs.is_leading_passthrough else rhs
+        batch = _static_int(env, leading_operand.logical_fake.shape[0])
+        if batch is None:
+            raise _decline("the batch extent must be static")
+        expected_root = (
+            env.canonical_block_id(leading_block_id),
+            m_block_id,
+            n_block_id,
+        )
+        expected_shape = (batch, m, n)
 
     analyzed = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
     if analyzed is None:
@@ -502,7 +598,6 @@ def detect_warp_mma_gemm(
         if out_fake.ndim != len(expected_root):
             raise _decline("the output rank must match the (batch,) M, N grid")
         out_shape = tuple(_static_int(env, size) for size in out_fake.shape)
-        expected_shape = (m, n) if leading_block_id is None else (batch, m, n)
         if out_shape != expected_shape:
             raise _decline("the output must cover the whole (batch,) M x N problem")
         store_index = store_node.args[1] if len(store_node.args) > 1 else None
@@ -587,29 +682,7 @@ def detect_warp_mma_gemm(
                 aux=tuple(aux),
             )
         )
-    _require_complete_root(
-        graphs,
-        k_block_ids=block_ids,
-        store_nodes={store.store_node for store in stores},
-    )
-    fn.cute_state.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
-        mma_node=mma_node,
-        lhs_fake=lhs_fake,
-        rhs_fake=rhs_fake,
-        lhs_strides=lhs_strides,
-        rhs_strides=rhs_strides,
-        rhs_k_major=rhs_k_major,
-        batch=batch,
-        m=m,
-        n=n,
-        k=k,
-        bm=bm,
-        bn=bn,
-        bk=bk,
-        warps=warps,
-        stores=tuple(stores),
-    )
-    return True
+    return tuple(stores)
 
 
 def _require_complete_root(
@@ -751,6 +824,17 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
         plan["epi_aux_count"] = len(first_aux)
         for index, name in enumerate(first_aux):
             plan[f"epi_aux{index}_name"] = name
+    # ``cute_pdl``: launched as a programmatic dependent of the previous
+    # kernel in the stream; the body waits before its first global access
+    # and releases its dependents once the last MMA is issued (the plan's
+    # ``use_pdl`` keeps the generic top-of-kernel wait out, see
+    # ``DeviceFunction._cute_pdl_applies``).
+    pdl = df.config.get("cute_pdl") is True and (
+        (capability := env.config_spec.target_device_capability) is not None
+        and capability >= (9, 0)
+    )
+    if pdl:
+        plan["use_pdl"] = True
     cg.cute_wrapper_plans.append(plan)
     df.body = emit_warp_mma_gemm_device_body(
         df,
@@ -761,6 +845,7 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
         aux_names=aux_args,
         out_pairs=out_pairs,
         aux_pairs=aux_pairs,
+        pdl=pdl,
     )
     df.preamble = []
     return True
@@ -788,11 +873,15 @@ def emit_warp_mma_gemm_device_body(
     aux_names: list[list[str]],
     out_pairs: list[bool] | None = None,
     aux_pairs: list[list[bool]] | None = None,
+    pdl: bool = False,
 ) -> list[ast.AST]:
     """Render the register-MMA GEMM body (see the module docstring).
 
     ``out_pairs`` / ``aux_pairs`` say which outputs and aux operands may move
     as element pairs (pair-aligned bases); the rest move element by element.
+    ``pdl``: wait on the previous grid ahead of the first global access (the
+    aux loads and operand packets) and release the dependents after the last
+    MMA, ahead of the output stores.
     """
     if out_pairs is None:
         out_pairs = [True] * len(match.stores)
@@ -878,6 +967,10 @@ def emit_warp_mma_gemm_device_body(
     emit(f"wm_row = wm_m0 + wm_wmi * {wtm} + wm_g")
     emit(f"wm_col = wm_n0 + wm_wni * {wtn} + 2 * wm_c")
 
+    if pdl:
+        # Programmatic dependent launch: everything above is address math
+        # and the shared allocation; every global access follows this wait.
+        emit("cute.arch.griddepcontrol_wait()")
     # ---- aux loads: issued at entry so their latency overlaps the operands.
     aux_value: dict[tuple[int, int, int, int, int], str] = {}
     for si, store in enumerate(match.stores):
@@ -949,11 +1042,44 @@ def emit_warp_mma_gemm_device_body(
                             aux_value[(si, li, am, an, 2 * half)] = lo
                             aux_value[(si, li, am, an, 2 * half + 1)] = hi
 
-    # ---- cp.async issue: one commit group per K chunk, all before the first wait.
-    def issue(*, tile: str, packets: int, cpr: int, row_bytes: int, gsrc: str) -> None:
+    # ---- operand packets: one commit group per K chunk, all issued before
+    # the first wait.  An operand the matmul reads as loaded moves by
+    # ``cp.async``; a cast operand (an int16 tile the program casts to the
+    # half dtype) is loaded into registers here -- every packet of the
+    # thread in flight at once -- and converted into its shared-memory slot
+    # by ``convert_pending`` once all packets are issued, so the conversion
+    # pays one DRAM latency, not one per packet.
+    pending: list[tuple[str, str, int]] = []  # (words prefix, smem slot, packets)
+
+    def cast_helper(cast: torch.dtype, source: torch.dtype) -> str:
+        from .cute_mma import _MMA_INTEGER_CAST_SOURCES
+
+        source_kind = _MMA_INTEGER_CAST_SOURCES[source]
+        target_kind = "bf16" if cast == torch.bfloat16 else "f16"
+        return f"{rt}.cvt_{source_kind}x8_{target_kind}_sts"
+
+    def issue(
+        *,
+        tag: str,
+        chunk: int,
+        tile: str,
+        packets: int,
+        cpr: int,
+        row_bytes: int,
+        gsrc: str,
+        cast: torch.dtype | None,
+    ) -> None:
         reps = max(1, packets // threads)
         for rep in range(reps):
+            name = f"wm_{tag}{chunk}_{rep}"
             if packets < threads:
+                if cast is not None:
+                    # Values assigned under the lane guard must exist before
+                    # it (the DSL merges the branches).
+                    emit(f"{name}_s = cutlass.Int32(0)")
+                    emit(
+                        "; ".join(f"{name}_w{j} = cutlass.Uint32(0)" for j in range(4))
+                    )
                 emit(f"if wm_tidx < {packets}:")
                 indent, idx = "    ", "wm_tidx"
             else:
@@ -961,30 +1087,80 @@ def emit_warp_mma_gemm_device_body(
             emit(f"{indent}wm_prow = {idx} // {cpr}")
             emit(f"{indent}wm_pch = {idx} % {cpr}")
             swz = _swizzled_chunk("wm_prow", "wm_pch", cpr)
+            slot = f"{tile} + wm_prow * {row_bytes} + {swz} * 16"
+            if cast is None:
+                emit(f"{indent}{rt}.cp_async_16({slot}, {gsrc})")
+            else:
+                emit(f"{indent}{name}_s = {slot}")
+                emit(
+                    f"{indent}{name}_w0, {name}_w1, {name}_w2, {name}_w3 = "
+                    f"{rt}.ldg_v4_b32({gsrc})"
+                )
+                pending.append(
+                    (
+                        name,
+                        cast_helper(
+                            cast,
+                            match.lhs_fake.dtype
+                            if tag == "a"
+                            else match.rhs_fake.dtype,
+                        ),
+                        packets,
+                    )
+                )
+
+    def convert_pending() -> None:
+        for name, helper, packets in pending:
+            guard = packets < threads
+            indent = "    " if guard else ""
+            if guard:
+                emit(f"if wm_tidx < {packets}:")
             emit(
-                f"{indent}{rt}.cp_async_16({tile} + wm_prow * {row_bytes} + {swz} * 16, {gsrc})"
+                f"{indent}{helper}({name}_s, {name}_w0, {name}_w1, {name}_w2, {name}_w3)"
             )
+        pending.clear()
+
+    def pending_words() -> int:
+        # each pending packet holds four 32-bit words per thread
+        return 4 * len(pending)
 
     for i in range(nk):
+        # Cast packets wait in registers until they are converted; keep the
+        # words in flight under a budget (a thread holding every chunk of a
+        # K=256 int16 operand would carry 256 live words and spill) by
+        # converting what is pending before issuing a chunk that would exceed
+        # it. Converted packets reach shared memory ahead of the first
+        # chunk's wait + barrier like the rest.
+        if pending_words() >= _CAST_PACKET_WORDS_IN_FLIGHT:
+            convert_pending()
         issue(
+            tag="a",
+            chunk=i,
             tile=f"(wm_s_a + {i * a_chunk})",
             packets=a_packets,
             cpr=cpr_a,
             row_bytes=ra,
             gsrc=f"wm_a_g + cutlass.Int64(wm_prow) * {a_row} + cutlass.Int64({i * bk * es} + wm_pch * 16)",
+            cast=match.lhs_cast,
         )
         if match.rhs_k_major:
             gsrc = f"wm_b_g + cutlass.Int64(wm_prow) * {b_row} + cutlass.Int64({i * bk * es} + wm_pch * 16)"
         else:
             gsrc = f"wm_b_g + cutlass.Int64({i * bk} + wm_prow) * {b_row} + cutlass.Int64(wm_pch * 16)"
         issue(
+            tag="b",
+            chunk=i,
             tile=f"(wm_s_b + {i * b_chunk})",
             packets=b_packets,
             cpr=cpr_b,
             row_bytes=rb,
             gsrc=gsrc,
+            cast=match.rhs_cast,
         )
         emit("cute.arch.cp_async_commit_group()")
+    # The converted packets land in shared memory before the first chunk's
+    # wait + barrier below, which publishes them like the cp.async packets.
+    convert_pending()
     # ---- accumulators
     for am in range(atoms_m):
         for an in range(atoms_n):
@@ -1058,6 +1234,10 @@ def emit_warp_mma_gemm_device_body(
                         f"{acc} = {mma}(wm_a_{am}_0, wm_a_{am}_1, wm_a_{am}_2, wm_a_{am}_3, "
                         f"wm_b_{an}_0, wm_b_{an}_1, {acc})"
                     )
+    if pdl:
+        # The last MMA is issued: let the next kernel launch while this
+        # CTA runs its epilogue (its own wait orders it after our stores).
+        emit("cute.arch.griddepcontrol_launch_dependents()")
     # ---- epilogue: the chain of every store on the fp32 fragments, then pairs.
     for si, store in enumerate(match.stores):
         odt = store.fake.dtype

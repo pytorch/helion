@@ -142,6 +142,104 @@ def mma_tf32(
     return _floats(result, 4, loc=loc, ip=ip)
 
 
+def _cvt_i16x8_sts(
+    source: str,
+    kind: str,
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object,
+    ip: object,
+) -> None:
+    # Eight 16-bit integers (``source``: s16 / u16) widened exactly to fp32
+    # and rounded (RN, the program's own ``.to()`` rounding) to eight half
+    # words (``kind``: bf16 / f16), stored as one 16-byte shared packet.
+    unpack = " ".join(
+        f"mov.b32 {{i{2 * j}, i{2 * j + 1}}}, ${j + 1};" for j in range(4)
+    )
+    widen = " ".join(f"cvt.rn.f32.{source} f{j}, i{j};" for j in range(8))
+    narrow = " ".join(f"cvt.rn.{kind}.f32 h{j}, f{j};" for j in range(8))
+    pack = " ".join(f"mov.b32 o{j}, {{h{2 * j}, h{2 * j + 1}}};" for j in range(4))
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            *[cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+        ],
+        "{ .reg .b16 i<8>; .reg .f32 f<8>; .reg .b16 h<8>; .reg .b32 o<4>; "
+        f"{unpack} {widen} {narrow} {pack} "
+        "st.shared.v4.b32 [$0], {o0, o1, o2, o3}; }",
+        "r,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def cvt_s16x8_bf16_sts(
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Eight int16 words -> eight bf16 (RN), stored as one shared packet."""
+    _cvt_i16x8_sts("s16", "bf16", smem_address, w0, w1, w2, w3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cvt_s16x8_f16_sts(
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Eight int16 words -> eight fp16 (RN), stored as one shared packet."""
+    _cvt_i16x8_sts("s16", "f16", smem_address, w0, w1, w2, w3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cvt_u16x8_bf16_sts(
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Eight uint16 words -> eight bf16 (RN), stored as one shared packet."""
+    _cvt_i16x8_sts("u16", "bf16", smem_address, w0, w1, w2, w3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cvt_u16x8_f16_sts(
+    smem_address: object,
+    w0: object,
+    w1: object,
+    w2: object,
+    w3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Eight uint16 words -> eight fp16 (RN), stored as one shared packet."""
+    _cvt_i16x8_sts("u16", "f16", smem_address, w0, w1, w2, w3, loc=loc, ip=ip)
+
+
 @dsl_user_op
 def ldg_b32(
     gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None

@@ -2341,6 +2341,19 @@ class DeviceFunction:
         capability = env.config_spec.target_device_capability
         if capability is None or capability < (9, 0):
             return False
+        if self.cute_state.cute_pdl_entry_wait:
+            # A tcgen05 kernel launched with ``use_pdl`` through its wrapper
+            # plan places late waits where its lowering knows the first
+            # global read of each warp (the flat kernel's prefetch, the
+            # persistent TMA-load and epilogue roles); when the generated
+            # body reads global memory ahead of those on some path (the
+            # grouped layout reads of the prologue, a scheduler-warp or
+            # grouped persistent builder without role waits, a root-body
+            # load ahead of the K loop) it gets this wait at the top of the
+            # body instead. Its releases all follow either wait.
+            from .cute.pdl_coverage import waits_cover_global_reads
+
+            return not waits_cover_global_reads([*self.preamble, *self.body])
         if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
             return False
         return not any(
