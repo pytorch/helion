@@ -1340,6 +1340,7 @@ class DeviceIRAnalysis:
         from .device_ir import HelperFunctionGraphInfo
         from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
+        from .device_ir import control_flow_child_graph_ids
 
         dot_targets = frozenset(matmul_operand_positions())
         graph_info_by_graph = {
@@ -1377,21 +1378,18 @@ class DeviceIRAnalysis:
         by_id = {graph.graph_id: graph for graph in graphs}
         child_loops: dict[int, tuple[tuple[int, frozenset[int]], ...]] = {}
         loop_calls: dict[int, list[torch.fx.Node]] = {}
-        graph_parent_of: dict[int, int] = {}
+        graph_parent_of = {
+            child_id: graph.graph_id
+            for graph in graphs
+            for node in graph.nodes
+            for child_id in control_flow_child_graph_ids(node)
+            if child_id in by_id
+        }
         for graph in graphs:
             if graph.is_reduction_loop:
                 continue
             edges: list[tuple[int, frozenset[int]]] = []
             for node in graph.nodes:
-                if node.target is _tracing_ops._if:
-                    child_ids = node.args[1:3]
-                elif node.target is _tracing_ops._while_loop:
-                    child_ids = (*node.args[:2], *node.args[3:])
-                else:
-                    child_ids = ()
-                for child_id in child_ids:
-                    if isinstance(child_id, int) and child_id in by_id:
-                        graph_parent_of[child_id] = graph.graph_id
                 if (
                     node.op != "call_function"
                     or not _tracing_ops.is_for_loop_target(node.target)
@@ -1402,8 +1400,6 @@ class DeviceIRAnalysis:
                 body_id = node.args[0]
                 loop_calls.setdefault(body_id, []).append(node)
                 body = by_id.get(body_id)
-                if body is not None:
-                    graph_parent_of[body_id] = graph.graph_id
                 if body is not None and not body.is_reduction_loop:
                     edges.append((body_id, body.block_ids))
             if edges:

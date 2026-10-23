@@ -518,6 +518,21 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return joins
 
 
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
+    if node.op != "call_function":
+        return ()
+    if _tracing_ops.is_for_loop_target(node.target):
+        return (cast("int", node.args[0]),)
+    if node.target is _tracing_ops._if:
+        return cast("tuple[int, ...]", node.args[1:3])
+    if node.target is _tracing_ops._while_loop:
+        result = cast("tuple[int, ...]", node.args[:2])
+        if len(node.args) > 3 and isinstance(node.args[3], int):
+            result = (*result, node.args[3])
+        return result
+    return ()
+
+
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
