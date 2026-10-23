@@ -1,10 +1,12 @@
 """Per-phase tcgen05 planning for ``hl.barrier()`` kernels with several GEMMs.
 
-CPU render pins: the barrier phases of ``squeeze_and_excitation_net_bwd_dx`` /
-``_bwd_da`` are separate ordered launches, so each GEMM phase owns its own
-tile triple (``materialized_matmul_block_ids``) and seeds, the pointwise phase
-keeps its SIMT layout knobs, and the relu-backward mask epilogue
-``acc.to(fp16) * (c[tile] > 0)`` splices into the tcgen05 epilogue chain.
+CPU render pins: the barrier phases of the two-GEMM backward chains
+(``test._cute_se_bwd_chains``, the pre-split ``squeeze_and_excitation_net``
+``bwd_dx`` / ``bwd_da`` bodies) are separate ordered launches, so each GEMM
+phase owns its own tile triple (``materialized_matmul_block_ids``) and seeds,
+the pointwise phase keeps its SIMT layout knobs, and the relu-backward mask
+epilogue ``acc.to(fp16) * (c[tile] > 0)`` splices into the tcgen05 epilogue
+chain.
 ``tcgen05_region_pid_types`` runs chosen GEMM launches of the flat chain as
 the static persistent two-CTA pipeline of the standalone single-GEMM surface.
 """
@@ -15,13 +17,13 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_da
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dx
 from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
+from test._cute_se_bwd_chains import se_bwd_da_chain
+from test._cute_se_bwd_chains import se_bwd_dx_chain
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_full_slice_matmul import _bind
 from test.test_cute_full_slice_matmul import _cpu_target
@@ -97,7 +99,7 @@ def _bwd_args(
 def _bind_bwd_dx(**kwargs: object) -> BoundKernel[Any]:
     t = _bwd_args(**kwargs)  # type: ignore[arg-type]
     return _bind(
-        squeeze_and_excitation_net_bwd_dx.fn,
+        se_bwd_dx_chain,
         (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"]),
     )
 
@@ -105,7 +107,7 @@ def _bind_bwd_dx(**kwargs: object) -> BoundKernel[Any]:
 def _bind_bwd_da(**kwargs: object) -> BoundKernel[Any]:
     t = _bwd_args(**kwargs)  # type: ignore[arg-type]
     return _bind(
-        squeeze_and_excitation_net_bwd_da.fn,
+        se_bwd_da_chain,
         (t["grad_out"], t["x"], t["b"], t["c"], t["d"]),
     )
 

@@ -62,6 +62,12 @@ def se_block_bwd_dx(grad_out: Tensor, x: Tensor, w: Tensor, s: Tensor) -> Tensor
     Compute gradient for x.
     grad_x = 2 * grad_out * s + (2 * grad_out * x * s * (1 - s)) @ w.T
 
+    The matmul runs on operands in the input dtype, like the reference
+    backward's: the elementwise factor ``2 * grad_out * x * s * (1 - s)`` is
+    formed in fp32 and rounded once to ``x.dtype`` before it enters the
+    matmul, ``w`` is read as is, and the products accumulate in fp32.  grad_x
+    is written in the input dtype, so autograd needs no converting copy.
+
     Args:
         grad_out: Gradient w.r.t output [m, n]
         x: Input tensor [m, n]
@@ -69,11 +75,11 @@ def se_block_bwd_dx(grad_out: Tensor, x: Tensor, w: Tensor, s: Tensor) -> Tensor
         s: sigmoid(x @ w) from forward pass [m, n]
 
     Returns:
-        grad_x: Gradient w.r.t x [m, n]
+        grad_x: Gradient w.r.t x [m, n], in x.dtype
     """
     m, n = x.size()
 
-    grad_x = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    grad_x = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
         # 2 * grad_out * s
@@ -81,16 +87,17 @@ def se_block_bwd_dx(grad_out: Tensor, x: Tensor, w: Tensor, s: Tensor) -> Tensor
         acc += 2.0 * grad_out[tile_m, tile_n] * s[tile_m, tile_n]
 
         for tile_k in hl.tile(n):
-            # 2 * grad_out * x * s * (1-s) for tile_k
+            # 2 * grad_out * x * s * (1-s) for tile_k, rounded to the input
+            # dtype as the matmul's A operand
             grad_to_w = (
                 2.0
                 * grad_out[tile_m, tile_k].to(torch.float32)
                 * x[tile_m, tile_k].to(torch.float32)
                 * s[tile_m, tile_k].to(torch.float32)
                 * (1.0 - s[tile_m, tile_k].to(torch.float32))
-            )
+            ).to(x.dtype)
             # grad_to_w @ w.T[tile_k, tile_n] = grad_to_w @ w[tile_n, tile_k].T
-            acc += grad_to_w @ w[tile_n, tile_k].to(torch.float32).T
+            acc = torch.addmm(acc, grad_to_w, w[tile_n, tile_k].T)
 
         grad_x[tile_m, tile_n] = acc.to(x.dtype)
 
@@ -104,31 +111,40 @@ def se_block_bwd_dw(grad_out: Tensor, x: Tensor, s: Tensor) -> Tensor:
     Compute gradient for w.
     grad_w = x.T @ (2 * grad_out * x * s * (1 - s))
 
+    The matmul runs on operands in the input dtype, like the reference
+    backward's: the elementwise factor ``2 * grad_out * x * s * (1 - s)`` is
+    formed in fp32 and rounded once to ``x.dtype`` before it enters the
+    matmul, ``x.T`` is read as is, and the products accumulate in fp32.
+    Every tile of grad_w is written by exactly one iteration, so it is
+    allocated uninitialized in the input dtype (no memset, no converting
+    copy in autograd).
+
     Args:
         grad_out: Gradient w.r.t output [m, n]
         x: Input tensor [m, n]
         s: sigmoid(x @ w) from forward pass [m, n]
 
     Returns:
-        grad_w: Gradient w.r.t w [n, n]
+        grad_w: Gradient w.r.t w [n, n], in x.dtype
     """
     m, n = x.size()
 
-    grad_w = torch.zeros([n, n], dtype=torch.float32, device=x.device)
+    grad_w = torch.empty([n, n], dtype=x.dtype, device=x.device)
 
     for tile_n1, tile_n2 in hl.tile([n, n]):
         acc_w = hl.zeros([tile_n1, tile_n2], dtype=torch.float32)
         for tile_m in hl.tile(m):
-            # 2 * grad_out * x * s * (1-s)
+            # 2 * grad_out * x * s * (1-s), rounded to the input dtype as the
+            # matmul's B operand
             grad_to_w = (
                 2.0
                 * grad_out[tile_m, tile_n2].to(torch.float32)
                 * x[tile_m, tile_n2].to(torch.float32)
                 * s[tile_m, tile_n2].to(torch.float32)
                 * (1.0 - s[tile_m, tile_n2].to(torch.float32))
-            )
+            ).to(x.dtype)
             # x[tile_m, tile_n1].T @ grad_to_w[tile_m, tile_n2]
-            acc_w += x[tile_m, tile_n1].to(torch.float32).T @ grad_to_w
+            acc_w = torch.addmm(acc_w, x[tile_m, tile_n1].T, grad_to_w)
 
         grad_w[tile_n1, tile_n2] = acc_w.to(x.dtype)
 

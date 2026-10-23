@@ -28,7 +28,7 @@ pytestmark = [
 BH, D, DV = 256, 128, 128
 COLUMN_REDUCE = "_cute_grouped_reduce_shared_columns("
 WARP_FOLD = "fold='warp'"
-STATE_STORE = "_cute_store_u32_vec(state.iterator"
+STATE_STORE = "_cute_store_u32_vec(new_state.iterator"
 KNOBS: dict[str, Any] = {
     "cute_register_tile_warp_fold": True,
     "cute_register_tile_store_first": True,
@@ -75,8 +75,8 @@ def _check_recurrent_step(
     vec: int = 4,
     **extra: Any,
 ) -> str:
-    """Run the fused recurrent step on two input sets (a stale output cannot
-    pass twice) and return the generated code."""
+    """Run the fused recurrent step on two input sets (a stale output or new
+    state cannot pass twice) and return the generated code."""
     kernel = helion.kernel(
         recurrent_step_fused.fn,
         backend="cute",
@@ -105,17 +105,20 @@ def _check_recurrent_step(
     compiled = bound.compile_config(config)
     rtol, atol = (1e-3, 1e-3) if dtype is torch.float32 else (2e-2, 2e-1)
     for _ in range(2):
-        out = compiled(q, k, v, state, alpha)
+        out, new_state = compiled(q, k, v, state, alpha)
         torch.cuda.synchronize()
         expected_state = (
             alpha.float()[:, None, None] * initial.float()
             + k.float()[:, :, None] * v.float()[:, None, :]
         )
         expected_out = (q.float()[:, :, None] * expected_state).sum(1)
-        torch.testing.assert_close(state.float(), expected_state, rtol=rtol, atol=atol)
+        torch.testing.assert_close(
+            new_state.float(), expected_state, rtol=rtol, atol=atol
+        )
         torch.testing.assert_close(out.float(), expected_out, rtol=rtol, atol=atol)
+        assert torch.equal(state, initial)
         q.copy_(torch.rand_like(q, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
-        state.copy_(initial)
+        v.copy_(torch.rand_like(v, dtype=torch.float32).mul_(2).sub_(1).to(dtype))
     return code
 
 
@@ -175,7 +178,7 @@ def test_bf16_register_tile_with_both_knobs() -> None:
         **KNOBS,
     )
     assert WARP_FOLD in code
-    assert code.count("_cute_store_u16_vec(state.iterator") == 1
+    assert code.count("_cute_store_u16_vec(new_state.iterator") == 1
 
 
 def _col_sum_reference(x: torch.Tensor) -> torch.Tensor:
@@ -248,12 +251,13 @@ def test_diagonal_decay_with_both_knobs_matches_reference() -> None:
     assert WARP_FOLD in code
     assert code.index(STATE_STORE) < code.index(COLUMN_REDUCE)
     compiled = bound.compile_config(config)
-    out = compiled(q, k, v, state, alpha)
+    out, new_state = compiled(q, k, v, state, alpha)
     torch.cuda.synchronize()
     expected_state = alpha[:, :, None] * initial + k[:, :, None] * v[:, None, :]
     expected_out = (q[:, :, None] * expected_state).sum(1)
-    torch.testing.assert_close(state, expected_state, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(new_state, expected_state, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=1e-3)
+    assert torch.equal(state, initial)
 
 
 OWNER_LOOP = "for synthetic_lane_2 in cutlass.range_constexpr("
@@ -311,9 +315,9 @@ def test_correction_step_chains_two_register_tile_levels(
     compiled = bound.compile_config(config)
     a = alpha[:, :, None] if diagonal else alpha[:, None, None]
     for _ in range(2):
-        out = compiled(q, k, v, state, alpha, beta)
+        out, new_state = compiled(q, k, v, state, alpha, beta)
         torch.cuda.synchronize()
-        decayed = a * initial
+        decayed = a * state
         kts = (k[:, :, None] * decayed).sum(1)
         expected_state = (
             decayed
@@ -321,7 +325,8 @@ def test_correction_step_chains_two_register_tile_levels(
             + beta[:, None, None] * k[:, :, None] * v[:, None, :]
         )
         expected_out = (q[:, :, None] * expected_state).sum(1)
-        torch.testing.assert_close(state, expected_state, rtol=1e-3, atol=1e-2)
+        torch.testing.assert_close(new_state, expected_state, rtol=1e-3, atol=1e-2)
         torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=1e-2)
+        assert torch.equal(state, initial)
         q.copy_(torch.rand_like(q).mul_(2).sub_(1))
-        state.copy_(initial)
+        v.copy_(torch.rand_like(v).mul_(2).sub_(1))

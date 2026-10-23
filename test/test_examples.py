@@ -2297,13 +2297,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
+    def test_fused_linear_jsd_flushed_probabilities(self):
+        """Rows whose softmax probabilities are fp32 subnormals.
+
+        fast_math's approximate exp and division flush them to zero; both JSD
+        kernels clamp the mixture before its log, otherwise the loss is
+        p * (log p - log 0) = NaN.  student == teacher, so the JSD and the
+        gradient are zero.
+        """
+        beta = 0.5
+        ignore_index = -100
+        temperature = 1.0
+        student_logits = torch.full([16, 1024], -100.0, device=DEVICE)
+        student_logits[:, 0] = 0.0
+        teacher_logits = student_logits.clone()
+        args = (beta, ignore_index, temperature, student_logits, teacher_logits)
+
+        check_example(
+            "fused_linear_jsd",
+            args,
+            torch.zeros((), device=DEVICE),
+            fn_name="fused_linear_jsd_kernel",
+            emit_code=False,
+            block_sizes=[16],
+            atol=1e-6,
+            rtol=0,
+        )
+        check_example(
+            "fused_linear_jsd",
+            args,
+            (torch.zeros(16, device=DEVICE), torch.zeros_like(student_logits)),
+            fn_name="jsd_kernel",
+            emit_code=False,
+            block_sizes=[16],
+            atol=1e-6,
+            rtol=0,
+        )
+
     def test_fused_linear_jsd_fwd(self):
         """Exercise the autograd-wrapped FusedLinearJSDFunction path
         (FusedLinearJSDFunction.forward -> jsd_kernel per chunk).
 
         This is the user-facing API; the existing `test_fused_linear_jsd`
         only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
-        Shape picked so chunk_size > 1 (chunked path actually runs).
+        The logits byte budget is shrunk below so the shape runs the chunked
+        path (chunk_size > 1 and more than one chunk).
         """
         beta = 0.5
         ignore_index = -100
@@ -2331,25 +2369,44 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         mod.jsd_kernel.settings.static_shapes = True
         mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
-        result = mod.fused_linear_jsd_fwd(
-            beta,
-            ignore_index,
-            temperature,
-            student_weight,
-            teacher_weight,
-            student_input,
-            teacher_input,
-        )
-        expected = mod.fused_linear_jsd_pytorch(
-            beta,
-            ignore_index,
-            temperature,
-            student_weight,
-            teacher_weight,
-            student_input,
-            teacher_input,
+        # The default budget makes this shape a single chunk; four chunks of
+        # 32 rows of fp32 [chunk, k] logits exercise the multi-chunk loop.
+        original_budget = mod.LOGITS_CHUNK_BYTES
+        self.addCleanup(setattr, mod, "LOGITS_CHUNK_BYTES", original_budget)
+        mod.LOGITS_CHUNK_BYTES = 32 * k * 4
+
+        def loss_and_grads(
+            fn: typing.Callable[..., torch.Tensor],
+        ) -> tuple[torch.Tensor, ...]:
+            # The forward precomputes the gradients of the mean loss w.r.t.
+            # the student input and weight; compare them with autograd of
+            # the reference, not only the loss.
+            x = student_input.detach().clone().requires_grad_(True)
+            w = student_weight.detach().clone().requires_grad_(True)
+            with torch.enable_grad():
+                loss = fn(
+                    beta,
+                    ignore_index,
+                    temperature,
+                    w,
+                    teacher_weight,
+                    x,
+                    teacher_input,
+                )
+                grad_x, grad_w = torch.autograd.grad(loss, (x, w))
+            return loss.detach(), grad_x, grad_w
+
+        result, grad_input, grad_weight = loss_and_grads(mod.fused_linear_jsd_fwd)
+        expected, expected_grad_input, expected_grad_weight = loss_and_grads(
+            mod.fused_linear_jsd_pytorch
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(
+            grad_input, expected_grad_input, atol=1e-6, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            grad_weight, expected_grad_weight, atol=1e-6, rtol=2e-2
+        )
 
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
@@ -2500,11 +2557,12 @@ class TestExamples(RefEagerTestBase, TestCase):
                 **config,
             )
 
-    @xfailIfPallas("conflicting tiling patterns")
-    @skipIfA10G("failure on a10g")
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
-    @skipIfTileIR("accuracy failure")
-    def test_squeeze_and_excitation_net_bwd_dx(self):
+    def _squeeze_and_excitation_net_bwd_inputs(self):
+        """Forward intermediates from the configured Helion forward, a random
+        grad_out, the torch autograd gradients of x, a and b, and the shared
+        backward intermediates (grad_cb, grad_c) computed with torch in fp32
+        and rounded to the input dtype as the dc kernel stores them."""
+        torch.manual_seed(0)
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -2516,7 +2574,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         configured_kernel = helion.kernel(
             squeeze_and_excitation_net_fwd.fn, config=config
         )
-        out, c, d = configured_kernel(x, a, b)
+        _out, c, d = configured_kernel(x, a, b)
 
         # Create gradient for backward pass
         grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -2530,61 +2588,80 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         out_torch.backward(grad_out)
 
-        args = (grad_out, x, a, b, c, d)
-        expected = x_torch.grad
+        grad_cb = grad_out.float() * x.float() * d.float() * (1.0 - d.float())
+        grad_cb = grad_cb.to(HALF_DTYPE)
+        grad_c = (grad_cb.float() @ b.float().T) * (c > 0)
+        grad_c = grad_c.to(HALF_DTYPE)
+        tensors = {"x": x, "a": a, "b": b, "c": c, "d": d, "grad_out": grad_out}
+        grads = {"x": x_torch.grad, "a": a_torch.grad, "b": b_torch.grad}
+        return tensors, grads, grad_cb, grad_c
 
+    @xfailIfPallas("conflicting tiling patterns")
+    @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
+    def test_squeeze_and_excitation_net_bwd_dc(self):
+        t, _grads, _grad_cb, _grad_c = self._squeeze_and_excitation_net_bwd_inputs()
+
+        # The shared intermediates are the autograd gradients of the forward's
+        # pre-activation intermediates: grad_cb of c @ b (before the sigmoid)
+        # and grad_c of x @ a (before the relu, so the relu mask is applied).
+        x_torch = t["x"].detach().clone().requires_grad_(True)
+        xa_torch = x_torch @ t["a"]
+        cb_torch = torch.relu(xa_torch) @ t["b"]
+        out_torch = torch.mul(x_torch, torch.sigmoid(cb_torch))
+        grad_cb_torch, grad_c_torch = torch.autograd.grad(
+            out_torch, (cb_torch, xa_torch), t["grad_out"]
+        )
+
+        args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
-            fn_name="squeeze_and_excitation_net_bwd_dx",
-            block_sizes=[16] * 8,
+            (grad_cb_torch, grad_c_torch),
+            fn_name="squeeze_and_excitation_net_bwd_dc",
+            block_sizes=[16] * 5,
             pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,
         )
 
-    @xfailIfPallas("tensor accessed with conflicting tiling patterns")
+    @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
+    def test_squeeze_and_excitation_net_bwd_dx(self):
+        t, grads, _grad_cb, grad_c = self._squeeze_and_excitation_net_bwd_inputs()
+
+        args = (t["grad_out"], t["a"], t["d"], grad_c)
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            grads["x"],
+            fn_name="squeeze_and_excitation_net_bwd_dx",
+            block_sizes=[16] * 3,
+            num_warps=4,
+            num_stages=2,
+            atol=0.3,
+            # grad_c carries the forward's half-precision c through the relu
+            # mask (c > 0); a flip at |c| ~ 0 shifts a whole row of grad_x by
+            # one grad_c element (0.1 % of the elements on the Pallas TPU row).
+            max_mismatch_pct=0.5,
+        )
+
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
-        m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        t, grads, _grad_cb, grad_c = self._squeeze_and_excitation_net_bwd_inputs()
 
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
-
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(
-            squeeze_and_excitation_net_fwd.fn, config=config
-        )
-        out, c, d = configured_kernel(x, a, b)
-
-        # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
-        args = (grad_out, x, b, c, d)
-        expected = a_torch.grad
-
+        args = (t["x"], grad_c)
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
+            grads["a"],
             fn_name="squeeze_and_excitation_net_bwd_da",
-            block_sizes=[16] * 8,
-            pid_type="persistent_blocked",
+            block_sizes=[16] * 3,
             num_warps=4,
             num_stages=2,
             atol=0.3,
@@ -2594,42 +2671,15 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
-        torch.manual_seed(0)
-        m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        t, grads, grad_cb, _grad_c = self._squeeze_and_excitation_net_bwd_inputs()
 
-        # Create configured kernel with explicit config
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
-
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(
-            squeeze_and_excitation_net_fwd.fn, config=config
-        )
-        out, c, d = configured_kernel(x, a, b)
-
-        # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
-        args = (grad_out, x, d, c)
-        expected = b_torch.grad
-
+        args = (t["c"], grad_cb)
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
+            grads["b"],
             fn_name="squeeze_and_excitation_net_bwd_db",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 3,
             num_warps=4,
             num_stages=2,
             atol=2.0,
