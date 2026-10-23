@@ -419,7 +419,10 @@ class TestReductions(RefEagerTestBase, TestCase):
             out = torch.empty([x.size(0), 3], device=x.device, dtype=x.dtype)
             for tile in hl.tile(x.size(0)):
                 # scale broadcasts over the merged dims as one size-1 dim
-                total = (x[tile] * scale[tile, None, None]).sum(dim=(1, 2))
+                value = x[tile] * scale[tile, None, None]
+                total = value.sum(dim=(1, 2))
+                # Tuple assignment renames the traced source.
+                _source, total = value, total
                 for step in hl.tile(3, block_size=1):
                     out[tile, step] = total[:, None]
             return out

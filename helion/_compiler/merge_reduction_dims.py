@@ -58,7 +58,6 @@ _MERGE_OPS = {
 
 @dataclass(frozen=True)
 class _ReductionChain:
-    source: str
     op: str
     dims: list[int]
     keepdim: bool
@@ -142,7 +141,6 @@ def chain_reduction_dims(
                     break
                 chain_nodes.add(created.name)
             node.meta[_META_KEY] = _ReductionChain(
-                source=source_node.name,
                 op=op.name(),
                 dims=sorted(dims),
                 keepdim=keepdim,
@@ -178,11 +176,12 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 node.meta.pop(_META_KEY)
             continue
         flat_nodes: dict[tuple[Node, int, int], Node] = {}
-        nodes_by_name = {node.name: node for node in graph.nodes}
         for node in tagged_nodes:
             tag = cast("_ReductionChain", node.meta.pop(_META_KEY))
-            original = nodes_by_name[tag.source]
-            source = replacements.get(original, original)
+            source = node
+            # Reduction and cast nodes have one tensor input.
+            while source is node or source.name in tag.nodes:
+                source = cast("Node", source.args[0])
             dims = tag.dims
             if dims != [*range(dims[0], dims[-1] + 1)]:
                 continue
