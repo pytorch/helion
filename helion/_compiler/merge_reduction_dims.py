@@ -128,7 +128,7 @@ def chain_reduction_dims(
         for d in sorted(dims, reverse=True):
             x = op(x, [d], keepdim, **kwargs)
         result = x.to(out_dtype) if upcast or bool_extrema else x
-        # Tag the chain with its source so merge_reduction_dims can replace it.
+        # Tag the chain so merge_reduction_dims can replace it.
         # Bool extrema use the integer chain above; merging the original
         # bool op would bypass that conversion and recreate any/all lowering.
         if mode is not None and source_node is not None and not bool_extrema:
