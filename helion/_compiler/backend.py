@@ -236,6 +236,14 @@ class Backend(abc.ABC):
     - What decorators and annotations are used on generated functions
     """
 
+    # ``torch.device.type`` values this backend can target (e.g. {"cuda"}).
+    # When the selected backend does not declare the active device type but
+    # another registered backend does, CompileEnvironment routes to that
+    # backend instead (see find_backend_for_device).  Empty (the default)
+    # means the backend does not participate in device routing and behavior
+    # is unchanged regardless of device.
+    device_types: frozenset[str] = frozenset()
+
     @property
     @abc.abstractmethod
     def name(self) -> str:
@@ -573,6 +581,37 @@ class Backend(abc.ABC):
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
+
+    def clamp_masked_pointer_offsets(self) -> bool:
+        """Whether masked load/store/atomic offsets must be clamped to >= 0.
+
+        Some hardware DMA paths require non-negative pointer offsets even for
+        masked-out elements; when True, codegen wraps the offset in
+        ``tl.where(mask, offset, 0)`` so masked-out elements access
+        ``ptr + 0`` (the loaded/stored value is discarded anyway). The pointer
+        and stack indexing strategies honor this; block-ptr and tensor
+        descriptor strategies are unaffected, so a backend that enables it
+        should also exclude those indexing modes from its search space.
+        """
+        return False
+
+    def inline_constexpr_at_module_level(self) -> bool:
+        """Whether literal constexpr args may be inlined as module-level constants.
+
+        Some backends require constexpr args to remain kernel parameters
+        rather than inlined module-level constants; they override this to
+        False so every constexpr arg stays a function parameter.
+        """
+        return True
+
+    def supports_num_threads_deferral(self) -> bool:
+        """Whether num_warps/num_stages may be None (deferred to the driver).
+
+        Backends that do not resolve these through the triton driver override
+        this to False; normalization then rejects a deferred None uniformly
+        instead of letting some consumer silently ignore it.
+        """
+        return True
 
     def launches_surplus_tile_threads(self) -> bool:
         """Whether an axis may be launched wider than the tile it indexes."""
@@ -1236,8 +1275,14 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
-    def effective_num_warps(self, config: Config) -> int:
-        """Return the warp count the backend will actually launch."""
+    def effective_num_warps(self, config: Config) -> int | None:
+        """Return the warp count the backend will actually launch.
+
+        ``None`` defers the choice to the triton driver's own default.
+        Backends whose driver binds the warp count itself (or rejects the
+        ``num_warps`` keyword entirely) override this to return ``None`` so
+        the launcher omits the keyword.
+        """
         return config.num_warps
 
     def customize_ast(self, hf: HostFunction) -> bool:
@@ -1562,6 +1607,10 @@ class Backend(abc.ABC):
             "tf32": "tf32",
             "tf32x3": "tf32x3",
             "ieee": "ieee",
+            # Forwarded verbatim: stock CUDA triton rejects it loudly at
+            # compile time; out-of-tree drivers that accept the value
+            # honor it.
+            "hf32": "hf32",
         }
         return triton_precision_by_dot_precision.get(precision, "")
 

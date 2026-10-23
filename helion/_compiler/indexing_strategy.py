@@ -980,6 +980,35 @@ class _PointerLoadContiguity:
         return None
 
 
+def _clamps_masked_offsets(indexing: SubscriptIndexing) -> bool:
+    """Whether the backend requires masked-out offsets clamped to 0."""
+    return indexing.has_mask() and (
+        CompileEnvironment.current().backend.clamp_masked_pointer_offsets()
+    )
+
+
+def _clamped_offset_expr(indexing: SubscriptIndexing, offset: ast.AST) -> ast.AST:
+    """Clamp masked-out pointer offsets to 0 when the backend requires it.
+
+    Some hardware DMA paths require non-negative pointer offsets even for
+    masked-out elements (see ``Backend.clamp_masked_pointer_offsets``). The
+    pointer and stack indexing strategies go through here; block-ptr and
+    tensor descriptor strategies are unaffected.
+
+    The stack strategy clamps with the subscript mask alone while its
+    load/store mask additionally conjoins the dev-ptr extent mask; lanes
+    excluded only by the latter still carry in-extent, hence non-negative,
+    offsets, so the DMA contract holds without clamping them.
+    """
+    if not _clamps_masked_offsets(indexing):
+        return offset
+    return expr_from_string(
+        "tl.where({mask}, {off}, 0)",
+        mask=indexing.mask_expr,
+        off=offset,
+    )
+
+
 class PointerIndexingStrategy(IndexingStrategy):
     """Generate the original pointer math to load/store from tensors"""
 
@@ -1020,8 +1049,13 @@ class PointerIndexingStrategy(IndexingStrategy):
             contiguity = _PointerLoadContiguity(state, fake_tensor, subscript).derive()
         except Exception:
             contiguity = None
-        if contiguity is not None:
+        clamped = _clamps_masked_offsets(indexing)
+        if clamped:
+            offset_ast = _clamped_offset_expr(indexing, offset_ast)
+        if contiguity is not None and not clamped:
             # Triton propagates the hint from ``index``, but not ``index * 1``.
+            # Skipped when clamping: ``tl.where`` breaks the value contiguity
+            # the hint would assert.
             inner_ast = offset_ast
             if (
                 isinstance(inner_ast, ast.BinOp)
@@ -1105,10 +1139,18 @@ class PointerIndexingStrategy(IndexingStrategy):
         ):
             value = expr_from_string(backend.reshape_expr("{value}", "[]"), value=value)
 
+        offset_expr = indexing.index_expr
+        # If dimensions need broadcasting for store, broadcast the pointer
+        if indexing.needs_broadcast():
+            shape_str = state.tile_strategy.shape_str(output_size)
+            broadcast = backend.broadcast_to_expr("{offset}", shape_str)
+            offset_expr = expr_from_string(broadcast, offset=offset_expr)
+        offset_expr = _clamped_offset_expr(indexing, offset_expr)
+
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
         store_placeholders: dict[str, ast.AST] = {
             "value": value,
-            "offset": indexing.broadcast_offset(state, output_size),
+            "offset": offset_expr,
             "mask": indexing.mask_expr,
         }
         if cache_modifier is not None:
@@ -1131,10 +1173,10 @@ class PointerIndexingStrategy(IndexingStrategy):
             state, fake_tensor, subscript, for_store=True
         )
         name = state.device_function.tensor_arg(fake_tensor).name
-        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        offset_expr = _clamped_offset_expr(indexing, indexing.index_expr)
         return expr_from_string(
             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
-            offset=indexing.broadcast_offset(state, output_size),
+            offset=offset_expr,
             value=value,
             mask=indexing.mask_expr,
             sem=sem,
@@ -1733,7 +1775,7 @@ class StackIndexingStrategy:
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
-            "offset": indexing.broadcast_offset(state, subscripts_shape),
+            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
             "mask": mask_expr,
         }
         if eviction_policy is not None:
@@ -1779,7 +1821,7 @@ class StackIndexingStrategy:
         placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
             "value": value,
-            "offset": indexing.broadcast_offset(state, subscripts_shape),
+            "offset": _clamped_offset_expr(indexing, indexing.index_expr),
             "mask": mask_expr,
         }
         if cache_modifier is not None:
