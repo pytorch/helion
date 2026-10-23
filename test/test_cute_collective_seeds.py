@@ -244,7 +244,6 @@ def test_collective_async_priority_preserves_candidates_and_default(
             )
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     k = hl.register_block_size(a.size(1))
     n = hl.register_block_size(b.size(1))
@@ -262,7 +261,7 @@ def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
 @pytest.mark.parametrize("missing_async", [False, True])
 def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) -> None:
     kernel = helion.kernel(
-        matmul.fn if missing_async else _reverse_registered_matmul.fn,
+        matmul.fn if missing_async else _reverse_registered_matmul,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
