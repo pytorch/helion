@@ -25,6 +25,7 @@ from torch.fx.experimental import proxy_tensor
 
 from .. import exc
 from ..language import _MEMORY_OPS
+from ..language._decorators import args_to_proxies
 from ..language._tracing_ops import _host_tensor
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
@@ -69,9 +70,8 @@ def _tensor_proxy_node(
     tensor: torch.Tensor,
     tracer: proxy_tensor.PythonKeyTracer | proxy_tensor._GraphAppendingTracerEx,
 ) -> Node:
-    slot = cast("Any", proxy_tensor.get_proxy_slot(tensor, tracer))
-    proxy = slot if isinstance(slot, torch.fx.Proxy) else slot.proxy
-    return proxy.node
+    proxy, _ = args_to_proxies(tracer, tensor)
+    return cast("torch.fx.Proxy", proxy).node
 
 
 def chain_reduction_dims(
@@ -178,7 +178,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             if not enabled or dims != [*range(dims[0], dims[-1] + 1)]:
                 continue
             if excluded is None:
-                # Leave tensors the kernel writes unmerged: a merged load reads
+                # Leave store and atomic targets unmerged: a merged load reads
                 # them in a different layout than they are written, and CuTe
                 # may promote an atomic target's dtype after merging, which
                 # its flattened view would miss.
