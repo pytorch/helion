@@ -3938,6 +3938,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
                 env, device_ir, device_ir.graphs
             )
+            from .cute.mma_support import cute_fp32_dot_uses_tf32
+
+            config_spec.cute_fp32_dot_exact = not cute_fp32_dot_uses_tf32()
 
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.

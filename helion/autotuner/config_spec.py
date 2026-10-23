@@ -1006,6 +1006,8 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_gathered_mma_n",
         "cute_gathered_mma_stages",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_pdl",
         "cute_min_blocks_per_mp",
         "epilogue_subtile",
@@ -1115,6 +1117,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1255,6 +1259,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1410,6 +1416,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1549,6 +1557,9 @@ class ConfigSpec:
         # separate roots reuse physical axes during CuTe launch planning.
         self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
+        # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
+        # SIMT GEMM knob's precondition, recorded by DeviceIR.
+        self.cute_fp32_dot_exact: bool = False
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -3426,7 +3437,7 @@ class ConfigSpec:
             value = config.get(key)
             if isinstance(value, list):
                 config[key] = [default for _ in value]
-        for key in ("cute_collective_mma", "cute_register_chain"):
+        for key in ("cute_collective_mma", "cute_register_chain", "cute_simt_mma"):
             if key in config:
                 config[key] = False
         for key, field in self._flat_fields().items():
@@ -5067,6 +5078,48 @@ class ConfigSpec:
                     "and CUDA compute capability >= 8.0"
                 )
 
+    def _normalize_cute_simt_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+        key = "cute_simt_mma"
+        if key in config:
+            value = config[key]
+            if type(value) is not bool or (value and not self.cute_simt_mma_enabled):
+                if fix_invalid:
+                    config[key] = False
+                else:
+                    raise InvalidConfig(
+                        "cute_simt_mma requires a boolean and an fp32 matrix contraction"
+                    )
+        # The layout is inert while the GEMM is off (a flat field keeps its
+        # default there, and the strict coverage round trip must stay the
+        # identity); only an unknown value is invalid.
+        layout_key = "cute_simt_mma_layout"
+        if layout_key not in config:
+            return
+        if config[layout_key] not in SIMT_MMA_LAYOUTS:
+            if fix_invalid:
+                config[layout_key] = SIMT_MMA_LAYOUTS[0]
+            else:
+                raise InvalidConfig(
+                    f"cute_simt_mma_layout must be one of {SIMT_MMA_LAYOUTS}"
+                )
+
+    @property
+    def cute_simt_mma_enabled(self) -> bool:
+        """Whether the exact fp32 SIMT GEMM (``cute_simt_mma``) has a target.
+
+        fp32 contractions under ``dot_precision="tf32"`` belong to the tensor
+        cores; the knob exists only when the kernel's precision keeps them
+        exact (``cute_fp32_dot_exact``, recorded by DeviceIR).
+        """
+        return self.cute_fp32_dot_exact and any(
+            fact.lhs_dtype == torch.float32 and fact.rhs_dtype == torch.float32
+            for fact in self.matmul_facts
+        )
+
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5707,6 +5760,7 @@ class ConfigSpec:
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_simt_mma(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
                 value = config.setdefault("cute_collective_mma", False)
                 if not isinstance(value, bool):
@@ -7766,6 +7820,11 @@ class ConfigSpec:
                         (False, True),
                         search_choices=(False, True) if chain_seeded else (False,),
                     )
+                if self.cute_simt_mma_enabled:
+                    from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+                    fields["cute_simt_mma"] = EnumFragment((False, True))
+                    fields["cute_simt_mma_layout"] = EnumFragment(SIMT_MMA_LAYOUTS)
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately

@@ -743,9 +743,13 @@ def _detect_specialized_mma_loop(
 ) -> bool:
     from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
+    from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
+    from .mma_support import cute_fp32_dot_uses_tf32
+    from .simt_gemm import simt_gemm_root_layout_supported
+    from .simt_gemm import simt_mma_requested
 
     if _detect_grouped_rank3_specialized_mma_loop(
         fn,
@@ -762,6 +766,20 @@ def _detect_specialized_mma_loop(
     if len(block_ids) != 1 or any(block_id in root_grid_ids for block_id in block_ids):
         return False
 
+    # The same boundary-only proof the root strategy applies
+    # (``create_loop_strategy``): axes that only bound an inner loop carry no
+    # threads or lanes, so the output tile is the root minus those axes.
+    from ..compile_environment import CompileEnvironment
+    from .loop_nesting import boundary_only_grid_blocks
+
+    env = CompileEnvironment.current()
+    inactive_root_block_ids = frozenset(
+        _tile_loop_inactive_block_ids(
+            fn,
+            list(root_grid_ids),
+            boundary_only_grid_blocks(env, device_ir, fn.codegen.codegen_graphs),
+        )
+    )
     candidates = []
     for graph_info in fn.codegen.codegen_graphs:
         if getattr(graph_info, "block_ids", None) != block_ids:
@@ -772,13 +790,20 @@ def _detect_specialized_mma_loop(
                 candidate is not None
                 and not candidate.requires_scalar_fallback
                 and candidate.operands.k_block_id == block_ids[0]
-                and _specialized_mma_root_mn_block_ids(candidate, config) is not None
+                and _specialized_mma_root_mn_block_ids(
+                    candidate,
+                    config,
+                    inactive_root_block_ids=inactive_root_block_ids,
+                )
+                is not None
             ):
                 candidates.append((node, candidate))
     if not candidates:
         return False
 
-    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0][1], config)
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(
+        candidates[0][1], config, inactive_root_block_ids=inactive_root_block_ids
+    )
     assert root_mn_block_ids is not None
     root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
     if root_layout is None:
@@ -803,6 +828,16 @@ def _detect_specialized_mma_loop(
     if not candidates:
         return False
 
+    # A K loop that subdivides an outer tile (``hl.tile(outer.begin,
+    # outer.end)``) may only become a lane-free specialized loop through the
+    # exact fp32 SIMT GEMM, which masks its steps against the loop's own end;
+    # every other lowering declines it in ``_emit_mma_pipeline``, and a
+    # declined lane-free loop would leave the scalar fallback one K element
+    # per step.
+    k_subrange_parent = _loop_subrange_parent_block_id(env, block_ids[0])
+    k_loop_is_subrange = k_subrange_parent is not None
+    k_subrange_in_root = k_subrange_parent is None or k_subrange_parent in root_grid_ids
+    fp32_exact = not cute_fp32_dot_uses_tf32()
     for node, candidate in candidates:
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
@@ -814,7 +849,7 @@ def _detect_specialized_mma_loop(
             input_device=lhs_val.device,
         )
         if candidate.requires_accumulator_seed:
-            if _specialized_mma_root_threads_support_impl(
+            if not k_loop_is_subrange and _specialized_mma_root_threads_support_impl(
                 "universal",
                 bm=bm,
                 bn=bn,
@@ -824,6 +859,29 @@ def _detect_specialized_mma_loop(
                 root_n_threads_explicit=root_n_threads_explicit,
             ):
                 return True
+            continue
+        if (
+            mma_impl == "universal"
+            and lhs_val.dtype == torch.float32
+            and fp32_exact
+            and k_subrange_in_root
+            and lhs_val.ndim == 2
+            and candidate.operands.rhs.source_fake.ndim == 2
+            and not candidate.operands.has_leading_passthrough
+            and simt_mma_requested(config)
+            and simt_gemm_root_layout_supported(
+                bm=bm,
+                bn=bn,
+                root_m_threads=root_m_threads,
+                root_n_threads=root_n_threads,
+                root_m_threads_explicit=root_m_threads_explicit,
+                root_n_threads_explicit=root_n_threads_explicit,
+            )
+        ):
+            # The exact fp32 SIMT GEMM owns the K loop (no K lanes); the
+            # emitter raises rather than declining, so this agreement holds.
+            return True
+        if k_loop_is_subrange:
             continue
         if mma_impl != "universal" and _specialized_mma_root_threads_support_impl(
             mma_impl,
@@ -1368,6 +1426,50 @@ def _loop_contains_atomic(
         if graph_contains_atomic(getattr(graph_info, "graph", None)):
             return True
     return False
+
+
+def _tile_loop_inactive_block_ids(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    inactive_grid_block_ids: set[int],
+) -> set[int]:
+    """Axes of a multi-dimensional tile loop that carry no threads or lanes.
+
+    The boundary-only grid axes, plus every axis of the loop whose element
+    coordinate no graph observes (sizes known equal to an observed axis stay
+    active, they alias its coordinate).  The root strategy and the
+    specialized-MMA detection use the same set so they agree on the output
+    tile a matmul owns.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
+    if len(block_ids) <= 1:
+        return inactive_block_ids
+    known_equal = getattr(env, "known_equal", None)
+    used_block_ids = _graph_used_block_ids(fn, block_ids)
+    if not used_block_ids:
+        used_block_ids = set(block_ids)
+    for block_id in tuple(used_block_ids):
+        block_size = env.block_sizes[block_id].size
+        if block_size is None or not isinstance(block_size, (int, torch.SymInt)):
+            continue
+        for other_block_id in block_ids:
+            if other_block_id == block_id:
+                continue
+            other_size = env.block_sizes[other_block_id].size
+            if other_size is None or not isinstance(other_size, (int, torch.SymInt)):
+                continue
+            equal = (
+                known_equal(block_size, other_size)
+                if known_equal is not None
+                else bool(block_size == other_size)
+            )
+            if equal:
+                used_block_ids.add(other_block_id)
+    inactive_block_ids.update(set(block_ids) - used_block_ids)
+    return inactive_block_ids
 
 
 def _graph_used_block_ids(
@@ -1955,6 +2057,8 @@ class CuteBackend(Backend):
             or key == "cute_store_policy"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
+            or key == "cute_simt_mma"
+            or key == "cute_simt_mma_layout"
             or key == "cute_signed_bitfield_bf16"
             or key == "cute_collective_mma"
             or key == "cute_collective_static_layouts"
@@ -4205,16 +4309,6 @@ class CuteBackend(Backend):
             or (len(block_ids) > 1 and not flattened)
             or bool(inactive_grid_block_ids.intersection(block_ids))
         ):
-            known_equal = getattr(env, "known_equal", None)
-
-            def sizes_known_equal(
-                lhs: int | torch.SymInt,
-                rhs: int | torch.SymInt,
-            ) -> bool:
-                if known_equal is not None:
-                    return known_equal(lhs, rhs)
-                return bool(lhs == rhs)
-
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
             original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
@@ -4224,29 +4318,9 @@ class CuteBackend(Backend):
                 num_threads_config=original_num_threads_config,
                 grid_ids=grid_ids,
             )
-            should_filter_inactive_block_ids = len(block_ids) > 1
-            inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
-            if should_filter_inactive_block_ids:
-                used_block_ids = _graph_used_block_ids(fn, block_ids)
-                if not used_block_ids:
-                    used_block_ids = set(block_ids)
-                for block_id in tuple(used_block_ids):
-                    block_size = env.block_sizes[block_id].size
-                    if block_size is None or not isinstance(
-                        block_size, (int, torch.SymInt)
-                    ):
-                        continue
-                    for other_block_id in block_ids:
-                        if other_block_id == block_id:
-                            continue
-                        other_size = env.block_sizes[other_block_id].size
-                        if other_size is None or not isinstance(
-                            other_size, (int, torch.SymInt)
-                        ):
-                            continue
-                        if sizes_known_equal(block_size, other_size):
-                            used_block_ids.add(other_block_id)
-                inactive_block_ids.update(set(block_ids) - used_block_ids)
+            inactive_block_ids = _tile_loop_inactive_block_ids(
+                fn, block_ids, inactive_grid_block_ids
+            )
             for i, block_id in enumerate(block_ids):
                 if block_id in inactive_block_ids:
                     num_threads_config[i] = 1
@@ -4339,7 +4413,7 @@ class CuteBackend(Backend):
                     # cap. Keep those auto-threaded ND tiles within 256
                     # threads and let lane loops cover the rest.
                     thread_limit = min(thread_limit, 256)
-            if should_filter_inactive_block_ids and mma_candidate:
+            if len(block_ids) > 1 and mma_candidate:
                 inactive_block_ids.clear()
                 num_threads_config = [
                     env.config_spec.num_threads.config_get(

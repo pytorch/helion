@@ -183,21 +183,56 @@ def _read_only_host_dsl(call: ast.Call, callee: CallableType) -> bool:
     )
 
 
-def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
+def integer_metadata_callables() -> tuple[object, ...]:
+    """Host helpers whose integer result is a pure function of their arguments.
+
+    ``hl.register_tunable`` / ``hl.register_block_size`` read the config and
+    the ``helion.cdiv`` / power-of-two helpers derive tile extents from it;
+    none of them touch tensor storage, so a proof that re-executes the host
+    prelude per launch (ordered phases) or ignores it (freshness) may admit
+    them. Autotuner fragment constructors are admitted for the tunable's
+    fragment argument.
+    """
+    from ... import cdiv
     from ... import next_power_of_2
+    from ..._utils import prev_power_of_2
+    from ...language.tunable_ops import register_block_size
+    from ...language.tunable_ops import register_tunable
+
+    return (
+        min,
+        max,
+        abs,
+        cdiv,
+        next_power_of_2,
+        prev_power_of_2,
+        register_tunable,
+        register_block_size,
+    )
+
+
+def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
+    from ...autotuner.config_fragment import ConfigSpecFragment
+    from ..type_info import ConfigFragmentType
     from ..type_info import LiteralType
     from ..type_info import SymIntType
 
+    function = callee.value
+    if not (
+        any(function is candidate for candidate in integer_metadata_callables())
+        or isinstance(function, type)
+        and issubclass(function, ConfigSpecFragment)
+    ):
+        return False
     return (
-        any(callee.value is function for function in (min, max, next_power_of_2))
-        and not call.keywords
+        not call.keywords
         and bool(call.args)
         and all(
             isinstance(arg, ExtendedAST)
             and (
-                isinstance(arg._type_info, SymIntType)
+                isinstance(arg._type_info, (SymIntType, ConfigFragmentType))
                 or isinstance(arg._type_info, LiteralType)
-                and type(arg._type_info.value) is int
+                and type(arg._type_info.value) in (int, str)
             )
             for arg in call.args
         )
