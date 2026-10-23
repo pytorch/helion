@@ -183,7 +183,16 @@ def test_worker_records_and_enforces_the_selected_output_contract(
         baselines.assert_correct(fn(), expected, case, output_dtype=output_dtype)
         return {"graph_correctness": "pass", "graph_ms": 1.0}
 
+    def measure_batched(fn, repetitions, calls, expected, case, *, output_dtype):
+        assert output_dtype == torch.bfloat16
+        return {"graph_calls_ms": 1.0, "graph_long_ms": 1.0, "graph_long_calls": calls}
+
+    def measure_cold(fn, repetitions):
+        return {"bench_ms": 1.0}
+
     monkeypatch.setattr(baselines, "measure", measure)
+    monkeypatch.setattr(baselines, "measure_batched", measure_batched)
+    monkeypatch.setattr(baselines, "measure_cold", measure_cold)
     args = SimpleNamespace(
         module="test",
         shape=0,
@@ -196,7 +205,7 @@ def test_worker_records_and_enforces_the_selected_output_contract(
     )
     compare.worker(args)
     result = json.loads(args.output.read_text())
-    assert result["status"] == "ok"
+    assert result["status"] == "ok", result.get("error")
     assert result["output_contract"] == {
         "shape": [2, 3],
         "dtype": "torch.bfloat16",
