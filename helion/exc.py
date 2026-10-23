@@ -132,7 +132,8 @@ class PdlPlacement(BaseError):
 class PdlStateWithoutWait(BaseError):
     message = (
         "A PDL launch with cross-loop state needs hl.pdl_wait() before the first "
-        "loop: the state is written by the previous launch."
+        "loop, or else hl.pdl_launch_dependents() only after the last loop and no "
+        "cross-rank dependencies: the previous launch reads and writes the state."
     )
 
 

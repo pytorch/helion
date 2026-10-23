@@ -502,6 +502,24 @@ def pdl_unwaited_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def pdl_exit_trigger_chain(x: torch.Tensor) -> torch.Tensor:
+    """Wait per task, not at entry, and trigger after the cross-loop state."""
+    first = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    for producer_batch, producer_width in hl.tile(x.size()):
+        hl.inline_triton("tl.extra.cuda.gdc_wait()\n0", args=(), output_like=None)
+        first[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch, consumer_width in hl.tile(x.size(), block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = first[consumer_batch, consumer_width] * 2
+    hl.pdl_launch_dependents()
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_two_axis_consumer(x: torch.Tensor) -> torch.Tensor:
     """Exercise conservative fallback for an unrendered two-axis action scope."""
     rows, columns = x.size()
@@ -1436,8 +1454,58 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         ]
         self.assertEqual(statements[0], "tl.extra.cuda.gdc_wait()")
         self.assertEqual(statements[-1], "tl.extra.cuda.gdc_launch_dependents()")
+        self.assertNotIn("fence.acq_rel.gpu", code)
         with self.assertRaises(helion.exc.PdlStateWithoutWait):
             code_and_output(pdl_unwaited_chain, (x,), **config)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="PDL needs sm90")
+    @skipIfTileIR("checks PTX that TileIR does not emit")
+    def test_pdl_exit_trigger_orders_state_without_wait(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        for pipeline in ("static", "dynamic"):
+            config = {
+                "block_sizes": [1, 16],
+                "pid_type": "persistent_blocked",
+                "cross_loop_pipeline": pipeline,
+                "num_sm_multiplier": 1,
+                "num_warps": 4,
+            }
+            with self.subTest(pipeline=pipeline):
+                code, out = code_and_output(pdl_exit_trigger_chain, (x,), **config)
+
+                torch.testing.assert_close(out, (x + 1) * 2)
+                self.assertIn("launch_pdl=True", code)
+                kernel = code[
+                    code.index("def _helion_") : code.index("\ndef pdl_exit_trigger")
+                ]
+                statements = [
+                    line.strip()
+                    for line in kernel.splitlines()[1:]
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                # Every warp is done with the state and its writes are released
+                # before the CTA lets the next launch start.
+                self.assertEqual(statements[-3], "tl.debug_barrier()")
+                self.assertIn("fence.acq_rel.gpu", statements[-2])
+                self.assertEqual(
+                    statements[-1], "tl.extra.cuda.gdc_launch_dependents()"
+                )
+                self.assertEqual(code.count("gdc_launch_dependents"), 1)
+                if pipeline == "static":
+                    # The previous launch's epoch store is read gpu-scope strong.
+                    epoch = next(
+                        s for s in statements if s.startswith("tile_dependency_epoch =")
+                    )
+                    self.assertIn("ld.acquire.gpu.global.u32", epoch)
+                # Back to back, each launch starts once the previous one triggered.
+                compiled = pdl_exit_trigger_chain.bind((x,)).compile_config(
+                    helion.Config(**config)
+                )
+                outs = [compiled(x) for _ in range(8)]
+                for out in outs:
+                    torch.testing.assert_close(out, (x + 1) * 2)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

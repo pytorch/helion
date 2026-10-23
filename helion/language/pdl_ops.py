@@ -42,7 +42,13 @@ def pdl_launch_dependents() -> None:
     Let the next PDL-launched kernel on the stream start launching.
 
     Call it on the host before the first loop to trigger at kernel entry, or after
-    the last loop to trigger at exit.
+    the last loop to trigger at exit. A kernel with cross-loop scheduling state
+    and no ``hl.pdl_wait()`` must trigger at exit, and Helion then makes every
+    thread's state accesses visible before the trigger: a launch starts only after
+    the kernel before it triggered, so the next launch of this kernel cannot start
+    before this one is done with the state. Such a kernel must not trigger from
+    ``hl.inline_triton``, which Helion cannot see, and cross-rank (symmetric)
+    state still needs ``hl.pdl_wait()``.
     """
     raise exc.NotInsideKernel
 

@@ -282,6 +282,27 @@ def pipelined_allreduce_kernel(
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
+def pdl_exit_allreduce_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    world: hl.constexpr,
+) -> torch.Tensor:
+    """Trigger PDL at exit without waiting while peers read this rank's tiles."""
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        symm[tile] = x[tile]
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(world):
+            acc = acc + peers[r][tile]
+        out[tile] = acc
+    hl.pdl_launch_dependents()
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
 def chained_exchange_kernel(
     symm: torch.Tensor,
     moment: torch.Tensor,
@@ -1431,6 +1452,21 @@ class TestDistributedTileDependencies(TestCase):
                 digests.append(digest[1])
         gather.assert_not_called()
         self.assertNotEqual(*digests)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="PDL needs sm90")
+    def test_pdl_exit_trigger_still_waits_for_peer_state(self) -> None:
+        group = dist.group.WORLD.group_name
+        symm, x = torch.zeros(2, 256, device=DEVICE)
+        # Other ranks use this rank's state; this stream does not order them.
+        for pipeline in ("static", "dynamic"):
+            with (
+                self.subTest(pipeline=pipeline),
+                self.assertRaises(helion.exc.PdlStateWithoutWait),
+            ):
+                _with_pipeline(
+                    pdl_exit_allreduce_kernel, (symm, x, group, 4), pipeline
+                ).to_triton_code()
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))

@@ -1775,9 +1775,19 @@ def emit_cross_loop_schedule(
     entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
-        result: list[ast.stmt] = [
-            statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
-        ]
+        epoch = f"tl.load({state_arg} + {worker})"
+        env = CompileEnvironment.current()
+        if "wait" not in env.pdl_entry and env.pdl_exit:
+            # Without an entry wait, only the previous launch's exit fence and
+            # trigger order its epoch store before this read: read it gpu-scope
+            # strong so that a stale L1 line cannot serve it.
+            epoch = (
+                "tl.inline_asm_elementwise("
+                "asm='ld.acquire.gpu.global.u32 $0, [$1];', constraints='=r,l', "
+                f"args=[{state_arg} + {worker}], dtype=tl.uint32, "
+                "is_pure=False, pack=1)"
+            )
+        result: list[ast.stmt] = [statement_from_string(f"{epoch_var} = {epoch} + 1")]
         if peer is not None:
             # uint64 so peer targets never wrap. Worker 0 advances it after the
             # done barrier, or else every worker counts its own launches.

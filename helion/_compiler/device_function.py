@@ -1325,16 +1325,34 @@ class DeviceFunction:
                     statement_from_string("cute.arch.griddepcontrol_wait()")
                 ]
         env = CompileEnvironment.current()
-        if (
-            self.triton_persistent_state_specs
-            and env.pdl_exit + env.pdl_entry
-            and "wait" not in env.pdl_entry
-        ):
-            raise exc.PdlStateWithoutWait
         pdl = {
             "wait": "tl.extra.cuda.gdc_wait()",
             "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
         }
+        pdl_exit = [statement_from_string(pdl[op]) for op in env.pdl_exit]
+        if self.triton_persistent_state_specs and "wait" not in env.pdl_entry:
+            # The previous launch accesses the cross-loop state too. Launches
+            # begin in stream order, each only after every CTA of the one before
+            # it triggered or exited, so every later launch, this kernel's next
+            # one included, begins after a trigger placed after the last state
+            # access. The kernel reads its state only through gpu-scope strong
+            # operations (atomics or acquire loads), so the gpu-scope release
+            # fence before the trigger is enough to make the state visible.
+            # Not covered: symmetric state, which other ranks access, and a
+            # trigger hidden in hl.inline_triton, which Helion cannot see.
+            symmetric = any(spec[3] for spec in self.triton_persistent_state_specs)
+            if "launch_dependents" in env.pdl_entry or (pdl_exit and symmetric):
+                raise exc.PdlStateWithoutWait
+            if pdl_exit:
+                # A CTA triggers when its first thread does: wait for every warp,
+                # then fence so its state accesses happen before the dependent starts.
+                pdl_exit[:0] = [
+                    statement_from_string("tl.debug_barrier()"),
+                    statement_from_string(
+                        "tl.inline_asm_elementwise('fence.acq_rel.gpu; // $0', "
+                        "'=r', [], dtype=tl.int32, is_pure=False, pack=1)"
+                    ),
+                ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
@@ -1344,7 +1362,7 @@ class DeviceFunction:
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
-                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
+                *pdl_exit,
             ],
         )
         constexpr_values: dict[str, int] = {}
