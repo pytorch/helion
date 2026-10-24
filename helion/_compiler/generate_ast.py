@@ -674,7 +674,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         refuses instead (lane restores, repeated block ids), the config, not the
         kernel, failed: the overflow is the actionable message. Callers wrap the
         statement visit and the device function finalization.
+
+        ``RegisterTileUnsupported`` is not a refusal but the register tile's
+        regeneration signal (``generate_ast`` retries with the rolled lane) and
+        passes through unchanged, decline or not.
         """
+        if isinstance(error, RegisterTileUnsupported):
+            return error
         if CompileEnvironment.current().backend_name != "cute":
             return error
         declined = self.device_function.cute_state.fragment_capacity_decline
@@ -2221,6 +2227,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         },
                     )
                     validate_lane_reduce_owners(list(self.device_function.body))
+                    from .cute.register_tile_admission import RegisterTileOptions
+
+                    knobs = self.device_function.config.config
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
                         uniform_names=lane_uniform_names,
@@ -2233,6 +2242,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             for name, aliases in self.device_function._variable_renames.items()
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
+                        register_tile_options=RegisterTileOptions(
+                            warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
+                            store_first=knobs.get("cute_register_tile_store_first")
+                            is True,
+                        ),
                     )
                     # Reject any owned marker without a proved lowering, so an
                     # incomplete per-lane input cannot stand in for a reduction.

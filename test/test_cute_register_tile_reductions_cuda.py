@@ -19,6 +19,7 @@ from test._cute_register_tile_kernels import col_sum
 from test._cute_register_tile_kernels import col_sum_dynamic
 from test._cute_register_tile_kernels import col_sum_f32_out
 from test._cute_register_tile_kernels import col_sum_guarded
+from test._cute_register_tile_kernels import col_var
 from test._cute_register_tile_kernels import column_config
 
 import helion
@@ -404,23 +405,48 @@ def test_looped_retry_matches_reference(
         _randn_like_inputs(tensors)
 
 
-def test_column_softmax_keeps_the_rolled_lane() -> None:
-    # One reduction feeding another is kept out of the register tile by the
-    # device IR; the requested geometry compiles as the rolled persistent lane
-    # it always was.
+@pytest.mark.parametrize("reduction_threads", (8, 16))
+def test_column_softmax_chains_two_register_tile_levels(
+    reduction_threads: int,
+) -> None:
+    # One reduction feeding another: the tile is loaded once, the max is
+    # combined, ``exp(t - max)`` is computed once more in a second accumulate
+    # nest and stashed for the store, then the sum is combined.
     torch.manual_seed(0)
     x = torch.randn(128, 16384, device=DEVICE)
     bound = col_softmax.bind((x,))
-    config = column_config(bound, block=32, tile_threads=8, reduction_threads=8)
+    config = column_config(
+        bound, block=32, tile_threads=8, reduction_threads=reduction_threads
+    )
     assert config.reduction_loops == [None]
     code = bound.to_code(config)
-    assert "for synthetic_lane_1 in range(" in code
-    assert "_lane_stash" not in code
+    assert "for synthetic_lane_1 in range(" not in code
+    assert code.count("for synthetic_lane_1 in cutlass.range_constexpr(") == 3
+    assert code.count("cute.math.exp2(") == 1
+    assert code.count("cute.arch.load(x.iterator") == 1
     compiled = bound.compile_config(config)
     for _ in range(2):
         out = compiled(x)
         torch.cuda.synchronize()
         torch.testing.assert_close(out, torch.softmax(x, dim=0), rtol=1e-4, atol=1e-5)
+        x.uniform_(-1, 1)
+
+
+def test_two_pass_variance_chains_two_register_tile_levels() -> None:
+    # The second reduction reads the first one's mean: level-1 accumulate
+    # nest from the stashed tile, both results flushed by the once-only tail.
+    torch.manual_seed(0)
+    x = torch.randn(128, 16384, device=DEVICE)
+    bound = col_var.bind((x,))
+    config = column_config(bound, block=32, tile_threads=8, reduction_threads=16)
+    code = bound.to_code(config)
+    assert code.count("for synthetic_lane_1 in cutlass.range_constexpr(") == 2
+    assert code.count(COLUMN_REDUCE) == 2
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, x.var(0, unbiased=False), rtol=1e-4, atol=1e-5)
         x.uniform_(-1, 1)
 
 
