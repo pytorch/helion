@@ -71,10 +71,13 @@ from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
 from ...language._tracing_ops import _get_symnode
+from ..compile_environment import CompileEnvironment
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
+from .gelu_tanh_approx import fast_math_unary_template
 from .math_templates import SIGMOID_TEMPLATE
 
 if TYPE_CHECKING:
@@ -122,6 +125,23 @@ def _round_epilogue_expression(template: str, dtype: torch.dtype | None) -> str:
         return template
     assert dtype is not None
     return f"({template}).to({_FLOAT_CAST_TYPES[dtype]}).to(cutlass.Float32)"
+
+
+def _unary_step_for(target: object) -> _UnaryOp | None:
+    """The accepted zero-arg unary step for ``target``, in the current
+    settings' math regime: under ``fast_math`` the DSL math calls and the
+    exact-GELU helper take ``fastmath=True`` (as the pointwise lowering of
+    the same ops does)."""
+    step = _ZERO_ARG_TARGETS.get(target)
+    if (
+        step is not None
+        and step.op_name in FAST_MATH_UNARY_OPS
+        and CompileEnvironment.current().settings.fast_math
+    ):
+        return dataclasses.replace(
+            step, template=fast_math_unary_template(step.template)
+        )
+    return step
 
 
 def _round_unary_step(step: _UnaryOp, node: torch.fx.Node) -> _UnaryOp:
@@ -889,7 +909,7 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
     cast_step = _floating_cast_step(node)
     if cast_step is not None:
         return _is_auxiliary_tensor_expr_node(cast_step[1], depth + 1)
-    unary_step = _ZERO_ARG_TARGETS.get(node.target)
+    unary_step = _unary_step_for(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
         if len(node.args) != 1 or not isinstance(node.args[0], torch.fx.Node):
@@ -1554,7 +1574,7 @@ def _classify_auxiliary_tensor_expr_impl(
         if operand_expr is None:
             return None
         return _UnaryTensorExpr(step=unary_step, operand=operand_expr)
-    unary_step = _ZERO_ARG_TARGETS.get(node.target)
+    unary_step = _unary_step_for(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
         if len(node.args) != 1 or not isinstance(node.args[0], torch.fx.Node):
@@ -1992,7 +2012,8 @@ def analyze_tcgen05_unary_epilogue_chain(
             cur = arg
             continue
         # Zero-arg unary ops.
-        if target in _ZERO_ARG_TARGETS:
+        zero_arg_step = _unary_step_for(target)
+        if zero_arg_step is not None:
             if cur.kwargs:
                 return None  # Reject unexpected kwargs.
             arg = cur.args[0] if cur.args else None
@@ -2001,7 +2022,7 @@ def analyze_tcgen05_unary_epilogue_chain(
             steps.append(
                 _AuxiliaryTensorExprStep(
                     expr=_UnaryTensorExpr(
-                        step=_round_unary_step(_ZERO_ARG_TARGETS[target], cur),
+                        step=_round_unary_step(zero_arg_step, cur),
                         operand=_CurrentTensorExpr(),
                     )
                 )

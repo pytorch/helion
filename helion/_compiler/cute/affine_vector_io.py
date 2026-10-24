@@ -33,6 +33,7 @@ from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _pointer_integer_affine_form
 from .persistent_branch_vec import _range_extent
 from .persistent_branch_vec import _single_tensor_iterator_root
+from .persistent_branch_vec import _tensor_stride_reference
 from .scalar_integer import _integer_expression
 from .scalar_recipe import PURE_HELPERS
 
@@ -46,8 +47,12 @@ _LANE = re.compile(r"vec_lane_(\d+)")
 _CASTS = frozenset(
     f"cutlass.{name}"
     for name in (
+        "Int8",
+        "Int16",
         "Int32",
         "Int64",
+        "Uint8",
+        "Uint16",
         "Uint32",
         "Uint64",
         "Float32",
@@ -76,6 +81,88 @@ _PURE = frozenset(
         "tanh",
     )
 )
+
+
+def _offset_affine_form(
+    node: ast.AST,
+    definitions: dict[str, ast.expr],
+    strides: dict[tuple[str, int], int],
+    constexpr: dict[str, int],
+    *,
+    depth: int = 0,
+) -> tuple[dict[str, int], int] | None:
+    """``(linear, constant)`` of an integer pointer offset in elements.
+
+    Names are read through ``definitions`` (the loop's and the enclosing
+    scopes') and ``constexpr`` (the module constants); a name without either,
+    and any expression this parser does not model (an integer division, a
+    coordinate call, a product of two non-constant factors), is a leaf keyed
+    by its source text, so two offsets built from the same definitions agree
+    on every leaf.  ``cutlass.Int32`` / ``Int64`` casts are transparent and a
+    ``T.layout.stride[d]`` reference takes its proven value.  ``None`` only
+    when the definition chain is too deep.
+    """
+    if depth > 32:
+        return None
+    stride = _tensor_stride_reference(node)
+    if stride is not None:
+        value = strides.get(stride)
+        return ({ast.unparse(node): 1}, 0) if value is None else ({}, value)
+    if isinstance(node, ast.Constant):
+        value = node.value
+        return ({}, value) if type(value) is int else ({ast.unparse(node): 1}, 0)
+    if isinstance(node, ast.Name):
+        if node.id in constexpr:
+            return {}, constexpr[node.id]
+        definition = definitions.get(node.id)
+        if definition is None:
+            return ({node.id: 1}, 0)
+        return _offset_affine_form(
+            definition, definitions, strides, constexpr, depth=depth + 1
+        )
+    if (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) in ("cutlass.Int32", "cutlass.Int64")
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        return _offset_affine_form(
+            node.args[0], definitions, strides, constexpr, depth=depth + 1
+        )
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        form = _offset_affine_form(
+            node.operand, definitions, strides, constexpr, depth=depth + 1
+        )
+        if form is None or isinstance(node.op, ast.UAdd):
+            return form
+        return {k: -v for k, v in form[0].items()}, -form[1]
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult)
+    ):
+        left = _offset_affine_form(
+            node.left, definitions, strides, constexpr, depth=depth + 1
+        )
+        right = _offset_affine_form(
+            node.right, definitions, strides, constexpr, depth=depth + 1
+        )
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Mult):
+            if left[0] and right[0]:
+                return ({ast.unparse(node): 1}, 0)
+            scale, (linear, constant) = (
+                (left[1], right) if not left[0] else (right[1], left)
+            )
+            return (
+                {k: v * scale for k, v in linear.items() if v * scale},
+                constant * scale,
+            )
+        sign = -1 if isinstance(node.op, ast.Sub) else 1
+        linear = dict(left[0])
+        for k, v in right[0].items():
+            linear[k] = linear.get(k, 0) + sign * v
+        return {k: v for k, v in linear.items() if v}, left[1] + sign * right[1]
+    return ({ast.unparse(node): 1}, 0)
 
 
 def _affine_loop_candidate(loop: ast.For) -> bool:
@@ -449,7 +536,8 @@ def _accesses(
             # A predicate may not itself perform memory accesses or effects.
             if any(
                 isinstance(item, ast.Call)
-                and ast.unparse(item.func) not in _CASTS | PURE_HELPERS
+                and ast.unparse(item.func)
+                not in _CASTS | PURE_HELPERS | _COMPARISON_CALLS
                 and not (extra_pure_call is not None and extra_pure_call(item))
                 for item in ast.walk(node.test)
             ):
@@ -504,9 +592,10 @@ def _accesses(
                     visit(arg, statement, guards)
                 return
             name = ast.unparse(node.func)
-            if name not in _CASTS | _PURE | PURE_HELPERS and name not in (
-                "cute.arch.thread_idx",
-                "cute.arch.block_idx",
+            # Scalar comparisons (``operator.ge(a, b)``) are pure like the
+            # ``ast.Compare`` forms the scalar lowering also emits.
+            if name not in _CASTS | _PURE | PURE_HELPERS | _COMPARISON_CALLS and (
+                name not in ("cute.arch.thread_idx", "cute.arch.block_idx")
             ):
                 if not (
                     isinstance(node.func, ast.Attribute)
@@ -874,21 +963,35 @@ class _Vectorizer:
         assert isinstance(loop, ast.For)
         try:
             sites = self.accesses(loop.body)
-            if not sites or sum(site.store for site in sites) > 1:
+            if not sites:
                 return None
             roots = [_single_tensor_iterator_root(site.pointer) for site in sites]
             if any(root is None or root not in self.dtypes for root in roots):
                 return None
-            for left, site in enumerate(sites):
-                if site.store and any(
-                    index != left
-                    and frozenset((roots[left], root)) not in self.disjoint
-                    for index, root in enumerate(roots)
-                ):
-                    return None
             snapshots = self.snapshots(loop.body)
             if snapshots is None:
                 return None
+            # Every store's tensor must be disjoint from every other access's
+            # tensor, except another store into the same tensor whose
+            # addresses provably never meet this one's for any pair of lanes
+            # (``_disjoint_store_pair``: an interleaved operand written as
+            # rows ``2k`` and ``2k + 1`` from two sites).  Stores flush after
+            # the loop in site order, so two sites that never alias may
+            # reorder freely.
+            for left, site in enumerate(sites):
+                if not site.store:
+                    continue
+                for index, (other, root) in enumerate(zip(sites, roots, strict=True)):
+                    if index == left or frozenset((roots[left], root)) in self.disjoint:
+                        continue
+                    if not (
+                        other.store
+                        and root == roots[left]
+                        and self._disjoint_store_pair(
+                            site, other, snapshots, outer, lane, width
+                        )
+                    ):
+                        return None
             writes = {
                 name
                 for statement in loop.body
@@ -1093,6 +1196,62 @@ class _Vectorizer:
             )
         except _Decline:
             return None
+
+    def _disjoint_store_pair(
+        self,
+        first: _Access,
+        second: _Access,
+        snapshots: list[dict[str, ast.expr]],
+        outer: dict[str, ast.expr],
+        lane: str,
+        width: int,
+    ) -> bool:
+        """Whether two stores into one tensor never address the same element
+        for any pair of lanes ``l, l'`` of the V-loop.
+
+        Both pointer offsets, read through the loop's and the enclosing
+        scopes' definitions (``_offset_affine_form``), must advance one
+        element per lane, agree on every other term and differ by a constant
+        of at least ``width`` elements: ``l - l' + delta`` is then never zero.
+        """
+        forms = []
+        for site in (first, second):
+            # ``T.iterator + term + ... + term``: the root, then the offset.
+            terms: list[ast.expr] = []
+            node = site.pointer
+            while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                terms.insert(0, node.right)
+                node = node.left
+            if not terms:
+                return False
+            definitions = {**outer, **snapshots[site.statement]}
+            linear: dict[str, int] = {}
+            constant = 0
+            for term in terms:
+                form = _offset_affine_form(
+                    term, definitions, self.strides, self.constexpr
+                )
+                if form is None:
+                    return False
+                for key, value in form[0].items():
+                    linear[key] = linear.get(key, 0) + value
+                constant += form[1]
+            linear = {key: value for key, value in linear.items() if value}
+            if linear.get(lane) != 1:
+                return False
+            forms.append((ast.unparse(node), (linear, constant)))
+        (
+            (first_base, (first_linear, first_constant)),
+            (
+                second_base,
+                (second_linear, second_constant),
+            ),
+        ) = forms
+        return (
+            first_base == second_base
+            and first_linear == second_linear
+            and abs(first_constant - second_constant) >= width
+        )
 
     def definition_reads(self, value: ast.expr) -> frozenset[str]:
         reads = self._definition_reads.get(value)

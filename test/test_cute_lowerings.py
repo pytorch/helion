@@ -9032,6 +9032,115 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("_cute_gelu_erf_exact_f32x2(", code)
         self.assertNotIn("cute.math.tanh", code)
 
+    def test_tcgen05_fused_gelu_exact_default_keeps_exact_erf(self) -> None:
+        """Without ``fast_math`` the GELU helper call carries no fastmath flag."""
+        code = self._gelu_erf_epilogue_code(fast_math=False)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertNotIn("fastmath", call)
+
+    def test_tcgen05_fused_gelu_fast_math_uses_approximate_erf(self) -> None:
+        """``fast_math`` routes the fused GELU through the DSL's approximate erf,
+        as the pointwise lowering of ``erf`` does under the same setting."""
+        code = self._gelu_erf_epilogue_code(fast_math=True)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertIn("fastmath=True)", call)
+
+    def test_tcgen05_fused_erf_fast_math_template(self) -> None:
+        """A plain ``torch.erf`` epilogue step takes ``fastmath=True`` under ``fast_math``."""
+        for fast_math, expected in (
+            (False, "cute.math.erf("),
+            (True, "fastmath=True)"),
+        ):
+            code = self._unary_epilogue_code("erf", fast_math=fast_math)
+            (call,) = [line for line in code.splitlines() if "cute.math.erf(" in line]
+            self.assertIn(expected, call)
+            if not fast_math:
+                self.assertNotIn("fastmath", call)
+
+    def _gelu_erf_epilogue_code(self, *, fast_math: bool) -> str:
+        return self._unary_epilogue_code("gelu", fast_math=fast_math)
+
+    def _unary_epilogue_code(self, op: str, *, fast_math: bool) -> str:
+        """Rendered source of a tcgen05 GEMM whose epilogue applies ``op``
+        (``"gelu"`` or ``"erf"``; two kernels because a kernel body cannot
+        close over the op)."""
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_gelu_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_erf_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.erf(acc).to(x.dtype)
+            return out
+
+        kernel = {"gelu": cute_matmul_gelu_epilogue, "erf": cute_matmul_erf_epilogue}[
+            op
+        ]
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = kernel.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            return bound.to_triton_code(cfg)
+
+    def test_tcgen05_fused_gelu_fast_math_runtime_correctness(self) -> None:
+        """The approximate-erf GELU epilogue stays within half-precision tolerance."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", fast_math=True)
+        def cute_matmul_gelu_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_gelu_fast.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        self.assertIn("fastmath=True)", bound.to_triton_code(cfg))
+        out = bound(x, y)
+        expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_gelu_exact_cute_pointwise_tensor_ssa_numeric_runtime_correctness(
         self,
     ) -> None:

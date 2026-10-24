@@ -1069,6 +1069,33 @@ class _Sinker:
             func = ast.unparse(node.func)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
                 return ast.unparse(node.args[0]) if node.args else _CONFLICT
+            if (fact := self._sinkable_load(node)) is not None:
+                # A scalar load this pass widens: the tensor's element type
+                # (the per-lane value is the bitcast of one vector element).
+                return CompileEnvironment.current().backend.dtype_str(fact.dtype)
+            if (
+                func == "_helion_persistent_branch_vec_load"
+                and len(node.args) >= 3
+                and isinstance(node.args[2], ast.Constant)
+                and isinstance(node.args[2].value, str)
+            ):
+                # The persistent branch vectorizer's load marker names its
+                # element type (``persistent_branch_vec.py``).
+                return node.args[2].value
+            if func == "_cute_inline_asm_elementwise":
+                # The explicitly rounded products of ``scalar_recipe_rounding``
+                # declare their result type.
+                declared = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "dtype"
+                    ),
+                    None,
+                )
+                if declared is not None and _is_dtype_ctor(ast.unparse(declared)):
+                    return ast.unparse(declared)
+                return _CONFLICT
             if _is_dtype_ctor(func):
                 return func
             if func.startswith(_DTYPE_PRESERVING_CALLS) and node.args:

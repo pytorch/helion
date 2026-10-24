@@ -90,13 +90,14 @@ def _rewrite(
     aligned: bool = True,
     disjoint: bool = True,
     integer_tensors: frozenset[str] = frozenset(),
+    strides: dict[tuple[str, int], int] | None = None,
 ):
     tree = ast.parse(source)
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
     rewriter = _Vectorizer(
         function.body,
-        strides={("src", 0): 1, ("out", 0): 1},
+        strides=strides if strides is not None else {("src", 0): 1, ("out", 0): 1},
         alignments={"src": 16 if aligned else 1, "out": 16},
         dtypes={"src": "cutlass.Float32", "out": "cutlass.Float32"},
         disjoint={frozenset(("src", "out"))} if disjoint else set(),
@@ -108,7 +109,14 @@ def _rewrite(
 
 
 def _execute(
-    tree: ast.Module, start: int, length: int, *, int32=int, int64=int, extra_args=()
+    tree: ast.Module,
+    start: int,
+    length: int,
+    *,
+    int32=int,
+    int64=int,
+    extra_args=(),
+    out_stride: tuple[int, ...] = (1,),
 ):
     stats = dict.fromkeys(
         ("scalar_loads", "scalar_stores", "vector_loads", "vector_stores"), 0
@@ -116,7 +124,9 @@ def _execute(
     data = [float(value) for value in range(80)]
     output = [-123.0] * 80
     src = _Tensor(iterator=_Pointer(data, stats), layout=SimpleNamespace(stride=(1,)))
-    out = _Tensor(iterator=_Pointer(output, stats), layout=SimpleNamespace(stride=(1,)))
+    out = _Tensor(
+        iterator=_Pointer(output, stats), layout=SimpleNamespace(stride=out_stride)
+    )
     namespace = {
         "cutlass": SimpleNamespace(
             Int32=int32,
@@ -761,3 +771,71 @@ def test_snapshot_gate_preserves_nested_masks_and_alias_rejection(
     if not disjoint:
         assert changed == 0
         assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+# Two stores into one output from a lane loop: an interleaved operand writes
+# rows ``2k`` and ``2k + 1`` (``out`` is (rows, 16), row stride 16).
+_TWO_ROW_SOURCE = """
+def kernel(src, out, start, length):
+    for tile_offset_1 in range(0, cutlass.Int32(length), 16):
+        row = cutlass.Int32(start)
+        row_lo = row * 2 + 0
+        row_hi = row * 2 + __HI_OFFSET__
+        for lane_1 in range(4):
+            lane_base_1 = cutlass.Int32(tile_offset_1) + cutlass.Int32(lane_1) * 4
+            for vec_lane_1 in cutlass.range_constexpr(4):
+                indices_1 = lane_base_1 + cutlass.Int32(vec_lane_1)
+                mask_1 = indices_1 < cutlass.Int32(length)
+                value = (src.iterator + cutlass.Int32(indices_1) * cutlass.Int32(src.layout.stride[0])).load() if mask_1 else cutlass.Float32(0)
+                if mask_1:
+                    (out.iterator + cutlass.Int32(row_lo) * cutlass.Int32(out.layout.stride[0]) + cutlass.Int32(indices_1) * cutlass.Int32(out.layout.stride[1])).store(cutlass.Float32(value * 2))
+                if mask_1:
+                    (out.iterator + cutlass.Int32(row_hi) * cutlass.Int32(out.layout.stride[0]) + cutlass.Int32(indices_1 + __COLUMN_SHIFT__) * cutlass.Int32(out.layout.stride[1])).store(cutlass.Float32(value + 1))
+"""
+_TWO_ROW_STRIDES = {("src", 0): 1, ("out", 0): 16, ("out", 1): 1}
+
+
+def _two_row_source(hi_offset: int, column_shift: int = 0) -> str:
+    return _TWO_ROW_SOURCE.replace("__HI_OFFSET__", str(hi_offset)).replace(
+        "__COLUMN_SHIFT__", str(column_shift)
+    )
+
+
+@pytest.mark.parametrize("length", [0, 3, 4, 12, 16])
+@pytest.mark.parametrize("start", [0, 1])
+def test_two_provably_disjoint_stores_of_one_tensor_both_vectorize(
+    length: int, start: int
+) -> None:
+    source = _two_row_source(1)
+    transformed, changed = _rewrite(source, strides=_TWO_ROW_STRIDES)
+    assert changed == 1
+    expected, _ = _execute(ast.parse(source), start, length, out_stride=(16, 1))
+    actual, after = _execute(transformed, start, length, out_stride=(16, 1))
+    assert actual == expected
+    # Rows 2k and 2k + 1 are 16 elements apart (>= the 4 lanes), so both
+    # stores flush as packets after the lane loop.
+    assert after["vector_stores"] == 2 * (length // 4)
+    assert after["scalar_stores"] == 2 * (length - 4 * (length // 4))
+
+
+@pytest.mark.parametrize(
+    "hi_offset,column_shift",
+    [
+        (0, 0),  # the same row: lane l of both stores
+        (0, 1),  # the same row, shifted by one lane: lane l against lane l - 1
+        (0, 3),  # still inside the 4-lane packet
+    ],
+)
+def test_two_stores_that_may_alias_keep_the_scalar_loop(
+    hi_offset: int, column_shift: int
+) -> None:
+    source = _two_row_source(hi_offset, column_shift)
+    transformed, changed = _rewrite(source, strides=_TWO_ROW_STRIDES)
+    assert changed == 0
+    assert ast.unparse(transformed) == ast.unparse(ast.parse(source))
+
+
+def test_two_stores_need_proven_strides_to_separate_their_rows() -> None:
+    # Without the proven row stride the constant distance is unknown.
+    _, changed = _rewrite(_two_row_source(1), strides={("src", 0): 1, ("out", 1): 1})
+    assert changed == 0

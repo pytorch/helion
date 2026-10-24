@@ -756,6 +756,17 @@ class CuteDeviceFunctionState:
         # (``roffset_N``), the loop target the AST passes see: (size-hint trip
         # count used for profitability decisions, constexpr parameter name).
         self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
+        # Cross-thread reductions over a block that a device loop's VECTORIZED
+        # lane loop distributes (several packets per thread per trip).  The
+        # reduce is emitted once per lane and so reduces one lane's packet;
+        # ``cute/fold_lane_reductions.py`` folds the per-lane partials across
+        # the unrolled lanes and runs the cross-thread combine once per trip.
+        # The lane variable of each such loop, mapped to the keys of the
+        # reduce calls emitted inside it (``fold_site_key``: the call with its
+        # input replaced).  Two loops may emit identical calls (the grouped
+        # warp reduce takes a raw thread-index expression), so the lane
+        # variable is the primary key.
+        self.lane_fold_reduce_sites: dict[str, set[str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.

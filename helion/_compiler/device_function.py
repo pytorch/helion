@@ -1736,19 +1736,44 @@ class DeviceFunction:
             # takes the unroll.
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
             sinking = bool(self.config.config.get("cute_vloop_sink"))
-            if lane_unroll > 1 and not (
-                sinking and self.cute_state.vloop_sink_unrolled
-            ):
+            knob_unroll = (
+                lane_unroll
+                if lane_unroll > 1
+                and not (sinking and self.cute_state.vloop_sink_unrolled)
+                else 1
+            )
+            # The vectorized lane loops of a reduced block whose per-lane
+            # cross-thread reductions are still inside them unroll completely
+            # whatever the knob says, and those reductions are folded across
+            # the trace-time lanes below.  A lane loop an earlier pass already
+            # reduces once after (the combine moved out of it) keeps its code.
+            from .cute.fold_lane_reductions import fold_lane_reductions
+            from .cute.fold_lane_reductions import lanes_with_sites
+
+            fold_sites = self.cute_state.lane_fold_reduce_sites
+            folded_lanes = lanes_with_sites(kernel_body, fold_sites)
+            if knob_unroll > 1 or folded_lanes:
                 kernel_body, unrolled = unroll_lane_loads(
                     kernel_body,
-                    lane_unroll,
+                    knob_unroll,
                     lambda name: self.new_var(name, dce=False),
+                    forced_full=folded_lanes,
                 )
                 # With sinking the knob belongs to the sunk nest's lane loops
                 # (``_normalize_cute_vloop_sink``); a nest that offers none
                 # keeps its code rather than regenerating knob-off.
-                if not unrolled and not sinking:
+                if knob_unroll > 1 and not unrolled and not sinking:
                     raise LaneUnrollNotApplied
+            if folded_lanes:
+                kernel_body = fold_lane_reductions(
+                    kernel_body,
+                    {
+                        lane: keys
+                        for lane, keys in fold_sites.items()
+                        if lane in folded_lanes
+                    },
+                    lambda name: self.new_var(name, dce=False),
+                )
             kernel_body = split_lane_loads(kernel_body)
             # Preserve the global FMA decisions above. This optional pass
             # moves only raw packet loads/cache writes across a proven

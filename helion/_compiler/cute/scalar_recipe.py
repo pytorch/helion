@@ -149,8 +149,8 @@ PURE_HELPERS = PURE_DECODE_HELPERS | {
     "_cute_join_cast",
     "_cute_python_mod",
 }
-# ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
-# product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
+# ``_cute_inline_asm_elementwise`` enters a recipe only as one of the explicitly
+# rounded products ``is_rounded_multiply`` recognizes (``_PureExpression.visit_Call``).
 _GLOBALS = (
     _BUILTINS
     | PURE_HELPERS
@@ -202,10 +202,21 @@ def _numeric_type(node: ast.expr) -> bool:
 
 ROUNDED_FP32_MULTIPLY_ASM = "mul.rn.f32 $0, $1, $2;"
 ROUNDED_FP32_MULTIPLY_CONSTRAINTS = "=f,f,f"
+ROUNDED_HALF_MULTIPLY_CONSTRAINTS = "=h,h,h"
+# The explicitly rounded products ``scalar_recipe_rounding`` emits, by the
+# ``cutlass`` dtype of the result: ``(asm, constraints)``.  The FP32 form is
+# the rounding-preserving product; the 16-bit forms are the exact products
+# ``narrow_exact_products`` makes of two upcasts and a cast back.
+ROUNDED_MULTIPLY_FORMS: dict[str, tuple[str, str]] = {
+    "Float32": (ROUNDED_FP32_MULTIPLY_ASM, ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
+    "Float16": ("mul.rn.f16 $0, $1, $2;", ROUNDED_HALF_MULTIPLY_CONSTRAINTS),
+    "BFloat16": ("mul.rn.bf16 $0, $1, $2;", ROUNDED_HALF_MULTIPLY_CONSTRAINTS),
+}
 
 
-def is_rounded_fp32_multiply(value: ast.expr) -> bool:
-    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``."""
+def rounded_multiply_dtype(value: ast.expr) -> str | None:
+    """The ``cutlass`` dtype name of an explicitly rounded product of
+    ``scalar_recipe_rounding`` (a key of ``ROUNDED_MULTIPLY_FORMS``), else None."""
     if not (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
@@ -215,13 +226,34 @@ def is_rounded_fp32_multiply(value: ast.expr) -> bool:
         and len(value.args[0].elts) == 2
         and len(value.keywords) == 4
     ):
-        return False
-    return {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords} == {
-        "asm": repr(ROUNDED_FP32_MULTIPLY_ASM),
-        "constraints": repr(ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
-        "dtype": "cutlass.Float32",
-        "is_pure": "True",
-    }
+        return None
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords}
+    for dtype, (asm, constraints) in ROUNDED_MULTIPLY_FORMS.items():
+        if keywords == {
+            "asm": repr(asm),
+            "constraints": repr(constraints),
+            "dtype": f"cutlass.{dtype}",
+            "is_pure": "True",
+        }:
+            return dtype
+    return None
+
+
+def is_rounded_multiply(value: ast.expr) -> bool:
+    """Recognize any explicitly rounded product of ``scalar_recipe_rounding``
+    (FP32, or the 16-bit forms of ``narrow_exact_products``): two register
+    operands, one register result, no memory or other effect."""
+    return rounded_multiply_dtype(value) is not None
+
+
+def is_rounded_fp32_multiply(value: ast.expr) -> bool:
+    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``.
+
+    Only this form has an FP32 result: the packed ``mul_packed_f32x2`` rewrite
+    and the typed FP32 proofs of the register chain must not accept the
+    16-bit forms.
+    """
+    return rounded_multiply_dtype(value) == "Float32"
 
 
 class _PureExpression(ast.NodeVisitor):
@@ -301,10 +333,11 @@ class _PureExpression(ast.NodeVisitor):
         self.visit(node.orelse)
 
     def visit_Call(self, node: ast.Call) -> None:
-        if is_rounded_fp32_multiply(node):
+        if is_rounded_multiply(node):
             # ``preserve_fp32_multiply_rounding``'s spelling of an FP32
             # product, already emitted for a product that
-            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time.
+            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time, or
+            # the 16-bit product ``narrow_exact_products`` made of one.
             self.visit(node.args[0])
             return
         path = _path(node.func)

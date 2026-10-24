@@ -969,6 +969,78 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         }
         return Config(**seed)
 
+    WARP_ROWS_PER_CTA = (2, 4)
+    WARP_ROWS_MAX_EXTENT = 4096
+
+    @classmethod
+    def warp_rows_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """One warp per row, several rows per CTA.
+
+        Short rows (up to ``WARP_ROWS_MAX_EXTENT`` elements) are latency and
+        launch bound; the one-row seeds spend a 32-thread CTA per row (2048
+        CTAs for 8 x 256 rows of 1024 fp16) where quack packs four rows into a
+        128-thread CTA.  Seeds the innermost tile axis at 2 and 4 rows with as
+        many threads on it, 32 threads on the row, 16-byte packets, the row as
+        one rolled trip, strided lanes and register-prefetch reloads: the form
+        measured at 2.24 us against quack's 2.28 on batch_softmax's 1024-wide
+        rows (B200), where the one-row winner reads 2.36.
+        """
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        block_id = rl_spec.block_id
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None or not spec.block_sizes:
+            return []
+        row_index = len(spec.block_sizes) - 1
+        row_block = spec.block_sizes[row_index].block_id
+        if (
+            extent > cls.WARP_ROWS_MAX_EXTENT
+            or block_id not in spec.num_threads.valid_block_ids()
+            or row_block not in spec.num_threads.valid_block_ids()
+            or block_id not in spec.cute_vector_widths.valid_block_ids()
+        ):
+            return []
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1 or extent % (32 * vec):
+            return []
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(block_id)._fragment(spec).choices
+        )
+        if vec not in choices:
+            return []
+        max_loop = spec.max_reduction_loop
+        if max_loop is not None and extent > max_loop:
+            return []
+        seeds: list[Config] = []
+        for rows in cls.WARP_ROWS_PER_CTA:
+            if not _block_size_value_reachable(spec, row_index, rows):
+                continue
+            block_sizes = [1] * len(spec.block_sizes)
+            block_sizes[row_index] = rows
+            seed: dict[str, Any] = {
+                "block_sizes": block_sizes,
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {row_block: rows, block_id: 32}
+                ),
+                "reduction_loops": [extent],
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {block_id: vec}
+                ),
+                **cls._row_reload_entries(spec, block_id),
+            }
+            if block_id in spec.cute_lane_layouts.valid_block_ids():
+                seed["cute_lane_layouts"] = _seq_config_list(
+                    spec.cute_lane_layouts, {block_id: "strided"}
+                )
+            try:
+                seeds.append(Config(**seed))
+            except Exception:
+                continue
+        return seeds
+
     @classmethod
     def _row_reload_entries(cls, spec: ConfigSpec, block_id: int) -> dict[str, Any]:
         """``register_prefetch`` reloads on the row's reduction block."""
@@ -1001,6 +1073,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rolled = cls.two_packet_rolled_row_seed_config(env, device_ir)
         if rolled is not None and rolled not in seeds:
             seeds.append(rolled)
+        for warp_rows in cls.warp_rows_seed_configs(env, device_ir):
+            if warp_rows not in seeds:
+                seeds.append(warp_rows)
         return seeds
 
 
