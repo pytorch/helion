@@ -141,11 +141,14 @@ def pin_configs(args: argparse.Namespace, kernels: dict[str, Any]) -> None:
     pinned = 0
     for name, configs in pins.items():
         # ``name@2`` marks a second kernel built from the same function; every
-        # kernel of that function takes the pin.
+        # kernel of that function takes the pin, and a pin read from a record
+        # that named the kernel ``name@2`` (which kernel gets the suffix
+        # depends on the collector's order) applies the same way.
+        base = name.split("@")[0]
         matches = [
             k
             for k in kernels
-            if k.split("@")[0] == name or k.split("@")[0].rsplit(".", 1)[-1] == name
+            if k.split("@")[0] == base or k.split("@")[0].rsplit(".", 1)[-1] == base
         ]
         if not matches:
             raise ValueError(f"Pin {name!r} matches nothing among {list(kernels)}")
@@ -214,10 +217,17 @@ def main() -> None:
         "eager_correctness": "pass",
     }
     if args.no_graph:
+        # Eager readings only: no graph is timed, so the graph dispatch
+        # warm-up is not run and the record says so.
+        result["graph_state_warmup"] = "not run (--no-graph: eager readings only)"
         torch.cuda.synchronize()
         runs = [baseline._event_ms(call) for _ in range(args.reps)]
         result.update(event_ms=statistics.median(runs), event_runs_ms=runs)
     else:
+        # Every timed reading of this process, the 16-call graph included,
+        # is taken in the steady dispatch state (``graph_state_warmup`` in
+        # the record; HELION_BENCHMARK_GRAPH_WARMUP=0 measures the fast one).
+        result["graph_state_warmup"] = baseline.graph_state_warmup()
         result.update(
             baseline.measure(
                 call,

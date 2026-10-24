@@ -1035,6 +1035,39 @@ def assert_correct(
         torch.testing.assert_close(actual[keep], (x / (1 - p))[keep])
 
 
+# The graph dispatch state of this process's first timed reading (see
+# ``graph_state_warmup``).
+_graph_state_note: str | None = None
+
+
+def graph_state_warmup() -> str:
+    """Put this process into its steady CUDA graph dispatch state before its
+    first timed reading (``helion.autotuner.benchmarking.steady_graph_dispatch``:
+    a fresh process replays graphs with shorter inter-node gaps until it has
+    done a little side-stream work, then every graph replays slower for the
+    life of the process; without the warm-up the 16-call graph is the
+    process's second graph and reads fast while the long graph after it is
+    the third and reads slow, for cute units only -- a Triton unit's process
+    was already steady by its second graph, cause not identified).
+
+    Returns the note the record carries as ``graph_state_warmup``: the state
+    of the process's *first* timed reading (``skipped: ...`` or ``failed:
+    ...`` when the warm-up did not run), with ``; then <state>`` appended
+    when a later attempt changed it (a failed warm-up is retried before the
+    next measurement, so a record's early readings may be fast-state and the
+    later ones steady; the note says so instead of the last writer winning).
+    """
+    global _graph_state_note
+    from helion.autotuner.benchmarking import steady_graph_dispatch
+
+    note = steady_graph_dispatch()
+    if _graph_state_note is None:
+        _graph_state_note = note
+    elif note != _graph_state_note.rsplit("; then ", 1)[-1]:
+        _graph_state_note = f"{_graph_state_note}; then {note}"
+    return _graph_state_note
+
+
 def graph_profile(replay: Callable, calls: int = 5) -> list[str]:
     """Names of the GPU activities (kernels, memsets, memcpys) one replay of
     a captured graph performs, in launch order; a node that a baseline has
@@ -1150,7 +1183,11 @@ def measure_batched(
 
     from helion.runtime import cute_cuda_graph
 
-    result: dict[str, Any] = {"graph_calls": calls, "sustain_ms": sustain_ms}
+    result: dict[str, Any] = {
+        "graph_calls": calls,
+        "sustain_ms": sustain_ms,
+        "graph_state_warmup": graph_state_warmup(),
+    }
 
     def output_bytes(value: Any) -> int:
         if isinstance(value, torch.Tensor):
@@ -1239,6 +1276,7 @@ def measure_cold(fn: Callable, repetitions: int, repeat: int = 100) -> dict:
 
     result: dict[str, Any] = {
         "bench_regime": f"interleaved_bench(repeat={repeat}, cold L2, CUDA graph)",
+        "graph_state_warmup": graph_state_warmup(),
     }
     # Backward callables replay autograd graphs whose saved streams PyTorch
     # must redirect into the capture; without this the bench silently falls
@@ -1274,6 +1312,9 @@ def measure(
 
     from helion.autotuner.benchmarking import _make_cudagraph_replay
 
+    # Before any timed reading: ``event_ms`` is taken in the same dispatch
+    # state as the graphs that follow it (and as the autotuner ranks in).
+    warmup = graph_state_warmup()
     torch.cuda.synchronize()
     for _ in range(5):
         fn()
@@ -1282,6 +1323,7 @@ def measure(
     result: dict[str, Any] = {
         "event_ms": statistics.median(runs),
         "event_runs_ms": runs,
+        "graph_state_warmup": warmup,
     }
     try:
         # The forward graph of backward-only workloads is intentionally built
