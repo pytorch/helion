@@ -7,7 +7,9 @@ from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
+from test._cute_binding import _capture_collective_interleaving
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _legacy_registered_seeds
 from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
@@ -28,7 +30,6 @@ pytestmark = skipUnlessBackends(["cute"])
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 
@@ -54,40 +55,6 @@ def partitioned_case() -> tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]]:
         autotune_effort="none",
     )
     return _cpu_bind(kernel, args), args
-
-
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    return seeds
-
-
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
-    """Undo schedule interleaving while retaining independent seed preferences."""
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ),
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    # Other registered heuristics retain their original positions. Replace
-    # only this heuristic's permutation when reproducing the old population.
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
 
 
 def _initial_population(
@@ -305,26 +272,11 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
     )
     bound = _cpu_bind(_matmul_with_unrelated_knob, args)
     assert bound.host_function is not None
-    legacy: list[helion.Config] = []
-    expected: list[helion.Config] = []
-    interleave = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds
-
-    def capture_interleaving(
-        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-    ) -> list[helion.Config]:
-        legacy[:] = seeds
-        expected[:] = interleave(spec, seeds, parameters)
-        return expected.copy()
-
     # This checks this heuristic's permutation, before later independent
     # overlays append their own policy siblings to the merged registry.
     with (
         bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=capture_interleaving,
-        ),
+        _capture_collective_interleaving() as (legacy, expected),
     ):
         actual = CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
@@ -334,6 +286,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
     assert set(legacy) == set(actual)
     assert legacy[0] == expected[0]
     assert legacy != expected
+    assert actual == expected
     assert all("gain" not in seed.config for seed in actual)
     # The computed A admits TMEM schedules; an unrelated gain must not change
     # their interleaving. Compare before the separate async-priority step.

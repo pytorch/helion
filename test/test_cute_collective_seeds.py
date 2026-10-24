@@ -9,15 +9,18 @@ from examples.matmul import matmul
 import pytest
 import torch
 
+from test._cute_binding import _capture_collective_interleaving
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _forbid_cuda_work
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_direct_zero_seed
 from helion._compiler.cute.collective_matmul import has_collective_native_seed_candidate
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
+from helion._hardware import HardwareInfo
 from helion._testing import TestCase
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
@@ -27,6 +30,8 @@ from helion.autotuner.config_spec import RootGridFact
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import DeviceIR
     from helion.autotuner.config_spec import ConfigSpec
@@ -69,6 +74,11 @@ def test_independent_contractions_receive_complete_collective_seeds() -> None:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
+        with _mock_hardware((9, 0), "NVIDIA H100 PCIe"):
+            facts = CuteCollectiveMatmulHeuristic.register_facts(
+                bound.env, bound.host_function.device_ir
+            )
+            assert "config_num_sm" not in facts
     assert seeds
     assert bound.to_code(seeds[0]).count("cute.gemm(") == 2
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
@@ -164,25 +174,41 @@ def test_matmul_placement_rejects_missing_attribution(unknown: str) -> None:
     assert cute_matmul_root_placements(env, ir) == ()
 
 
+def _mock_hardware(
+    capability: tuple[int, int], name: str
+) -> AbstractContextManager[object]:
+    return patch(
+        "helion._hardware.get_hardware_info",
+        return_value=HardwareInfo(
+            device_kind="cuda",
+            hardware_name=name,
+            runtime_version="13.0",
+            compute_capability=f"sm{capability[0]}{capability[1]}",
+        ),
+    )
+
+
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
-    ("capability", "num_sm", "dtype", "m", "preferred"),
+    ("capability", "num_sm", "dtype", "m", "hardware_name", "preferred"),
     [
-        ((8, 0), 108, torch.float16, 128, True),
-        ((8, 9), 128, torch.float16, 128, True),
-        ((9, 0), 114, torch.float16, 128, True),
-        ((9, 0), 114, torch.float16, 129, True),
-        ((9, 0), 114, torch.float16, 32, False),
-        ((9, 0), 114, torch.bfloat16, 128, False),
-        ((10, 0), 148, torch.float16, 128, True),
-        ((10, 0), 148, torch.bfloat16, 128, False),
+        ((8, 0), 108, torch.float16, 128, "NVIDIA A100", False),
+        ((8, 9), 128, torch.float16, 128, "NVIDIA L4", False),
+        ((9, 0), 114, torch.float16, 128, "NVIDIA H100 PCIe", True),
+        ((9, 0), 114, torch.float16, 129, "NVIDIA H100 PCIe", True),
+        ((9, 0), 114, torch.float16, 32, "NVIDIA H100 PCIe", False),
+        ((9, 0), 114, torch.bfloat16, 128, "NVIDIA H100 PCIe", False),
+        ((10, 0), 148, torch.float16, 128, "NVIDIA B200", False),
+        ((10, 0), 148, torch.bfloat16, 128, "NVIDIA B200", False),
+        ((9, 0), 114, torch.float16, 128, "NVIDIA H200", False),
     ],
 )
-def test_collective_async_priority_preserves_candidates_and_default(
+def test_collective_async_priority_preserves_candidates(
     capability: tuple[int, int],
     num_sm: int,
     dtype: torch.dtype,
     m: int,
+    hardware_name: str,
     preferred: bool,
 ) -> None:
     kernel = helion.kernel(
@@ -190,51 +216,34 @@ def test_collective_async_priority_preserves_candidates_and_default(
     )
     args = (torch.empty((m, 256), dtype=dtype), torch.empty((256, 64), dtype=dtype))
     heuristic = CuteCollectiveMatmulHeuristic
-    original: list[helion.Config] = []
-    interleave = heuristic._interleave_bounded_k_seeds
-
-    def capture_order(
-        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-    ) -> list[helion.Config]:
-        result = interleave(spec, seeds, parameters)
-        original[:] = result
-        return result
-
     with (
         _mock_cuda_unavailable(),
         _forbid_cuda_work(),
+        _mock_hardware(capability, hardware_name),
     ):
         bound = _cpu_bind(kernel, args, capability=capability, num_sm=num_sm)
         assert bound.host_function is not None
+        assert bound.config_spec.num_sm == num_sm
         with bound.env:
             ir = bound.host_function.device_ir
-            default = bound.config_spec.default_config()
-            assert bound.config_spec.compiler_default_config is None
-            with patch.object(
-                heuristic, "_interleave_bounded_k_seeds", side_effect=capture_order
-            ):
+            with _capture_collective_interleaving() as (_before, original):
                 actual = heuristic.get_seed_configs(bound.env, ir)
-            assert bound.config_spec.default_config() == default
             assert original[0]["cute_collective_copy"] == "scalar"
             if preferred:
                 async_seed = helion.Config.from_dict(
                     original[0].config | {"cute_collective_copy": "async"}
                 )
                 assert actual == [async_seed, *[s for s in original if s != async_seed]]
-                if capability[0] == 10:
-                    assert (
-                        helion.Config.from_dict(
-                            original[0].config
-                            | {
-                                "cute_collective_copy": "async_cached",
-                                "cute_collective_compute": "tcgen05",
-                            }
-                        )
-                        in actual
-                    )
             else:
                 assert actual == original
-            assert not heuristic.promote_seed_to_default
+            key = dict(compiler_promotion_specialization_key("cute", bound.env.device))
+            assert key[heuristic.name] == (
+                hardware_name if hardware_name == "NVIDIA H100 PCIe" else None
+            )
+            facts = heuristic.register_facts(bound.env, ir)
+            assert ("config_num_sm" in facts) == (
+                hardware_name == "NVIDIA H100 PCIe" and dtype == torch.float16
+            )
             with patch.object(bound.config_spec, "compiler_seed_configs", actual):
                 normalized = ConfigGeneration(
                     bound.config_spec
@@ -242,6 +251,27 @@ def test_collective_async_priority_preserves_candidates_and_default(
             assert normalized[0][1]["cute_collective_copy"] == (
                 "async" if preferred else "scalar"
             )
+            if preferred and m == 128:
+                axes, sites = heuristic._placements(bound.env, ir)
+                unknown_k = bound.env.shape_env.create_unbacked_symint()
+                with patch.object(
+                    bound.env.block_sizes[axes[0][2]],
+                    "from_config_assert",
+                    return_value=unknown_k,
+                ):
+                    assert not heuristic._prefer_async_copy(
+                        bound.env, actual[0], axes[0], sites[0][0]
+                    )
+        if preferred and m == 128:
+            group = next(
+                group
+                for group in bound.config_spec.compiler_coverage_groups
+                if group.mechanism == "cute.collective_static_layouts"
+            )
+            static = group.witnesses[0].carrier
+            assert static["cute_collective_copy"] == "async"
+            static.config[group.key] = group.witnesses[0].value
+            assert "cute.gemm(" in bound.to_code(static)
 
 
 def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -259,9 +289,13 @@ def _reverse_registered_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("missing_async", [False, True])
-def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) -> None:
+@pytest.mark.parametrize("reverse_registration", [False, True])
+def test_async_priority_uses_block_identity_and_preserves_missing_sibling(
+    missing_async: bool,
+    reverse_registration: bool,
+) -> None:
     kernel = helion.kernel(
-        matmul.fn if missing_async else _reverse_registered_matmul,
+        _reverse_registered_matmul if reverse_registration else matmul.fn,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
@@ -286,20 +320,33 @@ def test_async_priority_keeps_excluded_candidates_in_order(missing_async: bool) 
         original[:] = result
         return result
 
-    with _mock_cuda_unavailable(), _forbid_cuda_work():
-        bound = _cpu_bind(kernel, args)
+    with (
+        _mock_cuda_unavailable(),
+        _forbid_cuda_work(),
+        _mock_hardware((9, 0), "NVIDIA H100 PCIe"),
+    ):
+        bound = _cpu_bind(kernel, args, capability=(9, 0), num_sm=114)
         assert bound.host_function is not None
+        # Fission retains kernel-wide facts while this region places one site.
         with (
             bound.env,
+            patch.object(
+                bound.config_spec, "matmul_facts", bound.config_spec.matmul_facts * 2
+            ),
             patch.object(heuristic, "_interleave_bounded_k_seeds", side_effect=capture),
         ):
             actual = heuristic.get_seed_configs(
                 bound.env, bound.host_function.device_ir
             )
-        assert actual == original
         assert actual
-        if not missing_async:
-            assert actual[0].num_threads != [4, 32, 1]
+        if missing_async:
+            assert actual == original
+        else:
+            assert actual[0]["cute_collective_copy"] == "async"
+            assert actual == [
+                actual[0],
+                *[seed for seed in original if seed != actual[0]],
+            ]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

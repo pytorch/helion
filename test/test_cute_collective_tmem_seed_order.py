@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -8,6 +9,7 @@ import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _legacy_registered_seeds as _shared_legacy
 from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
@@ -23,11 +25,12 @@ from helion.autotuner.pattern_search import PatternSearch
 
 pytestmark = skipUnlessBackends(["cute"])
 
+_legacy_registered_seeds = partial(_shared_legacy, require_no_parameters=True)
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import helion
-    from helion.autotuner.config_spec import ConfigSpec
     from helion.runtime.kernel import BoundKernel
 
 
@@ -38,41 +41,6 @@ def _forbid_cuda_init() -> Iterator[None]:
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
-
-
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    # None of these contractions has a config-owned K chunk. The reviewed
-    # bounded-K interleaver previously returned this list unchanged.
-    assert not parameters
-    return seeds
-
-
-def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
-    """Undo schedule interleaving while retaining independent seed preferences."""
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ),
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
 
 
 def _initial_population(
