@@ -23,6 +23,7 @@ StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
@@ -59,6 +60,7 @@ class Config(Mapping[str, object]):
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         cute_store_policy: CuteStorePolicyLiteral | None = None,
+        cute_exact_div_form: CuteExactDivFormLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
         cute_async_load_group_rows: int | None = None,
@@ -125,6 +127,13 @@ class Config(Mapping[str, object]):
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
             cute_async_load_group_rows: Per-thread row iterations in each group.
+            cute_exact_div_form: How CuTe lowers an fp32 division by a
+                loop-invariant divisor (a row sum, a scalar argument); both
+                forms give the IEEE quotient bit for bit. ``"redo"`` (default)
+                speculates the Markstein sequence over the loop and re-runs
+                the loop with ``div.rn`` on a hard case (a loop the redo
+                cannot take keeps its plain division), ``"plain"`` keeps one
+                ``div.rn`` per element.
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
@@ -244,6 +253,7 @@ class Config(Mapping[str, object]):
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
             "cute_store_policy": cute_store_policy,
+            "cute_exact_div_form": cute_exact_div_form,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
             "cute_async_load_group_rows": cute_async_load_group_rows,
@@ -538,6 +548,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteStorePolicyLiteral",
             self.config.get("cute_store_policy", "default"),
+        )
+
+    @property
+    def cute_exact_div_form(self) -> CuteExactDivFormLiteral:
+        return cast(
+            "CuteExactDivFormLiteral",
+            self.config.get("cute_exact_div_form", "redo"),
         )
 
     @property

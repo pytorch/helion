@@ -660,6 +660,11 @@ class _Settings:
     cute_graph_cse: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
     )
+    cute_exact_division: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
+        )
+    )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -916,6 +921,18 @@ class Settings(_Settings):
             "log_softmax of it). Results are bitwise unchanged; set False "
             "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
             "regression against the traced graph."
+        ),
+        "cute_exact_division": (
+            "If True (the default), an fp32 division by a loop-invariant scalar "
+            "(a row sum, a scalar kernel argument) on CuTe hoists the divisor's "
+            "correctly rounded reciprocal and admission window out of the "
+            "element loop and divides with the Markstein sequence, re-running "
+            "the loop with div.rn when a dividend left the window: the IEEE "
+            "round-to-nearest quotient bit for bit, without one div.rn "
+            "expansion per element. Set False (HELION_CUTE_EXACT_DIVISION=0) "
+            "to keep the plain per-element division; the config knob "
+            "cute_exact_div_form picks the form (redo / plain) per kernel. "
+            "Independent of fast_math, whose fp32 division is approximate."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

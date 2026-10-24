@@ -363,6 +363,14 @@ class TensorNumelConstraint(NamedTuple):
     expr_str: str
 
 
+# ``cute_exact_div_form`` choices, the default first.  ``plain`` is also the
+# fail-closed repair of an unknown value, and of the retired ``guard`` form
+# (a per-element branch; its code shape changed ptxas's contraction of the
+# surrounding fp32 chains, so it was not bit identical to ``plain``).
+CUTE_EXACT_DIV_FORMS: tuple[str, ...] = ("redo", "plain")
+_CUTE_EXACT_DIV_FORM_RETIRED: frozenset[str] = frozenset({"guard"})
+
+
 class MatmulFact(NamedTuple):
     """Shape facts recorded when matmul requirements are applied.
 
@@ -1175,6 +1183,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1328,6 +1337,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1506,6 +1516,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1705,6 +1716,10 @@ class ConfigSpec:
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
+        # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
+        # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
+        # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
+        self.cute_exact_division_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
@@ -5532,6 +5547,37 @@ class ConfigSpec:
         if not self.cute_l2_evict_last_store_policy_supported:
             config[key] = "default"
 
+    def _normalize_cute_exact_div_form(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_exact_div_form`` picks how an fp32 division by a
+        loop-invariant divisor is lowered on CuTe (both forms give the IEEE
+        quotient bit for bit): ``redo`` speculates the Markstein sequence
+        over the loop and re-runs the loop on a hard case, ``plain`` keeps
+        ``div.rn`` per element.  A recorded config carrying the retired
+        ``guard`` form is repaired to ``plain`` (fail closed: the plain
+        division is what every form must equal), as is any unknown value
+        under ``fix_invalid``.  A kernel without such a division has nothing
+        for the knob to choose; it is dropped.  The gate
+        (``has_hoistable_fp32_divisions``) is a graph-level necessary
+        condition: a kernel whose division the AST pass then proves
+        loop-carried at every loop keeps the knob, with both forms rendering
+        identically."""
+        key = "cute_exact_div_form"
+        if key not in config:
+            return
+        value = config[key]
+        if value in _CUTE_EXACT_DIV_FORM_RETIRED:
+            config[key] = value = "plain"
+        if value not in CUTE_EXACT_DIV_FORMS:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} must be one of {CUTE_EXACT_DIV_FORMS}, got {value!r}"
+                )
+            config[key] = "plain"
+        if not self.cute_exact_division_sites or self.matmul_facts:
+            config.pop(key, None)
+
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -6494,6 +6540,7 @@ class ConfigSpec:
             self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_store_policy(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_exact_div_form(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
@@ -7856,6 +7903,8 @@ class ConfigSpec:
                 return True, "simt"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
+            if key == "cute_exact_div_form":
+                return True, CUTE_EXACT_DIV_FORMS[0]
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -8483,6 +8532,13 @@ class ConfigSpec:
                         else ("default",)
                     )
                 )
+                if self.cute_exact_division_sites and not self.matmul_facts:
+                    # How an fp32 quotient by a loop-invariant divisor is
+                    # lowered; bitwise identical forms, see
+                    # ``_normalize_cute_exact_div_form``.
+                    fields["cute_exact_div_form"] = EnumFragment(
+                        choices=CUTE_EXACT_DIV_FORMS
+                    )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)

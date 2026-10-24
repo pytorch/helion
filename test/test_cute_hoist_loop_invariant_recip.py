@@ -185,9 +185,12 @@ class TestCuteHoistRecip(TestCase):
         self.assertIn("* _helion_inv_div_0", code)
 
     def test_recip_hoist_needs_fast_math(self) -> None:
-        """Without ``fast_math`` the consume sweep keeps its IEEE divide by
-        ``di``: the reciprocal would round differently, and only where a
-        config creates the loop."""
+        """Without ``fast_math`` the consume sweep keeps the IEEE quotient by
+        ``di``: the ``1.0 / d`` + multiply rewrite would round differently,
+        and only where a config creates the loop.  The exact hoist
+        (``test_cute_exact_division.py``) takes the sweep instead: the
+        correctly rounded reciprocal and the Markstein sequence, with the
+        original divide kept in the redo copy."""
         x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
             _reduction_kernel,
@@ -199,7 +202,9 @@ class TestCuteHoistRecip(TestCase):
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_helion_inv_div_", code)
-        self.assertIn("/ di", code)
+        self.assertIn("_helion_exdiv_y_0 = 1.0 / di", code)
+        self.assertIn("_cute_exact_div_fast_f32(", code)
+        self.assertIn("/ di\n", code)
 
     def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
         """When the divisor changes per-iteration (e.g. ``local_sum``
@@ -500,6 +505,30 @@ def _normalize(source: str) -> str:
 @onlyBackends(["cute"])
 class TestCuteSharedRecip(TestCase):
     """Block-local reciprocal sharing sub-pass (AST-level, no GPU)."""
+
+    def test_loop_carried_alias_divisor_is_not_hoisted(self) -> None:
+        """``d = e`` at the end of the loop (directly, or through a rename
+        group) rebinds the divisor for the next iteration: the first
+        iteration divides by the pre-loop ``d``, so ``d`` is not invariant
+        and no reciprocal is hoisted.  Without the rebinding the
+        per-iteration snapshot ``d_copy_0`` resolves to ``d`` and the
+        reciprocal is hoisted above the loop."""
+        source = """\
+            for i in range(cutlass.Int32(0), cutlass.Int32(n), cutlass.Int32(16)):
+                d_copy_0 = d
+                load = (x.iterator + cutlass.Int32(i)).load()
+                v_0 = load / d_copy_0
+                (out.iterator + cutlass.Int32(i)).store(cutlass.Float32(v_0))
+                d = e
+            """
+        code = _run_pass(source)
+        self.assertNotIn("_helion_inv_div", code)
+        self.assertIn("v_0 = load / d", code)
+        code = _run_pass(source.replace("    d = e\n", "    v_9 = e\n"), {"v_9": "d"})
+        self.assertNotIn("_helion_inv_div", code)
+        code = _run_pass(source.replace("    d = e\n", ""))
+        self.assertIn("_helion_inv_div_0 = 1.0 / d", code)
+        self.assertIn("v_0 = load * _helion_inv_div_0", code)
 
     def test_three_divisions_by_one_divisor_share_one_reciprocal(self) -> None:
         """``swiglu_bwd``: three IEEE divides by ``v_9`` become one

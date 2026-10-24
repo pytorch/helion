@@ -127,6 +127,27 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    printed repros record the value in their ``@helion.kernel`` decorator and
    replay the graph they were emitted from whatever the replay environment.
 
+.. autoattribute:: Settings.cute_exact_division
+
+   CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
+   invariant across an element loop (a softmax row sum, a kernel-wide
+   temperature) hoists the divisor's correctly rounded reciprocal and its
+   admission window out of the loop and divides with the Markstein sequence
+   (``q = RN(x*y)``, ``r = RN(x - d*q)``, ``RN(q + r*y)``), speculated over the
+   loop: when some dividend left the window the loop runs again as written,
+   with ``div.rn.f32`` itself. The result is the IEEE round-to-nearest quotient
+   bit for bit (``helion/_compiler/cute/exact_division.py`` states the
+   argument); set ``cute_exact_division=False`` or
+   ``HELION_CUTE_EXACT_DIVISION=0`` to keep one ``div.rn`` expansion per
+   element; the config knob ``cute_exact_div_form`` (``"redo"``, ``"plain"``)
+   picks the form per kernel, so the autotuner can keep the plain division
+   where a kernel sits at the register cap (the knob is exposed for every
+   kernel whose traced graph divides fp32 by a scalar or a broadcast row value;
+   a loop the redo form cannot re-execute keeps its plain division, and where
+   the pass proves no divisor loop-invariant both forms render identically).
+   ``fast_math`` is unaffected: its fp32 division is the approximate
+   ``cute.math.div``.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -432,6 +453,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
 | ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
+| ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``0`` to keep one ``div.rn.f32`` per element for fp32 divisions by a loop-invariant scalar on CuTe instead of the hoisted bit-exact Markstein sequence. Default ``1``; results are bitwise identical either way. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |

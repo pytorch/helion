@@ -3644,11 +3644,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
+            from .cute.hoist_loop_invariant_recip import has_hoistable_fp32_divisions
             from .cute.signed_bitfield import has_signed_byte_field
             from .cute.tile_packing import tile_pack_counts
 
             config_spec.cute_tile_pack_counts = tile_pack_counts(
                 CompileEnvironment.current(), device_ir
+            )
+
+            # An fp32 quotient by a scalar or a broadcast row value: the exact
+            # division hoist can apply, so its form is tunable.
+            config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
+                info.graph for info in device_ir.graphs
             )
 
             config_spec.cute_signed_bitfield_bf16_available = (
