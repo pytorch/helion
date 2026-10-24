@@ -43,7 +43,6 @@ from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
-from .thread_budget import MAX_THREAD_BLOCK_DIMS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
 from .thread_budget import check_thread_limit
@@ -4083,7 +4082,6 @@ class CuteBackend(Backend):
         from ..tile_strategy import PerThreadNDTileStrategy
         from .matmul_utils import cute_kernel_has_half_precision_matmul
         from .matmul_utils import cute_matmul_contraction_block_ids
-        from .matmul_utils import cute_matmul_root_placements
 
         if len(set(block_ids)) != len(block_ids):
             # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
@@ -4220,7 +4218,6 @@ class CuteBackend(Backend):
                 return bool(lhs == rhs)
 
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-            spec = env.config_spec
             original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
                 fn,
@@ -4255,48 +4252,6 @@ class CuteBackend(Backend):
             for i, block_id in enumerate(block_ids):
                 if block_id in inactive_block_ids:
                     num_threads_config[i] = 1
-            if (
-                self.name == "cute"
-                and config.get("cute_collective_mma")
-                and not spec.cute_pointwise_region_block_ids.issuperset(block_ids)
-                and (placements := cute_matmul_root_placements(env, device_ir))
-                and all(
-                    bid not in block_ids
-                    for fact, _root in placements
-                    for bid in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
-                )
-            ):
-                # Sibling roots reuse CUDA axes. Bound each physical dimension
-                # separately, following the collective root's configured order.
-                caps = [1, 1, 1]
-                if (
-                    block_ids in device_ir.grid_block_ids
-                    and config.get("cute_collective_compute", "warp") == "warp"
-                ):
-                    caps = list(MAX_THREAD_BLOCK_DIMS)
-                    for _fact, root in placements:
-                        order = spec.loop_orders.config_get(
-                            config.loop_orders, root[0]
-                        ) or range(len(root))
-                        dims = [
-                            spec.num_threads.config_get(config.num_threads, root[i], 0)
-                            or 1
-                            for i in order
-                        ]
-                        dims = [threads for threads in dims if threads > 1]
-                        dims += [1] * (3 - len(dims))
-                        caps = list(starmap(min, zip(caps, dims, strict=True)))
-                axis = 0
-                for i in loop_order:
-                    size = nd_block_size[i]
-                    if num_threads_config[i] == 0:
-                        num_threads_config[i] = (
-                            _largest_divisor_at_most(size, caps[axis])
-                            if isinstance(size, int) and axis < 3
-                            else 1
-                        )
-                    if num_threads_config[i] > 1:
-                        axis += 1
             is_device_loop = any(bid not in grid_ids for bid in block_ids)
             active_block_ids = device_ir.codegen_active_block_ids
             reduction_axis_reserve = (

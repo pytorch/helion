@@ -1340,7 +1340,7 @@ class DeviceIRAnalysis:
         from .device_ir import HelperFunctionGraphInfo
         from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
-        from .device_ir import control_flow_child_graph_ids
+        from .device_ir import control_flow_parent_ids
 
         dot_targets = frozenset(matmul_operand_positions())
         graph_info_by_graph = {
@@ -1378,13 +1378,7 @@ class DeviceIRAnalysis:
         by_id = {graph.graph_id: graph for graph in graphs}
         child_loops: dict[int, tuple[tuple[int, frozenset[int]], ...]] = {}
         loop_calls: dict[int, list[torch.fx.Node]] = {}
-        graph_parent_of = {
-            child_id: graph.graph_id
-            for graph in graphs
-            for node in graph.nodes
-            for child_id in control_flow_child_graph_ids(node)
-            if child_id in by_id
-        }
+        graph_parent_of = control_flow_parent_ids(device_ir.graphs)
         for graph in graphs:
             if graph.is_reduction_loop:
                 continue

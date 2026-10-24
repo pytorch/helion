@@ -5,10 +5,13 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .. import exc
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
+from .cute.matmul_utils import cute_matmul_root_placements
+from .cute.packed_matmul import contraction_axis_for_fact
 from .device_function import DeviceFunction
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
@@ -23,6 +26,7 @@ from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import ItemsView
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from .. import Config
@@ -77,6 +81,7 @@ class TileStrategyDispatch:
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self._constexpr_live_graph_ids: frozenset[int] | None = None
+        self._collective_sibling_thread_axes: dict[TileStrategy, int] = {}
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.loop_nesting import constexpr_live_graph_ids
             from .cute.loop_nesting import tile_loop_paths
@@ -90,7 +95,10 @@ class TileStrategyDispatch:
             )
         self._add_loop_strategies(fn, config)
         if CompileEnvironment.current().backend.name == "cute":
-            self._normalize_shared_tile_thread_extents()
+            if CompileEnvironment.current().config_spec.matmul_facts:
+                self._normalize_collective_sibling_threads(config)
+            else:
+                self._normalize_shared_tile_thread_extents()
         self._add_reduction_strategies(fn, config)
         if CompileEnvironment.current().backend.name == "cute":
             self._normalize_shared_reduction_thread_extents()
@@ -126,6 +134,91 @@ class TileStrategyDispatch:
                 and dims[axis] > count
             ):
                 strategy.use_shared_thread_extent(dims[axis])
+
+    def _normalize_collective_sibling_threads(self, config: Config) -> None:
+        """Fit independent SIMT loops to the collective's physical launch."""
+        if not config.get("cute_collective_mma"):
+            return
+        env = CompileEnvironment.current()
+        device_ir = HostFunction.current().device_ir
+        placements = cute_matmul_root_placements(env, device_ir)
+        if not placements:
+            return
+        collective_blocks = {
+            bid
+            for fact, _root in placements
+            for bid in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if bid is not None
+        }
+        for fact, _root in placements:
+            axis = contraction_axis_for_fact(env, device_ir, fact)
+            if axis is not None:
+                collective_blocks.add(axis.block_id)
+        # Include owned device loops as well as root grids. This is the same
+        # per-axis maximum used at launch; final collective proofs still reject
+        # incompatible matrix layouts rather than silently changing them.
+        caps = self._thread_block_dims_for_strategies(
+            strategy
+            for strategy in self.strategies
+            if collective_blocks.intersection(strategy.block_ids)
+        )
+        # Tracing can register inner loops first. Finalize their parents before
+        # a child queries its lexical thread-axis offset.
+        depths: dict[tuple[int, ...], int] = {}
+        for path in self._cute_tile_loop_paths:
+            for depth, block_ids in enumerate(path):
+                depths[block_ids] = max(depths.get(block_ids, 0), depth)
+        for strategy in sorted(
+            self.strategies,
+            key=lambda item: depths.get(tuple(item.block_ids), 0),
+        ):
+            if (
+                not isinstance(strategy, PerThreadNDTileStrategy)
+                or strategy.mma_mode
+                or collective_blocks.intersection(strategy.block_ids)
+                or env.config_spec.cute_pointwise_region_block_ids.issuperset(
+                    strategy.block_ids
+                )
+            ):
+                continue
+            block_ids = tuple(strategy.block_ids)
+            # Nested and multi-axis loops keep their lexical coordinate mapping.
+            # Only independent single-axis leaf roots can move to the widest axis.
+            axis = self.thread_axis_for_strategy(strategy) or 0
+            if (
+                len(block_ids) == 1
+                and list(block_ids) in device_ir.grid_block_ids
+                and not any(
+                    path[0] == block_ids and len(path) > 1
+                    for path in self._cute_tile_loop_paths
+                )
+            ):
+                # Separate root loops execute sequentially and reuse the same
+                # launch coordinates, so siblings do not reserve CUDA axes.
+                axis = max(range(3), key=caps.__getitem__)
+            self._collective_sibling_thread_axes[strategy] = axis
+            extents = {}
+            # Bind every active block, including scalar tile axes which the
+            # ordinary shared-axis normalizer does not widen.
+            for index in strategy.loop_order:
+                bid = strategy.block_ids[index]
+                if bid in strategy.inactive_block_ids:
+                    continue
+                cap = caps[axis] if axis < 3 else 1
+                requested = env.config_spec.num_threads.config_get(
+                    config.num_threads, bid, 0
+                )
+                if requested > cap:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"sibling block {bid} requests {requested} threads on CUDA axis {axis}, "
+                        f"but the collective launch allows {cap}",
+                    )
+                extent = requested or cap
+                extents[bid] = extent
+                if extent > 1:
+                    axis += 1
+            strategy.use_shared_thread_extents(extents)
 
     def _normalize_shared_tile_thread_extents(self) -> None:
         """Repartition sibling tile loops over their common physical launch.
@@ -654,6 +747,8 @@ class TileStrategyDispatch:
         whereas sharing a threaded reduction's axis would let a lookup of the
         block's axis extent read the other reduction's threads.
         """
+        if target in self._collective_sibling_thread_axes:
+            return self._collective_sibling_thread_axes[target]
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
@@ -971,6 +1066,23 @@ class TileStrategyDispatch:
                 axes.setdefault(base_axis + local_axis, expr)
         return axes
 
+    def _thread_block_dims_for_strategies(
+        self, strategies: Iterable[TileStrategy]
+    ) -> tuple[int, int, int]:
+        dims = [1, 1, 1]
+        for strategy in strategies:
+            for block_id in strategy.block_ids:
+                axis = self.thread_axis_for_block_id(block_id)
+                size = self.thread_extent_for_block_id(block_id)
+                if (
+                    axis is not None
+                    and size is not None
+                    and size > 1
+                    and axis < len(dims)
+                ):
+                    dims[axis] = max(dims[axis], size)
+        return dims[0], dims[1], dims[2]
+
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.
 
@@ -981,15 +1093,9 @@ class TileStrategyDispatch:
         branches = self._strategy_branches()
         dims = [1, 1, 1]
         for branch in branches:
-            branch_dims = [1, 1, 1]
-            ordered = self._ordered_strategies_for_branch(branch)
-            for strategy in ordered:
-                for block_id in strategy.block_ids:
-                    axis = self.thread_axis_for_block_id(block_id)
-                    size = self.thread_extent_for_block_id(block_id)
-                    if axis is None or size is None or size <= 1 or axis >= len(dims):
-                        continue
-                    branch_dims[axis] = max(branch_dims[axis], size)
+            branch_dims = self._thread_block_dims_for_strategies(
+                self._ordered_strategies_for_branch(branch)
+            )
             for axis, size in enumerate(branch_dims):
                 dims[axis] = max(dims[axis], size)
         return dims[0], dims[1], dims[2]
