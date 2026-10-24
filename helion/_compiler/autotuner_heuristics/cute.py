@@ -16,6 +16,7 @@ from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
 
+from ..._utils import prev_power_of_2
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
@@ -3912,18 +3913,19 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
         return dedupe_configs(seeds)
 
 
-class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
-    """Companion seed: chunk = max(max_threads, size_hint/2) so the inner
-    reduction loop has very few outer iterations and lane_extent absorbs
-    the bulk of the work.
+def _reduction_chunk_size(size_hint: int, max_chunk: int | None) -> int:
+    return prev_power_of_2(size_hint // 2, max_chunk)
 
-    For large N this lattice (1-2 outer iters, large lane_extent) tends to
+
+class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
+    """Seed prev_power_of_2(min(size_hint // 2, max_reduction_loop)).
+
+    For large N this lattice (few outer iters, large lane_extent) tends to
     schedule better than the narrow-chunk lattice (many outer iters,
     lane_extent=1) on B200 — the SASS is dominated by per-iter scheduling
     bubbles in the narrow case, while the wide case lets the compiler
     overlap the load/compute/store traffic across the unrolled lane
-    iterations. Only applies when size_hint > max_threads (otherwise the
-    narrow heuristic already gives the same lattice).
+    iterations. Only applies when the rounded chunk exceeds max_threads.
     """
 
     name = "cute_reduction_wide_chunk"
@@ -3936,7 +3938,10 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
-        return rl_spec.size_hint > 2 * max_threads
+        return (
+            _reduction_chunk_size(rl_spec.size_hint, spec.max_reduction_loop)
+            > max_threads
+        )
 
     @classmethod
     def get_seed_config(
@@ -3946,12 +3951,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        # Halve the size_hint until it fits in the reduction_loop chunk
-        # spec's [low, high] range; the autotuner explores power-of-2
-        # chunks so we keep this seed PoT.
-        chunk = size_hint // 2
-        if chunk < max_threads:
-            chunk = max_threads
+        chunk = _reduction_chunk_size(size_hint, spec.max_reduction_loop)
         seed: dict[str, Any] = {
             "block_sizes": [1],
             "num_threads": _seq_config_list(spec.num_threads, {}),
@@ -3980,6 +3980,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_row_ladder"
     backend = "cute"
+    MAX_CHUNK = 65536
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -4007,9 +4008,12 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
         if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
             rows_per_cta = 1
-        chunk = min(size_hint // 2, 65536)
+        max_chunk = cls.MAX_CHUNK
+        if spec.max_reduction_loop is not None:
+            max_chunk = min(max_chunk, spec.max_reduction_loop)
+        chunk = _reduction_chunk_size(size_hint, max_chunk)
         chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
-        if chunk >= size_hint or chunk < 2:
+        if chunk < 2 or chunk >= size_hint or chunk > max_chunk:
             return None
         rdim_id = rl_spec.block_id
         tile_id = spec.block_sizes[0].block_id
@@ -4089,9 +4093,11 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
         # 4350 GB/s) — the shorter unrolled body overlaps its loads across
         # roll iterations instead of one long dependency chain.
         slice_len = size_hint // cluster_n
-        chunk = max(threads_per_row * max(vec, 1), min(4096, slice_len))
+        chunk = prev_power_of_2(min(4096, slice_len), spec.max_reduction_loop)
         while slice_len % chunk:
             chunk //= 2
+        if chunk < threads_per_row * max(vec, 1):
+            return None
         rdim_id = rl_spec.block_id
         tile_id = spec.block_sizes[0].block_id
         seed: dict[str, Any] = {
