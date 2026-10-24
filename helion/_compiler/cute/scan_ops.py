@@ -144,7 +144,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         isinstance(input_node, Node)
         and input_node.target is operator.getitem
         and isinstance(input_node.args[0], Node)
-        and input_node.args[0].target is torch.ops.aten.sort.default
+        and input_node.args[0].target
+        in (torch.ops.aten.sort.default, torch.ops.aten.sort.stable)
     ):
         sort_node = input_node.args[0]
         load = sort_node.meta.get("cute_sort_load")
@@ -1004,7 +1005,8 @@ def _cute_scan_input_is_sorted(node: object) -> bool:
         isinstance(node, Node)
         and node.target is operator.getitem
         and isinstance(node.args[0], Node)
-        and node.args[0].target is torch.ops.aten.sort.default
+        and node.args[0].target
+        in (torch.ops.aten.sort.default, torch.ops.aten.sort.stable)
     )
 
 

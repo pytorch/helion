@@ -49,6 +49,13 @@ def _shared_baseline(*args: object) -> torch.Tensor:
 
 _BASELINE_KWARGS: dict[str, object] = {
     "static_shapes": True,
+    # fast_math: the CuTe flash backend offers its polynomial (degree-2) exp2
+    # packets, an approximation of ex2.approx, only under this setting, and
+    # the softcap transform's tanh takes tanh.approx.f32; the Triton backend
+    # takes the approximate divide (fast_dividef, div.approx.ftz.f32) for the
+    # output normalization and Inductor's use_fast_math (flush-to-zero exp;
+    # exp2 keeps libdevice).
+    "fast_math": True,
     "autotune_baseline_fn": _shared_baseline,
     "autotune_baseline_atol": 5e-2,
     "autotune_baseline_rtol": 2e-2,

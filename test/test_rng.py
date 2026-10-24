@@ -21,6 +21,7 @@ from helion._testing import onlyBackends
 from helion._testing import output_only
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfPallas
@@ -654,6 +655,12 @@ class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas("specialized-dimension rand_like hits TPU MLIR refinement mismatch")
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     @skipIfRocm("ROCm Triton worker crashes on specialized-dimension rand_like")
+    # The TileIR B200 job loses its xdist worker in this test with no
+    # traceback (several times since 2026-10-11, on main as well), like the
+    # rand tests in test_random.py; the same test takes ~6s on Triton.
+    @skipIfTileIR(
+        "TileIR job loses its xdist worker on specialized-dimension rand_like"
+    )
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 

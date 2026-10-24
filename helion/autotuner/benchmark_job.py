@@ -13,6 +13,8 @@ from .accuracy import assert_close
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import _clone_args
+from .kernel_args import load_private_kernel_args
 from .kernel_args import load_trusted_kernel_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
@@ -47,6 +49,18 @@ class BenchmarkJob:
     use_wall_clock: bool = False
     fixed_repetitions: int | None = None
     probe_long_kernel: bool = False
+    # Finalist slot whose private argument copies this job reads (None shares
+    # the cached arguments with every other job).
+    args_slot: int | None = None
+    # Arguments the kernel writes: the job times it on a fresh clone of them,
+    # as the in-process path does, so the worker's cached arguments keep
+    # their original values for every later job (an accuracy check among
+    # them). Private finalist copies are already the finalist's own.
+    mutated_arg_indices: tuple[int, ...] = ()
+    # L2 regime of the timed calls (``call``, ``off`` or ``replay``); None
+    # reads HELION_AUTOTUNE_L2_FLUSH in the worker. The final selection names
+    # its own regime (``final_selection_l2_flush_mode``).
+    l2_flush_mode: str | None = None
 
     def __call__(self) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -54,7 +68,14 @@ class BenchmarkJob:
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                if self.args_slot is None:
+                    args = load_trusted_kernel_args(self.args_path)
+                    if self.mutated_arg_indices:
+                        args = _clone_args(
+                            args, None, idx_to_clone=self.mutated_arg_indices
+                        )
+                else:
+                    args = load_private_kernel_args(self.args_path, self.args_slot)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
@@ -65,6 +86,7 @@ class BenchmarkJob:
                     rep=self.rep,
                     fixed_repetitions=self.fixed_repetitions,
                     probe_long_kernel=self.probe_long_kernel,
+                    l2_flush_mode=self.l2_flush_mode,
                 )
                 return cast(
                     "float",
@@ -87,12 +109,23 @@ class AccuracyCheckResult:
 
 @dataclasses.dataclass
 class AccuracyCheckJob:
+    """Run one candidate on the trusted arguments and compare it to the baseline.
+
+    A kernel that mutates arguments (``mutated_arg_indices``) runs on a fresh
+    clone of those arguments, so every candidate starts from the original
+    values; its post-call arguments are then compared against the baseline's
+    (``baseline_post_args_path``), the same check the in-process path makes.
+    """
+
     fn_spec: SerializedCompiledFunction
     args_path: str
     baseline_path: str
     atol: float
     rtol: float
     scale_atol: bool = False
+    mutated_arg_indices: tuple[int, ...] = ()
+    baseline_post_args_path: str | None = None
+    check_input_accuracy: bool = True
 
     def __call__(self) -> AccuracyCheckResult:
         # Keep compile/launch diagnostics out of the autotune progress stream.
@@ -100,6 +133,10 @@ class AccuracyCheckJob:
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
                 args = load_trusted_kernel_args(self.args_path)
+                if self.mutated_arg_indices:
+                    args = _clone_args(
+                        args, None, idx_to_clone=self.mutated_arg_indices
+                    )
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)
                 output = fn(*args)
                 synchronize_device()
@@ -114,6 +151,18 @@ class AccuracyCheckJob:
                 rtol=self.rtol,
                 scale_atol_by_expected_rms=self.scale_atol,
             )
+            if (
+                self.mutated_arg_indices
+                and self.check_input_accuracy
+                and self.baseline_post_args_path is not None
+            ):
+                assert_close(
+                    args,
+                    _load_trusted_baseline_output(self.baseline_post_args_path),
+                    atol=self.atol,
+                    rtol=self.rtol,
+                    scale_atol_by_expected_rms=self.scale_atol,
+                )
         except AssertionError as e:
             return AccuracyCheckResult(ok=False, message=str(e))
         return AccuracyCheckResult(ok=True)

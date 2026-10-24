@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import itertools
 import os
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +14,7 @@ import helion
 from helion._compat import requires_cuda_version
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_config import Tcgen05GroupedWorklistSmemFacts
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from helion._compiler.cute.tcgen05_constants import (
@@ -19,6 +22,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
@@ -35,6 +41,9 @@ from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 pytestmark = skipUnlessBackends(["cute"])
 if matchesBackends(["cute"]):
@@ -667,6 +676,12 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     ):
         bound = _device_split_sizes_kernel.bind(args)
 
+    _assert_device_split_seed_family_policy(bound)
+
+
+def _assert_device_split_seed_family_policy(
+    bound: BoundKernel[torch.Tensor],
+) -> None:
     assert bound.host_function is not None
     analysis = analyze_tcgen05_grouped_worklist(
         bound.env,
@@ -677,8 +692,7 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     seed_facts = analysis.seed_facts
     assert seed_facts.device_split_sizes
     assert bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts == (
-        8,
-        True,
+        Tcgen05GroupedWorklistSmemFacts(8, True, output_dtype_bytes=2)
     )
     seeds = [
         config
@@ -687,27 +701,74 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
         == TCGEN05_GROUPED_MODE_WORKLIST_NM
     ]
     assert seeds
+    nm_seeds = [
+        config
+        for config in seeds
+        if config.get("tcgen05_grouped_worklist_orientation", "nm") == "nm"
+    ]
+    legacy_seeds = [
+        config
+        for config in nm_seeds
+        if config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        != TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+    ]
     assert {
         config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
-        for config in seeds
+        for config in legacy_seeds
     } == {
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
         TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     }
     assert (
-        seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        legacy_seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
         == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     )
+    assert seeds[0] == legacy_seeds[0]
+    # Source128 adds independent NM pipelines; MN geometry/panel recipes are
+    # separate families and do not inherit the old NM raster restriction.
+    source128_seeds = [config for config in nm_seeds if config not in legacy_seeds]
+    assert {
+        config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        for config in source128_seeds
+    } == {TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE}
+    mn_seeds = [config for config in seeds if config not in nm_seeds]
+    assert {
+        config.get("tcgen05_grouped_worklist_orientation") for config in mn_seeds
+    } == {"mn"}
+    assert {
+        config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] for config in mn_seeds
+    } == {
+        TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    }
     assert all(
         TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY not in config.config
         for config in seeds
     )
     assert all(
         config.config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1
-        for config in seeds
+        for config in nm_seeds
     )
     assert bound.config_spec.compiler_default_config == seeds[0]
+
+
+def test_grouped_device_split_seed_family_policy_without_gpu() -> None:
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    values = (
+        torch.empty((2048, 64), dtype=torch.bfloat16),
+        torch.empty((8, 512, 64), dtype=torch.bfloat16),
+        torch.empty((8,), dtype=torch.int32),
+    )
+    with (
+        _target(),
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _device_split_sizes_kernel._bind_isolated(values)
+        _assert_device_split_seed_family_policy(bound)
 
 
 def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
@@ -771,7 +832,49 @@ def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
         m_size=args[0].size(0),
         orientation="nm",
     )
-    assert "iterator + cutlass.Int64(8) * cutlass.Int64(" in code
+    # The parallel initializer loads offsets[g] and offsets[g+1] instead of
+    # spelling an unrolled literal8. Prove the same int64 strided addresses,
+    # including the final boundary, for every logical group.
+    pointers = [
+        node.func.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+        and "offsets.iterator" in ast.unparse(node.func.value)
+    ]
+    assert len(pointers) == 2
+    coordinates = {
+        node.id
+        for pointer in pointers
+        for node in ast.walk(pointer)
+        if isinstance(node, ast.Name) and node.id not in ("offsets", "cutlass")
+    }
+    assert len(coordinates) == 1
+    (coordinate,) = coordinates
+    for pointer in pointers:
+        assert {
+            ast.unparse(node.func)
+            for node in ast.walk(pointer)
+            if isinstance(node, ast.Call)
+        } == {"cutlass.Int64"}
+    stride = args[2].stride(0)
+    assert stride == 2 and args[2].dtype is torch.int64
+    namespace = {
+        "__builtins__": {},
+        "cutlass": SimpleNamespace(Int64=int),
+        "offsets": SimpleNamespace(
+            iterator=0, layout=SimpleNamespace(stride=(stride,))
+        ),
+    }
+    addresses = [
+        tuple(
+            eval(ast.unparse(pointer), namespace | {coordinate: group})
+            for pointer in pointers
+        )
+        for group in range(8)
+    ]
+    assert addresses == [(group * stride, (group + 1) * stride) for group in range(8)]
 
 
 @pytest.mark.parametrize(

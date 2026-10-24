@@ -355,7 +355,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # the resolved per-thread coordinate expression so a load and store over
         # the same arange share one lane loop.
         self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
-        self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
         # Per-pass state of ``load_transform``: the fused inputs whose prologue
@@ -432,6 +431,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "helion_flash_bwd",
                     "gathered_mma_tma",
                     "block_scaled_mma",
+                    "helion_mma_dag_tma",
+                    "helion_mma_dag_alias",
                 }
                 for plan in self.cute_wrapper_plans
             )
@@ -540,8 +541,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
         ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
-        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
-        dependency.
+        on the second loop's ``ForLoopGraphInfo`` when their underlying tensor
+        storages have a RAW dependency.
 
         TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
         to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
@@ -550,9 +551,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         from ..language._tracing_ops import _for_loop
         from ..language._tracing_ops import _for_loop_step
         from .device_ir import ForLoopGraphInfo
-        from .loop_dependency_checker import (
-            needs_inter_loop_debug_barrier_for_global_raw,
-        )
+        from .loop_dependency_checker import graph_memory_access_storage_ids
 
         env = CompileEnvironment.current()
         if env.codegen_name != "triton" or env.backend.name == "tileir":
@@ -564,7 +563,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # before a loop, it flushes all earlier writes, so the pending set
             # is reset and only writes from loops AFTER the barrier need to be
             # tracked for subsequent siblings.
-            pending_global_writes: set[str] = set()
+            pending_writes: set[int] = set()
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
                     continue
@@ -575,19 +574,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 cur_info = self.codegen_graphs[cur_id]
                 if not isinstance(cur_info, ForLoopGraphInfo):
                     continue
-                need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
-                    pending_global_writes,
-                    cur_info.host_loop_reads,
-                    global_barrier_tensor_names=self._triton_global_barrier_tensor_names,
+                reads, writes = graph_memory_access_storage_ids(
+                    self.codegen_graphs, cur_id
                 )
+                need_barrier = bool(pending_writes & reads)
                 cur_info.needs_barrier_before = need_barrier
                 if need_barrier:
                     # Barrier flushes everything written before it.
-                    pending_global_writes = set()
+                    pending_writes.clear()
                 # Accumulate the current loop's writes for future siblings.
-                pending_global_writes |= self._triton_global_barrier_tensor_names(
-                    cur_info.host_loop_writes
-                )
+                pending_writes.update(writes)
 
     def _compute_intra_loop_barriers(self) -> None:
         """Mark loads that read a tensor an earlier store in the same body wrote,
@@ -615,46 +611,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             mark_in_divergent_control_flow=env.backend.name != "cute",
         )
 
-    def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
-        """Names that may participate in cross-wavefront global (HBM) coherence.
-
-        Triton-specific: the Pallas SMEM filter is intentionally omitted here
-        because the only caller (``_compute_inter_loop_barriers``) gates on
-        Triton codegen.  The ``triton_`` prefix and the assertion below encode
-        that precondition so a future non-Triton caller fails loudly rather
-        than silently mis-classifying SMEM-only tensors as needing a global
-        barrier.
-        """
-        from .type_info import StackTensorType
-        from .type_info import TensorType
-
-        env = CompileEnvironment.current()
-        assert env.codegen_name == "triton" and env.backend.name != "tileir", (
-            "_triton_global_barrier_tensor_names called outside Triton codegen"
-        )
-
-        out: set[str] = set()
-        scratch_names = {s.name for s in self.device_function._scratch_args}
-        local_types = self.host_function.local_types
-        for name in names:
-            if name in scratch_names:
-                continue
-            if local_types is None:
-                out.add(name)
-                continue
-            ti = local_types.get(name)
-            if ti is None:
-                out.add(name)
-                continue
-            if isinstance(ti, (TensorType, StackTensorType)):
-                out.add(name)
-        return out
-
     def _clear_attention_flash_state(self) -> None:
         cute_state = self.device_function.cute_state
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
         cute_state.attention_flash_gated_match = None
+        cute_state.attention_flex_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:
@@ -701,15 +663,52 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "warp_mma GEMM family failed late validation"
         )
 
+    def fragment_capacity_failure(
+        self, error: exc.BackendUnsupported
+    ) -> exc.BackendUnsupported | exc.InvalidConfig:
+        """Report a generic-lowering refusal after a fragment capacity decline.
+
+        The computed-fragment owner declines a root whose shared memory exceeds
+        the CTA capacity so the ordinary lowering can own it; when that lowering
+        refuses instead (lane restores, repeated block ids), the config, not the
+        kernel, failed: the overflow is the actionable message. Callers wrap the
+        statement visit and the device function finalization.
+        """
+        if CompileEnvironment.current().backend_name != "cute":
+            return error
+        declined = self.device_function.cute_state.fragment_capacity_decline
+        if declined is None:
+            return error
+        needed, capacity = declined
+        return exc.InvalidConfig(
+            f"computed fragments need {needed} shared bytes, exceeding {capacity}, "
+            f"and no other lowering owns this root: {error}"
+        )
+
     def _try_codegen_computed_fragment_root(self) -> bool:
         from .cute.computed_fragment import codegen_computed_fragment_root
 
         return codegen_computed_fragment_root(self)
 
+    def _try_codegen_mma_dag_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.mma_dag_plan is None:
+            return False
+        from .cute.cute_mma_dag_codegen import codegen_mma_dag
+
+        if codegen_mma_dag(self):
+            return True
+        cute_state.mma_dag_plan = None
+        raise exc.BackendUnsupported("cute", "cute_mma_dag failed late validation")
+
     def _prefer_computed_fragment_root(self, root_graph_id: int) -> bool:
         """Try fragment ownership before other schedules when this root needs it."""
         env = CompileEnvironment.current()
         if env.backend_name != "cute":
+            return False
+        if self.device_function.cute_state.mma_dag_plan is not None:
+            # The warp-MMA recurrence owner replaces the root (its captured
+            # reductions are the dot's K extent).
             return False
         from .cute.captured_reduction import captured_reduction_coordinates
         from .cute.free_iota_reduction import free_iota_reductions
@@ -764,6 +763,36 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 )
             )
         )
+
+    def _try_codegen_topk_root(self) -> bool:
+        plan = self.device_function.cute_state.topk_plan
+        if plan is None:
+            return False
+        from .cute.topk import codegen_topk_root
+
+        if codegen_topk_root(self, plan):
+            return True
+        raise exc.BackendUnsupported("cute", "topk failed late validation")
+
+    def _try_codegen_radix_selection_root(self) -> bool:
+        plan = self.device_function.cute_state.radix_selection_plan
+        if plan is None:
+            return False
+        from .cute.radix_selection_codegen import codegen_radix_selection_root
+
+        if codegen_radix_selection_root(self, plan):
+            return True
+        raise exc.InvalidConfig("radix selection failed its final row/grid proof")
+
+    def _try_codegen_register_region(self) -> bool:
+        plan = self.device_function.cute_state.register_region_plan
+        if plan is None:
+            return False
+        from .cute.register_region import codegen_register_region
+
+        if codegen_register_region(self, plan):
+            return True
+        raise exc.BackendUnsupported("cute", "register region failed late validation")
 
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
@@ -1843,12 +1872,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         # pyrefly: ignore [missing-attribute]
                         self.device_function.pid.codegen_pid_init()
                     )
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
-                    body = []
-                else:
-                    # This is the last top level for, dont emit more if statements
-                    assert self.next_else_block is not None
-                    body = self.next_else_block
+                body = []
             with (
                 self.set_on_device(),
                 self.set_statements(body),
@@ -1910,14 +1934,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         root_graph_info.graph_id
                     )
                     if (
-                        not (
+                        not self._try_codegen_radix_selection_root()
+                        and not (
                             requested_fragment
                             and self._try_codegen_computed_fragment_root()
                         )
                         and not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_topk_root()
+                        and not self._try_codegen_register_region()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_gdn_recurrence_root()
+                        and not self._try_codegen_mma_dag_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
@@ -1984,30 +2012,26 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
                     self.device_function.flush_deferred_rdim_defs(self)
 
-                if isinstance(self.device_function.pid, ForEachProgramID):
-                    self.device_function.pid.case_phases.append(
+                pid = self.device_function.pid
+                if isinstance(pid, ForEachProgramID):
+                    pid.case_bodies.append(body)
+                    pid.case_phases.append(
                         self.host_function.device_ir.phase_for_root(node._root_id)
                     )
-
-                # If we are in a multi top level loop, for all loops except for the last one
-                # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
-                    block = (
-                        self.device_function.body
-                        if self.next_else_block is None
-                        else self.next_else_block
-                    )
-                    self.next_else_block = []
-                    block.append(
-                        create(
-                            ast.If,
-                            # pyrefly: ignore [missing-attribute]
-                            test=self.device_function.pid.codegen_test(state),
-                            body=body,
-                            orelse=self.next_else_block,
+                    if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                        pid.case_branches.append(
+                            create(
+                                ast.If,
+                                test=pid.codegen_test(state),
+                                body=body,
+                                orelse=[],
+                            )
                         )
-                    )
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                if isinstance(self.device_function.pid, ForEachProgramID):
+                    self.device_function.body.extend(
+                        self.device_function.pid.codegen_dispatch()
+                    )
                 if self.suppressed_lane_names:
                     _drop_dead_lane_derived_assignments(
                         self.device_function.body,
@@ -2245,10 +2269,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _sink_grid_vector_loops(self) -> None:
         cute_state = self.device_function.cute_state
         fired = False
+        unrolled = False
         if cute_state.vloop_sink_wrappers:
             from .cute.sink_vector_loops import sink_grid_vector_loops
 
-            self.device_function.body, fired = sink_grid_vector_loops(
+            self.device_function.body, fired, unrolled = sink_grid_vector_loops(
                 list(self.device_function.body),
                 wrappers=cute_state.vloop_sink_wrappers,
                 loads=cute_state.vloop_sink_loads,
@@ -2266,7 +2291,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg in self.device_function.arguments
                     if isinstance(arg, TensorArg)
                 },
+                proven_disjoint_tensor_pairs=(
+                    self.device_function.proven_disjoint_tensor_pairs()
+                ),
+                stores=cute_state.vloop_sink_stores,
             )
+            cute_state.vloop_sink_unrolled = unrolled
         if not fired and cute_state.vloop_sink_layout_applied:
             # The knob shaped the thread layout but nothing was sunk.  The
             # knob must not change the code by itself, so start over with it
@@ -2590,6 +2620,28 @@ def _generate_ast(
             )
 
             validate_warp_producer_regions(env, func.device_ir, config)
+        if env.backend_name == "cute" and config.get(
+            "tcgen05_grouped_prefix_adaptive_n", False
+        ):
+            from .cute.grouped_prefix_adaptive_n_codegen import (
+                generate_grouped_prefix_adaptive_n_candidate,
+            )
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "grouped prefix-adaptive N requires complete ordinary codegen"
+                )
+            return generate_grouped_prefix_adaptive_n_candidate(
+                func, config, emit_repro_caller
+            )
         if (
             env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"
@@ -2829,7 +2881,12 @@ def _generate_ast(
                 ):
                     _host_prefix.extend(codegen.host_statements)
                     prefix_recorded = True
-                codegen.add_statement(codegen.visit(stmt))
+                try:
+                    codegen.add_statement(codegen.visit(stmt))
+                except exc.BackendUnsupported as error:
+                    # A lane-loop pass after the root dispatch can refuse a
+                    # root the fragment owner declined for capacity.
+                    raise codegen.fragment_capacity_failure(error) from error
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             # Re-binding checks deferred from tcgen05 epilogue chains that no
             # store drained (chains ending in an atomic or a specialized
@@ -2841,12 +2898,17 @@ def _generate_ast(
                     codegen.suppressed_lane_names,
                     codegen.device_function.dce_vars,
                 )
-            if _bounded_cache_request is None:
-                kernel_def = codegen.device_function.codegen_function_def()
-            else:
-                kernel_def = codegen.device_function.codegen_function_def(
-                    bounded_cache_request=_bounded_cache_request
-                )
+            try:
+                if _bounded_cache_request is None:
+                    kernel_def = codegen.device_function.codegen_function_def()
+                else:
+                    kernel_def = codegen.device_function.codegen_function_def(
+                        bounded_cache_request=_bounded_cache_request
+                    )
+            except exc.BackendUnsupported as error:
+                # Lane-loop finalization can refuse a root the fragment owner
+                # declined for capacity (see ``fragment_capacity_failure``).
+                raise codegen.fragment_capacity_failure(error) from error
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
                 or codegen.device_function.cute_state.owned_root_block_dims
@@ -3004,6 +3066,10 @@ def _generate_ast(
                         "bias_name",
                         "alibi_name",
                         "document_name",
+                        "document_range_name",
+                        "row_kv_begin_name",
+                        "row_kv_begin_work_name",
+                        "scale_name",
                         "layout_name",
                         "n_sizes_name",
                         "k_sizes_name",
@@ -3015,6 +3081,8 @@ def _generate_ast(
                         "epi_aux1_name",
                         "epi_aux2_name",
                         "epi_aux3_name",
+                        # cute_mma_dag tcgen05 tensor maps (one per operand).
+                        *(f"tma{index}_name" for index in range(16)),
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))
@@ -3027,6 +3095,14 @@ def _generate_ast(
                                 resolved[key[:-5] + "_bind_idx"] = host_arg_positions[
                                     arg_name
                                 ]
+                    # The cute_mma_dag alias guard names every tensor
+                    # argument of its program (the names stay for the
+                    # launcher's error message).
+                    tensor_names = resolved.get("tensor_names")
+                    if isinstance(tensor_names, list):
+                        resolved["tensor_idx"] = [
+                            launcher_arg_positions[str(name)] for name in tensor_names
+                        ]
                     resolved_plans.append(resolved)
                 return resolved_plans
 
@@ -3075,6 +3151,11 @@ def _generate_ast(
                     cast(
                         "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
                     ),
+                )
+                from .cute.host_zero_fills import lower_host_zero_fills
+
+                final_host_statements = lower_host_zero_fills(
+                    func, final_host_statements, env, codegen.device_function.config
                 )
 
             host_def = func.codegen_function_def(

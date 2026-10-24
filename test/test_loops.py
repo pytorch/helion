@@ -816,13 +816,17 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(result, args[0] + 1)
 
-    @skipIfRefEager("checks the CuTe lowering's refusal")
+    @skipIfRefEager("checks the CuTe lowering of a block-sized slice reduction")
     @skipUnlessBackends(["cute"])
     def test_full_slice_of_block_sized_buffer_reduction(self):
         """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
         slice's reduction dim reuses the block's symbol after its loop ended.
-        CuTe must refuse it rather than reduce it with that dim's synthetic
-        lane loop, which would repeat the tile loop's atomics once per lane."""
+        Where CuTe lowers it, the dim combines across its threads, so each
+        row's total is the tile loop's atomics once, not once per lane. Where
+        CuTe has no lowering (e.g. ``BackendUnsupported: reduction lane owner
+        is not proven``), the refusal is the expected safe outcome: it must
+        refuse rather than reduce with that dim's synthetic lane loop, which
+        would repeat the tile loop's atomics once per lane."""
 
         @helion.kernel(static_shapes=True)
         def row_sums(y: torch.Tensor) -> torch.Tensor:
@@ -840,19 +844,14 @@ class TestLoops(RefEagerTestBase, TestCase):
             return rows
 
         y = torch.randn(64, 128, device=DEVICE)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "reduction lane owner is not proven"
-        ):
-            code_and_output(row_sums, (y,), block_sizes=[128])
+        try:
+            _code, result = code_and_output(row_sums, (y,), block_sizes=[128])
+        except helion.exc.BackendUnsupported as error:
+            self.assertIn("reduction lane owner is not proven", str(error))
+            return
+        torch.testing.assert_close(result, y.sum(dim=-1))
 
     @skipIfTileIR("Result mismatch with tileir backend")
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe has no lowering for reducing the full slice loss_sum[:, :] of a "
-        "buffer sized by a block: its reduction dim reuses tile_v's block, "
-        "whose loop has ended (BackendUnsupported: reduction lane owner is "
-        "not proven)",
-    )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -885,7 +884,20 @@ class TestLoops(RefEagerTestBase, TestCase):
         y_true = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
         args = (y_pred, y_true)
 
-        code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
+        try:
+            code, result = code_and_output(
+                kernel_fixed_block_size, args, block_sizes=[128]
+            )
+        except helion.exc.BackendUnsupported as error:
+            if _get_backend() == "cute" and (
+                "reduction lane owner is not proven" in str(error)
+            ):
+                self.skipTest(
+                    "CuTe has no lowering for reducing the full slice "
+                    "loss_sum[:, :] of a buffer sized by a block: "
+                    f"{error}"
+                )
+            raise
 
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
@@ -2214,6 +2226,85 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x + 1)
         self.assertNotIn(_thread_barrier(), code)
+
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
+    )
+    def test_sequential_loops_device_local_carry_has_no_barrier(self):
+        @helion.kernel(autotune_effort="none")
+        def two_pass_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                total = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    total += x[tile_m, tile_n].sum(dim=1)
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + total[:, None]
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            two_pass_sum,
+            (x,),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
+        self.assertNotIn("tl.debug_barrier()", code)
+
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
+    )
+    def test_sequential_loops_atomic_add_requires_barrier(self):
+        @helion.kernel(autotune_effort="none")
+        def write_then_atomic_add(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x[tile_m, tile_n] = 0.0
+                for tile_n in hl.tile(n):
+                    hl.atomic_add(x, [tile_m, tile_n], 1.0)
+            return x
+
+        x = torch.zeros(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            write_then_atomic_add,
+            (x,),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
+    )
+    def test_sequential_loops_barrier_tracks_storage_aliases(self):
+        @helion.kernel(autotune_effort="none")
+        def write_then_read_view(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            alias = x.view(m, n)
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = alias[tile_m, tile_n] + 1.0
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            write_then_read_view,
+            (x.clone(),),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
 
     @skipIfFn(
         lambda: _get_backend() not in ("triton", "cute"),

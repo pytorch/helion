@@ -41,6 +41,7 @@ from .cute_reshape import cute_lane_loops_active
 from .cute_reshape import describe_rebound_block_dims
 from .cute_reshape import subscript_rebound_block_dims
 from .thread_budget import MAX_THREADS_PER_BLOCK
+from .warp_atomic import warp_atomic_candidate
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -52,19 +53,6 @@ if TYPE_CHECKING:
 _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
 # ``red.global.add.v{2,4}.f32`` is an sm_90+ PTX form.
 _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY = (9, 0)
-
-
-def _cute_pointer_expr(
-    state: CodegenState,
-    target: torch.Tensor,
-    index: list[object],
-    ast_index: list[object] | tuple[object, ...] | None = None,
-) -> str:
-    from ...language.memory_ops import _cute_index_exprs
-
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
-    name = state.device_function.tensor_arg(target).name
-    return _cute_coord_pointer_expr(name, index_exprs)
 
 
 def _cute_coord_pointer_expr(name: str, index_exprs: list[str]) -> str:
@@ -284,6 +272,10 @@ def _codegen_cute_atomic_rmw(
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(target.dtype)
     callee = _cute_atomic_callee(cute_func, target.dtype)
+    if state.config.get(
+        "cute_warp_aggregated_atomics", False
+    ) and warp_atomic_candidate(state.fx_node):
+        callee = "_cute_warp_fetch_add_int32"
     cast_value_exprs = [
         expr_from_string(
             backend.ast_to_dtype_expr("{value}", target_dtype),
@@ -331,7 +323,9 @@ def _codegen_cute_atomic_rmw(
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
+    index_exprs = _cute_index_exprs(
+        state, index, ast_index, tensor=target, for_store=True
+    )
     tensor_name = state.device_function.tensor_arg(target).name
     pointer = _cute_coord_pointer_expr(tensor_name, index_exprs)
     resolved_kwargs = _resolve_cute_atomic_kwargs(cute_func, keyword_names)
@@ -650,7 +644,8 @@ def _cute_vector_atomic_site(
         return False
     # Fail closed to the scalar atomic when the target capability is unknown
     # or below sm_90.
-    capability = CompileEnvironment.current().config_spec.target_device_capability
+    env = CompileEnvironment.current()
+    capability = env.config_spec.target_device_capability
     if capability is None or capability < _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY:
         return False
     # An atomic that is uniform along a live lane loop must stay a scalar
@@ -668,7 +663,8 @@ def _cute_vector_atomic_site(
         for pos, idx in enumerate(index)
         if isinstance(idx, torch.SymInt)
         and (block_id := _cute_tile_axis_block_id(idx)) is not None
-        and target.stride(pos) == 1
+        # A dynamic stride (another dim's size) must not be guarded to 1
+        and env.known_equal(target.stride(pos), 1)
     ]
     if len(lane_axes) != 1:
         return False

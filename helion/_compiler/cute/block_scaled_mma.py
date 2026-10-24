@@ -59,6 +59,9 @@ class PreparedOperand:
     tensor_span: int
     scale_span: int
     row_fast: bool
+    # Byte address of the group's first byte when its eight bytes are one
+    # aligned contiguous qword (K-contiguous packed storage), else None.
+    qword_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,13 +81,34 @@ class BlockScaledMmaPlan:
     cluster_m: int
     persistent: bool
     num_sm: int
+    format: str = "nvfp4"
+    rhs_transposed: bool = False
+    fused_scales: bool = False
+    logical_m_per_cta: int = 128
+    swap_ab: bool = False
+    compact_m: bool = False
+    sf_tma: bool = False
+    sf_inplace: bool = False
+    accumulator_stages: int = 1
+    prefetch_output_registers: bool = False
+    tma_output: bool = False
+    prepare: str = "tiled"
+    pdl: bool = False
+    prepare_rows: int = 32
+    # ``cute_scaled_prepare="fused"``: per-side (mode, stride) of the fused
+    # consumer (``block_scaled_fused.fused_geometry``), else None.
+    fused: dict[str, tuple[str, int]] | None = None
 
     @property
     def workspace_bytes(self) -> int:
+        if self.fused_scales:
+            return 1
         padded_m, padded_n, padded_k = block_scaled_workspace_shape(
             self.m, self.n, self.k, self.bn, self.bk
         )
         padded_rows = padded_m + padded_n
+        if self.format == "mxfp8":
+            return padded_rows * padded_k // 32
         return padded_rows * padded_k // 2 + padded_rows * padded_k // 16
 
 
@@ -272,6 +296,33 @@ def _prepare_operand(
         )
         for indices in source.byte_indices
     )
+    # The eight bytes of a group form one aligned qword when exactly one
+    # index differs between the byte recipes, as the literal byte number
+    # along a unit stride, and every other stride is a multiple of eight.
+    strides = [resolve(stride) for stride in source.tensor.stride()]
+    first = source.byte_indices[0]
+    differing = [
+        dim
+        for dim in range(len(first))
+        if any(indices[dim] != first[dim] for indices in source.byte_indices[1:])
+    ]
+    qword_address = None
+    if (
+        len(differing) == 1
+        and strides[differing[0]] == 1
+        and all(
+            indices[differing[0]].operation == "constant"
+            and not indices[differing[0]].operands
+            and resolve(indices[differing[0]].value) == byte
+            for byte, indices in enumerate(source.byte_indices)
+        )
+        and all(
+            stride is not None and stride % 8 == 0
+            for dim, stride in enumerate(strides)
+            if dim != differing[0]
+        )
+    ):
+        qword_address = checked[0][0]
     return PreparedOperand(
         source,
         tuple(item[0] for item in checked),
@@ -279,6 +330,7 @@ def _prepare_operand(
         checked[0][1],
         scale[1],
         row_fast,
+        qword_address,
     )
 
 
@@ -545,9 +597,13 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
     stages = df.config.get("cute_scaled_stages", 4)
     cluster_m = df.config.get("cute_scaled_cluster_m", 2)
     persistent = df.config.get("cute_scaled_persistent", True)
+    prepare = df.config.get("cute_scaled_prepare", "tiled")
+    prepare_rows = df.config.get("cute_scaled_prepare_rows", 32)
     if (
-        type(bn) is not int
-        or bn not in (128, 256)
+        prepare not in ("tiled", "linear", "fused")
+        or prepare_rows not in (16, 32)
+        or type(bn) is not int
+        or bn not in (64, 128, 256)
         or type(bk) is not int
         or bk not in (64, 128, 256)
         or type(stages) is not int
@@ -573,9 +629,38 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
         or (padded_rows * padded_k // 16 + 255) // 256 >= 1 << 31
     ):
         return None
+    fused = None
+    if prepare == "fused":
+        from .block_scaled_fused import fused_geometry
+
+        fused = fused_geometry(
+            lhs_byte_addresses=lhs.byte_addresses,
+            rhs_byte_addresses=rhs.byte_addresses,
+            lhs_scale_address=lhs.scale_address,
+            rhs_scale_address=rhs.scale_address,
+            lhs_scale_span=lhs.scale_span,
+            rhs_scale_span=rhs.scale_span,
+            m=m,
+            n=n,
+            k=groups * 16,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+        )
+        if fused is None:
+            # The knob is inert where the fused consumer cannot read the
+            # sources directly: keep the preparation kernel.
+            prepare = "tiled"
     # Data B is divided across paired CTAs; SFB is replicated for the native
     # scale datapath. Leave space for epilogue tiles, alignment and barriers.
     stage_bytes = (128 + bn // cluster_m) * bk // 2 + (128 + bn) * bk // 16
+    if fused is not None:
+        # Raw staging tiles of the transposed sides.
+        stage_bytes += sum(
+            bk // 2 * rows
+            for side, rows in (("lhs", 128), ("rhs", bn))
+            if fused[side][0] == "transpose"
+        )
     if stage_bytes * stages + 128 * 64 * output.element_size() + 8192 > 232448:
         return None
     return BlockScaledMmaPlan(
@@ -594,6 +679,10 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
         cluster_m,
         persistent,
         env.config_spec.num_sm or 1,
+        prepare=cast("str", prepare),
+        pdl=df.config.get("cute_pdl", False) is True,
+        prepare_rows=cast("int", prepare_rows),
+        fused=fused,
     )
 
 
@@ -601,7 +690,9 @@ def plan_block_scaled(graphs: Sequence[GraphInfo]) -> None:
     df = DeviceFunction.current()
     if df.config.get("cute_scaled_mma", False) is not True:
         return
-    plan = _plan_block_scaled(graphs)
+    from .mxfp8_mma import plan_mxfp8
+
+    plan = plan_mxfp8(graphs) or _plan_block_scaled(graphs)
     if plan is None:
         raise exc.BackendUnsupported(
             "cute", "native block-scaled contraction proof declined"
@@ -671,7 +762,35 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         "rhs_scale_span": plan.rhs.scale_span,
         "lhs_row_fast": plan.lhs.row_fast,
         "rhs_row_fast": plan.rhs.row_fast,
+        "lhs_qword_address": plan.lhs.qword_address,
+        "rhs_qword_address": plan.rhs.qword_address,
+        "prepare": plan.prepare,
+        "pdl": plan.pdl,
+        "prepare_rows": plan.prepare_rows,
+        "fused": plan.fused,
     }
+    if plan.format == "mxfp8":
+        wrapper_plan["format"] = plan.format
+        wrapper_plan["rhs_transposed"] = plan.rhs_transposed
+        wrapper_plan["fused_scales"] = plan.fused_scales
+        wrapper_plan["logical_m_per_cta"] = plan.logical_m_per_cta
+        wrapper_plan["swap_ab"] = plan.swap_ab
+        wrapper_plan["compact_m"] = plan.compact_m
+        wrapper_plan["sf_tma"] = plan.sf_tma
+        wrapper_plan["sf_inplace"] = plan.sf_inplace
+        if plan.tma_output:
+            wrapper_plan["accumulator_stages"] = plan.accumulator_stages
+            wrapper_plan["prefetch_output_registers"] = plan.prefetch_output_registers
+            wrapper_plan["tma_output"] = plan.tma_output
+        if plan.fused_scales:
+            for side, operand in (("lhs", plan.lhs), ("rhs", plan.rhs)):
+                row_stride, column_stride = operand.source.scale.stride()
+                wrapper_plan[side + "_scale_row_stride"] = (
+                    CompileEnvironment.current().size_hint(row_stride)
+                )
+                wrapper_plan[side + "_scale_column_stride"] = (
+                    CompileEnvironment.current().size_hint(column_stride)
+                )
     if alpha.isidentifier():
         wrapper_plan["scale_name"] = alpha
     else:

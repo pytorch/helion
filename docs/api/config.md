@@ -89,6 +89,10 @@ Configs are typically discovered automatically through autotuning, but can also 
 .. autoattribute:: Config.static_ranges
 
    Whether to use ``tl.static_range`` instead of ``tl.range``.
+
+.. autoattribute:: Config.reduction_fusion
+
+   Fold multiple independent looped reductions that read the same operand into one loop with a single shared load. Trades global-memory bandwidth for register pressure, so it is autotuned.
 ```
 
 ### Execution and Indexing

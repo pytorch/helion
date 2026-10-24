@@ -336,6 +336,9 @@ class DeviceFunction:
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
         self.wrapper_only_params: list[str] = []
+        # Optional parameter annotations of wrapper-only params (e.g. TMA
+        # descriptors passed as ``cutlass.GridConstant[...]``).
+        self.wrapper_only_param_annotations: dict[str, str] = {}
         self._tensor_properties: dict[tuple[object, ...], TensorPropertyArg] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
@@ -1276,7 +1279,10 @@ class DeviceFunction:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         wrapper_only_params.extend(self.triton_persistent_state_args)
-        args.extend(create_arg(name) for name in wrapper_only_params)
+        args.extend(
+            create_arg(name, self.wrapper_only_param_annotations.get(name))
+            for name in wrapper_only_params
+        )
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -1341,6 +1347,7 @@ class DeviceFunction:
                 *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
+        constexpr_values: dict[str, int] = {}
         if backend.name == "cute":
             from .cute.fuse_two_pass_loads import fuse_two_pass_loads
             from .cute.uniform_comparison import lower_uniform_comparisons
@@ -1371,7 +1378,7 @@ class DeviceFunction:
             # trip counts. Three sources: literal constexpr inlined args,
             # host-side literal assignments to constexpr-named variables,
             # and the inlined module-level constexpr decls.
-            constexpr_values: dict[str, int] = {}
+            constexpr_values = {}
             for arg in constexpr_to_inline:
                 try:
                     value = int(arg.host_str())
@@ -1417,6 +1424,13 @@ class DeviceFunction:
                 self,
                 boundary_names={arg.name for arg in sorted_arguments},
                 disjoint_pairs=proven_disjoint_tensor_pairs,
+                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+            )
+            from .cute.simt_gemm import lower_simt_gemm
+
+            kernel_body = lower_simt_gemm(
+                kernel_body,
+                self,
                 rename_groups={k: v[0] for k, v in self._variable_renames.items()},
             )
             if any(
@@ -1547,6 +1561,15 @@ class DeviceFunction:
                 kernel_body = vectorize_affine_tile_lanes(
                     kernel_body, self, constexpr_values
                 )
+            from .cute.literal_offset_loads import merge_literal_offset_loads
+
+            kernel_body = merge_literal_offset_loads(kernel_body, self)
+            # Replace a byte-by-byte fp4 x fp4 decode-multiply-add chain over
+            # two merged 8-byte vectors with the exact f16x2 group dot
+            # (``quantized_helpers.float4_e2m1fn_x16_dot_float32``).
+            from .cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
+
+            kernel_body = fuse_fp4_pair_dot(kernel_body)
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1649,21 +1672,44 @@ class DeviceFunction:
             from .cute.unroll_lane_loads import LaneUnrollNotApplied
             from .cute.unroll_lane_loads import unroll_lane_loads
 
-            # ``cute_lane_unroll`` without vector-loop sinking: unroll the
-            # grid lane loops at trace time with every unrolled lane's
-            # loads (packets and scalars alike) issued before the first
-            # lane's compute.  The knob-off code is regenerated when no
-            # loop takes the unroll.
+            # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
+            # nest whose lane loops the sinking pass left rolled (their loads
+            # were persistent markers, now packets): unroll the lane loops (of
+            # the grid or of a device loop) at trace time with every unrolled
+            # lane's loads (packets and scalars alike) issued before the first
+            # lane's compute.  The knob-off code is regenerated when no loop
+            # takes the unroll.
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
-            if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
+            sinking = bool(self.config.config.get("cute_vloop_sink"))
+            if lane_unroll > 1 and not (
+                sinking and self.cute_state.vloop_sink_unrolled
+            ):
                 kernel_body, unrolled = unroll_lane_loads(
                     kernel_body,
                     lane_unroll,
                     lambda name: self.new_var(name, dce=False),
                 )
-                if not unrolled:
+                # With sinking the knob belongs to the sunk nest's lane loops
+                # (``_normalize_cute_vloop_sink``); a nest that offers none
+                # keeps its code rather than regenerating knob-off.
+                if not unrolled and not sinking:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
+            # Preserve the global FMA decisions above. This optional pass
+            # moves only raw packet loads/cache writes across a proven
+            # single-trip reduction; arithmetic and PDL waits stay in place.
+            if exact_thread_block_dims is not None:
+                from .cute.prefetch_reduction_packets import prefetch_reduction_packets
+
+                kernel_body = prefetch_reduction_packets(
+                    kernel_body,
+                    constexpr_values=constexpr_values,
+                    thread_block_dims=exact_thread_block_dims,
+                    tensor_dtypes=tensor_dtypes,
+                    reload_modes=reload_modes,
+                    argument_names={arg.name for arg in self.arguments},
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                )
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
             # the body, issue iter N+1's load BEFORE iter N's compute
@@ -1927,6 +1973,37 @@ class DeviceFunction:
                 rename_groups=rename_groups,
                 fast_math=CompileEnvironment.current().settings.fast_math,
             )
+            if self.config.get("cute_register_row", False):
+                from .cute.register_row_reduction import lower_register_row_reduction
+
+                if self.config.get("cute_register_row_tensor_copy", False):
+                    from .cute.register_row_tensor_copy import (
+                        context_from_device_function,
+                    )
+
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body,
+                        constexpr_values,
+                        tensor_copy_context=context_from_device_function(
+                            self,
+                            exact_thread_block_dims or (0, 0, 0),
+                            tensor_dtypes,
+                        ),
+                    )
+                else:
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body, constexpr_values
+                    )
+            elif self.config.get("cute_cluster_warp_online", False):
+                from .cute.rolled_cluster_online_pair import (
+                    fuse_rolled_cluster_online_pair,
+                )
+
+                kernel_body = fuse_rolled_cluster_online_pair(kernel_body)
+            if self.config.get("cute_independent_reduction", False):
+                from .cute.rolled_vector_reduction import split_rolled_vector_sums
+
+                kernel_body = split_rolled_vector_sums(kernel_body)
             # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
             # flush to zero), so it is gated on the fast_math SETTING —
             # tuned configs must never change numerics.
@@ -1952,6 +2029,20 @@ class DeviceFunction:
             kernel_body = lower_full_tile_bounds(
                 kernel_body, self, param_args, constexpr_values, rename_groups
             )
+            if self.config.get("cute_warp_fp32_redux", False):
+                from .cute.native_warp_reduction import enable_fp32_warp_redux
+
+                kernel_body = enable_fp32_warp_redux(kernel_body)
+            if self.config.get("cute_scalar_epilogue", False):
+                from .cute.scalar_epilogue import lower_scalar_epilogue
+
+                kernel_body = lower_scalar_epilogue(
+                    kernel_body,
+                    self,
+                    constexpr_values,
+                    thread_block_dims,
+                    proven_disjoint_tensor_pairs,
+                )
             if self.config.get("cute_rng_packet", False):
                 from .cute.philox_packets import lower_philox_packets
 
@@ -1987,6 +2078,13 @@ class DeviceFunction:
             from .cute.backend import validate_thread_axis_accesses
             from .cute.boolean_guards import reassociate_boolean_guards
 
+            if self.config.get("cute_register_row", False):
+                from .cute.online_chunk_reduction import lower_online_chunk_reduction
+
+                definition.body = lower_online_chunk_reduction(
+                    definition.body, constexpr_values
+                )
+
             # Type facts must see the final binding names, including every
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
@@ -2010,6 +2108,26 @@ class DeviceFunction:
             # Keep ordinary load/effect recognition intact through all memory
             # scheduling, including the late published/register-producer cuts.
             definition.body = lower_scalar_policy_loads(definition.body)
+            from .cute.packet_store_policy import lower_packet_store_policy
+
+            variable_renames = {
+                name: aliases[0] for name, aliases in self._variable_renames.items()
+            }
+            definition.body = lower_packet_store_policy(
+                definition.body,
+                policy=self.config.cute_store_policy,
+                # Shared and register pointers are not global store targets.
+                global_tensor_names=frozenset(
+                    variable_renames.get(argument.name, argument.name)
+                    for argument in param_args
+                    if isinstance(argument, TensorArg)
+                    and not isinstance(argument, TensorDescriptorArg)
+                ),
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                cuda_version=torch.version.cuda,
+            )
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"
@@ -2022,7 +2140,10 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel
             # with a (1, cluster_n, 1) thread-block cluster.
@@ -2128,6 +2249,16 @@ class DeviceFunction:
             source = env.tensor_input_source(arg.fake_value)
             runtime = env.runtime_value_for_tensor(arg.fake_value)
             if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
+                if source is not None or not input_metadata_specialized:
+                    continue
+                # A tensor the host function allocates (``torch.empty_like``)
+                # has no runtime value at compile time; its layout is what
+                # the traced allocation computed from the specialized input
+                # metadata, so a literal traced stride is the stride of every
+                # call this bound kernel serves.
+                for dim, fake_stride in enumerate(arg.fake_value.stride()):
+                    if type(fake_stride) is int:
+                        result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
                 cache_safe = source is not None and (
@@ -2228,6 +2359,19 @@ class DeviceFunction:
         capability = env.config_spec.target_device_capability
         if capability is None or capability < (9, 0):
             return False
+        if self.cute_state.cute_pdl_entry_wait:
+            # A tcgen05 kernel launched with ``use_pdl`` through its wrapper
+            # plan places late waits where its lowering knows the first
+            # global read of each warp (the flat kernel's prefetch, the
+            # persistent TMA-load and epilogue roles); when the generated
+            # body reads global memory ahead of those on some path (the
+            # grouped layout reads of the prologue, a scheduler-warp or
+            # grouped persistent builder without role waits, a root-body
+            # load ahead of the K loop) it gets this wait at the top of the
+            # body instead. Its releases all follow either wait.
+            from .cute.pdl_coverage import waits_cover_global_reads
+
+            return not waits_cover_global_reads([*self.preamble, *self.body])
         if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
             return False
         return not any(
@@ -2273,7 +2417,10 @@ class DeviceFunction:
             call_grid_expr = expr_from_string(
                 f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The cluster splits each row across ``cluster_n`` CTAs on a new
             # trailing grid dim.  Only a 1-D grid can host the cluster dim.
@@ -2327,13 +2474,19 @@ class DeviceFunction:
         Remove variables that are not used in the function body.
         """
 
-        for _ in range(8):
-            rw = ReadWrites.from_list([*self.preamble, *self.body])
+        rename_groups = {
+            name: aliases[0] for name, aliases in self._variable_renames.items()
+        }
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
+        while True:
+            previous_rw = rw
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
-            dead_lane_loop_elimination(self.body)
-            dead_lane_loop_elimination(self.preamble)
-        rw = ReadWrites.from_list([*self.preamble, *self.body])
+            dead_lane_loop_elimination(self.body, rename_groups)
+            dead_lane_loop_elimination(self.preamble, rename_groups)
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
+            if rw == previous_rw:
+                break
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).

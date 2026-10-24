@@ -404,7 +404,12 @@ def gemm_ptx_precomputed_qk(
     smem_offset: int,
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+    issue: Int32 | None = None,
 ) -> None:
+    """``issue`` (a warp-uniform Int32, nonzero = issue; the caller hoists the
+    uniformity shuffle off the issue chain) skips the MMA instructions only:
+    the shared descriptor still walks its stage stride, so a skipped issue
+    leaves the descriptor state exactly where an issued one would."""
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     num_k_tile = cute.size(tCrB_layout.shape[2])
     offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
@@ -412,13 +417,18 @@ def gemm_ptx_precomputed_qk(
     zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
+    input_args = [
+        Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+        Int32(_not_zero_init(zero_init)).ir_value(),
+        Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+    ]
+    issue_str = ""
+    if const_expr(issue is not None):
+        input_args.append(Int32(issue).ir_value())
+        issue_str = _issue_predicate_str(len(input_args) - 1)
     llvm.inline_asm(
         None,
-        [
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(_not_zero_init(zero_init)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-        ],
+        input_args,
         "{\n\t"
         ".reg .pred leader_thread;\n\t"
         ".reg .pred p;\n\t"
@@ -427,8 +437,7 @@ def gemm_ptx_precomputed_qk(
         ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
         ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
         f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        "mov.b32 tmem_acc, $2;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t" + issue_str + "mov.b32 tmem_acc, $2;\n\t"
         "mov.b32 smem_desc_b_lo_start, $0;\n\t"
         f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
         f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_0;\n\t"
@@ -448,7 +457,8 @@ def gemm_ptx_precomputed_qk(
             for k in range(1, num_k_tile)
         )
         + "setp.ne.b32 p, $1, 0;\n\t"
-        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + _issue_skip_open("", bool(issue_str))
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
         f"[tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, "
         f"{idesc_var_name}, {pred_str};\n\t"
         + "".join(
@@ -459,8 +469,46 @@ def gemm_ptx_precomputed_qk(
             )
             for k in range(1, num_k_tile)
         )
+        + _issue_skip_close("", bool(issue_str))
         + "}\n",
-        "r,r,r",
+        ",".join("r" for _ in input_args),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def shift_ptx_smem_desc(
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,
+    smem_offset: int,
+) -> None:
+    """Apply ``gemm_ptx_precomputed_qk``'s descriptor shift without issuing MMAs.
+
+    The precomputed A descriptors are shared PTX registers that every
+    ``gemm_ptx_precomputed_qk`` call moves by its ``smem_offset`` (the two Q
+    stages alternate -/+ one stage stride), so a skipped QK must still move
+    them to keep the next call's slot right.
+    """
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    llvm.inline_asm(
+        None,
+        [],
+        "{\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_a_hi;\n\t"
+        + "".join(
+            (
+                f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, "
+                f"{smem_var_name_prefix}_{k};\n\t"
+                f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                f"mov.b64 {smem_var_name_prefix}_{k}, "
+                "{smem_desc_a_lo, smem_desc_a_hi};\n\t"
+            )
+            for k in range(num_k_tile)
+        )
+        + "}\n",
+        constraints="",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -579,6 +627,7 @@ def gemm_ptx_dyn_qk(
     *,
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+    k_tiles: int | None = None,
 ) -> None:
     """SS gemm with BOTH operand start addresses as runtime inputs.
 
@@ -586,10 +635,16 @@ def gemm_ptx_dyn_qk(
     register: the callers pass starts re-read per iteration (see
     ``_flash_runtime.ld_volatile_shared_u32``) so ptxas forms the per-k
     descriptors with uniform adds inside the loop instead of hoisting them.
+
+    ``k_tiles`` issues only the first K tiles of the operand layouts (the
+    exact head dim over smem tiles padded to whole swizzle atoms).
     """
     smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     num_k_tile = cute.size(tCrB_layout.shape[2])
+    if const_expr(k_tiles is not None):
+        assert 1 <= k_tiles <= num_k_tile, (k_tiles, num_k_tile)
+        num_k_tile = k_tiles
     offset_a = [cute.crd2idx((0, 0, k), a_layout) for k in range(num_k_tile)]
     offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
     smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
@@ -651,6 +706,7 @@ def gemm_ptx_precomputed_qk_static(
     idesc_var_name: str,
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int | None = None,
+    issue: Int32 | None = None,
 ) -> None:
     """QK MMA with per-Q-stage descriptors declared up front.
 
@@ -679,13 +735,18 @@ def gemm_ptx_precomputed_qk_static(
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     mma_cta_group = op.cta_group if const_expr(cta_group is None) else cta_group
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(mma_cta_group))
+    input_args = [
+        Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+        Int32(_not_zero_init(zero_init)).ir_value(),
+        Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+    ]
+    issue_str = ""
+    if const_expr(issue is not None):
+        input_args.append(Int32(issue).ir_value())
+        issue_str = _issue_predicate_str(len(input_args) - 1)
     llvm.inline_asm(
         None,
-        [
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(_not_zero_init(zero_init)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-        ],
+        input_args,
         "{\n\t"
         ".reg .pred leader_thread;\n\t"
         ".reg .pred p;\n\t"
@@ -693,8 +754,7 @@ def gemm_ptx_precomputed_qk_static(
         ".reg .b32 smem_desc_b_lo_start;\n\t"
         ".reg .b32 smem_desc_b_lo;\n\t"
         f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        "mov.b32 tmem_acc, $2;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t" + issue_str + "mov.b32 tmem_acc, $2;\n\t"
         "mov.b32 smem_desc_b_lo_start, $0;\n\t"
         f"mov.b64 smem_desc_b_0, {{smem_desc_b_lo_start, {hex(smem_desc_b_hi)}}};\n\t"
         + "".join(
@@ -705,7 +765,8 @@ def gemm_ptx_precomputed_qk_static(
             for k in range(1, num_k_tile)
         )
         + "setp.ne.b32 p, $1, 0;\n\t"
-        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + _issue_skip_open("", bool(issue_str))
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
         f"[tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, "
         f"{idesc_var_name}, {pred_str};\n\t"
         + "".join(
@@ -716,12 +777,32 @@ def gemm_ptx_precomputed_qk_static(
             )
             for k in range(1, num_k_tile)
         )
+        + _issue_skip_close("", bool(issue_str))
         + "}\n",
-        "r,r,r",
+        ",".join("r" for _ in input_args),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+def _issue_predicate_str(operand: int) -> str:
+    """Declare the warp-uniform issue predicate from inline-asm operand
+    ``operand`` (nonzero = issue). The MMA groups of the stream are then
+    wrapped in ``_issue_skip_open`` / ``_issue_skip_close``: a uniform branch
+    around the issues (``leader_thread`` stays a pure ``elect`` predicate; an
+    ``and.pred`` into it made ptxas re-prove uniformity with a VOTEU before
+    every MMA, which cost 5% of a softmax-bound step) while the descriptor
+    bookkeeping and the folded barrier waits still run."""
+    return f".reg .pred issue_p;\n\tsetp.ne.b32 issue_p, ${operand}, 0;\n\t"
+
+
+def _issue_skip_open(tag: str, enabled: bool) -> str:
+    return f"@!issue_p bra SKIP_MMA{tag};\n\t" if enabled else ""
+
+
+def _issue_skip_close(tag: str, enabled: bool) -> str:
+    return f"SKIP_MMA{tag}:\n\t" if enabled else ""
 
 
 def _ptx_parity_wait(
@@ -737,6 +818,9 @@ def _ptx_parity_wait(
         f"@P{tag} bra DONE{tag}; \n\t"
         f"bra     LAB_WAIT{tag}; \n\t"
         f"DONE{tag}: \n\t"
+        # The P tile behind the barrier was written by ``tcgen05.st``: the
+        # MMAs that follow are ordered after the wait by this fence.
+        "tcgen05.fence::after_thread_sync; \n\t"
     )
 
 
@@ -756,8 +840,13 @@ def gemm_ptx_precomputed_pv_ts(
     wait_hint: int = 10_000_000,
     a_offsets: tuple[int, ...] | None = None,
     mbar_mid_ptrs: tuple[cutlass.Pointer, cutlass.Pointer] | None = None,
+    issue: Int32 | None = None,
 ) -> None:
     """Issue the PV MMA K-chunks as one inline-asm stream.
+
+    ``issue`` (a warp-uniform Int32, nonzero = issue) skips the MMA
+    instructions only; the folded barrier waits still run, so a skipped PV
+    consumes the same arrivals as an issued one.
 
     ``mbar_ptr``/``mbar_phase`` fold the staged-P wait into the stream: the first
     three quarters of the K-chunks issue, then the stream waits on ``mbar_ptr``
@@ -803,6 +892,7 @@ def gemm_ptx_precomputed_pv_ts(
             "@P1 bra DONE; \n\t"
             "bra     LAB_WAIT; \n\t"
             "DONE: \n\t"
+            "tcgen05.fence::after_thread_sync; \n\t"
         )
     else:
         assert mbar_mid_ptrs is None, "mbar_mid_ptrs needs the final-quarter mbar_ptr"
@@ -834,6 +924,12 @@ def gemm_ptx_precomputed_pv_ts(
         )
     else:
         chunked_stream = ""
+    issue_str = ""
+    if const_expr(issue is not None):
+        assert mbar_mid_ptrs is None, "the issue predicate needs the single-wait stream"
+        input_args.append(Int32(issue).ir_value())
+        issue_str = _issue_predicate_str(len(input_args) - 1)
+    skip = bool(issue_str)
     llvm.inline_asm(
         None,
         input_args,
@@ -846,14 +942,14 @@ def gemm_ptx_precomputed_pv_ts(
         ".reg .b32 smem_desc_b_lo;\n\t"
         ".reg .b32 smem_desc_b_hi;\n\t"
         ".reg .b64 smem_desc_b;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        "mov.b32 tmem_acc, $3;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t" + issue_str + "mov.b32 tmem_acc, $3;\n\t"
         "mov.b32 tmem_a, $0;\n\t"
         "mov.b32 smem_desc_b_lo_start, $1;\n\t"
         f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
         "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
         "setp.ne.b32 p, $2, 0;\n\t"
-        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + _issue_skip_open("A", skip)
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
         f"[tmem_acc], [tmem_a], smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
         + (
             chunked_stream
@@ -871,9 +967,11 @@ def gemm_ptx_precomputed_pv_ts(
                     num_k_tile if const_expr(mbar_ptr is None) else num_k_tile // 4 * 3,
                 )
             )
+            + _issue_skip_close("A", skip)
             + mbar_wait_str
             + (
-                "".join(
+                _issue_skip_open("B", skip)
+                + "".join(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, "
                         f"{hex(offset_b_diff[k - 1])};\n\t"
@@ -884,16 +982,13 @@ def gemm_ptx_precomputed_pv_ts(
                     )
                     for k in range(num_k_tile // 4 * 3, num_k_tile)
                 )
+                + _issue_skip_close("B", skip)
                 if const_expr(mbar_ptr is not None)
                 else ""
             )
         )
         + "}\n",
-        "r,r,r,r"
-        if const_expr(mbar_ptr is None)
-        else "r,r,r,r,r,r,r,r"
-        if const_expr(mbar_mid_ptrs is not None)
-        else "r,r,r,r,r,r",
+        ",".join("r" for _ in input_args),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1050,6 +1145,7 @@ def gemm_ptx_partial(
                 "@P1 bra DONE; \n\t"
                 "bra     LAB_WAIT; \n\t"
                 "DONE: \n\t"
+                "tcgen05.fence::after_thread_sync; \n\t"
             )
         else:
             mbar_wait_str = ""

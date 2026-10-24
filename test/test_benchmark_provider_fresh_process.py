@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from helion._testing import skipIfRefEager
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.kernel_args import load_trusted_kernel_args
@@ -31,6 +32,11 @@ class _UpdateCachedArgument:
         return float(value.item())
 
 
+@skipIfRefEager(
+    "Spawns real fresh-process benchmark-worker subprocesses -- compile-mode "
+    "machinery that HELION_INTERPRET=1 bypasses, and it flakes (crashing the "
+    "xdist worker with no traceback) on the single-GPU A10G ref-eager runner."
+)
 class TestFreshFinalistProcess(unittest.TestCase):
     def run_candidates(self, *, fail_first: bool) -> None:
         # Exercise real spawn workers and the real cached-argument loader.
@@ -44,6 +50,7 @@ class TestFreshFinalistProcess(unittest.TestCase):
             provider._autotune_metrics = AutotuneMetrics()
             provider._precompile_args_path = str(args_path)
             provider._subprocess_wrapper_unloadable = False
+            provider.mutated_arg_indices = []
             provider._benchmark_worker = None
             workers: list[BenchmarkWorker] = []
 

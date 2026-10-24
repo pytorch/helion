@@ -14,6 +14,7 @@ import torch
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..backend import Backend
+from ..backend import BackendState
 
 if TYPE_CHECKING:
     import ast
@@ -120,8 +121,8 @@ class FlyDSLBackend(Backend):
         return "flydsl"
 
     @property
-    def experimental(self) -> bool:
-        return True
+    def state(self) -> BackendState:
+        return BackendState.EXPERIMENTAL
 
     def validate_environment(self) -> None:
         try:

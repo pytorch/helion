@@ -27,6 +27,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from helion._testing import DEVICE
@@ -34,6 +35,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasTpu
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
@@ -47,6 +49,7 @@ from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_worker import _REAP_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
@@ -122,6 +125,18 @@ class _SpawnChildAndSleep:
 
 
 @dataclasses.dataclass
+class _AddInPlace:
+    """``b += a`` returning the baseline's output regardless of ``extra``."""
+
+    extra: float = 0.0
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        output = a + b
+        b.add_(a).add_(self.extra)
+        return output
+
+
+@dataclasses.dataclass
 class _ReturnValue:
     value: object
 
@@ -182,6 +197,12 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
         self.assertEqual(metrics.num_successful_candidate_measurements, 0)
 
 
+@skipIfRefEager(
+    "Spawns real benchmark-worker subprocesses and exercises their "
+    "SIGKILL/process-group reaping -- compile-mode machinery that "
+    "HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker "
+    "with no traceback) on the single-GPU A10G ref-eager runner."
+)
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
@@ -859,6 +880,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             autotune_compile_timeout=3,
             autotune_benchmark_timeout=17,
         )
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -885,6 +908,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     ) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -1253,6 +1278,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
         provider.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
         provider._precompile_args_path = "/tmp/args.pt"
         provider._benchmark_worker = Mock()
@@ -1301,13 +1327,140 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         )
         self.assertTrue(provider._probe_long_kernel())
 
-    def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
+    def test_subprocess_accuracy_check_includes_mutated_args(self) -> None:
+        # A kernel writing into an ``out`` argument is checked in the worker
+        # too: the job clones the mutated arguments and compares them against
+        # the baseline's post-call arguments.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings()
         provider.mutated_arg_indices = [0]
         provider._subprocess_benchmark_enabled = lambda: True
 
-        self.assertFalse(provider._subprocess_accuracy_check_enabled())
+        self.assertTrue(provider._subprocess_accuracy_check_enabled())
+
+    def test_subprocess_accuracy_job_carries_mutated_arg_baseline(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = [1]
+        provider._subprocess_accuracy_check_enabled = lambda: True
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._precompile_baseline_path = "/tmp/baseline.pt"
+        provider._effective_atol = 0.0
+        provider._effective_rtol = 0.0
+        provider._scale_atol = False
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = AccuracyCheckResult(ok=True)
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            # Without the baseline's post-call arguments the worker cannot
+            # check the mutation: fall back to the in-process check.
+            provider._precompile_baseline_post_args_path = None
+            self.assertIsNone(
+                provider._run_subprocess_accuracy_check_job(
+                    cast("CompiledConfig", object())
+                )
+            )
+            provider._benchmark_worker.run.assert_not_called()
+
+            provider._precompile_baseline_post_args_path = "/tmp/post_args.pt"
+            result = provider._run_subprocess_accuracy_check_job(
+                cast("CompiledConfig", object())
+            )
+
+        assert result is not None
+        self.assertTrue(result.ok)
+        job = provider._benchmark_worker.run.call_args.args[0]
+        self.assertEqual(job.mutated_arg_indices, (1,))
+        self.assertEqual(job.baseline_post_args_path, "/tmp/post_args.pt")
+        self.assertTrue(job.check_input_accuracy)
+
+    def _run_mutating_accuracy_job(
+        self,
+        fn: object,
+        *,
+        baseline_b: float,
+        check_input_accuracy: bool = True,
+    ) -> tuple[AccuracyCheckResult, torch.Tensor]:
+        """Run ``fn(a, b)`` as a mutated-``b`` accuracy job; return the result
+        and the worker's cached ``b`` (which the job must leave untouched)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            post_args_path = Path(tmpdir) / "baseline_post_args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            torch.save(torch.tensor([2.0]), baseline_path)
+            torch.save(
+                (torch.tensor([1.0]), torch.tensor([baseline_b])), post_args_path
+            )
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                    mutated_arg_indices=(1,),
+                    baseline_post_args_path=str(post_args_path),
+                    check_input_accuracy=check_input_accuracy,
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        return result, cached_b
+
+    def test_accuracy_check_job_clones_and_checks_mutated_args(self) -> None:
+        result, cached_b = self._run_mutating_accuracy_job(
+            _AddInPlace(), baseline_b=2.0
+        )
+        self.assertTrue(result.ok, result.message)
+        # The kernel ran on a clone: the worker's shared arguments still hold
+        # the original values for the next candidate.
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
+
+    def test_accuracy_check_job_rejects_wrong_mutation(self) -> None:
+        # Right output, wrong in-place result: only the post-call argument
+        # comparison can catch this config.
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Tensor-likes are not equal", result.message)
+
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0, check_input_accuracy=False
+        )
+        self.assertTrue(result.ok, result.message)
+
+    def test_benchmark_job_times_mutated_args_on_a_clone(self) -> None:
+        # Timing repeats the kernel many times; the worker's cached arguments
+        # must still hold the original values for the accuracy job that
+        # follows (and for every later config).  The timer is Triton's.
+        pytest.importorskip("triton")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=_AddInPlace(),
+            ):
+                BenchmarkJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    warmup=1,
+                    rep=1,
+                    fixed_repetitions=3,
+                    mutated_arg_indices=(1,),
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1447,7 +1600,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.run(_ReturnValue(7), timeout=0.01)
 
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
-        process.join.assert_called_once_with(timeout=5)
+        process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)

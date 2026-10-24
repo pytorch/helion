@@ -40,6 +40,7 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
+from .backend import BackendState
 from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -51,6 +52,14 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+# (source projections, expected classifier result) -> predicate over call args
+PreparedGuardFactory = typing.Callable[
+    [
+        typing.Sequence[typing.Callable[[typing.Sequence[object]], typing.Hashable]],
+        typing.Hashable,
+    ],
+    typing.Callable[[typing.Sequence[object]], bool],
+]
 # CUDA TMA limits each box dimension to 256 elements. Other descriptor
 # backends have their own legality checks and must not inherit this cap.
 CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
@@ -111,8 +120,15 @@ class RuntimeInputSpecialization:
     discovery registers the same named projection more than once.
     ``reusable_tensor_properties`` is an optional promise that the classifier's
     result depends only on the named storage properties (plus tensor metadata
-    already covered by eager dispatch guards), never on tensor contents.  It
-    lets repeated calls with the exact same tensors reuse a prevalidated result.
+    already covered by eager dispatch guards), never on tensor contents; or,
+    for ``int`` argument sources, only on the argument's value (``int_value``).
+    It lets code generation consume the result recorded in the bound kernel key.
+    ``prepared_guard_factory`` optionally builds, from the source projections
+    and an expected classifier result, a cheaper predicate over the raw call
+    arguments that holds exactly when the classifier would produce that result
+    again.  The prepared eager call evaluates it only after pinning every
+    argument's type, dtype, shape, stride and device, so the predicate needs to
+    read just the facts those pins leave open (pointers and storage spans).
     Runtime cache state is deliberately excluded from descriptor equality.
     """
 
@@ -122,8 +138,11 @@ class RuntimeInputSpecialization:
         dataclasses.field(compare=False, repr=False)
     )
     reusable_tensor_properties: frozenset[
-        typing.Literal["data_ptr", "storage_span"]
+        typing.Literal["data_ptr", "storage_span", "int_value"]
     ] = frozenset()
+    prepared_guard_factory: PreparedGuardFactory | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -450,7 +469,7 @@ class CompileEnvironment:
                 "debug_dtype_asserts=True (it emits Triton tl.cast / "
                 "tl.static_assert checks)",
             )
-        if self._backend.experimental:
+        if self._backend.state is BackendState.EXPERIMENTAL:
             from torch._dynamo.utils import warn_once
 
             warn_once(
@@ -540,6 +559,10 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # Input sizes code generation relied on being equal (a block store
+        # bounded by its tensor covering the tile's loop) only at this
+        # binding's values; like a guard, each keys the bound kernel.
+        self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
         self.tunable_symbols: set[sympy.Symbol] = set()
@@ -1955,6 +1978,47 @@ class CompileEnvironment:
             return size
         return self.size_hint(size)
 
+    def tunable_default_hint(self, expr: sympy.Basic) -> int | None:
+        """``expr`` evaluated with every ``hl.register_tunable`` symbol at its default.
+
+        A tunable-sized extent (a split-K factor sizing a workspace's
+        reduction dim) is not an unknown runtime size: the kernel declared
+        its range and default, and seeds size their loops over it from that
+        default rather than from the generic unbacked hint of 8192. Only
+        expressions whose free symbols are all integer tunables qualify; the
+        result stays above one, clear of singleton special cases.
+        """
+        symbols = {
+            symbol for symbol in expr.free_symbols if isinstance(symbol, sympy.Symbol)
+        }
+        if not symbols or not symbols <= self.tunable_symbols:
+            return None
+        substitutions: dict[sympy.Symbol, sympy.Integer] = {}
+        for symbol in symbols:
+            value = self.config_value_expressions.get(symbol)
+            if (
+                value is None
+                or value.operation != "config"
+                or len(value.arguments) != 1
+            ):
+                return None
+            name = value.arguments[0]
+            fragment = (
+                self.config_spec.user_defined_tunables.get(name)
+                if isinstance(name, str)
+                else None
+            )
+            if fragment is None:
+                return None
+            default = fragment.default()
+            if type(default) is not int:
+                return None
+            substitutions[symbol] = sympy.Integer(max(default, 2))
+        hinted = sympy.sympify(expr.xreplace(substitutions))
+        if not isinstance(hinted, sympy.Integer):
+            return None
+        return max(int(hinted), 2)
+
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
@@ -2051,8 +2115,12 @@ class CompileEnvironment:
         return result is sympy.true
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
-        if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
-            return (int(a) % b) == 0
+        a = self.specialize_expr(_to_sympy(a))
+        b_expr = self.specialize_expr(_to_sympy(b))
+        if isinstance(a, (int, sympy.Integer)) and isinstance(
+            b_expr, (int, sympy.Integer)
+        ):
+            return (int(a) % int(b_expr)) == 0
         return False
 
     def specialized_multiple(self, value: object, divisor: int) -> bool:

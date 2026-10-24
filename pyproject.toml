@@ -30,6 +30,7 @@ dev = [
     "expecttest",
     "pytest",
     "pytest-timeout",
+    "pytest-xdist",
     "pre-commit",
     "hypothesis",
     "tabulate",
@@ -117,6 +118,7 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 "helion/_compiler/cute/_flash_row_mma_runtime.py" = ["I002"]
 "helion/_compiler/cute/_warp_mma_runtime.py" = ["I002"]
 "helion/_compiler/cute/_flash_alt_runtime.py" = ["I002"]
+"helion/_compiler/cute/flex_score_mod_runtime.py" = ["I002"]
 # Same: the vendored @cute.jit gemm_ptx_partial here must NOT have its annotations
 # stringified by `from __future__ import annotations`. Imported by generated
 # kernels at runtime, not type-checked, so I002 is exempted. The remaining codes
@@ -157,6 +159,7 @@ include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
   "helion/**/*.json",
+  "helion/_compiler/cute/sorting_networks.LICENSE",
   "LICENSE",
 ]
 exclude = [
@@ -170,6 +173,7 @@ allow-direct-references = true
 source = "vcs"
 
 [tool.pytest.ini_options]
+markers = ["cuda: requires an explicitly assigned CUDA device"]
 # artifacts/ holds gitignored benchmark and probe outputs, some of them named
 # test_*.py with import-time side effects; pytest must never collect them
 # (pytest's built-in defaults plus artifacts and the docs build).

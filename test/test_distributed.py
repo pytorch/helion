@@ -58,7 +58,7 @@ autotuner_names = ["fixed", *search_algorithms]
 # The full kernel x autotuner cross product is too slow for CI. Only the
 # cheapest kernel (test_allreduce) runs every algorithm; the other kernels keep
 # one fast representative each, since the search algorithms themselves are
-# covered in test_autotuner.py and distributed coordination is orthogonal to
+# covered in test_autotuner_search.py and distributed coordination is orthogonal to
 # the choice of algorithm.
 representative_autotuner_names = ["FiniteSearch"]
 

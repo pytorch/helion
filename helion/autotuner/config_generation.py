@@ -197,10 +197,16 @@ class ConfigGeneration:
         self._cute_num_thread_block_pairs: list[tuple[int, int]] = []
         self._cute_block_index_by_id: dict[int, int] = {}
         self._cute_num_thread_index_by_id: dict[int, int] = {}
+        self._cute_collective_mma_index: int | None = None
+        self._cute_register_chain_index: int | None = None
+        self._cute_collective_compute_index: int | None = None
+        self._cute_collective_thread_layouts: list[tuple[int, int, int, int, int]] = []
+        self._cute_collective_vector_width_indices: list[int] = []
         self._cute_loop_order_index_by_id: dict[int, int] = {}
         self._cute_flatten_loop_groups: list[tuple[int, list[int]]] = []
         if self.config_spec.backend_name == "cute":
             self._init_cute_num_thread_pairs()
+            self._init_cute_collective_thread_layouts()
         self.num_warps_index: int = next(
             (
                 i
@@ -306,6 +312,106 @@ class ConfigGeneration:
             if i < len(flatten_indices)
         ]
 
+    def _init_cute_collective_thread_layouts(self) -> None:
+        """Record the thread slots the collective MMA's ownership rule fixes.
+
+        The collective warp MMA engages only when the contraction's N tile
+        owns exactly ``bn`` threads, its M tile ``threads // bn`` and its K
+        tile one, each with a vector width of one; any other layout silently
+        lowers the kernel to the scalar SIMT lane loops (tens of times
+        slower). Random and mutated configs that enable
+        ``cute_collective_mma`` therefore get their thread layout derived from
+        the block sizes instead of wasting evaluations there.
+        """
+
+        def scalar_index(key: str) -> int | None:
+            indices, _is_sequence = self._key_to_flat_indices.get(key, ([], False))
+            return indices[0] if len(indices) == 1 else None
+
+        self._cute_collective_mma_index = scalar_index("cute_collective_mma")
+        if self._cute_collective_mma_index is None:
+            return
+        self._cute_register_chain_index = scalar_index("cute_register_chain")
+        self._cute_collective_compute_index = scalar_index("cute_collective_compute")
+        width_indices, _is_sequence = self._key_to_flat_indices.get(
+            "cute_vector_widths", ([], True)
+        )
+        width_index_by_id = {
+            spec.block_id: width_indices[i]
+            for i, spec in enumerate(self.config_spec.cute_vector_widths)
+            if i < len(width_indices)
+        }
+        for fact in self.config_spec.matmul_facts:
+            block_ids = (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if any(
+                block_id is None
+                or block_id not in self._cute_block_index_by_id
+                or block_id not in self._cute_num_thread_index_by_id
+                for block_id in block_ids
+            ):
+                continue
+            m_block_id, n_block_id, k_block_id = cast("tuple[int, int, int]", block_ids)
+            self._cute_collective_thread_layouts.append(
+                (
+                    self._cute_block_index_by_id[m_block_id],
+                    self._cute_num_thread_index_by_id[m_block_id],
+                    self._cute_num_thread_index_by_id[n_block_id],
+                    self._cute_num_thread_index_by_id[k_block_id],
+                    self._cute_block_index_by_id[n_block_id],
+                )
+            )
+            self._cute_collective_vector_width_indices.extend(
+                width_index_by_id[block_id]
+                for block_id in block_ids
+                if block_id in width_index_by_id
+            )
+
+    def _repair_cute_collective_thread_layouts(self, flat_config: FlatConfig) -> None:
+        """Give an enabled collective MMA the thread layout its lowering admits."""
+        mma_index = self._cute_collective_mma_index
+        if (
+            mma_index is None
+            or not self._cute_collective_thread_layouts
+            or flat_config[mma_index] is not True
+        ):
+            return
+        compute_index = self._cute_collective_compute_index
+        if compute_index is not None and flat_config[compute_index] not in (
+            "warp",
+            "tcgen05",
+        ):
+            return
+        chain_index = self._cute_register_chain_index
+        register_chain = chain_index is not None and flat_config[chain_index] is True
+        threads = 64 if register_chain else 128
+        # The tiles the collective lowering admits (``collective_matmul``'s
+        # ``m_choices`` / ``n_choices``); outside them the collective declines
+        # whatever the thread layout says, so the lane loops keep the layout
+        # ``_repair_cute_num_threads`` gave them.
+        m_choices = (16, 32, 64, 128) if register_chain else (32, 64, 128)
+        n_choices = (16, 32, 64) if register_chain else (32, 64)
+        for (
+            m_block_index,
+            m_index,
+            n_index,
+            k_index,
+            n_block_index,
+        ) in self._cute_collective_thread_layouts:
+            bm = flat_config[m_block_index]
+            bn = flat_config[n_block_index]
+            if type(bm) is not int or type(bn) is not int:
+                continue
+            if bm not in m_choices or bn not in n_choices or threads % bn:
+                continue
+            m_threads = threads // bn
+            if m_threads > bm or bm % m_threads:
+                continue
+            flat_config[n_index] = bn
+            flat_config[m_index] = m_threads
+            flat_config[k_index] = 1
+        for width_index in self._cute_collective_vector_width_indices:
+            flat_config[width_index] = 1
+
     @functools.cached_property
     def overridden_flat_indices(self) -> set[int]:
         """Return flat_spec indices that are frozen by config overrides."""
@@ -323,21 +429,10 @@ class ConfigGeneration:
     def _filter_flash_resident_search_choices(self) -> None:
         if not self.config_spec.cute_flash_search_enabled:
             return
-        from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
         from .._compiler.cute.cute_flash import FLASH_ROW_SUM_SCHEDULE_KEY
         from .._compiler.cute.cute_flash import FLASH_SOFTMAX_LOWERING_KEY
-        from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
         from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 
-        topology_controls = dict(self._override_values)
-        if self._flash_pipeline_family_override is not None:
-            topology_controls["cute_flash_pipeline_family"] = (
-                self._flash_pipeline_family_override
-            )
-        topology = self.config_spec._cute_flash_config_topology(topology_controls)
-        inactive_lpt = _flash_inactive_lpt_domain(
-            is_causal=self.config_spec._cute_flash_is_causal, topology=topology
-        )
         # Explicit contradictory requests are rejected by override normalization.
         # Only sampled modes need a narrower domain shared by random draws and
         # deterministic coverage, so neither can request an impossible lowering.
@@ -355,15 +450,8 @@ class ConfigGeneration:
                 if all(
                     key not in self._override_values
                     or self._override_values[key] == required
-                    or (
-                        key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
-                        and type(self._override_values[key]) is int
-                        and self._override_values[key] in inactive_lpt
-                    )
                     for key, required in _flash_resident_softmax_overrides(
-                        choice,
-                        is_causal=self.config_spec._cute_flash_is_causal,
-                        topology=topology,
+                        choice
                     ).items()
                 )
             )
@@ -399,28 +487,6 @@ class ConfigGeneration:
                         if row_sum.coverage_choices is None
                         else tuple(
                             c for c in row_sum.coverage_choices if c == "post_acquire"
-                        )
-                    ),
-                ),
-            }
-        lpt = fields.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
-        if "resident_stateful" not in choices and isinstance(lpt, EnumFragment):
-            self._field_view = {
-                **self._flat_fields(),
-                FLASH_CAUSAL_LPT_SWIZZLE_KEY: dataclasses.replace(
-                    lpt,
-                    search_choices=tuple(
-                        c
-                        for c in lpt._active_choices()
-                        if type(c) is int and c in inactive_lpt
-                    ),
-                    coverage_choices=(
-                        None
-                        if lpt.coverage_choices is None
-                        else tuple(
-                            c
-                            for c in lpt.coverage_choices
-                            if type(c) is int and c in inactive_lpt
                         )
                     ),
                 ),
@@ -608,6 +674,7 @@ class ConfigGeneration:
             while num_threads > 1 and block_size % num_threads != 0:
                 num_threads //= 2
             flat_config[num_threads_idx] = max(num_threads, 1)
+        self._repair_cute_collective_thread_layouts(flat_config)
 
         for flatten_idx, block_ids in self._cute_flatten_loop_groups:
             if flat_config[flatten_idx] is not True:
@@ -930,9 +997,7 @@ class ConfigGeneration:
         from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 
         owned = _flash_resident_softmax_overrides(
-            config.config.get(FLASH_SOFTMAX_LOWERING_KEY),
-            is_causal=self.config_spec._cute_flash_is_causal,
-            topology=self.config_spec._cute_flash_config_topology(config.config),
+            config.config.get(FLASH_SOFTMAX_LOWERING_KEY)
         )
         return [
             index
@@ -1935,6 +2000,18 @@ class ConfigGeneration:
         ]
         return copy.deepcopy(selected)
 
+    def _flash_coverage_parent_overridden(self, goal: tuple[str, object]) -> bool:
+        """Whether ``goal`` is a conditional child whose parent value the
+        overrides pin away (``FLASH_COVERAGE_CHILD_PARENTS``): unreachable by
+        the design's construction, so uncovered telemetry rather than a
+        defect (like a family the overrides make unreachable)."""
+        from .._compiler.cute.cute_flash import FLASH_COVERAGE_CHILD_PARENTS
+
+        return any(
+            key in self._override_values and self._override_values[key] != value
+            for key, value in FLASH_COVERAGE_CHILD_PARENTS.get(goal, ())
+        )
+
     def flash_structural_coverage_uncovered_values(
         self,
     ) -> list[tuple[str, object]]:
@@ -2168,8 +2245,11 @@ class ConfigGeneration:
         uncovered = [
             goal
             for goal in self._flash_coverage_uncovered_cache
-            if goal[0] != FLASH_PIPELINE_FAMILY_KEY
-            or goal[1] not in unreachable_families
+            if (
+                goal[0] != FLASH_PIPELINE_FAMILY_KEY
+                or goal[1] not in unreachable_families
+            )
+            and not self._flash_coverage_parent_overridden(goal)
         ]
         problems: list[str] = []
         if uncovered:
