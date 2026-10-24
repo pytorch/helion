@@ -73,6 +73,38 @@ def test_example_backward_takes_the_flash_path(shape: tuple[int, ...]) -> None:
         )
 
 
+@onlyBackends(["cute"])
+@skipIfRefEager("checks the generated CuTe kernel kind")
+def test_example_decorator_config_normalizes_onto_the_pin() -> None:
+    """``examples/attention.py`` pins a Triton-shaped ``block_sizes=[64, 64]``
+    config on ``attention_backward``. The CuTe fused backward surface pins both
+    block sizes to 128 (``BlockSizeSpec.pin_structurally``), so the decorator
+    config, honoured without autotuning, normalizes onto the pin and emits the
+    fused kernel instead of the scalar SIMT lowering (117 ms vs 0.03 ms)."""
+    kernel = helion.kernel(
+        attention_backward.fn,
+        config=attention_backward.configs[0],
+        backend="cute",
+        static_shapes=True,
+        autotune_accuracy_check=False,
+        force_autotune=False,
+    )
+    assert kernel.configs[0].block_sizes == [64, 64]
+    args, expected = _inputs((1, 2, 256, 64))  # pyrefly: ignore [bad-argument-type]
+    bound = kernel.bind(args)
+    config = bound._implicit_config()
+    assert config is not None and config.block_sizes == [64, 64]
+    normalized = bound._normalized_config_copy(config)
+    assert normalized.block_sizes == [128, 128]
+    code = bound.to_triton_code(config)
+    assert "'kind': 'helion_flash_bwd'" in code
+    grads = kernel(*args)
+    for actual, reference in zip(grads, expected, strict=True):
+        torch.testing.assert_close(
+            actual.double(), reference, atol=2e-2, rtol=2e-2, check_device=False
+        )
+
+
 @helion.kernel(backend="cute", static_shapes=True)
 def _variant(
     q_in: torch.Tensor,

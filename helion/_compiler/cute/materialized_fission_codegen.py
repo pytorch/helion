@@ -165,14 +165,18 @@ def _stage_config(
         key = f"tcgen05_region_{kind}_stages"
         region_stages = result.config.pop(key, None)
         if region_stages is not None:
-            assert (
-                isinstance(region_stages, list)
-                and len(region_stages) == plan.region_count
+            # One entry per GEMM launch; launches without a native MMA
+            # (plain barrier phases) have no entry and keep the shared knobs.
+            state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+            positions = state.materialized_matmul_region_indices
+            assert isinstance(region_stages, list) and len(region_stages) == len(
+                positions
             )
-            count = region_stages[stage_index]
-            assert type(count) is int and 0 <= count <= 16
-            if count:
-                result.config[f"tcgen05_{kind}_stages"] = count
+            if stage_index in positions:
+                count = region_stages[positions.index(stage_index)]
+                assert type(count) is int and 0 <= count <= 16
+                if count:
+                    result.config[f"tcgen05_{kind}_stages"] = count
     if fanout:
         assert stage is not None
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config

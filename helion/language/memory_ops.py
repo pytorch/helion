@@ -46,6 +46,10 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -73,6 +77,7 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
@@ -154,6 +159,39 @@ class _AuxStepRecord:
     # Full-tile bm=256 four-CTA path: the per-row value is invariant across
     # every N subtile, so retain it in a scalar register for the whole tile.
     colvec_scalar_full: str | None = None
+
+
+def _exact_shape_aux_fragment_hoisted(
+    *,
+    requested: bool,
+    broadcast_axis: int | None,
+    aux_ndim: int,
+    aux_itemsize: int,
+    bm: int,
+    bn: int,
+    epi_warps: int,
+) -> bool:
+    """Whether ``tcgen05_aux_fragment_hoist`` hoists this auxiliary step.
+
+    Only a rank-2 exact-shape operand (``broadcast_axis is None``) is hoisted;
+    row-vector and leading-broadcast operands keep their own family gate. The
+    hoisted fragment must stay within
+    ``TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD`` per epilogue thread
+    (the strict normalizer refuses the knob above it; checked again here so
+    an unnormalized config cannot spill its way through).
+    """
+    if not requested or broadcast_axis is not None or aux_ndim != 2:
+        return False
+    fragment_bytes = tcgen05_aux_fragment_bytes_per_thread(
+        bm=bm, bn=bn, itemsize=aux_itemsize, epi_warps=epi_warps
+    )
+    if fragment_bytes > TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD:
+        raise exc.InvalidConfig(
+            f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True holds {fragment_bytes} "
+            "bytes of auxiliary tile per epilogue thread, above the "
+            f"{TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD}-byte register budget"
+        )
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3018,6 +3056,39 @@ def _codegen_cute_store_tcgen05_tile(
                 "auxiliary loads cannot precede the accumulator wait for a "
                 "partial-output TMA-store epilogue"
             )
+    # Whole-fragment register hoist of exact-shape auxiliary tiles
+    # (``tcgen05_aux_fragment_hoist``): the tile's auxiliary fragment is read
+    # once before the accumulator wait (``_aux_tile_setup_lines``) and sliced
+    # per subtile from registers. Legal only with the ``pre_acc_wait``
+    # placement on the static-full TMA-store epilogue; the register budget is
+    # checked per auxiliary step below. Fails closed: the knob is refused
+    # where the hoist would not render.
+    tcgen05_aux_fragment_hoist = (
+        df.config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY, False) is True
+    )
+    if tcgen05_aux_fragment_hoist and not (
+        tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        and tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.partial_output_tma_store
+        and any(
+            step.broadcast_axis is None
+            for step in (
+                aux_steps_in_chain
+                if fanout_plan is None
+                else tuple(
+                    step
+                    for chain in fanout_plan.chains
+                    for step in chain.auxiliary_tensor_loads
+                )
+            )
+        )
+    ):
+        raise exc.InvalidConfig(
+            f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True requires "
+            f"{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+            f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}, the static-full "
+            "TMA-store epilogue and an exact-shape auxiliary load in the chain"
+        )
 
     _TCGEN05_TMEM_DATAPATH_M = 128
     if tcgen05_value.has_explicit_epilogue_tile:
@@ -3208,6 +3279,21 @@ def _codegen_cute_store_tcgen05_tile(
                             bm=tcgen05_value.bm,
                         )
                         and tcgen05_value.use_tma_store_epilogue
+                    )
+                    or _exact_shape_aux_fragment_hoisted(
+                        requested=tcgen05_aux_fragment_hoist,
+                        broadcast_axis=aux_step.broadcast_axis,
+                        aux_ndim=aux_torch_tensor.ndim,
+                        aux_itemsize=aux_torch_tensor.dtype.itemsize,
+                        # A CTA pair's epilogue owns half of the pair tile's
+                        # rows per CTA.
+                        bm=(
+                            tcgen05_value.bm // 2
+                            if tcgen05_lifecycle.is_two_cta
+                            else tcgen05_value.bm
+                        ),
+                        bn=tcgen05_value.bn,
+                        epi_warps=tcgen05_value.epi_warp_count,
                     )
                     else None
                 ),
@@ -4410,14 +4496,34 @@ def _codegen_cute_store_tcgen05_tile(
                     )
                 continue
             if rec.aux_rmem_full is not None:
-                # Pre-wait hoisted rowvec: the whole fragment is already in
-                # registers (loaded before the accumulator consumer_wait by
-                # ``_aux_tile_setup_lines``); slice the active subtile.
-                lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
-                    f"{rec.aux_rmem_full}"
-                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
-                )
+                # Pre-wait hoisted fragment (rowvec or exact-shape): the whole
+                # tile is already in registers (loaded before the accumulator
+                # consumer_wait by ``_aux_tile_setup_lines``); slice the active
+                # subtile. An exact-shape fragment whose thread spans several
+                # M rows (``epi_tile_m`` below the 128-lane TMEM datapath, e.g.
+                # block_m=64) keeps the nested T2R profile the flat carrier
+                # cannot combine with, so its slice is re-laid out onto the
+                # carrier's layout exactly as the per-subtile global read is
+                # (a register-to-register copy); a single-row fragment and
+                # the rowvec hoist load the slice directly.
+                if (
+                    rec.broadcast_axis is None
+                    and not tcgen05_colvec_fragment_single_m_row
+                ):
+                    lines.append(
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.aux_rmem_full}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        + _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        )
+                    )
+                else:
+                    lines.append(
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.aux_rmem_full}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
+                    )
                 continue
             # Both remaining cases -- rowvec / leading-broadcast aux
             # (``broadcast_axis in (0, 1)``: a per-column operand broadcast

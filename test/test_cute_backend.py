@@ -11679,10 +11679,20 @@ class TestCuteBackend(TestCase):
             fired(cute_dense_attention, nonsq, block_sizes=[1, 128, 128]),
             "non-square must not fire flash",
         )
-        # Non-128 tiles (outside the validated 128x128 envelope).
-        self.assertFalse(
-            fired(cute_dense_attention, sq(256), block_sizes=[1, 64, 64]),
-            "non-128 tiles must not fire flash",
+        # Non-128 tiles: the flash surface pins the tiles to its 128x128
+        # envelope, so a provided 64x64 config is normalized onto the pin
+        # (``BlockSizeSpec.pin_structurally``) and the fused kernel runs
+        # over 128-row tiles rather than the scalar lowering over 64-row ones.
+        sq_args = sq(256)
+        code, out = code_and_output(
+            cute_dense_attention, sq_args, block_sizes=[1, 64, 64]
+        )
+        self.assertTrue(_flash_fired(code), "pinned tiles normalize onto 128x128")
+        torch.testing.assert_close(
+            out,
+            torch.nn.functional.scaled_dot_product_attention(*sq_args),
+            atol=1e-2,
+            rtol=1e-2,
         )
         self.assertFalse(
             fired(

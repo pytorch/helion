@@ -2514,12 +2514,16 @@ def _split_staged_matmul_lane_reductions(
             statement, allow_load=True, allow_reduction=True
         ):
             return None
+    first_marker = min(marker_indices)
     collective_indices = [
         index
         for index, statement in enumerate(body)
         if _contains_unduplicatable_op(statement)
+        # A matmul fold ahead of the reductions is computed once per lane
+        # and read back from its stash, never re-run per pass.
+        or (index < first_marker and _is_fold_dot_assignment(statement))
     ]
-    if collective_indices and min(marker_indices) <= max(collective_indices):
+    if collective_indices and first_marker <= max(collective_indices):
         return None
     transformed = [_clone_stmt(statement) for statement in body]
     prefix: list[ast.AST] = []
@@ -2713,6 +2717,10 @@ def _stashed_collective_dtype(value: ast.AST, before: Sequence[ast.AST]) -> str 
     name = _qualified_name(value.func)
     if name in _CHUNK_REDUCTION_HELPERS and len(value.args) >= 3:
         return _dtype_ctor_from_identity(ast.unparse(value.args[2]))
+    if name == _FOLD_DOT_HELPER and len(value.args) >= 6:
+        # ``fold_dot(lhs, step, rhs, step, valid, identity, ...)`` sums in
+        # its identity's dtype.
+        return _dtype_ctor_from_identity(ast.unparse(value.args[5]))
     if name is None or not name.startswith("cute.arch.warp_reduction_"):
         return None
     if not value.args:
@@ -4851,6 +4859,11 @@ _UNDUPLICATABLE_CALLS = (
     "cute.gemm",
     "warp_reduction",
 )
+# The synthetic-lane matmul fold (``fold_helpers.fold_dot``): a pure K loop
+# over operand re-reads.  Duplicating it into every lane pass is correct but
+# repeats the whole contraction per pass, so the staged splitter stashes its
+# per-lane value like a collective's instead.
+_FOLD_DOT_HELPER = "_cute_fold_dot"
 
 
 def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
@@ -4859,6 +4872,16 @@ def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
     second lane pass."""
     src = ast.unparse(stmt)
     return any(call in src for call in _UNDUPLICATABLE_CALLS)
+
+
+def _is_fold_dot_assignment(stmt: ast.AST) -> bool:
+    """``name = _cute_fold_dot(...)``: a stash-worthy pure per-lane value."""
+    return (
+        _plain_assignment_name(stmt) is not None
+        and isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and _qualified_name(stmt.value.func) == _FOLD_DOT_HELPER
+    )
 
 
 def _lane_split_reorders_aliasing_memory(
@@ -5755,6 +5778,12 @@ def _is_proven_relocatable_call(
         # ``_cute_store_*`` convention ``_is_store_call`` relies on.
         # Only the listed helpers: the memory passes collect and measure
         # exactly these, so any other ``_cute_load_*`` stays unproven.
+        return allow_load
+    if name == _FOLD_DOT_HELPER:
+        # The synthetic-lane matmul fold: pure arithmetic over reads of
+        # operand tensors the kernel never writes (``_cute_matmul_reread_unsafe``
+        # proved that before the fold was emitted), so it relocates exactly
+        # like a load of the same tensors.
         return allow_load
     return allow_reduction and (
         name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
