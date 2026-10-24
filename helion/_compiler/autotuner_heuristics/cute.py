@@ -4,6 +4,7 @@ import contextlib
 from copy import deepcopy
 from functools import partial
 from itertools import zip_longest
+import logging
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -59,7 +60,7 @@ from ..cute.loop_nesting import sibling_row_loop_blocks
 from ..cute.loop_nesting import tile_loop_paths
 from ..cute.matmul_utils import cute_matmul_root_placements
 from ..cute.mma_support import cute_fp32_dot_uses_tf32
-from ..cute.packed_matmul import packed_axis_for_fact
+from ..cute.packed_matmul import contraction_axis_for_fact
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -113,6 +114,8 @@ from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -2161,7 +2164,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return bool(cls.get_seed_configs(env, device_ir))
+        # Eligibility is cheap; get_seed_configs performs the placement and
+        # lowering proofs once when the registry requests the candidates.
+        return bool(env.config_spec.matmul_facts)
 
     @classmethod
     def get_seed_config(
@@ -2204,12 +2209,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             for block_id in item.block_ids
         }
         for fact, root in placements:
-            m, n, k = fact.m_block_id, fact.n_block_id, fact.k_block_id
-            factor = 1
-            if k is None:
-                packed = packed_axis_for_fact(env, device_ir, fact)
-                if packed is not None:
-                    k, factor = packed.block_id, packed.factor
+            m, n = fact.m_block_id, fact.n_block_id
+            axis = contraction_axis_for_fact(env, device_ir, fact)
+            k, factor = (None, 1) if axis is None else (axis.block_id, axis.factor)
             if (
                 m is None
                 or n is None
@@ -2494,12 +2496,36 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
         }
         axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
-        singleton_axes = set(blocks) - axis_ids
+        non_matmul_axes = blocks.keys() - axis_ids
+        matmul_roots = {root for _, root, _, _ in sites}
+        # A sibling reduction can claim an extra CUDA thread axis. Preserve
+        # existing epilogue admission within the matmul's own root.
+        reduction = spec.reduction_kernel_fact
+        grid = spec.kernel_grid_fact
+        if reduction is not None and grid is not None:
+            for item in reduction.reductions:
+                root = grid.group_for_graph(item.graph_id)
+                if root not in matmul_roots:
+                    log.debug(
+                        "Withholding collective seeds: reduction graph %s has %s",
+                        item.graph_id,
+                        f"sibling root {root}" if root else "no attributed root",
+                    )
+                    return []
+        # Only separate roots may retain ordinary tile defaults. A non-MMA
+        # axis nested under a matmul still shares its collective thread layout.
+        singleton_axes = {
+            block_id
+            for path in spec.cute_tile_loop_paths
+            if path[0] in matmul_roots
+            for level in path
+            for block_id in level
+            if block_id in non_matmul_axes
+        }
         if any(blocks[block_id].max_size != 1 for block_id in singleton_axes):
             return []
         fp32_inputs = any(
-            fact.lhs_dtype == torch.float32
-            for fact, _root in cute_matmul_root_placements(env, device_ir)
+            fact.lhs_dtype == torch.float32 for fact, _root, _, _ in sites
         )
         fixed_k = axis_ids - set(blocks)
         if any(
@@ -2515,6 +2541,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         }
         seeded_native = has_collective_native_seed_candidate(env, device_ir)
         result = []
+        non_matmul_defaults = {
+            block_id: fragments[block_id].default() for block_id in non_matmul_axes
+        }
         for bm, bn, bk in (
             (64, 32, 64),
             (64, 64, 64),
@@ -2542,8 +2571,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 for m, n, k, _ in axes
                 for block_id, value in zip((m, n, k), (128 // bn, bn, 1), strict=True)
             }
-            values.update(dict.fromkeys(singleton_axes, 1))
-            threads.update(dict.fromkeys(singleton_axes, 0))
+            values.update(non_matmul_defaults)
             if not all(
                 fragments[block_id].low <= value <= fragments[block_id].high
                 for block_id, value in values.items()

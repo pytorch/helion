@@ -16,7 +16,9 @@ from test._cute_binding import _cpu_bind
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _tensor_roots
+from helion._compiler.cute.packed_matmul import packed_axis_for_fact
 from helion._compiler.cute.packed_matmul import packed_matmul_axis
+from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
@@ -97,7 +99,7 @@ def _original_bound(
 )
 @skipUnlessBackends(["cute"])
 def test_original_int4_has_searchable_packed_collective_seeds(
-    shape: tuple[int, int, int],
+    shape: tuple[int, int, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bound = _original_bound(shape)
     assert bound.host_function is not None
@@ -119,6 +121,22 @@ def test_original_int4_has_searchable_packed_collective_seeds(
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     # Direct-load native facts must retain their logical, expanded K semantics.
     assert bound.config_spec.matmul_facts[0].k_block_id is None
+    with bound.env:
+        packed = packed_axis_for_fact(
+            bound.env, bound.host_function.device_ir, bound.config_spec.matmul_facts[0]
+        )
+    assert packed is not None
+    original = PerThreadNDTileStrategy.use_shared_thread_extents
+
+    def normalize_sibling(
+        strategy: PerThreadNDTileStrategy, extents: dict[int, int]
+    ) -> None:
+        assert packed.block_id not in strategy.block_ids
+        original(strategy, extents)
+
+    monkeypatch.setattr(
+        PerThreadNDTileStrategy, "use_shared_thread_extents", normalize_sibling
+    )
     for compute in ("warp", "tcgen05"):
         seed = next(
             value
