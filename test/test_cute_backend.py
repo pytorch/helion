@@ -14665,8 +14665,6 @@ class TestCuteBackend(TestCase):
                 (x, y, bias)
             ).config_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
             (seed["block_sizes"][1], seed["block_sizes"][2], seed["tcgen05_ab_stages"])
@@ -15150,8 +15148,6 @@ class TestCuteBackend(TestCase):
             dict(seed.config)
             for seed in spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
             (
@@ -15229,8 +15225,6 @@ class TestCuteBackend(TestCase):
             )
             for seed in chain_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         )
         self.assertEqual(
             chain_seeds,
