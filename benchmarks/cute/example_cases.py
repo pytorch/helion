@@ -41,6 +41,9 @@ class Case:
     # Only read when check == "mismatch_budget"; see run_example's knobs.
     max_mismatch_pct: float | None = None
     max_mismatched_abs_diff: float | None = None
+    # baseline_factories adds torch.compile of the first baseline unless the
+    # case already names a compiled baseline or opts out (unrolled loops).
+    auto_compile: bool = True
 
 
 # Three deliberately different workload sizes for every operation. Dimensions
@@ -152,6 +155,35 @@ LINEAR = [
 ]
 MODULES = [*CHECKS, *CUSTOM, *LINEAR]
 
+# (B, H, T, D, Dv). Indices 0-2 are the study's small workloads; 3-5 are
+# production sizes (flash-linear-attention's benchmark registry and the linear
+# harness's BENCH_CONFIGS), where the kernels are no longer launch-bound.
+LINEAR_SHAPES = [
+    (1, 4, 128, 32, 32),
+    (1, 8, 256, 64, 64),
+    (1, 8, 512, 64, 64),
+    (8, 8, 1024, 64, 64),
+    (4, 16, 2048, 128, 128),
+    (1, 32, 4096, 128, 128),
+]
+# (batch, heads, D, Dv) for the fused recurrent decode step, one per index above.
+RECURRENT_STEP_SHAPES = [
+    (1, 4, 32, 32),
+    (8, 8, 64, 64),
+    (32, 32, 128, 128),
+    (8, 16, 128, 128),
+    (16, 32, 128, 128),
+    (64, 32, 128, 128),
+]
+# A fullgraph torch.compile of the step-by-step recurrent reference unrolls its
+# T-step Python loop; keep that baseline to the sequence lengths it was built for.
+COMPILE_RECURRENT_MAX_T = 512
+
+
+def shape_count(module: str) -> int:
+    """Number of workload indices collect() accepts for a module."""
+    return len(LINEAR_SHAPES) if module in LINEAR else 3
+
 
 def rand(
     *shape: int, dtype: torch.dtype = torch.float32, grad: bool = False
@@ -198,11 +230,58 @@ def reference_jsd_logits(
     return ((1 - beta) * student_kl + beta * teacher_kl).mean()
 
 
+def linear_fla_baselines(harness: Any, inputs: Any) -> dict[str, Callable]:
+    """flash-linear-attention baselines for one linear-attention workload.
+
+    Returns {} when FLA is unavailable or the variant has no FLA kernel.
+    ``fla`` takes time-first copies made here, outside the timed region, and
+    returns FLA's time-first output viewed head-first; ``fla.head_first`` is
+    called on the example's head-first tensors and converts the layouts inside
+    the timed region, so it is also the differentiable form used for backward.
+    Varlen inputs are already token-major and pass through unchanged.
+    """
+    import dataclasses
+
+    from examples.linear.linear_attention_fla import get_fla_fwd_kernel
+    from examples.linear.linear_attention_harness import _fla_inputs
+    from examples.linear.linear_attention_harness import _is_varlen
+
+    fwd = get_fla_fwd_kernel(harness.variant)
+    if fwd is None:
+        return {}
+    varlen = _is_varlen(inputs)
+    scale = inputs.scale
+
+    def head_first(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        fi = _fla_inputs(dataclasses.replace(inputs, q=q, k=k, v=v))
+        out, _ = fwd(fi.q, fi.k, fi.v, fi.g, fi.beta, scale=scale, **fi.preamble)
+        return out if varlen else out.transpose(1, 2)
+
+    native = _fla_inputs(inputs)
+
+    def time_first(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out, _ = fwd(
+            native.q,
+            native.k,
+            native.v,
+            native.g,
+            native.beta,
+            scale=scale,
+            **native.preamble,
+        )
+        return out if varlen else out.transpose(1, 2)
+
+    return {"fla": time_first, "fla.head_first": head_first}
+
+
 def collect(module: str, shape_index: int) -> list[Case]:
     import helion._testing as testing
 
-    if module not in MODULES or shape_index not in range(3):
+    if module not in MODULES or shape_index not in range(shape_count(module)):
         raise ValueError((module, shape_index))
+    from benchmarks.cute import fla_compat
+
+    fla_compat.install()
     from examples.linear.linear_attention_utils import ACC_BWD_TOL
     from examples.linear.linear_attention_utils import ACC_FWD_TOL
 
@@ -223,6 +302,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
         max_mismatched_abs_diff: float | None = None,
         output_dtypes: dict[str, torch.dtype] | None = None,
         reference_note: str = "",
+        auto_compile: bool = True,
         **kwargs: Any,
     ) -> dict:
         kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
@@ -258,6 +338,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 reference_note=reference_note,
                 max_mismatch_pct=max_mismatch_pct,
                 max_mismatched_abs_diff=max_mismatched_abs_diff,
+                auto_compile=auto_compile,
             )
         )
         return dict.fromkeys([*kernels, *baselines], 1.0)
@@ -294,6 +375,46 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 record(m.exp, torch.exp, cases[0].args)
             if module == "fused_linear_jsd":
                 beta, ignore_index, temperature, sw, tw, sx, tx = cases[0].args
+                # The example's forward precomputes the input and weight
+                # gradients for its backward (Liger-style chunking), so a
+                # forward-only reference does strictly less work. The timed
+                # alternatives take the same two gradients; the first one still
+                # provides the expected loss.
+                forward_only = cases[0].baselines["aten"]
+                compiled_forward = torch.compile(forward_only, fullgraph=True)
+
+                def with_grads(fn: Callable) -> Callable:
+                    def call(
+                        beta: float,
+                        ignore_index: int,
+                        temperature: float,
+                        sw: torch.Tensor,
+                        tw: torch.Tensor,
+                        sx: torch.Tensor,
+                        tx: torch.Tensor,
+                    ) -> torch.Tensor:
+                        sx_leaf = sx.detach().requires_grad_(True)
+                        sw_leaf = sw.detach().requires_grad_(True)
+                        with torch.enable_grad():
+                            loss = fn(
+                                beta,
+                                ignore_index,
+                                temperature,
+                                sw_leaf,
+                                tw,
+                                sx_leaf,
+                                tx,
+                            )
+                            torch.autograd.grad(loss, (sx_leaf, sw_leaf))
+                        return loss.detach()
+
+                    return call
+
+                cases[0].baselines = {
+                    "aten.with_grads": with_grads(forward_only),
+                    "torch.compile.with_grads": with_grads(compiled_forward),
+                }
+                cases[0].auto_compile = False
                 record(
                     m.fused_linear_jsd_kernel,
                     reference_jsd_logits,
@@ -359,7 +480,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
             if module == "geglu":
                 cases[0].kernels["natural rank"] = m._geglu_pallas
         elif module in LINEAR:
-            shape = [(1, 4, 128, 32, 32), (1, 8, 256, 64, 64), (1, 8, 512, 64, 64)][i]
+            shape = LINEAR_SHAPES[i]
             description = f"B,H,T,D,Dv={shape}, chunk=64"
             if module == "linear.example_mamba2_ssd":
                 from examples.linear.linear_attention_engine import (
@@ -404,31 +525,47 @@ def collect(module: str, shape_index: int) -> list[Case]:
             ) -> torch.Tensor:
                 return harness.reference(dataclasses.replace(inputs, q=q, k=k, v=v))
 
+            fwd_baselines: dict[str, Callable] = {
+                "aten": recurrent_ref,
+                "aten.chunked": ref_fn,
+                "torch.compile": torch.compile(ref_fn, fullgraph=True),
+            }
+            if shape[2] <= COMPILE_RECURRENT_MAX_T:
+                fwd_baselines["compile.recurrent"] = torch.compile(
+                    recurrent_ref, fullgraph=True
+                )
+            fwd_dtypes = {
+                "cute:helion": inputs.q.dtype,
+                "triton:helion": inputs.q.dtype,
+                "baselines:aten.chunked": inputs.q.dtype,
+                "baselines:torch.compile": inputs.q.dtype,
+            }
+            bwd_baselines: dict[str, Callable] = {"aten": ref_fn}
+            fla_baselines = linear_fla_baselines(harness, inputs)
+            if fla_baselines:
+                # fla: FLA's own time-first layout, prepared outside the timed
+                # region (the kernel's intrinsic speed). fla.head_first: called
+                # on the example's head-first tensors, layout changes included.
+                fwd_baselines.update(fla_baselines)
+                fwd_dtypes.update(
+                    {f"baselines:{name}": inputs.q.dtype for name in fla_baselines}
+                )
+                bwd_baselines["fla.head_first"] = fla_baselines["fla.head_first"]
             record(
                 hl_fn,
-                {
-                    "aten": recurrent_ref,
-                    "aten.chunked": ref_fn,
-                    "torch.compile": torch.compile(ref_fn, fullgraph=True),
-                    "compile.recurrent": torch.compile(recurrent_ref, fullgraph=True),
-                },
+                fwd_baselines,
                 (inputs.q, inputs.k, inputs.v),
                 rtol=ACC_FWD_TOL,
                 atol=0,
-                output_dtypes={
-                    "cute:helion": inputs.q.dtype,
-                    "triton:helion": inputs.q.dtype,
-                    "baselines:aten.chunked": inputs.q.dtype,
-                    "baselines:torch.compile": inputs.q.dtype,
-                },
+                output_dtypes=fwd_dtypes,
                 reference_note=(
                     "The recurrent reference and compile.recurrent return FP32; "
-                    "Helion and chunked baselines return the input dtype."
+                    "Helion, FLA and chunked baselines return the input dtype."
                 ),
             )
             record(
                 hl_fn,
-                ref_fn,
+                bwd_baselines,
                 (inputs.q, inputs.k, inputs.v),
                 bwd=True,
                 rtol=ACC_BWD_TOL,
@@ -470,20 +607,33 @@ def collect(module: str, shape_index: int) -> list[Case]:
                         )
                         return output.transpose(1, 2) if varlen else output
 
+                    prepared_baselines: dict[str, Callable] = {"aten": prepared_ref}
+                    compile_recurrent = length <= COMPILE_RECURRENT_MAX_T
+                    if compile_recurrent:
+                        prepared_baselines["compile.recurrent"] = torch.compile(
+                            prepared_ref, fullgraph=True
+                        )
+                    prepared_fla = linear_fla_baselines(harness, prepared)
+                    prepared_baselines.update(prepared_fla)
                     record(
                         prepared_hl,
-                        prepared_ref,
+                        prepared_baselines,
                         (prepared.q, prepared.k, prepared.v),
                         rtol=0.03,
                         atol=0.05,
                         output_dtypes={
                             "cute:helion": prepared.q.dtype,
                             "triton:helion": prepared.q.dtype,
+                            **{
+                                f"baselines:{name}": prepared.q.dtype
+                                for name in prepared_fla
+                            },
                         },
                         reference_note=(
                             "The recurrent reference and its compiled baseline "
-                            "return FP32; Helion returns the input dtype."
+                            "return FP32; Helion and FLA return the input dtype."
                         ),
+                        auto_compile=compile_recurrent,
                     )
             if module in {"linear.example_kda", "linear.example_vanilla_linear_attn"}:
                 from examples.linear.linear_attention_engine import recurrent_step
@@ -491,11 +641,7 @@ def collect(module: str, shape_index: int) -> list[Case]:
                     recurrent_step_reference,
                 )
 
-                batch, heads, d, dv = [
-                    (1, 4, 32, 32),
-                    (8, 8, 64, 64),
-                    (32, 32, 128, 128),
-                ][i]
+                batch, heads, d, dv = RECURRENT_STEP_SHAPES[i]
                 q, k, v = (
                     rand(batch, heads, 1, d),
                     rand(batch, heads, 1, d),
