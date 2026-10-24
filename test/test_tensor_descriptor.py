@@ -16,6 +16,7 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -1959,6 +1960,79 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     code, result = code_and_output(kernel, args)
                     torch.testing.assert_close(result, expected)
                     self.assert_tensor_descriptor_not_used_for(code, tensor_name)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="range_warp_specialize is offered from Blackwell on"
+    )
+    @skipIfRefEager("asserts the generated code")
+    @skipIfTileIR("tileir backend ignores range_warp_specializes")
+    def test_loop_that_rereads_its_store_is_not_warp_specialized(self):
+        # ``d`` is stored and read back in one iteration of a loop the config
+        # warp-specializes, with descriptor loads feeding the dot and the
+        # epilogue.  Triton's partitioner put the epilogue (the ``y`` load,
+        # the re-read, the multiply and the ``out`` store) in the load
+        # partition and the ``d`` store in the MMA's, and the barrier between
+        # them was split per partition: ``out`` came back as ``y`` times the
+        # buffer's previous contents.  The loop's range_warp_specializes slot
+        # is pinned to None (see intra_loop_raw_reread_block_ids).
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[32, 64, 64],
+                # Descriptor loads (x, b, y, d); pointer stores (d, out).
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "pointer",
+                ],
+                host_tensor_descriptors=True,
+                num_warps=4,
+                num_stages=2,
+                range_warp_specializes=[None, True, None],
+            ),
+            static_shapes=True,
+        )
+        def gate(
+            x: torch.Tensor, y: torch.Tensor, b: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            n = b.size(1)
+            d = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], b[tile_k, tile_n])
+                    d[tile_m, tile_n] = torch.sigmoid(acc.to(x.dtype))
+                    out[tile_m, tile_n] = y[tile_m, tile_n] * d[tile_m, tile_n]
+            return out, d
+
+        m, k, n = 128, 128, 256
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16) * 0.1
+        # Leave freed blocks of the outputs' size holding 7.0: a stale re-read
+        # of ``d`` then shows instead of inheriting an earlier result.
+        stale = [
+            torch.full([m, n], 7.0, device=DEVICE, dtype=torch.float16)
+            for _ in range(2)
+        ]
+        del stale
+        code, (out, d) = code_and_output(gate, (x, y, b))
+        self.assertNotIn("warp_specialize", code)
+        torch.testing.assert_close(d, torch.sigmoid(x @ b), atol=1e-2, rtol=1e-2)
+        self.assertTrue(torch.equal(out, y * d))
+        # The grid loop's region holds the pair too; the K loop's does not.
+        spec = gate.bind((x, y, b)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize], [True, True, False]
+        )
+        normalized = spec.normalized_config(gate.configs[0])
+        self.assertEqual(normalized.range_warp_specializes, [None, None, None])
 
 
 if __name__ == "__main__":

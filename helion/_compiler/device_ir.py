@@ -3518,6 +3518,22 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
+        warp_specialize_specs = (
+            CompileEnvironment.current().config_spec.range_warp_specialize
+        )
+        if warp_specialize_specs:
+            from .loop_dependency_checker import intra_loop_raw_reread_block_ids
+
+            # A loop that stores and then re-reads the same storage cannot be
+            # warp-specialized (see intra_loop_raw_reread_block_ids); its
+            # slot stays in the config space pinned to None.
+            reread_block_ids = intra_loop_raw_reread_block_ids(
+                device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids
+            )
+            for spec in warp_specialize_specs:
+                if reread_block_ids.intersection(spec.block_ids):
+                    spec.pinned = True
+
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.dot_scaled_scales import expose_dot_scaled_scales
             from .cute.promote_output_axis import promote_partitioned_output_axis

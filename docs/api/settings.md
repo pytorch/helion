@@ -227,7 +227,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
-   Timeout in seconds for Triton compilation during autotuning. Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
+   Timeout in seconds for one precompile subprocess during autotuning, and the benchmark worker's deadline for a
+   candidate's compile and first call (never below ``autotune_benchmark_timeout``; a candidate past it is recorded as
+   failed to compile and the search goes on). Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
 
 .. autoattribute:: Settings.autotune_precompile
 
@@ -281,6 +283,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_baseline_rtol
 
    Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
+.. autoattribute:: Settings.autotune_fp8_accuracy
+
+   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
 
 .. autoattribute:: Settings.autotune_search_acf
 
@@ -402,7 +408,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
-| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
+| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds for one precompile subprocess, and for a candidate's compile and first call in the benchmark worker (a candidate past it is recorded as failed to compile). |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
 | ``HELION_AUTOTUNE_LOG_DETAILS`` | ``autotune_log_details`` | Enable cost-model dataset sidecar (``.meta.jsonl``) with full configs map. |

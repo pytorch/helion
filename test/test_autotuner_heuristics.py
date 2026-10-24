@@ -17,6 +17,7 @@ from typing import Any
 from typing import Iterator
 from typing import cast
 from unittest.mock import MagicMock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
@@ -1078,7 +1079,8 @@ class TestAutotunerHeuristic(TestCase):
         # The autotuning reference produces the baseline only while it is what
         # the kernel runs by default; a promoted execution default (whose
         # arithmetic the fast candidates share) takes over as soon as it
-        # differs from the reference.
+        # differs from the reference -- which then runs as well, to agree
+        # with it (``_compute_reference_baseline``).
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
         for default in (reference, execution_default):
@@ -1099,8 +1101,10 @@ class TestAutotunerHeuristic(TestCase):
                 self.assertEqual(output, "baseline")
                 self.assertEqual(mutated, [])
                 self.assertEqual(post_args, ())
-                provider.kernel.compile_config.assert_called_once_with(
-                    default, allow_print=False
+                compiled = [default] if default is reference else [default, reference]
+                self.assertEqual(
+                    provider.kernel.compile_config.call_args_list,
+                    [call(config, allow_print=False) for config in compiled],
                 )
 
     def test_should_promote_gate(self) -> None:
