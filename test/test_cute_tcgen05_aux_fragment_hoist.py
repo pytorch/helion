@@ -526,7 +526,10 @@ def _carriers(group: Any) -> list[dict[str, Any]]:
 
 
 def test_fanout_and_hoist_coverage_for_a_seedless_two_output_kernel() -> None:
-    bound = bind(gated_pair)
+    # 8192 rows: the 256x256 CTA pairs fill the machine (256 CTAs), so the
+    # multi-tile 256x128 pair seeds stay out and the kernel is seedless for
+    # the fanout (at 4096 rows the fanout rides those seeds: next test).
+    bound = bind(gated_pair, rows=8192)
     spec = bound.config_spec
     # The only compiler seeds are the 256x256 CTA pairs, which the fanout
     # does not admit; the carriers are synthesized from the geometry.
@@ -599,6 +602,56 @@ def test_fanout_and_hoist_coverage_for_a_seedless_two_output_kernel() -> None:
     assert _group(odd, HOIST) is None
 
 
+def test_fanout_rides_the_multi_tile_pair_seeds_on_a_one_wave_pair_grid() -> None:
+    # 4096 rows: the 256x256 pairs hold one tile per CTA (128 CTAs), so the
+    # multi-tile 256x128 pair seeds (2x2 on the resident-cluster cap, 2x1) are
+    # emitted, and the fanout admits that tile: the fanout group's carriers
+    # are the seeded pair (its ring leaves room for the C ring at c=2 only)
+    # instead of synthesized one-CTA tiles.
+    bound = bind(gated_pair)
+    seeds = bound.config_spec.compiler_seed_configs
+    multi_tile = [seed for seed in seeds if seed.block_sizes == [256, 128, 64]]
+    assert [seed.config["tcgen05_cluster_n"] for seed in multi_tile] == [2, 1]
+    assert multi_tile[0].config["tcgen05_persistent_grid_cap"] == "resident_clusters"
+    fanout = _group(bound, FANOUT_CONFIG_KEY)
+    assert fanout is not None and not fanout.dependencies
+    assert [w.value for w in fanout.witnesses] == ["off", "shared"]
+    for carrier in _carriers(fanout):
+        assert carrier["block_sizes"] == [256, 128, 64]
+        assert carrier["tcgen05_cluster_m"] == 2
+        assert carrier["tcgen05_cluster_n"] == 2
+        assert carrier["tcgen05_ab_stages"] == 8
+        assert carrier["tcgen05_c_stages"] == 2
+        assert carrier["tcgen05_persistent_grid_cap"] == "resident_clusters"
+        assert FANOUT_CONFIG_KEY not in carrier
+    hoist = _group(bound, HOIST)
+    assert hoist is not None
+    assert [w.value for w in hoist.witnesses] == [False, True, False, True]
+    hoist_carriers = _carriers(hoist)
+    for carrier in hoist_carriers:
+        assert carrier[FANOUT_CONFIG_KEY] == "shared"
+        assert carrier[PLACEMENT] == "pre_acc_wait"
+    # The geometry pair (K tile 128) first, then the seeded pair.
+    for carrier in hoist_carriers[:2]:
+        assert carrier["block_sizes"] == [256, 128, 128]
+        assert carrier["tcgen05_cluster_m"] == 2
+        assert carrier["tcgen05_ab_stages"] == 4
+    for carrier in hoist_carriers[2:]:
+        assert carrier["block_sizes"] == [256, 128, 64]
+        assert carrier["tcgen05_cluster_n"] == 2
+        assert carrier["tcgen05_ab_stages"] == 8
+        assert carrier["tcgen05_persistent_grid_cap"] == "resident_clusters"
+    swizzle = _group(bound, SWIZZLE)
+    assert swizzle is not None
+    assert [w.value for w in swizzle.witnesses] == [1, 8]
+    for group in (fanout, hoist, swizzle):
+        for witness in group.witnesses:
+            config = normalized(
+                bound, dict(witness.carrier.config) | {group.key: witness.value}
+            )
+            assert config.get(group.key, group.legacy) == witness.value
+
+
 def test_pair_fanout_sample_keeps_its_geometry_in_the_search() -> None:
     bound = bind(gated_pair)
     pair = base_config(
@@ -630,7 +683,10 @@ def test_pair_fanout_sample_keeps_its_geometry_in_the_search() -> None:
         assert config.get("tcgen05_strategy", "role_local_monolithic") == (
             "role_local_monolithic"
         )
-    # Without the fanout the same pair sample takes the projections as before.
+    # Without the fanout the same pair sample keeps its tile too: the SIMT
+    # aux load has no tile constraint, so an exact-shape-aux sample without
+    # the aux-TMA producer's C-input warp is no longer widened to 256x256
+    # (only the TMA aux regime keeps that projection).
     plain = normalized(
         bound,
         base_config(
@@ -642,8 +698,21 @@ def test_pair_fanout_sample_keeps_its_geometry_in_the_search() -> None:
         fix_invalid=True,
     )
     assert plain["tcgen05_cluster_m"] == 2
-    assert plain["block_sizes"][:2] == [256, 256]
+    assert plain["block_sizes"][:2] == [256, 128]
     assert plain.get(FANOUT_CONFIG_KEY, "off") == "off"
+    widened = normalized(
+        bound,
+        base_config(
+            block_sizes=[256, 128, 128],
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=4,
+            tcgen05_c_stages=2,
+            tcgen05_warp_spec_c_input_warps=1,
+        ),
+        fix_invalid=True,
+    )
+    assert widened["tcgen05_cluster_m"] == 2
+    assert widened["block_sizes"][:2] == [256, 256]
 
 
 def test_pair_carrier_needs_whole_pair_tiles() -> None:

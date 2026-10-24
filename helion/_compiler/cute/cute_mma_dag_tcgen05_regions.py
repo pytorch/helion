@@ -64,6 +64,7 @@ from .cute_mma_dag import MMA_DAG_DERIVED_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
@@ -2017,6 +2018,18 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         streamed_loops=len(streamed_loop_candidates(program)),
         tmem_operands=len(tmem_a_candidates(program))
         + len(shared_operand_dots(program)),
+        # The streamed epilogue's subject: root stores of a block without
+        # derived values (a materialized derived value keeps the whole-row
+        # form, so the knob would be dead there).
+        root_store_slots=tuple(
+            dict.fromkeys(
+                program.frag_slots[store.frag]
+                for store in program.stores
+                if store.loop < 0
+            )
+        )
+        if not any(step.loop < 0 for step in program.derived)
+        else (),
     )
 
 
@@ -2856,6 +2869,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # The ring loops rendered as a streamed pipeline (``md_empty{L}``
         # barriers) and the one whose batch is being emitted.
         self.streamed = streamed_ring_loops(program, self.tc, self.absorbed)
+        # The streamed loops rendered as plain K loops (no pass, no aux
+        # tile): their batches commit to the slots alone and ``md_cb`` once
+        # at the exit.
+        self.fast_streamed: set[int] = set()
         self.streaming: int | None = None
         # The streamed iteration being emitted has no pass and no aux tile:
         # warp 0 alone waits for the slot's tile and issues the batch, no
@@ -3413,29 +3430,57 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         plain round would (bitwise the mean of the two-round form), the
         second moments by Chan's update.  Returns the sum; the variance
         reduce reads ``fused_m2``."""
+        m2 = self.emit_second_moment(total, values, width)
+        return self.emit_moment_exchange(total, m2, frag_slot, width)
+
+    def emit_second_moment(self, total: str, values: Sequence[str], width: int) -> str:
+        """The sum of the squared deviations of ``values`` (``width`` of
+        them) from their own mean ``total / width``."""
         mean = self.bind("md_s", f"{total} / cutlass.Float32({width}.0)")
         squares = []
         for value in values:
             deviation = self.bind("md_s", f"{value} - {mean}")
             squares.append(self.bind("md_s", f"{deviation} * {deviation}"))
-        m2 = self.emit_tree_sum(squares)
+        return self.emit_tree_sum(squares)
+
+    def emit_chan_update(
+        self,
+        s_run: str,
+        m2_run: str,
+        n_run: int,
+        s_new: str,
+        m2_new: str,
+        n_new: int,
+    ) -> tuple[str, str, int]:
+        """Chan's update: the running (sum, second moment, count) combined
+        with a further group's (the groups in a fixed order)."""
+        n_all = n_run + n_new
+        mean_run = self.bind("md_s", f"{s_run} / cutlass.Float32({n_run}.0)")
+        mean_new = self.bind("md_s", f"{s_new} / cutlass.Float32({n_new}.0)")
+        delta = self.bind("md_s", f"{mean_new} - {mean_run}")
+        coefficient = n_run * n_new / n_all
+        m2_all = self.bind(
+            "md_s",
+            f"{m2_run} + {m2_new} + {delta} * {delta} "
+            f"* cutlass.Float32({coefficient!r})",
+        )
+        s_all = self.bind("md_s", f"{s_run} + {s_new}")
+        return s_all, m2_all, n_all
+
+    def emit_moment_exchange(
+        self, total: str, m2: str, frag_slot: int, width: int
+    ) -> str:
+        """The fused pair's round over this tile's sum ``total`` and second
+        moment ``m2`` (``width`` columns): the tiles' pairs combined in tile
+        order by Chan's update.  Returns the sum; sets ``fused_m2``."""
         if self.half_cols(frag_slot):
             m2 = self.bind("md_s", f"{m2} + cute.arch.shuffle_sync_bfly({m2}, 16)")
         sums, moments = self.emit_split_exchange([total, m2], frag_slot)
         s_run, m2_run, n_run = sums[0], moments[0], width
         for tile in range(1, len(sums)):
-            n_new = n_run + width
-            mean_run = self.bind("md_s", f"{s_run} / cutlass.Float32({n_run}.0)")
-            mean_tile = self.bind("md_s", f"{sums[tile]} / cutlass.Float32({width}.0)")
-            delta = self.bind("md_s", f"{mean_tile} - {mean_run}")
-            coefficient = n_run * width / n_new
-            m2_run = self.bind(
-                "md_s",
-                f"{m2_run} + {moments[tile]} + {delta} * {delta} "
-                f"* cutlass.Float32({coefficient!r})",
+            s_run, m2_run, n_run = self.emit_chan_update(
+                s_run, m2_run, n_run, sums[tile], moments[tile], width
             )
-            s_run = self.bind("md_s", f"{s_run} + {sums[tile]}")
-            n_run = n_new
         self.fused_m2 = m2_run
         return s_run
 
@@ -3744,7 +3789,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
 
     def emit_commit(self) -> None:
         with self.nest(f"if {_PRIMS}.elect_sync():"):
-            self.emit(f"{_PRIMS}.tcgen05_commit(md_cb, group={_PRIMS}.CTAGroup.CTA_1)")
+            if not self.streaming_fast:
+                # (A plain streamed K loop commits to ``md_cb`` once, at
+                # its exit: nothing inside it waits on ``md_cb``, and one
+                # commit per batch on the MMA warp's path cost ~25 ns per
+                # iteration.)
+                self.emit(
+                    f"{_PRIMS}.tcgen05_commit(md_cb, group={_PRIMS}.CTAGroup.CTA_1)"
+                )
             if self.streaming is not None:
                 # The slot this batch read is free once the batch is done.
                 loop = self.streaming
@@ -4034,6 +4086,16 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     loaded: set[int] = set(self.resident)
                     for store in first_snapshots:
                         self.emit_store_step(store, loaded, parity)
+                    streamed = (
+                        loop is None
+                        and not first_snapshots
+                        and not exchanges
+                        and not preps
+                        and self.streamed_slots(work) is not None
+                    )
+                    if streamed:
+                        self.emit_streamed_work(work, parity)
+                        work = []
                     for step in work:
                         if isinstance(step, Derived):
                             self.emit_derived(step, loaded)
@@ -4114,13 +4176,223 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                         dot, self.stage_expr(dot.loop), accumulate=dot.acc is not None
                     )
                     self.defined.add(dot.node)
-                self.emit_tma_store_wait(read=True)
+                if not self.streaming_fast:
+                    # A plain streamed K loop stages no store (its drains
+                    # are empty by construction): the group wait would
+                    # only put a divergent instruction on the MMA warp's
+                    # path every iteration.
+                    self.emit_tma_store_wait(read=True)
                 self.emit_commit()
-            self.emit("md_cn = md_cn + 1")
+            if not self.streaming_fast:
+                self.emit("md_cn = md_cn + 1")
             self.waited = False
             self.pending_batch_dots.extend(dots)
             self.flush_drains()
         self.current_blocks = []
+
+    # -- the streamed epilogue --------------------------------------------------
+
+    def streamed_slots(self, work: Sequence[Step]) -> list[int] | None:
+        """The fragment slots a root epilogue block reads chunk by chunk
+        (``emit_streamed_work``; ``cute_mma_dag_epilogue = "streamed"``),
+        or None where the block keeps its whole-row form.
+
+        A thread's row of a wide fragment (more than one 64-column
+        ``tcgen05.ld`` chunk) held in registers across the whole epilogue
+        spills: matmul_layernorm's 256-column rows at one CTA per SM cost
+        ~4.7 us over a plain-store twin at 2048^3, and a deeper ring (less
+        L1 behind the spills) made the epilogue slower still.  The streamed
+        form re-reads the row from tensor memory a chunk at a time per
+        phase (row reductions end a phase), so at most one chunk is live.
+        It covers blocks of row reductions, vector steps and staged stores
+        over whole-row tensor-memory fragments of one geometry; derived
+        values, half rows / half columns and loop blocks keep the register
+        form."""
+        if self.plan.epilogue != MMA_DAG_EPILOGUE_STREAMED:
+            return None
+        program = self.program
+        slots: list[int] = []
+        for step in work:
+            if isinstance(step, Reduce):
+                if step.vec is not None or step.frag is None or step.orient != "rows":
+                    return None
+                slot = program.frag_slots[step.frag]
+            elif isinstance(step, Store):
+                if step not in self.tc.staged_stores or step.loop >= 0:
+                    return None
+                slot = program.frag_slots[step.frag]
+            elif isinstance(step, (VecOp, VecStore)):
+                continue
+            else:
+                return None
+            if slot not in self.tc.tmem_slots or slot in self.resident:
+                return None
+            if self.half_rows(slot) or self.half_cols(slot):
+                return None
+            if slot not in slots:
+                slots.append(slot)
+        if not slots or any(self.ld_chunks(slot) < 2 for slot in slots):
+            return None
+        if len({(self.slot(s).rows, self.slot(s).cols) for s in slots}) != 1:
+            return None
+        return slots
+
+    def emit_streamed_work(self, work: Sequence[Step], parity: str) -> None:
+        """The block's steps in program order, the column work in phases: a
+        row reduction closes the phase holding the stores ahead of it (the
+        vector steps between phases run as they come)."""
+        fused = self.fused_variance
+        pending: list[Store] = []
+        for step in work:
+            if isinstance(step, Store):
+                pending.append(step)
+                continue
+            if isinstance(step, Reduce) and not (
+                fused is not None and step is fused[1]
+            ):
+                self.emit_streamed_phase(pending, step, parity)
+                pending = []
+                continue
+            self.emit_streamed_phase(pending, None, parity)
+            pending = []
+            if isinstance(step, Reduce):
+                # The variance: its second moments went with the sum's round.
+                self.emit(f"{self.vreg(step.slot)} = {self.fused_m2}")
+            elif isinstance(step, VecOp):
+                self.emit_vec_op(step)
+            elif isinstance(step, VecStore):
+                self.emit_vec_store(step)
+            else:
+                raise AssertionError(step)
+        self.emit_streamed_phase(pending, None, parity)
+
+    def emit_streamed_phase(
+        self, stores: Sequence[Store], reduce: Reduce | None, parity: str
+    ) -> None:
+        """One phase over the fragment row, a 64-column chunk at a time:
+        the chunk's columns of every source slot are read from tensor
+        memory, the chunk's side-vector packets are issued up front, the
+        stores stage the chunk's packets, and the reduction sums the chunk
+        (a pairwise tree) into the running total -- for the fused mean /
+        variance pair each chunk's sum and second moment about its own
+        mean, combined chunk by chunk with Chan's update, so the tile's
+        pair goes to the split's round as before.  After the last chunk
+        the reduction finishes (the split's exchange where the axis is
+        split) and the stores' staging tiles join the drains."""
+        if not stores and reduce is None:
+            return
+        program = self.program
+        slots: list[int] = []
+        for step in (*stores, *((reduce,) if reduce is not None else ())):
+            slot = program.frag_slots[cast("Node", step.frag)]
+            if slot not in slots:
+                slots.append(slot)
+        anchor = slots[0]
+        chunks = self.ld_chunks(anchor)
+        fused = self.fused_variance
+        stats = fused is not None and reduce is fused[0]
+        reduce_slot = program.frag_slots[cast("Node", reduce.frag)] if reduce else -1
+        split = reduce is not None and self.is_split_axis(program.slots[reduce_slot][1])
+        # Uniform scalars of the values once, outside the chunk scopes.
+        for store in stores:
+            self.hoist_scalars(store.value)
+        if reduce is not None:
+            self.hoist_scalars(reduce.value)
+        total: str | None = None
+        moments: tuple[str, str, int] | None = None
+        for chunk in range(chunks):
+            lo = chunk * TCGEN05_LD_COLS
+            hi = lo + self.chunk_cols(anchor, chunk)
+            # The chunk's values live in this scope alone: the next chunk
+            # (and the next phase) re-reads tensor memory.
+            self.evaluator.push()
+            for slot in slots:
+                self.emit_ld_chunk(slot, chunk)
+            for store in stores:
+                self.prefetch_side_packets(
+                    store.value, program.frag_slots[store.frag], lo, hi
+                )
+            for store in stores:
+                self.emit_stage_in(store, parity, evaluate=True, window=(lo, hi))
+            if reduce is not None:
+                # The chunk's elements register by register over the
+                # reduced slot: a vector the value reads beside the fragment
+                # (``centered = acc - mean``) resolves at each element's row
+                # / column (``frag_vec``), as in the whole-row reduction.
+                self.evaluator.enter_frag(reduce_slot)
+                values = []
+                for c in range(lo, hi):
+                    self.evaluator.reg = (c // TCGEN05_LD_COLS, c % TCGEN05_LD_COLS)  # type: ignore[assignment]
+                    coords = self.element_coords(reduce.value, reduce_slot, c)
+                    values.append(self.evaluator.evaluate(reduce.value, coords))
+                self.evaluator.leave_frag()
+                part = self.emit_tree_sum(values)
+                if stats:
+                    m2 = self.emit_second_moment(part, values, hi - lo)
+                    if moments is None:
+                        moments = (part, m2, hi - lo)
+                    else:
+                        moments = self.emit_chan_update(*moments, part, m2, hi - lo)
+                else:
+                    total = (
+                        part
+                        if total is None
+                        else self.bind("md_s", f"{total} + {part}")
+                    )
+            self.evaluator.pop()
+        for slot in slots:
+            self.slot_regs.pop(slot, None)
+        for store in stores:
+            self.drains.append((store, parity, dict(self.values)))
+        if reduce is None:
+            return
+        if stats:
+            assert moments is not None and fused is not None
+            total = self.emit_moment_exchange(
+                moments[0], moments[1], reduce_slot, fused[2]
+            )
+        elif split:
+            assert total is not None
+            (tiles,) = self.emit_split_exchange([total], reduce_slot)
+            total = self.emit_ordered_sum(tiles)
+        self.emit(f"{self.vreg(reduce.slot)} = {total}")
+
+    def side_vector_loads(self, value: Node) -> list[Node]:
+        """The one-dim loads under ``value`` (side vectors along the
+        fragment's columns), each once, in a deterministic order."""
+        from ...language import memory_ops
+
+        found: list[Node] = []
+        seen: set[Node] = set()
+        stack = [value]
+        program = self.program
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node in program.frag_slots or node in program.vec_leaves:
+                continue
+            if node.op == "call_function" and node.target is memory_ops.load:
+                access = self.accesses.get(node)
+                if access is not None and len(access.tile_dims) == 1:
+                    found.append(node)
+                continue
+            stack.extend(reversed(node.all_input_nodes))
+        return found
+
+    def prefetch_side_packets(self, value: Node, slot: int, lo: int, hi: int) -> None:
+        """Issue the 16-byte packets of ``value``'s side vectors over the
+        local columns ``[lo, hi)`` ahead of the chunk's math (the lazy
+        per-element loads otherwise expose one latency per packet)."""
+        for node in self.side_vector_loads(value):
+            access = self.accesses[node]
+            per_packet = 16 // access.dtype.itemsize
+            position = access.tile_positions[0]
+            for col in range(lo, hi, per_packet):
+                coords = ["0"] * len(access.dims)
+                coords[position] = self.col_expr(slot, col)
+                self.evaluator.evaluate(node, tuple(coords))
 
     def emit_tma_store_wait(self, read: bool, pending: int = 0) -> None:
         """The store thread waits until at most ``pending`` of its TMA store
@@ -4785,6 +5057,18 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
             )
+            if index in self.fast_streamed:
+                # The plain streamed loop's batches committed to their slots
+                # alone: one ``md_cb`` commit stands for them all (every
+                # batch is done), counted once.
+                with (
+                    self.nest("if md_warp == 0:"),
+                    self.nest(f"if {_PRIMS}.elect_sync():"),
+                ):
+                    self.emit(
+                        f"{_PRIMS}.tcgen05_commit(md_cb, group={_PRIMS}.CTAGroup.CTA_1)"
+                    )
+                self.emit("md_cn = md_cn + 1")
         for carry in loop.carries:
             self.defined.add(carry.phi)
         # Exchange tiles written inside the loop of fragments it defines are
@@ -5166,7 +5450,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # touches the slot, so only warp 0 waits for its tile -- in
         # ``emit_blocks``, ahead of the MMAs -- and no CTA barrier separates
         # the iterations (a GEMM K loop: 0.043 -> 0.021 ms at 2048^3).
-        self.streaming_fast = not passes and not tc.aux_tiles.get(index)
+        fast = not passes and not tc.aux_tiles.get(index)
+        self.streaming_fast = fast
+        if fast:
+            self.fast_streamed.add(index)
         if not self.streaming_fast:
             self.emit_slot_free_wait(index, count)
             self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
@@ -5182,12 +5469,22 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         assert not self.drains
         # The refill ``stages - 1`` iterations ahead lands in the slot the
         # previous batch read (this batch's own slot with a single stage):
-        # the issuing thread alone waits for that batch.
+        # the issuing thread alone waits for that batch.  In the plain K
+        # loop that thread is in warp 1 (the producer): warp 0 goes on to
+        # the next slot's tile and batch while the producer waits for the
+        # previous batch, so the tensor core's queue holds the next batch
+        # when the current one ends (with warp 0 waiting itself, it issued
+        # batch i+1 only once batch i-1 had completed and the queue drained
+        # every iteration: matmul_layernorm at (512, 1024, 1024), eight
+        # 128-deep steps, 7.27 -> 6.2 us per call; at 2048^3 23.9 -> 22.3).
+        # With passes or aux tiles every warp writes the slot behind the
+        # iteration's barrier and warp 0 refills as before.
         ahead = max(stages - 1, 1)
         offset = var if begin == "0" else f"({var} - {begin})"
         issue = f"{count} + {ahead}"
+        producer = 1 if fast and self.plan.warps >= 2 else 0
         with (
-            self.nest("if md_warp == 0:"),
+            self.nest(f"if md_warp == {producer}:"),
             self.nest(f"if {_PRIMS}.elect_sync():"),
             self.nest(f"if {offset} + {ahead} < {end} - {begin}:"),
         ):

@@ -15,6 +15,7 @@ import ast
 import pytest
 import torch
 
+from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
@@ -22,6 +23,7 @@ from test.test_cute_tcgen05_fixed_chain import _source
 
 import helion
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -264,6 +266,109 @@ def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> Non
     assert [line for line in body.splitlines() if WAIT not in line] == [
         line for line in plain_body.splitlines() if WAIT not in line
     ]
+
+
+def _device_scaled_gemm(
+    a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        acc = acc * scale_a[()] * scale_b[()]
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def test_persistent_kernel_binds_device_scalars_per_tile_and_waits_in_the_roles() -> (
+    None
+):
+    # ``acc * scale[()]`` epilogues: the rank-0 scalars are read once per
+    # output tile in the epilogue role, ahead of the accumulator wait, not
+    # inside every subtile iteration after the TMEM load (that read sat on
+    # the critical path: 7% of a 1024^3 fp8 GEMM). Their hoisted prologue
+    # loads are dead after the splice and no longer force an entry wait.
+    args = (
+        torch.empty((1024, 1024), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((1024, 1024), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((), dtype=torch.float32, device=CPU_DEVICE),
+        torch.empty((), dtype=torch.float32, device=CPU_DEVICE),
+    )
+    bound = helion.kernel(_device_scaled_gemm, backend="cute", static_shapes=True).bind(
+        args
+    )
+    source = _source(bound, _persistent_config(cute_pdl=True))
+    body = _kernel_body(source)
+    assert "'use_pdl': True" in source
+    assert body.count(WAIT) == 2 and body.count(RELEASE) == 1
+    _assert_no_entry_wait(body)
+    lines = body.splitlines()
+    waits = [i for i, line in enumerate(lines) if WAIT in line]
+    assert [lines[i - 1].strip() for i in waits] == [
+        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5):",
+        "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4):",
+    ]
+    for name in ("scale_a", "scale_b"):
+        reads = [i for i, line in enumerate(lines) if f"{name}.iterator.load()" in line]
+        assert len(reads) == 1, reads
+        (read,) = reads
+        assert lines[read].strip().startswith("tcgen05_scalar")
+        assert (
+            lines[read].strip().endswith(f"= cutlass.Float32({name}.iterator.load())")
+        )
+        # bound in the epilogue role, after its wait and ahead of the
+        # per-subtile loop (and so ahead of the accumulator wait inside it)
+        subtile_loop = next(
+            i for i, line in enumerate(lines) if "for _tcgen05_subtile in" in line
+        )
+        assert waits[1] < read < subtile_loop
+    chain = [line for line in lines if line.strip().startswith("tcgen05_chain_step")]
+    assert len(chain) == 2
+    assert chain[0].strip().endswith("* tcgen05_scalar")
+    assert chain[1].strip().endswith("* tcgen05_scalar_1")
+    # the plain scalar lowering of the loads is gone from the prologue
+    assert not any(
+        line.strip().startswith("load") and ".iterator.load()" in line for line in lines
+    )
+    plain = _kernel_body(_source(bound, _persistent_config()))
+    assert "griddepcontrol" not in plain
+    assert plain.count("scale_a.iterator.load()") == 1
+
+
+def test_simt_store_binds_device_scalars_ahead_of_the_accumulator_wait() -> None:
+    # The SIMT store body (direct stores here; edge tiles, partial TMA
+    # stores and column-major outputs take it too) binds the rank-0 scalars
+    # in its per-tile setup ahead of the accumulator wait, like the
+    # TMA-store body.
+    args = (
+        torch.empty((1024, 1024), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((1024, 1024), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((), dtype=torch.float32, device=CPU_DEVICE),
+        torch.empty((), dtype=torch.float32, device=CPU_DEVICE),
+    )
+    bound = helion.kernel(_device_scaled_gemm, backend="cute", static_shapes=True).bind(
+        args
+    )
+    body = _kernel_body(
+        _source(bound, _persistent_config(tcgen05_c_store_mode="direct"))
+    )
+    assert "tcgen05_tma_store_atom" not in body
+    lines = body.splitlines()
+    bindings = [
+        i
+        for i, line in enumerate(lines)
+        if line.strip().startswith("tcgen05_scalar") and ".iterator.load())" in line
+    ]
+    assert len(bindings) == 2
+    wait = next(
+        i
+        for i, line in enumerate(lines)
+        if "tcgen05_acc_pipeline.consumer_wait(" in line and i > bindings[0]
+    )
+    assert bindings[0] < bindings[1] < wait
 
 
 def test_wait_coverage_analysis() -> None:

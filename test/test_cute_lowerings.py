@@ -185,6 +185,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
@@ -5532,6 +5533,40 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_clc.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
+            eager = helion.Config(
+                **{**config.config, TCGEN05_CLC_QUERY_PACING_CONFIG_KEY: "eager"}
+            )
+            eager_code = bound.to_triton_code(eager)
+
+        # Default CLC query pacing ("tile"): the leader CTA's TMA-load warp
+        # arrives at the throttle barrier once per tile it starts, right
+        # before the tile's initial AB prefetch, and the scheduler warp syncs
+        # on it before each query; eager pacing emits none of it.
+        self.assertEqual(
+            code.count(
+                "tcgen05_clc_throttle_barrier = cutlass.pipeline.NamedBarrier("
+                "barrier_id=5, num_threads=64)"
+            ),
+            1,
+        )
+        self.assertEqual(code.count("tcgen05_clc_throttle_barrier.arrive()"), 1)
+        credit = re.search(
+            r"if cute\.arch\.make_warp_uniform\(cute\.arch\.block_idx_in_cluster\(\)\) "
+            r"== cutlass\.Int32\(0\):\n +tcgen05_clc_throttle_barrier\.arrive\(\)",
+            code,
+        )
+        self.assertIsNotNone(credit)
+        assert credit is not None
+        self.assertLess(credit.start(), code.index("tma_initial_full_tile ="))
+        self.assertEqual(
+            code.count("tcgen05_clc_throttle_barrier.arrive_and_wait()"), 1
+        )
+        self.assertLess(
+            code.index("tcgen05_clc_throttle_barrier.arrive_and_wait()"),
+            code.index("_cute_issue_clc_query_nomulticast(tcgen05_clc_mbar_smem_ptr"),
+        )
+        self.assertNotIn("tcgen05_clc_throttle_barrier", eager_code)
+        self.assertEqual(eager_code.count("_cute_issue_clc_query_nomulticast"), 2)
 
         # CLC issuance helper: appears exactly twice in the generated
         # module (one import line at the top + one call inside the
@@ -9354,8 +9389,15 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound.set_config(config)
         code = bound.to_triton_code(config)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
-        self.assertIn("* cutlass.Float32(scale_b.iterator.load())", code)
+        # The rank-0 scales are bound once per output tile (ahead of the
+        # accumulator wait) and the chain multiplies by the bound locals.
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn(
+            "tcgen05_scalar_1 = cutlass.Float32(scale_b.iterator.load())", code
+        )
+        self.assertIn("* tcgen05_scalar\n", code)
+        self.assertIn("* tcgen05_scalar_1\n", code)
+        self.assertNotIn("* cutlass.Float32(scale_a.iterator.load())", code)
         out = bound(x, y, scale_a, scale_b)
         expected = ((x @ y).to(torch.float32) * scale_a * scale_b).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=4e-1, rtol=1e-2)
@@ -9404,7 +9446,8 @@ class TestCuteLowerings(unittest.TestCase):
         bound.set_config(config)
         code = bound.to_triton_code(config)
         self.assertIn("cutlass.Float8E4M3FN", code)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("* tcgen05_scalar\n", code)
         out = bound(x, y, scale_a, scale_b)
         expected = (x.float() @ y.float() * scale_a * scale_b).to(torch.bfloat16)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)

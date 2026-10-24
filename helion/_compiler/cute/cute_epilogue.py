@@ -79,6 +79,7 @@ from .math_templates import SIGMOID_TEMPLATE
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Sequence
 
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
@@ -195,6 +196,13 @@ class _AuxiliaryTensorLoadExpr:
     template: str
 
 
+# Splice-side bindings of chain leaves to pre-bound locals: every auxiliary
+# load leaf (its per-subtile ``aux_loaded`` value) and, optionally, the
+# rank-0 device scalars (bound once per output tile ahead of the accumulator
+# wait; see ``Tcgen05UnaryEpilogueChain.render_runtime_scalar_bindings``).
+_LeafBindings = dict[_AuxiliaryTensorLoadExpr | _RuntimeScalarExpr, str]
+
+
 @dataclasses.dataclass(frozen=True)
 class _UnaryTensorExpr:
     """A whitelisted elementwise unary operation over an auxiliary expression."""
@@ -299,6 +307,99 @@ def aux_leaf_takes_promoted_f32_stage(
     )
 
 
+def rowvec_aux_stage_copy_elems(
+    aux_dtype_bits: int,
+    block_n: int,
+    aux_extent: int | None,
+    *,
+    copy_bits: int = 128,
+) -> int | None:
+    """Return the vector width when a row-vector aux can be staged safely."""
+    if aux_extent is None or aux_dtype_bits <= 0:
+        return None
+    if copy_bits % aux_dtype_bits != 0:
+        return None
+    copy_elems = copy_bits // aux_dtype_bits
+    if copy_elems <= 0:
+        return None
+    if block_n % copy_elems != 0 or aux_extent % copy_elems != 0:
+        return None
+    return copy_elems
+
+
+def rowvec_aux_takes_per_warp_f32_stage(
+    *,
+    aux_dtype_bits: int,
+    broadcast_axis: int | None,
+    epi_warp_count: int,
+    bn: int,
+    aux_extent: int | None,
+) -> bool:
+    """Whether a row-vector leaf takes the warp-private FP32 SMEM stage.
+
+    The shape half of the store lowering's ``pre_acc_wait`` decision (its
+    site conditions -- full-tile TMA-store epilogue into a row-major output,
+    an epilogue tile of at least 128 rows, no whole-fragment register hoist
+    -- are the caller's): a 32-bit N-broadcast row whose width splits into
+    whole 32-lane copies (``bn % (32 * copy_elems) == 0``), on the B200
+    sweep's profitable widths (``bn >= 64``, a stage of at most 4 KiB).
+    """
+    if aux_dtype_bits != 32 or broadcast_axis != 1:
+        return False
+    copy_elems = rowvec_aux_stage_copy_elems(aux_dtype_bits, bn, aux_extent)
+    if copy_elems is None or bn % (32 * copy_elems) != 0:
+        return False
+    return bn >= 64 and epi_warp_count * bn * (aux_dtype_bits // 8) <= 4 * 1024
+
+
+def fanout_pre_wait_stages_rowvec_aux(
+    chains: Sequence[Tcgen05UnaryEpilogueChain],
+    *,
+    bm: int,
+    bn: int,
+    epi_warp_count: int,
+) -> bool:
+    """Whether ``pre_acc_wait`` would SMEM-stage a row-vector leaf of a shared
+    two-output epilogue.
+
+    The fan-out traversal concatenates both stores' per-tile setups and does
+    not compose a per-store stage and barrier, so the splice declines such
+    kernels; this is the same decision at config level.  The fan-out's own
+    schedule fixes the site conditions: a full-tile TMA-store epilogue into
+    row-major outputs (``prove_paired_fanout``), the default epilogue tile of
+    ``bm`` rows (the 128-row staging gate is ``bm >= 128``) and no two-CTA
+    m128 register hoist (the paired fan-out needs ``bm == 256``).
+    """
+    if bm < 128:
+        return False
+    for chain in chains:
+        for leaf in chain.auxiliary_tensor_loads:
+            if leaf.broadcast_axis != 1:
+                continue
+            tensor_node = leaf.load_node.args[0]
+            assert isinstance(tensor_node, torch.fx.Node)
+            tensor = tensor_node.meta["val"]
+            assert isinstance(tensor, torch.Tensor)
+            bits = tensor.dtype.itemsize * 8
+            extent = tensor.shape[0] if isinstance(tensor.shape[0], int) else None
+            if rowvec_aux_takes_per_warp_f32_stage(
+                aux_dtype_bits=bits,
+                broadcast_axis=1,
+                epi_warp_count=epi_warp_count,
+                bn=bn,
+                aux_extent=extent,
+            ) or aux_leaf_takes_promoted_f32_stage(
+                chain,
+                leaf,
+                aux_dtype_bits=bits,
+                epi_warp_count=epi_warp_count,
+                bn=bn,
+                aux_extent=extent,
+            ):
+                return True
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class _AuxiliaryTensorExprStep:
     """One expression over the current carrier, scalars, and auxiliary loads."""
@@ -326,13 +427,12 @@ class _AuxiliaryTensorExprStep:
 
     def render_hoistable_aux_prelude_and_expr(
         self,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+        aux_locals_by_expr: _LeafBindings,
         local_name_factory: object,
         prelude_indent: str,
     ) -> tuple[str, str]:
         aux_expr = self.hoistable_aux_expr
         assert aux_expr is not None
-        assert len(aux_locals_by_expr) == len(self.operands)
         assert all(operand in aux_locals_by_expr for operand in self.operands)
         return _render_auxiliary_tensor_expr(
             aux_expr,
@@ -354,7 +454,7 @@ class _AuxiliaryTensorExprStep:
     def render_prelude_and_expr(
         self,
         carrier_name: str,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+        aux_locals_by_expr: _LeafBindings,
         local_name_factory: object,
         prelude_indent: str,
     ) -> tuple[str, str]:
@@ -895,13 +995,17 @@ def _render_runtime_scalar(expr: _RuntimeScalarExpr) -> str:
 def _render_auxiliary_tensor_expr(
     expr: _TensorExpr,
     carrier_name: str,
-    aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+    aux_locals_by_expr: _LeafBindings,
     local_name_factory: object,
     prelude_indent: str,
 ) -> tuple[str, str]:
     """Render an expression tree into bound TensorSSA locals."""
     if isinstance(expr, _RuntimeScalarExpr):
-        return "", _render_runtime_scalar(expr)
+        # A splice site that bound the scalar once per output tile (ahead of
+        # the accumulator wait) names the local; otherwise the leaf renders
+        # inline at every use.
+        bound = aux_locals_by_expr.get(expr)
+        return "", bound if bound is not None else _render_runtime_scalar(expr)
     if isinstance(expr, _CurrentTensorExpr):
         return "", carrier_name
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
@@ -1022,12 +1126,38 @@ class Tcgen05UnaryEpilogueChain:
             leaf for step in self.steps for leaf in _runtime_scalar_operands(step.expr)
         )
 
+    def render_runtime_scalar_bindings(
+        self, local_name_factory: object, prelude_indent: str
+    ) -> tuple[str, _LeafBindings]:
+        """Bind every rank-0 device-scalar leaf to a local, once.
+
+        Returns ``(prelude, bindings)``: one ``<local> = cutlass.Float32(<load>)``
+        line per distinct ``scale[()]`` leaf and the map the chain renderers
+        consult. The splice site emits the prelude once per output tile,
+        ahead of the accumulator wait, so the scalar's global read is issued
+        while the MMA drains instead of inside every subtile iteration after
+        the TMEM load (where the ``fence`` / named-barrier sequence keeps the
+        compiler from hoisting it and its latency lands on the critical path:
+        a 2x scalar epilogue cost 7% of a 1024^3 fp8 GEMM). Host scalars are
+        kernel arguments and stay inline.
+        """
+        bindings: _LeafBindings = {}
+        lines: list[str] = []
+        for leaf in self.runtime_scalars:
+            if leaf.is_host_scalar or leaf in bindings:
+                continue
+            local = local_name_factory("tcgen05_scalar")  # type: ignore[operator]
+            assert isinstance(local, str)
+            lines.append(f"{prelude_indent}{local} = {_render_runtime_scalar(leaf)}\n")
+            bindings[leaf] = local
+        return "".join(lines), bindings
+
     def render_prelude_and_expr(
         self,
         carrier_name: str,
         local_name_factory: object,
         prelude_indent: str,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str] | None = None,
+        aux_locals_by_expr: _LeafBindings | None = None,
     ) -> tuple[str, str]:
         """Return ``(prelude, final_expr)``.
 
@@ -1056,20 +1186,20 @@ class Tcgen05UnaryEpilogueChain:
             "splice site (the ast.Name fast path handles them)"
         )
         aux_steps = self.auxiliary_tensor_loads
+        local_bindings: _LeafBindings = aux_locals_by_expr or {}
+        aux_bindings = [
+            key for key in local_bindings if isinstance(key, _AuxiliaryTensorLoadExpr)
+        ]
         if aux_steps:
-            assert aux_locals_by_expr is not None and len(aux_locals_by_expr) == len(
-                aux_steps
-            ), (
+            assert len(aux_bindings) == len(aux_steps), (
                 "auxiliary-tensor chains require one local binding per load leaf; "
-                f"got {len(aux_locals_by_expr) if aux_locals_by_expr is not None else None} "
-                f"bindings for {len(aux_steps)} leaves"
+                f"got {len(aux_bindings)} bindings for {len(aux_steps)} leaves"
             )
-            assert all(step in aux_locals_by_expr for step in aux_steps)
+            assert all(step in local_bindings for step in aux_steps)
         else:
-            assert aux_locals_by_expr is None or not aux_locals_by_expr, (
+            assert not aux_bindings, (
                 "non-auxiliary chains must not be passed aux_locals_by_expr"
             )
-        local_bindings = aux_locals_by_expr or {}
         prelude_lines: list[str] = []
         cur_expr = carrier_name
         local = carrier_name

@@ -598,6 +598,26 @@ TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
 )
 TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY = "tcgen05_sched_stage_count"
 TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
+# Pacing of the scheduler warp's CLC (``clusterlaunchcontrol.try_cancel``)
+# queries.  ``"tile"`` issues the query for the next tile only once the
+# leader CTA's TMA-load warp has started the current one: a named barrier the
+# TMA-load warp arrives at per tile and the scheduler warp syncs on before
+# every query (CUTLASS's CLCThrottlePipeline, Quack's throttle barrier).
+# ``"eager"`` issues it as soon as a scheduler-pipeline stage frees.  With a
+# two-stage scheduler pipeline eager pacing lets every resident cluster fire
+# its second query within ~1 us of launch; under that burst ``try_cancel``
+# answers "no pending cluster" to a third of the clusters while tiles are
+# still pending (quack/AI/clc_spurious_invalid_investigation.md), those
+# clusters retire after two tiles and others run four: the grouped_gemm s2
+# row union (216 pair tiles on 74 resident pairs) took 19.2 us instead of the
+# balanced 15.6 us in two of three calls.
+TCGEN05_CLC_QUERY_PACING_CONFIG_KEY = "tcgen05_clc_query_pacing"
+TCGEN05_CLC_QUERY_PACING_TILE = "tile"
+TCGEN05_CLC_QUERY_PACING_EAGER = "eager"
+TCGEN05_CLC_QUERY_PACINGS = (
+    TCGEN05_CLC_QUERY_PACING_TILE,
+    TCGEN05_CLC_QUERY_PACING_EAGER,
+)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 

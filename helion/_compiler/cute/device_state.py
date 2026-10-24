@@ -830,6 +830,11 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # Name of the CLC throttle named barrier once the TMA-load role has
+        # emitted its per-tile credit (``cute_mma``); the scheduler-warp body
+        # (``program_id``) syncs on it before every CLC query only then, so a
+        # producer path without the credit never leaves the scheduler waiting.
+        self.clc_throttle_barrier: str | None = None
         # The materialized-operand dependency wait was emitted inside the
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
@@ -842,6 +847,10 @@ class CuteDeviceFunctionState:
         # statement after which ``program_id`` re-emits the TMA-load warp's
         # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
         self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
+        # Row-union kernels whose TMA-load role is hoisted: the cluster
+        # ``pipeline_init_wait`` the role executes once in its prelude, after
+        # its scheduler setup and ahead of its persistent loop.
+        self.tcgen05_tma_role_prelude_wait: str | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()

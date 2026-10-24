@@ -20,6 +20,8 @@ from ..cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
 from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_STREAM_COLS
+from ..cute.cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
@@ -56,6 +58,8 @@ from .cute_launch_bounds import MIN_BLOCKS_KEY
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
 
@@ -623,6 +627,17 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 config[MMA_DAG_PERSISTENT_KEY] = persistent[index]
             if index in epilogues:
                 config[MMA_DAG_EPILOGUE_KEY] = epilogues[index]
+            if (
+                mode == MMA_DAG_TCGEN05
+                and spec.cute_mma_dag_epilogue is not None
+                and MMA_DAG_EPILOGUE_STREAMED in spec.cute_mma_dag_epilogue.choices
+                and cls.wide_epilogue_rows(facts, sizes)
+            ):
+                # A thread's row of more than two 64-column chunks spills
+                # held whole across the epilogue: stream it (matmul_layernorm
+                # at 2048^3, 256 columns per thread: 25.4 -> 23.9 us per
+                # call; the 128-column form reads 0.3 us better whole).
+                config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_STREAMED
             if index in lookaheads:
                 config[MMA_DAG_LOOKAHEAD_KEY] = lookaheads[index]
             if index in aux_twins:
@@ -665,6 +680,25 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     continue
             seeds.append(Config.from_dict(config))
         return seeds or None
+
+    @classmethod
+    def wide_epilogue_rows(
+        cls, facts: CuteMmaDagFacts, sizes: Mapping[int, object]
+    ) -> bool:
+        """Whether some epilogue store's fragment row holds more than
+        ``MMA_DAG_EPILOGUE_STREAM_COLS`` fp32 columns per thread at
+        ``sizes`` (a 64-row fragment's lanes hold half rows)."""
+        tc = facts.tcgen05
+        if tc is None:
+            return False
+        for slot in tc.root_store_slots:
+            rows_axis, cols_axis = facts.frags[slot]
+            rows = facts.block_size(rows_axis, sizes) or 0
+            cols = facts.block_size(cols_axis, sizes) or 0
+            local = cols if rows > 64 else cols // 2
+            if local > MMA_DAG_EPILOGUE_STREAM_COLS:
+                return True
+        return False
 
     @classmethod
     def streaming_regions(cls, facts: CuteMmaDagFacts) -> bool:

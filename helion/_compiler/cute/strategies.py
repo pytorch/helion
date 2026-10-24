@@ -538,6 +538,37 @@ TCGEN05_BATCH_RASTER_CHOICES: tuple[str, ...] = (
 TCGEN05_BATCH_RASTER_DEFAULT = TCGEN05_BATCH_RASTER_FASTEST
 
 
+# How a static-persistent clustered tcgen05 launch caps its grid when the
+# problem holds more clusters than the device co-schedules.  ``sm_pairs``
+# (the historical cap) grants one SM pair per CTA pair regardless of
+# ``cluster_n``, so a ``cluster_n=2`` grid may launch twice the resident
+# cluster count: the surplus clusters become a second hardware wave whose
+# CTAs each run one tile with a cold prologue and an exposed epilogue.
+# ``resident_clusters`` caps the launch at the device's co-resident
+# whole-cluster count (``helion.runtime.get_max_active_clusters``), so the
+# persistent CTAs recycle their pipelines across tiles and the epilogue of
+# one tile overlaps the mainloop of the next.  Batched clustered grids
+# already use the resident-cluster cap; the knob is inert there and on
+# ``cluster_n=1`` grids (both caps agree).
+TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY = "tcgen05_persistent_grid_cap"
+TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS = "sm_pairs"
+TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS = "resident_clusters"
+TCGEN05_PERSISTENT_GRID_CAP_CHOICES: tuple[str, ...] = (
+    TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS,
+    TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS,
+)
+TCGEN05_PERSISTENT_GRID_CAP_DEFAULT = TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS
+
+
+def persistent_grid_cap_from_config(config: Mapping[str, object]) -> str:
+    """Decode ``tcgen05_persistent_grid_cap`` (default ``sm_pairs``)."""
+    value = config.get(
+        TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY, TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+    )
+    assert value in TCGEN05_PERSISTENT_GRID_CAP_CHOICES, value
+    return str(value)
+
+
 def batch_raster_from_config(config: Mapping[str, object]) -> str:
     """Decode ``tcgen05_batch_raster`` (default ``batch_fastest``)."""
     value = config.get(TCGEN05_BATCH_RASTER_CONFIG_KEY, TCGEN05_BATCH_RASTER_DEFAULT)

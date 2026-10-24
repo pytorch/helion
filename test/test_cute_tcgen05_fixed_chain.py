@@ -451,6 +451,95 @@ def test_initial_prefill_acquires_skip_the_fresh_ring_wait(
     assert kernel.count(KLOOP_ACQUIRE) >= 1
 
 
+def test_batched_gemm_rides_the_two_cta_paired_schedule() -> None:
+    # A leading batch axis is admitted to the explicit CtaGroup.TWO family:
+    # the paired SMEM facts analyze the rank-3 operands, the search enables
+    # the paired family, and the kernel is the role-local two-CTA schedule with
+    # the batch as the scheduler's third dimension (bmm 8 x 256x256x512: 8 x
+    # (256/128) x (256/64) = 64 pairs). The 2x2 cluster of pairs rides along.
+    bound = _bind_bmm((8, 256, 256, 512), torch.float16)
+    with bound.env:
+        state = bound.config_spec._cute_tcgen05_config
+        assert state.pipeline_smem_facts is not None
+        assert state.paired_pipeline_search_enabled()
+    for cluster_n in (1, 2):
+        requested = helion.Config(
+            block_sizes=[1, 128, 64, 64],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+            tcgen05_cta_group="two",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=cluster_n,
+            tcgen05_ab_stages=8,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        with bound.env:
+            config = bound.config_spec.normalized_config(requested)
+        assert config.config["tcgen05_cta_group"] == "two"
+        assert config.config["tcgen05_ab_stages"] == 8
+        source = bound.to_code(config)
+        kernel = _kernel_body(source)
+        assert f"_helion_cute_cluster_shape = (2, {cluster_n}, 1)" in source
+        assert "CtaGroup.TWO" in kernel
+        assert "'use_2cta_instrs': True" in source
+        params = re.search(r"PersistentTileSchedulerParams\(.*", kernel)
+        assert params is not None, kernel
+        assert "8" in params.group(0)
+
+
+def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
+    # bmm 7 x 384x192x512 at bn=64: three N tiles cannot be paired on the
+    # scheduler's N dimension, so the paired two-CTA family rejects
+    # cluster_n=2 at normalization (codegen used to raise instead); the
+    # search repair projects the sample onto cluster_n=1.  The L2 raster
+    # knobs that would re-pair the cluster lanes on (batch, m) are rejected
+    # the same way on an even tile count.
+    bound = _bind_bmm((7, 384, 192, 512), torch.float16)
+
+    def paired(bn: int, **overrides: object) -> helion.Config:
+        values: dict[str, object] = {
+            "block_sizes": [1, 128, bn, 64],
+            "loop_orders": [[0, 1, 2]],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cta_group": "two",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 2,
+            "tcgen05_ab_stages": 4,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+        values.update(overrides)
+        return helion.Config(**values)
+
+    with bound.env:
+        spec = bound.config_spec
+        with pytest.raises(helion.exc.InvalidConfig, match="cta_group='two'"):
+            spec.normalized_config(paired(64))
+        repaired = dict(paired(64).config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert repaired["tcgen05_cta_group"] == "two"
+        assert repaired["tcgen05_cluster_n"] == 1
+    even = _bind_bmm((8, 256, 256, 512), torch.float16)
+    with even.env:
+        spec = even.config_spec
+        for requested in (
+            paired(64, l2_groupings=[2]),
+            paired(64, tcgen05_l2_swizzle_size=2),
+        ):
+            with pytest.raises(helion.exc.InvalidConfig, match="cta_group='two'"):
+                spec.normalized_config(requested)
+            repaired = dict(requested.config)
+            spec.normalize(repaired, _fix_invalid=True)
+            # The repaired sample is a valid pair (the search projection
+            # keeps its own raster rule for cluster_n).
+            assert repaired["tcgen05_cta_group"] == "two"
+            assert spec.normalized_config(helion.Config(**repaired)).config == repaired
+        config = spec.normalized_config(paired(64))
+        assert config.config["tcgen05_cluster_n"] == 2
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in even.to_code(config)
+
+
 def test_batched_gemm_with_more_tiles_than_sms_keeps_the_persistent_loop() -> None:
     kernel = _kernel_body(
         _source(
@@ -736,6 +825,25 @@ def test_lifecycle_epilogue_free_leaves_only_the_tails_in_the_teardown() -> None
         "if exec_w:\n    acc_pipe.producer_tail(acc_pstate)",
         "if w0:\n    c.producer_tail()",
     ]
+
+
+def test_lifecycle_mma_warp_free_drains_the_stores_once() -> None:
+    # The two-CTA row-union teardown (MMA warp frees TMEM) issues the store
+    # drain exactly once: after the dealloc when ``drain_after_dealloc`` is
+    # set, else at the top as every other teardown does.
+    for drain_after_dealloc in (False, True):
+        lines = _lifecycle(
+            is_two_cta=True,
+            tmem_permit_released_early=True,
+            mma_warp_frees_tmem=True,
+            exec_acc_tmem_ptr="exec_ptr",
+            drain_after_dealloc=drain_after_dealloc,
+        ).render_store_post_loop_lines(tma_store_pipeline_tail="drain()")
+        assert lines.count("drain()") == 1
+        free = next(
+            i for i, line in enumerate(lines) if "tmem_alloc.free(exec_ptr)" in line
+        )
+        assert (lines.index("drain()") > free) is drain_after_dealloc
 
 
 def test_lifecycle_default_teardown_is_unchanged() -> None:

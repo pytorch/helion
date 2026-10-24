@@ -269,26 +269,35 @@ def test_generated_int32_intervals_match_original_initializer(
     old, new = case[2:]
     old_code = _metadata_code(old)
     tree = ast.parse(new)
-    statements = []
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_"):
-            statements = [
-                child
-                for child in node.body
-                if (
-                    isinstance(child, ast.Assign)
-                    and ast.unparse(child.targets[0])
-                    in {"row_union_starts", "row_union_ends"}
-                )
-                or (
-                    isinstance(child, ast.If)
-                    and any(
-                        isinstance(inner, ast.For)
-                        and ast.unparse(inner.target) == "row_union_group"
-                        for inner in child.body
-                    )
-                )
-            ]
+    device = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    # The interval setup is epilogue-role prelude (inside the epilogue warps'
+    # role block, behind that role's dependent-launch wait), not prologue.
+    role_block = next(
+        node
+        for node in device.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(inner, ast.For)
+            and ast.unparse(inner.target) == "row_union_group"
+            for inner in node.body
+        )
+    )
+    statements = [
+        child
+        for child in role_block.body
+        if (
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) in {"row_union_starts", "row_union_ends"}
+        )
+        or (
+            isinstance(child, ast.For)
+            and ast.unparse(child.target) == "row_union_group"
+        )
+    ]
     assert len(statements) == 3
     code = compile(ast.Module(body=statements, type_ignores=[]), "<row-union>", "exec")
     for offsets in (
@@ -640,20 +649,35 @@ def test_packet_predicate_stores_only_selected_in_bounds_elements(
 
 @skipUnlessBackends(["cute"])
 def test_grouped_kernels_wait_at_entry_under_cute_pdl(case: tuple) -> None:
-    """The grouped persistent kernels read the group layout in their prologue,
-    ahead of any role-local wait, so ``cute_pdl`` gives them the entry wait
-    (the body's first statement) and the launch attribute."""
+    """The grouped persistent kernel reads the group layout in its prologue,
+    ahead of any role-local wait, so ``cute_pdl`` gives it the entry wait
+    (the body's first statement) and the launch attribute.  The row-union
+    kernel reads the group offsets inside its epilogue role behind that
+    role's wait, so it needs no entry wait and its prologue overlaps the
+    previous kernel."""
+    from helion._compiler.cute.pdl_coverage import waits_cover_global_reads
+
     bound = case[0]
-    for config in (_old_config(None), _selected(bound)):
+    for config, entry_wait in ((_old_config(None), True), (_selected(bound), False)):
         with_knob = deepcopy(config)
         with_knob.config["cute_pdl"] = True
         source = bound.to_code(with_knob)
         assert "'use_pdl': True" in source
-        body = source[source.index("@cute.kernel") :]
-        lines = [line for line in body.splitlines()[1:] if line.strip()]
-        signature_end = next(
-            i for i, line in enumerate(lines) if line.rstrip().endswith(":")
+        device = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
         )
-        assert lines[signature_end + 1].strip() == "cute.arch.griddepcontrol_wait()"
+        first = ast.unparse(device.body[0]) == "cute.arch.griddepcontrol_wait()"
+        assert first is entry_wait
+        if not entry_wait:
+            assert waits_cover_global_reads(device.body)
+            epilogue = next(
+                node
+                for node in device.body
+                if isinstance(node, ast.If)
+                and any("group_offsets.iterator" in ast.unparse(n) for n in node.body)
+            )
+            assert ast.unparse(epilogue.body[0]) == "cute.arch.griddepcontrol_wait()"
         plain = bound.to_code(config)
         assert "griddepcontrol" not in plain[plain.index("@cute.kernel") :]

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from ..host_function import HostFunction
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_epilogue import _AuxiliaryTensorExprStep
-    from .cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .cute_epilogue import _LeafBindings
     from .device_state import CuteTcgen05StoreValue
 
 
@@ -272,6 +272,9 @@ class PairedFanoutPlan:
     # both chains are identical and the second output copies that value directly.
     rounded_suffix: bool
     pre_wait_aux_safe: bool = False
+    # True: the second chain continues from the shared prefix's FP32 value (the
+    # value the first store rounds), e.g. ``aux = pre.to(f16); out = gelu(pre)``.
+    unrounded_prefix: bool = False
 
 
 def _output_rounding_step(dtype: torch.dtype) -> _AuxiliaryTensorExprStep:
@@ -298,23 +301,35 @@ def shared_prefix(
     second: Tcgen05UnaryEpilogueChain,
     dtype: torch.dtype,
     prefix_dtype: torch.dtype | None,
-) -> tuple[int, bool] | None:
-    """Compare complete typed expression nodes, including rounding templates."""
+) -> tuple[int, bool, bool] | None:
+    """Compare complete typed expression nodes, including rounding templates.
+
+    Returns ``(prefix_steps, rounded_suffix, unrounded_prefix)``. The whole
+    first chain is the shared prefix (its auxiliary leaves included: the
+    second store re-emits the same per-subtile loads, which are dead when the
+    prefix already consumed them). The second chain either repeats the prefix
+    exactly (the second output copies the first), consumes the first output's
+    rounded value (an explicit cast to the output dtype, or a prefix already
+    computed in it), or continues from the prefix's FP32 value as the FX
+    graph does (``aux = pre.to(f16); out = gelu(pre)``).
+    """
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
     count = len(first.steps)
-    if not count or first.auxiliary_tensor_loads or second.steps[:count] != first.steps:
+    # Aux leaves are identity-keyed and rebuilt per walker; compare the stable
+    # chain keys (FX load identity, broadcast axis, template) instead.
+    if not count or _chain_key(second)[:count] != _chain_key(first):
         return None
     if len(second.steps) == count:
-        return count, False
+        return count, False, False
     # A low-precision operation already rounds its result. Its consumer need
     # not contain a redundant explicit cast to the first output's dtype.
     if (
         second.steps[count] != _output_rounding_step(dtype)
         and prefix_dtype is not dtype
     ):
-        return None
-    return count, True
+        return count, True, True
+    return count, True, False
 
 
 def prove_paired_fanout(
@@ -327,6 +342,7 @@ def prove_paired_fanout(
     from ...language import _tracing_ops
     from ...language import memory_ops
     from ..indexing_strategy import exact_tile_block_ids
+    from .cute_epilogue import _ZERO_ARG_TARGETS
     from .cute_epilogue import _node_tensor_dtype
     from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
     from .cute_fx_walk import build_inner_outputs_index_from_graphs
@@ -426,18 +442,21 @@ def prove_paired_fanout(
             if target is None or target.untyped_storage()._cdata in output_storage:
                 return None
         elif between and (
-            not _ordinary_operation(node)
+            # The chain's own elementwise helpers (``_gelu_erf`` ...) are pure
+            # Python-level targets the aten predicate does not know.
+            not (_ordinary_operation(node) or node.target in _ZERO_ARG_TARGETS)
             or _tracing_ops.is_for_loop_target(node.target)
             or node.target is _tracing_ops._if
         ):
             return None
+    # Row-vector (``bias[tile_n]``) and exact-shape leaves alike: the second
+    # store's per-subtile loads are emitted next to the first's and read the
+    # same aliasing-free storage; a leaf of the shared prefix is simply dead
+    # in the second chain. The splice declines the SMEM-staged rowvec forms,
+    # whose per-store stage and barrier do not compose.
     for load in chains[1].auxiliary_tensor_loads:
         target = _access_tensor(load.load_node)
-        if (
-            load.broadcast_axis is not None
-            or target is None
-            or target.untyped_storage()._cdata in writes
-        ):
+        if target is None or target.untyped_storage()._cdata in writes:
             return None
     assert len(axes[0]) == 2
     return PairedFanoutPlan(
@@ -452,11 +471,12 @@ def prove_paired_fanout(
         # Fresh factories are disjoint on every call, unlike sampled argument
         # storage IDs. Reject other writers throughout the enclosing regions.
         all(
-            _ordinary_operation(node)
+            (_ordinary_operation(node) or node.target in _ZERO_ARG_TARGETS)
             and (node.target is not memory_ops.store or _access_tensor(node) in fresh)
             for info in graphs
             for node in info.graph.nodes
         ),
+        unrounded_prefix=common[2],
     )
 
 
@@ -466,7 +486,6 @@ def schedule_supported(config: dict[str, object]) -> bool:
         "pid_type": "persistent_interleaved",
         "tcgen05_strategy": "role_local_monolithic",
         "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_cluster_n": 1,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_warp_spec_mma_warps": 1,
         "tcgen05_warp_spec_ab_load_warps": 1,
@@ -487,6 +506,10 @@ def schedule_supported(config: dict[str, object]) -> bool:
         )
         and type(config.get("tcgen05_cluster_m", 1)) is int
         and config.get("tcgen05_cluster_m", 1) in (1, 2)
+        # The cluster's N multicast only shapes the mainloop and the tile
+        # scheduler; the shared store traversal is per CTA.
+        and type(config.get("tcgen05_cluster_n", 1)) is int
+        and config.get("tcgen05_cluster_n", 1) in (1, 2)
         and config.get("tcgen05_cta_group", "auto")
         in (
             ("auto", "two")
@@ -556,7 +579,7 @@ def render_chain(
     carrier: str,
     new_var: Callable[[str], str],
     indent: str,
-    aux: dict[_AuxiliaryTensorLoadExpr, str],
+    aux: _LeafBindings,
 ) -> RenderedChain:
     source: list[str] = []
     all_variables: list[tuple[tuple[str, str], ...]] = []
@@ -609,9 +632,13 @@ def render_shared_suffix(
     rendered: RenderedChain,
     first_value: str,
     indent: str,
-    aux: dict[_AuxiliaryTensorLoadExpr, str],
+    aux: _LeafBindings,
 ) -> tuple[str, str]:
-    """Replay the old suffix names, replacing only its proved redundant cast."""
+    """Replay the old suffix names, replacing only its proved redundant cast.
+
+    ``first_value`` is the first output's rounded value, or the prefix's FP32
+    value when the plan continues from it (``unrounded_prefix``).
+    """
     assert _chain_key(rendered.chain) == _chain_key(plan.chains[1])
     if not plan.rounded_suffix:
         return "", first_value
@@ -621,10 +648,13 @@ def render_shared_suffix(
     from .cute_epilogue import _UnaryTensorExpr
 
     source: list[str] = []
-    has_cast = rendered.chain.steps[plan.prefix_steps] == _output_rounding_step(
-        plan.output_dtype
-    )
-    carrier = first_value if has_cast else f"{first_value}.to(cutlass.Float32)"
+    has_cast = not plan.unrounded_prefix and rendered.chain.steps[
+        plan.prefix_steps
+    ] == _output_rounding_step(plan.output_dtype)
+    if plan.unrounded_prefix:
+        carrier = first_value
+    else:
+        carrier = first_value if has_cast else f"{first_value}.to(cutlass.Float32)"
     for index in range(plan.prefix_steps, len(rendered.chain.steps)):
         step = rendered.chain.steps[index]
         if index == plan.prefix_steps and has_cast:
@@ -658,7 +688,7 @@ class FanoutIteration:
     release: str
     register_store: str
     chain: RenderedChain
-    auxiliary_names: dict[_AuxiliaryTensorLoadExpr, str]
+    auxiliary_names: _LeafBindings
     pre_wait_aux: bool = False
 
 
@@ -705,7 +735,13 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
     left, right = first.iteration, second.iteration
     assert _chain_key(left.chain.chain) == _chain_key(plan.chains[0])
     suffix, result = render_shared_suffix(
-        plan, right.chain, left.value_name, "        ", right.auxiliary_names
+        plan,
+        right.chain,
+        # The prefix's FP32 value is the first chain's final step; the first
+        # output's rounded value is its assignment.
+        left.chain.result if plan.unrounded_prefix else left.value_name,
+        "        ",
+        right.auxiliary_names,
     )
     pre_wait_aux = left.pre_wait_aux
     body = (

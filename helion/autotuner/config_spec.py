@@ -107,6 +107,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
@@ -143,6 +144,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
 from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
+from .._compiler.cute.cute_mma_dag import epilogue_knob_admitted
 from .._compiler.cute.cute_mma_dag import fixup_admitted
 from .._compiler.cute.cute_mma_dag import mma_dag_aux_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_epilogue_reason
@@ -3510,7 +3512,17 @@ class ConfigSpec:
         if facts.aux_candidates:
             self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
         self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
-        self.cute_mma_dag_epilogue = EnumFragment(choices=MMA_DAG_EPILOGUE_CHOICES)
+        # ``streamed`` is offered only where a root block without derived
+        # values stores fragments; elsewhere the knob keeps row / split.
+        self.cute_mma_dag_epilogue = EnumFragment(
+            choices=MMA_DAG_EPILOGUE_CHOICES
+            if epilogue_knob_admitted(facts)
+            else tuple(
+                choice
+                for choice in MMA_DAG_EPILOGUE_CHOICES
+                if choice != MMA_DAG_EPILOGUE_STREAMED
+            )
+        )
         self.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
         if facts.tcgen05 is not None and (
             not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
@@ -3564,9 +3576,14 @@ class ConfigSpec:
             (MMA_DAG_LOOKAHEAD_KEY, self.cute_mma_dag_lookahead),
         ):
             if fragment is None:
-                # The aux knob has no subject here: inert, no choices.
-                assert key == MMA_DAG_AUX_KEY
-                config[key] = MMA_DAG_AUX_CHOICES[0]
+                # The aux / epilogue knob has no subject here: inert, no
+                # choices.
+                assert key in (MMA_DAG_AUX_KEY, MMA_DAG_EPILOGUE_KEY)
+                config[key] = (
+                    MMA_DAG_AUX_CHOICES[0]
+                    if key == MMA_DAG_AUX_KEY
+                    else MMA_DAG_EPILOGUE_ROW
+                )
                 continue
             value = config.setdefault(key, fragment.default())
             if value not in fragment.choices or type(value) is bool:
@@ -3950,6 +3967,9 @@ class ConfigSpec:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
         if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        else:
+            # The epilogue form is the tensor-memory region renderer's.
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
         # Inert knobs: the body is replaced, so equal kernels share one
         # autotune identity (the occupancy hint stays searchable).  The
         # persistent tcgen05 launch is the generic persistent_interleaved
@@ -4593,6 +4613,8 @@ class ConfigSpec:
         cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        ab_stages_three_output_dtype_bytes: int | None = None,
+        ab_stages_three_output_stores: int = 1,
         reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
@@ -4605,6 +4627,8 @@ class ConfigSpec:
             cluster_m2_one_wave_only=cluster_m2_one_wave_only,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+            ab_stages_three_output_dtype_bytes=ab_stages_three_output_dtype_bytes,
+            ab_stages_three_output_stores=ab_stages_three_output_stores,
         )
         _record_restriction(
             self.restriction_reasons,
