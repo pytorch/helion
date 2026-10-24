@@ -150,12 +150,19 @@ def emit_flash_fa4_alt_device_body(
     e2e_res: int,
     kv_group: int = 1,
     relu_output: bool = False,
+    v_storage_k_major: bool = False,
 ) -> list[ast.stmt]:
     """Emit the alternating-warpgroup device body (see the module docstring).
 
     ``kv_group`` is the grouped-query divisor: K/V carry ``batch // kv_group``
     entries and are read at batch head ``flash_bh // kv_group``.
     ``relu_output`` applies the output ReLU epilogue in the correction warps.
+    ``v_storage_k_major`` is V's storage fact
+    (``FlashGraphOutputPlan.v_storage_k_major``): a dense ``[b, d, s]``
+    buffer is the K-major B operand of the PV MMA, the canonical ``[b, s, d]``
+    buffer the MN-major one; the host builds ``_flash_pv_mma`` and the V
+    staging layout from the same fact, so the descriptor's major mode here
+    must agree with them.
     """
     hd = head_dim
     assert hd in FA4_ALT_HEAD_DIMS
@@ -501,9 +508,10 @@ def emit_flash_fa4_alt_device_body(
     s.line(4, "flash_o_addr = tOtO.iterator.toint()")
     s.line(4, "flash_pa_addr = tStPa.iterator.toint()")
     s.line(4, "flash_pb_addr = tStPb.iterator.toint()")
+    v_major = "K" if v_storage_k_major else "MN"
     s.line(
         4,
-        "flash_v_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.MN)",
+        f"flash_v_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.{v_major})",
     )
     s.line(
         4,

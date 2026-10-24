@@ -391,6 +391,7 @@ def test_resolver_pins_the_structure() -> None:
     assert cfg.e2e_offset0 == cfg.e2e_offset == 11
     assert cfg.exp2_packet == "8x2" and cfg.e2e_schedule == "16/6"
     assert cfg.rescale_threshold == 12.0 and cfg.corr_tile_size == 8
+    assert cfg.o_stage == 2
     assert cute_flash.flash_effective_config_values(cfg)[FAMILY_KEY] == "fa4_alt"
 
 
@@ -399,6 +400,34 @@ def test_k_ring_depth_is_two_or_three(requested: int, expected: int) -> None:
     cfg = _resolve({**_ALT, "cute_flash_kv_stage": requested})
     assert cfg.kv_stage == expected
     assert FA4_ALT_V_STAGE == 2
+
+
+def test_shared_output_tile_request_resolves_to_the_two_q_stages() -> None:
+    """The fa4 pair body's shared staged output tile (``cute_flash_o_stage``
+    = 1) has no counterpart here: the body stages each item's output through
+    its own finished Q stage (``sO`` aliases the two Q stages), and the host
+    builds ``_flash_osl`` from the resolved tile count.  An honoured request
+    gave the launcher a one-tile layout under which stage 1 addressed tile 0
+    -- the next item's Q, loaded there meanwhile -- so the third item of every
+    persistent CTA read a clobbered Q (the (2, 16, 2048, 128) campaign
+    winner: 148 wrong tiles, racy).  The request resolves to two tiles on the
+    resolver and on the family's search surface; the pair body keeps it."""
+    cfg = _resolve({**_ALT, cute_flash.FLASH_O_STAGE_KEY: 1})
+    assert cfg.alternating_warpgroups
+    assert cfg.o_stage == 2
+    pair = _resolve({**_ALT, FAMILY_KEY: "fa4", cute_flash.FLASH_O_STAGE_KEY: 1})
+    assert not pair.alternating_warpgroups
+    assert pair.o_stage == 1
+    fragments = cute_flash.flash_autotune_fragments(
+        128,
+        16,
+        num_bh=32,
+        dtype=torch.bfloat16,
+        plain_row_body=True,
+        pipeline_family_override="fa4_alt",
+    )
+    fragment = cast("Any", fragments[cute_flash.FLASH_O_STAGE_KEY])
+    assert tuple(fragment.search_choices or ()) == (2,)
 
 
 def test_fa4_structural_knobs_normalize_to_one_effective_config() -> None:
@@ -413,6 +442,7 @@ def test_fa4_structural_knobs_normalize_to_one_effective_config() -> None:
         {"cute_flash_persistent_loop": "counted"},
         {"cute_flash_other_regs": 48, "cute_flash_softmax_regs": 200},
         {"cute_flash_e2e_offset0": 3},
+        {cute_flash.FLASH_O_STAGE_KEY: 1},
     ):
         assert (
             cute_flash.flash_effective_config_values(_resolve({**_ALT, **overrides}))
@@ -950,6 +980,39 @@ def test_only_alternating_modules_import_the_family_runtime() -> None:
     assert "_helion_flash_alt_rt.flash_fa4_alt_shared_storage(" in alt_src
     assert "_helion_flash_alt_rt" not in fa4_src
     assert "import helion._compiler.cute._flash_runtime as _helion_flash_rt" in fa4_src
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_shared_output_tile_request_runs_the_two_tile_body() -> None:
+    """The (2, 16, 2048, 128) bf16 campaign winner carried
+    ``cute_flash_o_stage`` = 1 on this family: 512 items over 148 CTAs, and
+    the third item of every CTA read a Q tile the previous item's output
+    staging had overwritten (148 wrong tiles, a race).  The request renders
+    the two-tile program -- the same code, no ``o_stage`` in the host plan --
+    and its output is bitwise the two-tile run's, within SDPA's bf16 noise."""
+    torch.manual_seed(1)
+    q, k, v = (
+        torch.randn(2, 16, 2048, 128, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    shared = {**_ALT, cute_flash.FLASH_O_STAGE_KEY: 1}
+
+    def render(config: dict[str, object]) -> str:
+        bound = cast("Any", _kernel(config)).bind((q, k, v))
+        return bound.to_code(
+            bound._normalized_config_copy(helion.Config.from_dict(config))
+        )
+
+    shared_src = render(shared)
+    assert "'o_stage'" not in shared_src
+    assert shared_src == render(_ALT)
+    out_ref, _ = _reference(q, k, v)
+    out_two, lse_two = _run(_ALT, q, k, v)
+    out_one, lse_one = _run(shared, q, k, v, launches=3)
+    assert torch.equal(out_one, out_two)
+    assert torch.equal(lse_one, lse_two)
+    assert (out_one.float() - out_ref.float()).abs().max().item() < 1e-2
 
 
 @skipIfNotCUDA()

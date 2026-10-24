@@ -4384,7 +4384,8 @@ def test_flex_hook_fast_full_knob_is_legal_on_the_list_walk() -> None:
     """``cute_flash_flex_hook_fast_full``: appended last; on the list walk
     (any walk form), off by default and off the list walk."""
     key = cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    # Appended after the flex axes (new axes go last; later knobs follow it).
+    assert key in cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
     assert _resolve(BODY).flex_hook_fast_full is False
     assert _resolve({**BODY, key: True}).flex_hook_fast_full is True
     assert (
