@@ -480,11 +480,11 @@ Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Tri
 
 class TritonUnrecoverableRuntimeError(BaseError):
     message = """\
-An unrecoverable Triton runtime error occurred: {reason}.
-This likely indicates a bug in Triton and cannot be recovered from.
+An unrecoverable device-side error occurred while running a candidate in the autotuning process: {reason}.
+The error is sticky: the CUDA context is poisoned and tuning cannot continue.
 {decorator}
 Original error: {error}
-Set HELION_AUTOTUNE_PRECOMPILE="spawn" to isolate these errors in a subprocess so tuning can continue."""
+Candidates run in this process, not in the killable benchmark worker that would have isolated the fault, because {isolation}."""
 
 
 class BaseWarning(_FixedMessage):

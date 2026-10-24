@@ -257,8 +257,10 @@ def tile_key(program: MmaDagProgram, operand: Operand) -> tuple[object, ...]:
     and transposed hold the same bytes)."""
     load = operand.load
     if load is None:
-        # A fragment read straight and transposed needs two tiles (both
-        # read K-major; the transposed one is written transposed).
+        # A fragment's tile is its pointwise chain: a fragment read straight
+        # and transposed shares one tile (dqkg's dA, the K-major A of the dq
+        # dot and the MN-major A of the dk dot), which ``tile_mn_major``
+        # puts under the 32-byte-unit swizzle.
         return operand.chain_key
     if operand.aux_loads:
         return operand.chain_key
