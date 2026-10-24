@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
-from ..language import _MEMORY_OPS
 from ..language.matmul_ops import MATMUL_FACT_ID_META
-from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
 from .inductor_lowering import ReductionLowering
+from .loop_dependency_checker import memory_write_target
 from .utils import compute_slice_size
 
 if TYPE_CHECKING:
@@ -80,12 +79,10 @@ def unused_block_ids(
             # Scalar stores have no tensor result carrying full-slice axes.
             # Match their logical extents directly: compute_shape can allocate
             # new reduction dimensions, which this liveness analysis must not do.
-            if (
-                node.target in _MEMORY_OPS
-                and node.target is not load
-                and isinstance(node.args[1], (list, tuple))
+            if (target := memory_write_target(node)) is not None and isinstance(
+                node.args[1], (list, tuple)
             ):
-                tensor = torch.fx.map_arg(node.args[0], lambda n: n.meta["val"])
+                tensor = torch.fx.map_arg(target, lambda n: n.meta["val"])
                 if isinstance(tensor, tuple):
                     tensor = tensor[0]
                 assert isinstance(tensor, torch.Tensor)

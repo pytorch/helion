@@ -586,7 +586,7 @@ def test_memory_proof_covers_every_pair_involving_a_writer() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ) as disjoint,
     ):
@@ -648,7 +648,7 @@ def test_memory_proof_rejects_stride_tail_and_slot_failures(
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ),
     ):
@@ -671,7 +671,7 @@ def test_memory_proof_rejects_unproved_alias() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             side_effect=(True, False, True),
         ),
     ):
@@ -725,7 +725,7 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ),
     ):

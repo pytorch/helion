@@ -16,6 +16,24 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def latency_field(candidates: list[dict[str, Any]]) -> str:
+    """The sustained per-call time of a graph grown past the event timer's
+    quantum (graph_long_ms) when every candidate has it, else the 16-call
+    graph's (graph_calls_ms), else the autotuner-regime cold-L2 time
+    (bench_ms), else the single-call replay time (whose launch-latency quantum
+    hides sub-20 us differences). One field per (module, case, shape) row
+    keeps each comparison like for like."""
+    for field in ("graph_long_ms", "graph_calls_ms", "bench_ms"):
+        if all(
+            isinstance(row.get(field), (int, float))
+            and math.isfinite(row[field])
+            and row[field] > 0
+            for row in candidates
+        ):
+            return field
+    return "graph_ms"
+
+
 def aggregate(run: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
     if run["schema"] != "example-backend-comparison-v1" or run["status"] != "complete":
         raise ValueError("Expected a completed example comparison")
@@ -94,11 +112,15 @@ def aggregate(run: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, A
                 "shape": shape,
                 "status": "incomplete",
             }
+            field = latency_field(
+                [c for provider in providers.values() for c in provider]
+            )
+            row["latency_field"] = field
             for provider in ("cute", "triton", "baselines"):
                 candidates = providers[provider]
                 if candidates:
-                    best = min(candidates, key=operator.itemgetter("graph_ms"))
-                    row[f"{provider}_ms"] = best["graph_ms"]
+                    best = min(candidates, key=operator.itemgetter(field))
+                    row[f"{provider}_ms"] = best[field]
                     row[f"{provider}_impl"] = best["impl"]
             if inventories.get((module, shape), {}).get("status") == "ok" and all(
                 providers[provider] for provider in ("cute", "triton", "baselines")

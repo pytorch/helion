@@ -47,22 +47,53 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
     seeds = CuteNestedRowHeuristic.get_seed_configs(bound.env, ir)
     assert seeds
     assert all(seed in spec.compiler_seed_configs for seed in seeds)
+    # The gathers vectorize along the features (four fp32 per 16-byte packet)
+    # only when the feature extent is a multiple of the packet (69 is not)
+    # and the flattened view's base alignment is provable: a dynamic-shape
+    # view carries a symbolic storage offset, which no bound residue covers.
+    sunk = [seed for seed in seeds if seed.config.get("cute_vloop_sink")]
+    assert bool(sunk) == (columns % 4 == 0 and static_shapes)
     for seed in seeds:
         normalized = seed.config.copy()
         spec.normalize(normalized)
         assert normalized["num_threads"] == seed.config["num_threads"]
+        vectorized = seed.config.get("cute_vloop_sink") is True
         with bound.env:
-            assert tile_loop_thread_count(bound.env, ir, ir.graphs, seed) <= 256
+            assert tile_loop_thread_count(bound.env, ir, ir.graphs, seed) <= (
+                512 if vectorized else 256
+            )
         for root, feature, reduction in paths:
             assert spec.num_threads.config_get(seed.num_threads, root[0]) == 1
-            assert spec.num_threads.config_get(seed.num_threads, reduction[0]) == 1
-            assert spec.num_threads.config_get(seed.num_threads, feature[0]) > 1
+            feature_threads = spec.num_threads.config_get(seed.num_threads, feature[0])
+            reduction_threads = spec.num_threads.config_get(
+                seed.num_threads, reduction[0]
+            )
+            feature_tile = spec.block_sizes.config_get(seed.block_sizes, feature[0])
+            widths = seed.config["cute_vector_widths"]
+            if vectorized:
+                # V contiguous features per thread, the rest of the block
+                # along the jagged rows; registers kept for the rows in flight.
+                assert spec.cute_vector_widths.config_get(widths, feature[0]) == 4
+                assert spec.cute_vector_widths.config_get(widths, reduction[0]) == 1
+                assert feature_threads * 4 == feature_tile
+                assert reduction_threads > 1
+                assert seed.config["cute_lane_unroll"] in (1, 2, 4, 8)
+                assert seed.config["cute_min_blocks_per_mp"] == 1
+            else:
+                assert reduction_threads == 1
+                assert feature_threads > 1
         with patch(
             "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
             return_value=232448,
         ):
             source = bound.to_code(seed)
         assert "def _helion_jagged_layer_norm_kernel" in source
+        if vectorized:
+            # Every pass gathers its rows as predicated 16-byte packets, and
+            # the normalized rows are stored as packets.
+            assert source.count("_cute_load_v16b_if(x_flat.iterator") >= 3
+            assert "_cute_store_u32_vec(out_flat.iterator" in source
+            assert "x_flat.layout.stride[0])).load()" not in source
 
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
@@ -92,6 +123,17 @@ def test_nested_jagged_default_is_the_primary_seed(
     assert default.num_threads == primary.num_threads
     for _, feature, _ in tile_loop_paths(host.device_ir, host.device_ir.graphs):
         assert spec.num_threads.config_get(default.num_threads, feature[0]) > 1
+    # On sm_90+ the seeded default launches as a programmatic dependent of
+    # the previous kernel: its launch and prologue overlap that kernel's
+    # tail (16 rows x 32 features: 2.17 -> 2.05 us per call in a stream of
+    # calls), and it waits ahead of its first global access.
+    assert default.config["cute_pdl"] is True
+    with patch(
+        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        return_value=232448,
+    ):
+        source = bound.to_code(default)
+    assert "griddepcontrol" in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -109,6 +151,35 @@ def test_nested_jagged_default_matches_reference(static_shapes: bool) -> None:
         static_shapes=static_shapes,
         autotune_effort="none",
     )
+    torch.testing.assert_close(
+        kernel(x, x_offsets, 1e-6),
+        reference_jagged_layer_norm_pytorch(x, x_offsets, 1e-6),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nested_jagged_vectorized_default_matches_reference() -> None:
+    # 128 features, static shapes: the primary seed vectorizes the gathers
+    # (V-loop sunk, packet loads and stores, lane-folded mean and variance).
+    static_shapes = True
+    torch.manual_seed(0)
+    lengths = torch.randint(0, 300, (23,))
+    lengths[3] = 0
+    lengths[5] = 1
+    x_offsets = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+    x_offsets = x_offsets.to(DEVICE)
+    x = torch.randn((int(lengths.sum()), 128), device=DEVICE)
+    kernel = helion.kernel(
+        jagged_layer_norm_kernel.fn,
+        backend="cute",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+    )
+    bound = kernel.bind((x, x_offsets, 1e-6))
+    default = bound.config_spec.default_config()
+    assert default.config.get("cute_vloop_sink") is True
     torch.testing.assert_close(
         kernel(x, x_offsets, 1e-6),
         reference_jagged_layer_norm_pytorch(x, x_offsets, 1e-6),

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import sympy
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from helion._compiler.active_blocks import unused_block_ids
 from helion._compiler.aten_lowering import resolve_reduction_sizes
@@ -54,7 +55,8 @@ def test_logical_size_preserves_capture_identity_and_arange_extent() -> None:
     graph = torch.fx.Graph()
     tensor = graph.placeholder("tensor")
     size = graph.call_function(torch.ops.aten.sym_size.int, (tensor, 1))
-    size.meta["val"] = 33
+    physical_extent = ShapeEnv().create_unbacked_symint()
+    size.meta["val"] = physical_extent
     indices = list(
         starmap(
             graph.call_function,
@@ -83,7 +85,20 @@ def test_logical_size_preserves_capture_identity_and_arange_extent() -> None:
         physical = index.args[position]
         assert isinstance(physical, torch.fx.Node) and physical is not size
         assert physical.meta["helion_host_scalar"] is False
+        assert physical.meta["val"] is physical_extent
+        assert physical.args == (str(physical_extent),)
     graph.lint()
+
+    class ExtentInterpreter(torch.fx.Interpreter):
+        def call_function(self, target, args, kwargs):
+            if target is _get_symnode:
+                return 64 if args == (str(physical_extent),) else int(args[0])
+            return super().call_function(target, args, kwargs)
+
+    logical, *ranges = ExtentInterpreter(torch.fx.GraphModule({}, graph)).run(None)
+    assert logical == 33
+    for value in ranges:
+        torch.testing.assert_close(value, torch.arange(64))
 
 
 def test_scalar_store_liveness_does_not_allocate_reduction_dimensions() -> None:

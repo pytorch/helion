@@ -191,13 +191,14 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
         # it outside FX's users map. Inline literal values on ordinary FX edges
         # as before, while keeping their source addressable for those captures.
         node.target = _get_symnode
+        size_expr = _to_sympy(size)
         node.args = (
-            str(size) if isinstance(size, int) else env.sympy_debug(_to_sympy(size)),
+            str(size) if isinstance(size, int) else env.sympy_debug(size_expr),
         )
         node.kwargs = {}
         node.meta["val"] = size
         node.meta["helion_host_scalar"] = isinstance(size, int) or (
-            HostFunction.current().is_host_scalar_expr(_to_sympy(size))
+            HostFunction.current().is_host_scalar_expr(size_expr)
         )
         if isinstance(size, int):
             for user in list(node.users):

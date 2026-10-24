@@ -6,7 +6,8 @@ single-dim reductions while tracing and tags the chain's result. Flattening
 requires static_shapes so a later input cannot change the view's strides.
 ``merge_reduction_dims`` then rewrites the producers of each tagged chain's
 input to read ``x.flatten(1, 2)`` instead of ``x`` and replaces the chain
-with a single reduction.  Chains it cannot rewrite are kept as they are.
+with a single reduction. Chains it cannot rewrite remain on Triton. CuTe
+requires tagged chains to merge and otherwise raises ``BackendUnsupported``.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 
 from .. import exc
-from ..language import _MEMORY_OPS
 from ..language._decorators import args_to_proxies
 from ..language._tracing_ops import _host_tensor
 from ..language.distributed_ops import make_async_remote_copy
@@ -32,17 +32,20 @@ from ..language.inline_triton_ops import inline_triton
 from ..language.inline_triton_ops import triton_kernel
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
-from .cute.memory_ops import register_cute_tensor_alias_specializations
-from .cute.memory_ops import runtime_tensors_are_proven_disjoint
 from .host_function import HostFunction
 from .indexing_strategy import is_block_size_index
 from .loop_dependency_checker import _storage_ids
+from .loop_dependency_checker import memory_write_target
+from .runtime_tensor_guards import _tensor_alias_sources
+from .runtime_tensor_guards import register_tensor_alias_specializations
+from .runtime_tensor_guards import runtime_tensors_have_disjoint_storage
 from .variable_origin import FlattenOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Any
 
+    from torch._guards import Source
     from torch.fx import Graph
     from torch.fx.node import Argument
 
@@ -71,10 +74,10 @@ class _ReductionChain:
 
 
 def _tensor_proxy_node(
-    tensor: torch.Tensor,
+    value: torch.Tensor | torch.fx.Proxy | proxy_tensor._ProxyTensor,
     tracer: proxy_tensor.PythonKeyTracer | proxy_tensor._GraphAppendingTracerEx,
 ) -> Node:
-    proxy, _ = args_to_proxies(tracer, tensor)
+    proxy, _ = args_to_proxies(tracer, value)
     return cast("torch.fx.Proxy", proxy).node
 
 
@@ -104,10 +107,10 @@ def chain_reduction_dims(
         # Helion's tracing patch can create their proxies during this lookup.
         if (
             mode is not None
-            and proxy_tensor.get_proxy_slot(source, mode.tracer, default=None)
+            and (slot := proxy_tensor.get_proxy_slot(source, mode.tracer, default=None))
             is not None
         ):
-            source_node = _tensor_proxy_node(source, mode.tracer)
+            source_node = _tensor_proxy_node(slot, mode.tracer)
             previous_tail = next(reversed(source_node.graph.nodes))
         # Like eager, cast the input to a low-precision dtype= first, then
         # accumulate in fp32 across every reduced dim and round once.
@@ -138,6 +141,9 @@ def chain_reduction_dims(
                     continue
             x = op(x, [d], keepdim, **kwargs)
         result = x.to(out_dtype) if upcast or bool_extrema else x
+        # Literal unit axes need no layout rewrite; Inductor folds their reductions.
+        if all(isinstance(size := source.size(d), int) and size == 1 for d in dims):
+            return result
         # Boolean extrema keep their integer chain: merging the original bool
         # operation would recreate unsupported any/all lowering.
         if mode is not None and source_node is not None and not bool_extrema:
@@ -228,29 +234,34 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 # may promote an atomic target's dtype after merging, which
                 # its flattened view would miss.
                 excluded_ids: set[int] = set()
-                storage_tensors: dict[int, torch.Tensor] = {}
                 for info in graphs:
                     for n in info.graph.nodes:
-                        value = n.meta.get("val")
-                        if isinstance(value, torch.Tensor):
-                            storage_tensors.setdefault(
-                                id(value.untyped_storage()), value
-                            )
-                        if n.target in _MEMORY_OPS and n.target is not load:
-                            target = n.args[0]
-                        elif n.target is make_async_remote_copy:
+                        target = memory_write_target(n)
+                        if n.target is make_async_remote_copy:
                             target = n.args[3]
                         elif n.target in (inline_triton, triton_kernel):
                             # Raw snippets can write any pointer passed in args.
                             # all_input_nodes also handles mapping-style args.
                             target = n.all_input_nodes
-                        else:
+                        if target is None:
                             continue
                         excluded_ids.update(_storage_ids(graphs, info.graph_id, target))
-                excluded = {
-                    storage_id: storage_tensors.get(storage_id)
-                    for storage_id in excluded_ids
-                }
+                excluded = dict.fromkeys(excluded_ids)
+                if excluded:
+                    remaining = len(excluded)
+                    for n in itertools.chain.from_iterable(
+                        info.graph.nodes for info in graphs
+                    ):
+                        value = n.meta.get("val")
+                        if (
+                            isinstance(value, torch.Tensor)
+                            and (storage_id := id(value.untyped_storage())) in excluded
+                            and excluded[storage_id] is None
+                        ):
+                            excluded[storage_id] = value
+                            remaining -= 1
+                            if not remaining:
+                                break
             merger = _Merger(source, dims, flat_views, flat_nodes, excluded)
             if (chain := merger.chain(source, node, tag.nodes)) is None:
                 require_chain_support(
@@ -259,6 +270,8 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                     "use the Triton backend for chained reductions"
                 )
                 continue
+            if merger.needs_alias_guard:
+                register_tensor_alias_specializations(env)
             merged = merger.clone(source)
             with graph.inserting_before(node.next):
                 result = _new_node(
@@ -354,6 +367,8 @@ class _Merger:
         # (host tensor node, merged dims) -> its flattened view's node
         self.flat_nodes = flat_nodes
         self.excluded_storages = excluded_storages
+        self.needs_alias_guard = False
+        self._alias_sources: tuple[Source, ...] | None = None
         self.cloned: dict[Node, Node] = {}
 
     def kind(self, node: Node) -> str | None:
@@ -439,12 +454,14 @@ class _Merger:
                 if self.env.tensor_storage_input_source(written) is None:
                     return None
                 continue
-            # These storage classifiers also guard future eager/prepared calls.
-            register_cute_tensor_alias_specializations(self.env)
-            if not runtime_tensors_are_proven_disjoint(
-                self.env, tensor, written, allow_unbound=True
+            if self._alias_sources is None:
+                # Classification is read-only; cloning starts after the whole chain proof.
+                self._alias_sources = _tensor_alias_sources(self.env)
+            if not runtime_tensors_have_disjoint_storage(
+                self.env, tensor, written, self._alias_sources
             ):
                 return None
+            self.needs_alias_guard = True
         index = cast("list[Argument]", node.args[1])
         first = node.meta["val"].ndim + self.offsets[0]
         merged = range(first, first + len(self.offsets))
@@ -459,7 +476,15 @@ class _Merger:
                 tensor_dim += 1  # a scalar index drops its dim
                 continue
             if out_dim in merged:
-                if not isinstance(k, slice) or k != slice(None):
+                if (
+                    not isinstance(k, slice)
+                    or (k.start is not None and not self.env.known_equal(k.start, 0))
+                    or (k.step is not None and not self.env.known_equal(k.step, 1))
+                    or (
+                        k.stop is not None
+                        and not self.env.known_equal(k.stop, tensor.size(tensor_dim))
+                    )
+                ):
                     return None
                 slices.append((i, tensor_dim))
             elif not (k is None or isinstance(k, (slice, torch.SymInt))):
@@ -468,11 +493,18 @@ class _Merger:
             tensor_dim += k is not None
         tensor_dims = [d for _, d in slices]
         if len(slices) != len(merged) or any(
-            b != a + 1
-            or not self.env.known_equal(
+            b != a + 1 for a, b in itertools.pairwise(tensor_dims)
+        ):
+            return None
+        # A unit axis can have any stride without affecting a flattening view.
+        strided_dims = [
+            d for d in tensor_dims if not self.env.known_equal(tensor.size(d), 1)
+        ]
+        if any(
+            not self.env.known_equal(
                 tensor.stride(a), tensor.stride(b) * tensor.size(b)
             )
-            for a, b in itertools.pairwise(tensor_dims)
+            for a, b in itertools.pairwise(strided_dims)
         ):
             return None
         return slices[0]
@@ -540,6 +572,8 @@ class _Merger:
                 flat.meta = {**_source_meta(host.meta), "val": tensor}
             self.flat_nodes[host, tensor_dim, end] = flat
         index = [*cast("list[Argument]", node.args[1])]
+        # Each accepted slice spans its whole original axis, including 0:n.
+        index[index_pos] = slice(None)
         del index[index_pos + 1 : index_pos + len(self.offsets)]
         result = _new_node(
             node.graph, load, (flat, index, *node.args[2:]), {}, node.meta

@@ -48,6 +48,9 @@ from test._cute_register_tile_kernels import column_config
 import helion
 from helion._compiler import generate_ast as generate_ast_module
 from helion._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from helion._compiler.cute.masked_packet_load_names import (
+    MASKED_PACKET_LOAD_HELPER_NAMES,
+)
 from helion._compiler.cute.persistent_branch_vec import _generated_access_pointer
 from helion._compiler.cute.register_tile_admission import (
     _CUTE_REGISTER_TILE_CONTROL_FLOW,
@@ -880,15 +883,20 @@ def test_aliasing_views_reject_every_load_form(
 @skipUnlessBackends(["cute"])
 def test_load_helper_names_match_the_backend_imports() -> None:
     # Every ``_cute_load_*`` helper the backend binds in generated code is in
-    # the one list the lane-loop passes read (relocation, load collection and
-    # the aliasing proofs), so a new helper cannot slip past them.
+    # one of the two lists the lane-loop passes read: the cache-hinted loads
+    # (relocation, load collection and the aliasing proofs) or the predicated
+    # packet loads of the sunk V-loop (``masked_packet_load_names``, which the
+    # relocation proof reads; they appear only in bodies the sink already
+    # unrolled), so a new helper cannot slip past them.
     bound, _arguments = _bind()
     bound_names = {
         name
         for name in bound.env.backend.library_imports
         if name.startswith("_cute_load_")
     }
-    assert bound_names == _CUTE_CACHE_LOAD_HELPER_NAMES
+    assert bound_names == (
+        _CUTE_CACHE_LOAD_HELPER_NAMES | MASKED_PACKET_LOAD_HELPER_NAMES
+    )
 
 
 def test_control_flow_names_are_tracing_ops() -> None:

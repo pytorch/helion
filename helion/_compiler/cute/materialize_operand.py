@@ -1028,6 +1028,23 @@ def _replacement_lhs(
     )
 
 
+def _fused_register_mma_admitted(env: CompileEnvironment) -> bool:
+    """Whether the unfissioned program's search admits the register-MMA family
+    for its cast operand (``CuteTcgen05Config.tcgen05_family_admitted`` is
+    False exactly when the matmul reads an in-register integer cast).
+
+    That family runs the latency-bound problems a materialization launch
+    would only slow down (the extra launch and its DRAM round trip cost more
+    than the whole fused GEMM: bf16 x int16 at (128, 256, 128) on B200 runs
+    4.3 us as two launches against ~2.2 us fused), so such a program keeps
+    its single launch; outside the family's admitted regime the tcgen05
+    pipeline needs the materialized operand and the fission proceeds.
+    ``env`` is the planner's temporary compile of the unfissioned program.
+    """
+    state = env.config_spec._cute_tcgen05_config
+    return state.warp_mma_admitted and not state.tcgen05_family_admitted
+
+
 def plan_operand_materialization(
     kernel: Kernel[Any],
     args: tuple[object, ...],
@@ -1103,6 +1120,17 @@ def plan_operand_materialization(
                 compiler.propagate_types(host)
                 compiler.finalize_config()
                 compiler.lower(host)
+                # The proof below specializes the shapes it needs; the fused
+                # program only has them when the kernel is static, so the
+                # register-MMA regime is honored for static kernels alone.
+                _require(
+                    not (
+                        owning_env.settings.static_shapes
+                        and _fused_register_mma_admitted(env)
+                    ),
+                    "the fused GEMM is admitted to the register-MMA family, "
+                    "which converts the operand in registers in one launch",
+                )
                 proof = _prove(host, source, env)
                 return _replacement(host, source, original_body, specializations, proof)
             except _Ineligible as error:

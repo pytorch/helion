@@ -32,6 +32,7 @@ from ..device_ir import KernelPhase
 from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
+from .host_zero_fills import lower_host_zero_fills
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
@@ -542,6 +543,10 @@ def generate_materialized_fission(
         module_loads.extend((load_statement, source_hash_statement))
     env.cute_resolved_wrapper_plans = resolved_plans
     assert generated_return is not None
+    # The stages saw one root each, so the wrapper's shared allocations are
+    # proven against the whole kernel: a zero-filled workspace one phase
+    # stores completely and a later phase reads needs no memset.
+    prefix = lower_host_zero_fills(func, prefix, env, config)
     for name in plan.materialized_names:
         assert (
             sum(

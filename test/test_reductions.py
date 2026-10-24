@@ -34,10 +34,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def _merged_reduction_backend() -> bool:
-    return _get_backend() in ("triton", "cute")
-
-
 @helion.kernel()
 def sum_kernel(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
@@ -93,8 +89,11 @@ def tile_row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
 def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
     for tile in hl.tile(x.size(0)):
-        v = x[tile, :, :]
-        if op == "sum":
+        if op == "bounded_sum":
+            v = x[tile, 0 : x.size(1) : 1, 0 : x.size(2) : 1]
+        else:
+            v = x[tile, :, :]
+        if op == "sum" or op == "bounded_sum":
             out[tile] = v.sum(dim=(1, 2))
         elif op == "sum_fp16":
             out[tile] = v.sum(dim=(1, 2), dtype=torch.float16)
@@ -259,10 +258,12 @@ class TestReductions(RefEagerTestBase, TestCase):
         (
             ((6, 24, 64), torch.float32, False, "sum", 256),
             ((6, 33, 33), torch.float32, False, "mean", 256),
+            ((6, 33, 33), torch.float32, False, "bounded_sum", 256),
+            ((6, 1, 33), torch.float32, False, "sum", 16),
             ((6, 64, 256), torch.bfloat16, False, "mean", 1024),
             ((6, 33, 33), torch.float32, False, "amax", 256),
             ((6, 33, 33), torch.float32, False, "amin", 256),
-            ((6, 64, 24), torch.float32, True, "sum", 16),
+            ((6, 64, 24), torch.float32, True, "mean", 16),
             # Equal chained extents share one dimension and cannot loop.
             ((6, 33, 33), torch.float32, True, "sum", None),
             ((6, 33, 33), torch.float32, False, "centered", None),
@@ -270,6 +271,8 @@ class TestReductions(RefEagerTestBase, TestCase):
     )
     def test_reduction_over_multiple_dims(self, shape, dtype, transpose, op, chunk):
         x = torch.randn(shape, device=DEVICE, dtype=dtype)
+        if x.size(1) == 1:
+            x = x.as_strided(x.shape, (x.stride(0), 999, x.stride(2)))
         if transpose:
             x = x.transpose(1, 2)
         # One-signed extrema inputs expose contributions from padded lanes.
@@ -282,10 +285,12 @@ class TestReductions(RefEagerTestBase, TestCase):
             return
         bound = _reduce_multi_dim_tile.bind((x, op))
         retired = [info for info in bound.env.block_sizes if info.retired]
-        self.assertEqual(bool(retired), not transpose and op != "centered")
+        merged = not transpose and op != "centered"
+        # A unit axis leaves the surviving reduction extent unchanged and live.
+        self.assertEqual(
+            bool(retired), merged and all(size > 1 for size in x.shape[1:])
+        )
         self.assertTrue(all(not info.is_tile for info in retired))
-        merge_backend = _merged_reduction_backend()
-        merged = merge_backend and not transpose and op != "centered"
         spec = bound.config_spec
         n_loops = len(spec.reduction_loops)
         if merged:
@@ -300,9 +305,9 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = (
             (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
             if op == "centered"
-            else getattr(torch, op)(x, dim=(1, 2))
+            else getattr(torch, "sum" if op == "bounded_sum" else op)(x, dim=(1, 2))
         )
-        for loop in (None, chunk) if chunk is not None and merge_backend else (None,):
+        for loop in (None, chunk) if chunk is not None else (None,):
             actual = bound.compile_config(
                 helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
             )(x, op)
@@ -321,8 +326,25 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Bool sums merge and count in int64, like eager.
         mask = torch.rand(6, 24, 40, device=DEVICE) > 0.5
         code, output = code_and_output(count, (mask,), block_sizes=[2])
-        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
+        self.assertIn("flatten(1, 2)", code)
         torch.testing.assert_close(output, mask.sum(dim=(1, 2)))
+
+    @onlyBackends(["triton", "cute"])
+    @parametrize("static_shapes", (False, True))
+    def test_multi_dim_unit_reductions(self, static_shapes):
+        kernel = helion.kernel(
+            _reduce_multi_dim_tile.fn,
+            static_shapes=static_shapes,
+            autotune_effort="none",
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(6, 1, 1, device=DEVICE, dtype=dtype)
+            for op in ("sum", "mean", "amin", "amax"):
+                with self.subTest(dtype=dtype, op=op):
+                    _, output = code_and_output(kernel, (x, op), block_sizes=[2])
+                    torch.testing.assert_close(
+                        output, getattr(torch, op)(x, dim=(1, 2))
+                    )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the generated code")
@@ -332,7 +354,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, output = code_and_output(
             _reduce_multi_dim_tile, (x, "sum_fp32"), block_sizes=[2]
         )
-        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
+        self.assertIn("flatten(1, 2)", code)
         torch.testing.assert_close(output, x.float().sum(dim=(1, 2)).to(x.dtype))
 
     @onlyBackends(["triton", "cute"])
@@ -477,7 +499,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 continue
             for reduction_loops in (
                 [None],
-                [256] if static_shapes and _merged_reduction_backend() else [16],
+                [256] if static_shapes else [16],
             ):
                 with self.subTest(static_shapes=static_shapes, loops=reduction_loops):
                     code, output = code_and_output(
@@ -488,7 +510,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                     )
                     self.assertEqual(
                         "flatten(1, 2)" in code,
-                        static_shapes and _merged_reduction_backend(),
+                        static_shapes,
                     )
                     torch.testing.assert_close(
                         output,
@@ -527,9 +549,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             sum_and_clear, (x, cleared, pointers, indirect), block_sizes=[2]
         )
         # Pointer contents do not prove where an indirect store writes.
-        self.assertEqual(
-            "flatten(1, 2)" in code, _merged_reduction_backend() and not indirect
-        )
+        self.assertEqual("flatten(1, 2)" in code, not indirect)
         torch.testing.assert_close(output, x.sum(dim=(1, 2)))
         self.assertTrue((cleared == 0).all())
 
@@ -587,23 +607,32 @@ class TestReductions(RefEagerTestBase, TestCase):
                 out[row] = dst[row, :, :].sum((1, 2))
             return out
 
+        # Bind only to check compiler write exclusion. These ordinary buffers
+        # cannot execute NVSHMEM; its runtime tests use distributed symmetric memory.
         bound = remote_write_then_sum.bind((x, acc))
         self.assertFalse(any(info.retired for info in bound.env.block_sizes))
 
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def write_scratch_read_input(
-            x: torch.Tensor, scratch: torch.Tensor
+            x: torch.Tensor, scratch: torch.Tensor, centered: hl.constexpr = False
         ) -> torch.Tensor:
             out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
             for row in hl.tile(x.size(0)):
                 scratch[row, :, :] = 0
-                out[row] = x[row, :, :].sum((1, 2))
+                value = x[row, :, :]
+                if centered:
+                    value = value - value.mean((1, 2), keepdim=True)
+                    out[row] = value.amax((1, 2))
+                else:
+                    out[row] = value.sum((1, 2))
             return out
 
         source = torch.ones_like(x)
         scratch = torch.empty_like(source)
         alias = source.view_as(source)
         disjoint = write_scratch_read_input.bind((source, scratch))
+        alias_key = "tensor_storage_disjoint_matrix_v1"
+        self.assertIn(alias_key, disjoint.env.runtime_input_specializations)
         self.assertIn(
             "flatten(1, 2)",
             disjoint.to_triton_code(disjoint.config_spec.default_config()),
@@ -614,6 +643,9 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(actual, torch.full_like(actual, total))
         aliased = write_scratch_read_input.bind((source, alias))
         self.assertIsNot(aliased, disjoint)
+        self.assertNotIn(alias_key, aliased.env.runtime_input_specializations)
+        rejected = write_scratch_read_input.bind((source, scratch, True))
+        self.assertNotIn(alias_key, rejected.env.runtime_input_specializations)
         self.assertNotIn(
             "flatten(", aliased.to_triton_code(aliased.config_spec.default_config())
         )
@@ -712,7 +744,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn(4, 8, 8, 8, device=DEVICE)
         code, (total, inner, plane) = code_and_output(reduce_rows, (x,))
         for dims in ("1, 3", "1, 2", "2, 3"):
-            self.assertEqual(f"flatten({dims})" in code, _merged_reduction_backend())
+            self.assertIn(f"flatten({dims})", code)
         torch.testing.assert_close(total, x.sum(dim=(1, 2, 3)))
         torch.testing.assert_close(inner, x.amax(dim=(1, 2)))
         torch.testing.assert_close(plane, x[:, 1].sum(dim=(1, 2)))

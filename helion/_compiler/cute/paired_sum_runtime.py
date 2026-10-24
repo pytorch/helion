@@ -30,19 +30,41 @@ def paired_sum_cast_kernel(
     # Each row is uniquely (chunk * 4 + accumulator) * row_lanes + ty.
     # Keep CUDA Reduce.cuh's four independent accumulator chains, then its
     # increasing accumulator-number fold. Invalid rows do not enter an add.
-    for chunk in range(cute.ceil_div(rows, 4 * row_lanes)):
-        for slot in cutlass.range_constexpr(4):
-            row = (chunk * 4 + slot) * row_lanes + ty
-            if row < rows and column < columns:
-                # The launch schema uses plain strided layouts, not composed
-                # layouts with a shared-memory swizzle.
-                offset_left = row * cutlass.Int32(left.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
-                offset_right = row * cutlass.Int32(right.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
-                values_left = _cute_resident_load_vector(left, offset_left, vector)
-                values_right = _cute_resident_load_vector(right, offset_right, vector)
-                for lane in cutlass.range_constexpr(vector):
-                    accum[0, slot, lane] = accum[0, slot, lane] + values_left[lane]
-                    accum[1, slot, lane] = accum[1, slot, lane] + values_right[lane]
+    # Rows are visited in groups: every load of a group is issued before its
+    # first addition so the latency-bound tail overlaps its memory traffic;
+    # each chain still adds its rows in ascending order.
+    chunks: cutlass.Constexpr = cute.ceil_div(rows, 4 * row_lanes)
+    group_chunks: cutlass.Constexpr = max(1, min(chunks, 64 // (8 * vector)))
+    loaded = cute.make_rmem_tensor((2, group_chunks * 4, vector), cutlass.Float32)
+    for group in range(cute.ceil_div(chunks, group_chunks)):
+        for part in cutlass.range_constexpr(group_chunks):
+            chunk = group * group_chunks + part
+            for slot in cutlass.range_constexpr(4):
+                row = (chunk * 4 + slot) * row_lanes + ty
+                if chunk < chunks and row < rows and column < columns:
+                    # The launch schema uses plain strided layouts, not composed
+                    # layouts with a shared-memory swizzle.
+                    offset_left = row * cutlass.Int32(left.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
+                    offset_right = row * cutlass.Int32(right.layout.stride[0]) + column  # pyrefly: ignore[missing-attribute]
+                    values_left = _cute_resident_load_vector(left, offset_left, vector)
+                    values_right = _cute_resident_load_vector(
+                        right, offset_right, vector
+                    )
+                    for lane in cutlass.range_constexpr(vector):
+                        loaded[0, part * 4 + slot, lane] = values_left[lane]
+                        loaded[1, part * 4 + slot, lane] = values_right[lane]
+        for part in cutlass.range_constexpr(group_chunks):
+            chunk = group * group_chunks + part
+            for slot in cutlass.range_constexpr(4):
+                row = (chunk * 4 + slot) * row_lanes + ty
+                if chunk < chunks and row < rows and column < columns:
+                    for lane in cutlass.range_constexpr(vector):
+                        accum[0, slot, lane] = (
+                            accum[0, slot, lane] + loaded[0, part * 4 + slot, lane]
+                        )
+                        accum[1, slot, lane] = (
+                            accum[1, slot, lane] + loaded[1, part * 4 + slot, lane]
+                        )
     for slot in cutlass.range_constexpr(1, 4):
         for lane in cutlass.range_constexpr(vector):
             accum[0, 0, lane] = accum[0, 0, lane] + accum[0, slot, lane]

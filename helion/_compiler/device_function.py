@@ -1426,6 +1426,13 @@ class DeviceFunction:
                 disjoint_pairs=proven_disjoint_tensor_pairs,
                 rename_groups={k: v[0] for k, v in self._variable_renames.items()},
             )
+            from .cute.simt_gemm import lower_simt_gemm
+
+            kernel_body = lower_simt_gemm(
+                kernel_body,
+                self,
+                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+            )
             if any(
                 plan.get("kind") == "gathered_mma_tma"
                 for plan in self.codegen.cute_wrapper_plans
@@ -1554,6 +1561,15 @@ class DeviceFunction:
                 kernel_body = vectorize_affine_tile_lanes(
                     kernel_body, self, constexpr_values
                 )
+            from .cute.literal_offset_loads import merge_literal_offset_loads
+
+            kernel_body = merge_literal_offset_loads(kernel_body, self)
+            # Replace a byte-by-byte fp4 x fp4 decode-multiply-add chain over
+            # two merged 8-byte vectors with the exact f16x2 group dot
+            # (``quantized_helpers.float4_e2m1fn_x16_dot_float32``).
+            from .cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
+
+            kernel_body = fuse_fp4_pair_dot(kernel_body)
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1656,19 +1672,27 @@ class DeviceFunction:
             from .cute.unroll_lane_loads import LaneUnrollNotApplied
             from .cute.unroll_lane_loads import unroll_lane_loads
 
-            # ``cute_lane_unroll`` without vector-loop sinking: unroll the
-            # grid lane loops at trace time with every unrolled lane's
-            # loads (packets and scalars alike) issued before the first
-            # lane's compute.  The knob-off code is regenerated when no
-            # loop takes the unroll.
+            # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
+            # nest whose lane loops the sinking pass left rolled (their loads
+            # were persistent markers, now packets): unroll the lane loops (of
+            # the grid or of a device loop) at trace time with every unrolled
+            # lane's loads (packets and scalars alike) issued before the first
+            # lane's compute.  The knob-off code is regenerated when no loop
+            # takes the unroll.
             lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
-            if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
+            sinking = bool(self.config.config.get("cute_vloop_sink"))
+            if lane_unroll > 1 and not (
+                sinking and self.cute_state.vloop_sink_unrolled
+            ):
                 kernel_body, unrolled = unroll_lane_loads(
                     kernel_body,
                     lane_unroll,
                     lambda name: self.new_var(name, dce=False),
                 )
-                if not unrolled:
+                # With sinking the knob belongs to the sunk nest's lane loops
+                # (``_normalize_cute_vloop_sink``); a nest that offers none
+                # keeps its code rather than regenerating knob-off.
+                if not unrolled and not sinking:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
             # Preserve the global FMA decisions above. This optional pass
@@ -2116,7 +2140,10 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel
             # with a (1, cluster_n, 1) thread-block cluster.
@@ -2161,7 +2188,7 @@ class DeviceFunction:
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        from .cute.memory_ops import runtime_tensors_are_proven_disjoint
+        from .runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
         env = CompileEnvironment.current()
         host_function = HostFunction.current()
@@ -2222,6 +2249,16 @@ class DeviceFunction:
             source = env.tensor_input_source(arg.fake_value)
             runtime = env.runtime_value_for_tensor(arg.fake_value)
             if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
+                if source is not None or not input_metadata_specialized:
+                    continue
+                # A tensor the host function allocates (``torch.empty_like``)
+                # has no runtime value at compile time; its layout is what
+                # the traced allocation computed from the specialized input
+                # metadata, so a literal traced stride is the stride of every
+                # call this bound kernel serves.
+                for dim, fake_stride in enumerate(arg.fake_value.stride()):
+                    if type(fake_stride) is int:
+                        result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
                 cache_safe = source is not None and (
@@ -2322,6 +2359,19 @@ class DeviceFunction:
         capability = env.config_spec.target_device_capability
         if capability is None or capability < (9, 0):
             return False
+        if self.cute_state.cute_pdl_entry_wait:
+            # A tcgen05 kernel launched with ``use_pdl`` through its wrapper
+            # plan places late waits where its lowering knows the first
+            # global read of each warp (the flat kernel's prefetch, the
+            # persistent TMA-load and epilogue roles); when the generated
+            # body reads global memory ahead of those on some path (the
+            # grouped layout reads of the prologue, a scheduler-warp or
+            # grouped persistent builder without role waits, a root-body
+            # load ahead of the K loop) it gets this wait at the top of the
+            # body instead. Its releases all follow either wait.
+            from .cute.pdl_coverage import waits_cover_global_reads
+
+            return not waits_cover_global_reads([*self.preamble, *self.body])
         if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
             return False
         return not any(
@@ -2367,7 +2417,10 @@ class DeviceFunction:
             call_grid_expr = expr_from_string(
                 f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
             )
-        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        simt_cluster_n = max(
+            getattr(self.cute_state, "simt_cluster_n", 1),
+            getattr(self.cute_state, "grid_cluster_n", 1),
+        )
         if simt_cluster_n > 1:
             # The cluster splits each row across ``cluster_n`` CTAs on a new
             # trailing grid dim.  Only a 1-D grid can host the cluster dim.

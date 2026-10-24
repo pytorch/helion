@@ -34,6 +34,12 @@ class Tcgen05FullTileScheduleFacts:
     shape: tuple[int, int, int]
     dtype: torch.dtype
     rhs_k_major: bool = False
+    # False for an M-major (column-major) A, e.g. ``x.T @ grad`` in a matmul
+    # backward: the UMMA smem descriptor takes it directly
+    # (``make_smem_layout_a(is_k_major=False)``), so the full-tile and
+    # paired families apply; the proofs that read A through the K-major
+    # partial-tile TMA protocol (N-edge clusters, fp8 K tails) stay K-major.
+    lhs_k_major: bool = True
 
 
 def n_edge_cluster_schedule_defaults() -> dict[str, object]:
@@ -64,8 +70,10 @@ def n_edge_cluster_geometry_supported(
     """
     if facts.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
         return False
-    if not facts.rhs_k_major or any(
-        type(value) is not int or value <= 0 for value in (*facts.shape, *tile)
+    if (
+        not facts.rhs_k_major
+        or not facts.lhs_k_major
+        or any(type(value) is not int or value <= 0 for value in (*facts.shape, *tile))
     ):
         return False
     m, n, k = facts.shape
@@ -156,6 +164,7 @@ def paired_k_tail_schedule_supported(
     if (
         facts.dtype != torch.float8_e4m3fn
         or not facts.rhs_k_major
+        or not facts.lhs_k_major
         or type(cluster_m) is not int
         or type(cluster_n) is not int
         or (cluster_m, cluster_n) != (2, 1)
@@ -300,7 +309,7 @@ def prove_full_tile_schedule_facts(
         or operands.lhs.source_fake.dtype
         not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
-        or operands.lhs.matrix_major != "row"
+        or operands.lhs.matrix_major not in ("row", "col")
         or operands.rhs.matrix_major not in ("row", "col")
         or operands.lhs.source_to_logical_order is not None
         or operands.rhs.source_to_logical_order is not None
@@ -318,4 +327,5 @@ def prove_full_tile_schedule_facts(
         gemm.shape,
         operands.lhs.source_fake.dtype,
         rhs_k_major=operands.rhs.matrix_major == "col",
+        lhs_k_major=operands.lhs.matrix_major == "row",
     )

@@ -77,6 +77,7 @@ class TileStrategyDispatch:
         super().__init__()
         self._device_function = fn
         self.strategies: list[TileStrategy] = []
+        self._has_rolled_reductions = False
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self._constexpr_live_graph_ids: frozenset[int] | None = None
@@ -192,6 +193,7 @@ class TileStrategyDispatch:
 
     def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
+        self._has_rolled_reductions |= isinstance(strategy, LoopedReductionStrategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
@@ -385,8 +387,10 @@ class TileStrategyDispatch:
         else:
             return self.strategies[0].fn.literal_expr(shape)
 
-        if CompileEnvironment.current().backend.name == "triton" and not isinstance(
-            expr, sympy.Symbol
+        if (
+            self._has_rolled_reductions
+            and CompileEnvironment.current().backend.name == "triton"
+            and not isinstance(expr, sympy.Symbol)
         ):
             block_symbols, _ = find_block_size_symbols(expr)
             if any(
@@ -395,7 +399,7 @@ class TileStrategyDispatch:
                 )
                 for block_id in block_symbols.values()
             ):
-                # A rolled extent is a device-loop variable, not a host constexpr.
+                # Derived rolled-axis shapes have no supported host definition here.
                 raise exc.BackendUnsupported(
                     "triton",
                     "derived tensor shapes involving a rolled reduction axis",
@@ -673,6 +677,11 @@ class TileStrategyDispatch:
         whereas sharing a threaded reduction's axis would let a lookup of the
         block's axis extent read the other reduction's threads.
         """
+        partner = getattr(target, "_cute_axis_partner", None)
+        if partner is not None:
+            # A sibling full-slice block indexing another's axis
+            # (``PersistentReductionStrategy._cute_sibling_axis_partner``).
+            return self.thread_axis_for_strategy(partner)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
@@ -752,7 +761,11 @@ class TileStrategyDispatch:
             return 0
         reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]
         return max(
-            sum(1 for s in reductions if s._reduction_thread_count() > 1),
+            sum(
+                1
+                for s in reductions
+                if s._reduction_thread_count() > 1 and s.thread_axes_used() > 0
+            ),
             1 if any(s.thread_axes_used() > 0 for s in reductions) else 0,
         )
 
