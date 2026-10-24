@@ -161,6 +161,7 @@ def prove_one_cta_pipeline_facts(
         or allocations.input_dtype_bytes != 1
         or gemm.output.dtype not in (torch.bfloat16, torch.float32)
         or tuple(gemm.output.shape) != gemm.shape[:2]
+        or gemm.candidate.operands.lhs.matrix_major != "row"
     ):
         return None
     return Tcgen05OneCtaPipelineFacts(

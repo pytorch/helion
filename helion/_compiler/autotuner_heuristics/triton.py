@@ -5330,18 +5330,18 @@ class TritonReductionHeuristic(AutotunerHeuristic):
 
         persistent = dict(config.config)
         persistent["reduction_loops"] = _custom_persistent_reduction_loops(spec, config)
-        default_sizes = spec._base_default_config().block_sizes
-        grid_ids = set(spec.grid_block_ids)
-        base_sizes = [
-            default
-            if not spec.has_native_reductions and block.block_id in grid_ids
-            else value
-            for block, value, default in zip(
-                spec.block_sizes, config.block_sizes, default_sizes, strict=True
-            )
-        ]
-        persistent_sizes = _custom_persistent_block_sizes(spec, base_sizes)
         mixed = spec.has_native_reductions
+        base_sizes = config.block_sizes
+        if not mixed:
+            default_sizes = spec._base_default_config().block_sizes
+            grid_ids = set(spec.grid_block_ids)
+            base_sizes = [
+                default if block.block_id in grid_ids else value
+                for block, value, default in zip(
+                    spec.block_sizes, config.block_sizes, default_sizes, strict=True
+                )
+            ]
+        persistent_sizes = _custom_persistent_block_sizes(spec, base_sizes)
         persistent["block_sizes"] = persistent_sizes
         # Every root shares the launch warp count; preserve the native choice.
         if not mixed:
@@ -5358,12 +5358,14 @@ _TUNED_REDUCTION_TARGETS = TritonReductionHeuristic.HARDWARE_TARGETS
 
 
 class TritonNarrowReductionHeuristic(AutotunerHeuristic):
-    """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
-    other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
-    supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
-    upstream seed, so it stays unclaimed on non-sm90/sm100. Native seeds remain unpromoted;
-    custom reductions keep the persistent seed as their untuned default. This retains the
-    pre-sm100 native behavior rather than changing the fallback for existing reductions.
+    """Reduction fallback for hardware without a tuned track (outside sm90/sm100).
+
+    Kernels without custom reduction loops keep the legacy native proposal: one
+    row per program, persistent reductions, and supported ``['last']`` eviction.
+    User-tiled reductions remain unclaimed. When custom loops are present, the
+    persistent custom seed starts from default coordinates and changes only
+    custom-only axes and loads. Mixed kernels keep native/default scheduling
+    and eviction, and this fallback is promoted only for custom-only kernels.
     """
 
     name = "triton_reduction_narrow"

@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Hashable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from torch.cuda import _POOL_HANDLE
@@ -594,7 +595,7 @@ def _append_cute_wrapper_plan(
             not in (
                 (8, 16, 32, 64, 128, 224, 256)
                 if plan.get("format") == "mxfp8"
-                else (128, 256)
+                else (64, 128, 256)
             )
             or plan_int("bk") not in (64, 128, 256)
             or plan_int("stages") not in (2, 3, 4, 5, 6, 8, 10, 12)
@@ -805,6 +806,16 @@ def _append_cute_wrapper_plan(
     if kind == "helion_mma_dag_alias":
         # cute_mma_dag: launch-time argument metadata for the alias guard
         # (``_MmaDagAliasGuard``); nothing to prepare on the host.
+        return
+
+    if kind == "helion_mma_dag_fixup":
+        # cute_mma_dag fixup split: the exchange workspace's pointer, a
+        # wrapper host scalar of ``_build_cute_schema_and_args`` passed on
+        # to the kernel after the ordinary arguments (and the tensor maps).
+        param = plan.get("param")
+        if not isinstance(param, str):
+            raise exc.BackendUnsupported("cute", "invalid mma_dag fixup wrapper plan")
+        call_args.append(param)
         return
 
     if kind == "helion_mma_dag_tma":
@@ -4406,6 +4417,24 @@ _CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] =
 _CUTE_STAGED_OPERAND_ALIGNMENT = 16
 
 
+def _block_scaled_aligned_inputs(plan: Mapping[str, object]) -> tuple[str, ...]:
+    """Index keys of a block-scaled plan's inputs read with an alignment
+    assumption: MXFP8 TMA reads the original FP8 allocations; the fused NVFP4
+    consumer TMAs the packed sources and their scales; the linear preparation
+    reads a side with a proved qword recipe as 8-byte words."""
+    if plan.get("format") == "mxfp8":
+        if plan.get("sf_tma") is True:
+            return ("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx")
+        return ("lhs_idx", "rhs_idx")
+    if plan.get("prepare") == "fused":
+        return ("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx")
+    return tuple(
+        f"{side}_idx"
+        for side in ("lhs", "rhs")
+        if plan.get(f"{side}_qword_address") is not None
+    )
+
+
 def _cute_staged_plan_operands(
     cute_kernel: object,
 ) -> tuple[tuple[int, bool], ...]:
@@ -4414,12 +4443,8 @@ def _cute_staged_plan_operands(
     for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
         kind = str(plan.get("kind"))
         roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
-        if kind == "block_scaled_mma" and plan.get("format") == "mxfp8":
-            # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
-            # Preserve their values when a replacement binding is under-aligned.
-            roles = (("lhs_idx", "rhs_idx"), ())
-            if plan.get("sf_tma") is True:
-                roles = (("lhs_idx", "rhs_idx", "lhs_scale_idx", "rhs_scale_idx"), ())
+        if kind == "block_scaled_mma":
+            roles = (_block_scaled_aligned_inputs(plan), ())
             if plan.get("tma_output") is True:
                 roles = (roles[0], ("out_idx",))
         if roles is None:
@@ -4680,6 +4705,69 @@ def _cuda_stream_capture_context(device: torch.device) -> tuple[int, int | None]
     raise exc.BackendUnsupported(
         "cute", "the current CUDA stream capture has been invalidated"
     )
+
+
+_MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT = 8
+
+
+def _mma_dag_fixup_workspace(
+    cute_kernel: object,
+    *,
+    device: torch.device,
+    row_tiles: int,
+    tiles: int,
+    rounds: int,
+    slabs: int,
+    rows: int,
+) -> torch.Tensor:
+    """The exchange workspace of a ``cute_mma_dag`` fixup split: per partial
+    slab and row tile the ``tiles x rows`` fp32 partials, then one u32
+    arrival counter per row tile (``rounds`` arrivals per launch).  Zeroed once and kept per (device, geometry,
+    stream, capture): the counters only ever grow (a launch's CTAs derive
+    their base from their first ticket), so no launch resets them, and the
+    cached pointer stays valid for a captured graph."""
+    partial_bytes = slabs * tiles * row_tiles * rows * 4
+    counter_bytes = -(-row_tiles * 4 // 256) * 256
+    stream_handle, capture_id = _cuda_stream_capture_context(device)
+    cache_key = (
+        device.type,
+        device.index,
+        row_tiles,
+        tiles,
+        rounds,
+        slabs,
+        rows,
+        stream_handle,
+        capture_id,
+    )
+    try:
+        cache = cast(
+            "OrderedDict[tuple[object, ...], torch.Tensor]",
+            cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache,
+        )
+    except AttributeError:
+        cache = OrderedDict()
+        cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache = cache
+    workspace = cache.get(cache_key)
+    if workspace is not None:
+        return workspace
+    workspace = torch.zeros(
+        partial_bytes + counter_bytes, dtype=torch.uint8, device=device
+    )
+    cache[cache_key] = workspace
+    if capture_id is not None:
+        _track_cute_cuda_graph_cache_entry(
+            cute_kernel,
+            "_helion_mma_dag_fixup_workspace_cache",
+            cache_key,
+            workspace,
+            (workspace,),
+        )
+    else:
+        eager_keys = [key for key in cache if key[-1] is None]
+        while len(eager_keys) > _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT:
+            cache.pop(eager_keys.pop(0))
+    return workspace
 
 
 def _tcgen05_grouped_dynamic_tensormap_workspace(
@@ -7461,6 +7549,38 @@ def _build_cute_schema_and_args(
         schema.append(("wrapper_host_scalar", total_name, "int"))
         launch_args.append(total_clusters)
         owned_tensors.extend(metadata_result.tensors())
+
+    fixup_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "helion_mma_dag_fixup"
+    ]
+    if len(fixup_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple mma_dag fixup wrapper plans")
+    if fixup_plans:
+        plan = fixup_plans[0]
+        tiles, rounds, slabs, rows = (
+            int(cast("int", plan["tiles"])),
+            int(cast("int", plan["rounds"])),
+            int(cast("int", plan["slabs"])),
+            int(cast("int", plan["rows"])),
+        )
+        param = _plan_str_value(plan, "param")
+        tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if not tensor_args or tiles <= 0 or grid[0] % tiles:
+            raise exc.BackendUnsupported("cute", "invalid mma_dag fixup launch")
+        workspace = _mma_dag_fixup_workspace(
+            cute_kernel,
+            device=tensor_args[0].device,
+            row_tiles=grid[0] // tiles,
+            tiles=tiles,
+            rounds=rounds,
+            slabs=slabs,
+            rows=rows,
+        )
+        schema.append(("wrapper_host_scalar", param, "int"))
+        launch_args.append(int(workspace.data_ptr()))
+        owned_tensors.append(workspace)
 
     chunk_prepare_plans = [
         cast("dict[str, object]", plan)

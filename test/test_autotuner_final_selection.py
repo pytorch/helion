@@ -26,6 +26,7 @@ from helion.autotuner import search_algorithms
 import helion.autotuner.base_search as base_search_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.base_search import _InProcessFinalSelectionMeasurer
 from helion.autotuner.base_search import _WorkerFinalSelectionMeasurer
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
@@ -1187,6 +1188,136 @@ class TestFinalSelection(TestCase):
         metrics.final_selection = {"finalists": 2}
         self.assertEqual(metrics.to_dict()["final_selection"], {"finalists": 2})
 
+    def test_finalists_are_timed_in_the_final_selection_regime(self) -> None:
+        """A resident search (HELION_AUTOTUNE_L2_FLUSH=0) ranks its finalists
+        in the replay regime, where configs that tie L2-resident separate;
+        the default per-call flush search keeps its regime. Both measurers
+        carry the regime to their timer; a backend's own steady bench does
+        not know the regimes and is called as before."""
+        member = _member(32, 1.0)
+        policy = FinalSelectionConfig(top_k=2, rounds=2, screen_rep_ms=0)
+        search = _make_search([member], policy=policy)
+        provider = Mock(spec=LocalBenchmarkProvider)
+        provider.mutated_arg_indices = []
+        provider.private_argument_copies_affordable.return_value = False
+        provider.steady_window_benchmark_available.return_value = True
+        provider._subprocess_benchmark_uses_wall_clock.return_value = False
+        provider.benchmark_isolated.return_value = [1.0]
+        search.benchmark_provider = provider
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: None)
+        )
+        for env, regime in [
+            ({"HELION_AUTOTUNE_L2_FLUSH": "0"}, "replay"),
+            ({}, "call"),
+            (
+                {
+                    "HELION_AUTOTUNE_L2_FLUSH": "0",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH": "0",
+                },
+                "off",
+            ),
+        ]:
+            with patch.dict(os.environ, env, clear=False):
+                for name in (
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                ):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                provider.benchmark_isolated.reset_mock()
+                with search._final_selection_measurer([member], policy) as measurer:
+                    self.assertIsInstance(measurer, _WorkerFinalSelectionMeasurer)
+                    self.assertEqual(measurer.regime_label, regime)
+                    self.assertEqual(measurer.measure(0, 3, 4), 1.0)
+                kwargs = provider.benchmark_isolated.call_args.kwargs
+                self.assertEqual(kwargs["l2_flush_mode"], regime)
+                self.assertEqual((kwargs["warmup"], kwargs["rep"]), (3, 4))
+        # a wall-clock worker always flushes, whatever the regime says
+        provider._subprocess_benchmark_uses_wall_clock.return_value = True
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            with search._final_selection_measurer([member], policy) as measurer:
+                self.assertEqual(
+                    measurer.regime_label, "call (wall clock, always flushed)"
+                )
+        provider._subprocess_benchmark_uses_wall_clock.return_value = False
+
+        provider.steady_window_benchmark_available.return_value = False
+        seen: list[dict[str, object]] = []
+
+        def fake_do_bench(fn: Callable[[], object], **kwargs: object) -> float:
+            seen.append(kwargs)
+            return 2.0
+
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(base_search_module, "do_bench", new=fake_do_bench),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            with search._final_selection_measurer([member], policy) as measurer:
+                self.assertIsInstance(measurer, _InProcessFinalSelectionMeasurer)
+                self.assertEqual(measurer.regime_label, "replay")
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertEqual(seen[-1]["l2_flush_mode"], "replay")
+            self.assertEqual((seen[-1]["warmup"], seen[-1]["rep"]), (3, 4))
+            # a backend's own steady bench is called without the regime and
+            # the selection says so
+            search.config_spec.backend.get_do_bench = lambda: fake_do_bench
+            with (
+                patch.object(base_search_module, "do_bench", new=lambda: None),
+                search._final_selection_measurer([member], policy) as measurer,
+            ):
+                self.assertEqual(measurer.regime_label, "backend bench")
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertNotIn("l2_flush_mode", seen[-1])
+            # the wall-clock bench takes the regime but always flushes
+            with (
+                patch.object(base_search_module, "do_bench", new=lambda: None),
+                patch.object(base_search_module, "do_bench_generic", new=fake_do_bench),
+                search._final_selection_measurer([member], policy) as measurer,
+            ):
+                self.assertEqual(
+                    measurer.regime_label, "call (wall clock, always flushed)"
+                )
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertEqual(seen[-1]["l2_flush_mode"], "replay")
+
+    def test_final_selection_logs_and_reports_its_regime(self) -> None:
+        fast = _member(32, 1.00)
+        slow = _member(64, 0.95)
+        policy = FinalSelectionConfig(top_k=4, rounds=2, screen_rep_ms=0)
+        search = _make_search([slow, fast], policy=policy)
+        truth = {id(fast): 1.00, id(slow): 1.05}
+        measurer = _FakeMeasurer(lambda member, window: truth[id(member)])
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(slow), fast)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "replay")
+        self.assertTrue(any("(L2 replay)" in line for line in logs.output))
+        # a measurer that times in another regime labels the phase itself
+        search = _make_search([slow, fast], policy=policy)
+        measurer = _FakeMeasurer(lambda member, window: truth[id(member)])
+        measurer.regime_label = "backend bench"  # type: ignore[attr-defined]
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(slow), fast)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "backend bench")
+        self.assertTrue(any("(L2 backend bench)" in line for line in logs.output))
+
 
 class TestPrivateKernelArgs(TestCase):
     def test_private_slots_own_distinct_storage_and_keep_aliases(self) -> None:
@@ -1306,6 +1437,58 @@ class TestPrivateKernelArgs(TestCase):
         self.assertEqual(job.fixed_repetitions, 7)
         job = BenchmarkJob(object(), "args.pt", args_slot=3)  # type: ignore[arg-type]
         self.assertEqual(job.args_slot, 3)
+
+    def test_worker_measurer_names_the_regime_of_every_window(self) -> None:
+        provider = Mock()
+        provider.benchmark_isolated.return_value = [0.5]
+        fn = lambda: None  # noqa: E731
+        with _WorkerFinalSelectionMeasurer(
+            provider, [fn], private_copies=False, timeout_s=1.0, l2_flush_mode="replay"
+        ) as measurer:
+            measurer.warm(0, 100)
+            self.assertEqual(measurer.measure(0, 3, 4), 0.5)
+        calls = provider.benchmark_isolated.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1].kwargs,
+            {
+                "warmup": 3,
+                "rep": 4,
+                "desc": "Final selection",
+                "args_slots": [None],
+                "timeout": 1.0,
+                "l2_flush_mode": "replay",
+            },
+        )
+        self.assertEqual(calls[0].kwargs["l2_flush_mode"], "replay")
+
+    def test_benchmark_job_times_in_the_regime_it_names(self) -> None:
+        seen: list[dict[str, object]] = []
+
+        def fake_bench(fn: Callable[[], object], **kwargs: object) -> float:
+            seen.append(kwargs)
+            return 1.5
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn_for_worker",
+                return_value=lambda *args: args,
+            ),
+            patch("helion.autotuner.benchmark_job._unload_compiled_fn"),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=("shared",),
+            ),
+            patch("helion.autotuner.benchmark_job.do_bench", side_effect=fake_bench),
+        ):
+            self.assertEqual(BenchmarkJob(object(), "args.pt")(), 1.5)  # type: ignore[arg-type]
+            self.assertEqual(
+                BenchmarkJob(object(), "args.pt", l2_flush_mode="replay")(),  # type: ignore[arg-type]
+                1.5,
+            )
+        # the search's jobs keep the worker's HELION_AUTOTUNE_L2_FLUSH regime
+        self.assertIsNone(seen[0]["l2_flush_mode"])
+        self.assertEqual(seen[1]["l2_flush_mode"], "replay")
 
     def test_benchmark_job_reads_the_private_slot(self) -> None:
         seen: dict[str, object] = {}

@@ -427,6 +427,19 @@ def _compiler_markers(body: list[ast.AST]) -> set[str]:
     }
 
 
+# The persistent-reduction vector markers wrap one scalar access each (the
+# load's original expression, the store's pointer and value); the pass
+# expanding them (``cute/persistent_branch_vec.py``) walks whatever nest it is
+# given and places each packet beside the constexpr lane loop holding its
+# site, so a body holding only these markers is placed like a scalar body.
+_PLACED_MARKERS = frozenset({_PERSISTENT_VEC_LOAD, _PERSISTENT_VEC_STORE})
+
+
+def _structural_markers(body: list[ast.AST]) -> set[str]:
+    """The placeholders whose expanding pass needs the full lane nest."""
+    return _compiler_markers(body) - _PLACED_MARKERS
+
+
 def contains_compiler_marker(body: list[ast.AST]) -> bool:
     """Whether a later pass still has to expand a ``_helion_*`` placeholder."""
     return bool(_compiler_markers(body))
@@ -2931,7 +2944,7 @@ def distribute_lane_loops(
     """
     if not body or not scopes:
         return None
-    if markers := _compiler_markers(body):
+    if markers := _structural_markers(body):
         _pin_atomics_beside_compiler_markers(body, scopes, markers)
         return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
@@ -3012,7 +3025,7 @@ def full_nest_inexactness(
     """
     if not body or not scopes:
         return None
-    if markers := _compiler_markers(body):
+    if markers := _structural_markers(body):
         _pin_atomics_beside_compiler_markers(body, scopes, markers)
         return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
@@ -3488,7 +3501,7 @@ def add_thread_barriers(
     # ``_helion_pending_collective_mma``), moving its statements between the
     # passes it builds and refusing a barrier among the ones it stages: the
     # accesses are checked as for any body, but a barrier they need rejects it.
-    placeholders = _compiler_markers([leaf.statement.node for leaf in leaves])
+    placeholders = _structural_markers([leaf.statement.node for leaf in leaves])
     statements = [leaf.statement for leaf in leaves]
     # The closures run over simple statements: a compound leaf (a device
     # loop) is represented by the statements of its body and takes their

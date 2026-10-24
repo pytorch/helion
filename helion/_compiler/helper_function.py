@@ -177,9 +177,10 @@ class HelperFunctionManager:
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo, final_name: str
     ) -> str:
-        """Register a global helper and reuse its first generated name."""
+        """Record a new global helper under its assigned name."""
         self.helper_functions[helper_graph_info.name] = helper_graph_info
-        return self._final_names.setdefault(helper_graph_info.name, final_name)
+        self._final_names[helper_graph_info.name] = final_name
+        return final_name
 
     def registered_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str | None:
         return self._final_names.get(helper_graph_info.name)

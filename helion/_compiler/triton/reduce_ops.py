@@ -53,12 +53,14 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         result = _codegen_rolled_reduce(state, loop, input_tensor, combine_func)
     else:
         dim = cast("int | None", state.proxy_arg(2))
-        keep_dims = state.proxy_arg(3)
-        keep_dims_arg = ", keep_dims=True" if keep_dims else ""
-        result = expr_from_string(
-            f"tl.reduce({{input_tensor}}, {{dim}}, {combine_func}{keep_dims_arg})",
-            input_tensor=input_tensor,
-            dim=ast.Constant(value=dim),
+        combine_func = _register_reduce_combine(
+            state,
+            combine_func,
+            len(custom_reduction_sources(state.fx_node)),
+            bool(state.proxy_arg(4)),
+        )
+        result = _reduce_expression(
+            input_tensor, dim, combine_func, keep_dims=bool(state.proxy_arg(3))
         )
     if state.proxy_arg(4):
         result = state.codegen.lift(result, dce=True, prefix="custom_reduce_result")
@@ -68,6 +70,17 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             for i in range(len(inputs))
         ]
     return result
+
+
+def _reduce_expression(
+    input_tensor: ast.AST, dim: int | None, combine_func: str, *, keep_dims: bool
+) -> ast.AST:
+    keep_dims_arg = ", keep_dims=True" if keep_dims else ""
+    return expr_from_string(
+        f"tl.reduce({{input_tensor}}, {{dim}}, {combine_func}{keep_dims_arg})",
+        input_tensor=input_tensor,
+        dim=ast.Constant(value=dim),
+    )
 
 
 def _codegen_rolled_reduce(
@@ -80,31 +93,29 @@ def _codegen_rolled_reduce(
     assert state.fx_node is not None
     sources = custom_reduction_sources(state.fx_node)
     dim = cast("int", state.proxy_arg(2))
-    keep_dims = state.proxy_arg(3)
+    keep_dims = bool(state.proxy_arg(3))
     is_tuple_input = bool(state.proxy_arg(4))
     fake_inputs = tuple(source.meta["val"] for source in sources)
     device_function = state.device_function
     env = CompileEnvironment.current()
     strategy = cast("LoopedReductionStrategy", loop.strategy)
     accumulators = []
-    padding_values = []
-    for source, value in zip(sources, fake_inputs, strict=True):
-        fill = cached_masked_value(source)
-        assert fill is not None
+    for value in fake_inputs:
         name = device_function.new_var("custom_reduce_acc", dce=True)
         shape = device_function.tile_strategy.shape_dims(list(value.size()))
         initial = env.backend.full_expr(shape, "0", value.dtype)
         loop.outer_prefix.append(statement_from_string(f"{name} = {initial}"))
         accumulators.append(name)
-        padding_values.append(
-            env.backend.full_expr(shape, constant_repr(fill), value.dtype)
-        )
     targets = ", ".join(accumulators)
     assignment_target = f"({targets},)" if is_tuple_input else targets
     values = cast("ast.Tuple", input_tensor).elts if is_tuple_input else [input_tensor]
     # Arithmetic can emit a wider dtype; the loop carry has the declared tensor type.
     values = [
-        env.backend.cast_ast(value, fake.dtype)
+        state.codegen.lift(
+            env.backend.cast_ast(value, fake.dtype),
+            dce=True,
+            prefix="custom_reduce_input",
+        )
         for value, fake in zip(values, fake_inputs, strict=True)
     ]
     source = ", ".join(ast.unparse(value) for value in values)
@@ -121,7 +132,13 @@ def _codegen_rolled_reduce(
         )
     )
     padded, dynamic = _emit_reduction_padding(
-        state, loop, carry_combine, targets, assignment_target, padding_values
+        state,
+        loop,
+        carry_combine,
+        targets,
+        assignment_target,
+        sources,
+        is_tuple_input=is_tuple_input,
     )
     reduction_input = expr_from_string(assignment_target)
     final_combine = carry_combine
@@ -137,11 +154,8 @@ def _codegen_rolled_reduce(
         final_combine = _register_reduce_combine(
             state, combine_func, len(fake_inputs), is_tuple_input, with_validity=True
         )
-    keep_dims_arg = ", keep_dims=True" if keep_dims else ""
-    reduction = expr_from_string(
-        f"tl.reduce({{input_tensor}}, {{dim}}, {final_combine}{keep_dims_arg})",
-        input_tensor=reduction_input,
-        dim=ast.Constant(value=dim),
+    reduction = _reduce_expression(
+        reduction_input, dim, final_combine, keep_dims=keep_dims
     )
     if dynamic and not is_tuple_input:
         reduction = expr_from_string("{result}[0]", result=reduction)
@@ -158,7 +172,9 @@ def _emit_reduction_padding(
     combine_func: str,
     targets: str,
     assignment_target: str,
-    padding_values: list[str],
+    sources: tuple[torch.fx.Node, ...],
+    *,
+    is_tuple_input: bool,
 ) -> tuple[str, bool]:
     """Preserve the persistent reduction's number of padded contributions."""
     device_function = state.device_function
@@ -189,9 +205,18 @@ def _emit_reduction_padding(
                 statement_from_string(f"{padded} = {padded} | ({padded} >> {shift})")
             )
         loop.outer_suffix.append(statement_from_string(f"{padded} = {padded} + 1"))
+    padding_values = []
+    for source in sources:
+        fill = cached_masked_value(source)
+        assert fill is not None
+        value = source.meta["val"]
+        shape = device_function.tile_strategy.shape_dims(list(value.size()))
+        padding_values.append(
+            env.backend.full_expr(shape, constant_repr(fill), value.dtype)
+        )
     padding = device_function.new_var("custom_reduce_padding")
     padding_args = ", ".join(padding_values)
-    padding_initial = f"({padding_args},)" if state.proxy_arg(4) else padding_args
+    padding_initial = f"({padding_args},)" if is_tuple_input else padding_args
     loop.outer_suffix.append(
         statement_from_string(
             f"for {padding} in range((({numel_expr} + {chunk_var} - 1) // {chunk_var}) * {chunk_var}, {padded}, {chunk_var}):\n"

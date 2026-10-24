@@ -34,6 +34,9 @@ from ._flash_row_mma_runtime import pack_f16x2  # noqa: F401
 from ._flash_row_mma_runtime import stg_f32  # noqa: F401
 from ._flash_row_mma_runtime import stg_v4_b32  # noqa: F401
 from ._flash_row_mma_runtime import sts_f32  # noqa: F401
+from ._warp_mma_runtime import _NC
+from ._warp_mma_runtime import cp_async_4  # noqa: F401
+from ._warp_mma_runtime import cp_async_16_ca  # noqa: F401
 from ._warp_mma_runtime import ldg_b32  # noqa: F401
 from ._warp_mma_runtime import ldg_bf16_as_f32  # noqa: F401
 from ._warp_mma_runtime import ldg_f16_as_f32  # noqa: F401
@@ -41,6 +44,9 @@ from ._warp_mma_runtime import ldg_f32  # noqa: F401
 from ._warp_mma_runtime import ldg_v2_f32  # noqa: F401
 from ._warp_mma_runtime import ldmatrix_x2  # noqa: F401
 from ._warp_mma_runtime import ldmatrix_x2_trans  # noqa: F401
+from ._warp_mma_runtime import lds_bf16_as_f32  # noqa: F401
+from ._warp_mma_runtime import lds_f16_as_f32  # noqa: F401
+from ._warp_mma_runtime import lds_s32  # noqa: F401
 from ._warp_mma_runtime import mma_tf32  # noqa: F401
 from ._warp_mma_runtime import stg_b32  # noqa: F401
 from ._warp_mma_runtime import stg_bf16  # noqa: F401
@@ -73,13 +79,13 @@ def sts_b32(
 
 @dsl_user_op
 def ldg_s32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> cutlass.Int32:
     """``ld.global.s32``: one int32 value (a side vector of window bounds)."""
     result = llvm.inline_asm(
         T.i32(),
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        "ld.global.s32 $0, [$1];",
+        f"ld.global{_NC[nc]}.s32 $0, [$1];",
         "=r,l,~{memory}",
         has_side_effects=True,
         loc=loc,
@@ -104,6 +110,22 @@ def f32_bits(value: object, *, loc: object = None, ip: object = None) -> object:
         **_ASM_KW,
     )
     return cutlass.Uint32(result)
+
+
+@dsl_user_op
+def bits_f32(word: object, *, loc: object = None, ip: object = None) -> object:
+    """``mov.b32``: the fp32 value of a 32-bit word (a packet's element)."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
+        "mov.b32 $0, $1;",
+        "=f,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
 
 
 @dsl_user_op
@@ -187,6 +209,25 @@ def lds_v4_b32(
         "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,r,~{memory}",
         has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return _words(result, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v4_b32(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.b32``: one 16-byte packet (eight 16-bit or four
+    32-bit elements) at a 16-byte aligned address."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
         loc=loc,
         ip=ip,
         **_ASM_KW,

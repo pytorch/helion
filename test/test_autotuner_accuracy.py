@@ -609,11 +609,17 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
         #   _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 4 total
+        #   + 2 benchmark runs = 4 total. The benchmark runs happen in the
+        #   killable worker when the subprocess benchmark is enabled, where
+        #   this patch does not reach: the parent then clones it twice.
+        expected_mutated_clones = (
+            2 if inplace_add.settings.autotune_benchmark_subprocess else 4
+        )
         self.assertEqual(
             mutated_clones[0],
-            4,
-            f"Mutated tensor cloned {mutated_clones[0]} times, expected 4.",
+            expected_mutated_clones,
+            f"Mutated tensor cloned {mutated_clones[0]} times, "
+            f"expected {expected_mutated_clones}.",
         )
 
         # Non-mutated tensors (a, b) should only be cloned during baseline:

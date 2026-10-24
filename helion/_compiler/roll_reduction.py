@@ -98,7 +98,7 @@ class ReductionRoller:
         # their payloads. Drop classification results with this one pass.
         self._reduction_block_ids: dict[torch.fx.Node, int | None] = {}
 
-    def reduction_block_id(self, node: torch.fx.Node) -> int | None:
+    def _cached_reduction_block_id(self, node: torch.fx.Node) -> int | None:
         if node.target is not _reduce:
             return reduction_block_id(node)
         if node not in self._reduction_block_ids:
@@ -107,7 +107,7 @@ class ReductionRoller:
 
     def is_reduction(self, node: torch.fx.Node) -> bool:
         """Whether the node reduces the dimension being rolled."""
-        return self.reduction_block_id(node) == self.rdim.block_id
+        return self._cached_reduction_block_id(node) == self.rdim.block_id
 
     def should_go_in_inner_graph(self, node: torch.fx.Node) -> bool:
         """Nodes go in the inner graph if they use the reduction dimension"""
@@ -115,7 +115,7 @@ class ReductionRoller:
             return False
         assert node.op == "call_function", f"Unsupported node type {node.op}"
 
-        if node.target is _reduce and self.reduction_block_id(node) is None:
+        if node.target is _reduce and self._cached_reduction_block_id(node) is None:
             raise NotImplementedError(
                 "custom reduction rolling requires Triton and matching single-axis payloads"
             )

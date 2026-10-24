@@ -64,6 +64,31 @@ def test_ordinary_binding_emits_the_complete_raw_tf32_family(k, n):
         assert "tcgen05." not in device
 
 
+@pytest.mark.parametrize("pdl", [False, True])
+def test_raw_tf32_kernel_honors_cute_pdl(pdl):
+    with cuda_binding(
+        static=True, original=True, groups=5, rows=131, k=64, n=64
+    ) as bound:
+        bound.config_spec.target_device_capability = (10, 0)
+        config = helion.Config.from_dict(_config(bound).config | {"cute_pdl": pdl})
+        device = _native_source(_source(bound, config))
+        kernel = next(
+            node
+            for node in ast.parse(device).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_helion_native_grouped_rna"
+        )
+        # The native module bypasses the device function, so the knob is
+        # honored by the renderer: every thread waits as the kernel's first
+        # statement and the launcher adds ``use_pdl``.
+        assert (ast.unparse(kernel.body[0]) == "cute.arch.griddepcontrol_wait()") is pdl
+        assert device.count("griddepcontrol") == (1 if pdl else 0)
+        assert (
+            "_helion_native_grouped_rna._helion_cute_use_pdl = True" in device
+        ) is pdl
+        assert "_helion_cute_wrapper_plans = []" in device
+
+
 @pytest.mark.parametrize(
     "case",
     [

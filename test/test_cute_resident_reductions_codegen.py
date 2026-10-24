@@ -71,7 +71,7 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
             bound.env, host.device_ir
         )
         assert seeds and all(seed in spec.compiler_seed_configs for seed in seeds)
-        assert {
+        geometries = {
             (
                 tuple(seed.block_sizes),
                 max(seed.num_threads),
@@ -79,13 +79,22 @@ def test_original_normalization_seeds_survive_search_and_emit_resident_pipeline(
                 seed.config["cute_reduction_schedule"],
             )
             for seed in seeds
-        } == {
+        }
+        lattice = {
             ((32, 1), 256, 2, "pipelined"),
             ((32, 1), 256, 1, "resident"),
             ((32, 1), 128, 1, "pipelined"),
             ((16, 1), 512, 2, "pipelined"),
             ((32, 1), 512, 4, "pipelined"),
         }
+        assert {g for g in geometries if g[0][0] >= 16} == lattice
+        # 64 rows leave most SMs idle at 16-32 rows per CTA: the same thread /
+        # row-group / schedule choices are repeated at an occupancy-filling
+        # coarse tile (one row per CTA for a 128-SM device).
+        occupancy = {g for g in geometries if g[0][0] < 16}
+        assert occupancy
+        assert {g[1:] for g in occupancy} <= {g[1:] for g in lattice}
+        assert {g[0] for g in occupancy} == {(1, 1)}
         generation = ConfigGeneration(spec)
         surviving = [config for _flat, config in generation.seed_flat_config_pairs()]
         for seed in seeds:

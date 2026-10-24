@@ -33,6 +33,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
+from helion.autotuner.config_spec import get_valid_eviction_policies
 import helion.language as hl
 from helion.language._tracing_ops import _mask_to
 from helion.language.reduce_ops import _reduce
@@ -1364,6 +1365,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                 expected = (
                     "last"
                     if memory.tensor_name == "y"
+                    and "last" in get_valid_eviction_policies(spec.backend_name)
                     else default.load_eviction_policies[memory.eviction_index]
                 )
                 self.assertEqual(

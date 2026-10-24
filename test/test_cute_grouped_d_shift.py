@@ -342,6 +342,9 @@ def test_signed_pointer_and_virtual_coordinate_bounds_fail_closed(
     assert not bounded_d_shift_index_domain(m, n, row_tile)
 
 
+# Renders every shifted seed of a grouped tcgen05 kernel: ~55 s alone, so the
+# 60 s per-test CI limit trips under xdist contention.
+@pytest.mark.timeout(180)
 def test_shifted_compiler_seeds_keep_the_old_prefix_and_logical_cap() -> None:
     args = (
         torch.empty((2048, 512), dtype=torch.bfloat16),

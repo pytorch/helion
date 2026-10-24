@@ -79,6 +79,11 @@ from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cute_mma_dag import AXIS_LEAD
 from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
@@ -95,6 +100,10 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_FIXUP
+from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
@@ -104,6 +113,8 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
+from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
+from .._compiler.cute.cute_mma_dag import fixup_admitted
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
@@ -1013,8 +1024,11 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_gathered_mma_n",
         "cute_gathered_mma_stages",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_pdl",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "epilogue_subtile",
     }
 )
@@ -1122,6 +1136,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1155,6 +1171,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1262,6 +1279,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1295,6 +1314,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_tiles_per_block",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -1417,6 +1437,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_store_policy",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
+        "cute_simt_mma",
+        "cute_simt_mma_layout",
         "cute_signed_bitfield_bf16",
         "cute_collective_mma",
         "cute_collective_static_layouts",
@@ -1556,6 +1578,9 @@ class ConfigSpec:
         # separate roots reuse physical axes during CuTe launch planning.
         self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
+        # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
+        # SIMT GEMM knob's precondition, recorded by DeviceIR.
+        self.cute_fp32_dot_exact: bool = False
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1731,9 +1756,16 @@ class ConfigSpec:
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
+        self.cute_mma_dag_aux: EnumFragment | None = None
         # The tcgen05 mode's persistent launch (CTAs per SM); None where the
         # mode or its one-tile-per-CTA region programs leave it no subject.
         self.cute_mma_dag_persistent: EnumFragment | None = None
+        # The tcgen05 region renderer's thread-block cluster over a
+        # full-slice fragment axis; None where the program has no such axis.
+        self.cute_mma_dag_cluster: EnumFragment | None = None
+        # How the split's CTAs combine their row reductions: one cluster's
+        # distributed shared memory, or the fixup grid's global workspace.
+        self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
@@ -1755,6 +1787,9 @@ class ConfigSpec:
         # Config with a native GEMM. Keep its ordinary SIMT layout knobs in
         # the native search schema; MMA-owned axes retain their auto layout.
         self.cute_pointwise_region_block_ids: frozenset[int] = frozenset()
+        # Root-grid axes fixed at one element per tile -> static tile count
+        # (``cute_tiles_per_block`` packs several of their tiles per CTA).
+        self.cute_tile_pack_counts: dict[int, int] = {}
         # Separately launched pointwise grids whose axes have one root owner.
         # Their search floors use the rank of that launch, independently of
         # any native MMA region sharing the complete kernel configuration.
@@ -3266,9 +3301,26 @@ class ConfigSpec:
         """
         self.cute_mma_dag_facts = facts
         modes = MMA_DAG_MODES
+        if facts.chain_vecs:
+            # No warp config runs a fragment chain over a row vector: the
+            # choice would only be repaired to ``off`` (and the random half
+            # of a search spent on the SIMT lowering).
+            modes = tuple(mode for mode in modes if mode != MMA_DAG_WARP)
         if facts.tcgen05 is not None:
             modes = (*modes, MMA_DAG_TCGEN05)
-        self.cute_mma_dag = EnumFragment(choices=modes)
+        search = modes
+        if facts.split_axis >= 0 and MMA_DAG_TCGEN05 in modes:
+            # A full-slice fragment program: its row reductions over the
+            # whole axis have the region renderer's lowering, while the SIMT
+            # fallback's lane-restore pass declines most tilings (50 of 55
+            # random "off" configs at 2048^3 and 49 of 56 at 512x1024x1024
+            # failed to compile, every tensor-memory config compiled), so
+            # the search samples the tensor-memory mode; "off" stays a legal
+            # value (the repair fallback, explicit configs).
+            search = tuple(mode for mode in modes if mode != MMA_DAG_OFF)
+        self.cute_mma_dag = EnumFragment(
+            choices=modes, search_choices=search if search != modes else None
+        )
         self.cute_mma_dag_warps = EnumFragment(
             choices=(
                 MMA_DAG_DEFAULT_WARPS,
@@ -3285,9 +3337,29 @@ class ConfigSpec:
         self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
         self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
+        if facts.aux_candidates:
+            self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
         if facts.tcgen05 is not None and not facts.tcgen05.regions:
             self.cute_mma_dag_persistent = EnumFragment(
                 choices=MMA_DAG_PERSISTENT_CHOICES
+            )
+        if (
+            facts.tcgen05 is not None
+            and facts.tcgen05.regions
+            and facts.split_axis >= 0
+        ):
+            # The split count: a portable cluster's (<= 8), and the fixup
+            # grid's wider ones where the program admits the fixup form.
+            admitted = fixup_admitted(facts)
+            self.cute_mma_dag_cluster = EnumFragment(
+                choices=tuple(
+                    choice
+                    for choice in MMA_DAG_CLUSTER_CHOICES
+                    if admitted or choice <= MMA_DAG_CLUSTER_MAX
+                )
+            )
+            self.cute_mma_dag_split = (
+                EnumFragment(choices=MMA_DAG_SPLIT_CHOICES) if admitted else None
             )
 
     def _normalize_cute_mma_dag(
@@ -3308,8 +3380,13 @@ class ConfigSpec:
             (MMA_DAG_EXCHANGE_KEY, self.cute_mma_dag_exchange),
             (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
+            (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
         ):
-            assert fragment is not None
+            if fragment is None:
+                # The aux knob has no subject here: inert, no choices.
+                assert key == MMA_DAG_AUX_KEY
+                config[key] = MMA_DAG_AUX_CHOICES[0]
+                continue
             value = config.setdefault(key, fragment.default())
             if value not in fragment.choices or type(value) is bool:
                 if fix_invalid:
@@ -3331,6 +3408,53 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
             config[MMA_DAG_PERSISTENT_KEY] = 0
+        cluster_fragment = self.cute_mma_dag_cluster
+        cluster = config.setdefault(MMA_DAG_CLUSTER_KEY, 1)
+        allowed = (1,) if cluster_fragment is None else cluster_fragment.choices
+        if cluster not in allowed or type(cluster) is not int:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY} must be one of {allowed!r}, got {cluster!r}"
+                )
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 and config[MMA_DAG_CLUSTER_KEY] != 1:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_CLUSTER_KEY} needs the tcgen05 mode")
+            config[MMA_DAG_CLUSTER_KEY] = 1
+        split_fragment = self.cute_mma_dag_split
+        split = config.setdefault(MMA_DAG_SPLIT_KEY, MMA_DAG_SPLIT_CLUSTER)
+        split_allowed = (
+            (MMA_DAG_SPLIT_CLUSTER,)
+            if split_fragment is None
+            else split_fragment.choices
+        )
+        if split not in split_allowed:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_SPLIT_KEY} must be one of {split_allowed!r}, got {split!r}"
+                )
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        if (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_CLUSTER
+            and cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX
+        ):
+            # A portable thread-block cluster holds eight CTAs: a wider split
+            # combines its rows through the fixup grid (offered only where
+            # the program admits it; the cluster choices stop at eight
+            # elsewhere, so this is the admitted case).
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_CLUSTER_KEY}={config[MMA_DAG_CLUSTER_KEY]} needs "
+                    f"{MMA_DAG_SPLIT_KEY}={MMA_DAG_SPLIT_FIXUP!r} (a portable cluster "
+                    f"holds at most {MMA_DAG_CLUSTER_MAX} CTAs)"
+                )
+            config[MMA_DAG_SPLIT_KEY] = (
+                MMA_DAG_SPLIT_FIXUP
+                if split_fragment is not None
+                else MMA_DAG_SPLIT_CLUSTER
+            )
+            if split_fragment is None:
+                config[MMA_DAG_CLUSTER_KEY] = 1
         if config[MMA_DAG_KEY] == MMA_DAG_OFF:
             # The warp count, stage depth and data routes are inert without
             # the mode.
@@ -3340,7 +3464,10 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
             config[MMA_DAG_PERSISTENT_KEY] = 0
+            config[MMA_DAG_CLUSTER_KEY] = 1
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
             return
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
@@ -3354,11 +3481,21 @@ class ConfigSpec:
         for axis in facts.axes:
             if axis.kind == AXIS_LEAD and axis.block_id in indices:
                 block_sizes[indices[axis.block_id]] = 1
-        sizes_by_block = {
+        sizes_by_block: dict[int, object] = {
             block_id: block_sizes[index] for block_id, index in indices.items()
         }
         warps, stages = config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY]
         mode = cast("str", config[MMA_DAG_KEY])
+        reason = apply_mma_dag_cluster(
+            facts,
+            sizes_by_block,
+            config[MMA_DAG_CLUSTER_KEY],
+            config[MMA_DAG_SPLIT_KEY],
+        )
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
+            config[MMA_DAG_CLUSTER_KEY] = 1
         reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
         if reason is not None:
             if not fix_invalid:
@@ -3377,11 +3514,41 @@ class ConfigSpec:
                 config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+                config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
                 config[MMA_DAG_PERSISTENT_KEY] = 0
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
             for block_id, index in indices.items():
                 block_sizes[index] = new_sizes[block_id]
+            # The repaired split axis slice names the split count (1 when
+            # the repair kept the whole axis, or fell back to the warp mode);
+            # beyond a portable cluster it is the fixup grid's.
+            config[MMA_DAG_CLUSTER_KEY] = facts.cluster_of(new_sizes)
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_FIXUP
+        if config[MMA_DAG_CLUSTER_KEY] == 1:
+            # The whole axis in one CTA: the combine mode has no subject.
+            config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+        elif (
+            config[MMA_DAG_SPLIT_KEY] == MMA_DAG_SPLIT_FIXUP
+            and apply_mma_dag_cluster(
+                facts,
+                {},
+                config[MMA_DAG_CLUSTER_KEY],
+                MMA_DAG_SPLIT_FIXUP,
+            )
+            is not None
+        ):
+            # The repaired split does not admit the fixup form (a program
+            # with a leading axis or two root axes, or too many tiles): the
+            # cluster form takes a portable count, else the whole axis.
+            if cast("int", config[MMA_DAG_CLUSTER_KEY]) <= MMA_DAG_CLUSTER_MAX:
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
+            else:
+                config[MMA_DAG_CLUSTER_KEY] = 1
+                config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
         # snapshot to stage.
@@ -3389,6 +3556,8 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+        if not facts.aux_candidates:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
             mma_dag_pass_warps_reason(
                 facts,
@@ -3399,12 +3568,18 @@ class ConfigSpec:
             is not None
         ):
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
-        # The loads route has a subject only in the tensor-memory region
-        # programs whose derived values read tiles.
-        if config[MMA_DAG_KEY] != MMA_DAG_TCGEN05 or not (
-            facts.tcgen05 is not None and facts.tcgen05.aux_items
-        ):
+        # The loads route has a subject in the tensor-memory region programs
+        # whose derived values read tiles, and in the warp mode when a ring
+        # tile's source is one a tensor map can fetch or an epilogue value
+        # reads a loop-invariant tile (staged ahead of the loops).
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            loads_subject = facts.tcgen05 is not None and bool(facts.tcgen05.aux_items)
+        else:
+            loads_subject = facts.tma_ring or facts.fixed_derived
+        if not loads_subject:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
+        if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         # Inert knobs: the body is replaced, so equal kernels share one
         # autotune identity (the occupancy hint stays searchable).  The
         # persistent tcgen05 launch is the generic persistent_interleaved
@@ -3435,7 +3610,7 @@ class ConfigSpec:
             value = config.get(key)
             if isinstance(value, list):
                 config[key] = [default for _ in value]
-        for key in ("cute_collective_mma", "cute_register_chain"):
+        for key in ("cute_collective_mma", "cute_register_chain", "cute_simt_mma"):
             if key in config:
                 config[key] = False
         for key, field in self._flat_fields().items():
@@ -4084,6 +4259,37 @@ class ConfigSpec:
         if self.backend_name != "cute":
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
+
+    def _cute_config_forms_one_vector_lane(
+        self,
+        config: dict[str, object],
+        rl_spec: ReductionLoopSpec,
+        available: int,
+    ) -> bool:
+        """Whether ``config`` spells out one vector per thread for the
+        persistent reduction ``rl_spec``: an explicit thread count that fits
+        the remaining budget and a vector width whose product is the extent
+        (``PersistentReductionStrategy`` keeps a V-wide fragment per thread
+        exactly then).  That lane is the requested geometry (a pointwise
+        kernel's stride-1 slice, rope's half head dim), not a thread count the
+        budget shrank, so it stays persistent beside wide tile axes.
+        """
+        nt_list = cast("list[int]", config.get("num_threads", []) or [])
+        vec_list = cast("list[int]", config.get("cute_vector_widths", []) or [])
+        requested = self.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+        if (
+            not isinstance(requested, int)
+            or requested <= 0
+            or requested > available
+            or rl_spec.size_hint % requested
+        ):
+            return False
+        if rl_spec.block_id not in self.cute_vector_widths.valid_block_ids():
+            return False
+        vec = self.cute_vector_widths.config_get(vec_list, rl_spec.block_id, 1)
+        return (
+            isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
+        )
 
     def _cute_config_forms_register_tile(
         self,
@@ -5006,6 +5212,39 @@ class ConfigSpec:
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
 
+    def _normalize_cute_tiles_per_block(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_tiles_per_block`` packs that many one-element grid tiles per
+        CTA as thread sub-groups: a flat pid type, no CTA cluster split, no L2
+        grouping (its pid decode has no pack term), and a packable root-grid
+        axis whose static tile count it divides."""
+        from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+        from .._compiler.cute.tile_packing import l2_grouped
+
+        pack = config.get("cute_tiles_per_block", 1)
+        if type(pack) is not int or pack not in TILES_PER_BLOCK_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_tiles_per_block must be one of {TILES_PER_BLOCK_CHOICES}"
+                )
+            pack = 1
+        if pack > 1 and not (
+            config.get("pid_type", "flat") == "flat"
+            and config.get("cute_cluster_n", 1) == 1
+            and not l2_grouped(config)
+            and any(count % pack == 0 for count in self.cute_tile_pack_counts.values())
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_tiles_per_block needs a flat pid type, no cluster split, "
+                    "no L2 grouping and a one-element grid axis whose tile count "
+                    "it divides"
+                )
+            pack = 1
+        if "cute_tiles_per_block" in config or pack != 1:
+            config["cute_tiles_per_block"] = pack
+
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5027,23 +5266,21 @@ class ConfigSpec:
                     f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
                 )
             unroll = 1
-        if not sink and not self._cute_config_forms_grid_lane_loop(config):
+        if not sink and not self._cute_config_forms_lane_loop(config):
             unroll = 1
         if "cute_lane_unroll" in config or unroll != 1:
             config["cute_lane_unroll"] = unroll
 
-    def _cute_config_forms_grid_lane_loop(self, config: dict[str, object]) -> bool:
-        """Whether some grid tile axis gets a per-thread lane loop: an explicit
-        thread count below its static block size that divides it (the
-        condition ``PerThreadNDTileStrategy`` allocates a lane variable on)."""
+    def _cute_config_forms_lane_loop(self, config: dict[str, object]) -> bool:
+        """Whether some tile axis (of the grid or of a device loop) gets a
+        per-thread lane loop: an explicit thread count below its static block
+        size that divides it (the condition ``PerThreadNDTileStrategy``
+        allocates a lane variable on)."""
         # Runs before the sequences are normalized: a single-block kernel may
         # still spell them as scalars.
         nt_list = _as_sequence(config.get("num_threads"))
         bs_list = _as_sequence(config.get("block_sizes"))
-        thread_block_ids = self.num_threads.valid_block_ids()
-        for block_id in self.grid_block_ids:
-            if block_id not in thread_block_ids:
-                continue
+        for block_id in self.num_threads.valid_block_ids():
             nt = self.num_threads.config_get(nt_list, block_id, 0)
             bs = self.block_sizes.config_get(bs_list, block_id, 1)
             if (
@@ -5075,6 +5312,48 @@ class ConfigSpec:
                     "cute_register_chain requires a boolean, matrix contractions, "
                     "and CUDA compute capability >= 8.0"
                 )
+
+    def _normalize_cute_simt_mma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+        key = "cute_simt_mma"
+        if key in config:
+            value = config[key]
+            if type(value) is not bool or (value and not self.cute_simt_mma_enabled):
+                if fix_invalid:
+                    config[key] = False
+                else:
+                    raise InvalidConfig(
+                        "cute_simt_mma requires a boolean and an fp32 matrix contraction"
+                    )
+        # The layout is inert while the GEMM is off (a flat field keeps its
+        # default there, and the strict coverage round trip must stay the
+        # identity); only an unknown value is invalid.
+        layout_key = "cute_simt_mma_layout"
+        if layout_key not in config:
+            return
+        if config[layout_key] not in SIMT_MMA_LAYOUTS:
+            if fix_invalid:
+                config[layout_key] = SIMT_MMA_LAYOUTS[0]
+            else:
+                raise InvalidConfig(
+                    f"cute_simt_mma_layout must be one of {SIMT_MMA_LAYOUTS}"
+                )
+
+    @property
+    def cute_simt_mma_enabled(self) -> bool:
+        """Whether the exact fp32 SIMT GEMM (``cute_simt_mma``) has a target.
+
+        fp32 contractions under ``dot_precision="tf32"`` belong to the tensor
+        cores; the knob exists only when the kernel's precision keeps them
+        exact (``cute_fp32_dot_exact``, recorded by DeviceIR).
+        """
+        return self.cute_fp32_dot_exact and any(
+            fact.lhs_dtype == torch.float32 and fact.rhs_dtype == torch.float32
+            for fact in self.matmul_facts
+        )
 
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -5714,8 +5993,10 @@ class ConfigSpec:
             )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_tiles_per_block(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_simt_mma(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
                 value = config.setdefault("cute_collective_mma", False)
                 if not isinstance(value, bool):
@@ -6084,6 +6365,8 @@ class ConfigSpec:
                             and self._cute_config_forms_register_tile(
                                 config, spec, available
                             )
+                        ) or self._cute_config_forms_one_vector_lane(
+                            config, spec, available
                         ):
                             continue
                         chunk = min(spec.size_hint, available)
@@ -6790,9 +7073,18 @@ class ConfigSpec:
         """Raise search floors for grid block dimensions based on problem size.
 
         Very small block sizes produce enormous grids that the autotuner
-        wastes time exploring.  This heuristic sets a floor so the total
-        number of blocks per dimension stays within a reasonable range
-        derived from ``num_compute_units``.
+        wastes time exploring.  This heuristic floors each root grid so its
+        program count (the product of its dimensions' block counts) stays
+        within a budget derived from ``num_compute_units``.
+
+        The budget is shared across the dimensions of one grid by water
+        filling: a dimension that cannot use its even share of the budget
+        (``B=4`` in a ``[B, L]`` grid) is left unfloored and hands its unused
+        share to the remaining dimensions, so ``L`` may still tile down to 1
+        when the whole grid fits the budget.  Each root grid (``KernelGridFact``
+        roots, or the fissioned pointwise launches) owns a full budget; with
+        no recorded grid topology every grid axis belongs to one grid, the
+        legacy rule.
 
         The raised minimum never exceeds the default block size that
         ``_fragment`` would compute, so memory and shared-memory
@@ -6801,33 +7093,64 @@ class ConfigSpec:
         if not self.grid_block_ids:
             return
 
-        n_cus = num_compute_units()
-        n_dims = len(self.grid_block_ids)
-        max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
-        independent_max_blocks: dict[int, int] = {
-            block_id: math.ceil((n_cus * 64) ** (1.0 / len(grid)))
-            for grid in self.cute_pointwise_region_grid_groups
-            for block_id in grid
-        }
+        budget = num_compute_units() * 64
+        for grid in self._grid_floor_groups():
+            specs: list[BlockSizeSpec] = []
+            for grid_bid in grid:
+                try:
+                    spec = self.block_sizes.block_id_lookup(grid_bid)
+                except KeyError:
+                    continue
+                if spec.size_hint > 0:
+                    specs.append(spec)
+            remaining = float(budget)
+            # Smallest dimensions first: they are the ones that may not use
+            # their even share, and the surplus flows to the larger ones.
+            # Dimensions of one extent take the same share at once, so a
+            # symmetric grid floors every axis alike (for a uniform grid this
+            # is exactly the legacy per-axis rule, ceil(budget ** (1 / n))).
+            ordered = sorted(specs, key=lambda s: s.size_hint)
+            index = 0
+            while index < len(ordered):
+                size = ordered[index].size_hint
+                tied = [spec for spec in ordered[index:] if spec.size_hint == size]
+                share = remaining ** (1.0 / (len(ordered) - index))
+                index += len(tied)
+                if size <= share:
+                    # The whole dimension fits in its share at block size 1.
+                    remaining = max(remaining / size ** len(tied), 1.0)
+                    continue
+                max_blocks = math.ceil(share)
+                remaining = max(remaining / max_blocks ** len(tied), 1.0)
+                for spec in tied:
+                    default = spec._fragment(self).default_val
+                    min_block = min(size // max_blocks, default)
+                    if min_block >= 2:
+                        min_block = 1 << (min_block.bit_length() - 1)
+                        min_block = min(min_block, spec.max_size)
+                        spec.autotuner_min = assert_integer_power_of_two(
+                            max(min_block, spec.autotuner_min)
+                        )
 
-        for grid_bid in self.grid_block_ids:
-            try:
-                spec = self.block_sizes.block_id_lookup(grid_bid)
-            except KeyError:
-                continue
-            if spec.size_hint <= 0:
-                continue
-            default = spec._fragment(self).default_val
-            min_block = spec.size_hint // independent_max_blocks.get(
-                grid_bid, max_blocks_per_dim
-            )
-            min_block = min(min_block, default)
-            if min_block >= 2:
-                min_block = 1 << (min_block.bit_length() - 1)
-                min_block = min(min_block, spec.max_size)
-                spec.autotuner_min = assert_integer_power_of_two(
-                    max(min_block, spec.autotuner_min)
-                )
+    def _grid_floor_groups(self) -> list[tuple[int, ...]]:
+        """Root grids for the occupancy floor, each owning a full budget."""
+        independent = [
+            tuple(grid) for grid in self.cute_pointwise_region_grid_groups if grid
+        ]
+        covered = {block_id for grid in independent for block_id in grid}
+        if self.kernel_grid_fact is not None:
+            roots = [
+                tuple(block_id for block_id in root if block_id not in covered)
+                for root in self.kernel_grid_fact.grid_groups
+            ]
+            known = covered | {block_id for root in roots for block_id in root}
+            # Axes added after the topology was recorded (a promoted output
+            # axis) share one grid with every other unassigned axis.
+            rest = tuple(b for b in self.grid_block_ids if b not in known)
+        else:
+            roots = []
+            rest = tuple(b for b in self.grid_block_ids if b not in covered)
+        return [grid for grid in (*independent, *roots, rest) if grid]
 
     def create_config_generation(
         self,
@@ -7772,6 +8095,11 @@ class ConfigSpec:
                         (False, True),
                         search_choices=(False, True) if chain_seeded else (False,),
                     )
+                if self.cute_simt_mma_enabled:
+                    from .._compiler.cute.simt_gemm import SIMT_MMA_LAYOUTS
+
+                    fields["cute_simt_mma"] = EnumFragment((False, True))
+                    fields["cute_simt_mma_layout"] = EnumFragment(SIMT_MMA_LAYOUTS)
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately
@@ -7819,6 +8147,18 @@ class ConfigSpec:
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
                         choices=(0, 1, 2, 3, 4, 6)
                     )
+                # Several one-element grid tiles per CTA (thread sub-groups):
+                # tiny-tile kernels are CTA-dispatch bound.
+                if (
+                    self.supports_config_key("cute_tiles_per_block")
+                    and self.cute_tile_pack_counts
+                    and not self.matmul_facts
+                ):
+                    from .._compiler.cute.tile_packing import TILES_PER_BLOCK_CHOICES
+
+                    fields["cute_tiles_per_block"] = EnumFragment(
+                        choices=TILES_PER_BLOCK_CHOICES
+                    )
             # The fused flash bodies (forward and backward) emit their own
             # epilogues; the subtiled store split rewrites the graphs the
             # attention matchers read, so the knob leaves the search space.
@@ -7864,8 +8204,14 @@ class ConfigSpec:
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
+                if self.cute_mma_dag_aux is not None:
+                    fields[MMA_DAG_AUX_KEY] = self.cute_mma_dag_aux
                 if self.cute_mma_dag_persistent is not None:
                     fields[MMA_DAG_PERSISTENT_KEY] = self.cute_mma_dag_persistent
+                if self.cute_mma_dag_cluster is not None:
+                    fields[MMA_DAG_CLUSTER_KEY] = self.cute_mma_dag_cluster
+                if self.cute_mma_dag_split is not None:
+                    fields[MMA_DAG_SPLIT_KEY] = self.cute_mma_dag_split
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
