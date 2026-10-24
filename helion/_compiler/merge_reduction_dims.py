@@ -27,8 +27,13 @@ from .. import exc
 from ..language import _MEMORY_OPS
 from ..language._decorators import args_to_proxies
 from ..language._tracing_ops import _host_tensor
+from ..language.distributed_ops import make_async_remote_copy
+from ..language.inline_triton_ops import inline_triton
+from ..language.inline_triton_ops import triton_kernel
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
+from .cute.memory_ops import register_cute_tensor_alias_specializations
+from .cute.memory_ops import runtime_tensors_are_proven_disjoint
 from .host_function import HostFunction
 from .indexing_strategy import is_block_size_index
 from .loop_dependency_checker import _storage_ids
@@ -85,11 +90,8 @@ def chain_reduction_dims(
         keepdim: bool = False,
         **kwargs: object,
     ) -> object:
-        if (
-            not dim
-            or len(dims := set(canonicalize_dims(x.ndim, dim))) != len(dim)
-            or len(dims) < 2
-        ):
+        dims = set(canonicalize_dims(x.ndim, dim)) if dim else set()
+        if not dim or len(dims) != len(dim) or len(dims) < 2:
             if fallback is None:
                 return NotImplemented
             return fallback(x, dim, keepdim, **kwargs)
@@ -122,24 +124,47 @@ def chain_reduction_dims(
         # backend lowers. Integer min/max has the same truth table.
         if bool_extrema:
             x = x.to(torch.uint8)
-        if upcast:
+        elif upcast:
             x = x.to(out_dtype)
             kwargs["dtype"] = torch.float32
         for d in sorted(dims, reverse=True):
+            if bool_extrema:
+                # Uint8 extrema over a literal unit axis only change rank.
+                # Avoid a redundant reduction whose block can alias another axis.
+                extent = x.size(d)
+                if isinstance(extent, int) and extent == 1:
+                    if not keepdim:
+                        x = x.squeeze(d)
+                    continue
             x = op(x, [d], keepdim, **kwargs)
         result = x.to(out_dtype) if upcast or bool_extrema else x
-        # Tag the chain so merge_reduction_dims can replace it.
-        # Bool extrema use the integer chain above; merging the original
-        # bool op would bypass that conversion and recreate any/all lowering.
+        # Boolean extrema keep their integer chain: merging the original bool
+        # operation would recreate unsupported any/all lowering.
         if mode is not None and source_node is not None and not bool_extrema:
             node = _tensor_proxy_node(result, mode.tracer)
             if source_node.graph is not node.graph:
                 return result
-            chain_nodes: set[str] = set()
+            # Follow only tensor producers of this result. Lazy scalar/host
+            # proxies and unrelated nodes appended while tracing are not part
+            # of the reduction chain.
+            created_nodes: set[Node] = set()
             for created in reversed(node.graph.nodes):
                 if created is previous_tail:
                     break
+                created_nodes.add(created)
+            chain_nodes: set[str] = set()
+            pending = [node]
+            while pending:
+                created = pending.pop()
+                if (
+                    created not in created_nodes
+                    or created.name in chain_nodes
+                    or created.target is _host_tensor
+                    or not isinstance(created.meta.get("val"), torch.Tensor)
+                ):
+                    continue
                 chain_nodes.add(created.name)
+                pending.extend(created.all_input_nodes)
             node.meta[_META_KEY] = _ReductionChain(
                 op=op.name(),
                 dims=sorted(dims),
@@ -160,8 +185,13 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
     # without static_shapes kernels aren't specialized on strides, so a later
     # input's flatten() might copy.
     enabled = env.backend.name in ("triton", "cute") and env.settings.static_shapes
+
+    def require_chain_support(detail: str) -> None:
+        if env.backend.name == "cute":
+            raise exc.BackendUnsupported("cute", detail)
+
     replaced: set[int] = set()
-    excluded: set[int] | None = None
+    excluded: dict[int, torch.Tensor | None] | None = None
     # Shared across graphs, so each flattened view is one kernel argument
     flat_views: dict[tuple[int, int, int], torch.Tensor] = {}
     # a replaced chain's result -> its replacement, which later chains reduce
@@ -172,6 +202,10 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
         if not tagged_nodes:
             continue
         if not enabled:
+            require_chain_support(
+                "multi-dimensional reductions require static_shapes=True "
+                "and adjacent dimensions that can be flattened without copying"
+            )
             for node in tagged_nodes:
                 node.meta.pop(_META_KEY)
             continue
@@ -183,25 +217,47 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
             while source is node or source.name in tag.nodes:
                 source = cast("Node", source.args[0])
             dims = tag.dims
-            if dims != [*range(dims[0], dims[-1] + 1)]:
+            if any(b != a + 1 for a, b in itertools.pairwise(dims)):
+                require_chain_support(
+                    "multi-dimensional reductions over non-adjacent dimensions"
+                )
                 continue
             if excluded is None:
                 # Leave store and atomic targets unmerged: a merged load reads
                 # them in a different layout than they are written, and CuTe
                 # may promote an atomic target's dtype after merging, which
                 # its flattened view would miss.
+                excluded_ids: set[int] = set()
+                storage_tensors: dict[int, torch.Tensor] = {}
+                for info in graphs:
+                    for n in info.graph.nodes:
+                        value = n.meta.get("val")
+                        if isinstance(value, torch.Tensor):
+                            storage_tensors.setdefault(
+                                id(value.untyped_storage()), value
+                            )
+                        if n.target in _MEMORY_OPS and n.target is not load:
+                            target = n.args[0]
+                        elif n.target is make_async_remote_copy:
+                            target = n.args[3]
+                        elif n.target in (inline_triton, triton_kernel):
+                            # Raw snippets can write any pointer passed in args.
+                            # all_input_nodes also handles mapping-style args.
+                            target = n.all_input_nodes
+                        else:
+                            continue
+                        excluded_ids.update(_storage_ids(graphs, info.graph_id, target))
                 excluded = {
-                    storage
-                    for info in graphs
-                    for n in info.graph.nodes
-                    if n.target in _MEMORY_OPS and n.target is not load
-                    for storage in _storage_ids(graphs, info.graph_id, n.args[0])
+                    storage_id: storage_tensors.get(storage_id)
+                    for storage_id in excluded_ids
                 }
             merger = _Merger(source, dims, flat_views, flat_nodes, excluded)
-            if (
-                merger.kind(source) != "merge"
-                or (chain := merger.chain(node, tag.nodes)) is None
-            ):
+            if (chain := merger.chain(source, node, tag.nodes)) is None:
+                require_chain_support(
+                    "multi-dimensional reduction cannot be flattened without "
+                    "changing its layout or merging a writable tensor; "
+                    "use the Triton backend for chained reductions"
+                )
                 continue
             merged = merger.clone(source)
             with graph.inserting_before(node.next):
@@ -233,10 +289,10 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 | {n for n, k in merger.kinds.items() if k == "merge"}
                 | {cast("Node", n.args[0]) for n in merger.flat_loads}
             )
-            while unused := [n for n in dead if not n.users]:
-                for n in unused:
-                    graph.erase_node(n)
-                    dead.remove(n)
+            # FX nodes compare by their topological position in the graph.
+            for dead_node in sorted(dead, reverse=True):
+                if not dead_node.users:
+                    graph.erase_node(dead_node)
     if replacements:
         from .device_ir import NodeArgsGraphInfo
 
@@ -286,7 +342,7 @@ class _Merger:
         dims: list[int],
         flat_views: dict[tuple[int, int, int], torch.Tensor],
         flat_nodes: dict[tuple[Node, int, int], Node],
-        excluded_storages: set[int],
+        excluded_storages: dict[int, torch.Tensor | None],
     ) -> None:
         val = source.meta["val"]
         self.env = CompileEnvironment.current()
@@ -334,9 +390,12 @@ class _Merger:
             return "merge"
         return None
 
-    def chain(self, result: Node, chain_nodes: frozenset[str]) -> set[Node] | None:
-        """The nodes of the chain ending at ``result``, or None if the merged
-        producers have other users, which would then load them twice."""
+    def chain(
+        self, source: Node, result: Node, chain_nodes: frozenset[str]
+    ) -> set[Node] | None:
+        """Prove the mergeable producers and terminal chain have no outside users."""
+        if self.kind(source) != "merge":
+            return None
         chain: set[Node] = set()
         stack = [result]
         while stack:
@@ -370,6 +429,22 @@ class _Merger:
         tensor = host.meta["val"]
         if id(tensor.untyped_storage()) in self.excluded_storages:
             return None
+        fresh = self.env.tensor_storage_is_compiler_allocated(tensor)
+        for written in self.excluded_storages.values():
+            if written is None:
+                return None
+            if self.env.tensor_storage_is_compiler_allocated(written):
+                continue
+            if fresh:
+                if self.env.tensor_storage_input_source(written) is None:
+                    return None
+                continue
+            # These storage classifiers also guard future eager/prepared calls.
+            register_cute_tensor_alias_specializations(self.env)
+            if not runtime_tensors_are_proven_disjoint(
+                self.env, tensor, written, allow_unbound=True
+            ):
+                return None
         index = cast("list[Argument]", node.args[1])
         first = node.meta["val"].ndim + self.offsets[0]
         merged = range(first, first + len(self.offsets))

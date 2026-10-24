@@ -254,14 +254,18 @@ def prepare_node_lowering(
             arg_to_name[arg] = name
             input_names.append(name)
 
-        if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            dtype = {
-                torch.SymInt: torch.int64,
-                torch.SymFloat: torch.float32,
-                torch.SymBool: torch.bool,
-            }[type(example)]
+        if isinstance(
+            example, (int, float, bool, torch.SymInt, torch.SymFloat, torch.SymBool)
+        ):
+            if isinstance(example, (bool, torch.SymBool)):
+                dtype = torch.bool
+            elif isinstance(example, (int, torch.SymInt)):
+                dtype = torch.int64
+            else:
+                dtype = torch.float32
             if (
-                isinstance(example, (torch.SymFloat, torch.SymInt))
+                isinstance(example, (int, float, torch.SymFloat, torch.SymInt))
+                and not isinstance(example, bool)
                 and opmath_dtype is not None
             ):
                 # Typed as the op's dtype, promotion leaves it unrounded; the

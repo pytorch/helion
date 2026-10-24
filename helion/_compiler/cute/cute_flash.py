@@ -27287,9 +27287,9 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
         resolved_aux_args.append(aux_arg)
     epi_scalar_names: list[str] = []
     if row_epilogue is not None:
-        expr_to_origin = HostFunction.current().expr_to_origin
+        host_function = HostFunction.current()
         for expr in row_epilogue.scalar_exprs:
-            if any(symbol not in expr_to_origin for symbol in expr.free_symbols):
+            if not host_function.is_host_scalar_expr(expr):
                 return None
             epi_scalar_names.append(f"cutlass.Float32({df.sympy_expr(expr)})")
 

@@ -269,14 +269,21 @@ class TestReductions(RefEagerTestBase, TestCase):
         ),
     )
     def test_reduction_over_multiple_dims(self, shape, dtype, transpose, op, chunk):
-        if _get_backend() == "cute" and (transpose or op == "centered"):
-            self.skipTest("CuTe cannot lower chained reductions")
         x = torch.randn(shape, device=DEVICE, dtype=dtype)
         if transpose:
             x = x.transpose(1, 2)
         # One-signed extrema inputs expose contributions from padded lanes.
         x = {"amax": -x.abs() - 1, "amin": x.abs() + 1}.get(op, x)
+        if _get_backend() == "cute" and (transpose or op == "centered"):
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "multi-dimensional reduction"
+            ):
+                _reduce_multi_dim_tile.bind((x, op))
+            return
         bound = _reduce_multi_dim_tile.bind((x, op))
+        retired = [info for info in bound.env.block_sizes if info.retired]
+        self.assertEqual(bool(retired), not transpose and op != "centered")
+        self.assertTrue(all(not info.is_tile for info in retired))
         merge_backend = _merged_reduction_backend()
         merged = merge_backend and not transpose and op != "centered"
         spec = bound.config_spec
@@ -354,10 +361,11 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )
                 torch.testing.assert_close(output, expected.to(x.dtype), rtol=0, atol=0)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @parametrize("op", ("amin", "amax"))
-    def test_multi_dim_bool_extrema(self, op):
-        @helion.kernel(static_shapes=True)
+    @parametrize("static_shapes", (False, True))
+    def test_multi_dim_bool_extrema(self, op, static_shapes):
+        @helion.kernel(static_shapes=static_shapes)
         def reduce(mask: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
             out = torch.empty((mask.size(0),), device=mask.device, dtype=torch.bool)
             for row in hl.tile(mask.size(0)):
@@ -367,12 +375,14 @@ class TestReductions(RefEagerTestBase, TestCase):
                     out[row] = mask[row, :, :].amax((1, 2))
             return out
 
-        mask = torch.rand(5, 7, 9, device=DEVICE) > 0.5
-        mask[0] = True
-        mask[1] = False
-        _, output = code_and_output(reduce, (mask, op), block_sizes=[2])
-        expected = mask.amin((1, 2)) if op == "amin" else mask.amax((1, 2))
-        torch.testing.assert_close(output, expected)
+        for shape in ((5, 7, 9), (5, 1, 1), (5, 1, 9), (5, 9, 1)):
+            with self.subTest(shape=shape):
+                mask = torch.rand(shape, device=DEVICE) > 0.5
+                mask[0] = True
+                mask[1] = False
+                _, output = code_and_output(reduce, (mask, op), block_sizes=[2])
+                expected = mask.amin((1, 2)) if op == "amin" else mask.amax((1, 2))
+                torch.testing.assert_close(output, expected)
 
     @onlyBackends(["triton"])
     @parametrize("static_shapes", (False, True))
@@ -384,10 +394,12 @@ class TestReductions(RefEagerTestBase, TestCase):
             for row in hl.tile(x.size(0)):
                 value = x[row, :]
                 n = value.size(1)
-                value = value + value.new_full(value.shape, n)
-                total = value.sum(1)
+                index = hl.arange(n)
+                filled = value + value.new_full(value.shape, n)
+                total = (filled * index).sum(1)
                 for step in hl.tile(3, block_size=1):
-                    out[row, step] = total[:, None] / n
+                    offset = hl.full([row], n, dtype=x.dtype)
+                    out[row, step] = (total + offset)[:, None] / n
             return out
 
         x = torch.randn(64, 33, device=DEVICE)
@@ -395,8 +407,32 @@ class TestReductions(RefEagerTestBase, TestCase):
             _, actual = code_and_output(
                 reduce, (x,), block_sizes=[4], reduction_loops=[chunk]
             )
-            expected = x.sum(1) / x.size(1) + x.size(1)
+            index = torch.arange(x.size(1), device=x.device)
+            expected = ((x + x.size(1)) * index).sum(1) / x.size(1) + 1
             torch.testing.assert_close(actual, expected[:, None].expand(-1, 3))
+
+        @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
+        def derived_shape(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                value = x[row, :]
+                extra = value.new_full([row, value.size(1) * 2], 1)
+                out[row] = value.sum(1) + extra.sum(1)
+            return out
+
+        full = torch.ones(5, 64, device=DEVICE)
+        bound = derived_shape.bind((full,))
+        loops = len(bound.config_spec.reduction_loops)
+        actual = bound.compile_config(
+            helion.Config(block_sizes=[2], reduction_loops=[None] * loops)
+        )(full)
+        torch.testing.assert_close(actual, full.sum(1) + 128)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "derived tensor shapes.*rolled reduction"
+        ):
+            bound.compile_config(
+                helion.Config(block_sizes=[2], reduction_loops=[8] * loops)
+            )(full)
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
@@ -432,9 +468,13 @@ class TestReductions(RefEagerTestBase, TestCase):
         # Without static_shapes kernels aren't specialized on strides, so a
         # later input might not flatten into a view: the dims stay chained.
         for static_shapes in (True, False):
-            if not static_shapes and _get_backend() == "cute":
-                continue
             kernel = helion.kernel(static_shapes=static_shapes)(scaled_sum)
+            if not static_shapes and _get_backend() == "cute":
+                with self.assertRaisesRegex(
+                    helion.exc.BackendUnsupported, "static_shapes=True"
+                ):
+                    kernel.bind((x, scale))
+                continue
             for reduction_loops in (
                 [None],
                 [256] if static_shapes and _merged_reduction_backend() else [16],
@@ -486,7 +526,10 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, output = code_and_output(
             sum_and_clear, (x, cleared, pointers, indirect), block_sizes=[2]
         )
-        self.assertEqual("flatten(1, 2)" in code, _merged_reduction_backend())
+        # Pointer contents do not prove where an indirect store writes.
+        self.assertEqual(
+            "flatten(1, 2)" in code, _merged_reduction_backend() and not indirect
+        )
         torch.testing.assert_close(output, x.sum(dim=(1, 2)))
         self.assertTrue((cleared == 0).all())
 
@@ -529,6 +572,75 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randint(-4, 5, (6, 24, 40), device=DEVICE).float()
         acc = torch.ones_like(x)
         code, output = code_and_output(add_then_sum, (x, acc), block_sizes=[2, 2])
+        self.assertNotIn("flatten(", code)
+        torch.testing.assert_close(output, (x + 1).sum(dim=(1, 2)))
+
+        @helion.kernel(static_shapes=True)
+        def remote_write_then_sum(x: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                copy = hl.make_async_remote_copy(
+                    x, [row.begin], 0, dst=dst, dst_index=[row.begin]
+                )
+                copy.start()
+                copy.wait()
+                out[row] = dst[row, :, :].sum((1, 2))
+            return out
+
+        bound = remote_write_then_sum.bind((x, acc))
+        self.assertFalse(any(info.retired for info in bound.env.block_sizes))
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def write_scratch_read_input(
+            x: torch.Tensor, scratch: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                scratch[row, :, :] = 0
+                out[row] = x[row, :, :].sum((1, 2))
+            return out
+
+        source = torch.ones_like(x)
+        scratch = torch.empty_like(source)
+        alias = source.view_as(source)
+        disjoint = write_scratch_read_input.bind((source, scratch))
+        self.assertIn(
+            "flatten(1, 2)",
+            disjoint.to_triton_code(disjoint.config_spec.default_config()),
+        )
+        for target, total in ((scratch, 960), (alias, 0), (scratch, 960), (alias, 0)):
+            source.fill_(1)
+            actual = write_scratch_read_input(source, target)
+            torch.testing.assert_close(actual, torch.full_like(actual, total))
+        aliased = write_scratch_read_input.bind((source, alias))
+        self.assertIsNot(aliased, disjoint)
+        self.assertNotIn(
+            "flatten(", aliased.to_triton_code(aliased.config_spec.default_config())
+        )
+
+        @helion.kernel(static_shapes=True)
+        def inline_write_then_sum(x: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size(0)):
+                hl.inline_triton(
+                    """
+                    offset = tl.arange(0, 1024)
+                    index = {row} * 960 + offset
+                    value = tl.load({x} + index, offset < 960, other=0)
+                    tl.store({acc} + index, value + 1, offset < 960)
+                    None
+                    """,
+                    {"x": x, "acc": acc, "row": tile.begin},
+                    output_like=None,
+                )
+            hl.barrier()
+            for tile in hl.tile(x.size(0)):
+                out[tile] = acc[tile, :, :].sum(dim=(1, 2))
+            return out
+
+        code, output = code_and_output(
+            inline_write_then_sum, (x, acc), block_sizes=[1, 2]
+        )
         self.assertNotIn("flatten(", code)
         torch.testing.assert_close(output, (x + 1).sum(dim=(1, 2)))
 

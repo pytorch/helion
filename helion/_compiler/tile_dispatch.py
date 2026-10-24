@@ -5,15 +5,18 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .. import exc
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
 from .device_function import DeviceFunction
+from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
+from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
@@ -328,7 +331,7 @@ class TileStrategyDispatch:
             and block.block_id not in executable
             and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
             and canonical in tile_blocks
-            and not env.block_sizes[canonical].reduction
+            and env.block_sizes[canonical].is_tile
             and block.symbol() == env.block_sizes[canonical].symbol()
             and block.numel == env.block_sizes[canonical].symbol()
         }
@@ -381,6 +384,22 @@ class TileStrategyDispatch:
             expr = shape
         else:
             return self.strategies[0].fn.literal_expr(shape)
+
+        if CompileEnvironment.current().backend.name == "triton" and not isinstance(
+            expr, sympy.Symbol
+        ):
+            block_symbols, _ = find_block_size_symbols(expr)
+            if any(
+                isinstance(
+                    self.block_id_to_strategy.get_any(block_id), LoopedReductionStrategy
+                )
+                for block_id in block_symbols.values()
+            ):
+                # A rolled extent is a device-loop variable, not a host constexpr.
+                raise exc.BackendUnsupported(
+                    "triton",
+                    "derived tensor shapes involving a rolled reduction axis",
+                )
 
         # Try to map block symbols to their variable names
         mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)

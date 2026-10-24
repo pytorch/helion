@@ -126,13 +126,11 @@ def register_lowering(
 def _keep_shape_size_reads(node: Node) -> None:
     """Keep physical tile extents in shape parameters."""
     physical: Node | None = None
-    changed = False
 
     def physical_size(arg: Node) -> Node:
-        nonlocal physical, changed
+        nonlocal physical
         if arg is not node:
             return arg
-        changed = True
         if physical is None:
             with node.graph.inserting_before(node):
                 physical = node.graph.call_function(
@@ -154,16 +152,23 @@ def _keep_shape_size_reads(node: Node) -> None:
             parameters = list(user.target._signature.parameters)
         else:
             continue
-        changed = False
         args, kwargs = list(user.args), dict(user.kwargs)
         for position, name in enumerate(parameters):
-            if name not in {"size", "shape", "length", "output_size"}:
+            if name not in {"size", "shape", "length", "output_size"} and not (
+                user.target
+                in (
+                    torch.ops.aten.arange.default,
+                    torch.ops.aten.arange.start,
+                    torch.ops.aten.arange.start_step,
+                )
+                and name == "end"
+            ):
                 continue
             if position < len(args):
                 args[position] = map_arg(args[position], physical_size)
             elif name in kwargs:
                 kwargs[name] = map_arg(kwargs[name], physical_size)
-        if changed:
+        if tuple(args) != user.args or kwargs != user.kwargs:
             user.args, user.kwargs = tuple(args), kwargs
 
 
@@ -180,28 +185,28 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
         if block_id is None or not env.block_sizes[block_id].reduction:
             continue
         _keep_shape_size_reads(node)
-        if not node.users:
-            graph.erase_node(node)
-            continue
         size = env.block_sizes[block_id].size
         assert isinstance(size, (int, torch.SymInt))
+        # Keep the scalar node's identity: nested graph captures can refer to
+        # it outside FX's users map. Inline literal values on ordinary FX edges
+        # as before, while keeping their source addressable for those captures.
+        node.target = _get_symnode
+        node.args = (
+            str(size) if isinstance(size, int) else env.sympy_debug(_to_sympy(size)),
+        )
+        node.kwargs = {}
+        node.meta["val"] = size
+        node.meta["helion_host_scalar"] = isinstance(size, int) or (
+            HostFunction.current().is_host_scalar_expr(_to_sympy(size))
+        )
         if isinstance(size, int):
-            for consumer in list(node.users):
-                consumer.args, consumer.kwargs = map_arg(
-                    (consumer.args, consumer.kwargs),
-                    lambda n, extent=size, source=node: extent if n is source else n,
+            for user in list(node.users):
+                user.args, user.kwargs = map_arg(
+                    (user.args, user.kwargs),
+                    lambda arg, extent=size, source=node: (
+                        extent if arg is source else arg
+                    ),
                 )
-            graph.erase_node(node)
-        else:
-            # Removing the tensor dependency lets this scalar stay outside
-            # rolled graphs, even when the full slice is loaded in chunks.
-            node.target = _get_symnode
-            node.args = (env.sympy_debug(_to_sympy(size)),)
-            node.kwargs = {}
-            node.meta["val"] = size
-            node.meta["helion_host_scalar"] = (
-                HostFunction.current().is_host_scalar_expr(_to_sympy(size))
-            )
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)

@@ -208,11 +208,7 @@ def _row_block(node: object, rows: int) -> int | None:
     bid = origin.origin.block_id
     env = CompileEnvironment.current()
     block = env.block_sizes[bid]
-    return (
-        bid
-        if not block.reduction and env.specialize_expr(block.numel) == rows
-        else None
-    )
+    return bid if block.is_tile and env.specialize_expr(block.numel) == rows else None
 
 
 def _closure(node: Node) -> frozenset[Node]:

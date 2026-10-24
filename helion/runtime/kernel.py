@@ -2621,6 +2621,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
 
             self._apply_mark_static(args)
+            runtime_args = dict(
+                zip(self.kernel.signature.parameters, args, strict=False)
+            )
 
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
@@ -2629,12 +2632,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             ):
                 try:
                     compiler = KernelCompiler(self.env)
-                    self.host_function: HostFunction = compiler.compile(
-                        self.kernel.fn,
-                        self.fake_args,
-                        constexpr_args,
-                        rewrite_ast=rewrite_ast,
-                    )
+                    with self.env.use_runtime_arg_values(runtime_args):
+                        self.host_function: HostFunction = compiler.compile(
+                            self.kernel.fn,
+                            self.fake_args,
+                            constexpr_args,
+                            rewrite_ast=rewrite_ast,
+                        )
                 except Exception:
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
@@ -2644,9 +2648,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._bind_guard_count = len(self.env.shape_env.guards)
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
-                runtime_args = dict(
-                    zip(self.kernel.signature.parameters, args, strict=False)
-                )
                 self.env.snapshot_tensor_descriptor_alignments(runtime_args)
 
                 # Post-compile FX-graph scan to detect kernels

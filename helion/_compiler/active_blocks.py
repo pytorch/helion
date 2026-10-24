@@ -10,10 +10,10 @@ import torch
 from ..language import _MEMORY_OPS
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.memory_ops import load
-from ..language.memory_ops import store_subscript_shape
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
 from .inductor_lowering import ReductionLowering
+from .utils import compute_slice_size
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -62,23 +62,48 @@ def active_block_ids(
     return frozenset(result)
 
 
-def unused_block_ids(graphs: Sequence[GraphInfo], block_ids: set[int]) -> set[int]:
+def unused_block_ids(
+    graphs: Sequence[GraphInfo],
+    block_ids: set[int],
+    *,
+    used_block_ids: frozenset[int] | None = None,
+) -> set[int]:
     """The ``block_ids`` nothing in ``graphs`` uses."""
     env = CompileEnvironment.current()
-    unused = block_ids - active_block_ids(graphs, (), env)
+    if used_block_ids is None:
+        used_block_ids = active_block_ids(graphs, (), env)
+    unused = block_ids - used_block_ids
+    if not unused:
+        return unused
     for graph in graphs:
         for node in graph.graph.nodes:
-            # stores and atomics use rdims through their subscripts (a load's
-            # val has them), which were shaped when traced, so this
-            # allocates nothing
+            # Scalar stores have no tensor result carrying full-slice axes.
+            # Match their logical extents directly: compute_shape can allocate
+            # new reduction dimensions, which this liveness analysis must not do.
             if (
                 node.target in _MEMORY_OPS
                 and node.target is not load
                 and isinstance(node.args[1], (list, tuple))
             ):
                 tensor = torch.fx.map_arg(node.args[0], lambda n: n.meta["val"])
-                assert isinstance(tensor, (torch.Tensor, tuple))
-                index = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
-                shape = store_subscript_shape(tensor, [*index])
-                unused.difference_update(map(env.get_block_id, shape))
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
+                assert isinstance(tensor, torch.Tensor)
+                indices = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
+                indices = [index for index in indices if index is not None]
+                for size, index in zip(tensor.shape, indices, strict=True):
+                    if not isinstance(index, slice):
+                        continue
+                    extent = compute_slice_size(index, size)
+                    # ShapeEnv can know equal extents whose expression keys differ.
+                    used = set()
+                    for block_id in unused:
+                        logical = env.block_sizes[block_id].size
+                        if isinstance(logical, (int, torch.SymInt)) and env.known_equal(
+                            logical, extent
+                        ):
+                            used.add(block_id)
+                    unused.difference_update(used)
+                    if not unused:
+                        return unused
     return unused

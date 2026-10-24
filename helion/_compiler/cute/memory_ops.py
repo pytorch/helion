@@ -2023,7 +2023,7 @@ def _cute_reread_extents_exact(cg: GenerateAST, value_node: torch.fx.Node) -> bo
             return False
         for size in value.shape:
             block_id = env.get_block_id(size)
-            if block_id is not None and not env.block_sizes[block_id].reduction:
+            if block_id is not None and env.block_sizes[block_id].is_tile:
                 continue
             logical = size if block_id is None else env.block_sizes[block_id].size
             static = _cute_static_size(env, config, logical)

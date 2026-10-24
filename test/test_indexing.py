@@ -8024,7 +8024,7 @@ class TestCuteAllAxisGatherCPU(TestCase):
                         )
                     )
             self.assertEqual(prove(), ())
-        # Implicit full reductions still reach the single-axis lowerer.
+        # Implicit full reductions still report unsupported multiple axes.
         for op, mode, keep in (("min", "empty", True), ("max", "none", False)):
             with (
                 self.subTest(op=op),
