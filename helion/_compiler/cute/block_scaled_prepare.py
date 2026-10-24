@@ -351,6 +351,7 @@ def make_block_scaled_entry(plan: Mapping[str, object]) -> object:
             ),
             pdl=bool(plan.get("pdl", False)),
             fused=cast("dict[str, tuple[str, int]] | None", plan.get("fused")),
+            epilogue_n=int(cast("int", plan.get("epilogue_n", 64))),
         ),
     }
     linecache.cache[filename] = (
