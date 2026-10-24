@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -9,9 +10,9 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _initial_population
-from test.cute_population_contracts import _legacy_order
-from test.cute_population_contracts import _legacy_registered_seeds
+from test.cute_seed_population import _initial_population
+from test.cute_seed_population import _legacy_order
+from test.cute_seed_population import _legacy_registered_seeds
 from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
@@ -22,6 +23,7 @@ from test.test_cute_gathered_mma_codegen import _bound as _gathered_bound
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -71,9 +73,11 @@ def test_hundred_row_population_reaches_coupled_pipeline_chunk_geometries(
     legacy = _initial_population(
         bound, args, seeds=_legacy_registered_seeds(bound), count=100
     )
+    state = random.getstate()
     actual = _initial_population(bound, args, count=100)
-    assert len(actual) == len(legacy)
     assert actual == _initial_population(bound, args, count=100)
+    assert random.getstate() == state
+    assert len(actual) == len(legacy)
     for stages in (2, 4):
         before = [
             seed for seed in legacy if seed.get("cute_collective_stages") == stages
@@ -229,6 +233,19 @@ def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
     assert len(legacy_seeds) == len(seeds)
     assert set(legacy_seeds) == set(seeds)
     assert legacy_seeds[0] == seeds[0]
+    group = next(
+        group
+        for group in bound.config_spec.compiler_coverage_groups
+        if group.mechanism == "cute.collective_static_layouts"
+    )
+    assert group.witnesses[0].carrier == next(
+        seed
+        for seed in legacy_seeds
+        if seed.get("cute_collective_mma", False)
+        and seed.get("cute_collective_compute", "warp") == "warp"
+        and not seed.get("cute_collective_static_layouts", False)
+    )
+
     population = _initial_population(bound, args, count=30)
     legacy_population = _initial_population(bound, args, seeds=legacy_seeds, count=30)
     assert {seed.get("cute_collective_copy") for seed in population} >= {
@@ -245,6 +262,16 @@ def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
         }
     assert {seed.get("cute_collective_stages", 1) for seed in population} >= {1, 2, 4}
     assert any(seed.get("cute_proven_bounds") for seed in population)
+    assert (
+        len(
+            {
+                tuple(seed.block_sizes)
+                for seed in population
+                if seed.get("cute_collective_mma")
+            }
+        )
+        >= 6
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -272,7 +299,7 @@ def test_nonzero_accumulator_reaches_native_seed_schedules(dtype: torch.dtype) -
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_gathered_schedules_preserve_the_existing_seed_order(
+def test_gathered_schedules_keep_their_slots_while_other_schedules_rotate(
     dtype: torch.dtype,
 ) -> None:
     bound = _gathered_bound((1024, 512, 512, 8), dtype, False)
@@ -280,7 +307,30 @@ def test_gathered_schedules_preserve_the_existing_seed_order(
         seed.get("cute_collective_compute") == "tma_gather"
         for seed in bound.config_spec.compiler_seed_configs
     )
-    assert bound.config_spec.compiler_seed_configs == _legacy_registered_seeds(bound)
+    actual = bound.config_spec.compiler_seed_configs
+    legacy = _legacy_registered_seeds(bound)
+
+    def gathered(seeds: list[helion.Config]) -> list[tuple[int, helion.Config]]:
+        return [
+            (index, seed)
+            for index, seed in enumerate(seeds)
+            if seed.get("cute_collective_compute") == "tma_gather"
+        ]
+
+    assert gathered(actual) == gathered(legacy)
+    assert actual[0] == legacy[0]
+    assert len(actual) == len(legacy) and set(actual) == set(legacy)
+    assert actual != legacy
+    assert (
+        len(
+            {
+                tuple(seed.block_sizes)
+                for seed in actual[:30]
+                if seed.get("cute_collective_compute") != "tma_gather"
+            }
+        )
+        >= 6
+    )
 
 
 def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
@@ -325,3 +375,90 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         )
         for seed in interleaved
     ] == actual
+
+
+@pytest.mark.parametrize("family", ["bounded_k", "tmem", "register", "packet"])
+def test_gathered_widths_and_depths_remain_distinct_in_compound_families(
+    partitioned_case: tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]],
+    family: str,
+) -> None:
+    bound, _args = partitioned_case
+    seeds = [
+        helion.Config(
+            cute_collective_compute="tma_gather",
+            cute_gathered_mma_n=n,
+            cute_gathered_mma_stages=stages,
+            split_k=chunk,
+        )
+        for chunk in (1, 2)
+        for n in (128, 256, 512)
+        for stages in (2, 3, 4)
+    ]
+    extra = {
+        "bounded_k": {},
+        "tmem": {"cute_collective_tmem_a": True},
+        "register": {
+            "cute_collective_compute": "tcgen05",
+            "cute_collective_copy": "scalar",
+            "cute_collective_recipe": "vector",
+        },
+        "packet": {"cute_collective_operand_packets": True},
+    }[family]
+    anchor = [helion.Config.from_dict(extra)] if extra else []
+    actual = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
+        bound.config_spec, [*seeds, *anchor], ("split_k",)
+    )
+    assert [seed for seed in actual if seed not in anchor] == seeds
+    assert len(actual) == len(seeds) + len(anchor)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _gathered_bounded_k_matmul(
+    a: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    n, k = weights.size(2), a.size(1)
+    chunks = hl.register_tunable("chunks", PowerOfTwoFragment(1, 32))
+    width = helion.next_power_of_2(helion.cdiv(k, chunks))
+    out = torch.zeros((indices.numel(), n), device=a.device, dtype=a.dtype)
+    for col, outer in hl.tile([n, k], block_size=[None, width]):
+        for row in hl.tile(indices.numel()):
+            selected = indices[row]
+            acc = hl.zeros([row, col], dtype=torch.float32)
+            for inner in hl.tile(outer.begin, outer.end):
+                acc = torch.addmm(acc, a[selected, inner], weights[0, inner, col])
+            hl.atomic_add(out, [row, col], acc.to(out.dtype))
+    return out
+
+
+def test_gathered_bounded_k_candidates_reach_the_initial_prefix() -> None:
+    bound = _cpu_bind(
+        _gathered_bounded_k_matmul,
+        (
+            torch.empty(256, 2048, dtype=torch.float16),
+            torch.empty(1, 2048, 512, dtype=torch.float16),
+            torch.empty(256, dtype=torch.int32),
+        ),
+    )
+    assert bound.host_function is not None
+    heuristic = CuteCollectiveMatmulHeuristic
+    with (
+        bound.env,
+        patch.object(
+            heuristic,
+            "_interleave_bounded_k_seeds",
+            wraps=heuristic._interleave_bounded_k_seeds,
+        ) as interleaved,
+    ):
+        seeds = heuristic.get_seed_configs(bound.env, bound.host_function.device_ir)
+    assert any(call.args[2] == ("chunks",) for call in interleaved.call_args_list)
+    gathered = {
+        (seed["cute_gathered_mma_n"], seed["cute_gathered_mma_stages"])
+        for seed in seeds
+        if seed.get("cute_collective_compute") == "tma_gather"
+    }
+    assert len(gathered) == 7
+    assert {
+        (seed["cute_gathered_mma_n"], seed["cute_gathered_mma_stages"])
+        for seed in seeds[:30]
+        if seed.get("cute_collective_compute") == "tma_gather"
+    } == gathered

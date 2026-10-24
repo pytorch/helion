@@ -9,13 +9,14 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _legacy_registered_seeds as _shared_legacy
-from test.cute_population_contracts import _seeded_population as _initial_population
+from test.cute_seed_population import _initial_population
+from test.cute_seed_population import _legacy_registered_seeds as _shared_legacy
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
 from test.test_cute_collective_tmem_seed import _dependent_contractions
 from test.test_cute_collective_tmem_seed import _dependent_inputs
 
+from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
 
 _legacy_registered_seeds = partial(_shared_legacy, require_no_parameters=True)
@@ -68,11 +69,13 @@ def test_full_initial_population_reaches_complete_tmem_operand_schedule(
     assert old_seeds[0] == new_seeds[0]
     assert len(old_seeds) == len(new_seeds)
     assert set(old_seeds) == set(new_seeds)
-    before = _initial_population(bound, args, seeds=old_seeds)
-    after = _initial_population(bound, args)
+    before = _initial_population(
+        bound, args, assert_raw_canonical=False, seeds=old_seeds
+    )
+    after = _initial_population(bound, args, assert_raw_canonical=False)
+    assert after == _initial_population(bound, args, assert_raw_canonical=False)
     assert len(before) == len(after)
     assert before[0] == after[0]
-    assert after == _initial_population(bound, args)
     if shape == 2:
         assert not any(_complete_schedule(config) for config in before)
     complete = [config for config in after if _complete_schedule(config)]
@@ -103,9 +106,35 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
         for config in reversed(bound.config_spec.compiler_seed_configs)
         if config.get("cute_collective_tmem_a")
     )
-    population = _initial_population(bound, args, count=count, user_seeds=[explicit])
+    population = _initial_population(
+        bound, args, assert_raw_canonical=False, count=count, user_seeds=[explicit]
+    )
     # The helper checks exactly count legacy rows plus declared coverage only.
     with bound.env:
         generation = bound.config_spec.create_config_generation()
         _flat, normalized = generation.canonicalize_flat(generation.flatten(explicit))
     assert population[1] == normalized
+
+
+def test_filtered_dependent_seeds_use_the_ordinary_permutation(
+    dependent_case: tuple[BoundKernel, tuple[torch.Tensor, ...]],
+) -> None:
+    bound, _args = dependent_case
+    seeds = [
+        seed
+        for seed in _legacy_registered_seeds(bound)
+        if not seed.get("cute_collective_tmem_a", False)
+    ]
+    before = seeds.copy()
+    with patch.object(
+        bound.config_spec,
+        "_base_default_config",
+        side_effect=AssertionError("unused defaults"),
+    ):
+        actual = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
+            bound.config_spec, seeds, ()
+        )
+    assert seeds == before
+    assert actual[0] == seeds[0]
+    assert len(actual) == len(seeds) and set(actual) == set(seeds)
+    assert actual != seeds

@@ -2111,10 +2111,11 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         avoiding an asynchronous copy's raw shared-memory staging. Rotate its
         paired copy/recipe choices before repeating geometries. Ordinary
         matmuls and TMEM-operand alternatives rotate through complete schedules
-        as well as compute/copy/depth/chunk groups, retaining the ranked geometry
-        order within each. Ordinary gathered-row matmuls keep their existing
-        order to preserve their column-width and depth alternatives. Exposing
-        more schedules trades some early geometry coverage for schedule coverage.
+        as well as compute/copy/depth/chunk groups. Ordinary schedules stagger
+        their starting geometry to retain shape diversity in short populations.
+        Ordinary gathered-row alternatives keep their original population slots;
+        only the other seeds are staggered around them. For compound families,
+        gathered-row widths and depths are separate schedule dimensions.
         This only reorders existing seeds;
         the first seed, default promotion, other heuristics, and search budget
         stay unchanged. Unrelated user knobs never supply a grouping dimension.
@@ -2137,18 +2138,20 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             or register_recipe_schedules
             or packet_schedules
         )
-        if ordinary and any(
-            seed.get("cute_collective_compute") == "tma_gather" for seed in seeds
-        ):
-            return seeds
-        default = spec._base_default_config()
+        gathered_positions: set[int] = set()
+        defaults = spec._base_default_config().config if parameters else {}
         groups: dict[tuple[object, ...], list[Config]] = {}
-        for seed in seeds:
+        for index, seed in enumerate(seeds):
+            if ordinary and seed.get("cute_collective_compute") == "tma_gather":
+                gathered_positions.add(index)
+                continue
             key = (
                 seed.get("cute_collective_compute", "warp"),
                 seed.get("cute_collective_copy", "scalar"),
                 seed.get("cute_collective_stages", 1),
-                *(seed.get(parameter, default[parameter]) for parameter in parameters),
+                seed.get("cute_gathered_mma_n"),
+                seed.get("cute_gathered_mma_stages"),
+                *(seed.get(parameter, defaults[parameter]) for parameter in parameters),
             )
             if ordinary or tmem_operand_schedules:
                 key += (
@@ -2164,12 +2167,25 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             if packet_schedules:
                 key += (seed.get("cute_collective_operand_packets", False),)
             groups.setdefault(key, []).append(seed)
-        return [
-            seed
-            for row in zip_longest(*groups.values())
-            for seed in row
-            if seed is not None
+        schedules = list(groups.values())
+        if ordinary:
+            # Stagger geometry across schedules instead of spending the quick
+            # population on every schedule of the same one or two geometries.
+            # Keep the first group's primary seed used by collective coverage;
+            # every schedule still retains all its original geometries.
+            for index, group in enumerate(schedules):
+                offset = index % len(group)
+                schedules[index] = group[offset:] + group[:offset]
+        result = [
+            seed for row in zip_longest(*schedules) for seed in row if seed is not None
         ]
+        if gathered_positions:
+            reordered = iter(result)
+            return [
+                seed if index in gathered_positions else next(reordered)
+                for index, seed in enumerate(seeds)
+            ]
+        return result
 
     @classmethod
     def get_seed_configs(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from copy import deepcopy
-from functools import partial
 import random
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -12,22 +11,17 @@ from unittest.mock import patch
 
 import torch
 
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._hardware import HardwareInfo
 from helion._testing import patch_cute_mma_support
 from helion.autotuner.compiler_coverage import same_value
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 
 if TYPE_CHECKING:
-    import helion
     from helion.autotuner.config_generation import FlatConfig
     from helion.autotuner.config_spec import ConfigSpec
+    from helion.autotuner.pattern_search import PatternSearch
     from helion.runtime.config import Config
-    from helion.runtime.kernel import BoundKernel
 
 
 def with_flat_min_blocks_default(spec: ConfigSpec, config: Config) -> Config:
@@ -165,96 +159,3 @@ def _target() -> ExitStack:
     ):
         stack.enter_context(patch(name, return_value=value))
     return stack
-
-
-def _legacy_order(
-    spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
-) -> list[helion.Config]:
-    return seeds
-
-
-def _legacy_registered_seeds(
-    bound: BoundKernel, *, require_no_parameters: bool = False
-) -> list[helion.Config]:
-    assert bound.host_function is not None
-    with (
-        bound.env,
-        patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ) as interleaved,
-    ):
-        legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-    if require_no_parameters:
-        assert all(not call.args[2] for call in interleaved.call_args_list)
-    # Other registered heuristics retain their original positions. Replace
-    # only this heuristic's permutation when reproducing the old population.
-    members = set(legacy)
-    selected = [
-        seed for seed in bound.config_spec.compiler_seed_configs if seed in members
-    ]
-    assert len(selected) == len(legacy)
-    iterator = iter(legacy)
-    return [
-        next(iterator) if seed in members else seed
-        for seed in bound.config_spec.compiler_seed_configs
-    ]
-
-
-def _initial_population(
-    bound: BoundKernel,
-    args: tuple[object, ...],
-    *,
-    seeds: list[helion.Config] | None = None,
-    count: int | None = None,
-    user_seeds: list[helion.Config] | None = None,
-    random_seed: int | None = None,
-    assert_canonical: bool = True,
-) -> list[helion.Config]:
-    state = random.getstate() if random_seed is not None else None
-    try:
-        if random_seed is not None:
-            random.seed(random_seed)
-        profile = get_effort_profile("full").pattern_search
-        assert profile is not None
-        with (
-            bound.env,
-            patch.object(
-                bound.config_spec,
-                "compiler_seed_configs",
-                bound.config_spec.compiler_seed_configs if seeds is None else seeds,
-            ),
-            patch.object(bound.settings, "autotune_seed_configs", user_seeds),
-        ):
-            search = PatternSearch(
-                bound,
-                args,
-                initial_population=profile.initial_population
-                if count is None
-                else count,
-                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
-            )
-            flat = checked_initial_population(search)
-            result = [search.config_gen.unflatten(value) for value in flat]
-            if assert_canonical:
-                assert [search.config_gen.flatten(config) for config in result] == flat
-            assert result[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
-            )
-            assert len(result) == len(set(result))
-            assert all(
-                search.config_gen.unflatten(search.config_gen.flatten(config)) == config
-                for config in result
-            )
-            return result
-    finally:
-        if state is not None:
-            random.setstate(state)
-
-
-_seeded_population = partial(
-    _initial_population, random_seed=46291, assert_canonical=False
-)
