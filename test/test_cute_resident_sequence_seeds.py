@@ -11,6 +11,7 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
+from test.cute_seed_population import _initial_population
 
 import helion
 from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
@@ -18,9 +19,6 @@ from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
 )
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -72,36 +70,6 @@ def _seeds(bound: BoundKernel) -> list[helion.Config]:
         )
     assert seeds
     return seeds
-
-
-def _initial_population(
-    bound: BoundKernel,
-    args: tuple[torch.Tensor, torch.Tensor],
-    *,
-    count: int | None = None,
-    explicit: helion.Config | None = None,
-) -> list[helion.Config]:
-    profile = get_effort_profile("full").pattern_search
-    assert profile is not None
-    with (
-        bound.env,
-        patch.object(
-            bound.settings, "autotune_seed_configs", [explicit] if explicit else []
-        ),
-    ):
-        search = PatternSearch(
-            bound,
-            args,
-            initial_population=profile.initial_population if count is None else count,
-            initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
-        )
-        flats = search._generate_initial_population_flat()
-        configs = [search.config_gen.unflatten(flat) for flat in flats]
-        assert [search.config_gen.flatten(config) for config in configs] == flats
-        assert configs[0] == search.config_gen.unflatten(
-            search.config_gen.default_flat()
-        )
-    return configs
 
 
 @pytest.fixture(scope="module", params=[(256, 1024), (4096, 4096), (4096, 32768)])
@@ -215,7 +183,7 @@ def test_existing_seed_prefix_and_primary_remain_stable(
 def test_new_seeds_keep_population_budget_and_user_priority(count: int) -> None:
     bound, args = _bind(32, 4096)
     explicit = _seeds(bound)[-1]
-    population = _initial_population(bound, args, count=count, explicit=explicit)
+    population = _initial_population(bound, args, count=count, user_seeds=[explicit])
     assert len(population) == count
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)

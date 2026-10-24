@@ -3589,8 +3589,8 @@ class ConfigSpec:
             config["loop_orders"] = [item._fill_missing() for item in self.loop_orders]
         if "l2_groupings" in config:
             config["l2_groupings"] = [1 for _ in self.l2_groupings]
+        config.pop("num_threads", None)
         for key, default in (
-            ("num_threads", 0),
             ("cute_vector_widths", 1),
             ("cute_lane_layouts", "blocked"),
             ("cute_reduction_reloads", "auto"),

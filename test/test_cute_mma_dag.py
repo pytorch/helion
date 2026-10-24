@@ -758,8 +758,12 @@ def test_normalize_pins_the_inert_knobs_when_on() -> None:
     ).config
     with bound.env:
         bound.config_spec.normalize(config)
+        assert (
+            bound.config_spec.normalized_config(helion.Config.from_dict(config)).config
+            == config
+        )
     assert config["pid_type"] == "flat"
-    assert all(t == 0 for t in config["num_threads"])
+    assert "num_threads" not in config
     assert all(w == 1 for w in config["cute_vector_widths"])
     assert all(layout == "blocked" for layout in config["cute_lane_layouts"])
     assert config["cute_min_blocks_per_mp"] == 2
