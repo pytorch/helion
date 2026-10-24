@@ -5416,7 +5416,8 @@ class ConfigSpec:
         if not self.cute_host_paired_sum_available:
             if value != "off" and not fix_invalid:
                 raise InvalidConfig(
-                    "host sums require a typed independent pair or terminal sum/cast"
+                    "host sums require a typed independent pair, terminal sum/cast "
+                    "or a 1-D sum/mean after the launch"
                 )
             config.pop(key, None)
             return
