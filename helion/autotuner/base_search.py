@@ -1166,6 +1166,17 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to accuracy checks."
             )
+        if not self.settings.autotune_accuracy_check:
+            # Say so where the selection is reported: a log that names a
+            # selected config without this line reads as if the config had
+            # passed a check it never saw (a kernel that disables the check
+            # relies on its caller's own comparison).
+            self.log.warning(
+                "Accuracy checks were disabled (autotune_accuracy_check=False): "
+                f"the selected config was ranked among "
+                f"{self._autotune_metrics.num_configs_tested} configs by timing "
+                "alone and was never compared with the baseline output."
+            )
         if self._autotune_metrics.num_compile_failures:
             self.log.warning(
                 f"{self._autotune_metrics.num_compile_failures} of "

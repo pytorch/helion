@@ -85,6 +85,7 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "helion_flash_gated": _FLASH_DEPENDENCIES,
     "helion_flash_bwd": _FLASH_DEPENDENCIES,
     "helion_flash_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
+    "helion_flash_bwd_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
     "helion_warp_mma_gemm": (
         "_compiler/cute/_warp_mma_runtime.py",
         "_compiler/cute/_flash_row_mma_runtime.py",

@@ -28,6 +28,7 @@ from ..backend import BackendState
 from ..backend import _active_loop_block_ids
 from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
+from ..backend import _attention_pattern_fits_root
 from ..backend import _attention_softmax_pattern_head_dim
 from ..backend import _grouped_rank3_specialized_mma_plan
 from ..backend import _kernel_specialized_mma_impl
@@ -957,6 +958,13 @@ def _attention_loop_shape(
         kv_block_id=block_ids[0],
     )
     if pattern is None:
+        return None
+    # Operand facts without a fused body (fp8 operands on an odd KV tile count
+    # or with the canonical V) or a K/V batch index off the root keep the
+    # generic lowering; the search surface declines them the same way.
+    if not _attention_pattern_fits_root(
+        pattern, root_grid_ids, kv_block_id=block_ids[0]
+    ):
         return None
 
     env = CompileEnvironment.current()

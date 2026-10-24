@@ -40,6 +40,7 @@ from typing import TypeVar
 from typing import cast
 from typing import overload
 
+import sympy
 import torch
 
 from ...autotuner.config_fragment import ConfigSpecFragment
@@ -130,6 +131,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from ..backend import _AttentionKVLoadIndices
     from .flash_tuning import FlashCausalTuningPolicy
     from .flash_tuning import FlashDenseTuningPolicy
 
@@ -160,6 +162,10 @@ class FlashGraphOutputPlan(NamedTuple):
     # V/O head dim when it differs from ``head_dim`` (the asymmetric (192, 128)
     # pair); ``None`` is the symmetric case, as on ``AttentionScorePlan``.
     head_dim_v: int | None = None
+    # V's layout (``AttentionScorePlan.v_k_major``): ``True`` is the
+    # pre-transposed ``[kv_batch, head_dim_v, seq]`` host tensor read as
+    # ``v[b, :, tile_n]``; ``False`` the canonical ``[kv_batch, seq, head_dim_v]``.
+    v_k_major: bool = False
     # Flex envelope (``AttentionScorePlan.is_flex``): the Q and K/V lengths
     # (``seq`` keeps the Q length), the BHSD geometry of the 4-D operands
     # (``batch`` is ``B * H``), the four BlockMask tables in
@@ -175,6 +181,18 @@ class FlashGraphOutputPlan(NamedTuple):
     # (``flex_match.flex_operand_strides`` form) the rank-4 ``(S, D, H, B)``
     # TMA maps are built from; ``None`` keeps the rank-3 contiguous maps.
     operand_strides: tuple[tuple[int, ...], ...] | None = None
+    # The output is the contiguous 4-D ``[B, H, seq, hd]`` tensor stored at
+    # ``out[bh // H, bh % H, tile_m, :]``: flat row block ``bh`` of its
+    # ``[B * H, seq, hd]`` view, which is how the bodies address it
+    # (``batch`` is Q's batch-head count).
+    o_batch_heads_split: bool = False
+    # V's storage, read from the host tensor's strides: ``True`` when the
+    # key dim is contiguous (a dense ``[kv_batch, head_dim_v, seq]`` buffer,
+    # the K-major tcgen05 B operand), ``False`` when the head dim is (the
+    # canonical buffer, MN-major) -- in either index form (``v_k_major`` is
+    # the index form; a transposed view of the canonical buffer has
+    # ``v_k_major`` set and this False, as ``examples/fp8_attention.py``).
+    v_storage_k_major: bool = False
 
     @property
     def value_head_dim(self) -> int:
@@ -228,7 +246,46 @@ def _flash_flex_graph_output_plan_from_graphs(
 
 
 def _flash_supported_io_dtype(dtype: torch.dtype) -> bool:
+    """Q/K/V/O dtypes every fused flash family lowers (the 16-bit operands);
+    fp8 runs on the plain fa4 pair body alone (``flash_operand_facts_lowered``
+    and the resolver's family pin)."""
     return dtype in (torch.float16, torch.bfloat16)
+
+
+# Operand dtypes the attention matcher records on its pattern: the 16-bit
+# pair every family hosts plus fp8 (e4m3), whose tcgen05 route
+# (``kind::f8f6f4``, MMA-K 32, an 8-bit TMEM P) the fa4 pair body hosts.
+# ``flash_operand_facts_lowered`` is the gate between the two sets.
+FLASH_MATCHED_IO_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+
+
+def flash_operand_facts_lowered(
+    io_dtype: torch.dtype,
+    *,
+    v_k_major: bool = False,
+    score_rank: int = 3,
+    num_kv: int | None = None,
+) -> bool:
+    """Whether a fused flash body hosts the matched operand facts.
+
+    The bodies take 16-bit Q/K/V with V in its canonical ``[b, tile_n, :]``
+    index form or pre-transposed (``v[b, :, tile_n]``,
+    ``AttentionScorePlan.v_k_major``; the output plan reads the storage
+    behind either form and the host builds the PV MMA, the body its V
+    descriptor, from that) over the 3-D ``bmm`` root (``q[tile_b, tile_m,
+    :]``) or the 2-D ``hl.dot`` root (a scalar batch-head index; the
+    emitters index programs by root block, not FX node). fp8 (e4m3) operands
+    run on the fa4 pair body alone (``kind::f8f6f4`` MMAs, an 8-bit TMEM P,
+    byte-sized TMA boxes), so they need an even KV tile count (``num_kv``;
+    None declines). The search surface and the codegen detector consult
+    this gate together, so a fact without a body keeps the generic lowering
+    on both.
+    """
+    if _flash_supported_io_dtype(io_dtype):
+        return True
+    if io_dtype is torch.float8_e4m3fn:
+        return num_kv is not None and num_kv % 2 == 0
+    return False
 
 
 def _flash_io_dtype_str(dtype: torch.dtype) -> str:
@@ -236,6 +293,8 @@ def _flash_io_dtype_str(dtype: torch.dtype) -> str:
         return "cutlass.Float16"
     if dtype is torch.bfloat16:
         return "cutlass.BFloat16"
+    if dtype is torch.float8_e4m3fn:
+        return "cutlass.Float8E4M3FN"
     raise AssertionError(f"unsupported flash dtype: {dtype}")
 
 
@@ -326,22 +385,6 @@ def _flash_source_load_node(node: torch.fx.Node) -> torch.fx.Node | None:
     return None
 
 
-def _flash_k_source_load_node(node: torch.fx.Node) -> torch.fx.Node | None:
-    if node.op != "call_function" or not node.args:
-        return None
-    if node.target is torch.ops.aten.permute.default:
-        if len(node.args) < 2 or node.args[1] != [0, 2, 1]:
-            return None
-    elif node.target is torch.ops.aten.transpose.int:
-        if len(node.args) < 3 or node.args[1] != 1 or node.args[2] != 2:
-            return None
-    else:
-        return None
-    if not isinstance(node.args[0], torch.fx.Node):
-        return None
-    return _flash_source_load_node(node.args[0])
-
-
 def _flash_source_host_tensor_name(node: torch.fx.Node) -> str | None:
     load_node = _flash_source_load_node(node)
     if load_node is not None:
@@ -352,6 +395,17 @@ def _flash_source_host_tensor_name(node: torch.fx.Node) -> str | None:
 class FlashRootLoopInfo(NamedTuple):
     q_name: str
     index_pair: tuple[torch.fx.Node, torch.fx.Node]
+
+
+def _flash_is_root_batch_index(node: torch.fx.Node, block_id: int) -> bool:
+    """The root batch index of the Q load: the batch tile's block symnode
+    (the 3-D form) or a scalar index of that block (``tile.begin`` of the unit
+    tile or an ``hl.grid`` index: the 2-D form)."""
+    from ..backend import _attention_scalar_batch_block_id
+
+    return _flash_is_block_symnode(node, block_id) or (
+        _attention_scalar_batch_block_id(node) == block_id
+    )
 
 
 def _flash_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
@@ -460,6 +514,21 @@ def _flash_lse_log_base_for_scale(lse_scale: float) -> str | None:
     return None
 
 
+def _flash_is_promoted_axis_wrapper(node: torch.fx.Node) -> bool:
+    """A ``_for_loop`` over no block (``_for_loop(graph, [], [], [])``): the
+    scope wrapper ``promote_output_axis`` leaves behind when a serial query
+    tile loop becomes a launch axis. It iterates once and carries nothing."""
+    return (
+        len(node.args) >= 4
+        and isinstance(node.args[1], (list, tuple))
+        and not node.args[1]
+        and isinstance(node.args[2], (list, tuple))
+        and not node.args[2]
+        and isinstance(node.args[3], (list, tuple))
+        and not node.args[3]
+    )
+
+
 def _flash_root_loop_info(
     graphs: Iterable[GraphInfo],
     *,
@@ -475,6 +544,11 @@ def _flash_root_loop_info(
                 continue
             if len(node.args) < 4 or not isinstance(node.args[3], (list, tuple)):
                 return None
+            if _flash_is_promoted_axis_wrapper(node):
+                # The promoted query-tile axis (``promote_output_axis``) keeps
+                # its capture scope as a block-less loop around the body; the
+                # KV loop with the Q tile among its inputs sits inside it.
+                continue
             loop_inputs = node.args[3]
             if not loop_inputs or not isinstance(loop_inputs[0], torch.fx.Node):
                 return None
@@ -502,7 +576,7 @@ def _flash_root_loop_info(
             if root_block_ids is not None:
                 if len(root_block_ids) != 2:
                     return None
-                if not _flash_is_block_symnode(
+                if not _flash_is_root_batch_index(
                     indices[0], int(root_block_ids[0])
                 ) or not _flash_is_block_symnode(indices[1], int(root_block_ids[1])):
                     return None
@@ -524,6 +598,9 @@ class FlashOperandNames(NamedTuple):
     k_name: str
     v_name: str
     kv_group: int
+    # ``True`` when V is read as the pre-transposed ``v[b, :, tile_n]`` tile
+    # (``AttentionScorePlan.v_k_major``).
+    v_k_major: bool = False
 
 
 def _flash_attention_operand_names(
@@ -533,6 +610,10 @@ def _flash_attention_operand_names(
     kv_block_id: int | None = None,
 ) -> FlashOperandNames | None:
     from ..backend import _attention_canonical_kv_load_indices
+    from ..backend import _attention_matmul_form
+    from ..backend import _attention_pv_operands
+    from ..backend import _attention_transposed_source
+    from ..backend import _attention_v_load_indices
 
     root_info = _flash_root_loop_info(graphs, root_block_ids=root_block_ids)
     if root_info is None:
@@ -541,43 +622,65 @@ def _flash_attention_operand_names(
     k_names: set[str] = set()
     v_names: set[str] = set()
     kv_groups: set[int] = set()
+    v_layouts: set[bool] = set()
     for graph_info in graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
-            if node.target is torch.ops.aten.bmm.dtype:
+            matmul_form = _attention_matmul_form(node)
+            if matmul_form is None:
+                continue
+            # The 3-D ``bmm`` / ``baddbmm`` pair or the 2-D ``hl.dot`` pair
+            # (``backend._attention_softmax_pattern_head_dim``).
+            rank = (
+                3
+                if node.target
+                in (torch.ops.aten.bmm.dtype, torch.ops.aten.baddbmm.default)
+                else 2
+            )
+            if matmul_form == "qk":
                 if len(node.args) < 2 or not isinstance(node.args[1], torch.fx.Node):
                     return None
-                k_load = _flash_k_source_load_node(node.args[1])
+                k_source = _attention_transposed_source(node.args[1], rank)
+                if k_source is None:
+                    return None
+                k_load = _flash_source_load_node(k_source)
                 if k_load is None:
                     return None
                 k_indices = _attention_canonical_kv_load_indices(
                     k_load, kv_block_id=kv_block_id
                 )
-                if k_indices is None:
+                if k_indices is None or not _flash_kv_batch_block_on_root(
+                    k_indices, root_block_ids
+                ):
                     return None
                 k_name = _flash_load_host_tensor_name(k_load)
                 if k_name is None:
                     return None
                 k_names.add(k_name)
                 kv_groups.add(k_indices.kv_group)
-            elif node.target is torch.ops.aten.baddbmm.default:
-                if len(node.args) < 3 or not isinstance(node.args[2], torch.fx.Node):
+            else:
+                pv_operands = _attention_pv_operands(node)
+                if pv_operands is None:
                     return None
-                v_load = _flash_source_load_node(node.args[2])
-                if v_load is None:
-                    return None
-                v_indices = _attention_canonical_kv_load_indices(
-                    v_load, kv_block_id=kv_block_id
+                _, _, v_operand = pv_operands
+                v_indices = _attention_v_load_indices(
+                    v_operand, kv_block_id=kv_block_id, rank=rank
                 )
-                if v_indices is None:
+                if v_indices is None or not _flash_kv_batch_block_on_root(
+                    v_indices, root_block_ids
+                ):
+                    return None
+                v_load = _flash_source_load_node(v_operand)
+                if v_load is None:
                     return None
                 v_name = _flash_load_host_tensor_name(v_load)
                 if v_name is None:
                     return None
                 v_names.add(v_name)
                 kv_groups.add(v_indices.kv_group)
-    if len(k_names) != 1 or len(v_names) != 1:
+                v_layouts.add(v_indices.k_major)
+    if len(k_names) != 1 or len(v_names) != 1 or len(v_layouts) != 1:
         return None
     # K and V must share one grouped-query divisor: the kernel reads both at
     # ``bh // kv_group`` from tensors with ``batch // kv_group`` entries.
@@ -587,7 +690,26 @@ def _flash_attention_operand_names(
     v_name = next(iter(v_names))
     if len({root_info.q_name, k_name, v_name}) != 3:
         return None
-    return FlashOperandNames(root_info.q_name, k_name, v_name, next(iter(kv_groups)))
+    return FlashOperandNames(
+        root_info.q_name,
+        k_name,
+        v_name,
+        next(iter(kv_groups)),
+        v_k_major=next(iter(v_layouts)),
+    )
+
+
+def _flash_kv_batch_block_on_root(
+    indices: _AttentionKVLoadIndices, root_block_ids: Sequence[int] | None
+) -> bool:
+    """A scalar K/V batch index (the 2-D form) must be of the root batch block
+    the Q tile is read at (``_flash_root_loop_info``); the 3-D form's inner
+    batch tile is that block by construction."""
+    return (
+        indices.batch_block_id is None
+        or root_block_ids is None
+        or indices.batch_block_id == int(root_block_ids[0])
+    )
 
 
 def _is_full_slice(value: object) -> bool:
@@ -612,6 +734,117 @@ def _flash_store_has_canonical_indices(
     if len(node.args) > 3 and node.args[3] is not None:
         return False
     return rank == 2 or _is_full_slice(indices[2])
+
+
+def _flash_symint_expr(value: object) -> sympy.Expr | None:
+    if isinstance(value, torch.SymInt):
+        expr = value.node.expr
+        return expr if isinstance(expr, sympy.Expr) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return sympy.Integer(value)
+    return None
+
+
+def _flash_node_int_expr(node: object) -> sympy.Expr | None:
+    """The sympy expression of an int-valued subscript entry (a literal or a
+    node whose traced value is an int / SymInt)."""
+    if isinstance(node, torch.fx.Node):
+        return _flash_symint_expr(node.meta.get("val"))
+    return _flash_symint_expr(node)
+
+
+def _flash_index_is_batch_split(
+    node: object,
+    batch_index: torch.fx.Node,
+    heads: sympy.Expr,
+    *,
+    mode: str,
+) -> bool:
+    """``batch_index // heads`` (``mode == "floordiv"``) or ``batch_index %
+    heads`` (``"mod"``), in either traced spelling: an operator node over the
+    batch index node and a divisor equal to ``heads``, or a folded symbolic
+    value (``_get_symnode('(u3//u1)')``, ``'PythonMod(u3, u1)'``) whose
+    expression is that quotient / remainder of the batch index's symbol."""
+    from torch.utils._sympy.functions import FloorDiv
+    from torch.utils._sympy.functions import Mod
+    from torch.utils._sympy.functions import PythonMod
+
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return False
+    floordiv_targets = (
+        operator.floordiv,
+        torch.ops.aten.floor_divide.default,
+        torch.ops.aten.floor_divide.Scalar,
+    )
+    mod_targets = (operator.mod, torch.ops.aten.remainder.Scalar)
+    targets = floordiv_targets if mode == "floordiv" else mod_targets
+    if node.target in targets:
+        if len(node.args) < 2 or node.args[0] is not batch_index:
+            return False
+        divisor = _flash_node_int_expr(node.args[1])
+        return divisor is not None and bool(divisor == heads)
+    batch_expr = _flash_node_int_expr(batch_index)
+    expr = _flash_node_int_expr(node)
+    if batch_expr is None or expr is None:
+        return False
+    if mode == "floordiv":
+        return bool(expr == FloorDiv(batch_expr, heads))
+    return any(
+        bool(expr == candidate)
+        for candidate in (
+            PythonMod(batch_expr, heads),
+            Mod(batch_expr, heads),
+            sympy.Mod(batch_expr, heads),
+        )
+    )
+
+
+def _flash_value_is_contiguous(value: torch.Tensor) -> bool:
+    """``is_contiguous`` over possibly unbacked sizes, through the compile
+    environment's facts: a contiguous allocation over an unbacked size spells
+    the stride above it as ``Max(1, u)`` (a size-0 dim keeps a unit stride),
+    and both spellings are the same layout."""
+    env = CompileEnvironment.current()
+    stride: int | torch.SymInt = 1
+    clamped_stride: int | torch.SymInt = 1
+    for size, actual_stride in reversed(
+        tuple(zip(value.shape, value.stride(), strict=True))
+    ):
+        if not (
+            env.known_equal(actual_stride, stride)
+            or env.known_equal(actual_stride, clamped_stride)
+        ):
+            return False
+        stride = stride * size
+        clamped_stride = clamped_stride * torch.sym_max(1, size)
+    return True
+
+
+def _flash_store_has_batch_heads_split_indices(
+    node: torch.fx.Node,
+    index_pair: tuple[torch.fx.Node, torch.fx.Node],
+    value: torch.Tensor,
+) -> bool:
+    """``out[bh // H, bh % H, tile_m, :]`` over a contiguous 4-D ``out`` whose
+    second dim is ``H``: with ``bh`` the root batch index of the Q load and
+    ``tile_m`` the root query tile, the store lands at flat row block ``bh``
+    of the ``[B * H, seq, hd]`` view (``(bh // H) * H + bh % H == bh``), which
+    is the collapsed output the fused bodies address. The product ``B * H``
+    need not be proved equal to the batch-head count: the generic lowering
+    writes the same addresses for the same ``bh``."""
+    indices = node.args[1] if len(node.args) > 1 else None
+    if not isinstance(indices, (list, tuple)) or len(indices) != 4:
+        return False
+    if len(node.args) > 3 and node.args[3] is not None:
+        return False
+    if indices[2] is not index_pair[1] or not _is_full_slice(indices[3]):
+        return False
+    heads = _flash_symint_expr(value.shape[1])
+    if heads is None or not _flash_value_is_contiguous(value):
+        return False
+    return _flash_index_is_batch_split(
+        indices[0], index_pair[0], heads, mode="floordiv"
+    ) and _flash_index_is_batch_split(indices[1], index_pair[0], heads, mode="mod")
 
 
 def _flash_store_value_is_output(node: torch.fx.Node) -> bool:
@@ -685,7 +918,35 @@ def _flash_epilogue_dtype_str(dtype: torch.dtype) -> str:
 
 def _flash_dtype_bytes(dtype_str: str) -> int:
     """Element size of a ``cutlass.*`` dtype name emitted by the flash codegen."""
-    return 4 if dtype_str == "cutlass.Float32" else 2
+    if dtype_str == "cutlass.Float32":
+        return 4
+    if dtype_str == "cutlass.Float8E4M3FN":
+        return 1
+    return 2
+
+
+def _flash_dtype_bits(dtype_str: str) -> int:
+    return 8 * _flash_dtype_bytes(dtype_str)
+
+
+def _flash_mma_kind_args(io_dtype: str) -> tuple[str, str]:
+    """The keyword arguments the PTX MMA helpers take for the operand dtype:
+    ``(QK from SMEM, PV with the TMEM-sourced P)``. The 16-bit operands are the
+    helpers' defaults (``kind::f16``, 16-bit A), so they spell nothing; fp8
+    operands issue ``kind::f8f6f4`` MMAs over an 8-bit TMEM P."""
+    if io_dtype == "cutlass.Float8E4M3FN":
+        return ', mma_kind="f8f6f4"', ', mma_kind="f8f6f4", a_width=8'
+    return "", ""
+
+
+def _flash_p_store_tmem_repetition(p_store_repetition: int, io_dtype: str) -> int:
+    """The TMEM store atom's 32-bit-word repetition for a P store knob value.
+
+    The knob (``cute_flash_p_store_rep``) counts P columns in 16-bit units
+    (16: one 32-column score chunk per store, 32: a chunk pair), so the store
+    repetition in words scales with the io dtype's packing: 16-bit P keeps the
+    value, fp8 P packs four columns per word and halves it (8 / 16)."""
+    return p_store_repetition * _flash_dtype_bits(io_dtype) // 16
 
 
 def _flash_row_epilogue_gmem_views(
@@ -955,7 +1216,8 @@ def _flash_store_value_output_epilogue(node: torch.fx.Node) -> str | None:
 
 
 def _flash_normalized_accumulator_node(value: torch.fx.Node) -> bool:
-    """True for ``acc_phi / l_i_phi[:, :, None]``: the flash-normalized output."""
+    """True for ``acc_phi / l_i_phi[:, :, None]`` (or ``[:, None]`` in the
+    2-D form): the flash-normalized output."""
     from ...language import view_ops
 
     if value.op != "call_function" or value.target is not torch.ops.aten.div.Tensor:
@@ -978,11 +1240,9 @@ def _flash_normalized_accumulator_node(value: torch.fx.Node) -> bool:
     if sum_loop is not acc_loop:
         return False
     indices = sum_view.args[1] if len(sum_view.args) > 1 else None
-    if not isinstance(indices, (list, tuple)) or len(indices) != 3:
+    if not isinstance(indices, (list, tuple)) or len(indices) not in (2, 3):
         return False
-    return bool(
-        _is_full_slice(indices[0]) and _is_full_slice(indices[1]) and indices[2] is None
-    )
+    return indices[-1] is None and all(_is_full_slice(index) for index in indices[:-1])
 
 
 def _flash_row_epilogue_load_name(
@@ -1074,6 +1334,40 @@ def _flash_graph_host_tensors(graphs: Iterable[GraphInfo]) -> dict[str, torch.Te
     return host_tensors
 
 
+def _flash_3d_contiguous_dim(value: torch.Tensor) -> int | None:
+    """Which of a dense 3-D ``[B, X, Y]`` tensor's matrix dims is contiguous:
+    2 for a contiguous buffer (``Y`` unit stride), 1 for the dense transpose
+    of a contiguous ``[B, Y, X]`` buffer (``X`` unit stride, the view
+    ``buffer.transpose(1, 2)`` produces); None for any other layout (the
+    batch stride must be the dense ``X * Y`` either way)."""
+    if value.ndim != 3:
+        return None
+    env = CompileEnvironment.current()
+    _, x, y = value.shape
+    stride_b, stride_x, stride_y = value.stride()
+    if not env.known_equal(stride_b, x * y):
+        return None
+    if env.known_equal(stride_y, 1) and env.known_equal(stride_x, y):
+        return 2
+    if env.known_equal(stride_x, 1) and env.known_equal(stride_y, x):
+        return 1
+    return None
+
+
+def _flash_v_storage_k_major(value: torch.Tensor, *, v_k_major: bool) -> bool | None:
+    """Whether V's storage has the key dim contiguous (the K-major tcgen05 B
+    operand) given its index form: the canonical ``v[b, tile_n, :]`` reads a
+    ``[kv_batch, seq, head_dim_v]`` tensor, the pre-transposed ``v[b, :,
+    tile_n]`` a ``[kv_batch, head_dim_v, seq]`` one, and either may be a
+    contiguous buffer or the dense transposed view of the other's. None when
+    the layout is neither."""
+    contiguous_dim = _flash_3d_contiguous_dim(value)
+    if contiguous_dim is None:
+        return None
+    seq_dim = 2 if v_k_major else 1
+    return contiguous_dim == seq_dim
+
+
 def _flash_graph_output_plan_from_graphs(
     graphs: Iterable[GraphInfo],
     *,
@@ -1087,13 +1381,6 @@ def _flash_graph_output_plan_from_graphs(
         # two list walks); its output plan comes from that match.
         return _flash_flex_graph_output_plan_from_graphs(graphs, root_block_ids)
     host_tensors = _flash_graph_host_tensors(graphs)
-    flash_3d_tensors = {
-        name: value
-        for name, value in host_tensors.items()
-        if value.ndim == 3
-        and _flash_supported_io_dtype(value.dtype)
-        and value.is_contiguous()
-    }
     operands = _flash_attention_operand_names(
         graphs,
         root_block_ids=root_block_ids,
@@ -1101,11 +1388,34 @@ def _flash_graph_output_plan_from_graphs(
     )
     if operands is None:
         return None
-    q_name, k_name, v_name, kv_group = operands
+    q_name, k_name, v_name, kv_group, v_k_major = operands
+    if score_plan is not None and score_plan.v_k_major != v_k_major:
+        return None
     operand_names = (q_name, k_name, v_name)
     if score_plan is not None and score_plan.kv_group != kv_group:
         return None
+    # The plan reads every matched operand dtype (fp8 included); whether a
+    # body hosts the result is ``flash_operand_facts_lowered``'s question,
+    # asked by every surface before this plan is consulted. V alone may be
+    # the dense transpose of a contiguous buffer (``_flash_v_storage_k_major``
+    # reads which of its two layouts the storage has); every other tensor is
+    # contiguous.
+    flash_3d_tensors = {
+        name: value
+        for name, value in host_tensors.items()
+        if value.ndim == 3
+        and value.dtype in FLASH_MATCHED_IO_DTYPES
+        and (
+            value.is_contiguous()
+            or (name == v_name and _flash_3d_contiguous_dim(value) is not None)
+        )
+    }
     if not all(name in flash_3d_tensors for name in operand_names):
+        return None
+    v_storage_k_major = _flash_v_storage_k_major(
+        flash_3d_tensors[v_name], v_k_major=v_k_major
+    )
+    if v_storage_k_major is None:
         return None
     bias_names = (
         tuple(
@@ -1162,6 +1472,7 @@ def _flash_graph_output_plan_from_graphs(
 
     o_store_names: list[str] = []
     o_store_epilogues: list[str] = []
+    o_batch_heads_split = False
     row_programs: list[FlashRowEpilogueProgram] = []
     lse_store_names: list[str] = []
     lse_log_bases: list[str] = []
@@ -1170,8 +1481,23 @@ def _flash_graph_output_plan_from_graphs(
         if value is None:
             return None
         if (
+            value.ndim == 4
+            and value.dtype in FLASH_MATCHED_IO_DTYPES
+            and _flash_store_has_batch_heads_split_indices(node, index_pair, value)
+        ):
+            # ``out[bh // H, bh % H, tile_m, :]`` over the contiguous
+            # ``[B, H, seq, hd]`` output: flat row block ``bh`` of its
+            # ``[B * H, seq, hd]`` view, the collapsed output the bodies store.
+            output_epilogue = _flash_store_value_output_epilogue(node)
+            if output_epilogue is None:
+                return None
+            o_store_names.append(name)
+            o_store_epilogues.append(output_epilogue)
+            o_batch_heads_split = True
+            continue
+        if (
             value.ndim == 3
-            and _flash_supported_io_dtype(value.dtype)
+            and value.dtype in FLASH_MATCHED_IO_DTYPES
             and value.is_contiguous()
         ):
             if not _flash_store_has_canonical_indices(node, 3, index_pair):
@@ -1218,15 +1544,27 @@ def _flash_graph_output_plan_from_graphs(
         return None
 
     o_name = o_store_names[0]
-    o_value = flash_3d_tensors.get(o_name)
+    o_value = (
+        host_tensors.get(o_name)
+        if o_batch_heads_split
+        else flash_3d_tensors.get(o_name)
+    )
     if o_value is None or o_name in operand_names:
         return None
     io_dtype = o_value.dtype
-    batch = int(o_value.shape[0])
-    seq = int(o_value.shape[1])
-    # O carries the V head dim; Q carries the Q/K head dim (they differ only
-    # for the asymmetric MLA pair).
-    head_dim_v = int(o_value.shape[2])
+    if o_batch_heads_split:
+        # The split store addresses the output by its flat row block: the
+        # batch-head count is Q's (the ``[B, H]`` product stays symbolic, as
+        # in the generic lowering), the tile geometry the output's last dims.
+        batch = int(flash_3d_tensors[q_name].shape[0])
+        seq = int(o_value.shape[2])
+        head_dim_v = int(o_value.shape[3])
+    else:
+        batch = int(o_value.shape[0])
+        seq = int(o_value.shape[1])
+        # O carries the V head dim; Q carries the Q/K head dim (they differ
+        # only for the asymmetric MLA pair).
+        head_dim_v = int(o_value.shape[2])
     head_dim = int(flash_3d_tensors[q_name].shape[2])
     if batch <= 0 or seq <= 0:
         return None
@@ -1243,7 +1581,8 @@ def _flash_graph_output_plan_from_graphs(
     row_epilogue = row_programs[0] if row_programs else None
     aux_names = row_epilogue.aux_names if row_epilogue is not None else ()
     core_names = {q_name, k_name, v_name, o_name, *bias_names}
-    if not core_names <= set(flash_3d_tensors):
+    core_3d_names = core_names - ({o_name} if o_batch_heads_split else set())
+    if not core_3d_names <= set(flash_3d_tensors):
         return None
     if set(flash_3d_tensors) - core_names - set(aux_names):
         return None
@@ -1262,10 +1601,14 @@ def _flash_graph_output_plan_from_graphs(
         value = flash_3d_tensors[name]
         expected_batch = batch if name == q_name else kv_batch
         expected_head_dim = head_dim_v if name == v_name else head_dim
+        # The K-major V is the pre-transposed ``[kv_batch, head_dim_v, seq]``.
+        expected_shape = (
+            (expected_batch, expected_head_dim, seq)
+            if name == v_name and v_k_major
+            else (expected_batch, seq, expected_head_dim)
+        )
         if (
-            int(value.shape[0]) != expected_batch
-            or int(value.shape[1]) != seq
-            or int(value.shape[2]) != expected_head_dim
+            tuple(int(size) for size in value.shape) != expected_shape
             or value.dtype != io_dtype
         ):
             return None
@@ -1422,6 +1765,9 @@ def _flash_graph_output_plan_from_graphs(
         kv_group,
         row_kv_begin_names=row_kv_begin_names,
         head_dim_v=None if head_dim_v == head_dim else head_dim_v,
+        v_k_major=v_k_major,
+        o_batch_heads_split=o_batch_heads_split,
+        v_storage_k_major=v_storage_k_major,
     )
 
 
@@ -1981,20 +2327,26 @@ def _flash_o_ld_repetition(hd: int) -> str:
 
 
 def _flash_o_store_thread_layout_lines(
-    head_dim_v: int, threads: int, *, dim_name: str, elems_name: str
+    head_dim_v: int,
+    threads: int,
+    *,
+    dim_name: str,
+    elems_name: str,
+    elems_per_packet: int = 8,
 ) -> str:
     """Thread layout of the staged vector store of a ``head_dim_v``-wide tile.
 
-    Every thread stores one 16-byte packet (``elems_name`` elements: eight
-    at 16 bits) per step, so a row holds ``head_dim_v // 8`` packets. The
-    (rows, threads per row) layout tiles the ``threads``-wide store only when
-    the per-row count divides the thread count: widths whose packet count
-    does (16, 32, 64, 128) spread each row over all its packets, the others
-    (48, 80, 96, 112) take the largest common divisor, so a pass covers a row
+    Every thread stores one 16-byte packet (``elems_name`` elements:
+    ``elems_per_packet``, eight at 16 bits and sixteen at 8) per step, so a
+    row holds ``head_dim_v // elems_per_packet`` packets. The (rows, threads
+    per row) layout tiles the ``threads``-wide store only when the per-row
+    count divides the thread count: widths whose packet count does (16, 32,
+    64, 128 at 16 bits) spread each row over all its packets, the others (48,
+    80, 96, 112) take the largest common divisor, so a pass covers a row
     slice and the copy iterates the slices. Either way every thread owns
     packets (a thread outside the layout would address past the tile).
     """
-    packets_per_row = head_dim_v // 8
+    packets_per_row = head_dim_v // elems_per_packet
     threads_per_row = math.gcd(packets_per_row, threads)
     if threads_per_row == packets_per_row:
         dim_line = f"{dim_name} = {head_dim_v} // {elems_name}"
@@ -2014,6 +2366,7 @@ def _flash_aliased_kv_stage_cap(
     head_dim_v: int | None = None,
     aux_smem_bytes: int = 0,
     output_tiles: int | None = None,
+    dtype_bytes: int = 2,
 ) -> int:
     """Largest legal aliased K/V depth for the requested output storage.
 
@@ -2024,7 +2377,10 @@ def _flash_aliased_kv_stage_cap(
     (``_flash_uneven_kv_ring_supported``).  ``aux_smem_bytes`` is shared
     memory the body adds outside the tiles (the flex hook's cooperative
     table staging).  ``output_tiles`` is the staged output tile count
-    (``cute_flash_o_stage``; None: one per query stage).
+    (``cute_flash_o_stage``; None: one per query stage).  ``dtype_bytes`` is
+    the operand element size: the Q tiles, the ring slots and the staged
+    output tiles all scale with it (fp8 tiles are half the 16-bit bytes, so
+    the ring fits twice the depth).
     """
     return max_fa4_kv_depth(
         FlashScheduleSpec(
@@ -2037,6 +2393,7 @@ def _flash_aliased_kv_stage_cap(
             head_dim_v=head_dim_v,
             aux_smem_bytes=aux_smem_bytes,
             output_tiles=output_tiles,
+            dtype_bytes=dtype_bytes,
         )
     )
 
@@ -2150,7 +2507,11 @@ def _flash_o_stage_legal(
     tiles), the segment tiling, the two-CTA and separate-ring bodies, the
     asymmetric pair's uneven ring and the output over the dead Q stages each
     stage per tile.  Codegen applies the same test; the resolver pins the
-    knob off elsewhere."""
+    knob off elsewhere.  The alternating-warpgroup family shares the fa4
+    topology but stages through the item's own Q stage: its structural block
+    pins the knob to two tiles after this test (the host builds ``_flash_osl``
+    from the resolved value, so a one-tile layout there would alias stage 1
+    onto the next item's Q)."""
     return (
         topology == "fa4"
         and epi_tma
@@ -2582,6 +2943,16 @@ class FlashAttentionConfig:
     # ``_FLASH_BIAS_FORMS``. Pinned to ``direct`` when the plan has no such
     # bias so the inert knob never enters a config identity.
     bias_form: str = "direct"
+    # How the fa4 chunked softmax reads an additive tensor bias
+    # (``_FLASH_BIAS_STAGES``): ``direct`` loads it from global memory in the
+    # softmax warps (one 8-byte load per 4 columns, every lane of a warp on a
+    # different row: 32 sectors per request), ``tma`` has the load warp copy
+    # the 128 x kv_tile bias boxes of both query tiles into a shared-memory
+    # ring (``bias_stage_depth`` stages) one step ahead and the softmax warps
+    # read their rows from it. Pinned to ``direct`` wherever the staged form
+    # is not legal (no tensor bias, another body, no shared-memory room).
+    bias_stage: str = "direct"
+    bias_stage_depth: int = 0
     # Small contiguous [BH, 128, 64] biased-attention SIMT path. Kept as a config
     # knob so benchmarks/autotune can opt back to the general flash emitter.
     small_biased: bool = True
@@ -2905,7 +3276,8 @@ class FlashAttentionConfig:
     # epilogue warp drains stage 0's TMA store before the correction warps
     # stage stage 1 into it), which frees a K/V tile of shared memory: the
     # aliased ring's depth cap gains one slot (head dim 128: 3 -> 4). Legal
-    # on the plain TMA epilogue only (``_flash_o_stage_legal``).
+    # on the plain TMA epilogue only (``_flash_o_stage_legal``); the
+    # alternating family stages through the item's own Q stage and pins 2.
     o_stage: int = 2
     # Tiling of a per-row KV lower-bound (ROW_KV_BEGIN) plan on the fa4 pair
     # body. ``global`` walks the sequence-wide 256-row pair grid and masks the
@@ -3692,6 +4064,66 @@ def _flash_resolve_bias_form(
     if form not in _FLASH_BIAS_FORMS:
         form = default
     return form
+
+
+def _flash_bias_stage_bytes(dtype: torch.dtype, *, kv_tile_n: int) -> int:
+    """Shared memory of one staged-bias ring stage: both query tiles' 128 x
+    ``kv_tile_n`` boxes of the bias in the io dtype (the chunked body's bias
+    dtype)."""
+    return 2 * 128 * kv_tile_n * dtype.itemsize
+
+
+def _flash_bias_stage_tma_legal(
+    *,
+    score_modifier_kinds: Sequence[str],
+    dtype: torch.dtype,
+    softmax_disc: bool,
+    q_tile_m: int,
+    kv_tile_n: int,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    has_list_walk: bool,
+    small_biased_candidate: bool,
+    use_2cta_instrs: bool,
+    use_cga2_local_cta: bool,
+    use_clc_scheduler: bool,
+    local_tma_partition: bool,
+    tensor_4d_tma: bool,
+    alt_requested: bool,
+) -> bool:
+    """Whether ``cute_flash_bias_stage='tma'`` can render for this plan.
+
+    The staged bias is written for the plain one-CTA fa4 body over two
+    128-row query tiles and 128-column KV tiles whose only score transform is
+    the additive tensor bias and whose chunked softmax pass 1 adds it (the
+    generic modifier body): the load warp issues the four (128, 64) TMA boxes
+    of a KV step next to that step's K/V copies, indexed by the same KV tile
+    expression, and the two softmax warpgroups read their query tile's boxes
+    in the pass-1 chunk loop. Everything else -- masks or other transforms
+    (their own segment loops and predicates), the whole-row softmax, the
+    cooperative and cluster families, the CLC scheduler, the local TMA
+    partitions and 4-D maps, the small biased SIMT candidate and the
+    alternating-warpgroup family -- declines; the shared-memory fit is the
+    caller's (``_flash_aliased_kv_stage_cap``). The aliased-ring caller also
+    excludes the separate and uneven rings.
+    """
+    return (
+        tuple(score_modifier_kinds) == (TENSOR_BIAS_KIND,)
+        and _flash_supported_io_dtype(dtype)
+        and softmax_disc
+        and q_tile_m == 128
+        and kv_tile_n == 128
+        and not is_causal
+        and not has_kv_tile_pruning
+        and not has_list_walk
+        and not small_biased_candidate
+        and not use_2cta_instrs
+        and not use_cga2_local_cta
+        and not use_clc_scheduler
+        and not local_tma_partition
+        and not tensor_4d_tma
+        and not alt_requested
+    )
 
 
 def _flash_causal_mask_storeback_legal(
@@ -4513,6 +4945,11 @@ def resolve_flash_config(
         # operands; pin the pair to the plain FA4 family regardless of the
         # requested family, env override or legacy topology key.
         requested_family_flags = _flash_pipeline_family_flags("fa4")
+    if dtype is torch.float8_e4m3fn:
+        # fp8 operands run on the plain fa4 pair body alone (``kind::f8f6f4``
+        # MMAs over an 8-bit TMEM P, byte-sized TMA boxes); every other
+        # family is written and verified for 16-bit operands.
+        requested_family_flags = _flash_pipeline_family_flags("fa4")
     if has_list_walk:
         # The BlockMask list walk is written for the plain fa4 pair body
         # (per-stage tile status over the union of two 128-row lists) and
@@ -4585,6 +5022,7 @@ def resolve_flash_config(
             plain_row_body=plain_row_body,
             has_row_epilogue=has_row_epilogue,
             has_score_modifiers=has_score_modifiers,
+            score_modifier_kinds=score_modifier_kinds,
         ):
             row_mma_config = _resolve_row_mma_config(
                 head_dim,
@@ -6195,6 +6633,17 @@ def resolve_flash_config(
         else 0,
     ):
         o_stage = 2
+    # The tensor bias's staging (``cute_flash_bias_stage``): the staged form
+    # is legal on the plain fa4 chunked body alone and takes shared memory
+    # from the K/V ring's budget, so it is decided with the ring depth below.
+    bias_stage = "direct"
+    bias_stage_depth = 0
+    bias_stage_cfg = _cfg(FLASH_BIAS_STAGE_KEY)
+    if bias_stage_cfg is not None and bias_stage_cfg not in _FLASH_BIAS_STAGES:
+        raise InvalidConfig(
+            f"{FLASH_BIAS_STAGE_KEY} must be one of {_FLASH_BIAS_STAGES}, "
+            f"got {bias_stage_cfg!r}"
+        )
     if uneven_kv_ring:
         kv_stage = UNEVEN_KV_RING_DEPTH
     elif (
@@ -6212,6 +6661,8 @@ def resolve_flash_config(
             "kv_tile_n": kv_tile_n,
             "use_2cta_instrs": use_2cta_instrs,
             "output_tiles": 1 if o_stage == 1 else None,
+            # The operand element size: fp8 tiles fit twice the depth.
+            "dtype_bytes": dtype.itemsize,
         }
         # The stream's ring: the deepest of 4 / 2 / 1 chunk slots that
         # leaves a two-deep K/V ring; none fitting turns the width off.
@@ -6230,9 +6681,46 @@ def resolve_flash_config(
         if not flex_coalesce_slots:
             flex_coalesce = 0
         flex_coop_bytes = flex_coalesce_slots * flex_coop_slot_bytes
+        # The staged tensor bias: the deepest ring (of both query tiles'
+        # boxes) that leaves a two-deep K/V ring, requested or by default;
+        # none fitting (or another body) reads ``direct``.
+        if bias_stage_cfg != "direct" and _flash_bias_stage_tma_legal(
+            score_modifier_kinds=score_modifier_kinds,
+            dtype=dtype,
+            softmax_disc=softmax_disc,
+            q_tile_m=q_tile_m,
+            kv_tile_n=kv_tile_n,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            has_list_walk=has_list_walk,
+            small_biased_candidate=small_biased_candidate,
+            use_2cta_instrs=use_2cta_instrs,
+            use_cga2_local_cta=use_cga2_local_cta,
+            use_clc_scheduler=use_clc_scheduler,
+            local_tma_partition=local_tma_partition,
+            tensor_4d_tma=tensor_4d_tma,
+            alt_requested=alt_requested,
+        ):
+            stage_bytes = _flash_bias_stage_bytes(dtype, kv_tile_n=kv_tile_n)
+            for depth in _FLASH_BIAS_STAGE_DEPTHS:
+                if (
+                    _flash_aliased_kv_stage_cap(
+                        head_dim,
+                        aux_smem_bytes=flex_aux_bytes
+                        + flex_coop_bytes
+                        + depth * stage_bytes,
+                        **cap_options,  # pyrefly: ignore[bad-argument-type]
+                    )
+                    >= 2
+                ):
+                    bias_stage = "tma"
+                    bias_stage_depth = depth
+                    break
         aliased_kv_stage_cap = _flash_aliased_kv_stage_cap(
             head_dim,
-            aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
+            aux_smem_bytes=flex_aux_bytes
+            + flex_coop_bytes
+            + bias_stage_depth * _flash_bias_stage_bytes(dtype, kv_tile_n=kv_tile_n),
             **cap_options,  # pyrefly: ignore[bad-argument-type]
         )
         kv_stage = min(max(kv_stage, 2), aliased_kv_stage_cap)
@@ -6369,6 +6857,15 @@ def resolve_flash_config(
         q_tile_m = 128
         # K ring depth (the V ring is two deep); 3 fills shared memory exactly.
         kv_stage = min(max(kv_stage, 2), 3)
+        # The body stages each item's output tile through its own finished Q
+        # stage (``sO`` aliases the two Q stages, indexed by the item's
+        # stage): the pair body's shared staged tile does not exist here.
+        # Honouring a request for it would hand the launcher a one-tile
+        # ``_flash_osl`` under which stage 1 addresses tile 0 -- the next
+        # item's Q, loaded into stage 0 meanwhile -- so every third item of a
+        # persistent CTA read a clobbered Q (the (2, 16, 2048, 128) campaign
+        # winner: 148 wrong tiles).
+        o_stage = 2
         epi_stg = False
         epi_stg_store = "slice"
         epi_stg_gmem = "stage"
@@ -6814,6 +7311,8 @@ def resolve_flash_config(
         row_epilogue_warps=row_epilogue_warps,
         packed_reduce=packed_reduce,
         bias_form=bias_form,
+        bias_stage=bias_stage,
+        bias_stage_depth=bias_stage_depth,
         small_biased=small_biased,
         causal_lpt_swizzle=causal_lpt_swizzle,
         causal_lpt_l2_shift=causal_lpt_l2_shift,
@@ -6948,6 +7447,8 @@ def _resolve_row_mma_config(
         score_modifier_kinds=score_modifier_kinds,
     )
     seq = 128 * num_kv
+    # A tensor bias stages its (rows, chunk) tile beside every K/V chunk.
+    bias_rows = TENSOR_BIAS_KIND in score_modifier_kinds
 
     def plannable(row_warps: int, row_tile_m: int) -> bool:
         return row_mma_shape_supported(
@@ -6961,6 +7462,7 @@ def _resolve_row_mma_config(
                 row_warps=row_warps,
                 aux_dtypes=aux_dtypes,
             ),
+            bias_rows=bias_rows,
         )
 
     row_warps = ROW_MMA_DEFAULT_WARPS
@@ -7123,6 +7625,14 @@ _FLASH_BIAS_FORMS = ("direct", "packed", "scalar")
 # are the only values the autotuner may choose between; ``direct`` rounds
 # differently and is never searched.
 _FLASH_SEARCHED_BIAS_FORMS = ("packed", "scalar")
+FLASH_BIAS_STAGE_KEY = "cute_flash_bias_stage"
+# Where the fa4 chunked softmax reads an additive tensor bias: global memory
+# in the softmax warps (``direct``) or a shared-memory ring the load warp
+# fills by TMA one KV step ahead (``tma``); see ``_flash_bias_stage_depth``.
+_FLASH_BIAS_STAGES = ("direct", "tma")
+# Ring depths tried for the staged bias, deepest first: each stage holds both
+# query tiles' 128 x kv_tile boxes (64 KB of a 16-bit bias at 128 columns).
+_FLASH_BIAS_STAGE_DEPTHS = (2, 1)
 FLASH_SMALL_BIASED_KEY = "cute_flash_small_biased"
 FLASH_CAUSAL_LPT_SWIZZLE_KEY = "cute_flash_causal_lpt_swizzle"
 FLASH_CAUSAL_LPT_L2_SHIFT_KEY = "cute_flash_causal_lpt_l2_shift"
@@ -7511,6 +8021,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_WS_MASK_PHASES_KEY,
     FLASH_WS_K_STAGE_EXTRA_KEY,
     FLASH_FLEX_HOOK_FAST_FULL_KEY,
+    FLASH_BIAS_STAGE_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -7583,6 +8094,7 @@ def flash_effective_config_values(
         FLASH_ROW_EPILOGUE_WARPS_KEY: config.row_epilogue_warps,
         FLASH_PACKED_REDUCE_KEY: config.packed_reduce,
         FLASH_BIAS_FORM_KEY: config.bias_form,
+        FLASH_BIAS_STAGE_KEY: config.bias_stage,
         FLASH_SMALL_BIASED_KEY: config.small_biased,
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: config.causal_lpt_swizzle,
         FLASH_CAUSAL_LPT_L2_SHIFT_KEY: config.causal_lpt_l2_shift,
@@ -8127,7 +8639,19 @@ _FLASH_RESCALE_THRESHOLD_VALUES = (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
 
 
 def _flash_safe_rescale_threshold_values(dtype: torch.dtype) -> tuple[float, ...]:
-    """Return thresholds whose largest pinned probability fits in ``dtype``."""
+    """Return thresholds whose largest pinned probability fits in ``dtype``
+    and whose rescaling the dtype's mantissa absorbs.
+
+    A pinned row max scales every probability of the row by up to
+    ``2**threshold`` before it is packed in the io dtype. The 16-bit formats
+    round the scaled and the unscaled probabilities to outputs within one
+    16-bit ulp of each other; an 8-bit format (three mantissa bits) does
+    not, so the fp8 autotune accuracy rule (one fp8 ulp against the default
+    config) rejects every pinned configuration (14 of 50 in the shape-0
+    quick search): only the unpinned threshold is searched for them.
+    """
+    if torch.finfo(dtype).bits <= 8:
+        return (0.0,)
     max_log2 = math.log2(torch.finfo(dtype).max)
     return tuple(
         threshold
@@ -9382,6 +9906,29 @@ def flash_attention_seed_configs(
     base_seed = _flash_config_with_values(block_sizes, base_values)
     if base_seed not in seeds:
         seeds.append(base_seed)
+    bias_stage_fragment = fragments.get(FLASH_BIAS_STAGE_KEY)
+    if (
+        isinstance(bias_stage_fragment, EnumFragment)
+        and "tma" in (bias_stage_fragment.search_choices or ())
+        and base_values.get(FLASH_BIAS_STAGE_KEY) != "tma"
+    ):
+        # The staged tensor bias over the staged output tile: where the
+        # default's output staging leaves no shared memory for the bias ring
+        # (d128), the ring beside the plain vector epilogue measured 133 us
+        # against 239 us for the staged output with the direct bias at
+        # (2, 16, 2048, 128); the resolver pins the knob back to ``direct``
+        # wherever the ring still does not fit.
+        bias_seed = _flash_config_with_values(
+            block_sizes,
+            {
+                **base_values,
+                FLASH_BIAS_STAGE_KEY: "tma",
+                FLASH_EPI_TMA_KEY: False,
+                FLASH_EPI_STG_KEY: False,
+            },
+        )
+        if bias_seed not in seeds:
+            seeds.append(bias_seed)
 
     family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
     assert isinstance(family_fragment, EnumFragment)
@@ -10935,6 +11482,10 @@ def flash_autotune_fragments(
         # (the single-warpgroup s_stage, the unpacked reduce) leave the search
         # instead of surviving as uncoverable structural rows.
         pipeline_family_override = "fa4"
+    if dtype is torch.float8_e4m3fn:
+        # fp8 operands likewise run on the plain fa4 family alone (the
+        # resolver pins it); the surface is the pinned-fa4 surface.
+        pipeline_family_override = "fa4"
         topology_override = None
     valid_topology = (
         topology_override
@@ -11326,11 +11877,14 @@ def flash_autotune_fragments(
             FLASH_PIPELINE_FAMILY_FLAGS[family].use_2cta_instrs
             for family in active_families
         )
+        # The operand element size (fp8 tiles fit twice the depth).
+        dtype_bytes = dtype.itemsize
         value_cap = _flash_aliased_kv_stage_cap(
             head_dim,
             head_dim_v=head_dim_v,
             stage_output=False,
             use_2cta_instrs=use_2cta_kv_layout,
+            dtype_bytes=dtype_bytes,
         )
         search_cap = _flash_aliased_kv_stage_cap(
             head_dim,
@@ -11339,6 +11893,7 @@ def flash_autotune_fragments(
             # stores), so its searched depths are the staged ring's.
             stage_output=output_requires_tma or has_list_walk,
             use_2cta_instrs=use_2cta_kv_layout,
+            dtype_bytes=dtype_bytes,
         )
         kv_stage_values = tuple(range(2, value_cap + 1))
         kv_stage_search = tuple(range(2, search_cap + 1))
@@ -11354,6 +11909,7 @@ def flash_autotune_fragments(
                 stage_output=output_requires_tma or has_list_walk,
                 use_2cta_instrs=use_2cta_kv_layout,
                 output_tiles=1,
+                dtype_bytes=dtype_bytes,
             )
             if shared_cap > search_cap:
                 kv_stage_coverage = kv_stage_search
@@ -11666,6 +12222,27 @@ def flash_autotune_fragments(
         _FLASH_BIAS_FORMS if has_alibi_bias else (defaults.bias_form,),
         _FLASH_SEARCHED_BIAS_FORMS if has_alibi_bias else (defaults.bias_form,),
     )
+    # The tensor bias's staging: searched on the plans whose fa4 body can
+    # stage it (one tensor bias, no masks, 16-bit io); the resolver pins
+    # ``direct`` on every config where the ring does not fit beside the
+    # config's other shared-memory users (at d128 the staged output tile
+    # takes its room: the search pairs the staged bias with
+    # ``cute_flash_epi_tma=False``), so such pairs spell one identity.
+    # Every other plan carries ``direct``.
+    bias_stage_searched = (
+        fa4_search_eligible
+        and tuple(score_modifier_kinds) == (TENSOR_BIAS_KIND,)
+        and _flash_supported_io_dtype(dtype)
+        and not is_causal
+        and not has_kv_tile_pruning
+        and not has_list_walk
+        and not small_biased_candidate
+    )
+    bias_stage = enum(
+        defaults.bias_stage,
+        _FLASH_BIAS_STAGES if bias_stage_searched else (defaults.bias_stage,),
+        _FLASH_BIAS_STAGES if bias_stage_searched else (defaults.bias_stage,),
+    )
 
     # The cooperative pair's cluster: two pairs sharing K/V by multicast
     # where the pair is active and four query tiles divide the sequence.
@@ -11875,8 +12452,11 @@ def flash_autotune_fragments(
     )
     # The persistent list walk's early next-item QK0 is searched both ways
     # on the fa4 pair body (the resolver pins it off on the grid, the split
-    # walk and the cluster scheduler), default on.
-    flex_early_qk_searchable = has_list_walk and not pair_walk
+    # walk and the cluster scheduler), default on.  torch's empty BlockMask
+    # (the trivial walk) never runs the persistent list walk, so the knob is
+    # pinned there like the tail split below: a searched value the resolver
+    # always pins off fails the structural coverage validation.
+    flex_early_qk_searchable = has_list_walk and not pair_walk and not flex_trivial_walk
     flex_early_qk = enum(
         True if flex_early_qk_searchable else defaults.flex_early_qk,
         (False, True),
@@ -11948,11 +12528,18 @@ def flash_autotune_fragments(
             _flash_pipeline_family_flags(family) for family in active_families
         )
     )
+    # The resolver pins the chain off for every operand dtype outside the
+    # 16-bit pair (the dense hd64 chained bodies are 16-bit), so fp8 must not
+    # search it (a knob searched both ways but always pinned off fails the
+    # structural coverage design).
     role_chain = enum(
         defaults.role_chain,
         (False, True),
         (False, True)
-        if role_chain_supported and head_dim == 64 and not is_causal
+        if role_chain_supported
+        and head_dim == 64
+        and not is_causal
+        and _flash_supported_io_dtype(dtype)
         else (defaults.role_chain,),
     )
 
@@ -12231,9 +12818,12 @@ def flash_autotune_fragments(
     # masks and the list walk) keep the ring statistics handoff; the
     # resolver pins it.
     if fa4_search_eligible and not variable_trip_count:
+        # ``single_final`` needs a pinned row max (``rescale_threshold > 0``),
+        # which an io dtype that searches only the unpinned threshold (fp8)
+        # never provides: the resolver would fold it to ``single``.
         transports = (
             ("ring2", "single", "single_final")
-            if dense_d64_fa4 and standard_dense_output
+            if dense_d64_fa4 and standard_dense_output and len(threshold_search) > 1
             else ("ring2", "single")
         )
         if fixed_family_requires_persistence or has_row_epilogue:
@@ -12522,6 +13112,7 @@ def flash_autotune_fragments(
         FLASH_ROW_EPILOGUE_WARPS_KEY: row_epilogue_warps,
         FLASH_PACKED_REDUCE_KEY: packed_reduce,
         FLASH_BIAS_FORM_KEY: bias_form,
+        FLASH_BIAS_STAGE_KEY: bias_stage,
         FLASH_SMALL_BIASED_KEY: small_biased,
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: causal_lpt,
         FLASH_CAUSAL_LPT_L2_SHIFT_KEY: causal_lpt_shift,
@@ -12674,6 +13265,9 @@ def flash_autotune_fragments(
             (FLASH_ROW_SUM_SCHEDULE_KEY, "post_acquire"),
             (FLASH_ROWMAX_KEY, "software"),
             (FLASH_SP_ROW_SUM_KEY, "fragment"),
+            # The body stages through the item's own Q stage: no shared
+            # staged output tile (the resolver pins the same).
+            (FLASH_O_STAGE_KEY, 2),
         ):
             fragment = fragments[key]
             assert isinstance(fragment, EnumFragment)
@@ -13402,6 +13996,9 @@ def _flash_score_transform_block(
     range_suffix: str = "",
     row_kv_begin_guard: bool = True,
     skip_causal: bool = False,
+    bias_stage: str = "direct",
+    bias_box_expr: str = "",
+    bias_col_expr: str = "0",
 ) -> str:
     """Emit the score transforms of ``score_plan`` for one loaded tile.
     ``skip_causal`` leaves the causal mask out (a loop over tiles below the
@@ -13411,11 +14008,21 @@ def _flash_score_transform_block(
     (``_flash_contiguous_kv_tile_range``) and row bound the per-row KV lower
     bound reads; ``row_kv_begin_guard`` wraps that mask in its boundary-tile
     predicate (the fa4 body decides per tile or per loop segment itself).
+    ``bias_stage='tma'`` reads the tensor bias from the staged shared-memory
+    box ``bias_box_expr`` (this query tile's (128, 64) box of the chunk's KV
+    tile half) at column ``bias_col_expr`` instead of global memory.
     """
     lines: list[str] = []
     for modifier in score_plan.modifiers:
         if modifier.kind == TENSOR_BIAS_KIND:
-            if chunk_expr is None or io_dtype is None:
+            if bias_stage == "tma":
+                assert chunk_expr is not None and bias_box_expr
+                lines.append(
+                    f"{indent}_helion_flash_rt.add_score_bias_smem_t2r("
+                    f"{score_tensor}, {coord_tensor}, {bias_box_expr}, "
+                    f"{bias_col_expr}, _flash_score_bias_scale)"
+                )
+            elif chunk_expr is None or io_dtype is None:
                 lines.append(
                     f"{indent}_helion_flash_rt.add_score_bias_t2r("
                     f"{score_tensor}, {coord_tensor}, _flash_mBias, {bh_expr}, "
@@ -13855,7 +14462,7 @@ def _flash_ws_inv_sum_source(score_plan: AttentionScorePlan) -> str:
     KV lower bound or a BlockMask / mask region may leave a row with no
     visible key (row sum 0): such rows produce 0 like FlexAttention/FA4
     instead of ``0 * inf``."""
-    if score_plan.row_kv_begin_masks or score_plan.is_flex:
+    if score_plan.row_kv_begin_masks or score_plan.flex_envelope:
         return (
             "        flash_inv_sum = cutlass.Float32(cutlass.select_(\n"
             "            flash_row_sum == cutlass.Float32(0.0), cutlass.Float32(0.0),\n"
@@ -13871,7 +14478,7 @@ def _flash_fa4_runtime_disc_score_plan_supported(
 
     The flex envelope's regions render through the hook slot of the generic
     modifier body, never through the hand-written helpers."""
-    return not score_plan.is_flex and all(
+    return not score_plan.flex_envelope and all(
         modifier.kind == CAUSAL_MASK_KIND for modifier in score_plan.modifiers
     )
 
@@ -16573,7 +17180,7 @@ tAsA_aux_tma, tAgA_aux_tma = cute_cpasync_flash.tma_partition(
     setup_o_store = (
         f"""
 flash_o_store_elems = 128 // {io_dtype}.width
-{_flash_o_store_thread_layout_lines(hd, 128, dim_name="flash_o_tO_dim1", elems_name="flash_o_store_elems")}
+{_flash_o_store_thread_layout_lines(hd, 128, dim_name="flash_o_tO_dim1", elems_name="flash_o_store_elems", elems_per_packet=128 // _flash_dtype_bits(io_dtype))}
 flash_o_vO_layout = cute.make_layout((1, flash_o_store_elems))
 flash_o_gmem_atom = cute.make_copy_atom(
     cute.nvgpu.CopyUniversalOp(), {io_dtype}, num_bits_per_copy=128)
@@ -18948,8 +19555,8 @@ def _flash_flex_coord_bounds(
 def _flash_flex_prefetch_regs(
     score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
 ) -> tuple[int, ...]:
-    """The prefetch budget fact of a flex plan (empty off flex)."""
-    if not score_plan.is_flex:
+    """The prefetch budget fact of a flex plan (empty off the flex envelope)."""
+    if not score_plan.flex_envelope:
         return ()
     return flex_prefetch_regs(
         score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
@@ -18959,8 +19566,8 @@ def _flash_flex_prefetch_regs(
 def _flash_flex_coalesce_steps(
     score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
 ) -> tuple[int, ...]:
-    """The cooperative-width fact of a flex plan (empty off flex)."""
-    if not score_plan.is_flex:
+    """The cooperative-width fact of a flex plan (empty off the flex envelope)."""
+    if not score_plan.flex_envelope:
         return ()
     return flex_coalesce_steps(
         score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
@@ -18970,8 +19577,8 @@ def _flash_flex_coalesce_steps(
 def _flash_flex_hook_ops(
     score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
 ) -> int:
-    """The score hook's per-element operation count (0 off flex)."""
-    if not score_plan.is_flex:
+    """The score hook's per-element operation count (0 off the flex envelope)."""
+    if not score_plan.flex_envelope:
         return 0
     return flex_hook_ops(
         score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
@@ -19088,6 +19695,7 @@ def emit_flash_fa4_device_body(
     flex_host_flags: str | None = None,
     flex_tail_split: int = 0,
     flex_tail_items_ws: int = 0,
+    v_storage_k_major: bool = False,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -19213,8 +19821,9 @@ def emit_flash_fa4_device_body(
     # structure (one per-item trip count, the LPT-style grid decode); a list
     # walk reads the count and the tiles from the BlockMask tables, a trivial
     # walk (one KV block covering the sequence) visits every tile with the
-    # same softmax body.
-    flex_body = score_plan.is_flex
+    # same softmax body.  A dense flex plan (``flex_dense``: the trivial walk
+    # with no regions on the dense geometry) is the dense plan here.
+    flex_body = score_plan.flex_envelope
     list_walk = score_plan.has_list_walk
     # The list walk's bitmask access: register words (one word, or the
     # device-built masks) or the cursor over the host words table.
@@ -19598,6 +20207,10 @@ def emit_flash_fa4_device_body(
             cfg.flex_coalesce,
             cfg.s_load_repetition,
         )
+    # The verified specs size Q, the K/V ring and the staged output tiles by
+    # the operand element size (``dtype_bytes``): the capacity check and the
+    # rendered storage-size assert follow the byte-sized fp8 tiles, as the
+    # resolver's ring-depth cap (``_flash_aliased_kv_stage_cap``) does.
     verified_shared_memory_bytes: int | None = None
     if separate_kv_rings:
         assert not use_cga2_local_cta
@@ -19612,6 +20225,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    dtype_bytes=_flash_dtype_bytes(io_dtype),
                     aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
@@ -19642,6 +20256,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    dtype_bytes=_flash_dtype_bytes(io_dtype),
                     aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
@@ -19675,6 +20290,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    dtype_bytes=_flash_dtype_bytes(io_dtype),
                     aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
@@ -19703,6 +20319,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    dtype_bytes=_flash_dtype_bytes(io_dtype),
                     aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
@@ -19930,16 +20547,81 @@ def emit_flash_fa4_device_body(
         # the struct, above it); the exact-size check stays for the bodies
         # it was built for.
         verified_shared_memory_bytes = None
+    # The staged tensor bias (``cute_flash_bias_stage='tma'``): a ring of
+    # ``bias_stage_depth`` stages behind the K/V ring, each both query
+    # tiles' (128, 64) boxes of a 128-column KV tile, filled by the load
+    # warp one step ahead and released by the softmax warpgroups after
+    # pass 1 (see ``_flash_bias_stage_tma_legal``).
+    bias_tma = cfg.bias_stage == "tma"
+    bias_depth = cfg.bias_stage_depth if bias_tma else 0
+    bias_boxes_per_stage = q_stage * (kv_n // 64)
+    bias_tx_bytes = bias_boxes_per_stage * 128 * 64 * _flash_dtype_bytes(io_dtype)
+    if bias_tma:
+        assert bias_depth in _FLASH_BIAS_STAGE_DEPTHS
+        assert q_stage == 2 and kv_n == 128
+        assert not (use_local_tma_partition or segment_tiling)
+        storage_extra_args += (
+            f", bias_elems={bias_depth * bias_boxes_per_stage * 128 * 64}"
+            f", bias_stages={bias_depth}"
+        )
+        # The ring's bytes enter the schedule model as aux bytes (rounded
+        # into the header there, laid out after the K/V ring here).
+        verified_shared_memory_bytes = None
+
+    def _bias_ring_index_lines(counter: str, indent: str) -> str:
+        """Slot and parity of ring step ``counter`` (a carried Int32)."""
+        if bias_depth == 1:
+            return (
+                f"{indent}flash_bias_slot = cutlass.Int32(0)\n"
+                f"{indent}flash_bias_par = {counter} & 1"
+            )
+        assert bias_depth == 2
+        return (
+            f"{indent}flash_bias_slot = {counter} & 1\n"
+            f"{indent}flash_bias_par = ({counter} >> 1) & 1"
+        )
+
+    def _bias_load_lines(kv_expr: str, indent: str) -> str:
+        """The load warp's issue of one KV step's bias boxes: wait for the
+        slot's release, arm its transaction barrier, copy both query tiles'
+        two halves (the K/V tile index ``kv_expr``), advance the counter."""
+        if not bias_tma:
+            return ""
+        copies = "\n".join(
+            f"{indent}cute.copy(_flash_tma_bias, "
+            f"tBgB[None, flash_m_tile{q_slot}, ({kv_expr}) * {kv_n // 64} + {half}, flash_bh], "
+            f"tBsB[None, flash_bias_slot * {bias_boxes_per_stage} + {q_slot * (kv_n // 64) + half}], "
+            f"tma_bar_ptr=flash_bias_full_ptr + flash_bias_slot)"
+            for q_slot in range(q_stage)
+            for half in range(kv_n // 64)
+        )
+        return (
+            "\n"
+            + _bias_ring_index_lines("flash_bias_pidx", indent)
+            + f"\n{indent}_helion_flash_rt.mbar_spin_wait("
+            f"flash_bias_empty_ptr + flash_bias_slot, flash_bias_par ^ 1, {cfg.wait_hint})"
+            f"\n{indent}with cute.arch.elect_one():"
+            f"\n{indent}    cute.arch.mbarrier_arrive_and_expect_tx("
+            f"flash_bias_full_ptr + flash_bias_slot, {bias_tx_bytes})\n"
+            + copies
+            + f"\n{indent}flash_bias_pidx = flash_bias_pidx + 1"
+        )
+
     prefetch_epi_tma = (
         "\n    cute_cpasync_flash.prefetch_descriptor(_flash_tma_o)"
         if cfg.epi_tma
+        else ""
+    )
+    prefetch_bias_tma = (
+        "\n    cute_cpasync_flash.prefetch_descriptor(_flash_tma_bias)"
+        if bias_tma
         else ""
     )
     prefetch_descriptors = f"""
 if warp_idx == 0:
     cute_cpasync_flash.prefetch_descriptor(_flash_tma_q)
     cute_cpasync_flash.prefetch_descriptor(_flash_tma_k)
-    cute_cpasync_flash.prefetch_descriptor(_flash_tma_v){prefetch_epi_tma}
+    cute_cpasync_flash.prefetch_descriptor(_flash_tma_v){prefetch_epi_tma}{prefetch_bias_tma}
 """
     clc_setup = (
         f"""
@@ -19967,12 +20649,13 @@ flash_clc_consumer_state = cutlass_pipeline_flash.make_pipeline_state(
         if use_clc_scheduler
         else ""
     )
-    # P-over-S aliases S1 at fp16 granularity: (acc_width/io_width) * TMEM_S1.
-    p1_off = (32 // 16) * 128  # = 256 fp16 units (acc Float32 -> io Float16)
+    # P-over-S aliases S1 at io-dtype granularity: (acc_width/io_width) * TMEM_S1
+    # (256 fp16 units or 512 fp8 units for the 128 f32 columns of S1).
+    p1_off = (32 // _flash_dtype_bits(io_dtype)) * 128
     # In-place P-over-S layout: P0 aliases S0@0, P1 aliases S1@128. The staged-P STORE
     # targets are tStS0.iterator / tStS1.iterator and the PV-read P addresses are the S
-    # addresses directly (flash_s0_addr / flash_s1_addr). The P0->P1 step is 256 fp16
-    # units (= 128 f32-cols).
+    # addresses directly (flash_s0_addr / flash_s1_addr). The P0->P1 step is 128 f32-cols
+    # in io-dtype units.
     p1_step = p1_off
     p0_store_iter = "tStS0.iterator"
     p1_store_iter = "tStS1.iterator"
@@ -20404,11 +21087,18 @@ flash_cta_layout_vmnk = None
 flash_tcgen05_mcast_mask = None
 """
     mixed_p_store = cfg.p_store_repetition == 32 and split_p_arrive
-    p_store_repetition = 16 if mixed_p_store else cfg.p_store_repetition
+    # The knob counts P columns in 16-bit units (16: one 32-column score
+    # chunk per store, 32: a pair); the TMEM store atom repeats 32-bit words,
+    # so the io dtype's packing scales it (fp8 P packs four per word: 8 / 16).
+    p_store_repetition = _flash_p_store_tmem_repetition(
+        16 if mixed_p_store else cfg.p_store_repetition, io_dtype
+    )
     p_store_mixed_setup = (
-        """
+        f"""
 flash_st32_atom = cute.make_copy_atom(
-    cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+    cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({
+            _flash_p_store_tmem_repetition(32, io_dtype)
+        })), cutlass.Float32)
 flash_tiled_st32_0 = cute_tcgen05_flash.make_tmem_copy(flash_st32_atom, tStS0_P)
 flash_tiled_st32_1 = cute_tcgen05_flash.make_tmem_copy(flash_st32_atom, tStS1_P)
 flash_thr_st32_0 = flash_tiled_st32_0.get_slice(flash_local_tidx)
@@ -20418,6 +21108,18 @@ tST32tS1 = flash_thr_st32_1.partition_D(tStS1_P)
 tST32cS = flash_thr_st32_0.partition_S(tScS_P)
 flash_P_STORE32_CHUNKS = cute.size(tST32tS0, mode=[2])"""
         if mixed_p_store
+        else ""
+    )
+    # The staged bias's TMA partition: the (m, n, bh) bias view divided into
+    # (128, 64) boxes against the ring's boxes (``tBgB[None, m_tile, half, bh]``
+    # -> ``tBsB[None, box]``).
+    bias_tma_partition_setup = (
+        """
+gBias_tma = cute.flat_divide(_flash_mBiasT, (128, 64))
+tBsB, tBgB = cute_cpasync_flash.tma_partition(
+    _flash_tma_bias, 0, cute.make_layout(1),
+    cute.group_modes(sBias, 0, 2), cute.group_modes(gBias_tma, 0, 2))"""
+        if bias_tma
         else ""
     )
     setup_tma_partitions = (
@@ -20438,7 +21140,7 @@ tKsK, tKgK_kdl = cute_cpasync_flash.tma_partition(
     cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
 tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
     _flash_tma_v, 0, cute.make_layout(1),
-    cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3)){setup_gmem_slice}"""
+    cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3)){setup_gmem_slice}{bias_tma_partition_setup}"""
     )
     # A warp publishes/consumes 32 adjacent rows. Keep rows contiguous so the
     # ring and query slots do not multiply the lane stride and alias SMEM banks:
@@ -20517,6 +21219,27 @@ flash_v_prod, flash_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
     aux_full_init = (
         "        cute.arch.mbarrier_init(flash_aux_full_ptr + flash_st, 1)\n"
         if aux_smem_staging
+        else ""
+    )
+    # The staged bias ring: its smem tensor over the launcher's swizzled box
+    # layout, its full (one TMA arrive, transaction bytes) / empty (every
+    # softmax thread of both warpgroups) barriers.
+    bias_smem_setup = (
+        "\nsBias = storage.sBias.get_tensor(_flash_bsl.outer, swizzle=_flash_bsl.inner)"
+        if bias_tma
+        else ""
+    )
+    bias_mbar_ptr_setup = (
+        "flash_bias_full_ptr = storage.bias_mbar_ptr.data_ptr()\n"
+        f"flash_bias_empty_ptr = flash_bias_full_ptr + {bias_depth}\n"
+        if bias_tma
+        else ""
+    )
+    bias_mbar_init = (
+        f"    for flash_st in cutlass.range_constexpr({bias_depth}):\n"
+        "        cute.arch.mbarrier_init(flash_bias_full_ptr + flash_st, 1)\n"
+        "        cute.arch.mbarrier_init(flash_bias_empty_ptr + flash_st, 256)\n"
+        if bias_tma
         else ""
     )
     staged_first_load_setup = cfg.first_load_order == FLASH_FIRST_LOAD_ORDER_STAGED
@@ -20612,7 +21335,7 @@ _flash_storage_cls = _helion_flash_rt.flash_fa4_shared_storage(
 smem = cutlass_utils_flash.SmemAllocator()
 storage = smem.allocate(_flash_storage_cls){flex_aux_smem_setup}
 sQ = storage.sQ.get_tensor(_flash_qsl.outer, swizzle=_flash_qsl.inner)
-{smem_kv_setup}
+{smem_kv_setup}{bias_smem_setup}
 flash_scale_t = storage.sScale.get_tensor({scale_layout})
 
 # Raw mbarrier init -> fence -> CTA sync, before the pipelines.
@@ -20622,7 +21345,7 @@ flash_pfor2_ptr = storage.pfor2_mbar.data_ptr(){pforc_ptr_setup}
 flash_o_full_ptr = storage.o_full_mbar.data_ptr()
 flash_corr_epi_full_ptr = storage.corr_epi_mbar_ptr.data_ptr()
 flash_corr_epi_empty_ptr = flash_corr_epi_full_ptr + 2
-{aux_full_ptr_setup}flash_s0_corr_full_ptr = storage.s0_corr_mbar_ptr.data_ptr()
+{aux_full_ptr_setup}{bias_mbar_ptr_setup}flash_s0_corr_full_ptr = storage.s0_corr_mbar_ptr.data_ptr()
 flash_s0_corr_empty_ptr = flash_s0_corr_full_ptr + {s_corr_stage}
 flash_s1_corr_full_ptr = storage.s1_corr_mbar_ptr.data_ptr()
 flash_s1_corr_empty_ptr = flash_s1_corr_full_ptr + {s_corr_stage}
@@ -20635,7 +21358,7 @@ if tidx == 0:{prologue_init}
         cute.arch.mbarrier_init(flash_pfor2_ptr + flash_st, {pfor2_count}){pforc_init}
         cute.arch.mbarrier_init(flash_corr_epi_full_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_corr_epi_empty_ptr + flash_st, 1)
-{aux_full_init}    for flash_st in cutlass.range_constexpr({s_corr_stage}):
+{aux_full_init}{bias_mbar_init}    for flash_st in cutlass.range_constexpr({s_corr_stage}):
         cute.arch.mbarrier_init(flash_s0_corr_full_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_s0_corr_empty_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_s1_corr_full_ptr + flash_st, 128)
@@ -20960,7 +21683,7 @@ tOsO_tma, tOgO_tma = cute_cpasync_flash.tma_partition(
         f"""
 flash_o_store_bits = 128
 flash_o_async_copy_elems = flash_o_store_bits // {io_dtype}.width
-{_flash_o_store_thread_layout_lines(hd_v, 32, dim_name="flash_o_tO_shape_dim_1", elems_name="flash_o_async_copy_elems")}
+{_flash_o_store_thread_layout_lines(hd_v, 32, dim_name="flash_o_tO_shape_dim_1", elems_name="flash_o_async_copy_elems", elems_per_packet=128 // _flash_dtype_bits(io_dtype))}
 flash_o_vO_layout = cute.make_layout((1, flash_o_async_copy_elems))
 flash_o_gmem_atom = cute.make_copy_atom(
     cute.nvgpu.CopyUniversalOp(), {io_dtype}, num_bits_per_copy=flash_o_store_bits)
@@ -21409,6 +22132,10 @@ if warp_idx == 15:
     )
 
     load_head = f"    cute.arch.setmaxregister_decrease({cfg.other_regs})"
+    if bias_tma:
+        # The bias ring's producer step counter (slot and parity), carried
+        # across work items like the K/V pipeline state.
+        load_head += "\n    flash_bias_pidx = cutlass.Int32(0)"
     load_loop_var = "flash_kv_load_iter"
     flex_load_prelude = ""
     load_next_stmt: str | None = None
@@ -21612,7 +22339,12 @@ if warp_idx == 15:
     load_prologue = _flash_fa4_load_prologue_for_order(
         cfg.first_load_order, load_q0, load_k0, load_q1, load_v0, staged_wait
     )
-    load_inner = f"""{local_load_tma_block}{load_prologue}
+    # The staged bias's boxes follow each step's K/V copies: the first tile's
+    # after the prologue (behind the first score tile's bytes), the next
+    # tile's behind its V copy, indexed by the same KV tile expression.
+    bias_load_first = _bias_load_lines(load_first_kv, "        ")
+    bias_load_next = _bias_load_lines("flash_kv_next", "            ")
+    load_inner = f"""{local_load_tma_block}{load_prologue}{bias_load_first}
         for {load_loop_var} in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
 {load_next_stmt}
             flash_kve = {load_k_prod}.acquire_and_advance(){load_k_extra_tx_loop}{load_k_extra_wait_loop}
@@ -21620,7 +22352,7 @@ if warp_idx == 15:
                       tma_bar_ptr=flash_kve.barrier)
             flash_kve = {load_v_prod}.acquire_and_advance()
             cute.copy(_flash_tma_v, tVgV[None, flash_kv_next], {v_load_slot},
-                      tma_bar_ptr=flash_kve.barrier)"""
+                      tma_bar_ptr=flash_kve.barrier){bias_load_next}"""
     load_tail = (
         "    flash_k_prod.tail()\n    flash_v_prod.tail()\n    flash_q_prod.tail()"
         if separate_kv_rings
@@ -21782,8 +22514,12 @@ if warp_idx == 15:
     if cfg.mma_ptx:
         # Each CTA owns 128 Q rows even when a CtaGroup.TWO MMA spans 256 rows.
         # SMEM descriptors use 16-byte units, so derive the stage stride from
-        # the per-CTA tile rather than the cluster-wide MMA M extent.
-        q_stage_stride = (mma_m // cta_group_size) * hd // 8
+        # the per-CTA tile (rows x head dim x element bytes) rather than the
+        # cluster-wide MMA M extent.
+        q_stage_stride = (
+            (mma_m // cta_group_size) * hd * _flash_dtype_bytes(io_dtype) // 16
+        )
+        qk_mma_kind_arg, pv_mma_kind_arg = _flash_mma_kind_args(io_dtype)
         if cfg.precompute_qk_desc:
             qk_desc_head = """
     flash_q_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
@@ -21847,11 +22583,15 @@ if warp_idx == 15:
                 "helion_flash_q_smem_desc",
                 "helion_flash_qk_mma_idesc",
                 smem_offset={smem_offset},
-                zero_init=True{gemm_cta_group_arg}{issue_arg})"""
+                zero_init=True{gemm_cta_group_arg}{issue_arg}{qk_mma_kind_arg})"""
 
-        pv_desc_head = """
+        # V's major mode follows its storage (``v_storage_k_major``, read
+        # from the host tensor's strides): the canonical ``[b, s, d]`` buffer
+        # is the MN-major B operand, a dense ``[b, d, s]`` buffer the K-major
+        # one (the host builds the PV MMA the same way).
+        pv_desc_head = f"""
     flash_v_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
-        sV, _helion_flash_ptx.Major.MN)
+        sV, _helion_flash_ptx.Major.{"K" if v_storage_k_major else "MN"})
     _helion_flash_ptx.declare_ptx_idesc(
         _flash_pv_mma.op, "helion_flash_pv_mma_idesc")"""
         # flash_s0_addr/flash_s1_addr are the TMEM addresses of the PV-gemm P operand
@@ -21880,7 +22620,10 @@ if warp_idx == 15:
             # pforc pair, the last quarter on pfor2 (pfor gates the first, above).
             pv0_split_wait_arg += "\n                mbar_mid_ptrs=(flash_pforc_ptr + 0, flash_pforc_ptr + 1),"
             pv1_split_wait_arg += "\n                mbar_mid_ptrs=(flash_pforc_ptr + 2, flash_pforc_ptr + 3),"
-        pv_wait_hint_arg = f", wait_hint={cfg.wait_hint}"
+        # fp8 operands issue ``kind::f8f6f4`` MMAs; the TMEM-sourced P is
+        # eight bits wide (the fp16 kind and width are the helpers' defaults,
+        # so 16-bit renders spell nothing).
+        pv_wait_hint_arg = f", wait_hint={cfg.wait_hint}{pv_mma_kind_arg}"
         # Every PV descriptor starts at the V operand's slot (the uneven ring
         # shifts the odd slot toward V).
         pv_v_slot = _v_ring_slot(
@@ -22632,7 +23375,7 @@ if warp_idx == 15:
         and not causal_hd128_resident
         and not is_causal
         and not pruned_interval
-        and score_plan.is_flex
+        and score_plan.flex_envelope
         and not score_plan.flex_has_score_region
         and s_resident_chunks * cfg.s_load_repetition == kv_n
     )
@@ -22834,7 +23577,9 @@ if warp_idx == 15:
     # could not be tested against 0) and the normalizer maps 0 to 0.
     # A FlexAttention mask can hide a row on every tile (and an empty pair
     # walks one zero-P step), so the flex plan takes the same pair.
-    empty_row_normalizer = bool(score_plan.row_kv_begin_masks) or score_plan.is_flex
+    empty_row_normalizer = (
+        bool(score_plan.row_kv_begin_masks) or score_plan.flex_envelope
+    )
     inv_sum_fn = (
         "_helion_flash_rt.rcp_approx_ftz_or_zero"
         if empty_row_normalizer
@@ -24342,6 +25087,18 @@ if warp_idx == 15:
                         # The per-tile predicate / the masked loop segments
                         # already select the boundary tiles.
                         row_kv_begin_guard=False,
+                        bias_stage=cfg.bias_stage,
+                        # This query tile's box of the chunk's KV tile half
+                        # in the ring slot of the step (``flash_ci`` is a
+                        # Python int of the unrolled chunk loop).
+                        bias_box_expr=(
+                            "sBias[None, None, "
+                            f"flash_bias_slot * {bias_boxes_per_stage} + {stage} * {kv_n // 64} "
+                            f"+ flash_ci // {64 // cfg.s_load_repetition}]"
+                        ),
+                        bias_col_expr=(
+                            f"(flash_ci % {64 // cfg.s_load_repetition}) * {cfg.s_load_repetition}"
+                        ),
                     )
 
                 def _modifier_rowmax_block(
@@ -24459,6 +25216,21 @@ if warp_idx == 15:
                 masked_rowmax_block = _modifier_rowmax_block(
                     _modifier_transform(score_plan)
                 )
+                if bias_tma:
+                    # The staged bias: wait for the step's ring slot (after
+                    # the S wait), read it in the pass-1 chunk loop, release
+                    # it once every chunk's bias is in the scores (pass 2
+                    # re-reads the biased scores from TMEM).
+                    masked_rowmax_block = (
+                        _bias_ring_index_lines("flash_bias_cidx", "            ")
+                        + "\n            _helion_flash_rt.mbar_spin_wait("
+                        "flash_bias_full_ptr + flash_bias_slot, flash_bias_par, "
+                        f"{cfg.wait_hint})\n"
+                        + masked_rowmax_block
+                        + "\n            _helion_flash_rt.mbarrier_arrive("
+                        "flash_bias_empty_ptr + flash_bias_slot)"
+                        "\n            flash_bias_cidx = flash_bias_cidx + 1"
+                    )
                 needs_mask = (
                     _flash_kv_tile_needs_mask_condition(
                         score_plan,
@@ -25298,12 +26070,15 @@ if warp_idx == 15:
         softmax_corr_prod_state = (
             "\n    flash_s_corr_prod_index = cutlass.Int32(0)" + softmax_corr_prod_state
         )
+    # The staged bias ring's consumer step counter of each softmax
+    # warpgroup (slot and parity), carried across work items.
+    softmax_bias_state = "\n    flash_bias_cidx = cutlass.Int32(0)" if bias_tma else ""
     softmax0_head = f"""    cute.arch.setmaxregister_increase({cfg.softmax_regs})
 {softmax0_setup.rstrip()}
-    flash_s_full_phase = cutlass.Int32(0){softmax_corr_prod_state}{_softmax_row_epilogue_head("0")}"""
+    flash_s_full_phase = cutlass.Int32(0){softmax_corr_prod_state}{softmax_bias_state}{_softmax_row_epilogue_head("0")}"""
     softmax1_head = f"""    cute.arch.setmaxregister_increase({cfg.softmax_regs})
 {softmax1_setup.rstrip()}
-    flash_s_full_phase = cutlass.Int32(0){softmax_corr_prod_state}{_softmax_row_epilogue_head("1")}"""
+    flash_s_full_phase = cutlass.Int32(0){softmax_corr_prod_state}{softmax_bias_state}{_softmax_row_epilogue_head("1")}"""
     softmax_needs_tile_decode = (
         has_lse
         or is_causal
@@ -26910,6 +27685,13 @@ _FLASH_BIAS_KERNEL_PARAMS = [
     "_flash_mBias",
     "_flash_score_bias_scale",
 ]
+# The staged bias (``cute_flash_bias_stage='tma'``): its (128, 64) box TMA
+# atom, the TMA-adjusted bias view and the ring's swizzled smem layout.
+_FLASH_BIAS_TMA_KERNEL_PARAMS = [
+    "_flash_tma_bias",
+    "_flash_mBiasT",
+    "_flash_bsl",
+]
 
 _FLASH_ALIBI_KERNEL_PARAMS = [
     "_flash_mAlibi",
@@ -26985,6 +27767,9 @@ class FlashTensorPlan(NamedTuple):
     # V/O head dim when it differs from ``head_dim`` (the asymmetric (192, 128)
     # pair); ``None`` is the symmetric case, as on ``AttentionScorePlan``.
     head_dim_v: int | None = None
+    # V's storage (``FlashGraphOutputPlan.v_storage_k_major``): the key dim
+    # contiguous (K-major B operand) or the head dim (MN-major).
+    v_storage_k_major: bool = False
     # Flex envelope: the four BlockMask tables (partial count, partial index,
     # full count, full index) and the captured aux tensors as plain kernel
     # params (``df.placeholder_args`` keeps them in the signature), the Q and
@@ -27300,13 +28085,37 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
         (v_arg, kv_batch, graph_plan.value_head_dim),
         (o_arg, graph_plan.batch, graph_plan.value_head_dim),
     ):
+        if arg is o_arg and graph_plan.o_batch_heads_split:
+            # The ``[B, H, seq, hd]`` output stored by flat row block (the
+            # graph plan proved the split); its leading dims stay symbolic.
+            if (
+                arg.fake_value.ndim != 4
+                or arg.fake_value.dtype != graph_plan.dtype
+                or not _flash_value_is_contiguous(arg.fake_value)
+                or int(arg.fake_value.shape[2]) != graph_plan.seq
+                or int(arg.fake_value.shape[3]) != expected_head_dim
+            ):
+                return None
+            continue
+        # The pre-transposed V reads a ``[kv_batch, head_dim_v, seq]`` tensor;
+        # either index form may be a contiguous buffer or the dense transposed
+        # view of the other's (the graph plan read which).
+        expected_shape = (
+            (expected_batch, expected_head_dim, graph_plan.seq)
+            if arg is v_arg and graph_plan.v_k_major
+            else (expected_batch, graph_plan.seq, expected_head_dim)
+        )
+        dense = (
+            _flash_v_storage_k_major(arg.fake_value, v_k_major=graph_plan.v_k_major)
+            == graph_plan.v_storage_k_major
+            if arg is v_arg
+            else arg.fake_value.is_contiguous()
+        )
         if (
             arg.fake_value.ndim != 3
             or arg.fake_value.dtype != graph_plan.dtype
-            or not arg.fake_value.is_contiguous()
-            or int(arg.fake_value.shape[0]) != expected_batch
-            or int(arg.fake_value.shape[1]) != graph_plan.seq
-            or int(arg.fake_value.shape[2]) != expected_head_dim
+            or not dense
+            or tuple(int(size) for size in arg.fake_value.shape) != expected_shape
         ):
             return None
     for arg in resolved_bias_args:
@@ -27387,6 +28196,7 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
         graph_plan.kv_group,
         row_kv_begin_args=tuple(resolved_row_kv_begin_args),
         head_dim_v=graph_plan.head_dim_v,
+        v_storage_k_major=graph_plan.v_storage_k_major,
     )
 
 
@@ -27517,15 +28327,22 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             bias_arg_count=len(bias_args),
         )
     )
-    supports_tensor_4d_tma = _flash_values_support_tensor_4d_tma(
-        plan.q_arg.fake_value,
-        plan.k_arg.fake_value,
-        plan.v_arg.fake_value,
-        score_plan=score_plan,
-        batch=batch,
-        seq=seq,
-        head_dim=head_dim,
-        dtype=io_dtype,
+    # The flex envelope reads its 4-D operands directly (strided ones through
+    # the rank-4 maps), so the collapsed path's reshape-view TMA proof does
+    # not apply to it: the surface reports the family unsupported on every
+    # flex plan and the resolver pins it off here the same way.
+    supports_tensor_4d_tma = (
+        not score_plan.is_flex
+        and _flash_values_support_tensor_4d_tma(
+            plan.q_arg.fake_value,
+            plan.k_arg.fake_value,
+            plan.v_arg.fake_value,
+            score_plan=score_plan,
+            batch=batch,
+            seq=seq,
+            head_dim=head_dim,
+            dtype=io_dtype,
+        )
     )
     flash_config: Mapping[str, object] | None = df.config
     if score_plan.requires_ws_overlap:
@@ -27540,7 +28357,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     env = CompileEnvironment.current()
     row_mma_aligned = all(
         cute_tensor_base_is_aligned(env, arg.fake_value, 16)
-        for arg in (q_arg, k_arg, v_arg, o_arg, lse_arg, *plan.epi_aux_args)
+        for arg in (q_arg, k_arg, v_arg, o_arg, lse_arg, *bias_args, *plan.epi_aux_args)
         if arg is not None
     )
     row_mma_aux_dtypes = () if row_emit is None else row_emit.aux_dtypes
@@ -27552,7 +28369,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         dtype=io_dtype,
         num_bh=batch,
         is_causal=is_causal,
-        flex_trivial_walk=score_plan.is_flex and not score_plan.has_list_walk,
+        flex_trivial_walk=score_plan.flex_envelope and not score_plan.has_list_walk,
         has_kv_tile_pruning=score_plan.has_kv_tile_pruning,
         requires_ws_overlap=score_plan.requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
@@ -27575,9 +28392,11 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(score_plan),
         causal_resident_compatible=seq % 256 == 0,
-        prefer_packed_reduce=bool(score_plan.modifiers) or score_plan.is_flex,
+        prefer_packed_reduce=bool(score_plan.modifiers) or score_plan.flex_envelope,
         plain_row_body=(
-            row_emit is None and not score_plan.modifiers and not score_plan.is_flex
+            row_emit is None
+            and not score_plan.modifiers
+            and not score_plan.flex_envelope
         ),
         has_row_epilogue=row_emit is not None,
         has_score_modifiers=(
@@ -27602,8 +28421,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         kv_group=kv_group,
         fast_math=env.settings.fast_math,
         # The flex envelope (the plan category the resolver pins to the fa4
-        # pair body at every KV tile count; a trivial walk included).
-        has_list_walk=score_plan.is_flex,
+        # pair body at every KV tile count; a trivial walk included).  A
+        # dense flex plan (``flex_dense``) is the dense category.
+        has_list_walk=score_plan.flex_envelope,
     )
     if score_plan.is_flex and seq < 128 and cfg.epi_tma:
         # A query length shorter than one 128-row tile: the TMA store's
@@ -27696,6 +28516,13 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.preamble = []
         return True
 
+    # The flex envelope's runtime softmax scale (a kernel scalar; None for a
+    # literal scale and for every other plan).
+    flex_scale_arg = (
+        plan.flex_scale_arg_name
+        if plan.flex_scale_arg_name is not None
+        else score_plan.scale_arg
+    )
     if cfg.topology == ROW_MMA_FAMILY:
         # A fused row epilogue addresses its aux rows as plain kernel tensor
         # parameters (the same (B, S, D) geometry as O) and stages them through
@@ -27714,12 +28541,17 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             row_warps=cfg.row_warps,
             aux_dtypes=row_mma_aux_dtypes,
         )
+        # The row programs host the square causal mask and one additive
+        # tensor bias (its tile staged beside every K/V chunk); the resolver
+        # admitted only those kinds.
+        row_mma_bias_arg = bias_args[0] if tensor_biases else None
         if not row_mma_shape_supported(
             seq=seq,
             head_dim=head_dim,
             row_warps=cfg.row_warps,
             row_tile_m=cfg.row_tile_m,
             aux_bytes=row_mma_aux_bytes,
+            bias_rows=row_mma_bias_arg is not None,
         ):
             return False
         emit_flash_row_mma_module_statements(cg)
@@ -27740,6 +28572,11 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 "o_name": o_arg.name,
                 **({} if lse_arg is None else {"lse_name": lse_arg.name}),
                 **(
+                    {}
+                    if row_mma_bias_arg is None
+                    else {"bias_name": row_mma_bias_arg.name}
+                ),
+                **(
                     {
                         "epi_aux_count": len(plan.epi_aux_args),
                         **{
@@ -27755,7 +28592,21 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.placeholder_args.update((q_arg.name, k_arg.name, v_arg.name, o_arg.name))
         if lse_arg is not None:
             df.placeholder_args.add(lse_arg.name)
+        if row_mma_bias_arg is not None:
+            df.placeholder_args.add(row_mma_bias_arg.name)
         df.placeholder_args.update(aux_arg.name for aux_arg in plan.epi_aux_args)
+        # A dense flex plan's runtime scale (peeled into the multiplier: raw
+        # QK units): the row programs read the kernel scalar and derive the
+        # log2 scale from it, as the tcgen05 wrapper does for the other
+        # bodies (``_flash_scale_log2 = _flash_scale * log2(e)``).
+        row_mma_scale_expr: str | None = None
+        if score_plan.is_flex and flex_scale_arg is not None:
+            assert score_plan.scale_peeled
+            row_mma_scale_expr = (
+                f"cutlass.Float32({flex_scale_arg})"
+                f" * cutlass.Float32({math.log2(math.e)!r})"
+            )
+            df.placeholder_args.add(flex_scale_arg)
         df.cute_state.attention_flash_threads = 32 * cfg.row_warps
         df.body = emit_flash_row_mma_device_body(
             q_name=q_arg.name,
@@ -27768,12 +28619,20 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             head_dim=head_dim,
             io_dtype=io_dtype_str,
             scale_log2=scale_log2,
+            scale_log2_expr=row_mma_scale_expr,
             lse_scale=score_plan.lse_scale,
             row_warps=cfg.row_warps,
             row_tile_m=cfg.row_tile_m,
             relu_output=_flash_output_relu_enabled(output_epilogue),
             row_epilogue=row_mma_epilogue,
             kv_group=kv_group,
+            causal=is_causal,
+            bias_name=None if row_mma_bias_arg is None else row_mma_bias_arg.name,
+            # The source bias in raw QK units (the tcgen05 bodies' plan key
+            # ``score_bias_scale``).
+            bias_scale=(
+                tensor_biases[0].scale_log2 / scale_log2 if tensor_biases else 1.0
+            ),
         )
         df.preamble = []
         return True
@@ -27785,14 +28644,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         fa4_tile_rows = 128 * cfg.q_tile_count
         if cfg.use_2cta_instrs or cfg.use_cga2_local_cta:
             fa4_tile_rows *= 2
-        if score_plan.is_flex:
+        if score_plan.flex_envelope:
             # A ragged last pair runs a dead or half-live second stage.
             total_tiles = batch * (-(-seq // fa4_tile_rows))
         elif seq % fa4_tile_rows != 0:
             return False
         else:
             total_tiles = batch * (seq // fa4_tile_rows)
-    elif score_plan.is_flex and cfg.use_2cta_instrs:
+    elif score_plan.flex_envelope and cfg.use_2cta_instrs:
         # The cooperative pair's list walk: a ragged last pair runs a dead or
         # half-live second tile.
         total_tiles = batch * (-(-seq // (2 * cfg.q_tile_m * cfg.pair_cluster)))
@@ -27870,11 +28729,11 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         # The launcher builds the K/V views and the KV tile count over the
         # K/V length; Q/O/LSE keep ``seq``.
         wrapper_plan["kv_seq"] = kv_seq
-    flex_scale_arg = (
-        plan.flex_scale_arg_name
-        if plan.flex_scale_arg_name is not None
-        else score_plan.scale_arg
-    )
+    if plan.v_storage_k_major:
+        # A dense ``[kv_batch, head_dim_v, seq]`` V buffer: the launcher views
+        # it as the K-major (D, S, B) B operand and builds the PV MMA with a
+        # K-major B (the body's V descriptor follows).
+        wrapper_plan["v_k_major"] = True
     if score_plan.is_flex and flex_scale_arg is not None:
         # A runtime softmax scale: the launcher derives ``_flash_scale_log2``
         # from it (mask-only plans, raw QK units) and passes it to the hooks.
@@ -27898,6 +28757,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         bias_modifier = tensor_biases[0]
         wrapper_plan["bias_name"] = bias_arg.name
         wrapper_plan["score_bias_scale"] = bias_modifier.scale_log2 / scale_log2
+        if cfg.bias_stage == "tma":
+            # The launcher builds the (128, 64) box TMA atom and the ring's
+            # swizzled smem layout over ``bias_stage`` stages of both tiles.
+            wrapper_plan["bias_stage"] = cfg.bias_stage_depth
     if alibi_biases:
         wrapper_plan["alibi_name"] = alibi_args[0].name
         wrapper_plan["alibi_count"] = int(alibi_args[0].fake_value.shape[0])
@@ -28094,6 +28957,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.wrapper_only_params.extend(_FLASH_LSE_KERNEL_PARAMS)
     if tensor_biases:
         df.wrapper_only_params.extend(_FLASH_BIAS_KERNEL_PARAMS)
+        if cfg.bias_stage == "tma":
+            df.wrapper_only_params.extend(_FLASH_BIAS_TMA_KERNEL_PARAMS)
     if alibi_biases:
         df.wrapper_only_params.extend(_FLASH_ALIBI_KERNEL_PARAMS)
     if document_masks:
@@ -28211,6 +29076,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 e2e_res=alt_exp2.e2e_res,
                 kv_group=kv_group,
                 relu_output=_flash_output_relu_enabled(output_epilogue),
+                v_storage_k_major=plan.v_storage_k_major,
             )
         )
     elif cfg.topology == "fa4":
@@ -28241,7 +29107,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 # (the flex tables and hooks index ``b`` / ``h``): the 4D
                 # geometry when the tensor plan proved it, else one batch.
                 num_heads=(
-                    (plan.tensor_4d_heads or batch) if score_plan.is_flex else None
+                    (plan.tensor_4d_heads or batch)
+                    if score_plan.flex_envelope
+                    else None
                 ),
                 flex_scalar_exprs=plan.flex_scalar_exprs,
                 flex_item_table=flex_item_table,
@@ -28252,6 +29120,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 flex_host_flags=flex_host_flags,
                 flex_tail_split=flex_tail_split,
                 flex_tail_items_ws=flex_tail_items_ws,
+                v_storage_k_major=plan.v_storage_k_major,
             )
         )
     else:

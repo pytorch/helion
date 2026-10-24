@@ -1443,6 +1443,41 @@ def cute_dense_attention(q_in, k_in, v_in):
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def cute_dense_attention_post_dot_scale(q_in, k_in, v_in):
+    """``cute_dense_attention`` with the softmax scale on the scores
+    (``(q @ k^T) * scale``) instead of on Q."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt, kt.transpose(1, 2), torch.float32) * qk_scale
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def cute_dense_attention_with_lse(q_in, k_in, v_in):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
@@ -3597,6 +3632,32 @@ class TestCuteBackend(TestCase):
         self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_STAGED, 5)
         self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_CHOICES, (0, 1, 2, 3, 4, 5))
 
+    def test_flash_attention_post_dot_scale_fires_and_matches_sdpa(self) -> None:
+        """The softmax scale on the scores (``(q @ k^T) * scale``) is the same
+        attention body as the pre-scaled-Q form: the fused tcgen05 flash kernel
+        fires at [1,128,128] and matches SDPA for fp16 and bf16 operands."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with (
+                self.subTest(dtype=dtype),
+                patch(
+                    "helion._compiler.cute.backend._detect_specialized_mma_loop",
+                    return_value=True,
+                ),
+            ):
+                q, k, v = (
+                    torch.randn(2, 8, 256, 64, dtype=dtype, device=DEVICE)
+                    for _ in range(3)
+                )
+                code, out = code_and_output(
+                    cute_dense_attention_post_dot_scale,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("flash_kv_prod", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_fires_and_matches_sdpa(self) -> None:
         """With the gate default-on, square fp16 attention at [1,128,128] lowers
         to the fused tcgen05 flash kernel and matches SDPA for head_dim 64/128."""
@@ -4875,10 +4936,12 @@ class TestCuteBackend(TestCase):
                 )
             env = SimpleNamespace(
                 config_spec=spec,
+                # The fallback targets read the root batch block's source
+                # (``_attention_unit_fixed_block``): an autotuned block here.
                 block_sizes={
-                    0: SimpleNamespace(size=256),
-                    1: SimpleNamespace(size=262_144),
-                    2: SimpleNamespace(size=262_144),
+                    0: SimpleNamespace(size=256, block_size_source=None),
+                    1: SimpleNamespace(size=262_144, block_size_source=None),
+                    2: SimpleNamespace(size=262_144, block_size_source=None),
                 },
             )
             device_ir = DeviceIR()
@@ -4899,6 +4962,9 @@ class TestCuteBackend(TestCase):
                     head_dim=64,
                     head_dim_v=64,
                     io_dtype=torch.float16,
+                    v_k_major=False,
+                    score_rank=3,
+                    batch_block_id=None,
                     is_causal=False,
                     score_plan=SimpleNamespace(
                         has_kv_tile_pruning=False,
@@ -6467,7 +6533,10 @@ class TestCuteBackend(TestCase):
         bound = cute_biased_attention.bind((q, k, v, bias))
         code = bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
         self.assertTrue(_flash_fired(code))
-        self.assertIn("add_score_bias_t2r", code)
+        # The generic modifier body adds the bias in pass 1 -- from the staged
+        # ring by default (``cute_flash_bias_stage='tma'``), from global
+        # memory under ``'direct'``.
+        self.assertIn("_helion_flash_rt.add_score_bias_smem_t2r(", code)
         self.assertIn("_flash_mBias", code)
         self.assertIn("flash_fa4_shared_storage", code)
         _assert_score_modified_reductions(self, code)
@@ -6500,7 +6569,8 @@ class TestCuteBackend(TestCase):
         )
         self.assertTrue(_flash_fired(code))
         self.assertIn("flash_tiled_ld_coord", code)
-        self.assertIn("add_score_bias_t2r", code)
+        # Either bias lowering (the staged ring is the default here).
+        self.assertIn("_helion_flash_rt.add_score_bias_", code)
         self.assertNotIn("helion_small_biased_attention", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
