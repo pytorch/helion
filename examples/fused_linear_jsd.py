@@ -3,8 +3,8 @@ Fused Linear JSD Example
 ========================
 
 This example demonstrates how to implement a memory-efficient fused linear + JSD
-kernel using Helion. The fusion avoids materializing the full [batch, vocab] logits
-tensor by:
+kernel using Helion. The fusion bounds the materialized [chunk, vocab] logits
+tensor (one chunk when the whole [batch, vocab] logits fit the byte budget) by:
 1. Chunking the batch dimension
 2. Computing logits per-chunk via matmul
 3. Computing JSD loss and grad_logits per-chunk
@@ -30,6 +30,16 @@ from helion._testing import run_example
 import helion.exc
 import helion.language as hl
 
+# Chunking exists to bound the materialized [chunk, vocab] fp32 logits (student,
+# teacher and grad_logits chunks are live at once), not to make chunks tiny:
+# every chunk costs two GEMMs, a kernel launch and two more GEMMs.
+LOGITS_CHUNK_BYTES = 64 * 2**20
+
+# fast_math's approximate exp and division flush fp32 subnormal probabilities to
+# zero, so the kernels clamp the mixture to fp32 tiny before taking its log
+# (log 0 = -inf and p * (log p - log m) would be 0 * inf = NaN).
+FP32_TINY = torch.finfo(torch.float32).tiny
+
 # %%
 # Helion JSD Kernel
 # -----------------
@@ -38,7 +48,9 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp, log and division; see FP32_TINY for the clamp
+# on the mixture before its log.
+@helion.kernel(fast_math=True)
 def jsd_kernel(
     beta: float,
     ignore_index: int,
@@ -79,7 +91,7 @@ def jsd_kernel(
 
         # Compute mixture distribution: m = (1-beta)*student + beta*teacher
         m = (1 - beta) * student_prob + beta * teacher_prob
-        log_m = torch.log(m)
+        log_m = torch.log(torch.clamp(m, min=FP32_TINY))
 
         # JSD = (1-beta) * KL(student || m) + beta * KL(teacher || m)
         # KL(p || q) = sum(p * (log(p) - log(q)))
@@ -89,10 +101,14 @@ def jsd_kernel(
 
         loss[tile] = jsd_loss
 
-        # Gradient of JSD w.r.t. student logits
-        # d(JSD)/d(student_logits) = (1-beta)/T * (student_prob - m)
-        # This comes from the chain rule through softmax
-        grad_tile = ((1 - beta) / temperature) * (student_prob - m)
+        # Gradient of the row's JSD w.r.t. the student logits, through the
+        # softmax: d(JSD)/d(student_logits) = (1-beta)/T * p * (log(p/m) - KL(p||m))
+        # (the mean over the batch is applied in the autograd backward).
+        grad_tile = (
+            ((1 - beta) / temperature)
+            * student_prob
+            * ((student_log_prob - log_m) - student_kl[:, None])
+        )
         grad_student_logits[tile, :] = grad_tile
 
     return loss, grad_student_logits
@@ -106,7 +122,9 @@ def jsd_kernel(
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+# fast_math: approximate exp, log and division; see FP32_TINY for the clamp
+# on the mixture before its log.
+@helion.kernel(fast_math=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def fused_linear_jsd_kernel(
     beta: float,
     ignore_index: int,
@@ -138,7 +156,7 @@ def fused_linear_jsd_kernel(
 
         # Compute mixture distribution: m = (1-beta)*student + beta*teacher
         m = (1 - beta) * student_prob + beta * teacher_prob
-        log_m = torch.log(m)
+        log_m = torch.log(torch.clamp(m, min=FP32_TINY))
 
         # JSD = (1-beta) * KL(student || m) + beta * KL(teacher || m)
         student_kl = (student_prob * (student_log_prob - log_m)).sum(dim=-1)
@@ -179,25 +197,26 @@ class FusedLinearJSDFunction(torch.autograd.Function):
         """
         Forward pass with chunking to reduce memory usage.
 
-        Instead of materializing full [batch, vocab] logits, we:
+        Instead of materializing [batch, vocab] logits beyond the byte budget, we:
         1. Process in chunks along the batch dimension
         2. Compute logits per-chunk: chunk_logits = chunk_input @ weight.T
         3. Compute JSD loss and grad_logits per-chunk
         4. Convert grad_logits to grad_input: grad_input = grad_logits @ weight
 
-        This way we only ever have [chunk_size, vocab] in memory, not [batch, vocab].
+        This way we only ever have [chunk_size, vocab] logits in memory.
         """
-        batch_size, hidden_dim = student_input.shape
+        batch_size = student_input.shape[0]
         vocab_size = student_weight.shape[0]
 
-        # Calculate chunk size to balance memory vs overhead
-        # Larger chunks = more memory but fewer kernel launches
-        # Use heuristic similar to Liger: chunk based on vocab/hidden ratio
-        inc_factor = max(1, (vocab_size + hidden_dim - 1) // hidden_dim)
-        chunk_size = 1
-        while chunk_size * 2 <= batch_size // inc_factor:
-            chunk_size *= 2
-        chunk_size = max(1, min(chunk_size, batch_size))
+        # Chunk rows so one [chunk, vocab] fp32 logits tensor fits the byte
+        # budget.  Liger's vocab/hidden ratio rule made 8-16 chunks at the
+        # benchmark shapes (64,128,1024), (128,512,4096), (256,1024,16384),
+        # whose whole logits tensors are only 0.25-16 MiB, so the pipeline
+        # launched that many small GEMMs plus a per-chunk add and ran 4-8x
+        # slower than torch.compile of the unchunked reference.  Under the
+        # budget those shapes are one chunk; (1024, 4096, 128256) still chunks
+        # (about 130 rows per chunk).
+        chunk_size = min(batch_size, max(1, LOGITS_CHUNK_BYTES // (vocab_size * 4)))
         num_chunks = (batch_size + chunk_size - 1) // chunk_size
 
         # Allocate outputs
@@ -233,16 +252,17 @@ class FusedLinearJSDFunction(torch.autograd.Function):
             # grad_input = grad_logits @ weight
             grad_student_input[start_idx:end_idx] = grad_logits_chunk @ student_weight
 
-            # Accumulate weight gradient: grad_weight += grad_logits.T @ input
-            grad_student_weight = (
-                grad_student_weight + grad_logits_chunk.T @ student_input_chunk.float()
-            )
+            # Accumulate weight gradient in place so the add rides the GEMM:
+            # grad_weight += grad_logits.T @ input
+            grad_student_weight.addmm_(grad_logits_chunk.T, student_input_chunk.float())
 
         # Normalize loss by batch size
         total_loss = total_loss / batch_size
 
-        # Save for backward
+        # Save for backward; the gradients are of the per-row loss sum, the
+        # backward applies the mean's 1 / batch_size.
         ctx.save_for_backward(grad_student_input, grad_student_weight)
+        ctx.batch_size = batch_size
 
         return total_loss
 
@@ -252,14 +272,15 @@ class FusedLinearJSDFunction(torch.autograd.Function):
         *grad_outputs: Any,  # noqa: ANN401
     ) -> tuple[Tensor, Tensor, None, None, None, None, None]:
         """
-        Backward pass: rescale the precomputed gradients by grad_output.
+        Backward pass: rescale the precomputed gradients by grad_output and
+        the mean's 1 / batch_size.
         """
         (grad_output,) = grad_outputs
         grad_student_input, grad_student_weight = ctx.saved_tensors
 
-        # Scale gradients by upstream gradient
-        grad_student_input = grad_output * grad_student_input
-        grad_student_weight = grad_output * grad_student_weight
+        scale = grad_output / ctx.batch_size
+        grad_student_input = scale * grad_student_input
+        grad_student_weight = scale * grad_student_weight
 
         # Return gradients for: student_input, student_weight, teacher_input,
         # teacher_weight, beta, ignore_index, temperature

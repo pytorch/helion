@@ -1,12 +1,14 @@
 """Register-tile lowering of lane reductions over one-vector tiles (CPU codegen).
 
 The fused linear-attention recurrent step loads a ``[D, dv]`` state tile,
-updates it in place (``state = state * decay + k[:, None] * v[None, :]``) and
-reduces ``q[:, None] * state`` over ``D``.  With the reduction split across a
-persistent synthetic lane loop the CuTe backend used to nest that lane loop
-inside the tile's constexpr V-loop, so the state load stayed scalar, each lane
-iteration waited for its own load, and the same-index read-modify-write was
-rejected by the aliasing gate because the tensor strides were not proven.
+writes the updated tile to a new state tensor at the same index (``new_state =
+state * decay + k[:, None] * v[None, :]``) and reduces ``q[:, None] *
+new_state`` over ``D``.  With the reduction split across a persistent synthetic
+lane loop the CuTe backend used to nest that lane loop inside the tile's
+constexpr V-loop, so the state load stayed scalar, each lane iteration waited
+for its own load, and the same-index read-modify-write (the in-place form of the
+step, kept here as ``recurrent_step_in_place``) was rejected by the aliasing
+gate because the tensor strides were not proven.
 
 Now the scalar reduction lane nests OUTSIDE the one-vector tile wrappers as a
 trace-time register tile: one packet load per lane, every lane's loads issued
@@ -44,6 +46,7 @@ from test._cute_register_tile_kernels import col_sum_guarded
 from test._cute_register_tile_kernels import col_sum_nested
 from test._cute_register_tile_kernels import col_var
 from test._cute_register_tile_kernels import column_config
+from test._cute_register_tile_kernels import recurrent_step_in_place
 from test._cute_register_tile_kernels import rms_norm_bwd
 from test._cute_register_tile_kernels import rms_norm_bwd_arguments
 
@@ -246,12 +249,14 @@ def test_same_index_state_update_keeps_vector_loads_and_stores() -> None:
         _iter_name(loop) == "cutlass.range_constexpr" for loop in _kernel_loops(code)
     )
     # One 16-byte packet per lane for the state tile and one for ``v``; the
-    # state tensor is read exactly once (the packet) and written exactly once
-    # (the flush) per lane -- no scalar re-load of the stored fragment.
+    # state tensor is read exactly once (the packet) and the new state written
+    # exactly once (the flush) per lane -- no scalar re-load of the stored
+    # fragment.
     assert code.count("cute.arch.load(") == 2
     assert code.count("ir.VectorType.get([4], cutlass.Uint32.mlir_type)") == 2
-    assert code.count("state.iterator") == 2
-    assert code.count("_cute_store_u32_vec(state.iterator") == 1
+    assert code.count("(state.iterator") == 1
+    assert code.count("(new_state.iterator") == 1
+    assert code.count("_cute_store_u32_vec(new_state.iterator") == 1
     assert code.count("_cute_store_u32_vec(out.iterator") == 1
     # Accumulate nest: all loads, no stores.  Consume nest: the state flush.
     accumulate, consume = _owner_loops(code)
@@ -260,7 +265,7 @@ def test_same_index_state_update_keeps_vector_loads_and_stores() -> None:
     assert accumulate_source.count("cute.arch.load(") == 2
     assert ".load()" in accumulate_source
     assert "_cute_store" not in accumulate_source
-    assert "_cute_store_u32_vec(state.iterator" in consume_source
+    assert "_cute_store_u32_vec(new_state.iterator" in consume_source
     assert ".load(" not in consume_source
     # The vectorized tile axis owns thread_idx[0]; the reduction sits above it.
     assert (
@@ -329,10 +334,13 @@ def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> N
     # cannot schedule (a structural rejection ahead of its aliasing proof); the
     # rolled nesting the kernel is regenerated with is then rejected by the
     # aliasing gate, as the loads of one lane may not move above another
-    # lane's state store.  Each of the three stages names its reason.
+    # lane's state store.  Each of the three stages names its reason.  The
+    # example's step writes a new state tensor, which no input can alias, so
+    # this test runs the in-place form of the same step.
     state = torch.empty((BH, D, DV), dtype=torch.float32)
     q, k, v, _state, alpha = _arguments(state)
-    bound, _arguments_alive = _bind((state[:, :, 0], k, v, state, alpha))
+    arguments = (state[:, :, 0], k, v, state, alpha)
+    bound = _cpu_bind(recurrent_step_in_place, arguments)
     with (
         caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.memory_ops"),
         caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),

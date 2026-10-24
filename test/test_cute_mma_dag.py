@@ -7641,8 +7641,59 @@ def test_anchored_wy_seeds_the_neumann_chain_from_the_loaded_gram() -> None:
     assert f"{RT}.mma_" not in seed
 
 
-def _se_block_module() -> object:
-    return importlib.import_module("examples.se_block")
+def _tf32_se_block_bwd_dx(
+    grad_out: torch.Tensor, x: torch.Tensor, w: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """examples/se_block.py's ``se_block_bwd_dx`` before the example moved its
+    matmul operands to the input dtype: an fp32 (tf32) dot whose A operand is
+    the derived chain ``2 * g * x * s * (1 - s)`` over widened half tiles and
+    whose B is the widened transposed w tile, with the half-typed
+    ``acc += 2.0 * grad_out * s`` seeding the carry.  The subject of the tf32
+    derived-chain tests here, in the tcgen05 files and on the GPU."""
+    m, n = x.size()
+    grad_x = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc += 2.0 * grad_out[tile_m, tile_n] * s[tile_m, tile_n]
+        for tile_k in hl.tile(n):
+            grad_to_w = (
+                2.0
+                * grad_out[tile_m, tile_k].to(torch.float32)
+                * x[tile_m, tile_k].to(torch.float32)
+                * s[tile_m, tile_k].to(torch.float32)
+                * (1.0 - s[tile_m, tile_k].to(torch.float32))
+            )
+            acc += grad_to_w @ w[tile_n, tile_k].to(torch.float32).T
+        grad_x[tile_m, tile_n] = acc.to(x.dtype)
+    return grad_x
+
+
+def _tf32_se_block_bwd_dw(
+    grad_out: torch.Tensor, x: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """``se_block_bwd_dw`` of the same tf32 form: the widened transposed half
+    tile of x as A, the derived chain as B."""
+    m, n = x.size()
+    grad_w = torch.zeros([n, n], dtype=torch.float32, device=x.device)
+    for tile_n1, tile_n2 in hl.tile([n, n]):
+        acc_w = hl.zeros([tile_n1, tile_n2], dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            grad_to_w = (
+                2.0
+                * grad_out[tile_m, tile_n2].to(torch.float32)
+                * x[tile_m, tile_n2].to(torch.float32)
+                * s[tile_m, tile_n2].to(torch.float32)
+                * (1.0 - s[tile_m, tile_n2].to(torch.float32))
+            )
+            acc_w += x[tile_m, tile_n1].to(torch.float32).T @ grad_to_w
+        grad_w[tile_n1, tile_n2] = acc_w.to(x.dtype)
+    return grad_w
+
+
+TF32_SE_BLOCK: dict[str, Callable[..., torch.Tensor]] = {
+    "se_block_bwd_dx": _tf32_se_block_bwd_dx,
+    "se_block_bwd_dw": _tf32_se_block_bwd_dw,
+}
 
 
 def _bind_se_block(name: str, *, precision: str | None = None) -> BoundKernel:
@@ -7652,7 +7703,7 @@ def _bind_se_block(name: str, *, precision: str | None = None) -> BoundKernel:
     w = torch.empty((n, n), dtype=f16, device=CPU_DEVICE)
     args: tuple[object, ...] = (x, x, w, x) if name == "se_block_bwd_dx" else (x, x, x)
     settings = {} if precision is None else {"dot_precision": precision}
-    fn = getattr(_se_block_module(), name).fn
+    fn = TF32_SE_BLOCK[name]
     return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # type: ignore[arg-type]
 
 
@@ -8144,7 +8195,7 @@ def _bind_half_chain() -> BoundKernel:
 def _accumulating_addmm(
     grad_out: torch.Tensor, x: torch.Tensor, d: torch.Tensor, c: torch.Tensor
 ) -> torch.Tensor:
-    """squeeze_and_excitation_net's ``bwd_db`` body: ``acc = torch.addmm(acc,
+    """the pre-split squeeze_and_excitation_net ``bwd_db`` body (grad_d recomputed per K tile): ``acc = torch.addmm(acc,
     c[tile_m, tile_k].T, grad_d)`` -- a half ``addmm`` into an fp32
     accumulator (the ``hl.dot(a, b, acc=acc)`` contract), its B operand the
     half chain ``grad_out * x * d * (1 - d)``, its A operand a transposed

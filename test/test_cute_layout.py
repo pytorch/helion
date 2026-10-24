@@ -1064,8 +1064,9 @@ def test_unit_tile_beside_a_sliced_dim_matches_reference(correction: bool) -> No
     code = bound.to_code(config)
     assert "layout_change_smem" not in code
     compiled = bound.compile_config(config)
-    out = compiled(*args)
+    out, new_state = compiled(*args)
     torch.cuda.synchronize()
     expected_out, expected_state = _recurrent_reference(q, k, v, initial, alpha, beta)
-    torch.testing.assert_close(state, expected_state, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(new_state, expected_state, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(out.float(), expected_out, rtol=2e-2, atol=2e-1)
+    assert torch.equal(state, initial)
