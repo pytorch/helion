@@ -328,6 +328,117 @@ def _synthesized_fanout_carriers(
     return carriers
 
 
+def _synthesized_pair_fanout_carriers(
+    spec: ConfigSpec, state: CuteTcgen05Config
+) -> list[Config]:
+    """CTA-pair full-tile carriers for a proved fanout, from the geometry.
+
+    The fanout admits the ``tcgen05_cluster_m=2`` pair at one tile shape only
+    (the 256x128 16-bit tile, two C stages). Where the pair is on the search
+    surface and the output is whole pair tiles, build that carrier for every
+    K tile the search admits (128, then 64), each with the deepest AB ring
+    the whole static arena -- both outputs' C rings -- fits; the pair halves
+    the B operand's L2 feed per CTA, so its ring holds more K steps than the
+    one-CTA 128x128 carrier's in the same SMEM. Each carrier passes the same
+    schedule, fanout-admission and strict-normalization checks as the
+    seed-derived ones. Empty where the pair is not searched or does not
+    divide the output.
+    """
+    extents = state.matmul_compile_time_static_extents
+    fragments = state._matmul_block_fragments()
+    if (
+        state.cluster_m2_search_constraints is None
+        or extents is None
+        or fragments is None
+        or any(value is None or value <= 0 for value in extents)
+    ):
+        return []
+    m, n, k = extents
+    assert m is not None and n is not None and k is not None
+    bm_fragment, bn_fragment, bk_fragment = fragments
+    bm, bn = 256, 128
+    if (
+        m % bm
+        or n % bn
+        or not bm_fragment.low <= bm <= bm_fragment.high
+        or not bn_fragment.low <= bn <= bn_fragment.high
+    ):
+        return []
+    carriers: list[Config] = []
+    for bk in (128, 64):
+        if k % bk or not bk_fragment.low <= bk <= bk_fragment.high:
+            continue
+        blocks = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        if blocks is None:
+            continue
+        ceiling = min(
+            k // bk, state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=2)
+        )
+        ab_stages = next(
+            (
+                depth
+                for depth in range(ceiling, 0, -1)
+                if state.default_layout_smem_fits(
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    cluster_m=2,
+                    ab_stages=depth,
+                    c_stages=2,
+                    stage_rows=False,
+                )
+            ),
+            None,
+        )
+        if ab_stages is None:
+            continue
+        candidate = Config(
+            block_sizes=blocks,
+            pid_type="persistent_interleaved",
+            tcgen05_cta_group="auto",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=ab_stages,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_strategy="role_local_monolithic",
+            tcgen05_layout_strategy="default",
+        )
+        try:
+            spec.normalize(candidate)
+        except InvalidConfig:
+            continue
+        if not schedule_supported(candidate.config):
+            continue
+        trial = Config.from_dict(
+            deepcopy(candidate.config) | {FANOUT_CONFIG_KEY: "shared"}
+        )
+        if not state.epilogue_fanout_config_supported(trial.config):
+            continue
+        try:
+            spec.normalize(trial)
+        except InvalidConfig:
+            continue
+        trial.config.pop(FANOUT_CONFIG_KEY)
+        if trial not in carriers:
+            carriers.append(trial)
+    return carriers
+
+
+def _carrier_geometry(config: Config, k_index: int | None) -> tuple[object, ...]:
+    """The output tile a carrier walks: its M/N blocks and CTA cluster."""
+    blocks = tuple(
+        value for index, value in enumerate(config.block_sizes) if index != k_index
+    )
+    return (
+        blocks,
+        config.config.get("tcgen05_cluster_m", 1),
+        config.config.get("tcgen05_cluster_n", 1),
+    )
+
+
 def register_aux_fragment_hoist_coverage(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> None:
@@ -359,6 +470,11 @@ def register_aux_fragment_hoist_coverage(
         ]
         if not groups:
             return
+        # The CTA-pair carrier first: the fanout group itself keeps the
+        # one-CTA carriers (its witness budget holds one geometry), so the
+        # pair's full recipe -- fanout, pre-wait placement, hoist -- enters
+        # the search through this group where the pair divides the output.
+        sources.extend(_synthesized_pair_fanout_carriers(spec, state))
         for witness in groups[0].witnesses:
             carrier = witness.carrier
             if carrier not in sources:
@@ -372,7 +488,7 @@ def register_aux_fragment_hoist_coverage(
                 continue
             if schedule_supported(candidate.config) and candidate not in sources:
                 sources.append(candidate)
-    carriers: list[Config] = []
+    admitted: list[Config] = []
     for source in sources:
         values: dict[str, object] = {
             TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: TCGEN05_AUX_LOAD_PLACEMENTS[1],
@@ -388,10 +504,29 @@ def register_aux_fragment_hoist_coverage(
         except InvalidConfig:
             continue
         trial.config.pop(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY)
-        if trial not in carriers:
-            carriers.append(trial)
+        if trial not in admitted:
+            admitted.append(trial)
+    # Two carriers (the group's witness budget): one per output tile geometry
+    # (M/N blocks and cluster; the K tile and ring depth are not a geometry)
+    # first, in source order, so a CTA-pair carrier and the one-CTA carrier
+    # both witness the hoist; a lone geometry keeps its C-ring twins as before.
+    carriers: list[Config] = []
+    seen_geometries: set[tuple[object, ...]] = set()
+    indices = state._matmul_block_indices()
+    k_index = indices[2] if indices is not None else None
+    for trial in admitted:
+        geometry = _carrier_geometry(trial, k_index)
+        if geometry in seen_geometries:
+            continue
+        seen_geometries.add(geometry)
+        carriers.append(trial)
         if len(carriers) == 2:
             break
+    for trial in admitted:
+        if len(carriers) == 2:
+            break
+        if trial not in carriers:
+            carriers.append(trial)
     if not carriers:
         return
     spec.register_compiler_coverage_group(

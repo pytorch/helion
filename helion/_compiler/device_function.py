@@ -2169,6 +2169,17 @@ class DeviceFunction:
                 result.append(
                     statement_from_string(f"{self.name}._helion_cute_use_pdl = True")
                 )
+        sass_checks = self.cute_state.sass_checks
+        if sass_checks:
+            # The CuTe launcher verifies the compiled kernel's SASS against
+            # these checks before its first launch
+            # (``helion.runtime.cute.sass_check``).
+            with SyntheticLocation():
+                result.append(
+                    statement_from_string(
+                        f"{self.name}._helion_cute_sass_checks = {tuple(sass_checks)!r}"
+                    )
+                )
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
         if (
             CompileEnvironment.current().backend.name == "cute"

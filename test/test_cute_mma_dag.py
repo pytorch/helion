@@ -13,7 +13,9 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import itertools
 import os
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 from typing import cast
@@ -31,6 +33,7 @@ from test.test_cute_tcgen05_fixed_chain import _cpu_only  # noqa: F401
 import helion
 from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
 from helion._compiler.cute import cute_mma_dag as dag
+from helion._compiler.cute import cutedsl_compat
 from helion._compiler.cute.cute_mma_dag_codegen import _float_literal
 from helion._compiler.cute.cute_mma_dag_codegen import _Layout
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
@@ -51,6 +54,7 @@ from helion.runtime.cute.launcher import _MmaDagAliasGuard
 pytest.importorskip("cuda.bindings.driver")
 pytest.importorskip("cutlass")
 
+from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
 
 if TYPE_CHECKING:
@@ -339,6 +343,8 @@ def _tensors(
         "g_last": torch.empty((bh, n, d), dtype=f32, device=CPU_DEVICE),
         "g_last_s": torch.empty((bh, n), dtype=f32, device=CPU_DEVICE),
         "gc": torch.empty((bh, n, c), dtype=f32, device=CPU_DEVICE),
+        # The per-channel decay cumsum of the anchored (full_gla) mode.
+        "gc4": torch.empty((bh, n, c, d), dtype=f32, device=CPU_DEVICE),
         "h0": torch.empty((bh, d, dv), dtype=bf16, device=CPU_DEVICE),
         "dh_init": torch.empty((bh, d, dv), dtype=f32, device=CPU_DEVICE),
     }
@@ -382,6 +388,10 @@ def _bind_fwd(
         args = (t["k"], t["v"], None, h0, None, False, False, False, has_h0)
     elif mode == "diag":
         args = (t["k"], t["v"], t["g_last"], h0, None, True, False, False, has_h0)
+    elif mode == "anchored":
+        # full_gla's forward state kernel: the decay rides the key per
+        # channel; ``gc_last`` is the last row of the staged ``gc`` tile.
+        args = (t["k"], t["v"], t["g_last"], h0, t["gc4"], True, False, True, has_h0)
     else:
         args = (t["k"], t["v"], t["g_last_s"], h0, t["gc"], True, True, False, has_h0)
     return _bind("chunk_fwd_h_diag_fused", args, dag=dag)
@@ -537,6 +547,61 @@ def _bind_dstate(gated: bool = False, **shape: int) -> BoundKernel:
     return _bind(
         "chunk_bwd_dstate_delta_helion",
         (t["k"], t["k"], t["w"], t["u"], t["h0"], g_cs, dl, gated, 0.125),
+    )
+
+
+def _varlen_tables(
+    chunks: tuple[int, ...], c: int = 64
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """The varlen kernels' chunk tables for sequences of ``chunks`` chunks
+    each, the last chunk of every sequence one row short: ``(chunk_offsets
+    [N + 1], token_base [NT], valid_len [NT], NT, T_total)``."""
+    offsets = [0, *itertools.accumulate(chunks)]
+    lens = [count * c - 1 for count in chunks]
+    cu = [0, *itertools.accumulate(lens)]
+    token_base = [cu[n] + i * c for n, count in enumerate(chunks) for i in range(count)]
+    valid_len = [
+        min(lens[n] - i * c, c) for n, count in enumerate(chunks) for i in range(count)
+    ]
+    i64 = torch.int64
+    return (
+        torch.tensor(offsets, dtype=i64, device=CPU_DEVICE),
+        torch.tensor(token_base, dtype=i64, device=CPU_DEVICE),
+        torch.tensor(valid_len, dtype=i64, device=CPU_DEVICE),
+        offsets[-1],
+        cu[-1],
+    )
+
+
+def _bind_fwd_h_delta_varlen(
+    *,
+    h: int = 2,
+    chunks: tuple[int, ...] = (4, 1, 3),
+    c: int = 64,
+    d: int = 128,
+    dv: int = 64,
+) -> BoundKernel:
+    """The varlen state pass: one program per (head, sequence), the chunk
+    walk's bounds read from ``chunk_offsets``."""
+    bf16, f32 = torch.bfloat16, torch.float32
+    chunk_offsets, _base, _valid, nt, _t = _varlen_tables(chunks, c)
+    n = len(chunks)
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    return _bind(
+        "chunk_fwd_h_delta_varlen_helion",
+        (
+            e(h * nt, c, d),
+            e(h * nt, c, d),
+            e(h * nt, c, dv),
+            e(h * n, d, dv, dtype=f32),
+            e(h * nt, d, dtype=f32),
+            chunk_offsets,
+            nt,
+            h,
+        ),
     )
 
 
@@ -1446,6 +1511,52 @@ def test_delta_state_kernels_are_admitted_when_d_equals_c() -> None:
     assert loop.count(f"{RT}.ldmatrix_x4(") == 16
     assert loop.count(f"{RT}.ldmatrix_x4_trans(") == 16
     assert loop.count(f"{RT}.mma_bf16(") == 16 + 16
+
+
+def test_anchored_fwd_h_reads_the_decay_row_from_the_ring_slot() -> None:
+    # full_gla's forward state kernel (``diag_anchored``): ``gc_last =
+    # gc[idx, i_t, C - 1, tile_d]`` is row 63 of the ``gc[idx, i_t, :,
+    # tile_d]`` tile the ring stages for the key's decay chain, so the carry
+    # rescale and the chain read it from the slot (``lds_f32`` at the
+    # swizzled row address) behind the iteration barrier instead of
+    # re-fetching the row from global memory on the chain -- the rescale is
+    # no longer hoisted to the iteration top.  The key's ``.to(bf16)`` under
+    # its transpose is folded into the exchange's pack: one rounding, no
+    # scalar cast widened back.  Both derived routes; the same bytes.
+    bound = _bind_fwd("anchored", has_h0=True, d=128, dv=128)
+    for derived, row_reads in (("exchange", 2 + 4), ("pass", 2 + 8)):
+        source = _source(
+            bound, _config(32, 128, warps=8, stages=4, cute_mma_dag_derived=derived)
+        )
+        assert SIMT_FALLBACK not in source
+        loop = _loop_and_after(_kernel_body(source))
+        reads = re.findall(
+            rf"{RT}\.lds_f32\((md_d\d+) \+ md_stage \* 8192 \+ 63 \* 128 \+ ", loop
+        )
+        assert len(reads) == row_reads and len(set(reads)) == 1, (derived, reads)
+        assert f"{RT}.ldg_f32(" not in loop and f"{RT}.ldg_v2_f32(" not in loop
+        barrier = loop.index("cute.arch.barrier()")
+        assert loop.index(f"{RT}.lds_f32(") > barrier
+        rescale = re.search(r"\n\s+md_c0_0_0_0 = md_v", loop)
+        assert rescale is not None and rescale.start() > barrier
+        assert loop.count("cute.arch.barrier()") == 2
+        # (``pack_bf16x2(cutlass.Float32(<fp32 register>), ...)``: the pack
+        # rounds the fp32 products itself; the loaded bf16 halves are
+        # re-typed exactly, their fp32 twins feed the chain.)
+        assert not _bf16_casts_of_computed_values(loop)
+        assert loop.count(f"{RT}.mma_bf16(") == 16
+
+
+def test_decay_rows_without_a_staged_tile_keep_their_global_loads() -> None:
+    # ``diag`` mode: ``g_last[idx, i_t, tile_d]`` has no tile of ``g_last``
+    # in the ring, so the rescale's row stays a global load (fail closed: an
+    # alias needs the same tensor staged) -- the register prefetch's, loaded
+    # one iteration ahead into a register the loop refills.
+    loop = _loop_and_after(
+        _kernel_body(_source(_bind_fwd("diag"), _config(64, 64, warps=4, stages=2)))
+    )
+    assert f"{RT}.ldg_f32(" in loop and f"{RT}.lds_f32(" not in loop
+    assert re.search(rf"^ *md_px\w* = {RT}\.ldg_f32\(", loop, re.MULTILINE)
 
 
 def test_fwd_h_delta_feeds_the_carry_and_the_derived_value_from_registers() -> None:
@@ -4414,6 +4525,13 @@ def _scalar_global_loads(body: str) -> list[tuple[str, str, str]]:
     )
 
 
+def _bf16_casts_of_computed_values(body: str) -> list[str]:
+    """``cutlass.BFloat16(x)`` casts of anything but an unpacked 16-bit tile
+    half (``md_lo_N`` / ``md_hi_N``: the exact re-typing of a loaded element
+    whose fp32 twin the chain reads, ``_Emitter.retyped``)."""
+    return re.findall(r"cutlass\.BFloat16\((?!md_(?:lo|hi)(?:_\d+)?\))[^)]*\)", body)
+
+
 def test_loop_invariant_side_loads_go_out_ahead_of_the_loop() -> None:
     # wy_dL with the pipeline's bf16 beta: the betaV convert pass reads beta
     # at the thread's packet rows (four rounds) and the dv_out epilogue at
@@ -5266,8 +5384,9 @@ def test_region_programs_seed_the_far_corner_of_the_tile_warp_stage_box() -> Non
         for sizes, warps, stages in corners
     ]
     # (A 128-deep K tile at 64 rows is a partial trip for the odd row tiles:
-    # not a tcgen05 config, so the 64-row corner keeps K = 64.)
-    assert forms == [(64, 64, 64, 8, 1), (128, 64, 128, 8, 1)]
+    # not a tcgen05 config, so the 64-row corner keeps K = 64.  The corners
+    # follow their row tiles' ranked order.)
+    assert sorted(forms) == [(64, 64, 64, 8, 1), (128, 64, 128, 8, 1)]
     seeds = [
         (
             tuple(c.config["block_sizes"]),
@@ -5277,10 +5396,13 @@ def test_region_programs_seed_the_far_corner_of_the_tile_warp_stage_box() -> Non
         for c in bound.config_spec.compiler_seed_configs
         if c.config.get("cute_mma_dag") == "tcgen05"
     ]
-    assert seeds[: len(top)] == [
-        (tuple(sizes[i] for i in range(3)), warps, stages)
+    # (The ranked seeds in their order; the top seed's split / lookahead /
+    # persistent twins sit between them.)
+    remaining = iter(seeds)
+    assert all(
+        (tuple(sizes[i] for i in range(3)), warps, stages) in remaining
         for sizes, warps, stages in top
-    ]
+    )
     assert ((64, 64, 64), 8, 1) in seeds and ((128, 64, 128), 8, 1) in seeds
     # Outside the region programs the seed list is the ranked one.
     fwd_o = _bind_fwd_o(True, bhn=2048, d=128, dv=128).config_spec
@@ -5301,14 +5423,22 @@ def test_the_top_warp_seed_comes_again_with_the_one_cta_occupancy_hint() -> None
     seeds = [c.config for c in bound.config_spec.compiler_seed_configs]
     top = next(i for i, c in enumerate(seeds) if c.get("cute_mma_dag") == "warp")
     assert seeds[top].get("cute_min_blocks_per_mp", 0) == 0
-    twins = seeds[top + 1 : top + 3]
+    # The top warp seed's twins (``_twin_knobs``: the aux ring, the L2
+    # hint where the hinted packets can be verified, the occupancy hint)
+    # follow it, each the seed with that one knob flipped.
+    twins = []
+    while top + 1 + len(twins) < len(seeds) and _twin_knobs(
+        seeds[top + 1 + len(twins)]
+    ):
+        twins.append(seeds[top + 1 + len(twins)])
     hinted = [c for c in twins if c.get("cute_min_blocks_per_mp") == 1]
     assert len(hinted) == 1
     assert {k: v for k, v in hinted[0].items() if k != "cute_min_blocks_per_mp"} == {
         k: v for k, v in seeds[top].items() if k != "cute_min_blocks_per_mp"
     }
-    # The aux-ring twin of chunk_scan (side loads of the K loop) is the other.
+    # The aux-ring twin of chunk_scan (side loads of the K loop) is another.
     assert [c.get("cute_mma_dag_aux") for c in twins].count("ring") == 1
+    assert len({frozenset(_twin_knobs(c)) for c in twins}) == len(twins)
     # The hint is a searched knob of these kernels (the twin normalizes
     # unchanged).
     with bound.env:
@@ -6041,6 +6171,38 @@ def _seed_knobs(config: helion.Config) -> tuple[list[int], str, int, int, str]:
     )
 
 
+def _seed_knobs_of(c: dict[str, object]) -> tuple[list[int], str, int, int, str]:
+    return _seed_knobs(helion.Config.from_dict(c))
+
+
+def _twin_knobs(c: dict[str, object]) -> dict[str, object]:
+    """The knobs by which a seed is one of the first warp seed's twins: the
+    L2-hinted staged slots, the aux ring, the one-CTA occupancy hint."""
+    twin: dict[str, object] = {}
+    if c.get("load_eviction_policies") and any(
+        cast("list[str]", c["load_eviction_policies"])
+    ):
+        twin["load_eviction_policies"] = tuple(
+            cast("list[str]", c["load_eviction_policies"])
+        )
+    if c.get("cute_mma_dag_aux") == "ring":
+        twin["cute_mma_dag_aux"] = "ring"
+    if c.get("cute_min_blocks_per_mp") == 1:
+        twin["cute_min_blocks_per_mp"] = 1
+    return twin
+
+
+def _unhinted_seed_knobs(
+    spec: ConfigSpec,
+) -> list[tuple[list[int], str, int, int, str]]:
+    """The seeds' knobs without the first warp seed's twins (the L2-hinted
+    one -- see ``test_the_first_warp_seed_has_an_l2_evict_last_twin`` --,
+    the aux-ring and the occupancy-hint twins)."""
+    return [
+        _seed_knobs(c) for c in spec.compiler_seed_configs if not _twin_knobs(c.config)
+    ]
+
+
 def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     # The cold autotune of the gated delta rule at s1 (seed 31337) left the
     # ranked ladder for: dqkw at three stages, wy_dL at the full kk tile
@@ -6049,22 +6211,36 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     # (the first seed stays), each measured against the default; see
     # ``mma_dag_seed_variants``.
     bf16 = torch.bfloat16
+
     # Gated dqkw's dattn is a hoisted root exchange: the streaming class
     # leads with the four tensor-memory seeds, then the warp ladder.
+    # (The tensor-memory seeds carry their persistent twins at a CTA-rich
+    # grid, so the warp ladder starts where the first warp seed is.)
+    def warp_start(seeds: list[tuple[list[int], str, int, int, str]]) -> int:
+        start = next(i for i, s in enumerate(seeds) if s[1] == "warp")
+        assert start >= 4
+        assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:start])
+        return start
+
     dqkw = _bind_dqkw(True, bhn=2048, d=128, dv=128).config_spec
-    seeds = [_seed_knobs(c) for c in dqkw.compiler_seed_configs]
-    # (The four ranked tensor-memory seeds, then the corner seeds of the
-    # region programs -- see ``tcgen05_corner_seeds`` -- then the ladder.)
-    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
-    assert first >= 4 and all(
-        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
-    )
-    seeds = seeds[first:]
+    seeds = _unhinted_seed_knobs(dqkw)
+    w = warp_start(seeds)
     top = ([64, 32, 64, 64, 64], "warp", 4, 2, "auto")
-    assert seeds[0] == top
-    # (The top warp seed's twins -- aux ring, occupancy hint -- sit between
-    # it and the ladder.)
-    assert seeds[9:14] == [
+    assert seeds[w] == top
+    # The top warp seed's twins sit right behind it in the full list, each
+    # the same tile with one knob flipped (the L2 hint, the aux ring, the
+    # occupancy hint: see ``_twin_knobs``), the L2-hinted one among them.
+    full = [c.config for c in dqkw.compiler_seed_configs]
+    at = full.index(
+        next(c for c in full if _seed_knobs_of(c) == top and not _twin_knobs(c))
+    )
+    twins = []
+    while at + 1 + len(twins) < len(full) and _twin_knobs(full[at + 1 + len(twins)]):
+        twins.append(full[at + 1 + len(twins)])
+    assert twins and all(_seed_knobs_of(c) == top for c in twins)
+    assert sum(bool(c.get("load_eviction_policies")) for c in twins) == 1
+    assert len({frozenset(_twin_knobs(c)) for c in twins}) == len(twins)
+    assert seeds[w + 8 : w + 13] == [
         ([64, 32, 64, 64, 64], "warp", 4, 3, "auto"),
         ([64, 32, 64, 64, 64], "warp", 4, 3, "smem"),
         ([64, 32, 64, 64, 64], "warp", 4, 2, "smem"),
@@ -6074,18 +6250,14 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
         ([128, 32, 64, 64, 64], "warp", 4, 2, "auto"),
         ([128, 32, 64, 64, 64], "warp", 4, 2, "smem"),
     ]
-    assert seeds[14:] == []
+    assert seeds[w + 13 :] == []
     # The flat streaming programs (wy_dL, dk) lead with the four
     # tensor-memory seeds; the warp ladder and its neighbours follow.
     wy_dl = _bind_wy_dl(True, bf16, bf16, bhn=2048, d=128, dv=128).config_spec
-    seeds = [_seed_knobs(c) for c in wy_dl.compiler_seed_configs]
-    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
-    assert first >= 4 and all(
-        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
-    )
-    seeds = seeds[first:]
-    assert seeds[0] == ([64, 64, 64], "warp", 4, 2, "auto")
-    assert seeds[9:14] == [
+    seeds = _unhinted_seed_knobs(wy_dl)
+    w = warp_start(seeds)
+    assert seeds[w] == ([64, 64, 64], "warp", 4, 2, "auto")
+    assert seeds[w + 8 : w + 13] == [
         ([64, 64, 64], "warp", 4, 3, "auto"),
         ([64, 64, 64], "warp", 4, 3, "smem"),
         ([64, 64, 64], "warp", 4, 2, "smem"),
@@ -6095,14 +6267,10 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
         ([64, 64, 128], "warp", 4, 2, "smem"),
     ]
     dk = _bind_dk(bhn=2048, d=128, dv=128).config_spec
-    seeds = [_seed_knobs(c) for c in dk.compiler_seed_configs]
-    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
-    assert first >= 4 and all(
-        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
-    )
-    seeds = seeds[first:]
-    assert seeds[0] == ([64], "warp", 4, 2, "auto")
-    assert seeds[9:11] == [
+    seeds = _unhinted_seed_knobs(dk)
+    w = warp_start(seeds)
+    assert seeds[w] == ([64], "warp", 4, 2, "auto")
+    assert seeds[w + 8 : w + 10] == [
         ([64], "warp", 4, 1, "auto"),
         ([32], "warp", 2, 1, "auto"),
     ]
@@ -6139,13 +6307,13 @@ def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
     variants = dag.mma_dag_seed_variants(facts, ladder)
     assert variants
     warp = [c for c in spec.compiler_seed_configs if c.config["cute_mma_dag"] == "warp"]
-    # The top warp seed's occupancy-hint twin sits behind it; the ladder and
-    # its measured neighbours are the rest.
-    hinted = [c for c in warp if c.config.get("cute_min_blocks_per_mp") == 1]
-    assert len(hinted) == 1
-    warp = [c for c in warp if c.config.get("cute_min_blocks_per_mp") != 1]
-    assert len(warp) == len(ladder) + len(variants)
-    for config in [*warp[len(ladder) :], *hinted]:
+    # The top warp seed's twins (L2 hint, aux ring, occupancy hint) sit
+    # behind it; the ladder and its measured neighbours are the rest.
+    twins = [c for c in warp if _twin_knobs(c.config)]
+    plain = [c for c in warp if not _twin_knobs(c.config)]
+    assert len([c for c in twins if c.config.get("load_eviction_policies")]) == 1
+    assert len(plain) == len(ladder) + len(variants)
+    for config in [*plain[len(ladder) :], *twins]:
         with bound.env:
             normalized = spec.normalized_config(config)
         assert normalized.config["cute_mma_dag"] == "warp"
@@ -6543,11 +6711,12 @@ def test_loop_less_seeds_and_normalization_pin_the_inert_stage_depth() -> None:
     assert {c.config["cute_mma_dag_stages"] for c in seeds} == {
         dag.MMA_DAG_DEFAULT_STAGES
     }
-    # One seed per tile (the top seed's occupancy-hint twin repeats its tile
-    # with ``cute_min_blocks_per_mp``).
-    plain = [c for c in seeds if c.config.get("cute_min_blocks_per_mp", 0) != 1]
+    # One seed per tile (the first warp seed's twins -- the L2-hinted, the
+    # aux-ring and the occupancy-hint twin -- repeat its tile).
+    plain = [c for c in seeds if not _twin_knobs(c.config)]
     tiles = [cast("list[int]", c.config["block_sizes"]) for c in plain]
     assert len(tiles) == len({tuple(t) for t in tiles})
+    assert len(seeds) - len(plain) >= 1
     with bound.env:
         normalized = spec.normalized_config(_config(1, 64, warps=4, stages=2))
     assert normalized.config["cute_mma_dag_stages"] == dag.MMA_DAG_DEFAULT_STAGES
@@ -7059,6 +7228,370 @@ def _row_scaled_operand(
         lhs = (acc * rowsum[:, :, None]).to(torch.bfloat16)
         out[tile_b, :, :] = hl.dot(lhs, c[tile_b, :, :])
     return out
+
+
+# The config whose kernel died with CUDA_ERROR_ILLEGAL_INSTRUCTION in the
+# kda forward's cold autotune (chunk_fwd_wy_delta_helion, diag_anchored, the
+# (8, 8, 1024, 64, 64) shape): a warp mma_dag with ``load_eviction_policies``
+# naming "l2_last" at the staged k and v slots, whose cp.async packets the
+# emitter once hinted ``.L2::cache_hint`` -- a form the CuTe DSL's nvJitLink
+# miscompiles (see ``emit_issue_tile``).
+_WY_FAULT_CONFIG: dict[str, object] = {
+    "block_sizes": [8, 8],
+    "cute_collective_compute": "warp",
+    "cute_collective_copy": "scalar",
+    "cute_collective_mma": False,
+    "cute_collective_native_seeded": False,
+    "cute_collective_tmem_a": False,
+    "cute_collective_tmem_seed": False,
+    "cute_lane_layouts": ["blocked"] * 5,
+    "cute_min_blocks_per_mp": 0,
+    "cute_mma_dag": "warp",
+    "cute_mma_dag_derived": "exchange",
+    "cute_mma_dag_epilogue": "row",
+    "cute_mma_dag_exchange": "auto",
+    "cute_mma_dag_loads": "tma",
+    "cute_mma_dag_lookahead": "off",
+    "cute_mma_dag_pass_warps": "off",
+    "cute_mma_dag_persistent": 0,
+    "cute_mma_dag_stages": 8,
+    "cute_mma_dag_store": "staged",
+    "cute_mma_dag_warps": 4,
+    "cute_pdl": True,
+    "cute_reduction_reloads": ["auto"],
+    "cute_register_chain": False,
+    "cute_store_policy": "default",
+    "cute_vector_widths": [1] * 5,
+    "load_eviction_policies": ["", "", "l2_last", "", "", "l2_last"],
+    "num_threads": [0, 0, 0],
+}
+
+
+def test_the_autotune_fault_config_renders_hinted_packets_behind_a_sass_check() -> None:
+    # The config whose kernel died in the kda autotune renders its staged k
+    # and v tiles' packets hinted ``L2::cache_hint`` again (the normalizer
+    # keeps the two staged slots at their canonical value and pins the
+    # rest), and the module declares the SASS check the launcher runs
+    # before the kernel's first launch: the DSL's assembler, not the
+    # render, decides whether a hinted LDGSTS is encoded with its shared
+    # address in a uniform register beside the descriptor
+    # (``sass_check.hinted_cp_async_misencoding``), so a misencoded kernel
+    # is refused instead of launched.  The blank policy list renders plain
+    # packets and no check, byte for byte as before; the L1-only priorities
+    # leave the L1-bypassing packets plain too.
+    bound = _bind_wy_anchored(bhn=1024, d=64, dv=64)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    # k (2), the derived value's ring load (3) and v (5) are the staged tiles.
+    assert facts is not None and facts.staged_slots == (2, 3, 5)
+    config = helion.Config.from_dict(_WY_FAULT_CONFIG)
+    with bound.env:
+        normalized = spec.normalized_config(config)
+    assert normalized.config["load_eviction_policies"] == [
+        "",
+        "",
+        "l2_last",
+        "",
+        "",
+        "l2_last",
+    ]
+    hinted = bound.to_code(normalized)
+    body = _kernel_body(hinted)
+    assert SIMT_FALLBACK not in body
+    assert f"{RT}.mma_tf32(" in body
+    # k's and v's packets are hinted (a hinted tile keeps its packets under
+    # the config's ``tma`` loads: ``plan_tma``); the derived value's ring
+    # load (slot 3, "" in the config) is the one tile a tensor map fetches
+    # -- hinted at slot 3 too, it keeps hinted packets and nothing rides
+    # the bulk tensor copy.
+    hinted_packets = body.count(f"{RT}.cp_async_16_l2(")
+    plain_packets = body.count(f"{RT}.cp_async_16(")
+    assert hinted_packets and not plain_packets
+    assert "cp_async_bulk_tensor_shared_cta_global" in body
+    assert body.count("md_pol_evict_last = ") == 1
+    every = _kernel_body(
+        _source(
+            bound,
+            helion.Config.from_dict(
+                {
+                    **_WY_FAULT_CONFIG,
+                    "load_eviction_policies": [
+                        "",
+                        "",
+                        "l2_last",
+                        "l2_last",
+                        "",
+                        "l2_last",
+                    ],
+                }
+            ),
+        )
+    )
+    slot3_packets = every.count(f"{RT}.cp_async_16_l2(") - hinted_packets
+    assert slot3_packets > 0
+    assert f"{RT}.cp_async_16(" not in every
+    assert "cp_async_bulk_tensor_shared_cta_global" not in every
+    assert (
+        f"._helion_cute_sass_checks = ({dag.MMA_DAG_HINTED_CP_ASYNC_CHECK!r},)"
+        in hinted
+    )
+    plain = _source(
+        bound,
+        helion.Config.from_dict(
+            {**_WY_FAULT_CONFIG, "load_eviction_policies": [""] * 6}
+        ),
+    )
+    assert "cp_async_16_l2" not in plain
+    assert "md_pol_" not in plain
+    assert "_helion_cute_sass_checks" not in plain
+    # (v's converted tile keeps its packets -- a tensor map fetches no raw
+    # source -- while k's and the derived ring load's tiles ride tensor maps.)
+    assert 0 < _kernel_body(plain).count(f"{RT}.cp_async_16(") < hinted_packets
+    assert "cp_async_bulk_tensor_shared_cta_global" in _kernel_body(plain)
+    # The same hints with the per-thread packets everywhere (``lane``) is
+    # the ``every`` kernel: the normalizer pins the route to ``tma``.
+    with bound.env:
+        lane = spec.normalized_config(
+            helion.Config.from_dict(
+                {
+                    **_WY_FAULT_CONFIG,
+                    "cute_mma_dag_loads": "lane",
+                    "load_eviction_policies": [
+                        "",
+                        "",
+                        "l2_last",
+                        "l2_last",
+                        "",
+                        "l2_last",
+                    ],
+                }
+            )
+        )
+    assert lane.config["cute_mma_dag_loads"] == "tma"
+    assert (
+        _source(
+            bound,
+            helion.Config.from_dict(
+                {**_WY_FAULT_CONFIG, "load_eviction_policies": ["last", "first"] * 3}
+            ),
+        )
+        == plain
+    )
+    # Read as text: the runtime module imports cutlass, absent on CPU rows.
+    runtime = Path(dag.__file__).with_name("_mma_dag_runtime.py").read_text()
+    assert "cp.async.cg.shared.global.L2::cache_hint" in runtime
+    assert "createpolicy.fractional.L2::evict_last" in runtime
+
+
+def test_staged_tiles_carry_the_l2_policy_of_their_slot() -> None:
+    # The decode program's loads in program order take the tunable slots k
+    # (0), q (1), the weights (2), ``tile_n.index`` (3, 5), ks (4), ke (6);
+    # the two operand tiles are the ones cp.async stages.  The L2 policies
+    # of their slots ride the packets as ``L2::cache_hint`` with one
+    # ``createpolicy`` word per policy ahead of them; the L1-only
+    # priorities leave the (L1-bypassing) packets untouched.
+    bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.staged_slots == (0, 1)
+    assert spec.load_eviction_policies.length == 7
+    program = _program(bound)
+    assert [(a.name, a.eviction_slot) for a in program.accesses] == [
+        ("q", 1),
+        ("k", 0),
+        ("w", 2),
+        ("ks", 4),
+        ("ke", 6),
+        ("out", None),
+    ]
+
+    def render(*policies: str) -> str:
+        return _source(
+            bound,
+            _config(1, 64, warps=4, stages=4, load_eviction_policies=list(policies)),
+        )
+
+    plain = render(*[""] * 7)
+    assert render("last", "first", "last", "last", "last", "last", "last") == plain
+    body = _kernel_body(plain)
+    # k's 64x128 tile: eight packets per thread; q's 32x128: four.
+    assert body.count(f"{RT}.cp_async_16(") == 12 and "md_pol_" not in body
+    assert "_helion_cute_sass_checks" not in plain
+    source = render("l2_last", "l1_l2_last", "l2_last", "", "", "", "")
+    hinted = _kernel_body(source)
+    assert hinted.count(f"{RT}.l2_policy_evict_last()") == 1
+    assert hinted.count(f"{RT}.cp_async_16_l2(") == 12
+    assert f"{RT}.cp_async_16(" not in hinted
+    assert hinted.count(", md_pol_evict_last)") == 12
+    assert hinted.index("md_pol_evict_last = ") < hinted.index(f"{RT}.cp_async_16_l2(")
+    assert "._helion_cute_sass_checks = ('hinted_cp_async',)" in source
+    # The weights' side loads keep their plain form whatever their slot says.
+    assert hinted.count(f"{RT}.ldg_f32(") == body.count(f"{RT}.ldg_f32(")
+    first = _kernel_body(render("streaming", "nc_l2_first", "", "", "", "", ""))
+    assert first.count(f"{RT}.l2_policy_evict_first()") == 1
+    assert first.count(", md_pol_evict_first)") == 12
+    mixed = _kernel_body(render("l2_last", "streaming", "", "", "", "", ""))
+    assert mixed.count(", md_pol_evict_last)") == 8
+    assert mixed.count(", md_pol_evict_first)") == 4
+    assert mixed.count("md_pol_") == 2 + 12
+
+
+def test_the_normalizer_keeps_the_staged_slots_canonical_and_pins_the_rest() -> None:
+    # One value per packet form on the staged slots ("l2_last" for the
+    # evict_last hint, "streaming" for evict_first); the side loads' slots,
+    # inert in the mode, pin to identity.  The ordinary lowering (mode off)
+    # keeps every slot as given.
+    bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+    spec = bound.config_spec
+
+    def normalized(**extra: object) -> list[str]:
+        with bound.env:
+            config = spec.normalized_config(
+                helion.Config.from_dict({"block_sizes": [1, 64], **extra})
+            )
+        return cast("list[str]", config.config["load_eviction_policies"])
+
+    warp = {"cute_mma_dag": "warp", "cute_mma_dag_warps": 4}
+    policies = [
+        "l1_l2_last",
+        "nc_l2_first",
+        "l2_last",
+        "last",
+        "streaming",
+        "",
+        "first",
+    ]
+    assert normalized(load_eviction_policies=policies, **warp) == [
+        "l2_last",
+        "streaming",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]
+    assert (
+        normalized(load_eviction_policies=["last", "first", *[""] * 5], **warp)
+        == [""] * 7
+    )
+    assert (
+        normalized(load_eviction_policies=["last"] * 7, cute_mma_dag="off")
+        == ["last"] * 7
+    )
+
+
+def test_hinted_packets_need_a_disassembler() -> None:
+    # Without ``nvdisasm`` the launcher could not verify a hinted kernel's
+    # SASS, so nothing hinted exists: the normalizer pins every slot to ""
+    # (the render is the plain one) and the seeds carry no hinted twin.
+    hinted = _config(1, 64, warps=4, stages=4, load_eviction_policies=["l2_last"] * 7)
+    with patch.object(cutedsl_compat, "nvdisasm_path", return_value=None):
+        assert not cutedsl_compat.hinted_cp_async_available()
+        # (The seeds are planted at bind time.)
+        bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+        spec = bound.config_spec
+        seeds = [
+            c.config for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+        ]
+        with bound.env:
+            normalized = spec.normalized_config(hinted)
+        assert normalized.config["load_eviction_policies"] == [""] * 7
+        source = bound.to_code(normalized)
+    assert "cp_async_16_l2" not in source and "_helion_cute_sass_checks" not in source
+    assert source == _source(bound, _config(1, 64, warps=4, stages=4))
+    assert seeds and not any("load_eviction_policies" in c for c in seeds)
+    assert cutedsl_compat.hinted_cp_async_available()
+
+
+def test_the_first_warp_seed_has_an_l2_evict_last_twin() -> None:
+    # Right behind the first warp seed (and its derived-route / side-load
+    # twins), the same tile with the staged operands' slots at "l2_last";
+    # the plain seed stays the promoted default and no other seed carries
+    # a policy.
+    bound = _bind_fn(_head_sum_logits_batched, _head_sum_inputs(h=32))
+    spec = bound.config_spec
+    seeds = [
+        c.config for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+    ]
+    first = next(i for i, c in enumerate(seeds) if c["cute_mma_dag"] == "warp")
+    plain, twin = seeds[first], seeds[first + 1]
+    assert "load_eviction_policies" not in plain
+    assert twin["load_eviction_policies"] == ["l2_last", "l2_last", "", "", "", "", ""]
+    assert {k: v for k, v in twin.items() if k != "load_eviction_policies"} == plain
+    assert sum("load_eviction_policies" in c for c in seeds) == 1
+    with bound.env:
+        normalized = spec.normalized_config(helion.Config.from_dict(twin))
+    assert normalized.config["load_eviction_policies"] == twin["load_eviction_policies"]
+    assert not any(
+        cast("list[str]", spec.default_config().config["load_eviction_policies"])
+    )
+    # Behind the derived-route twin where the first warp seed has one.
+    dx = _bind_se_block("se_block_bwd_dx").config_spec
+    seeds = [
+        c.config
+        for c in dx.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "warp"
+    ]
+    assert seeds[1]["cute_mma_dag_derived"] == "pass"
+    assert "load_eviction_policies" not in seeds[1]
+    assert seeds[2]["cute_mma_dag_derived"] == "exchange"
+    assert seeds[2]["load_eviction_policies"]
+    assert seeds[2]["block_sizes"] == seeds[0]["block_sizes"]
+    assert sum("load_eviction_policies" in c for c in seeds) == 1
+    # Behind the aux-ring twin where the first warp seed has one.
+    bwd = _bind_bwd("scalar").config_spec
+    seeds = [
+        c.config
+        for c in bwd.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "warp"
+    ]
+    assert seeds[1].get("cute_mma_dag_aux") == "ring"
+    assert "load_eviction_policies" not in seeds[1]
+    assert seeds[2]["load_eviction_policies"]
+    assert seeds[2].get("cute_mma_dag_aux", "register") == "register"
+    assert seeds[2]["block_sizes"] == seeds[0]["block_sizes"]
+
+
+def test_ring_and_zero_filled_packets_carry_the_policy_too() -> None:
+    # A K-loop recurrence: the ring's packets of every iteration name the
+    # one policy word bound ahead of the loop.  A ragged root tile: the
+    # zero-filled packets take the policy behind their byte count.
+    bound = _bind_fwd()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.staged_slots
+    policies = [
+        "l2_last" if slot in facts.staged_slots else ""
+        for slot in range(spec.load_eviction_policies.length)
+    ]
+    body = _kernel_body(
+        _source(
+            bound, _config(64, 64, warps=4, stages=2, load_eviction_policies=policies)
+        )
+    )
+    assert body.count(f"{RT}.cp_async_16_l2(") == 16
+    assert f"{RT}.cp_async_16(" not in body
+    assert body.count("md_pol_evict_last = ") == 1
+    assert body.index("md_pol_evict_last = ") < body.index("for md_i in cutlass.range(")
+    ragged = _bind_fn(_ragged_rows_summed, _ragged_inputs(m=8))
+    facts = ragged.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.staged_slots == (0, 1)
+    body = _kernel_body(
+        _source(
+            ragged,
+            _config(
+                16,
+                128,
+                warps=4,
+                stages=2,
+                load_eviction_policies=["l2_last", "l2_last"],
+            ),
+        )
+    )
+    assert body.count(f"{RT}.cp_async_16_l2_zfill(") == 1
+    assert body.count(f"{RT}.cp_async_16_l2(") == 8
+    assert "md_zf, md_pol_evict_last)" in body
+    assert f"{RT}.cp_async_16_zfill(" not in body and f"{RT}.cp_async_16(" not in body
 
 
 def test_anchored_wy_seeds_the_neumann_chain_from_the_loaded_gram() -> None:
@@ -7746,7 +8279,16 @@ def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:
     spec = dx.config_spec
     assert spec.cute_mma_dag_derived is not None
     assert spec.cute_mma_dag_derived.choices == ("exchange", "pass")
-    assert spec.default_config().config["cute_mma_dag_derived"] == "exchange"
+    # dx's K loop streams under the pass route (every loop of the program is
+    # a streamed candidate), so the pass twin leads the tensor-memory seeds;
+    # at this 256x128 shape the grid is below 128 CTAs at the top
+    # tensor-memory tile, so the warp mode leads and the default keeps the
+    # exchange route.
+    default = spec.default_config().config
+    assert (default["cute_mma_dag"], default["cute_mma_dag_derived"]) == (
+        "warp",
+        "exchange",
+    )
     # dw's B operand (the same chain feeding B) and a bf16-typed chain
     # feeding a 16-bit dot are pass chains as well.
     for bound, role in (
@@ -7757,16 +8299,18 @@ def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:
         (dot,) = program.dots
         assert program.chain_root(getattr(dot, role)) is not None
         assert bound.config_spec.cute_mma_dag_facts.pass_chains == 1  # type: ignore[union-attr]
-    # The seeds compare the two routes at the first tile of each mode: the
-    # pass variant follows the first seed (the promoted default stays).
+    # The seeds compare the two routes at the first tile of each mode: on
+    # tensor memory the pass variant leads for this streamed program, the
+    # exchange route right behind it; in the warp mode the pass variant
+    # follows the first seed.
     seeds = [
         c.config
         for c in dx.config_spec.compiler_seed_configs
         if c.config.get("cute_mma_dag") in ("warp", "tcgen05")
     ]
     routes = [(c["cute_mma_dag"], c["cute_mma_dag_derived"]) for c in seeds]
-    first_tc = routes.index(("tcgen05", "exchange"))
-    assert routes[first_tc + 1] == ("tcgen05", "pass")
+    first_tc = routes.index(("tcgen05", "pass"))
+    assert routes[first_tc + 1] == ("tcgen05", "exchange")
     assert seeds[first_tc]["block_sizes"] == seeds[first_tc + 1]["block_sizes"]
     first_warp = routes.index(("warp", "exchange"))
     assert routes[first_warp + 1] == ("warp", "pass")
@@ -7908,3 +8452,903 @@ def test_a_half_typed_pass_chain_packs_its_operand_tile_once() -> None:
     assert re.search(rf"md_c{slot}_\d+_\d+_\d = ", exchange)
     assert not re.search(rf"md_c{slot}_", loop)
     assert f"{RT}.sts_v4_b32(md_t0 + " not in exchange
+
+
+def test_varlen_state_pass_is_admitted_with_tensor_loop_bounds() -> None:
+    # chunk_fwd_h_delta_varlen_helion walks ``hl.tile(chunk_offsets[n],
+    # chunk_offsets[n + 1], block_size=1)``: a grid loop whose bounds are
+    # tensor elements and whose index is the tile's begin; the chunk row
+    # ``(hn // N) * NT + tile_j.begin`` mixes the lead coordinate, the int
+    # argument NT and the loop index.  Admitted: the bounds are one uniform
+    # scalar load each ahead of the loop, the trip count dynamic.
+    bound = _bind_fwd_h_delta_varlen()
+    assert bound.config_spec.cute_mma_dag is not None
+    assert "cute_mma_dag" in bound.config_spec.default_config().config
+    program = _program(bound)
+    (loop,) = program.loops
+    assert loop.static_trip is None and loop.symbol is not None
+    assert [access.name for access in program.scalar_loads] == [
+        "chunk_offsets",
+        "chunk_offsets",
+    ]
+    assert all(
+        access.dtype == torch.int64 and not access.dims
+        for access in program.scalar_loads
+    )
+    assert program.begin is program.scalar_loads[0].node
+    assert program.end is program.scalar_loads[1].node
+    # The epilogue stores the final state (the carry's phi) per sequence.
+    assert [store.region for store in program.stores].count("epilogue") == 1
+    body = _kernel_body(_source(bound, _config(32, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert body.count(f"cutlass.Int32({RT}.ldg_s64(") == 2
+    assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in body
+    # The ring prologue and the refill are guarded by the dynamic bounds.
+    assert "if md_scalar < md_scalar_1:" in body
+    assert "if md_i + 1 < md_scalar_1:" in body
+    assert "md_stage = (md_i - md_scalar) % 2" in body
+    assert f"{RT}.mma_bf16(" in body
+    # (The dense form keeps its static trip count.)
+    (dense_loop,) = _program(_bind_fwd_h_delta()).loops
+    assert dense_loop.static_trip == 8
+
+
+def _varlen_binders() -> dict[str, Callable[[], BoundKernel]]:
+    """The varlen chunked KDA forward's kernels at one small batch: three
+    sequences of 2, 1 and 3 chunks, every last chunk one row short."""
+    bf16, f32 = torch.bfloat16, torch.float32
+    h, c, d, dv = 2, 64, 64, 64
+    _offsets, token_base, valid_len, nt, t_total = _varlen_tables((2, 1, 3), c)
+    hnt = h * nt
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    gc = e(hnt, c, d, dtype=f32)
+    binders: dict[str, Callable[[], BoundKernel]] = {
+        "chunk_fwd_h_delta_varlen_helion": _bind_fwd_h_delta_varlen,
+        "chunk_cumsum_gc_varlen_helion": functools.partial(
+            _bind,
+            "chunk_cumsum_gc_varlen_helion",
+            (
+                e(t_total, h, d),
+                token_base,
+                valid_len,
+                gc,
+                e(h, dtype=f32),
+                e(h, d, dtype=f32),
+                -5.0,
+                True,
+                True,
+                True,
+            ),
+        ),
+        "chunk_fwd_A_diag_anchored_varlen_helion": functools.partial(
+            _bind,
+            "chunk_fwd_A_diag_anchored_varlen_helion",
+            (
+                e(t_total, h, d),
+                e(t_total, h, d),
+                gc,
+                token_base,
+                valid_len,
+                e(hnt, c, c),
+                e(hnt, c, c),
+                0.125,
+                True,
+            ),
+        ),
+        "chunk_fwd_wy_delta_varlen_helion": functools.partial(
+            _bind,
+            "chunk_fwd_wy_delta_varlen_helion",
+            (
+                e(t_total, h, d),
+                e(t_total, h, dv),
+                e(t_total, h),
+                gc,
+                e(hnt, c, c),
+                token_base,
+                valid_len,
+                e(hnt, c, d),
+                e(hnt, c, dv),
+                e(hnt, c, d),
+            ),
+        ),
+        "chunk_fwd_o_diag_anchored_varlen_helion": functools.partial(
+            _bind,
+            "chunk_fwd_o_diag_anchored_varlen_helion",
+            (
+                e(t_total, h, d),
+                e(hnt, c, dv),
+                gc,
+                e(hnt, d, dv),
+                e(hnt, c, c),
+                token_base,
+                valid_len,
+                e(t_total, h, dv),
+                0.125,
+                True,
+            ),
+        ),
+    }
+    return binders
+
+
+def test_varlen_engine_kernels_pin_their_admission() -> None:
+    # The varlen chunked KDA forward's kernels with the dag's verdict: the
+    # state pass (tensor loop bounds) and the token-major wy / o_diag kernels
+    # (windows at a runtime token offset) are admitted; the gated cumsum and
+    # the anchored gram (hl.arange sub-blocks, a l2norm reduction over a
+    # window) decline.
+    binders = _varlen_binders()
+    admitted = {
+        "chunk_fwd_h_delta_varlen_helion",
+        "chunk_fwd_wy_delta_varlen_helion",
+        "chunk_fwd_o_diag_anchored_varlen_helion",
+    }
+    verdicts = {}
+    for name, binder in binders.items():
+        spec = binder().config_spec
+        verdicts[name] = spec.cute_mma_dag is not None
+        assert ("cute_mma_dag" in spec.default_config().config) == verdicts[name], name
+    assert verdicts == {name: name in admitted for name in binders}
+
+
+def test_a_windowed_tile_keeps_its_packets_under_the_tma_ring() -> None:
+    # The varlen wy transform at D=32, DV=64: the key loop's ring holds the
+    # k tile -- a window, its rows at token_base[j] and live below
+    # valid_len[j] -- and the derived g_cs tile, 64- and 128-byte rows.
+    # Under ``cute_mma_dag_loads="tma"`` the g_cs tile rides a tensor map
+    # while the windowed k tile keeps its zero-filled packets: a bulk
+    # tensor copy lands its box whole, zero only past the tensor's bounds,
+    # so it can neither start the rows at the window's runtime offset nor
+    # zero those at and past its limit.  (Fetched by a tensor map at row 0
+    # of the token axis, k read the batch's first tokens for every chunk:
+    # the kda varlen forward's w and k_state were wrong against the
+    # recurrent reference, test_linear_kda_varlen.)  The bind-time facts
+    # agree: the k slot is not one the loads knob may move onto a tensor
+    # map, so hinting it never pins the route.
+    bf16, f32 = torch.bfloat16, torch.float32
+    h, c, d, dv = 2, 64, 32, 64
+    _offsets, token_base, valid_len, nt, t_total = _varlen_tables((2, 1, 3), c)
+    hnt = h * nt
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    bound = _bind(
+        "chunk_fwd_wy_delta_varlen_helion",
+        (
+            e(t_total, h, d),
+            e(t_total, h, dv),
+            e(t_total, h),
+            e(hnt, c, d, dtype=f32),
+            e(hnt, c, c),
+            token_base,
+            valid_len,
+            e(hnt, c, d),
+            e(hnt, c, dv),
+            e(hnt, c, d),
+        ),
+    )
+    program = _program(bound)
+    assert {access.name for access in program.accesses if access.windows} == {
+        "beta",
+        "k",
+        "v",
+    }
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tma_ring
+    assert {
+        access.name
+        for access in program.accesses
+        if access.eviction_slot in facts.tma_slots
+    } == {"g_cs"}
+    config = _config(32, 32, warps=4, stages=2, cute_mma_dag_loads="tma")
+    with bound.env:
+        assert (
+            bound.config_spec.normalized_config(config).config["cute_mma_dag_loads"]
+            == "tma"
+        )
+    source = _source(bound, config)
+    body = _kernel_body(source)
+    assert SIMT_FALLBACK not in body
+    assert "md_tma0: cutlass.GridConstant[_helion_mma_dag_tc.cuda.TensorMap]" in body
+    assert "md_tma1" not in source
+    assert "'tma_count': 1" in source and "'tma0_elem': 4" in source
+    copies = re.findall(
+        r"cp_async_bulk_tensor_shared_cta_global\(.*?, (md_tma\d)\.get_ptr\(\), \[(.*?)\], ",
+        body,
+    )
+    assert copies and all(name == "md_tma0" for name, _coords in copies)
+    # g_cs's coordinates: the d tile, row 0, the chunk row; no window scalar.
+    assert all("md_scalar" not in coords for _name, coords in copies)
+    # k: packets from a base at the window's offset, zero-filled past the
+    # window's limit and the tensor's end.
+    assert "k.iterator.toint() + cutlass.Int64(md_scalar_1) * 128" in body
+    assert re.search(
+        r"md_zf = cutlass\.Int32\(16\) if md_pr\d* < md_scalar and md_scalar_1 \+ md_pr\d* < 381 else cutlass\.Int32\(0\)",
+        body,
+    )
+
+
+def test_windowed_accesses_are_predicated_per_row() -> None:
+    # The token-major varlen kernels read ``x[token_base[j] + hl.arange(C),
+    # h, :]`` under ``extra_mask=(hl.arange(C) < valid_len[j])[:, None]``: a
+    # window of the chunk axis at a runtime row offset, live below a runtime
+    # limit.  The offset and the limit are uniform scalar loads; every row
+    # of the window is predicated: the staged packets zero-fill, the per-lane
+    # loads read zero and the stores are dropped past the limit or the
+    # tensor's end.  The tcgen05 region renderer takes the windowed loads
+    # (test_windowed_tiles_take_the_tcgen05_region_renderer).
+    binders = _varlen_binders()
+    wy = binders["chunk_fwd_wy_delta_varlen_helion"]()
+    program = _program(wy)
+    assert program.windowed and not program.windowed_stores
+    with wy.env, wy.host_function:
+        assert dag.mma_dag_facts(program).tcgen05 is not None
+    windows = {
+        access.name: [
+            (position, window.offset.name, window.limit.name, window.extent)
+            for position, window in access.windows
+        ]
+        for access in program.accesses
+        if access.windows
+    }
+    # beta is a vector (its one dim windowed); k and v are the tile rows.
+    assert windows == {
+        "beta": [(0, "token_base", "valid_len", 381)],
+        "k": [(0, "token_base", "valid_len", 381)],
+        "v": [(0, "token_base", "valid_len", 381)],
+    }
+    # (The mask is decoded ahead of the subscripts: the limit comes first.)
+    assert [access.name for access in program.scalar_loads] == [
+        "valid_len",
+        "token_base",
+    ]
+    body = _kernel_body(_source(wy, _config(64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert body.count(f"cutlass.Int32({RT}.ldg_s64(") == 2
+    # The window offset moves every windowed base by whole rows.
+    assert "md_base_3 = beta.iterator.toint() + cutlass.Int64(md_scalar_1) * 4" in body
+    assert "k.iterator.toint() + cutlass.Int64(md_scalar_1) * 256" in body
+    # k / v tiles: cp.async packets zero-filled past the limit / the end.
+    assert f"{RT}.cp_async_16_zfill(" in body
+    assert re.search(
+        r"md_zf = cutlass\.Int32\(16\) if md_pr\d* < md_scalar and md_scalar_1 \+ md_pr\d* < 381 else cutlass\.Int32\(0\)",
+        body,
+    )
+    # beta: per-lane predicated loads.
+    assert f"{RT}.ldg_bf16_as_f32_pred(" in body
+    assert re.search(
+        r"md_ok = cutlass\.Int32\(1\) if md_L0_rowl < md_scalar and md_scalar_1 \+ md_L0_rowl < 381 else cutlass\.Int32\(0\)",
+        body,
+    )
+
+    # o_diag: the window's rows are the output tile's rows too -- the store
+    # is guarded; the fused q row norm is a keepdim reduction of a derived
+    # fragment over the windowed tile (read along the rows: position 0).
+    o_diag = binders["chunk_fwd_o_diag_anchored_varlen_helion"]()
+    program = _program(o_diag)
+    assert program.windowed and not program.loops
+    windows = {
+        access.name: [(p, w.offset.name, w.limit.name) for p, w in access.windows]
+        for access in program.accesses
+        if access.windows
+    }
+    assert windows == {
+        "q": [(0, "token_base", "valid_len")],
+        "out": [(0, "token_base", "valid_len")],
+    }
+    (reduce,) = program.reduces
+    assert reduce.orient == "rows" and reduce.frag is not None
+    assert reduce.frag in {derived.node for derived in program.derived}
+    assert set(program.vec_positions.values()) == {0}
+    body = _kernel_body(_source(o_diag, _config(warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert body.count(f"cutlass.Int32({RT}.ldg_s64(") == 2
+    assert f"{RT}.ldg_b32_pred(" in body
+    assert "if md_L0_rowl < md_scalar and md_scalar_1 + md_L0_rowl < 381:" in body
+    assert f"{RT}.stg_b32(" in body
+
+
+def test_windowed_tiles_take_the_tcgen05_region_renderer() -> None:
+    # The varlen wy kernel under the tcgen05 mode: the k / v window tiles
+    # ride the TMA ring with their boxes at the runtime row offset (the
+    # third coordinate, the token dim), the rows at and past the limit (or
+    # the tensor's end) read as zero in the convert passes that widen them
+    # (``_Evaluator.tile_leaf``: both branches typed alike), and the beta
+    # vector keeps its per-lane predicated loads.
+    binders = _varlen_binders()
+    wy = binders["chunk_fwd_wy_delta_varlen_helion"]()
+    body = _kernel_body(
+        _source(
+            wy,
+            helion.Config(
+                block_sizes=[64],
+                cute_mma_dag="tcgen05",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=2,
+            ),
+        )
+    )
+    assert "tcgen05_mma(" in body and SIMT_FALLBACK not in body
+    assert body.count(f"cutlass.Int32({RT}.ldg_s64(") == 2
+    boxes = re.findall(r"cp_async_bulk_tensor_shared_cta_global\(.*?\[(.*?)\]", body)
+    windowed = [box for box in boxes if box.endswith("cutlass.Int32(md_scalar_1)")]
+    assert len(windowed) >= 2 and all(
+        re.fullmatch(r"cutlass\.Int32\(tile_offset_0 // \d+\)", box.split(", ")[1])
+        for box in windowed
+    )
+    assert re.search(
+        r"cutlass\.BFloat16\(md_lo_\d+\) if md_pr\w+ < md_scalar and md_scalar_1 \+ md_pr\w+ < 381 else cutlass\.BFloat16\(0\)",
+        body,
+    )
+    assert f"{RT}.ldg_bf16_as_f32_pred(" in body
+    # The window's rows never move the tile address: the offset is the
+    # box coordinate, the base of every windowed tensor holds it too.
+    assert "k.iterator.toint() + cutlass.Int64(md_scalar_1) * 256" in body
+
+
+def _windowed_store_loop(
+    v: torch.Tensor,
+    A: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """A windowed store inside a tile loop: ``out[token_base[j] + arange,
+    h, tile_dv] = A[r] @ v[r, :, tile_dv]`` under the row mask."""
+    NT = token_base.size(0)
+    C = hl.specialize(A.size(1))
+    for tile_r in hl.tile(A.size(0), block_size=1):
+        j = tile_r.begin % NT
+        head = tile_r.begin // NT
+        base = token_base[j]
+        idx = hl.arange(C)
+        valid = idx < valid_len[j]
+        At = A[tile_r.begin, :, :]
+        for tile_dv in hl.tile(v.size(2)):
+            vt = v[tile_r.begin, :, tile_dv]
+            hl.store(
+                out,
+                [base + idx, head, tile_dv],
+                hl.dot(At, vt).to(out.dtype),
+                extra_mask=valid[:, None],
+            )
+
+
+def _windowed_direct_operand(
+    k: torch.Tensor,
+    A: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """A windowed bf16 tile fed to a bf16 dot as it is (no pointwise DAG
+    between the load and the operand)."""
+    NT = token_base.size(0)
+    C = hl.specialize(A.size(1))
+    for tile_r in hl.tile(A.size(0), block_size=1):
+        j = tile_r.begin % NT
+        head = tile_r.begin // NT
+        base = token_base[j]
+        idx = hl.arange(C)
+        valid = idx < valid_len[j]
+        At = A[tile_r.begin, :, :]
+        for tile_d in hl.tile(k.size(2)):
+            kt = hl.load(k, [base + idx, head, tile_d], extra_mask=valid[:, None])
+            out[tile_r.begin, :, tile_d] = hl.dot(At, kt).to(out.dtype)
+
+
+def _windowed_probe_args(kernel: str) -> tuple[object, ...]:
+    bf16 = torch.bfloat16
+    h, c, d = 2, 64, 128
+    _offsets, token_base, valid_len, nt, t_total = _varlen_tables((2, 1, 3), c)
+    hnt = h * nt
+
+    def e(*shape: int, dtype: torch.dtype = bf16) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=CPU_DEVICE)
+
+    if kernel == "store":
+        return (e(hnt, c, d), e(hnt, c, c), token_base, valid_len, e(t_total, h, d))
+    return (e(t_total, h, d), e(hnt, c, c), token_base, valid_len, e(hnt, c, d))
+
+
+def test_windowed_stores_and_direct_window_operands_keep_the_warp_mode() -> None:
+    # Fail closed: the tcgen05 renderers' staged / TMA stores do not drop a
+    # window's rows past the limit, so a program with a windowed store has
+    # no tcgen05 facts; neither has one whose windowed bf16 tile would feed
+    # the MMA as it lands (no pointwise DAG, no widening: no pass masks its
+    # rows).  The warp mode keeps both.
+    store = _bind_fn(_windowed_store_loop, _windowed_probe_args("store"))
+    program = _program(store)
+    assert program.windowed_stores
+    with store.env, store.host_function:
+        assert dag.mma_dag_facts(program).tcgen05 is None
+    with pytest.raises(InvalidConfig), store.env:
+        store.config_spec.normalized_config(
+            helion.Config(block_sizes=[64], cute_mma_dag="tcgen05")
+        )
+    body = _kernel_body(_source(store, _config(64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body and f"{RT}.mma_" in body
+
+    direct = _bind_fn(_windowed_direct_operand, _windowed_probe_args("direct"))
+    program = _program(direct)
+    assert program.windowed and not program.windowed_stores
+    (dot,) = program.dots
+    assert dot.b.load is not None and dot.b.load.windows and not dot.b.pointwise
+    with direct.env, direct.host_function:
+        assert dag.mma_dag_facts(program).tcgen05 is None
+    with pytest.raises(InvalidConfig), direct.env:
+        direct.config_spec.normalized_config(
+            helion.Config(block_sizes=[64], cute_mma_dag="tcgen05")
+        )
+    body = _kernel_body(_source(direct, _config(64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body and f"{RT}.cp_async_16_zfill(" in body
+
+
+def _column_window_load(
+    x: torch.Tensor,
+    hmat: torch.Tensor,
+    base_t: torch.Tensor,
+    lim_t: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    # A 2-D tile windowed along its second tile dim: ``x[r, :, base + idx]``.
+    nt = base_t.size(0)
+    d = hl.specialize(hmat.size(0))
+    for tile_r in hl.tile(out.size(0), block_size=1):
+        j = tile_r.begin % nt
+        idx = hl.arange(d)
+        valid = idx < lim_t[j]
+        xt = torch.where(
+            valid[None, :],
+            hl.load(
+                x,
+                [tile_r.begin, slice(None), base_t[j] + idx],
+                extra_mask=valid[None, :],
+            ),
+            0,
+        )
+        out[tile_r.begin, :, :] = hl.dot(xt, hmat[:, :]).to(out.dtype)
+
+
+def _column_window_store(
+    x: torch.Tensor,
+    hmat: torch.Tensor,
+    base_t: torch.Tensor,
+    lim_t: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    # A 2-D tile stored at a window along the contiguous dim.
+    nt = base_t.size(0)
+    d = hl.specialize(hmat.size(1))
+    for tile_r in hl.tile(x.size(0), block_size=1):
+        j = tile_r.begin % nt
+        idx = hl.arange(d)
+        valid = idx < lim_t[j]
+        o = hl.dot(x[tile_r.begin, :, :], hmat[:, :])
+        hl.store(
+            out,
+            [tile_r.begin, slice(None), base_t[j] + idx],
+            o.to(out.dtype),
+            extra_mask=valid[None, :],
+        )
+
+
+def _row_window_load(
+    x: torch.Tensor,
+    hmat: torch.Tensor,
+    base_t: torch.Tensor,
+    lim_t: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    # The varlen layout: token rows of ``x [T, H, D]`` at a runtime offset.
+    nt = base_t.size(0)
+    c = hl.specialize(hmat.size(0))
+    for tile_r in hl.tile(out.size(0), block_size=1):
+        j = tile_r.begin % nt
+        h = tile_r.begin // nt
+        idx = hl.arange(c)
+        valid = idx < lim_t[j]
+        xt = torch.where(
+            valid[:, None],
+            hl.load(x, [base_t[j] + idx, h, slice(None)], extra_mask=valid[:, None]),
+            0,
+        )
+        out[tile_r.begin, :, :] = hl.dot(xt, hmat[:, :]).to(out.dtype)
+
+
+def test_tile_windows_are_rows_at_a_packet_aligned_stride() -> None:
+    # A 2-D tile's window must be its first tile dim at a 16-byte multiple
+    # of a row stride: the warp emitter moves the tile's packets and pairs
+    # by whole rows and predicates them per row, so a window along the
+    # contiguous dim (a layout read or written along its columns) would
+    # misalign the cp.async packets at an odd offset and guard a pair store
+    # by its first column only.  Declined, load and store alike -- the
+    # kernels bind to the ordinary lowering without the knob -- and so is a
+    # window on the second tile dim of a transposed layout (an aligned
+    # stride, the wrong position) and a row window at a row stride that is
+    # not a multiple of 16 bytes.  A vector's window is per element at any
+    # stride (the wy kernel's beta: see the test above).
+    bf16 = torch.bfloat16
+
+    def e(*shape: int) -> torch.Tensor:
+        return torch.empty(shape, dtype=bf16, device=CPU_DEVICE)
+
+    base_t = torch.tensor([0, 64, 200, 136, 448], device=CPU_DEVICE)
+    lim_t = torch.tensor([64, 40, 64, 1, 17], device=CPU_DEVICE)
+    declined = (
+        ("column load", _column_window_load, (e(10, 64, 512), e(64, 64))),
+        ("column store", _column_window_store, (e(10, 64, 64), e(64, 64))),
+        (
+            "second tile dim at a 128-byte stride",
+            _column_window_load,
+            (e(10, 512, 64).transpose(1, 2), e(64, 64)),
+        ),
+    )
+    for name, fn, (x, hmat) in declined:
+        out = e(10, 64, 64) if fn is _column_window_load else e(10, 64, 512)
+        spec = _bind_fn(fn, (x, hmat, base_t, lim_t, out)).config_spec
+        assert spec.cute_mma_dag is None, name
+        assert "cute_mma_dag" not in spec.default_config().config, name
+    # The row window of the varlen layout is admitted at a 256-byte row
+    # stride (2 heads of 64 bf16) ...
+    t, h, c, d, dv = 500, 2, 64, 64, 64
+    rows = _bind_fn(
+        _row_window_load, (e(t, h, d), e(c, dv), base_t, lim_t, e(h * 5, c, dv))
+    )
+    assert rows.config_spec.cute_mma_dag is not None
+    program = _program(rows)
+    assert [
+        (position, window.offset.name, window.limit.name, window.extent)
+        for access in program.accesses
+        for position, window in access.windows
+    ] == [(0, "base_t", "lim_t", t)]
+    body = _kernel_body(_source(rows, _config(warps=4, stages=2)))
+    assert f"{RT}.cp_async_16_zfill(" in body
+    # ... and declined over a padded view whose row stride is 2 * 66
+    # elements = 264 bytes.
+    padded = torch.empty((t, h, d + 2), dtype=bf16, device=CPU_DEVICE)[..., :d]
+    spec = _bind_fn(
+        _row_window_load, (padded, e(c, dv), base_t, lim_t, e(h * 5, c, dv))
+    ).config_spec
+    assert spec.cute_mma_dag is None
+    assert "cute_mma_dag" not in spec.default_config().config
+
+
+# --------------------------------------------------------------------------
+# Side loads riding the ring (``cute_mma_dag_aux='ring'``)
+# --------------------------------------------------------------------------
+
+
+def _aux_ring_calls(body: str) -> tuple[int, int, int]:
+    """(4-byte cp.async packets, shared reads, wait groups) of the aux ring."""
+    return (
+        body.count(f"{RT}.cp_async_4("),
+        body.count(f"{RT}.lds_f32(md_aux0"),
+        body.count("cute.arch.cp_async_wait_group("),
+    )
+
+
+def test_side_loads_ride_the_aux_ring_with_the_operand_tiles() -> None:
+    # bwd_dh with the scalar decay: the gc row (the q pass's gate, read at
+    # the thread's two packet rows) and the g_last scalar (the carry
+    # rescale) vary with the chunk loop.  Under ``ring`` both are 4-byte
+    # cp.async packets into the loop's aux ring -- a word per thread per
+    # site (three), per stage -- issued with their iteration's operand
+    # tiles: the prologue's ``stages - 1`` groups and the refill; the lanes
+    # read this iteration's stage behind its wait, and no per-lane global
+    # load is left in the loop.
+    bound = _bind_bwd("scalar")
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.aux_candidates
+    assert [
+        (r.loop, r.kind, facts.axes[r.axis].kind if r.axis >= 0 else None)
+        for r in facts.aux_loads
+    ] == [(0, "across", dag.AXIS_RDIM), (0, "scalar", None)]
+    assert spec.cute_mma_dag_aux is not None
+    assert spec.cute_mma_dag_aux.choices == ("register", "ring")
+    register = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=4)))
+    ring = _kernel_body(
+        _source(bound, _config(32, 64, warps=4, stages=4, cute_mma_dag_aux="ring"))
+    )
+    assert "md_aux0" not in register
+    assert _aux_ring_calls(register) == (0, 0, 1)
+    # 3 prologue groups x 3 words, plus the refill's 3.
+    assert _aux_ring_calls(ring) == (12, 3, 1)
+    loop = _loop_and_after(ring)
+    assert f"{RT}.lds_f32(md_aux0 + md_stage * 1536 + 0 + md_tidx * 4)" in loop
+    assert (
+        f"{RT}.cp_async_4(md_aux0 + (md_stage + 3) % 4 * 1536 + 0 + md_tidx * 4, "
+        in loop
+    )
+    assert loop.index("cute.arch.cp_async_wait_group(2)") < loop.index(
+        f"{RT}.lds_f32(md_aux0"
+    )
+    assert not _scalar_global_loads(loop)
+    assert _scalar_global_loads(_loop_and_after(register))
+    # The aux ring sits behind the operand rings and the staging buffers;
+    # the planner allocates exactly the estimate.
+    roots = [axis for axis in facts.axes if axis.kind == dag.AXIS_ROOT]
+    sizes: dict[int, object] = {
+        axis.block_id: 1 for axis in facts.axes if axis.kind == dag.AXIS_LEAD
+    }
+    sizes[roots[0].block_id], sizes[roots[1].block_id] = 32, 64
+    resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
+    plain = dag.mma_dag_smem_estimate(facts, resolved, 4, 4)
+    staged = dag.mma_dag_smem_estimate(facts, resolved, 4, 4, aux="ring")
+    assert staged == plain + 4 * 3 * 128 * 4
+    assert f"alloc_smem(cutlass.Uint8, {plain}, alignment=128)" in register
+    assert f"alloc_smem(cutlass.Uint8, {staged}, alignment=128)" in ring
+    assert f"md_aux0 = md_s0 + {plain}" in ring
+    # One stage: the iteration's own group carries its words, waited for in
+    # full ahead of the reads.
+    one = _kernel_body(
+        _source(bound, _config(32, 64, warps=4, stages=1, cute_mma_dag_aux="ring"))
+    )
+    assert _aux_ring_calls(one) == (3, 3, 1)
+    assert "cute.arch.cp_async_wait_group(0)" in _loop_and_after(one)
+    assert not _scalar_global_loads(_loop_and_after(one))
+
+
+def test_the_aux_knob_is_pinned_without_a_subject() -> None:
+    # No side load varying with a ring loop (the vanilla recurrences: the
+    # scale is a float argument), or the tensor-memory mode (its own
+    # register prefetch): the knob is inert and pinned to the register
+    # prefetch.
+    for bound in (_bind_fwd(), _bind_bwd()):
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None and not facts.aux_candidates
+        config = _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring").config
+        with bound.env:
+            bound.config_spec.normalize(config)
+        assert config["cute_mma_dag_aux"] == "register"
+    bound = _bind_bwd("scalar")
+    config = helion.Config(
+        block_sizes=[64, 32],
+        cute_mma_dag="tcgen05",
+        cute_mma_dag_warps=4,
+        cute_mma_dag_stages=4,
+        cute_mma_dag_aux="ring",
+    ).config
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag"] == "tcgen05"
+    assert config["cute_mma_dag_aux"] == "register"
+    config = _config(32, 64, warps=4, stages=4, cute_mma_dag_aux="ring").config
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_aux"] == "ring"
+    # A side load varying with an outer loop is read inside the inner one
+    # (hoisted ahead of it): not a ring load.
+    t = _tensors3(bhn=4, d=128, dv=128)
+    gd = torch.empty((4, 128), dtype=torch.float32, device=CPU_DEVICE)
+    outer = _bind_fn(_inner_varying_row_gate, (t["q"], t["h"], gd))
+    facts = outer.config_spec.cute_mma_dag_facts
+    assert facts is not None and not facts.aux_candidates
+    # One varying with the inner loop is: the 64-element DV tile of the
+    # gate vector per iteration, a 16-byte run per packet copied once per
+    # CTA in the inner loop's frame (see
+    # ``test_the_aux_ring_stages_vectors_along_the_contiguous_dim_once_per_cta``).
+    gdv = torch.empty((4, 128), dtype=torch.float32, device=CPU_DEVICE)
+    inner = _bind_fn(_inner_varying_gate, (t["q"], t["h"], gdv))
+    facts = inner.config_spec.cute_mma_dag_facts
+    assert facts is not None and len(facts.aux_loads) == 1
+    (record,) = facts.aux_loads
+    assert (record.loop, record.kind) == (1, "run")
+    assert facts.axes[record.axis].kind == dag.AXIS_LOOP
+    body = _kernel_body(
+        _source(inner, _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring"))
+    )
+    assert f"{RT}.cp_async_16(md_aux1 + " in body
+    inner_loop = body[body.index("for md_i1 in") :]
+    assert not _scalar_global_loads(inner_loop)
+
+
+def test_the_first_warp_seed_has_an_aux_ring_twin() -> None:
+    # Right behind the first warp seed: the same tile with the side loads
+    # riding the ring; one such seed, and it normalizes as is.
+    bound = _bind_bwd("scalar")
+    spec = bound.config_spec
+    seeds = [
+        c.config for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+    ]
+    first = next(i for i, c in enumerate(seeds) if c["cute_mma_dag"] == "warp")
+    plain, twin = seeds[first], seeds[first + 1]
+    assert "cute_mma_dag_aux" not in plain
+    assert twin["cute_mma_dag_aux"] == "ring"
+    assert {k: v for k, v in twin.items() if k != "cute_mma_dag_aux"} == plain
+    assert sum(c.get("cute_mma_dag_aux") == "ring" for c in seeds) == 1
+    with bound.env:
+        normalized = spec.normalized_config(helion.Config.from_dict(twin))
+    assert normalized.config["cute_mma_dag_aux"] == "ring"
+    assert spec.default_config().config["cute_mma_dag_aux"] == "register"
+    # No twin where no side load varies with a ring loop.
+    seeds = [
+        c.config
+        for c in _bind_fwd().config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag")
+    ]
+    assert not any(c.get("cute_mma_dag_aux") == "ring" for c in seeds)
+
+
+def _bind_fwd_scalar_unaligned(*, v_aligned: bool = False) -> BoundKernel:
+    """The scalar-decay forward with k (and v, unless ``v_aligned``) sliced
+    ``[..., 4:68]`` out of 80-wide rows: an 8-byte-aligned base cp.async
+    cannot stage, so the operand's pass copies from global memory (the
+    synchronous route)."""
+    t = _tensors()
+    k = torch.empty((2, 8, 64, 80), dtype=torch.bfloat16, device=CPU_DEVICE)[..., 4:68]
+    v = t["v"]
+    if not v_aligned:
+        v = torch.empty((2, 8, 64, 80), dtype=torch.bfloat16, device=CPU_DEVICE)[
+            ..., 4:68
+        ]
+    return _bind(
+        "chunk_fwd_h_diag_fused",
+        (k, v, t["g_last_s"], t["h0"], t["gc"], True, True, False, True),
+    )
+
+
+def test_a_loop_whose_ring_stages_nothing_has_no_aux_ring_to_ride() -> None:
+    # k and v sliced [..., 4:68] out of 80-wide rows: 8-byte-aligned bases,
+    # so both operand tiles take the synchronous lane pass and the chunk
+    # loop's cp.async ring is empty.  The aux ring rides the ring (its
+    # copies are issued with the ring tiles), so there is nothing for it to
+    # ride: the facts carry no aux loads (the program-level records are
+    # there), the knob is pinned to the register prefetch, the seed list
+    # has no ring twin, and a hand-written ring plan declines instead of
+    # failing inside the emitter.
+    bound = _bind_fwd_scalar_unaligned()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and not facts.aux_candidates and not facts.aux_loads
+    program = _program(bound)
+    assert program.loop_has_ring(0)
+    with bound.env:
+        assert dag.mma_dag_aux_records(bound.env, program, program.loops[0])
+        assert dag.mma_dag_ring_loops(bound.env, program) == frozenset()
+        assert dag.mma_dag_aux_loads(bound.env, program) == {}
+    config = _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring").config
+    with bound.env:
+        spec.normalize(config)
+    assert config["cute_mma_dag_aux"] == "register"
+    body = _kernel_body(bound.to_code(helion.Config(**config)))
+    assert f"{RT}.cp_async_4(" not in body and "md_aux0" not in body
+    assert body == _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    seeds = [
+        c.config for c in spec.compiler_seed_configs if c.config.get("cute_mma_dag")
+    ]
+    assert seeds and not any(c.get("cute_mma_dag_aux") == "ring" for c in seeds)
+    # Normalization's pins bypassed (the knob given a surface, the facts a
+    # subject, the reason silenced): the planner declines on its own.
+    raw = _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring")
+    spec.cute_mma_dag_aux = EnumFragment(choices=dag.MMA_DAG_AUX_CHOICES)
+    spec.cute_mma_dag_facts = dataclasses.replace(facts, aux_candidates=True)
+    try:
+        with (
+            patch(
+                "helion.autotuner.config_spec.mma_dag_aux_reason",
+                return_value=None,
+            ),
+            pytest.raises(BackendUnsupported, match="whose ring stages a tile"),
+        ):
+            bound.to_code(raw)
+    finally:
+        spec.cute_mma_dag_aux = None
+        spec.cute_mma_dag_facts = facts
+    # k alone under-aligned: v's tile rides the ring and the aux copies
+    # with it (the k pass copies from global memory beside them); the same
+    # aux loads as the aligned kernel's.
+    bound = _bind_fwd_scalar_unaligned(v_aligned=True)
+    facts = bound.config_spec.cute_mma_dag_facts
+    aligned = _bind_fwd("scalar").config_spec.cute_mma_dag_facts
+    assert facts is not None and aligned is not None
+    assert facts.aux_loads == aligned.aux_loads and len(facts.aux_loads) == 2
+    program = _program(bound)
+    with bound.env:
+        assert dag.mma_dag_ring_loops(bound.env, program) == frozenset({0})
+    body = _kernel_body(
+        _source(bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring"))
+    )
+    loop = _loop_and_after(body)
+    assert f"{RT}.cp_async_4(md_aux0" in loop and f"{RT}.lds_f32(md_aux0" in loop
+    assert f"{RT}.ldg_b32(" in loop and f"{RT}.cp_async_16(" in loop
+    assert not _scalar_global_loads(loop)
+
+
+def test_aux_rings_that_overflow_shared_memory_pin_the_knob_to_the_registers() -> None:
+    # The capacity squeezed between the register and the ring estimates:
+    # the repair keeps the tile and the stages and drops the route; strict
+    # normalization names the knob.
+    bound = _bind_bwd("scalar")
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    roots = [axis for axis in facts.axes if axis.kind == dag.AXIS_ROOT]
+    sizes: dict[int, object] = {
+        axis.block_id: 1 for axis in facts.axes if axis.kind == dag.AXIS_LEAD
+    }
+    sizes[roots[0].block_id], sizes[roots[1].block_id] = 32, 64
+    resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
+    plain = dag.mma_dag_smem_estimate(facts, resolved, 4, 4)
+    assert dag.mma_dag_smem_estimate(facts, resolved, 4, 4, aux="ring") > plain + 16
+    spec.cute_mma_dag_facts = dataclasses.replace(facts, smem_capacity=plain + 16)
+    try:
+        config = _config(32, 64, warps=4, stages=4, cute_mma_dag_aux="ring").config
+        with bound.env:
+            spec.normalize(config, _fix_invalid=True)
+        assert config["cute_mma_dag_aux"] == "register"
+        assert (config["block_sizes"], config["cute_mma_dag_stages"]) == ([32, 64], 4)
+        config = _config(32, 64, warps=4, stages=4, cute_mma_dag_aux="ring").config
+        with (
+            bound.env,
+            pytest.raises(InvalidConfig, match="cute_mma_dag_aux='ring'"),
+        ):
+            spec.normalize(config)
+    finally:
+        spec.cute_mma_dag_facts = facts
+
+
+def test_a_row_the_ring_slot_would_serve_rides_the_aux_ring_under_ring() -> None:
+    # full_gla's anchored forward: ``gc_last = gc[idx, i_t, C - 1, tile_d]``
+    # is a row of the staged gc tile, so under ``register`` the ring slot
+    # serves it behind the iteration barrier (``_ring_aliases``; the carry
+    # rescale runs there), while under ``ring`` it is an fp32 vector the aux
+    # ring copies once per CTA (``AuxRing.shared``) and the lanes read by
+    # coordinate behind the barrier -- never both routes for one load.  No
+    # scalar bf16 cast on either route.
+    bound = _bind_fwd("anchored", has_h0=True, d=128, dv=128)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    assert [(r.loop, r.kind, facts.axes[r.axis].kind) for r in facts.aux_loads] == [
+        (0, "shared", dag.AXIS_ROOT)
+    ]
+    alias_read = re.compile(
+        rf"{RT}\.lds_f32\(md_d\d+ \+ md_stage \* 8192 \+ 63 \* 128 \+ "
+    )
+    for derived, row_reads in (("exchange", 2 + 4), ("pass", 2 + 8)):
+        loops = {}
+        for aux in ("register", "ring"):
+            source = _source(
+                bound,
+                _config(
+                    32,
+                    128,
+                    warps=8,
+                    stages=4,
+                    cute_mma_dag_derived=derived,
+                    cute_mma_dag_aux=aux,
+                ),
+            )
+            loops[aux] = _loop_and_after(_kernel_body(source))
+        register, ring = loops["register"], loops["ring"]
+        assert len(alias_read.findall(register)) == row_reads
+        assert f"{RT}.cp_async_4(" not in register and "md_aux0" not in register
+        assert not alias_read.findall(ring)
+        assert ring.count(f"{RT}.cp_async_4(") == 1
+        assert ring.count(f"{RT}.lds_f32(md_aux0 + md_stage * 128 + 0 + ") == row_reads
+        assert f"{RT}.ldg_f32(" not in ring
+        assert not _bf16_casts_of_computed_values(ring)
+        # The rescale reads the shared row: behind the iteration barrier.
+        rescale = re.search(r"\n\s+md_c0_0_0_0 = md_v", ring)
+        assert rescale is not None
+        assert rescale.start() > ring.index("cute.arch.barrier()")
+        assert ring.count("cute.arch.barrier()") == 2
+
+
+def test_the_rounding_root_is_found_through_views() -> None:
+    # The q pass's value is ``(q * gate).to(bf16).transpose(-2, -1)``: the
+    # pack rounds the fp32 products itself, so no scalar bf16 cast (and no
+    # widening back) is left in the loop; the 16-bit intermediate of a
+    # lossy chain (k -> f16 -> bf16) stays (see the lossy cast test).
+    body = _kernel_body(
+        _source(_bind_bwd("scalar"), _config(32, 64, warps=4, stages=4))
+    )
+    loop = _loop_and_after(body)
+    assert not _bf16_casts_of_computed_values(loop)
+    assert loop.count(f"{RT}.pack_bf16x2(") == 8
+    assert loop.count("cute.arch.mul_packed_f32x2(") == 8

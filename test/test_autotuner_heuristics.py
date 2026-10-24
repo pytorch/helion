@@ -11019,13 +11019,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        for tcfg in (bias_tcfg, residual_tcfg):
-            self.assertIsNone(tcfg.pipeline_smem_facts)
-            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(
-                ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
-            )
-            self.assertEqual(ab_fragment.high, 12)
+        # The broadcast (rowvec) bias keeps the legacy fragment: no allocation
+        # proof, the dtype hard cap. An exact-shape 16-bit auxiliary load is a
+        # register-resident SIMT load that takes no shared memory, so the
+        # residual kernel keeps the complete allocation proof (facts that record
+        # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
+        self.assertIsNone(bias_tcfg.pipeline_smem_facts)
+        bias_ab_fragment = bias_tcfg.optional_fragments(for_search=True)[
+            "tcgen05_ab_stages"
+        ]
+        self.assertEqual(
+            bias_ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
+        )
+        self.assertEqual(bias_ab_fragment.high, 12)
+        self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
+        self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
+        self.assertEqual(
+            residual_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(

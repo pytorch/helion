@@ -88,8 +88,16 @@ from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
 from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
+from .cute_mma_dag import MMA_DAG_DERIVED_PASS
+from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from .cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from .cute_mma_dag import MMA_DAG_K_STEP
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
@@ -139,6 +147,14 @@ if TYPE_CHECKING:
 
 TCGEN05_WARP_CHOICES: tuple[int, ...] = (4, 8)
 TCGEN05_EPILOGUE_WARPS = 4
+# ``cute_mma_dag_epilogue='split'``: the region programs' epilogue on eight
+# warps, warp w + 4 taking the other half of warp w's rows' columns (the two
+# reach the same tensor-memory lanes).
+TCGEN05_SPLIT_WARPS = 8
+# Columns of a fragment one thread holds at least under the split: the
+# packet loops over exchange, staging and aux tiles move 16 bytes (eight
+# 16-bit elements) per step.
+TCGEN05_SPLIT_MIN_COLS = 8
 # The epilogue warps' own barrier while the pass warps run their loop.
 EPILOGUE_WARPS_BARRIER = (
     f"cute.arch.barrier(barrier_id=1, number_of_threads={32 * TCGEN05_EPILOGUE_WARPS})"
@@ -245,7 +261,8 @@ class Tcgen05TileFacts:
     elem_bytes: int
     source_bytes: int
     region: str
-    # The tensor core reads the tile MN-major (its K along the rows).
+    # The tensor core reads the tile MN-major (its K along the rows) -- by
+    # some reader of the shared tile (region programs: ``tile_mn_major``).
     mn_major: bool = False
     # A per-element pass rewrites the tile (a pointwise chain or a dtype
     # change between the source and the operand).
@@ -278,6 +295,10 @@ class RegisterCarryFacts:
 
     slot: int
     live: tuple[tuple[int, ...], ...]
+    # The same live sets as (rows, cols) axis pairs: the split epilogue's
+    # budget counts the columns one thread holds of each (``live`` counts
+    # whole rows, the row layout's budget).
+    live_frags: tuple[tuple[tuple[int, int], ...], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -316,6 +337,10 @@ class Tcgen05Facts:
     # Some dot runs on fp32 (tf32) operands.
     tf32: bool = False
     ring_loops: int = 0
+    # Region programs: the ring loops the streamed schedule may render
+    # (``cute_mma_dag_tcgen05_regions.streamed_loop_candidates``); each
+    # takes one more mbarrier per ring slot.
+    streamed_loops: int = 0
     staged_regions: int = 0
     # Derived values' tile inputs that may ride a loop ring (the
     # ``cute_mma_dag_loads`` knob has a subject).
@@ -324,6 +349,27 @@ class Tcgen05Facts:
     # points (a root fragment's exchange tile is written once ahead of the
     # loop reading it), for the TMEM layout; None: the planner's.
     live_groups: tuple[tuple[int, ...], ...] | None = None
+    # ``derived_cols`` as (rows, cols) axis pairs: the split epilogue's
+    # budget counts the columns one thread holds of each fragment.
+    derived_frags: tuple[tuple[tuple[int, int], ...], ...] = ()
+    # Region programs whose epilogue never needs whole rows (no fragment
+    # reduction, no vector): ``cute_mma_dag_epilogue='split'`` has a subject.
+    split_epilogue: bool = False
+    # Region programs whose one ring loop is a fresh dot and the derived
+    # values over it (``region_lookahead``): the loop and the dot's slot
+    # ``cute_mma_dag_lookahead='on'`` runs one iteration ahead (-1: none).
+    lookahead_loop: int = -1
+    lookahead_slot: int = -1
+    # Region programs: the fp32 A operands the tensor core may read from
+    # tensor memory and the ``X @ X`` dots exchanging one tile for both
+    # operands (``cute_mma_dag_exchange='auto'`` has a subject;
+    # ``cute_mma_dag_tcgen05_regions.tmem_a_candidates`` /
+    # ``shared_operand_dots``).
+    tmem_operands: int = 0
+    # Region programs: why the program cannot run as a persistent launch
+    # (``cute_mma_dag_persistent``; None: it can, given the shared memory
+    # of the persistent layout and a program-order schedule).
+    persistent_reason: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -388,13 +434,35 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
     target = env.config_spec.target_device_capability
     if target is None or target[0] != 10:
         return None
-    if not program.loops or program.scans:
+    if not program.loops or program.scans or program.windowed_stores:
         # A loop-less program (one GEMM over tiles staged once per CTA
         # with a fused epilogue) runs on the warp emitter: neither
         # tensor-memory renderer has been exercised without a loop whose
         # ring feeds the accumulators.  A prefix sum of a fragment is the
-        # warp emitter's as well (a shuffle scan over the mma.sync layout).
+        # warp emitter's as well (a shuffle scan over the mma.sync layout),
+        # and so is a windowed store (rows at a runtime offset under a
+        # runtime limit: the TMA / staged stores here do not drop rows).
         return None
+    if program.windowed:
+        # A windowed load (its tile's rows at a runtime offset, zero at and
+        # past a runtime limit) is the region renderer's: its TMA box lands
+        # at the offset and every read of the tile's elements by a pass is
+        # masked by the limit (``_Evaluator.tile_leaf``).  The single-loop
+        # emitter feeds its tiles to the MMA as they land, and so would a
+        # windowed operand tile without a pass (a bf16 tile read as it is):
+        # neither is admitted (``plan_tcgen05_regions`` refuses the routes
+        # without a pass as well).
+        if program.simple:
+            return None
+        for dot in program.dots:
+            for operand in (dot.a, dot.b):
+                load = operand.load
+                if (
+                    load is not None
+                    and load.windows
+                    and not (operand.pointwise or load.dtype != operand.dtype)
+                ):
+                    return None
     from .cute_mma_dag import cluster_split_axis
 
     vector_steps = (*program.reduces, *program.vec_ops, *program.vec_stores)
@@ -507,6 +575,27 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         epilogue_stores=epilogue_stores,
         derived_cols=derived_cols,
         general_loop=program_order_loop(program),
+        derived_frags=derived_frag_axes(program),
+    )
+
+
+def derived_frag_axes(
+    program: MmaDagProgram,
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Per derived value, the (rows, cols) axis indices of the fragments it
+    reads plus its own (``Tcgen05Facts.derived_frags``)."""
+    return tuple(
+        (
+            *(
+                (
+                    program.slots[program.frag_slots[frag]][0].index,
+                    program.slots[program.frag_slots[frag]][1].index,
+                )
+                for frag in step.frags
+            ),
+            (step.rows.index, step.cols.index),
+        )
+        for step in program.derived
     )
 
 
@@ -556,26 +645,85 @@ def tcgen05_tmem_cols(total: int) -> int:
     return cols
 
 
-def resident_slots(tc: Tcgen05Facts, resolved: Sequence[int]) -> tuple[int, ...]:
-    """The register carries (``Tcgen05Facts.register_carries``) resident at
-    the resolved block sizes: every derived value of the carry's loop keeps
-    its live rows plus the carry's within the register budget."""
-    return tuple(
-        carry.slot
-        for carry in tc.register_carries
-        if all(
-            sum(resolved[axis] for axis in live) <= TCGEN05_MAX_DERIVED_COLS
-            for live in carry.live
-        )
+def tcgen05_half_cols(rows: int, cols: int) -> bool:
+    """Whether a 64-row fragment of ``cols`` columns is read with
+    ``tcgen05.ld.16x32bx2``: lanes 0-15 of a warp hold the first half of
+    their row's columns, lanes 16-31 the second, so every lane carries data
+    (the ``32x32b`` shape leaves lanes 16-31 idle).  The half must be a
+    power of two of at least one 16-byte packet."""
+    half = cols // 2
+    return (
+        rows == 64
+        and cols >= 16
+        and half & (half - 1) == 0
+        and half <= 2 * TCGEN05_LD_COLS
     )
 
 
-def tcgen05_slot_columns(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> int:
+def tcgen05_thread_cols(rows: int, cols: int, split: bool = False) -> int:
+    """fp32 columns of a ``rows x cols`` fragment one epilogue thread holds:
+    the row (the ``row`` epilogue), half of it under the split epilogue
+    (its warp pair shares the row), and half again where the 64-row tile's
+    lane halves split the warp's columns (``tcgen05_half_cols``)."""
+    if split:
+        cols //= 2
+    return cols // 2 if tcgen05_half_cols(rows, cols) else cols
+
+
+def tcgen05_live_cols(
+    resolved: Sequence[int],
+    cols: Sequence[int],
+    frags: Sequence[tuple[int, int]],
+    split: bool,
+) -> int:
+    """The register budget's count of one derived value's live set: whole
+    rows (``cols``, the column axes) under the row epilogue -- its 64-row
+    tiles hold half rows, a margin the measured kernels keep -- and the
+    thread's columns of each (rows, cols) fragment under the split."""
+    if not split:
+        return sum(resolved[axis] for axis in cols)
+    return sum(
+        tcgen05_thread_cols(resolved[rows], resolved[columns], split=True)
+        for rows, columns in frags
+    )
+
+
+def resident_slots(
+    tc: Tcgen05Facts, resolved: Sequence[int], split: bool = False
+) -> tuple[int, ...]:
+    """The register carries (``Tcgen05Facts.register_carries``) resident at
+    the resolved block sizes: every derived value of the carry's loop keeps
+    its live rows plus the carry's within the register budget (the
+    thread's columns of them under the split epilogue)."""
+    resident = []
+    for carry in tc.register_carries:
+        # (Facts without the axis pairs keep the row accounting.)
+        frags = carry.live_frags if split and carry.live_frags else None
+        if all(
+            tcgen05_live_cols(
+                resolved,
+                live,
+                frags[index] if frags is not None else (),
+                frags is not None,
+            )
+            <= TCGEN05_MAX_DERIVED_COLS
+            for index, live in enumerate(carry.live)
+        ):
+            resident.append(carry.slot)
+    return tuple(resident)
+
+
+def tcgen05_slot_columns(
+    facts: CuteMmaDagFacts,
+    resolved: Sequence[int],
+    split: bool = False,
+    lookahead: bool = False,
+) -> int:
     tc = facts.tcgen05
     if tc is not None and tc.regions:
         from .cute_mma_dag_tcgen05_regions import region_tmem_columns
 
-        return region_tmem_columns(facts, resolved)
+        return region_tmem_columns(facts, resolved, split=split, lookahead=lookahead)
     """TMEM columns of all fragment slots at 32-column-aligned offsets."""
     return sum(
         _align(resolved[cols], TCGEN05_SLOT_ALIGN) for _rows, cols in facts.frags
@@ -633,19 +781,52 @@ def tcgen05_fixed_bytes(
 
 
 def tcgen05_smem_bytes(
-    facts: CuteMmaDagFacts, resolved: Sequence[int], stages: int, staged: bool
+    facts: CuteMmaDagFacts,
+    resolved: Sequence[int],
+    stages: int,
+    staged: bool,
+    persistent: bool = False,
 ) -> int:
+    """Shared memory of the tcgen05 config (``persistent``: a region
+    program's persistent layout keeps its root items beside the frames;
+    the single-loop layout is the same either way)."""
     tc = facts.tcgen05
     assert tc is not None
     if tc.regions:
         from .cute_mma_dag_tcgen05_regions import region_smem_bytes
 
-        return region_smem_bytes(facts, resolved, stages)
-    total = stages * tcgen05_stage_bytes(tc, resolved)
-    total += tcgen05_fixed_bytes(facts, resolved, staged, total)
+        return region_smem_bytes(facts, resolved, stages, persistent=persistent)
+    ring = stages * tcgen05_stage_bytes(tc, resolved)
+    total = ring + tcgen05_fixed_bytes(facts, resolved, staged, ring)
     # Barriers (the program-order loop adds its step barrier) and the TMEM
     # slot.
-    return total + 8 * (stages + 3 + int(tc.general_loop)) + 16
+    total += 8 * (stages + 3 + int(tc.general_loop)) + 16
+    if persistent:
+        staging = 0
+        for slot, es in tc.epilogue_stores:
+            rows, cols = facts.frags[slot]
+            staging = max(staging, resolved[rows] * resolved[cols] * es)
+        total += tcgen05_persistent_staging(facts, staging, ring, total)
+    return total
+
+
+def tcgen05_persistent_staging(
+    facts: CuteMmaDagFacts, staging: int, ring_bytes: int, smem: int
+) -> int:
+    """The bytes a persistent launch adds for its epilogue staging tile:
+    the tile overlays the drained ring's last bytes in a one-tile launch
+    (and in a persistent one that cannot afford more), which holds the next
+    tile's boxes over those bytes back until the staging reads are done
+    (the dv kernel at (8, 8, 1024, 64, 64): a 1.2-2.4k-cycle wait at every
+    later tile's start); when ``smem`` plus the tile fits the capacity, the
+    tile lives beside the fixed region instead and every leading box goes
+    out under the epilogue.  0: no staging tile, or it already lives
+    beside the ring (larger than it), or it does not fit."""
+    if not staging or staging > ring_bytes:
+        return 0
+    if facts.smem_capacity and smem + staging > facts.smem_capacity:
+        return 0
+    return staging
 
 
 def tcgen05_warps_reason(warps: object) -> str | None:
@@ -663,14 +844,36 @@ def tcgen05_config_reason(
     warps: int,
     stages: int,
     derived: str = MMA_DAG_DERIVED_EXCHANGE,
+    epilogue: str = MMA_DAG_EPILOGUE_ROW,
+    lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
+    persistent: bool = False,
 ) -> str | None:
     """Why the resolved block sizes cannot run the tcgen05 mode (None: they
     can).  The caller checked the warp / stage choices, the power-of-two and
     divisibility rules and the dot K step; ``derived`` is the
-    ``cute_mma_dag_derived`` route (it sizes the region programs' items)."""
+    ``cute_mma_dag_derived`` route (it sizes the region programs' items),
+    ``epilogue`` the ``cute_mma_dag_epilogue`` layout (the split counts the
+    thread's half rows in the derived-value register budget), ``lookahead``
+    the ``cute_mma_dag_lookahead`` schedule (it doubles the ring loop's dot
+    slot in tensor memory), ``persistent`` the ``cute_mma_dag_persistent``
+    launch (a region program's root items then live beside the frames)."""
     tc = facts.tcgen05
     if tc is None:
         return f"the kernel or the target does not admit {MMA_DAG_TCGEN05}"
+    split = epilogue == MMA_DAG_EPILOGUE_SPLIT
+    if split:
+        from .cute_mma_dag import mma_dag_epilogue_reason
+
+        reason = mma_dag_epilogue_reason(facts, warps, MMA_DAG_TCGEN05)
+        if reason is not None:
+            return f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r}: {reason}"
+    ahead = lookahead == MMA_DAG_LOOKAHEAD_ON
+    if ahead:
+        from .cute_mma_dag import mma_dag_lookahead_reason
+
+        reason = mma_dag_lookahead_reason(facts, stages, MMA_DAG_TCGEN05)
+        if reason is not None:
+            return f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r}: {reason}"
     if (
         facts.split_axis >= 0
         and resolved[facts.split_axis] != facts.axes[facts.split_axis].extent
@@ -686,7 +889,14 @@ def tcgen05_config_reason(
                 "a tcgen05 tile needs columns in multiples of 8 up to "
                 f"{TCGEN05_MAX_N}, not {bn}"
             )
-    columns = tcgen05_slot_columns(facts, resolved)
+        if split and tcgen05_thread_cols(bm, bn, split=True) < TCGEN05_SPLIT_MIN_COLS:
+            # The exchange tiles, staging tiles and aux reads move 16-byte
+            # packets of the thread's columns: eight 16-bit elements at least.
+            return (
+                f"the split epilogue leaves a thread {tcgen05_thread_cols(bm, bn, split=True)} "
+                f"columns of a {bm}x{bn} fragment (at least {TCGEN05_SPLIT_MIN_COLS})"
+            )
+    columns = tcgen05_slot_columns(facts, resolved, split, ahead)
     if columns > TCGEN05_MAX_TMEM_COLS:
         return (
             f"the fragments need {columns} TMEM columns (limit {TCGEN05_MAX_TMEM_COLS})"
@@ -711,8 +921,9 @@ def tcgen05_config_reason(
     for tile in tc.tiles:
         if tile.passed and tile.elem_bytes == 4 and tile.source_bytes == 4:
             return "no in-place pass over fp32 (the pass rewrites 16-bit pairs)"
-    for cols in tc.derived_cols:
-        live = sum(resolved[c] for c in cols)
+    for index, cols in enumerate(tc.derived_cols):
+        frags = tc.derived_frags[index] if split and tc.derived_frags else ()
+        live = tcgen05_live_cols(resolved, cols, frags, split and bool(frags))
         if live > TCGEN05_MAX_DERIVED_COLS:
             return (
                 f"a derived value holds {live} fp32 columns per thread in "
@@ -721,7 +932,15 @@ def tcgen05_config_reason(
     if tc.regions:
         from .cute_mma_dag_tcgen05_regions import region_config_reason
 
-        return region_config_reason(facts, resolved, stages, derived=derived)
+        return region_config_reason(
+            facts,
+            resolved,
+            stages,
+            derived=derived,
+            split=split,
+            lookahead=ahead,
+            persistent=persistent,
+        )
     smem = tcgen05_smem_bytes(facts, resolved, stages, True)
     if facts.smem_capacity and smem > facts.smem_capacity:
         return (
@@ -880,12 +1099,20 @@ def tcgen05_persistent_ctas(
 ) -> int:
     """The CTAs per SM a persistent launch of the tcgen05 config should
     run: the shared- and tensor-memory occupancy of one CTA (capped at the
-    knob's largest choice), 0 when the grid would not fill two waves of
-    them (nothing to amortize)."""
+    knob's largest choice; a region program's persistent layout, which 0
+    when it does not fit or the program excludes the launch), 0 when the
+    grid would not fill two waves of them (nothing to amortize)."""
     from .cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
 
+    tc = facts.tcgen05
+    assert tc is not None
     resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
-    smem = tcgen05_smem_bytes(facts, resolved, stages, True)
+    if tc.regions:
+        from .cute_mma_dag_tcgen05_regions import region_config_reason
+
+        if region_config_reason(facts, resolved, stages, persistent=True) is not None:
+            return 0
+    smem = tcgen05_smem_bytes(facts, resolved, stages, True, persistent=True)
     tmem = tcgen05_tmem_cols(tcgen05_slot_columns(facts, resolved))
     ctas = mma_dag_ctas_per_sm(
         smem, facts.smem_capacity, tmem, max(MMA_DAG_PERSISTENT_CHOICES)
@@ -899,13 +1126,154 @@ def tcgen05_persistent_ctas(
     return ctas
 
 
+def tcgen05_split_seed(
+    facts: CuteMmaDagFacts,
+) -> tuple[dict[int, int], int, int] | None:
+    """The split epilogue's seed (``cute_mma_dag_epilogue='split'``, eight
+    warps): the largest root tile the split admits, at the best region rank
+    among its stage depths (None: the program or no tile admits it).  The
+    tile the row layout's budget refuses -- 128 x 128 over a derived carry,
+    the sparse-attention indexer's logits -- is the split's subject: one
+    wave of 128 CTAs, every warp over half a row."""
+    if not any(axis.kind == AXIS_ROOT for axis in facts.axes):
+        # (A program without a root tile keeps the knob to the search.)
+        return None
+    seeds = tcgen05_seed_configs(facts, epilogue=MMA_DAG_EPILOGUE_SPLIT)
+    if not seeds:
+        return None
+
+    def root_area(sizes: Mapping[int, int]) -> int:
+        area = 1
+        for axis in facts.axes:
+            if axis.kind == AXIS_ROOT:
+                area *= sizes[axis.block_id]
+        return area
+
+    largest = max(root_area(sizes) for sizes, _warps, _stages in seeds)
+    return next(seed for seed in seeds if root_area(seed[0]) == largest)
+
+
+def tcgen05_split_twins(
+    facts: CuteMmaDagFacts, seed: tuple[Mapping[int, int], int, int]
+) -> list[tuple[dict[int, int], int, int]]:
+    """The split epilogue's twins of a four-warp tensor-memory ``seed``
+    (``(sizes, warps, stages)``): its tile with the fragment rows doubled,
+    and with the fragment columns doubled, at eight warps and its stages.
+    A thread of the eight-warp split holds the registers of a thread of the
+    four-warp row layout over half the tile, so each twin runs the seed's
+    epilogue budget over twice the tile: twice the rows is the M=128 MMA
+    shape (the tensor core's full rate; M=64 runs at half), twice the
+    columns halves the operand traffic per output element (the indexer at
+    (512, 4096), B200: 64 x 64 at four warps 38.5 us; 128 x 64 split
+    32.5, 64 x 128 split 30.6 against Triton's 29.8).  Twins the extent
+    does not divide, the row layout's 128-row tiles, or configs the split
+    refuses are left out (empty: none)."""
+    from .cute_mma_dag import mma_dag_config_reason
+
+    sizes, warps, stages = seed
+    tc = facts.tcgen05
+    if tc is None or not (tc.regions and tc.split_epilogue):
+        return []
+    if warps != TCGEN05_DEFAULT_WARPS or not any(
+        axis.kind == AXIS_ROOT for axis in facts.axes
+    ):
+        # (A program without a root tile keeps the knob to the search, as
+        # ``tcgen05_split_seed`` does.)
+        return []
+    twins: list[tuple[dict[int, int], int, int]] = []
+    for position in (0, 1):
+        axes = {rows_cols[position] for rows_cols in facts.frags}
+        candidate = dict(sizes)
+        for index in sorted(axes):
+            axis = facts.axes[index]
+            if axis.kind not in (AXIS_ROOT, AXIS_LOOP):
+                break
+            doubled = 2 * sizes[axis.block_id]
+            if axis.extent % doubled or (
+                position == 0 and doubled > max(TCGEN05_M_CHOICES)
+            ):
+                break
+            candidate[axis.block_id] = doubled
+        else:
+            if (
+                axes
+                and candidate != dict(sizes)
+                and mma_dag_config_reason(
+                    facts,
+                    candidate,
+                    TCGEN05_SPLIT_WARPS,
+                    stages,
+                    MMA_DAG_TCGEN05,
+                    epilogue=MMA_DAG_EPILOGUE_SPLIT,
+                )
+                is None
+            ):
+                twins.append((candidate, TCGEN05_SPLIT_WARPS, stages))
+    return twins
+
+
+def tcgen05_lookahead_stages(
+    facts: CuteMmaDagFacts,
+    sizes: Mapping[int, int],
+    warps: int,
+    stages: int,
+    split: bool,
+) -> int:
+    """The ring depth of a lookahead seed over the tile ``sizes``: two slots
+    at least (the next tile lands under the epilogue), three where the tile
+    runs one CTA per SM at two -- with no co-resident CTA to overlap the
+    refill's latency, the ring must hold the slot the in-flight dot reads,
+    the next tile landed and one in flight (the indexer's 128 x 128 split
+    at (512, 4096), B200: three stages 29.3 us against two 32.5; the
+    128 x 64 split at two CTAs per SM: two 31.6 against three 32.9).  The
+    seed's deeper ring is kept where it is one already."""
+    from .cute_mma_dag import mma_dag_config_reason
+    from .cute_mma_dag import mma_dag_cta_count
+    from .cute_mma_dag import mma_dag_ctas_per_sm
+
+    stages = max(stages, 2)
+    if stages >= 3:
+        return stages
+    resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
+    smem = tcgen05_smem_bytes(facts, resolved, stages, True)
+    tmem = tcgen05_tmem_cols(tcgen05_slot_columns(facts, resolved, split, True))
+    resident = mma_dag_ctas_per_sm(smem, facts.smem_capacity, tmem)
+    if facts.sm_count:
+        # A grid below the SM count leaves every SM one CTA, whatever the
+        # occupancy admits.
+        resident = min(
+            resident, -(-mma_dag_cta_count(facts, resolved) // facts.sm_count)
+        )
+    if resident >= 2:
+        return stages
+    epilogue = MMA_DAG_EPILOGUE_SPLIT if split else MMA_DAG_EPILOGUE_ROW
+    if (
+        mma_dag_config_reason(
+            facts,
+            sizes,
+            warps,
+            3,
+            MMA_DAG_TCGEN05,
+            epilogue=epilogue,
+            lookahead=MMA_DAG_LOOKAHEAD_ON,
+        )
+        is not None
+    ):
+        return stages
+    return 3
+
+
 def tcgen05_seed_configs(
     facts: CuteMmaDagFacts,
+    epilogue: str = MMA_DAG_EPILOGUE_ROW,
+    lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
 ) -> list[tuple[dict[int, int], int, int]]:
     """Ranked tcgen05 ``(sizes, warps, stages)`` seeds: fragment rows from
     the {64, 128} ladder, other tunable axes from {64, 128, 32, 16}, four
     warps then eight, stages 8 then 4 (a tile loop: also 2 and 1, never
-    deeper than its trip count).
+    deeper than its trip count).  Under ``epilogue='split'`` the seeds are
+    the eight-warp configs legal for the split epilogue (empty where the
+    program has no subject for it).
 
     Ranked by CTAs >= 128, then fitting the grid in one wave: a grid beyond
     the SM count wants two CTAs per SM of shared memory *and* tensor memory
@@ -920,6 +1288,10 @@ def tcgen05_seed_configs(
     tc = facts.tcgen05
     if tc is None:
         return []
+    split = epilogue == MMA_DAG_EPILOGUE_SPLIT
+    if split and not (tc.regions and tc.split_epilogue):
+        return []
+    warp_choices = (TCGEN05_SPLIT_WARPS,) if split else TCGEN05_SEED_WARPS
     tunable = _tunable_axes(facts)
     fixed = _fixed_sizes(facts)
     ladders = [
@@ -938,6 +1310,15 @@ def tcgen05_seed_configs(
     loop_axes = {axis.loop for axis in facts.axes if axis.kind == AXIS_LOOP}
     chain_loop = tc.regions and any(
         index not in loop_axes for index in range(len(facts.loops))
+    )
+    # A region program whose every loop is a streamed K loop
+    # (``cute_mma_dag_tcgen05_regions.streamed_loop_candidates``: the K-loop
+    # GEMMs with a passed operand), ranked by its own cost below.
+    streamed = (
+        tc.regions
+        and not chain_loop
+        and bool(facts.loops)
+        and tc.streamed_loops == len(facts.loops)
     )
     fallback = False
     for choice in _seed_choices(ladders):
@@ -969,14 +1350,23 @@ def tcgen05_seed_configs(
             stage_choices = TCGEN05_SEED_STAGES + TCGEN05_FALLBACK_STAGES
         if fallback:
             stage_choices = TCGEN05_FALLBACK_STAGES
-        for stages, warps in itertools.product(stage_choices, TCGEN05_SEED_WARPS):
+        for stages, warps in itertools.product(stage_choices, warp_choices):
             if (
-                mma_dag_config_reason(facts, sizes, warps, stages, MMA_DAG_TCGEN05)
+                mma_dag_config_reason(
+                    facts,
+                    sizes,
+                    warps,
+                    stages,
+                    MMA_DAG_TCGEN05,
+                    epilogue=epilogue,
+                    lookahead=lookahead,
+                )
                 is not None
             ):
                 continue
             if (
-                tc.regions
+                not split
+                and tc.regions
                 and warps > TCGEN05_DEFAULT_WARPS
                 and not region_warps_matter(facts, sizes)
             ):
@@ -987,10 +1377,12 @@ def tcgen05_seed_configs(
             root_area = 1
             root_perimeter = 0
             loop_area = 1
+            slices = 1
             for (index, axis), tile in zip(tunable, choice, strict=True):
                 if index == facts.split_axis:
                     # The cluster's CTAs each take a slice of the axis.
-                    ctas *= axis.extent // tile
+                    slices = axis.extent // tile
+                    ctas *= slices
                 elif axis.kind == AXIS_ROOT:
                     ctas *= axis.extent // tile
                     root_area *= tile
@@ -1001,12 +1393,60 @@ def tcgen05_seed_configs(
                 cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))
             ]
             smem = tcgen05_smem_bytes(facts, resolved, stages, True)
-            tmem = tcgen05_tmem_cols(tcgen05_slot_columns(facts, resolved))
+            tmem = tcgen05_tmem_cols(
+                tcgen05_slot_columns(
+                    facts, resolved, split, lookahead == MMA_DAG_LOOKAHEAD_ON
+                )
+            )
             two_per_sm = (
                 not facts.smem_capacity or 2 * smem <= facts.smem_capacity
             ) and 2 * tmem <= TCGEN05_MAX_TMEM_COLS
             fits_wave = not facts.sm_count or ctas <= facts.sm_count or two_per_sm
-            if tc.regions:
+            if streamed:
+                if (
+                    facts.pass_chains
+                    and mma_dag_config_reason(
+                        facts,
+                        sizes,
+                        warps,
+                        stages,
+                        MMA_DAG_TCGEN05,
+                        MMA_DAG_DERIVED_PASS,
+                        epilogue=epilogue,
+                        lookahead=lookahead,
+                    )
+                    is not None
+                ):
+                    # The pass route leads these programs (the heuristic's
+                    # twin order): a ring the chain's tiles do not fit would
+                    # seed the exchange route with the chain's sources left
+                    # to the lanes.
+                    continue
+                # A streamed K loop's passes rewrite an A and a B tile per
+                # iteration on every warp, redone by every CTA of the output
+                # tile's row and column: the work per SM is the CTAs it
+                # hosts over the wave times the root tile's perimeter, the
+                # tensor core and the ring behind it.  se_block dx at
+                # 1024x512 (B200): [64, 64] 8w s4 9.9 us against [64, 32] s4
+                # 17.2 (two CTAs per SM, half the tile), [64, 128] s2 14.4
+                # (half the SMs) and [64, 16] 4w s2 21.0 (the two-per-SM rank
+                # above); at 4096x1024 [128, 128, 32] s4 57 us against
+                # [128, 64, 64] 4w s2 118 and [64, 64, 64] 8w s4 109.  Eight
+                # warps spread the passes (9.9 against 10.9 at four); the
+                # ring deepens to four slots first, then the bytes in flight
+                # ([128, 128, 32] s4 57 against [128, 128, 64] s2 67; [64,
+                # 64, 64] s4 9.9 against [64, 64, 32] s8 11.5).
+                waves = -(-ctas // facts.sm_count) if facts.sm_count else 1
+                rank = (
+                    int(ctas >= 128),
+                    -(waves * root_perimeter),
+                    root_area,
+                    warps,
+                    min(stages, 4),
+                    stages * loop_area,
+                    loop_area,
+                )
+            elif tc.regions:
                 # Region programs (many small CTAs, a few iterations each):
                 # two CTAs per SM of shared memory and TMEM first (one CTA
                 # leaves the SM idle through every commit round trip: wy_dL
@@ -1043,8 +1483,9 @@ def tcgen05_seed_configs(
                     stages,
                     loop_area,
                     -warps,
-                    # A cluster split's slices (equal otherwise): more CTAs.
-                    ctas,
+                    # A cluster split's slices: more CTAs.  (Root tiles that
+                    # tie keep the ladders' order, ``TCGEN05_N_LADDER``.)
+                    slices,
                 )
             elif chain:
                 waves = -(-ctas // facts.sm_count) if facts.sm_count else 1
@@ -1222,7 +1663,15 @@ class Tcgen05Tile:
         return step * self.k_elems * self.atom_bytes
 
     def leading_byte_offset(self, k_major: bool) -> int:
-        return 16 if k_major else self.slab_bytes
+        """The descriptor's leading byte offset: unused for a swizzled
+        K-major read (16, the conventional value) except under the 32-byte
+        unit swizzle -- a row-major fp32 tile written for an MN-major B read
+        and read K-major as the A of the same ``X @ X`` dot (``shared_
+        operand_dots``) -- where the hardware rejects 16 (misaligned
+        address) and takes the slab stride like the MN-major read."""
+        if k_major and self.swizzle != ATOM_32B_SWIZZLE:
+            return 16
+        return self.slab_bytes
 
     @property
     def stride_byte_offset(self) -> int:
@@ -1341,6 +1790,22 @@ class Tcgen05Plan:
     # mbarrier (``cute_mma_dag_pass_warps``); the stores then take the
     # four-warp path.
     pass_warps: bool = False
+    # Region programs under ``cute_mma_dag_epilogue='split'``: all eight
+    # warps run the epilogue, warp w + 4 over the second half of warp w's
+    # rows' columns (``tcgen05_thread_cols``).
+    split_epilogue: bool = False
+    # Region programs under ``cute_mma_dag_lookahead='on'``: the ring
+    # loop's dot (``Tcgen05Facts.lookahead_loop`` / ``lookahead_slot``) is
+    # issued one iteration ahead of its epilogue into the slot's twin
+    # columns (the slot spans ``2 * lookahead_width``) by iteration parity.
+    lookahead: bool = False
+    lookahead_width: int = 0
+    lookahead_loop: int = -1
+    lookahead_slot: int = -1
+    # Region programs under ``cute_mma_dag_exchange='auto'``: the A operands
+    # read from tensor memory, (dot node, role) -> the fragment slot (no
+    # shared tile exists for them; ``tile`` must not be asked).
+    tmem_operands: dict[tuple[Node, str], int] = dataclasses.field(default_factory=dict)
 
     @property
     def store_warps(self) -> int:
@@ -1364,6 +1829,9 @@ def plan_tcgen05(
     loads_mode: str = MMA_DAG_LOADS_TMA,
     persistent: bool = False,
     derived_mode: str = MMA_DAG_DERIVED_EXCHANGE,
+    epilogue: str = MMA_DAG_EPILOGUE_ROW,
+    lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
+    exchange_mode: str = MMA_DAG_EXCHANGE_AUTO,
 ) -> Tcgen05Plan:
     """The tcgen05 plan for the resolved ``sizes`` (the config passed
     :func:`tcgen05_config_reason`)."""
@@ -1383,6 +1851,20 @@ def plan_tcgen05(
             store_mode,
             loads_mode,
             derived_mode,
+            epilogue=epilogue,
+            lookahead=lookahead,
+            exchange_mode=exchange_mode,
+            persistent=persistent,
+        )
+    if epilogue != MMA_DAG_EPILOGUE_ROW:
+        raise _decline(
+            f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r}: the single-loop renderer "
+            "keeps one row per epilogue thread"
+        )
+    if lookahead != MMA_DAG_LOOKAHEAD_OFF:
+        raise _decline(
+            f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r}: the single-loop renderer "
+            "issues its dots in program order"
         )
     if any(route == ROUTE_DERIVED for route in routes.values()):
         # (Pass chains are tile-only derived values: never a simple program.)
@@ -1654,25 +2136,30 @@ def plan_tcgen05(
         ),
         default=0,
     )
+    general = program_order_loop(program)
+    barriers = 8 * (stages + 3 + int(general) + (2 * stages if pass_warps else 0)) + 16
     if epilogue_staging <= fixed_offset:
         # A persistent launch prefetches the next tile's first ring slot under
-        # this epilogue: the staging tile overlays the ring's last bytes, so
-        # the slot's leading TMA boxes can land while it is read.
-        epilogue_staging_offset = (
-            (fixed_offset - epilogue_staging) // SLAB_ALIGNMENT * SLAB_ALIGNMENT
-            if persistent
-            else 0
-        )
+        # this epilogue: the staging tile lives beside the fixed region when
+        # the capacity allows (``tcgen05_persistent_staging``), so every
+        # leading TMA box of the slot can land while it is read; otherwise
+        # it overlays the ring's last bytes and the boxes over them wait
+        # for the staging reads.
+        if persistent and tcgen05_persistent_staging(
+            facts, epilogue_staging, fixed_offset, fixed_offset + fixed + barriers
+        ):
+            epilogue_staging_offset = fixed_offset + fixed
+            fixed += epilogue_staging
+        else:
+            epilogue_staging_offset = (
+                (fixed_offset - epilogue_staging) // SLAB_ALIGNMENT * SLAB_ALIGNMENT
+                if persistent
+                else 0
+            )
     else:
         epilogue_staging_offset = fixed_offset + fixed
         fixed += epilogue_staging
-    general = program_order_loop(program)
-    smem = (
-        fixed_offset
-        + fixed
-        + 8 * (stages + 3 + int(general) + (2 * stages if pass_warps else 0))
-        + 16
-    )
+    smem = fixed_offset + fixed + barriers
     if facts.smem_capacity and smem > facts.smem_capacity:
         raise _decline(
             f"{smem} B of shared memory exceed the capacity {facts.smem_capacity}"
@@ -1922,7 +2409,7 @@ class _PassEvaluator(_Evaluator):
             # The half-row's first column (``md_cb{slot}``) must keep the
             # packets aligned: a multiple of the packet's elements.
             slot = int(base[len("md_cb") :])
-            if (em.slot(slot).cols // 2) % per_packet:
+            if em.local_cols(slot) % per_packet:
                 return None
         first = j - j % per_packet
         key = (
@@ -2034,6 +2521,10 @@ class _Tcgen05Emitter(_Emitter):
     pointwise machinery over TMEM-resident fragments (one row per epilogue
     thread, 64 columns per load) and UMMA-swizzled shared tiles."""
 
+    # A windowed tile's TMA box lands its whole rows: the passes mask the
+    # rows at and past the limit as they read them (``_Evaluator.tile_leaf``).
+    masked_tile_windows = True
+
     def __init__(self, cg: GenerateAST, plan: MmaDagPlan) -> None:
         # The warp emitter's constructor builds mma.sync warp grids and the
         # ldmatrix tile map; this mode has neither, so set up the shared
@@ -2047,6 +2538,12 @@ class _Tcgen05Emitter(_Emitter):
         self.tc = tc
         self.program = plan.program
         self.lines = []
+        # ``cute_mma_dag_epilogue='split'`` (region programs): every warp
+        # runs the epilogue over half of its rows' columns.
+        self.split = tc.split_epilogue
+        self.epilogue_warps = (
+            TCGEN05_SPLIT_WARPS if self.split else TCGEN05_EPILOGUE_WARPS
+        )
         # Open ``row_guard`` blocks (lane-divergent ``if md_rowok:``): no
         # CTA-wide barrier may be emitted inside one.
         self.row_guards = 0
@@ -2054,6 +2551,7 @@ class _Tcgen05Emitter(_Emitter):
         self.accesses = {access.node: access for access in self.program.accesses}
         self.base_vars = {}
         self.iter_vars = {}
+        self.scalar_vars = {}
         self.deferred = []
         self._defined_tiles = set()
         # The warp emitter's loop state its ``bind`` / raw-ring helpers
@@ -2061,6 +2559,12 @@ class _Tcgen05Emitter(_Emitter):
         # ``in_loop`` form and hoists its side loads through ``prefetched``.
         self.values = {}
         self.raw_stages = {}
+        # The warp emitter's ring-slot aliases of vector loads
+        # (``_Emitter._ring_aliases``) have no subject here: this mode's
+        # ring is TMA-fed and its side loads are hoisted through
+        # ``prefetched``; every vector load keeps its global read.
+        self.ring_aliases = {}
+        self.ring_ready = set()
         # Line indices splitting a persistent launch's render into the
         # once-per-CTA setup, the tile body and the teardown.
         self.setup_end = 0
@@ -2168,34 +2672,40 @@ class _Tcgen05Emitter(_Emitter):
     def half_rows(self, slot: int) -> bool:
         return self.slot(slot).rows == 64
 
+    def warp_cols(self, slot: int) -> int:
+        """Columns of the fragment this thread's warp holds: the row, or
+        half of it under the split epilogue (warps w and w + 4 share it)."""
+        cols = self.slot(slot).cols
+        return cols // 2 if self.split else cols
+
     def half_cols(self, slot: int) -> bool:
         """A 64-row fragment is read with ``tcgen05.ld.16x32bx2``: lanes 0-15
         of a warp hold the first half of their row's columns, lanes 16-31
         the second (``md_cb{slot}`` is the lane's first column), so every
         lane carries data (the ``32x32b`` shape leaves lanes 16-31 idle).
-        The half must be a power of two of at least one 16-byte packet."""
-        geometry = self.slot(slot)
-        half = geometry.cols // 2
-        return (
-            geometry.rows == 64
-            and geometry.cols >= 16
-            and half & (half - 1) == 0
-            and half <= 2 * TCGEN05_LD_COLS
-        )
+        The half must be a power of two of at least one 16-byte packet
+        (``tcgen05_half_cols``; of the warp's half under the split)."""
+        return tcgen05_half_cols(self.slot(slot).rows, self.warp_cols(slot))
 
     def local_cols(self, slot: int) -> int:
         """Columns of the fragment this thread holds."""
         geometry = self.slot(slot)
-        return geometry.cols // 2 if self.half_cols(slot) else geometry.cols
+        return tcgen05_thread_cols(geometry.rows, geometry.cols, self.split)
+
+    def has_cb(self, slot: int) -> bool:
+        """Whether ``md_cb{slot}`` (this thread's first fragment column) is
+        defined: the lane halves of a 64-row tile, every slot of the split
+        epilogue (the warp pair's halves)."""
+        return self.split or self.half_cols(slot)
 
     def col_expr(self, slot: int, j: int) -> str:
         """The fragment column of this thread's local column ``j``."""
-        return f"(md_cb{slot} + {j})" if self.half_cols(slot) else str(j)
+        return f"(md_cb{slot} + {j})" if self.has_cb(slot) else str(j)
 
     def chunk_expr(self, slot: int, chunk: int, per_packet: int) -> str:
         """The 16-byte chunk of the row holding this thread's local packet
         ``chunk`` (``per_packet`` elements per chunk)."""
-        if self.half_cols(slot):
+        if self.has_cb(slot):
             return f"(md_cb{slot} // {per_packet} + {chunk})"
         return str(chunk)
 
@@ -2209,9 +2719,10 @@ class _Tcgen05Emitter(_Emitter):
         return '"16x32bx2"' if self.half_cols(slot) else '"32x32b"'
 
     def ld_offset(self, slot: int) -> str:
-        """The half split-off keyword of the 16x32bx2 shape (empty otherwise)."""
+        """The half split-off keyword of the 16x32bx2 shape (empty otherwise):
+        the second lane half's columns start one local row width in."""
         if self.half_cols(slot):
-            return f", offset={self.slot(slot).cols // 2}"
+            return f", offset={self.local_cols(slot)}"
         return ""
 
     @contextlib.contextmanager
@@ -2463,7 +2974,12 @@ class _Tcgen05Emitter(_Emitter):
             else:
                 axis = subscript.axis
                 assert axis is not None
-                if axis.kind == AXIS_RDIM:
+                if subscript.window is not None:
+                    # The window's rows: the box lands at the runtime row
+                    # offset (rows past the tensor's end zero-fill; rows at
+                    # and past the limit are masked where the tile is read).
+                    value = self.scalar_vars[subscript.window.offset.node]
+                elif axis.kind == AXIS_RDIM:
                     value = "0"
                 elif axis is loop_axis:
                     value = f"({loop_value}) * {self.plan.size(axis)}"
@@ -2498,8 +3014,9 @@ class _Tcgen05Emitter(_Emitter):
                     f"{spec.param}.get_ptr(), [{coords}], md_full + ({stage}))"
                 )
 
-    def emit_epilogue_tma_issue(self) -> None:
-        """One elected thread: the epilogue operand tiles, on ``efull``."""
+    def emit_epilogue_tma_issue(self, *, next_tile: bool = False) -> None:
+        """One elected thread: the epilogue operand tiles, on ``efull``
+        (``next_tile``: the next tile's, at its coordinates)."""
         tc = self.tc
         self.emit(
             f"{_PRIMS}.mbarrier_arrive_expect_tx(md_efull, {tc.epilogue_tx_bytes})"
@@ -2510,11 +3027,31 @@ class _Tcgen05Emitter(_Emitter):
                 continue
             for slab in range(spec.slabs):
                 dst = f"md_smem + {tc.fixed_offset + spec.offset + slab * spec.slab_bytes}"
-                coords = ", ".join(self.tma_coords(spec, self.loop_var, slab))
+                coords = ", ".join(
+                    self.next_tile(c) if next_tile else c
+                    for c in self.tma_coords(spec, self.loop_var, slab)
+                )
                 self.emit(
                     f"{_PRIMS}.cp_async_bulk_tensor_shared_cta_global({dst}, "
                     f"{spec.param}.get_ptr(), [{coords}], md_efull)"
                 )
+
+    def emit_next_tile_epilogue_issue(self) -> None:
+        """A cross-tile persistent launch, behind the tile's end barrier
+        (every reader of this tile's epilogue tiles is done -- the epilogue
+        dot was waited -- and ``md_efull`` was re-armed and published): one
+        elected thread issues the next tile's epilogue operand tiles, so
+        they land under the next tile's loop."""
+        from ..program_id import PersistentProgramIDs
+
+        pid = self.df.pid
+        assert isinstance(pid, PersistentProgramIDs)
+        with (
+            self.nest("if md_warp == 0:"),
+            self.nest(f"if {_PRIMS}.elect_sync():"),
+            self.nest(f"if md_npid < {pid.total_pids_var}:"),
+        ):
+            self.emit_epilogue_tma_issue(next_tile=True)
 
     # -- operand passes -----------------------------------------------------------
 
@@ -2533,11 +3070,23 @@ class _Tcgen05Emitter(_Emitter):
         from ...language import view_ops
         from .cute_mma_dag import _is_swap_permute
 
+        # The root is the node the evaluator lowers: a loop placeholder
+        # aliasing a value of the enclosing region (``program.aliases``; a
+        # 16-bit operand converted at the root and read by a loop's dots)
+        # resolves to that value first, as ``_Evaluator.evaluate`` resolves
+        # it, so the fold finds the same node (``_mask_to`` stays: a masked
+        # root is not folded).
+        aliases = self.program.aliases
         root = strip_new_vars(value)
-        while _is_swap_permute(root) or (
-            root.op == "call_function" and root.target is view_ops.subscript
-        ):
-            root = strip_new_vars(cast("Node", root.args[0]))
+        while True:
+            if root in aliases:
+                root = strip_new_vars(aliases[root])
+            elif _is_swap_permute(root) or (
+                root.op == "call_function" and root.target is view_ops.subscript
+            ):
+                root = strip_new_vars(cast("Node", root.args[0]))
+            else:
+                break
         assert isinstance(self.evaluator, _PassEvaluator)
         self.evaluator.round_root = root
 
@@ -3380,9 +3929,21 @@ class _Tcgen05Emitter(_Emitter):
     # -- fragments in TMEM ---------------------------------------------------------
 
     def tmem_ptr(self, slot: int, col: int) -> str:
+        """The tensor-memory address of this thread's warp's lanes at local
+        column ``col`` of ``slot`` (warp w + 4 reaches the lanes of warp w;
+        under the split epilogue it starts half a row in)."""
         column = self.slot(slot).column + col
+        offset = f"md_tmem + {column}"
+        if self.split:
+            offset = f"{offset} + (md_warp // 4) * {self.warp_cols(slot)}"
+        if self.tc.lookahead and slot == self.tc.lookahead_slot:
+            # The lookahead dot's result of this iteration: the slot's twin
+            # columns at odd iterations (``emit_lookahead_mma`` wrote them).
+            offset = (
+                f"{offset} + md_pt{self.tc.lookahead_loop} * {self.tc.lookahead_width}"
+            )
         return (
-            f"cutlass.inttoptr(((md_warp % 4) * 32 << 16) | (md_tmem + {column}), "
+            f"cutlass.inttoptr(((md_warp % 4) * 32 << 16) | ({offset}), "
             f"{_RT}.TMEM_SPACE, cutlass.Float32)"
         )
 
@@ -4099,6 +4660,10 @@ class _Tcgen05Emitter(_Emitter):
                 self.emit_next_tile_issue(begin, end, early=False)
                 self.emit(f"{self.phase_base} = {self.phase_base} + ({end} - {begin})")
             self.emit(self.sync)
+            if self.phase_base is not None and tc.epilogue_tx_bytes:
+                # The next tile's epilogue tiles, on the re-armed (and now
+                # published) ``md_efull``: they land under its loop.
+                self.emit_next_tile_epilogue_issue()
             self.teardown_start = len(self.lines)
         with self.nest("if md_warp == 0:"):
             self.emit(
@@ -4121,23 +4686,47 @@ class _Tcgen05Emitter(_Emitter):
         warps, epilogue tiles or TMA stores, over the generic
         persistent_interleaved program ids (their mixed-radix decomposition
         of ``virtual_pid + grid`` gives the next tile)."""
-        from ..program_id import PersistentInterleavedProgramIDs
-
         tc = self.tc
-        pid = self.df.pid
         _begin, _end, trip = self.loop_bounds()
         if (
             not tc.tma
             or not tc.tx_bytes
             or tc.pass_warps
             or self.general_loop
-            or tc.epilogue_tx_bytes
             or tc.store_tma
             or not trip
-            or not isinstance(pid, PersistentInterleavedProgramIDs)
-            or self.df.config.get("xcd_remap", False)
         ):
             return False
+        if any(
+            tc.tile(dot, operand).region == REGION_LOOP
+            for dot in self.program.dots_in("epilogue")
+            for operand in (dot.a, dot.b)
+        ):
+            # An epilogue dot over a ring tile (an operand chain it shares
+            # with a loop dot, ``plan_tcgen05``): the slots are not free at
+            # the drain, so no box goes out ahead.
+            return False
+        planned = self.next_tile_coords()
+        if planned is None:
+            return False
+        self.phase_base = "md_ib"
+        self.next_pid, self.next_coords = planned
+        return True
+
+    def next_tile_coords(self) -> tuple[str, dict[str, str]] | None:
+        """The next tile of this CTA's persistent walk: its virtual program
+        id (``virtual_pid + grid``) and each tile coordinate name (the tile
+        begins and the root / leading axis bases) -> its value there, from
+        the generic persistent_interleaved program ids' mixed-radix
+        decomposition (None: another program-id strategy, an XCD remap, or
+        an axis the decomposition does not cover)."""
+        from ..program_id import PersistentInterleavedProgramIDs
+
+        pid = self.df.pid
+        if not isinstance(pid, PersistentInterleavedProgramIDs) or self.df.config.get(
+            "xcd_remap", False
+        ):
+            return None
         infos = pid.pid_info
         counts = [f"({info.num_pids_expr(is_device=True)})" for info in infos[:-1]]
         nxt = f"({pid.virtual_pid_var} + {pid.grid_size_expr})"
@@ -4155,12 +4744,9 @@ class _Tcgen05Emitter(_Emitter):
             if axis.kind in (AXIS_ROOT, AXIS_LEAD):
                 begin = self.cg.tile_begin_var(axis.block_id)
                 if begin not in coords:
-                    return False
+                    return None
                 coords[self.axis_base(axis)] = coords[begin]
-        self.phase_base = "md_ib"
-        self.next_pid = nxt
-        self.next_coords = coords
-        return True
+        return nxt, coords
 
     def next_tile(self, text: str) -> str:
         """``text`` (a TMA coordinate) at the next tile's coordinates."""
@@ -4197,6 +4783,15 @@ class _Tcgen05Emitter(_Emitter):
             )
 
         specs = [t.tma or t.raw_tma for t in tc.loop_tiles]
+        if not early and not any(
+            clear(spec.offset + slab * spec.slab_bytes, spec.slab_bytes) is False
+            for spec in specs
+            if spec is not None
+            for slab in range(spec.slabs)
+        ):
+            # Every box went out early (the staging tile lives beside the
+            # ring): nothing is left for the late issue.
+            return
         with (
             self.nest("if md_warp == 0:"),
             self.nest(f"if {_PRIMS}.elect_sync():"),
@@ -5209,6 +5804,7 @@ __all__ = [
     "TCGEN05_DEFAULT_STAGES",
     "TCGEN05_DEFAULT_WARPS",
     "TCGEN05_EPILOGUE_WARPS",
+    "TCGEN05_SPLIT_WARPS",
     "TCGEN05_WARP_CHOICES",
     "TMA_KIND",
     "SlotGeometry",
@@ -5218,16 +5814,22 @@ __all__ = [
     "Tcgen05Tile",
     "TmaSpec",
     "codegen_mma_dag_tcgen05",
+    "derived_frag_axes",
     "operand_k_major",
     "plan_tcgen05",
+    "resident_slots",
     "tcgen05_atom_bytes",
     "tcgen05_config_reason",
     "tcgen05_facts",
+    "tcgen05_half_cols",
+    "tcgen05_live_cols",
     "tcgen05_repair",
     "tcgen05_seed_configs",
     "tcgen05_slot_columns",
     "tcgen05_smem_bytes",
+    "tcgen05_split_seed",
     "tcgen05_stage_bytes",
+    "tcgen05_thread_cols",
     "tcgen05_tmem_cols",
     "tcgen05_warps_reason",
 ]

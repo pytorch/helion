@@ -338,6 +338,52 @@ TCGEN05_AUX_LOAD_PLACEMENTS = (
     TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
+# The pid type of each GEMM launch of an ordered ``hl.barrier()`` chain (one
+# entry per ``materialized_matmul_block_ids`` triple, like
+# ``tcgen05_region_ab_stages``).  The chain's own ``pid_type`` is ``flat``
+# (one ordered launch per phase, the SIMT phases flat); ``inherit`` keeps a
+# GEMM launch flat, while a persistent value runs it as the static persistent
+# two-CTA pipeline (``tcgen05_cta_group="two"``, ``tcgen05_cluster_m=2``) of
+# the standalone single-GEMM surface, its ring depths per region
+# (``tcgen05_region_ab_stages`` / ``tcgen05_region_c_stages``).  Pure
+# scheduling: the same tiles, operands and epilogue arithmetic.
+TCGEN05_REGION_PID_TYPES_CONFIG_KEY = "tcgen05_region_pid_types"
+TCGEN05_REGION_PID_TYPE_INHERIT = "inherit"
+TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
+    TCGEN05_REGION_PID_TYPE_INHERIT,
+    "persistent_blocked",
+    "persistent_interleaved",
+)
+# The recipe a persistent GEMM launch of a chain runs under, projected onto
+# its launch config by ``materialized_fission_codegen._stage_config`` (the
+# standalone paired pipeline's fixed coordinates, ``_paired_pipeline_parameters``).
+# The chain's whole-kernel config keeps the flat recipe of its ``inherit``
+# launches (a scheduler warp, a one-slot accumulator ring, direct stores ...),
+# which these launches do not see.
+TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION: tuple[tuple[str, object], ...] = (
+    ("tcgen05_persistence_model", "static_persistent"),
+    ("tcgen05_strategy", "role_local_monolithic"),
+    ("tcgen05_layout_strategy", "default"),
+    ("tcgen05_warp_spec_mma_warps", 1),
+    ("tcgen05_warp_spec_ab_load_warps", 1),
+    ("tcgen05_warp_spec_epi_load_warps", 0),
+    ("tcgen05_warp_spec_scheduler_warps", 0),
+    ("tcgen05_warp_spec_c_input_warps", 0),
+    ("tcgen05_warp_spec_store_warps", 0),
+    ("tcgen05_num_epi_warps", 4),
+    ("tcgen05_acc_stages", 2),
+    ("tcgen05_c_store_mode", "normal"),
+    ("tcgen05_aux_load_mode", "simt"),
+    ("tcgen05_acc_wait_placement", "subtile_loop"),
+    ("tcgen05_epilogue_layout", "normal"),
+    ("tcgen05_tvm_ffi_launch", False),
+    ("tcgen05_flat_role_coordinates", False),
+    ("tcgen05_layout_overrides_epi_tile_m", None),
+    ("tcgen05_layout_overrides_epi_tile_n", None),
+    ("tcgen05_layout_overrides_smem_swizzle_a", None),
+    ("tcgen05_layout_overrides_smem_swizzle_b", None),
+    ("tcgen05_layout_overrides_d_store_box_n", None),
+)
 # ``pre_acc_wait`` on an exact-shape auxiliary operand (a full ``(m, n)``
 # residual / gate input) normally issues each subtile's global read just ahead
 # of that subtile's accumulator wait; the named barriers between subtiles

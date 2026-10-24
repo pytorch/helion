@@ -94,6 +94,7 @@ from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
 from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_RING
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
@@ -102,13 +103,24 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_CANONICAL
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_HINTS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_LANE
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_TMA
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
@@ -132,10 +144,15 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
 from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
 from .._compiler.cute.cute_mma_dag import fixup_admitted
+from .._compiler.cute.cute_mma_dag import mma_dag_aux_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_epilogue_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_lookahead_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_persistent_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_ragged_ceilings
 from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
@@ -1809,6 +1826,13 @@ class ConfigSpec:
         # reaches its tile (``cute_mma_dag_derived``: the exchange of a
         # derived fragment, or a packet pass from the staged sources).
         self.cute_mma_dag_derived: EnumFragment | None = None
+        # The tensor-memory region programs' epilogue layout
+        # (``cute_mma_dag_epilogue``: one row per thread on four warps, or
+        # the row's columns split over a warp pair on eight).
+        self.cute_mma_dag_epilogue: EnumFragment | None = None
+        # The region programs' ring-loop schedule (``cute_mma_dag_lookahead``:
+        # the one dot of the loop issued one iteration ahead of its epilogue).
+        self.cute_mma_dag_lookahead: EnumFragment | None = None
         # The tcgen05 mode's persistent launch (CTAs per SM); None where the
         # mode or its one-tile-per-CTA region programs leave it no subject.
         self.cute_mma_dag_persistent: EnumFragment | None = None
@@ -3452,7 +3476,14 @@ class ConfigSpec:
         if facts.aux_candidates:
             self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
         self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
-        if facts.tcgen05 is not None and not facts.tcgen05.regions:
+        self.cute_mma_dag_epilogue = EnumFragment(choices=MMA_DAG_EPILOGUE_CHOICES)
+        self.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
+        if facts.tcgen05 is not None and (
+            not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
+        ):
+            # The persistent launch: the single-loop renderer's tile loop,
+            # or a region program's (``cute_mma_dag_tcgen05_regions``;
+            # ``persistent_reason`` names the programs it excludes).
             self.cute_mma_dag_persistent = EnumFragment(
                 choices=MMA_DAG_PERSISTENT_CHOICES
             )
@@ -3495,6 +3526,8 @@ class ConfigSpec:
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
             (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
             (MMA_DAG_DERIVED_KEY, self.cute_mma_dag_derived),
+            (MMA_DAG_EPILOGUE_KEY, self.cute_mma_dag_epilogue),
+            (MMA_DAG_LOOKAHEAD_KEY, self.cute_mma_dag_lookahead),
         ):
             if fragment is None:
                 # The aux knob has no subject here: inert, no choices.
@@ -3580,6 +3613,8 @@ class ConfigSpec:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
             config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
             config[MMA_DAG_PERSISTENT_KEY] = 0
             config[MMA_DAG_CLUSTER_KEY] = 1
             config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
@@ -3620,13 +3655,142 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
             config[MMA_DAG_CLUSTER_KEY] = 1
+        # The split epilogue has a subject only in the tensor-memory region
+        # programs without reductions, at eight warps; elsewhere the knob is
+        # inert and pinned to the row layout.
+        if (
+            config[MMA_DAG_EPILOGUE_KEY] == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_epilogue_reason(facts, warps, mode) is not None
+        ):
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+        epilogue = cast("str", config[MMA_DAG_EPILOGUE_KEY])
+        # The lookahead schedule has a subject only in the region programs
+        # whose one ring loop is a fresh dot and the derived values over it.
+        if (
+            config[MMA_DAG_LOOKAHEAD_KEY] == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_lookahead_reason(facts, stages, mode) is not None
+        ):
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+        lookahead = cast("str", config[MMA_DAG_LOOKAHEAD_KEY])
+        # The aux ring has a subject only in the warp mode with a side load
+        # varying with an innermost ring loop of the bound inputs; elsewhere
+        # the knob is inert and pinned to the register prefetch.
+        if (
+            config[MMA_DAG_AUX_KEY] == MMA_DAG_AUX_RING
+            and mma_dag_aux_reason(facts, mode) is not None
+        ):
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        aux = cast("str", config[MMA_DAG_AUX_KEY])
+        # The persistent launch has a subject only in the tensor-memory mode
+        # (every single-loop program; the region programs whose root loops
+        # have static trips, under the program-order schedule); elsewhere
+        # the knob is inert and pinned to one tile per CTA.
+        if (
+            config[MMA_DAG_PERSISTENT_KEY]
+            and mma_dag_persistent_reason(facts, mode, lookahead) is not None
+        ):
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        persistent = cast("int", config[MMA_DAG_PERSISTENT_KEY])
         reason = mma_dag_config_reason(
-            facts, sizes_by_block, warps, stages, mode, derived
+            facts,
+            sizes_by_block,
+            warps,
+            stages,
+            mode,
+            derived,
+            epilogue=epilogue,
+            lookahead=lookahead,
+            aux=aux,
+            persistent=persistent > 0,
         )
         if (
             reason is not None
+            and persistent
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+                aux=aux,
+            )
+            is None
+        ):
+            # The persistent layout (a region program's root items beside
+            # the frames) overflows the shared memory the one-tile layout
+            # fits: the tile stays, the launch goes.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PERSISTENT_KEY}={persistent!r}: {reason}"
+                )
+            persistent = config[MMA_DAG_PERSISTENT_KEY] = 0
+            reason = None
+        if (
+            reason is not None
+            and aux == MMA_DAG_AUX_RING
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
+            is None
+        ):
+            # The aux rings overflow the shared memory (or the per-thread
+            # cap) the register prefetch fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_AUX_KEY}={aux!r}: {reason}")
+            aux = config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            reason = None
+        if (
+            reason is not None
+            and lookahead == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived, epilogue=epilogue
+            )
+            is None
+        ):
+            # The doubled dot slot overflows the tensor memory the program
+            # order fits: the tile stays, the schedule goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r}: {reason}")
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
+            and epilogue == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived
+            )
+            is None
+        ):
+            # The split's budget or tensor-memory layout refuses what the
+            # row layout runs: the tile stays, the layout goes (and the
+            # schedule with it).
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r}: {reason}")
+            epilogue = config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
             and derived == MMA_DAG_DERIVED_PASS
-            and mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
             is None
         ):
             # The pass route alone (its ring tiles) overflows the shared
@@ -3654,11 +3818,21 @@ class ConfigSpec:
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
                 config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
                 config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+                config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+                config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
                 config[MMA_DAG_PERSISTENT_KEY] = 0
                 config[MMA_DAG_CLUSTER_KEY] = 1
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
+            # (The repair searched under the row epilogue, in program order,
+            # with the register prefetch, and -- on a region program, whose
+            # persistent layout is larger -- one tile per CTA.)
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            if facts.tcgen05 is not None and facts.tcgen05.regions:
+                config[MMA_DAG_PERSISTENT_KEY] = 0
             for block_id, index in indices.items():
                 block_sizes[index] = new_sizes[block_id]
             # The repaired split axis slice names the split count (1 when
@@ -3704,7 +3878,15 @@ class ConfigSpec:
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
         # snapshot to stage, no device loop whose ring the stage depth sizes.
-        if not facts.identity_candidates:
+        # (The tensor-memory region programs give the exchange knob a second
+        # subject: the fp32 A operands read from tensor memory and the
+        # ``X @ X`` dots sharing one tile.)
+        tcgen05_exchange = (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and facts.tcgen05 is not None
+            and facts.tcgen05.tmem_operands > 0
+        )
+        if not facts.identity_candidates and not tcgen05_exchange:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
@@ -3757,13 +3939,50 @@ class ConfigSpec:
             ("cute_vector_widths", 1),
             ("cute_lane_layouts", "blocked"),
             ("cute_reduction_reloads", "auto"),
-            ("load_eviction_policies", ""),
             ("reduction_loops", None),
             ("flatten_loops", False),
         ):
             value = config.get(key)
             if isinstance(value, list):
                 config[key] = [default for _ in value]
+        # The warp mode's staged tiles carry the L2 policy of their slot
+        # (``MMA_DAG_L2_HINTS``) on their cp.async packets, one canonical
+        # value per packet form; every other slot (the side loads, every load
+        # of the tensor-memory mode) is inert.  The hinted packets exist only
+        # where the launcher can verify their assembly
+        # (``hinted_cp_async_available``): elsewhere every slot pins to "".
+        policies = config.get("load_eviction_policies")
+        if isinstance(policies, list):
+            staged = (
+                set(facts.staged_slots)
+                if config[MMA_DAG_KEY] == MMA_DAG_WARP and hinted_cp_async_available()
+                else set()
+            )
+            canonical = [
+                MMA_DAG_L2_CANONICAL.get(
+                    MMA_DAG_L2_HINTS.get(policy, "") if isinstance(policy, str) else "",
+                    "",
+                )
+                if slot in staged
+                else ""
+                for slot, policy in enumerate(policies)
+            ]
+            config["load_eviction_policies"] = canonical
+            # A hinted tile keeps its cp.async packets under either loads
+            # route (``plan_tma``): a ``lane`` config hinting every tile a
+            # tensor map could fetch renders the ``tma`` config's kernel
+            # when no fixed epilogue tile tells them apart -- one identity.
+            if (
+                config[MMA_DAG_KEY] == MMA_DAG_WARP
+                and config.get(MMA_DAG_LOADS_KEY) == MMA_DAG_LOADS_LANE
+                and facts.tma_slots
+                and not facts.fixed_derived
+                and all(
+                    slot < len(canonical) and canonical[slot]
+                    for slot in facts.tma_slots
+                )
+            ):
+                config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_TMA
         for key in ("cute_collective_mma", "cute_register_chain", "cute_simt_mma"):
             if key in config:
                 config[key] = False
@@ -8525,6 +8744,9 @@ class ConfigSpec:
                 assert self.cute_mma_dag_pass_warps is not None
                 assert self.cute_mma_dag_loads is not None
                 assert self.cute_mma_dag_derived is not None
+                assert self.cute_mma_dag_epilogue is not None
+                lookahead_fragment = self.cute_mma_dag_lookahead
+                assert lookahead_fragment is not None
                 fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
                 fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
                 fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
@@ -8537,6 +8759,8 @@ class ConfigSpec:
                 if aux_fragment is not None:
                     fields[MMA_DAG_AUX_KEY] = aux_fragment
                 fields[MMA_DAG_DERIVED_KEY] = self.cute_mma_dag_derived
+                fields[MMA_DAG_EPILOGUE_KEY] = self.cute_mma_dag_epilogue
+                fields[MMA_DAG_LOOKAHEAD_KEY] = lookahead_fragment
                 persistent_fragment = self.cute_mma_dag_persistent
                 if persistent_fragment is not None:
                     fields[MMA_DAG_PERSISTENT_KEY] = persistent_fragment
