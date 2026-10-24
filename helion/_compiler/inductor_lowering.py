@@ -254,16 +254,16 @@ def prepare_node_lowering(
             arg_to_name[arg] = name
             input_names.append(name)
 
-        if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            dtype = {
-                torch.SymInt: torch.int64,
-                torch.SymFloat: torch.float32,
-                torch.SymBool: torch.bool,
-            }[type(example)]
-            if (
-                isinstance(example, (torch.SymFloat, torch.SymInt))
-                and opmath_dtype is not None
-            ):
+        if isinstance(
+            example, (int, float, bool, torch.SymInt, torch.SymFloat, torch.SymBool)
+        ):
+            if isinstance(example, (bool, torch.SymBool)):
+                dtype = torch.bool
+            elif isinstance(example, (int, torch.SymInt)):
+                dtype = torch.int64
+            else:
+                dtype = torch.float32
+            if dtype != torch.bool and opmath_dtype is not None:
                 # Typed as the op's dtype, promotion leaves it unrounded; the
                 # kernel value is float32 (see opmath_scalar_dtype).
                 dtype = opmath_dtype
@@ -995,8 +995,7 @@ class ReductionLowering(InductorLowering):
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
         if len(reduction_ranges) != 1:
-            # TODO(jansel): can this happen?
-            raise NotImplementedError("multiple reduction dimensions")
+            raise exc.MultipleReductionDims
         # In Inductor IR, reduction_ranges holds sizes, not loop vars.
         # Support both symbolic and constant sizes by allocating/looking up
         # a matching reduction dimension in the current environment.
@@ -1084,7 +1083,6 @@ class ReductionLowering(InductorLowering):
 
         dims = self._get_reduction_dims(node.meta["orig_node"], repr_input)
         if len(dims) != 1:
-            # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
 
         env = CompileEnvironment.current()

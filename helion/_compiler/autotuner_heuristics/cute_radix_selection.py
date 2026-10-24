@@ -12,7 +12,6 @@ from ...autotuner.compiler_coverage import CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
-from ..cute.memory_ops import register_cute_tensor_alias_specializations
 from ..cute.memory_ops import register_persistent_vec_alignment_specializations
 from ..cute.ordered_selection import unordered_topk_args
 from ..cute.radix_selection_config import ALGORITHM_KEY
@@ -22,6 +21,7 @@ from ..cute.radix_selection_config import GEOMETRY_CHOICES
 from ..cute.radix_selection_config import HISTOGRAM_KEY
 from ..cute.radix_selection_config import HISTOGRAM_MODES
 from ..cute.radix_selection_config import PIPELINE_CHOICES
+from ..runtime_tensor_guards import register_tensor_alias_specializations
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -59,7 +59,7 @@ class CuteRadixSelectionHeuristic(AutotunerHeuristic):
             graph = match_radix_selection_root(device_ir.graphs, check_storage=False)
             if graph is None:
                 return frozenset({"input_tensor_metadata"})
-            register_cute_tensor_alias_specializations(env)
+            register_tensor_alias_specializations(env)
             register_persistent_vec_alignment_specializations(env)
             graph = match_radix_selection_root(device_ir.graphs, allow_unbound=True)
             if graph is not None:

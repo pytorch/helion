@@ -1741,8 +1741,8 @@ def _plan_single_token_rank1_recurrence(
     ):
         return None
 
+    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
     from .memory_ops import runtime_tensor_has_specialized_alignment
-    from .memory_ops import runtime_tensors_are_proven_disjoint
 
     if not all(
         runtime_tensor_has_specialized_alignment(env, tensor, alignment)

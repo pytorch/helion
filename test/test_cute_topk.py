@@ -39,7 +39,6 @@ from helion._compiler.autotuner_heuristics.cute import CuteTopKHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute import selection_coarse
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
 from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
@@ -48,6 +47,9 @@ from helion._compiler.cute.selection_network import trace_selection_network
 from helion._compiler.cute.topk import _match_direct_topk_root
 from helion._compiler.cute.topk import match_topk_root
 from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends

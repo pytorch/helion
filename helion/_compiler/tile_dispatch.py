@@ -5,15 +5,18 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .. import exc
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
 from .device_function import DeviceFunction
+from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
+from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
@@ -74,6 +77,7 @@ class TileStrategyDispatch:
         super().__init__()
         self._device_function = fn
         self.strategies: list[TileStrategy] = []
+        self._has_rolled_reductions = False
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self._constexpr_live_graph_ids: frozenset[int] | None = None
@@ -189,6 +193,7 @@ class TileStrategyDispatch:
 
     def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
+        self._has_rolled_reductions |= isinstance(strategy, LoopedReductionStrategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
@@ -203,7 +208,7 @@ class TileStrategyDispatch:
         inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
 
         if self._constexpr_live_graph_ids is not None:
-            from .cute.active_blocks import active_block_ids as live_block_ids
+            from .active_blocks import active_block_ids as live_block_ids
 
             # A reduction dim used only on the untaken side of a constant
             # branch is never emitted; its strategy would only claim an axis.
@@ -328,7 +333,7 @@ class TileStrategyDispatch:
             and block.block_id not in executable
             and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
             and canonical in tile_blocks
-            and not env.block_sizes[canonical].reduction
+            and env.block_sizes[canonical].is_tile
             and block.symbol() == env.block_sizes[canonical].symbol()
             and block.numel == env.block_sizes[canonical].symbol()
         }
@@ -381,6 +386,24 @@ class TileStrategyDispatch:
             expr = shape
         else:
             return self.strategies[0].fn.literal_expr(shape)
+
+        if (
+            self._has_rolled_reductions
+            and CompileEnvironment.current().backend.name == "triton"
+            and not isinstance(expr, sympy.Symbol)
+        ):
+            block_symbols, _ = find_block_size_symbols(expr)
+            if any(
+                isinstance(
+                    self.block_id_to_strategy.get_any(block_id), LoopedReductionStrategy
+                )
+                for block_id in block_symbols.values()
+            ):
+                # Derived rolled-axis shapes have no supported host definition here.
+                raise exc.BackendUnsupported(
+                    "triton",
+                    "derived tensor shapes involving a rolled reduction axis",
+                )
 
         # Try to map block symbols to their variable names
         mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)

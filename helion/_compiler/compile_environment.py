@@ -2449,6 +2449,17 @@ class BlockSizeInfo:
     # input size to the literal.  Cleared once a known-equal non-literal size
     # (a full slice of a specialized dim) joins it.
     literal_size: bool = False
+    # Merging can retire an axis while its stable ID must remain addressable.
+    retired: bool = False
+
+    @property
+    def is_tile(self) -> bool:
+        return not self.reduction and not self.retired
+
+    def retire_reduction(self) -> None:
+        assert self.reduction
+        self.reduction = False
+        self.retired = True
 
     def add_debug_name(self, name: str) -> None:
         if not name:

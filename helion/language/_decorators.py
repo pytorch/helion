@@ -165,7 +165,7 @@ def is_api_func(fn: object) -> TypeGuard[APIFunc]:
 
 
 def args_to_proxies(
-    tracer: proxy_tensor.PythonKeyTracer,
+    tracer: proxy_tensor.PythonKeyTracer | proxy_tensor._GraphAppendingTracerEx,
     args: _T,
     kwargs: dict[str, object] | None = None,
 ) -> tuple[_T, dict[str, object]]:

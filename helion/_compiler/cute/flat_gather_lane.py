@@ -573,7 +573,7 @@ def _factor_prepared_guard(
 ) -> Callable[[Sequence[object]], bool]:
     """The prepared argument guard pins each argument's type; the value's
     residue is the one fact left to check."""
-    from .memory_ops import _prepared_guard_source
+    from ..runtime_tensor_guards import _prepared_guard_source
 
     namespace: dict[str, object] = {}
     checks: list[str] = []
