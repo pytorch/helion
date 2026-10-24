@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .fragment_slab_loads import ScalarLoad
     from .fragment_slab_loads import SlabGroup
     from .warp_producer_regions import WarpProducerRecorder
 
@@ -692,6 +693,9 @@ class FragmentCompiler:
         # ``cute_fragment_slab_loads``: repeated static windows of one tensor
         # read views of a slab staged once at the start of the root.
         self.slab_plan = {}
+        # The uniform scalar loads (a varlen slab's row offset and limit)
+        # read once per CTA ahead of the slabs: load -> the DSL variable.
+        self.slab_scalars: dict[ScalarLoad, str] = {}
         if self.df.config.get("cute_fragment_slab_loads", False):
             from .fragment_slab_loads import plan_slab_loads
 
@@ -1514,16 +1518,72 @@ class FragmentCompiler:
             staged = all(
                 (kind != "block" or value in self.offsets)
                 and (kind != "slice" or self.static_extent(fake.shape[dim]) is not None)
+                and (kind != "uniform" or self.uniform_at_root(value))
                 for dim, (kind, value) in enumerate(group.descriptors)
+            ) and all(
+                self.uniform_at_root(expr)
+                for load in (group.offset, group.limit)
+                if load is not None
+                for expr in load.indices
             )
             if not staged:
                 for member in group.members:
                     cast("dict[Node, SlabGroup]", self.slab_plan).pop(member, None)
                 continue
+            for load in (group.offset, group.limit):
+                if load is not None:
+                    self.slab_scalar(load)
             group.fragment = self.load_slab(group)
             # Alive for the whole root: no later phase may recycle it.
             self.held.append(group.fragment)
         self.flush_pending_barrier()
+
+    def uniform_at_root(self, expr: object) -> bool:
+        """Whether the uniform integer expression ``expr`` is defined at the
+        start of the root: its grid symbols are the root's own blocks (a
+        device loop's tile symbols are not yet bound there)."""
+        if not isinstance(expr, sympy.Expr):
+            return False
+        origins = HostFunction.current().expr_to_origin
+        for symbol in expr.free_symbols:
+            info = origins.get(symbol)
+            origin = info.origin if info is not None else None
+            if isinstance(origin, GridOrigin) and origin.block_id not in self.offsets:
+                return False
+        return True
+
+    def slab_scalar(self, load: ScalarLoad) -> str:
+        """The uniform 0-d integer ``load`` (a slab's row offset or limit) as
+        an Int32 read once per CTA ahead of the slabs: zero when its
+        subscript is outside the tensor, like the body's own load of it.
+        (An int64 table value is narrowed: a row index or count of a static
+        extent below 2**31.)"""
+        if load in self.slab_scalars:
+            return self.slab_scalars[load]
+        fake = cast("torch.Tensor", load.node.meta["val"])
+        tensor = HostTensor(
+            self.df.tensor_arg(fake, prefer_name=load.tensor).name, fake
+        )
+        indices = [self.sym(expr) for expr in load.indices]
+        masks = [
+            f"(({index}) >= 0 and ({index}) < ({self.sym(fake.shape[dim])}))"
+            for dim, index in enumerate(indices)
+        ]
+        offset = (
+            " + ".join(
+                f"cutlass.Int64({index}) * cutlass.Int64({self.host_stride(tensor, dim)})"
+                for dim, index in enumerate(indices)
+            )
+            or "0"
+        )
+        name = self.df.new_var("fragment_slab_scalar")
+        self.emit(f"{name} = cutlass.Int32(0)")
+        self.emit(
+            f"if {self.predicate(masks)}:\n"
+            f"    {name} = cutlass.Int32(({tensor.name}.iterator + ({offset})).load())"
+        )
+        self.slab_scalars[load] = name
+        return name
 
     def slab_member(
         self, node: Node, shape: tuple[int, ...], dtype: torch.dtype
@@ -1546,7 +1606,7 @@ class FragmentCompiler:
                     else:
                         mapped.append(f"({coords[position]}) + {offset}")
                         position += 1
-                elif kind == "const":
+                elif kind in ("const", "uniform"):
                     mapped.append("0")
                 else:
                     mapped.append(coords[position])
@@ -1591,18 +1651,31 @@ class FragmentCompiler:
                 )
             elif kind == "slice":
                 shape.append(self.extent(fake.shape[dim]))
-            elif kind == "const":
+            elif kind in ("const", "uniform"):
                 shape.append(1)
             else:
                 shape.append(cast("tuple[int, int]", value)[1])
         slab_shape = tuple(shape)
+        offset_var = None if group.offset is None else self.slab_scalars[group.offset]
+        limit_var = None if group.limit is None else self.slab_scalars[group.limit]
 
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
             indices: list[str] = []
             masks: list[str] = []
             for dim, (kind, value) in enumerate(group.descriptors):
                 if dim == group.window_dim:
-                    indices.append(f"({group.start}) + ({coords[dim]})")
+                    row = f"({group.start}) + ({coords[dim]})"
+                    if offset_var is not None:
+                        # A window at a runtime row offset: live below the
+                        # limit (in the window's own coordinates) and
+                        # inside the tensor; zero past either.
+                        if limit_var is not None:
+                            masks.append(f"(({row}) < ({limit_var}))")
+                        row = f"({offset_var}) + {row}"
+                        masks.append(
+                            f"(({row}) >= 0 and ({row}) < ({self.sym(fake.shape[dim])}))"
+                        )
+                    indices.append(row)
                 elif kind == "block":
                     block = cast("int", value)
                     expression = f"({self.offsets[block]}) + ({coords[dim]})"
@@ -1612,6 +1685,12 @@ class FragmentCompiler:
                     indices.append(coords[dim])
                 elif kind == "const":
                     indices.append(str(value))
+                elif kind == "uniform":
+                    expression = self.sym(value)
+                    masks.append(
+                        f"(({expression}) >= 0 and ({expression}) < ({self.sym(fake.shape[dim])}))"
+                    )
+                    indices.append(expression)
                 else:
                     indices.append(
                         f"({cast('tuple[int, int]', value)[0]}) + ({coords[dim]})"
@@ -1637,12 +1716,33 @@ class FragmentCompiler:
         batched = self.batched_loads and self.warp_producer_recorder is None
         lanes = packet_lanes(fake.dtype)
         strides = static_strides(fake)
+        # The slab's rows are packets when its last dim is the whole
+        # contiguous dim, or a static window of it at a packet-aligned start
+        # and extent inside the dim (``hl.arange(D)`` over a D-wide dim).
+        # The varying dimension (``("window", None)``: the members' windows
+        # along it) is walked element by element, never packed.
+        inner_size = self.static_extent(fake.shape[-1])
+        inner_kind, inner_value = group.descriptors[-1]
+        if group.window_dim == len(slab_shape) - 1:
+            inner_packets = False
+        elif inner_kind == "slice":
+            inner_packets = True
+        elif inner_kind == "window":
+            inner_start, inner_extent = cast("tuple[int, int]", inner_value)
+            inner_packets = (
+                lanes is not None
+                and inner_size is not None
+                and inner_start % lanes == 0
+                and inner_extent % lanes == 0
+                and inner_start + inner_extent <= inner_size
+            )
+        else:
+            inner_packets = False
         if (
             self.vector_io
             and lanes is not None
             and strides is not None
-            and group.descriptors[-1][0] == "slice"
-            and group.window_dim != len(slab_shape) - 1
+            and inner_packets
             and strides[-1] == 1
             and all(stride % lanes == 0 for stride in strides[:-1])
             and slab_shape[-1] % lanes == 0
@@ -3275,7 +3375,8 @@ class FragmentCompiler:
     @staticmethod
     def staged_recipe(value: Fragment) -> bool:
         """Whether every leaf of *value*'s recipe is resident (a staged
-        buffer or a scalar), so any lane may evaluate it at any coordinate."""
+        buffer or a scalar) or pure (an ``hl.arange`` row mask, a tile
+        index), so any lane may evaluate it at any coordinate."""
         pending = [value]
         seen: set[int] = set()
         while pending:
@@ -3287,7 +3388,7 @@ class FragmentCompiler:
                 if fragment.snapshot is not None:
                     return False
                 continue
-            if not fragment.dependencies and fragment.shape:
+            if not fragment.dependencies and fragment.shape and not fragment.pure:
                 return False
             pending.extend(fragment.dependencies)
         return True

@@ -94,6 +94,7 @@ from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescript
 from ..triton.launcher import get_num_sm
 from .occupancy import get_max_active_clusters
 from .source_dependencies import referenced_helper_sources
+from .source_dependencies import sass_check_source_dependencies
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
@@ -3615,6 +3616,8 @@ class _CompiledCuteLauncher:
         "_compile_options",
         "_compiled",
         "_jit_func",
+        "_kernel_name",
+        "_sass_checks",
     )
 
     def __init__(
@@ -3622,12 +3625,20 @@ class _CompiledCuteLauncher:
         jit_func: object,
         compile_options: str | None,
         cache_key: str | None = None,
+        sass_checks: tuple[str, ...] = (),
+        kernel_name: str = "",
     ) -> None:
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
         self._capi_compiled: object = None
         self._cache_key = cache_key
+        # The kernel's ``_helion_cute_sass_checks``: run on the cubin of a
+        # fresh compile before it is persisted or launched (a disk-cache hit
+        # was verified by the process that wrote it, under the checker whose
+        # source ``_cute_disk_cache_key`` folded into the key).
+        self._sass_checks = sass_checks
+        self._kernel_name = kernel_name
 
     def capi_function(self) -> object:
         """The compiled function in its C-API (``JitExecutor``) form.
@@ -3671,6 +3682,10 @@ class _CompiledCuteLauncher:
                         *args,
                         options=self._compile_options,
                     )
+                if self._sass_checks:
+                    from .sass_check import verify_compiled
+
+                    verify_compiled(compiled, self._sass_checks, self._kernel_name)
                 if self._cache_key is not None:
                     self._persist_to_disk(compiled)
             self._compiled = compiled
@@ -3986,7 +4001,13 @@ def _get_compiled_cute_launcher(
         resident_clusters=_cute_resident_clusters(cluster_shape, device),
     )
     launcher = _CompiledCuteLauncher(
-        jit_func, compile_options, cache_key=disk_cache_key
+        jit_func,
+        compile_options,
+        cache_key=disk_cache_key,
+        sass_checks=tuple(
+            getattr(cast("Any", cute_kernel), "_helion_cute_sass_checks", ())
+        ),
+        kernel_name=getattr(cast("Any", cute_kernel), "__name__", "cute_kernel"),
     )
     cache[cache_key] = launcher
     return launcher
@@ -4050,7 +4071,10 @@ def _cute_disk_cache_key(
     with a cluster above two CTAs bakes into that clamp instead
     (``_cute_resident_clusters``): it varies with the GPC floorsweeping of
     same-SM-count devices, so it joins the key where it is not ``None`` (the
-    other kernels' keys are unchanged).
+    other kernels' keys are unchanged).  A kernel that declares SASS checks
+    (``_helion_cute_sass_checks``) adds them and the checker's source
+    fingerprint (``sass_check_source_dependencies``): a cache hit is trusted
+    on its writer's verification, so a stricter rule must re-verify.
     """
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
@@ -4072,6 +4096,15 @@ def _cute_disk_cache_key(
     called_helper_sources = referenced_helper_sources(kernel_globals)
     if called_helper_sources is None:
         return None
+    sass_checks = tuple(
+        getattr(cast("Any", cute_kernel), "_helion_cute_sass_checks", ())
+    )
+    checker: tuple[object, ...] = ()
+    if sass_checks:
+        checker_sources = sass_check_source_dependencies()
+        if checker_sources is None:
+            return None
+        checker = ((sass_checks, checker_sources),)
     try:
         import cutlass
 
@@ -4099,6 +4132,7 @@ def _cute_disk_cache_key(
             num_sm,
             _cute_use_pdl(cute_kernel),
             *(() if resident_clusters is None else (resident_clusters,)),
+            *checker,
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()

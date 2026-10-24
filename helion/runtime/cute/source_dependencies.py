@@ -123,8 +123,28 @@ def wrapper_source_dependencies(
     paths = set(_COMMON_DEPENDENCIES)
     for kind in kinds:
         paths.update(_WRAPPER_DEPENDENCIES.get(kind, ()))
+    return _fingerprints(sorted(paths))
+
+
+# The launcher's SASS checks (``helion.runtime.cute.sass_check``) admit a
+# kernel that declares ``_helion_cute_sass_checks`` before it is persisted;
+# a disk-cache hit is trusted on its writer's verification, so the key of
+# such a kernel covers the checker's source: a stricter rule re-verifies
+# (recompiles) the entries persisted under the old one.
+_SASS_CHECK_DEPENDENCIES = ("runtime/cute/sass_check.py",)
+
+
+def sass_check_source_dependencies() -> tuple[tuple[str, str], ...] | None:
+    """Fingerprint the SASS checker's source for a kernel that declares
+    checks; None (disabling disk reuse) when it cannot be read."""
+    return _fingerprints(_SASS_CHECK_DEPENDENCIES)
+
+
+def _fingerprints(
+    relative_paths: Iterable[str],
+) -> tuple[tuple[str, str], ...] | None:
     result = []
-    for relative in sorted(paths):
+    for relative in relative_paths:
         try:
             source = (_PACKAGE_ROOT / relative).read_bytes()
         except OSError:

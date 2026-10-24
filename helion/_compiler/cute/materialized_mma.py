@@ -216,13 +216,24 @@ def _register_region_mma_search(
     mma_nodes: dict[int, torch.fx.Node],
     allow_persistent: bool,
     reason: str,
+    region_pid_types: bool = False,
 ) -> None:
-    """Publish one tile triple, shape and pipeline budget per GEMM launch."""
+    """Publish one tile triple, shape and pipeline budget per GEMM launch.
+
+    ``region_pid_types`` marks an ordered barrier chain: its launches are
+    flat, and ``tcgen05_region_pid_types`` may run the GEMM launches as the
+    static persistent two-CTA pipeline (``CuteTcgen05Config``).
+    """
+    from ...language.matmul_ops import _cuda_num_sms_or_zero
     from .pipeline_smem import analyze_pipeline_smem_facts
     from .tcgen05_config import CuteTcgen05Config
 
     spec = env.config_spec
     state = spec._cute_tcgen05_config
+    state.region_pid_type_search_enabled = region_pid_types
+    state.device_sm_count = _cuda_num_sms_or_zero(
+        placed[min(placed)][0].operands.lhs.source_fake.device
+    )
     indices = sorted(placed)
     state.materialized_matmul_shapes = tuple(
         (
@@ -360,7 +371,11 @@ def enable_phase_mma_search(
     (``cute_pointwise_region_block_ids``).  The single persistent launch
     cannot host the tcgen05 pipeline; enabling this surface makes the
     multi-root planning veto the persistent pid types, leaving the ordered
-    launches.  Anything unproven declines and the SIMT lowering stays.
+    launches.  Within the flat chain, ``tcgen05_region_pid_types`` may run
+    individual GEMM launches as the static persistent two-CTA pipeline of
+    the standalone single-GEMM surface (``CuteTcgen05Config``), each with
+    its own complete allocation proof and ring depth.  Anything unproven
+    declines and the SIMT lowering stays.
     """
     from .aux_tensor import _TCGEN05_AUX_DETECTOR_MMA_TARGETS
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
@@ -454,6 +469,7 @@ def enable_phase_mma_search(
         mma_nodes=mma_nodes,
         allow_persistent=False,
         reason="independent CuTe MMA barrier phases",
+        region_pid_types=True,
     )
     spec.cute_pointwise_region_block_ids = frozenset(plain_block_ids)
     # An axis reused by another phase keeps the shared search floor.
