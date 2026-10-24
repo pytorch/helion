@@ -283,10 +283,11 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
         The reference config only exists to produce baseline outputs, so a
         hardware limit Helion cannot model at config-generation time must not
-        cost the whole autotune.
+        cost the whole autotune.  A promoted execution default goes first and
+        backs off to the reference config.
         """
         attempted: list[int] = []
-        search, args, reference_block = self._rejecting_baseline_search(
+        search, args, reference_block, promoted = self._rejecting_baseline_search(
             lambda block, reference: block > reference // 4, attempted
         )
         self.assertGreaterEqual(reference_block, 4)
@@ -296,7 +297,7 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         # Halve once per failure until the tile is accepted.
         self.assertEqual(
             attempted,
-            [reference_block, reference_block // 2, reference_block // 4],
+            [*promoted, reference_block, reference_block // 2, reference_block // 4],
         )
         torch.testing.assert_close(
             search.benchmark_provider._baseline_output, args[0] + args[1]
@@ -305,7 +306,7 @@ class TestAutotunerAccuracy(AutotunerTestCase):
     def test_reference_baseline_aborts_when_every_block_size_fails(self) -> None:
         """Shrinking is bounded: a config nothing fixes still reports clearly."""
         attempted: list[int] = []
-        search, _, reference_block = self._rejecting_baseline_search(
+        search, _, reference_block, promoted = self._rejecting_baseline_search(
             lambda block, reference: True, attempted
         )
 
@@ -318,17 +319,19 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         ):
             search._prepare()
 
-        self.assertEqual(len(attempted), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        shrinking = attempted[len(promoted) :]
+        self.assertEqual(attempted[: len(promoted)], promoted)
+        self.assertEqual(len(shrinking), _MAX_REFERENCE_BASELINE_ATTEMPTS)
         # Each attempt halves the previous one, starting from the reference
         # config that the error message reports.
-        self.assertEqual(attempted[0], reference_block)
-        for previous, block in itertools.pairwise(attempted):
+        self.assertEqual(shrinking[0], reference_block)
+        for previous, block in itertools.pairwise(shrinking):
             self.assertEqual(block, previous // 2)
         # A retry is announced only when it actually runs.
         retries = [
             c for c in warn.call_args_list if "retrying the baseline" in str(c.args[0])
         ]
-        self.assertEqual(len(retries), len(attempted) - 1)
+        self.assertEqual(len(retries), len(shrinking) - 1)
 
     def test_reference_baseline_raises_errors_shrinking_cannot_fix(self) -> None:
         """Bugs and unrecoverable runtime errors are not retried.
@@ -342,7 +345,7 @@ class TestAutotunerAccuracy(AutotunerTestCase):
             # raises) every non-fatal config failure, so the backoff keeps
             # shrinking past one and only unrecoverable runtime errors stop it.
             attempted: list[int] = []
-            search, _, reference_block = self._rejecting_baseline_search(
+            search, _, reference_block, promoted = self._rejecting_baseline_search(
                 lambda block, reference: True, attempted, RuntimeError("unsupported op")
             )
             with self.assertRaisesRegex(
@@ -350,24 +353,41 @@ class TestAutotunerAccuracy(AutotunerTestCase):
                 "Autotuning reference config failed while computing baseline",
             ):
                 search._prepare()
-            self.assertEqual(len(attempted), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+            self.assertEqual(
+                len(attempted), len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS
+            )
         else:
             errors.insert(0, RuntimeError("unsupported op"))
         for error in errors:
             with self.subTest(error=str(error)):
                 attempted: list[int] = []
-                search, _, reference_block = self._rejecting_baseline_search(
+                search, _, reference_block, promoted = self._rejecting_baseline_search(
                     lambda block, reference: True, attempted, error
+                )
+                # An unrecoverable runtime error surfaces on the first config
+                # (the promoted default when there is one); a bug on the
+                # promoted default still backs off to the reference config,
+                # which then raises it.  The error names the config it reports.
+                on_promoted = bool(promoted) and "CUDA error" in str(error)
+                role = (
+                    "Execution default"
+                    if on_promoted
+                    else "Autotuning reference config"
                 )
 
                 with self.assertRaisesRegex(
                     helion.exc.InvalidConfig,
-                    "Autotuning reference config failed while computing baseline",
+                    f"{role} failed while computing baseline",
                 ) as ctx:
                     search._prepare()
 
-                self.assertEqual(attempted, [reference_block])
+                if on_promoted:
+                    self.assertEqual(attempted, promoted)
+                else:
+                    self.assertEqual(attempted, [*promoted, reference_block])
                 self.assertIs(ctx.exception.__cause__, error)
+                # Raised as is: the cause keeps the traceback of where it failed.
+                self.assertIsNotNone(error.__traceback__)
 
     def test_autotune_baseline_tolerance(self) -> None:
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
@@ -589,11 +609,17 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
         #   _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 4 total
+        #   + 2 benchmark runs = 4 total. The benchmark runs happen in the
+        #   killable worker when the subprocess benchmark is enabled, where
+        #   this patch does not reach: the parent then clones it twice.
+        expected_mutated_clones = (
+            2 if inplace_add.settings.autotune_benchmark_subprocess else 4
+        )
         self.assertEqual(
             mutated_clones[0],
-            4,
-            f"Mutated tensor cloned {mutated_clones[0]} times, expected 4.",
+            expected_mutated_clones,
+            f"Mutated tensor cloned {mutated_clones[0]} times, "
+            f"expected {expected_mutated_clones}.",
         )
 
         # Non-mutated tensors (a, b) should only be cloned during baseline:

@@ -427,6 +427,19 @@ def _compiler_markers(body: list[ast.AST]) -> set[str]:
     }
 
 
+# The persistent-reduction vector markers wrap one scalar access each (the
+# load's original expression, the store's pointer and value); the pass
+# expanding them (``cute/persistent_branch_vec.py``) walks whatever nest it is
+# given and places each packet beside the constexpr lane loop holding its
+# site, so a body holding only these markers is placed like a scalar body.
+_PLACED_MARKERS = frozenset({_PERSISTENT_VEC_LOAD, _PERSISTENT_VEC_STORE})
+
+
+def _structural_markers(body: list[ast.AST]) -> set[str]:
+    """The placeholders whose expanding pass needs the full lane nest."""
+    return _compiler_markers(body) - _PLACED_MARKERS
+
+
 def contains_compiler_marker(body: list[ast.AST]) -> bool:
     """Whether a later pass still has to expand a ``_helion_*`` placeholder."""
     return bool(_compiler_markers(body))
@@ -2166,20 +2179,98 @@ def _used_inner(statements: list[_Statement], inner: set[str]) -> set[str]:
     return used
 
 
+def _repeatable(statement: _Statement, written: frozenset[str]) -> bool:
+    """Whether running ``statement`` once per lane of a loop its values ignore
+    is the tile program by construction: a register computation or a load
+    of tensors no statement of the body writes or reaches through an unknown
+    call (``written``), with no store, atomic, fence or unknown effect of
+    its own."""
+    return not (
+        statement.pinned
+        or statement.atomic
+        or statement.fence
+        or statement.tensors_written
+        or statement.tensors & written
+    )
+
+
+def _repeat_inside(
+    statement: _Statement,
+    trail: list[_Statement],
+    statements: list[_Statement],
+    lane_var: str,
+    attached: dict[str, list[_Statement]],
+    universe: list[_Statement],
+) -> bool:
+    """Move ``statement`` and the ``trail`` statements it depends on into the
+    lane loop ``lane_var`` when every one of them is ``_repeatable`` and no
+    statement left outside the loop reads a name they define.
+
+    Returns ``False``, moving nothing, otherwise.  ``_place`` restarts the
+    scope's placement with the enlarged inside (each move strictly grows it,
+    so the restarts end).  ``written`` counts the tensors the loops' attached
+    statements (hoisted loads, store flushes) write as well as the body's.
+    A name a moved statement defines is visible only inside the loop: a
+    reader anywhere in the body (``universe``, every group of every scope)
+    that stays outside would be emitted after the loop reading an undefined
+    name, so such a move is refused and the placement abandoned."""
+    written = frozenset().union(
+        *(other.tensors_written | other.opaque for other in statements),
+        *(
+            other.tensors_written | other.opaque
+            for others in attached.values()
+            for other in others
+        ),
+    )
+    moved: list[_Statement] = []
+    pending = [statement]
+    while pending:
+        current = pending.pop()
+        if current in moved:
+            continue
+        if not _repeatable(current, written):
+            return False
+        moved.append(current)
+        pending.extend(
+            other for other in trail if other not in moved and _depends(other, current)
+        )
+    defined = frozenset().union(*(other.writes for other in moved))
+    for other in universe:
+        if other in moved or lane_var in other.lanes:
+            continue
+        if other.reads & defined:
+            log.debug(
+                "lane placement abandoned at %s: statement %d reads %s outside "
+                "the loop the definition would move into",
+                lane_var,
+                other.index,
+                sorted(other.reads & defined),
+            )
+            return False
+    for other in moved:
+        other.lanes.add(lane_var)
+    return True
+
+
 def _place(
     statements: list[_Statement],
     scopes: list[LaneScope],
     attached: dict[str, list[_Statement]],
+    universe: list[_Statement] | None = None,
 ) -> list[ast.AST | LanePlacement] | None:
+    # ``universe`` is the whole body: the groups a scope splits off recurse
+    # with their own ``statements`` and still need to see every reader.
+    if universe is None:
+        universe = statements
     if not scopes:
         return [statement.node for statement in statements]
     scope, rest = scopes[0], scopes[1:]
     inside = [s for s in statements if scope.lane_var in s.lanes]
     if not inside:
-        return _place(statements, rest, attached)
+        return _place(statements, rest, attached, universe)
     outside = [s for s in statements if scope.lane_var not in s.lanes]
     if not outside:
-        inner = _place(inside, rest, attached)
+        inner = _place(inside, rest, attached, universe)
         return None if inner is None else [LanePlacement(scope.lane_var, inner)]
     inner_vars = {inner_scope.lane_var for inner_scope in rest}
     # ``_propagate_lanes`` nests every loop a statement shares with this one
@@ -2215,6 +2306,13 @@ def _place(
             elif statement.index > max(positions):
                 after.add(statement.index)
             else:
+                log.debug(
+                    "lane placement abandoned at %s: statement %d conflicts with "
+                    "an attached statement of the loop inside its span %s",
+                    scope.lane_var,
+                    statement.index,
+                    positions,
+                )
                 return None
     # A statement with no dependence on the loop keeps its side of the loop's
     # last statement; one that depends on a statement already placed after
@@ -2229,15 +2327,39 @@ def _place(
         )
         if forced_after:
             if statement.index in before:
-                return None
+                # Needed before the loop by a statement inside and after it
+                # by the loop's ordering: a mask computed from a load that a
+                # pinned statement inside (a shared-memory reduction helper)
+                # orders after itself, feeding a store inside.  When the
+                # statement and the trail it depends on only compute registers
+                # and load tensors nothing in the body writes, running them
+                # inside the loop once per lane is the tile program by
+                # construction; the emitted nest is checked like any other.
+                if not _repeat_inside(
+                    statement, trail, statements, scope.lane_var, attached, universe
+                ):
+                    log.debug(
+                        "lane placement abandoned at %s: statement %d must sit on "
+                        "both sides of the loop (%s)",
+                        scope.lane_var,
+                        statement.index,
+                        ast.unparse(statement.node)[:160],
+                    )
+                    return None
+                return _place(statements, scopes, attached, universe)
             trail.append(statement)
         else:
             lead.append(statement)
     if _used_inner(lead, inner_vars) & _used_inner(trail, inner_vars):
+        log.debug(
+            "lane placement abandoned at %s: an inner loop is used both before "
+            "and after it",
+            scope.lane_var,
+        )
         return None
     result: list[ast.AST | LanePlacement] = []
     for group in (lead, inside, trail):
-        placed = _place(group, rest, attached) if group else []
+        placed = _place(group, rest, attached, universe) if group else []
         if placed is None:
             return None
         if group is inside:
@@ -2822,7 +2944,7 @@ def distribute_lane_loops(
     """
     if not body or not scopes:
         return None
-    if markers := _compiler_markers(body):
+    if markers := _structural_markers(body):
         _pin_atomics_beside_compiler_markers(body, scopes, markers)
         return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
@@ -2833,6 +2955,12 @@ def distribute_lane_loops(
         )
         _attribute_sites(statements, scopes, attached)
         placement = _place(statements, list(scopes), attached)
+    else:
+        log.debug(
+            "lane placement abandoned: a loop would have to nest inside a loop "
+            "the original nest places inside it (%s)",
+            [scope.lane_var for scope in scopes],
+        )
     if placement is None:
         # The original nest is emitted.  A pin applied for the abandoned
         # placement stays (``pinned_lanes``); the loops it left are pinned or
@@ -2897,7 +3025,7 @@ def full_nest_inexactness(
     """
     if not body or not scopes:
         return None
-    if markers := _compiler_markers(body):
+    if markers := _structural_markers(body):
         _pin_atomics_beside_compiler_markers(body, scopes, markers)
         return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
@@ -3373,7 +3501,7 @@ def add_thread_barriers(
     # ``_helion_pending_collective_mma``), moving its statements between the
     # passes it builds and refusing a barrier among the ones it stages: the
     # accesses are checked as for any body, but a barrier they need rejects it.
-    placeholders = _compiler_markers([leaf.statement.node for leaf in leaves])
+    placeholders = _structural_markers([leaf.statement.node for leaf in leaves])
     statements = [leaf.statement for leaf in leaves]
     # The closures run over simple statements: a compound leaf (a device
     # loop) is represented by the statements of its body and takes their

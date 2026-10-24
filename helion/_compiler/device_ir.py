@@ -1109,6 +1109,9 @@ class DeviceIR:
                 mark_narrowed_fp32_multiplies(graph_info.graph)
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if env.backend_name == "cute":
+            from .cute.flat_gather_lane import (
+                register_flat_gather_factor_specializations,
+            )
             from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import (
                 register_persistent_vec_alignment_specializations,
@@ -1117,6 +1120,9 @@ class DeviceIR:
             # Explicit tile loops can also use vector memory transactions,
             # even when no persistent reduction block or contraction exists.
             register_persistent_vec_alignment_specializations(env)
+            # A flat gather scaled by an ``int`` argument packs its lanes
+            # only when the argument is a multiple of the packet width.
+            register_flat_gather_factor_specializations(env, self)
             if rdims:
                 # Reduction kernels reorder input reads across warps. Grid
                 # kernels add these storage-dependent dispatch guards below
@@ -3211,11 +3217,22 @@ def _register_load_store_tunables(
     from ..autotuner.config_spec import get_valid_eviction_policies
     from ..autotuner.config_spec import get_valid_load_cache_modifiers
     from ..autotuner.config_spec import get_valid_store_cache_modifiers
+    from .cute.cutedsl_compat import readonly_packet_load_supported
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
+        choices = get_valid_eviction_policies(env.backend_name)
+        search_choices = None
+        if "nc_l2_first" in choices and not readonly_packet_load_supported(
+            env.config_spec.target_device_capability, torch.version.cuda
+        ):
+            # Read-only packets lower to the ordinary load on this target, so
+            # searching them would only repeat "".  Explicit configs stay valid.
+            search_choices = tuple(
+                choice for choice in choices if choice != "nc_l2_first"
+            )
         env.config_spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
+            EnumFragment(choices=choices, search_choices=search_choices),
             length=loads_without_eviction_policy,
         )
 
@@ -3547,6 +3564,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     for node in graph.nodes:
                         node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
 
+            env = CompileEnvironment.current()
+            if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
+                from ..language.barrier import BARRIER_PID_TYPE_REASON
+                from .cute.ordered_phases import ordered_phases_supported
+
+                spec = env.config_spec
+                if len(device_ir.phases) > 1 and ordered_phases_supported(
+                    func, device_ir
+                ):
+                    # The single persistent launch shares one thread block
+                    # across phases (and cannot host the tcgen05 pipeline).
+                    # Ordered per-phase launches tune each phase alone; the
+                    # persistent launch stays the default.
+                    spec.allowed_pid_types = (
+                        *(p for p in spec.allowed_pid_types if p != "flat"),
+                        "flat",
+                    )
+                else:
+                    spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)
+
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
@@ -3568,6 +3605,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
             from .cute.signed_bitfield import has_signed_byte_field
+            from .cute.tile_packing import tile_pack_counts
+
+            config_spec.cute_tile_pack_counts = tile_pack_counts(
+                CompileEnvironment.current(), device_ir
+            )
 
             config_spec.cute_signed_bitfield_bf16_available = (
                 config_spec.target_device_capability == (10, 0)
@@ -3663,9 +3705,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     tuple(block_ids) for block_ids in device_ir.grid_block_ids
                 }
                 mma_candidates = []
+                # Candidates whose operand is an in-register integer cast
+                # (``_MmaOperandInfo.cast_dtype``): only the register-MMA
+                # family lowers them, and it replaces the whole body of ONE
+                # plain GEMM, so such a candidate enters the search only when
+                # it is the kernel's single matmul and its stores are the
+                # epilogue chains the family renders.
+                cast_candidates: list[object] = []
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
-                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        candidate = analyze_cute_mma_node(
+                            node, device_ir=device_ir, allow_integer_casts=True
+                        )
                         if candidate is None or candidate.requires_accumulator_seed:
                             continue
                         if (
@@ -3703,9 +3754,31 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # Operand analysis may prove an FP32 upcast lossless.
                         # Search must use the same source dtype as MMA codegen;
                         # these are fake values, not changes to the FX inputs.
-                        lhs = lhs.to(dtype=candidate.operands.lhs.source_fake.dtype)
-                        rhs = rhs.to(dtype=candidate.operands.rhs.source_fake.dtype)
+                        # (A cast operand plans with the dtype the tensor core
+                        # multiplies, which is what the program casts to.)
+                        lhs = lhs.to(dtype=candidate.operands.lhs.mma_dtype)
+                        rhs = rhs.to(dtype=candidate.operands.rhs.mma_dtype)
+                        if (
+                            candidate.operands.lhs.cast_dtype is not None
+                            or candidate.operands.rhs.cast_dtype is not None
+                        ):
+                            from .cute.cute_warp_mma_gemm import warp_mma_store_matches
+
+                            try:
+                                warp_mma_store_matches(
+                                    device_ir.graphs, node, candidate.operands
+                                )
+                            except exc.BackendUnsupported:
+                                continue
+                            cast_candidates.append(candidate)
                         mma_candidates.append((candidate, lhs, rhs, node))
+                if cast_candidates and len(mma_candidates) != 1:
+                    mma_candidates = [
+                        item
+                        for item in mma_candidates
+                        if item[0] not in cast_candidates
+                    ]
+                    cast_candidates = []
                 supports_small_n_role_local_tma = bool(mma_candidates) and all(
                     candidate.supports_small_n_role_local_tma
                     for candidate, _lhs, _rhs, _node in mma_candidates
@@ -3740,6 +3813,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             or candidate.operands.rhs.source_to_logical_order
                             is not None
                         ),
+                        operand_casts=candidate in cast_candidates,
                     )
                     planning_results.append(planning_result)
                     search_plan = planning_result.plan
@@ -3757,7 +3831,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     (
                         candidate.operands.output_block_ids,
                         candidate.operands.k_block_id,
-                        candidate.operands.lhs.source_fake.dtype,
+                        candidate.operands.lhs.mma_dtype,
                     )
                     for candidate, _lhs, _plan in search_candidates
                 }
@@ -3771,13 +3845,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     analysis_keys,
                 ):
                     candidate, lhs, search_plan = search_candidates[0]
+                    config_spec._cute_tcgen05_config.fission_bundle = (
+                        env.cute_fission_plan is not None
+                    )
                     enable_cute_tcgen05_search(
                         lhs,
                         plan=search_plan,
                         m_block_id=candidate.operands.m_block_id,
                         n_block_id=candidate.operands.n_block_id,
                         k_block_id=candidate.operands.k_block_id,
-                        input_dtype=candidate.operands.lhs.source_fake.dtype,
+                        input_dtype=candidate.operands.lhs.mma_dtype,
                         has_leading_passthrough=(
                             candidate.operands.has_leading_passthrough
                         ),
@@ -3793,9 +3870,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # loop); kernels with several matmuls keep tcgen05.
                         warp_mma_plain_kernel=len(mma_candidates) == 1,
                     )
-                    if len(mma_candidates) == 1 and not (
-                        config_spec.reduction_block_ids
-                        - {candidate.operands.k_block_id}
+                    if (
+                        len(mma_candidates) == 1
+                        and not cast_candidates
+                        and not (
+                            config_spec.reduction_block_ids
+                            - {candidate.operands.k_block_id}
+                        )
                     ):
                         from .cute.pipeline_smem import analyze_pipeline_smem_facts
                         from .cute.pipeline_smem import pipeline_region_graphs
@@ -3811,6 +3892,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate,
                                 mma_candidates[0][3],
                                 allocation_graphs,
+                                allow_fp8_broadcasts=(
+                                    len(device_ir.root_ids) == 1
+                                    and env.cute_fission_plan is None
+                                ),
                                 capacity_bytes=(
                                     tcgen05_config.per_cta_smem_capacity_bytes(
                                         lhs.device
@@ -3844,9 +3929,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for candidate, _lhs, _rhs, node in mma_candidates
                         },
                     )
-        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
-        if grid_policy.raise_independent_axis_block_size_minimums:
-            config_spec.raise_grid_block_minimums()
         if (
             len(device_ir.root_ids) > 1
             and CompileEnvironment.current().cute_fission_plan is None
@@ -3891,6 +3973,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         env = CompileEnvironment.current()
         analysis = DeviceIRAnalysis.build(device_ir, env)
         config_spec.kernel_grid_fact = analysis.kernel_grid_fact
+        # After the grid topology is recorded: the floors budget each root
+        # grid separately, so this must see ``kernel_grid_fact``.
+        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
+        if grid_policy.raise_independent_axis_block_size_minimums:
+            config_spec.raise_grid_block_minimums()
         if env.backend.name == "cute":
             from .cute.loop_nesting import boundary_only_grid_blocks
             from .cute.loop_nesting import tile_loop_paths
@@ -3901,6 +3988,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
                 env, device_ir, device_ir.graphs
             )
+            from .cute.mma_support import cute_fp32_dot_uses_tf32
+
+            config_spec.cute_fp32_dot_exact = not cute_fp32_dot_uses_tf32()
 
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.

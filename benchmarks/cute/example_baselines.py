@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import importlib
 import inspect
+from pathlib import Path
 import statistics
 import sys
 import time
@@ -16,6 +17,12 @@ from typing import Callable
 
 if TYPE_CHECKING:
     import torch
+
+# The repository root's quack/ checkout directory has no __init__.py. With the
+# root on sys.path it shadows the installed package as a namespace package, and
+# quack's JIT cache then fails on quack.__file__. Like the dedicated
+# comparisons, import quack from the checkout itself when it exists.
+QUACK_PATH = Path(__file__).resolve().parents[2] / "quack"
 
 
 def _event_ms(fn: Callable) -> float:
@@ -83,24 +90,61 @@ class PreparedCandidate:
     details: dict
 
 
-def active_kernel_configs() -> list[dict]:
+def live_example_kernels() -> dict[str, Any]:
+    """Every live Helion kernel whose function is defined in an example module.
+
+    Kernels are found through the garbage collector, not module globals: some
+    examples build theirs inside cached factory functions (nvfp4_gemv) and
+    those never appear in ``vars(module)``.
+    """
+    import gc
+
     import helion
 
-    found = {}
+    # Some examples build their kernels in zero-argument cached factories
+    # (``@functools.cache def _foo_kernel() -> helion.Kernel``); construct
+    # those first so they can be pinned before the first call.
     for name, module in list(sys.modules.items()):
         if not name.startswith("examples.") or module is None:
             continue
         for obj in list(vars(module).values()):
-            if isinstance(obj, helion.Kernel) and obj._bound_kernels:
-                identity = f"{obj.fn.__module__}.{obj.fn.__name__}"
-                found[identity] = {
-                    "kernel": identity,
-                    "backend": obj.settings.backend,
-                    "configs": [
-                        bound._config.to_json() if bound._config is not None else None
-                        for bound in obj._bound_kernels.values()
-                    ],
-                }
+            wrapped = getattr(obj, "__wrapped__", None)
+            if (
+                isinstance(obj, functools._lru_cache_wrapper)
+                and callable(wrapped)
+                and "Kernel" in str(inspect.signature(wrapped).return_annotation)
+                and not inspect.signature(wrapped).parameters
+            ):
+                obj()
+    # Keyed by the function's qualified name; a second kernel built from the
+    # same function (examples/attention.py builds attention_dynamic from
+    # attention.fn) is kept under ``name@2`` instead of silently replacing
+    # the first in whatever order the collector lists them.
+    found: dict[str, Any] = {}
+    for obj in gc.get_objects():
+        if isinstance(obj, helion.Kernel) and obj.fn.__module__.startswith("examples."):
+            base = f"{obj.fn.__module__}.{obj.fn.__name__}"
+            key = base
+            index = 1
+            while key in found and found[key] is not obj:
+                index += 1
+                key = f"{base}@{index}"
+            found[key] = obj
+    return found
+
+
+def active_kernel_configs() -> list[dict]:
+    found = {}
+    for identity, obj in live_example_kernels().items():
+        if obj._bound_kernels:
+            found[identity] = {
+                "kernel": identity,
+                "backend": obj.settings.backend,
+                "configs": [
+                    bound._config.to_json() if bound._config is not None else None
+                    for bound in obj._bound_kernels.values()
+                ],
+            }
     return list(found.values())
 
 
@@ -108,6 +152,8 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
     import torch
     import torch.nn.functional as F
 
+    if QUACK_PATH.is_dir() and str(QUACK_PATH) not in sys.path:
+        sys.path.insert(0, str(QUACK_PATH))
     baseline = next(iter(case.baselines.values()))
     result: dict[str, Callable] = {
         name: (lambda fn=fn: fn) for name, fn in case.baselines.items()
@@ -470,7 +516,18 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
             from helion._testing import HALF_DTYPE
 
-            return lambda a, b: gemm(a, b, out_dtype=HALF_DTYPE)
+            def call(
+                a: torch.Tensor,
+                b: torch.Tensor,
+                scale_a: torch.Tensor | None = None,
+                scale_b: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                # The second case passes tensor-wise scales: alpha folds them
+                # into quack's epilogue.
+                alpha = 1.0 if scale_a is None or scale_b is None else scale_a * scale_b
+                return gemm(a, b, alpha=alpha, out_dtype=HALF_DTYPE)
+
+            return call
 
         result["quack"] = quack_fp8_gemm
     if module == "gather_gemv":
@@ -635,6 +692,29 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
         result["quack.grouped_mm"] = lambda: grouped_jagged(True)
         result["aten.grouped_mm"] = lambda: grouped_jagged(False)
+        # FP32 _grouped_mm copies offsets to the host, which CUDA graphs reject.
+        # A padded batched GEMM is a capture-safe ATen formulation.
+        offsets = case.args[0]
+        longest = int((offsets[1:] - offsets[:-1]).max())
+
+        def padded_bmm(
+            offsets: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            rows = torch.repeat_interleave(
+                torch.arange(weights.shape[0], device=x.device),
+                offsets[1:] - offsets[:-1],
+                output_size=x.shape[0],
+            )
+            cols = torch.arange(x.shape[0], device=x.device) - offsets[rows]
+            padded = x.new_zeros(weights.shape[0], longest, x.shape[1])
+            padded[rows, cols] = x
+            return torch.baddbmm(bias[:, None, :], padded, weights)[rows, cols]
+
+        result["aten.padded_bmm"] = lambda: padded_bmm
+        result["compile.padded_bmm"] = lambda: torch.compile(padded_bmm, fullgraph=True)
     if module in {
         "jagged_sum",
         "jagged_mean",
@@ -950,6 +1030,232 @@ def assert_correct(
         torch.testing.assert_close(actual[keep], (x / (1 - p))[keep])
 
 
+def graph_profile(replay: Callable, calls: int = 5) -> list[str]:
+    """Names of the GPU activities (kernels, memsets, memcpys) one replay of
+    a captured graph performs, in launch order; a node that a baseline has
+    and we do not (or vice versa) shifts the single-replay graph time by a
+    whole launch-latency quantum."""
+    import torch
+    from torch.profiler import ProfilerActivity
+    from torch.profiler import profile
+
+    replay()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+        for _ in range(calls):
+            replay()
+        torch.cuda.synchronize()
+    events = sorted(
+        (
+            e
+            for e in prof.events() or []
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ),
+        key=lambda e: e.time_range.start,
+    )
+    per_replay = len(events) // calls if calls else len(events)
+    names = [
+        f"{e.time_range.elapsed_us():.2f}us {e.name[:100]}" for e in events[:per_replay]
+    ]
+    for name in names:
+        print(f"graph node {name}", file=sys.stderr)
+    return names
+
+
+def kernel_profile(fn: Callable, calls: int) -> dict:
+    """Median per-call sum of GPU kernel durations (us) over ``calls`` eager
+    calls under torch.profiler, plus a per-kernel breakdown. Measures device
+    time only, so launch latency and CPU overhead drop out."""
+    import torch
+    from torch.profiler import ProfilerActivity
+    from torch.profiler import profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+        for _ in range(calls):
+            fn()
+        torch.cuda.synchronize()
+    kernels = [
+        e
+        for e in prof.events() or []
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith("Memcpy")
+        and not e.name.startswith("Memset")
+    ]
+    kernels.sort(key=lambda e: e.time_range.start)
+    per_name: dict[str, list[float]] = {}
+    for e in kernels:
+        per_name.setdefault(e.name, []).append(e.time_range.elapsed_us())
+    # Every kernel name should appear once per call; the per-call total is
+    # the sum of per-kernel medians, which is robust to profiler stragglers.
+    total = 0.0
+    for name, durations in per_name.items():
+        per_call = len(durations) / calls
+        median = statistics.median(durations)
+        total += median * per_call
+        print(
+            f"kernel {median:9.2f} us x{per_call:g}/call  {name[:120]}",
+            file=sys.stderr,
+        )
+    return {"kernel_us": total, "kernel_names": list(per_name)}
+
+
+def measure_batched(
+    fn: Callable,
+    repetitions: int,
+    calls: int,
+    expected: Any,
+    case: Any,
+    *,
+    output_dtype: torch.dtype | None = None,
+    sustain_ms: float = 500.0,
+    min_replay_us: float = 400.0,
+    max_calls: int = 256,
+) -> dict:
+    """Per-call ms of one CUDA graph holding ``calls`` back-to-back calls.
+
+    A single-call graph replay carries the graph launch latency quantized to
+    ~2 us steps, so kernels under ~20 us all read alike; folding many calls
+    into one graph amortizes it. Each call still pays its in-graph kernel
+    launch gap, which is also what a real sequence of kernels pays.
+
+    The graph is replayed back-to-back for ``sustain_ms`` before timing so a
+    power-capped GPU settles on its sustained clock (a B200 at 750 W drops
+    from boost to the cap ~100 ms into a load; medians of a 70 us GEMM moved
+    from 60 to 69 us), and the median of ``max(repetitions, 7)`` do_bench
+    medians is reported as ``graph_calls_ms``. Readings of one implementation
+    agree to ~0.3% across processes in this form.
+
+    CUDA event elapsed times are quantized to 1/512 ms (1.953 us) on B200, so
+    one replay of a 16-call graph of a 3 us kernel (47 us) reads in 4% steps
+    and the median flips between adjacent steps as the true time drifts by a
+    fraction of one. When one replay of the ``calls`` graph takes less than
+    ``min_replay_us``, a second graph grown by powers of two (up to
+    ``max_calls``) until a replay takes at least that long is measured the
+    same way and reported as ``graph_long_ms`` with ``graph_long_calls`` (a
+    quantum of at most 0.5%; the per-graph launch latency is also amortized
+    further, so the two readings differ by a fraction of a microsecond on
+    tiny kernels); otherwise ``graph_long_ms`` repeats ``graph_calls_ms``.
+    The report prefers ``graph_long_ms``.
+    """
+    import math
+
+    import torch
+
+    from helion.runtime import cute_cuda_graph
+
+    result: dict[str, Any] = {"graph_calls": calls, "sustain_ms": sustain_ms}
+
+    def output_bytes(value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            return value.numel() * value.element_size()
+        if isinstance(value, (list, tuple)):
+            return sum(output_bytes(v) for v in value)
+        if isinstance(value, dict):
+            return sum(output_bytes(v) for v in value.values())
+        return 0
+
+    def capture(count: int) -> tuple[Any, int]:
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+        try:
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                fn()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            outputs: list[Any] = []
+            with cute_cuda_graph() as graph:
+                for _ in range(count):
+                    outputs.append(fn())
+            torch.cuda.synchronize()
+        finally:
+            torch.autograd.graph.set_override_stale_capture_stream(False)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_correct(outputs[-1], expected, case, output_dtype=output_dtype)
+        return graph, output_bytes(outputs[-1])
+
+    def measure(graph: Any, count: int) -> list[float]:
+        started = time.perf_counter()
+        while (time.perf_counter() - started) * 1000.0 < sustain_ms:
+            graph.replay()
+        torch.cuda.synchronize()
+        return [_event_ms(graph.replay) / count for _ in range(max(repetitions, 7))]
+
+    try:
+        graph, per_call_bytes = capture(calls)
+        runs = measure(graph, calls)
+        replay_us = statistics.median(runs) * calls * 1000.0
+        result.update(
+            graph_calls_ms=statistics.median(runs),
+            graph_calls_runs_ms=runs,
+            graph_replay_us=replay_us,
+        )
+        if replay_us < min_replay_us and calls < max_calls:
+            factor = 2 ** max(1, math.ceil(math.log2(min_replay_us / replay_us)))
+            long_calls = min(max_calls, calls * factor)
+            # Every call of the grown graph keeps its own output alive; stay
+            # within a quarter of the free device memory.
+            free_bytes = torch.cuda.mem_get_info()[0]
+            while long_calls > calls and long_calls * per_call_bytes > free_bytes // 4:
+                long_calls //= 2
+            del graph
+            graph, _ = capture(long_calls)
+            long_runs = measure(graph, long_calls)
+            result.update(
+                graph_long_ms=statistics.median(long_runs),
+                graph_long_calls=long_calls,
+                graph_long_runs_ms=long_runs,
+            )
+        else:
+            result.update(
+                graph_long_ms=result["graph_calls_ms"], graph_long_calls=calls
+            )
+    except Exception as error:
+        result["graph_calls_error"] = f"{type(error).__name__}: {error}"
+        # A failed capture leaves the capture stream current; later
+        # measurements must not run on it.
+        torch.cuda.set_stream(torch.cuda.default_stream())
+    return result
+
+
+def measure_cold(fn: Callable, repetitions: int, repeat: int = 100) -> dict:
+    """Per-call ms in the autotuner's own regime: ``interleaved_bench`` flushes
+    L2 before every timed call (batched into one CUDA graph of up to 16
+    [flush; call] pairs for short kernels, with the flush-only graph time
+    subtracted), the regime tritonbench measures and Helion's autotuner
+    optimizes for, whatever HELION_AUTOTUNE_L2_FLUSH says. Median of
+    ``repetitions`` bench medians."""
+    import torch
+
+    from helion.autotuner.benchmarking import _make_cudagraph_replay
+    from helion.autotuner.benchmarking import interleaved_bench
+
+    result: dict[str, Any] = {
+        "bench_regime": f"interleaved_bench(repeat={repeat}, cold L2, CUDA graph)",
+    }
+    # Backward callables replay autograd graphs whose saved streams PyTorch
+    # must redirect into the capture; without this the bench silently falls
+    # back to eager calls and times host-side autograd overhead instead.
+    torch.autograd.graph.set_override_stale_capture_stream(True)
+    try:
+        torch.cuda.synchronize()
+        _make_cudagraph_replay(fn)  # fail loudly if the call cannot be captured
+        runs = [
+            interleaved_bench(
+                [fn], repeat=repeat, default_cudagraph=True, l2_flush_mode="call"
+            )[0]
+            for _ in range(repetitions)
+        ]
+        result.update(bench_ms=statistics.median(runs), bench_runs_ms=runs)
+    except Exception as error:
+        result["bench_error"] = f"{type(error).__name__}: {error}"
+    finally:
+        torch.autograd.graph.set_override_stale_capture_stream(False)
+    return result
+
+
 def measure(
     fn: Callable,
     repetitions: int,
@@ -957,6 +1263,7 @@ def measure(
     case: Any,
     *,
     output_dtype: torch.dtype | None = None,
+    graph_nodes: bool = False,
 ) -> dict:
     import torch
 
@@ -981,6 +1288,8 @@ def measure(
             torch.autograd.graph.set_override_stale_capture_stream(False)
         actual = replay()
         result["graph_output"] = metadata(actual)
+        if graph_nodes:
+            result["graph_nodes"] = graph_profile(replay)
         assert_correct(actual, expected, case, output_dtype=output_dtype)
         graph_runs = [_event_ms(replay) for _ in range(repetitions)]
         actual = replay()

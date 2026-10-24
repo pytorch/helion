@@ -21,8 +21,8 @@ from .._compiler.compile_environment import _symint_expr
 from .._compiler.cute.access_regions import access_address
 from .._compiler.cute.access_regions import block_size_symbol
 from .._compiler.cute.access_regions import tile_begin_symbol
-from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .._compiler.cute.cache_policy_loads import cache_hinted_load_helper
+from .._compiler.cute.cache_policy_loads import is_cache_policy_suffix
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
@@ -358,6 +358,84 @@ def _cute_index_override(state: CodegenState, block_id: int) -> str | None:
     return override.get(_cute_remap_block_id(state, block_id))
 
 
+def _cute_rolled_replica(state: CodegenState, block_id: int) -> str | None:
+    """The index variable of the chunk lane loop standing in for a rolled
+    reduction block outside the reduction's own loop on the current grid
+    (``_cute_make_rolled_replica``), or None."""
+    grid_state = state.codegen.current_grid_state
+    if grid_state is None or not grid_state.rolled_reduction_replicas:
+        return None
+    return grid_state.rolled_reduction_replicas.get(
+        _cute_remap_block_id(state, block_id)
+    )
+
+
+def _cute_make_rolled_replica(
+    state: CodegenState, size: object, used_block_ids: set[int]
+) -> int | None:
+    """Give a full-slice access over a rolled reduction's extent, outside that
+    reduction's loop, its own lane loop over the block.
+
+    The rolled strategy walks its block in chunks of its thread count inside
+    ``for roffset``: the block's index exists only there, and a statement
+    after the loop spanning the whole block (the zero store of a dQ row next
+    to the row's ``sum(o * do)`` at head dim 128, where the two share the
+    block of that extent) had no coordinate for it.  The replica registers,
+    once per block and grid, a synthetic lane loop with the reduction's
+    thread geometry -- ``index = thread_idx()[axis] + lane * threads`` over
+    ``numel / threads`` lanes -- and the lane distribution places only the
+    statements reading it inside, as it does for any other full-slice block.
+    Only a block whose extent the threads divide qualifies: the thread count
+    is a power of two, so that is every power-of-two extent, and the device
+    IR attaches a store over any other extent to a replay of the rolled loop
+    (which walks the tail chunk with the loop's own bound), so no such store
+    reaches here and the replica needs no mask.  Returns the block id it
+    stands for, or None when no unused rolled block of that static extent
+    qualifies at the grid level (the caller then raises as before).
+    """
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+    env = CompileEnvironment.current()
+    grid_state = state.codegen.current_grid_state
+    if grid_state is None:
+        return None
+    fn = state.device_function
+    for block_id in _matching_block_ids(env, size):
+        if block_id in used_block_ids:
+            continue
+        if _cute_rolled_replica(state, block_id) is not None:
+            return block_id
+        strategy = fn.tile_strategy.block_id_to_strategy.get_any(block_id)
+        if (
+            not isinstance(strategy, LoopedReductionStrategy)
+            or strategy._thread_count <= 0
+            or strategy._cute_reduction_vec_width != 1
+            or not strategy._claims_thread_axis()
+        ):
+            continue
+        numel = env.block_sizes[block_id].numel
+        if isinstance(numel, sympy.Integer):
+            numel = int(numel)
+        if not isinstance(numel, int) or numel <= 0:
+            continue
+        threads = strategy._thread_count
+        if numel % threads:
+            continue
+        axis = strategy._get_thread_axis()
+        lane_var = fn.new_var(f"synthetic_lane_{block_id}")
+        index_var = fn.new_var(f"rindex_lane_{block_id}")
+        grid_state.add_lane_loop(block_id, lane_var, numel // threads)
+        grid_state.lane_setup_statements.append(
+            statement_from_string(
+                f"{index_var} = cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+                f" + cutlass.Int32({lane_var}) * {threads}"
+            )
+        )
+        grid_state.rolled_reduction_replicas[block_id] = index_var
+        return block_id
+    return None
+
+
 def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     if (override := _cute_index_override(state, block_id)) is not None:
         return override
@@ -368,18 +446,42 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     grid_state = state.codegen.current_grid_state
     if grid_state is not None and block_id in grid_state.block_ids:
         return grid_state.strategy.index_var(block_id)
+    if (replica := _cute_rolled_replica(state, block_id)) is not None:
+        return replica
     return None
 
 
 def _cute_resolve_active_slice_block_id(
-    state: CodegenState, size: object, used_block_ids: set[int]
+    state: CodegenState,
+    size: object,
+    used_block_ids: set[int],
+    *,
+    tile_block_ids: frozenset[int] | set[int] = frozenset(),
 ) -> int | None:
-    """Resolve the same slice axis for pointer arithmetic and atomic ownership."""
+    """Resolve the same slice axis for pointer arithmetic and atomic ownership.
+
+    A block no other position of the subscript indexes comes first.  Failing
+    that, a block another SLICE position already took may be returned: two
+    slices of one tensor whose extents coincide share the reduction block of
+    that extent (a matmul operand's K and N at 128), and the consumer handles
+    the pair (the matmul's operand index override).  A block a TILE position
+    took (``tile_block_ids``) never is: the tile's block coordinates the
+    thread's row, so a slice bound to it would run along the diagonal.  With
+    the batch extent equal to the head dim (``static_shapes``) and the
+    slice's own block's index not active at the store (a rolled reduction's
+    lives only inside its loop; a persistent one's lanes closed before the
+    store), the batch tile's block was the one active candidate and was
+    returned here: the store took the batch tile's index as its column and
+    wrote one element per row, silently.  With no candidate the caller
+    falls back (a chunk lane loop for a rolled reduction's block) or rejects
+    the site ("indexing dimension is not active in this scope").
+    """
     env = CompileEnvironment.current()
     active_candidates = [
         block_id
         for block_id in _matching_block_ids(env, size)
-        if _cute_active_index_var(state, block_id) is not None
+        if block_id not in tile_block_ids
+        and _cute_active_index_var(state, block_id) is not None
     ]
     active_unused_candidates = [
         block_id for block_id in active_candidates if block_id not in used_block_ids
@@ -665,6 +767,8 @@ def _cute_index_exprs(
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and block_id in grid_state.block_ids:
             return grid_state.strategy.index_var(block_id)
+        if (replica := _cute_rolled_replica(state, block_id)) is not None:
+            return replica
         return None
 
     def index_var_for_block_id(block_id: int, size: object) -> str:
@@ -707,6 +811,9 @@ def _cute_index_exprs(
         if isinstance(idx, torch.SymInt)
         if (block_id := env.get_block_id(idx)) is not None
     }
+    # The blocks the tile positions take: never a slice's (see
+    # ``_cute_resolve_active_slice_block_id``).
+    tile_block_ids = set(used_block_ids)
     result = []
     tensor_dim = 0
     for pos, idx in enumerate(subscript):
@@ -741,6 +848,7 @@ def _cute_index_exprs(
             continue
         if tile_info is not None and tile_info.block_size is not None:
             used_block_ids.add(tile_info.block_id)
+            tile_block_ids.add(tile_info.block_id)
             result.append(tile_with_offset_index_expr(tile_info))
             tensor_dim += 1
             continue
@@ -777,7 +885,7 @@ def _cute_index_exprs(
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
             dim_size = tensor.shape[tensor_dim]
             block_id = _cute_resolve_active_slice_block_id(
-                state, dim_size, used_block_ids
+                state, dim_size, used_block_ids, tile_block_ids=tile_block_ids
             )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
@@ -790,6 +898,16 @@ def _cute_index_exprs(
                 dim_size, 1
             ):
                 result.append(inactive_singleton_slice_expr)
+                tensor_dim += 1
+                continue
+            # The slice's block is a rolled reduction's and its loop is not
+            # open here: stand a chunk lane loop in for it.
+            block_id = _cute_make_rolled_replica(state, dim_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                result.append(idx_var)
                 tensor_dim += 1
                 continue
             if inactive_slice_expr is None:
@@ -816,7 +934,7 @@ def _cute_index_exprs(
             start = idx.start if idx.start is not None else 0
             step = idx.step if idx.step is not None else 1
             block_id = _cute_resolve_active_slice_block_id(
-                state, slice_size, used_block_ids
+                state, slice_size, used_block_ids, tile_block_ids=tile_block_ids
             )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
@@ -1079,7 +1197,7 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
         )
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         # The L2 policy helper only exists in 16-byte vector form.
         eviction_suffix = ""
     if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
@@ -1109,6 +1227,11 @@ def _cute_scalar_load_expr(
 
 # Maximum bytes per vector load/store transaction (LDG.128/STG.128).
 _CUTE_VECTOR_MAX_BYTES = 16
+# A lane of the sunk flat-gather path (``cute_vloop_sink``) may span up to
+# four consecutive 16-byte packets, loaded under one predicate: a wider lane
+# puts more of a row in flight per thread without a second sweep over the
+# rows for the next chunk of columns.
+_FLAT_GATHER_SINK_MAX_BYTES = 64
 
 # Dtype -> (cutlass scalar type name, max vector width).  Used for the
 # ``vec`` mode that issues an explicit
@@ -1217,7 +1340,7 @@ def _cute_unroll_vec_load_expr(
     ``createpolicy.fractional`` helper of its width; byte-packed dtypes and
     2-byte scalars silently drop the hint.
     """
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         helper = (
             None
             if _cute_is_byte_packed(dtype)
@@ -1808,6 +1931,8 @@ def _cute_combined_mask(
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and block_id in grid_state.block_ids:
             return grid_state.strategy.index_var(block_id)
+        if (replica := _cute_rolled_replica(state, block_id)) is not None:
+            return replica
         return None
 
     def active_local_coord(block_id: int) -> str | None:
@@ -2683,6 +2808,9 @@ def _codegen_cute_store_tcgen05_tile(
         segment_store
         and segment_grouped is not None
         and segment_grouped.fixed_tensormaps
+    )
+    grouped_bounded_output_shift = bool(
+        segment_grouped is not None and segment_grouped.bounded_output_shift
     )
     tcgen05_source_bm = tcgen05_value.source_tile_m
     tcgen05_source_bn = tcgen05_value.source_tile_n
@@ -3587,7 +3715,9 @@ def _codegen_cute_store_tcgen05_tile(
 
     worklist_nm_segment_valid_m_bound = (
         tcgen05_value.segment_store_valid_m_bound
-        if tcgen05_value.orientation is Tcgen05Orientation.NM and segment_store
+        if tcgen05_value.orientation is Tcgen05Orientation.NM
+        and segment_store
+        and not grouped_bounded_output_shift
         else ""
     )
 
@@ -4173,6 +4303,24 @@ def _codegen_cute_store_tcgen05_tile(
                     f"{rec.aux_rmem}.load()\n"
                 )
                 continue
+            if tcgen05_value.output_column_major and unconditional_full_tile:
+                # Column-major broadcasts may retain a nested R2S profile while
+                # the accumulator carrier is flat. Materialize the broadcast
+                # into the carrier profile, preserving its coordinates and the
+                # original order of the epilogue's FP32 operations.
+                lines.extend(
+                    (
+                        (
+                            f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                            f"{rec.ttr_aux_grouped}"
+                            f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        ),
+                        _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        ),
+                    )
+                )
+                continue
             if rowvec_stage is None and unconditional_full_tile:
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
@@ -4438,8 +4586,10 @@ def _codegen_cute_store_tcgen05_tile(
     grouped_tma_plan = matmul_plan if grouped_tail_epilogue or segment_store else None
     grouped_tma = grouped_tma_plan.grouped if grouped_tma_plan is not None else None
     d_tma_uses_rank3_mnl_tensor = (
-        (row_union is not None and row_union.schedule is not None)
+        (tcgen05_value.output_column_major and not leading_passthrough_output)
+        or (row_union is not None and row_union.schedule is not None)
         or grouped_fixed_d_tensormap
+        or grouped_bounded_output_shift
         or (
             grouped_tma is not None
             and grouped_tma.d_mode is not Tcgen05GroupedDMode.NONE
@@ -4506,6 +4656,7 @@ def _codegen_cute_store_tcgen05_tile(
             **({"orientation": "nm"} if tcgen05_nm_store else {}),
             **({"fixed_tensormap": True} if grouped_fixed_d_tensormap else {}),
             **({"rank3_mnl_tensor": True} if d_tma_uses_rank3_mnl_tensor else {}),
+            **({"bounded_output_shift": True} if grouped_bounded_output_shift else {}),
             **(
                 {
                     "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
@@ -4784,6 +4935,28 @@ def _codegen_cute_store_tcgen05_tile(
         if row_union is not None and row_union.schedule is not None and tma_store:
             local_gmem_tensor = f"{gmem_tensor}[None, None, 0]"
             tile_coord = f"({static_tile_coord_n}, {static_tile_coord_m})"
+        elif (
+            grouped_bounded_output_shift
+            and gmem_tensor
+            in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)
+            and rank3_mnl_tensor
+        ):
+            assert grouped_tma is not None and grouped_tma.m_size is not None
+            row_delta = f"cutlass.Int32({grouped_tma.m_size}) - {grouped_tma.problem_m}"
+            row_end = f"{grouped_tma.global_m_start} + {grouped_tma.problem_m}"
+            offset = (
+                f"(cutlass.Int32(0), {row_delta}, {row_end})"
+                if tcgen05_nm_store
+                else f"({row_delta}, cutlass.Int32(0), {row_end})"
+            )
+            local_gmem_tensor = df.new_var("tcgen05_bounded_output")
+            tile_setup.append(
+                f"{local_gmem_tensor} = cute.domain_offset({offset}, {gmem_tensor})"
+            )
+            coord_m, coord_n = grouped_tma.cta_tile_idx_m, grouped_tma.cta_tile_idx_n
+            if tcgen05_nm_store:
+                coord_m, coord_n = coord_n, coord_m
+            tile_coord = f"({coord_m}, {coord_n}, 0)"
         elif (
             gmem_tensor
             in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)
@@ -7194,6 +7367,22 @@ def _codegen_cute_store_tcgen05_tile(
     return [*main_stmts, *post_loop_stmts]
 
 
+def _ref_masked_slice_indices(
+    tensor: torch.Tensor, indices: list[object]
+) -> list[object]:
+    """Include sliced axes in Cartesian indexing and mask broadcasting."""
+    index_dtype = next(
+        (index.dtype for index in indices if isinstance(index, torch.Tensor)),
+        torch.int64,
+    )
+    return [
+        torch.arange(tensor.size(dim), device=tensor.device, dtype=index_dtype)[index]
+        if isinstance(index, slice)
+        else index
+        for dim, index in enumerate(indices)
+    ]
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -7210,15 +7399,12 @@ def _(
         raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
 
     # Normalize indices and identify tensor indices
-    indices = []
-    tensor_idx_positions = []
-    for i, idx in enumerate(index):
-        if isinstance(idx, RefTile):
-            idx = idx.index
-        # pyrefly: ignore [bad-argument-type]
-        indices.append(idx)
-        if isinstance(idx, torch.Tensor):
-            tensor_idx_positions.append(i)
+    indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+    if extra_mask is not None:
+        indices = _ref_masked_slice_indices(tensor, indices)
+    tensor_idx_positions = [
+        i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
+    ]
 
     # Handle broadcasting for multiple tensor indices
     if len(tensor_idx_positions) > 1:
@@ -7427,12 +7613,12 @@ def _(
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
 
-    # Process indices: convert RefTiles and clamp tensor indices
+    index = _ref_masked_slice_indices(
+        tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+    )
+    # Process indices: clamp tensor indices
     orig_indices, safe_indices, is_tensor_mask = [], [], []
     for i, idx in enumerate(index):
-        if isinstance(idx, RefTile):
-            idx = idx.index  # Convert RefTile to tensor
-
         if isinstance(idx, torch.Tensor):
             dim_size = tensor.shape[i] if i < len(tensor.shape) else tensor.numel()
             orig_indices.append(idx)

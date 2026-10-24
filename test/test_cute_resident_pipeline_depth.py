@@ -233,11 +233,14 @@ def test_old_seed_prefix_default_and_owned_lists_are_preserved() -> None:
     assert bound.host_function is not None
     spec = bound.config_spec
     family = _family(bound)
+    # One three-tail triple per coarse tile: the lattice's sixteen rows and,
+    # for 64 rows on a 128-SM device, the occupancy seed's four.
+    assert len(family) % 3 == 0
     assert [seed["cute_host_paired_sum"] for seed in family] == [
         "off",
         "mapped",
         "narrow",
-    ]
+    ] * (len(family) // 3)
     current = deepcopy(spec.compiler_seed_configs)
     promoted = deepcopy(spec.compiler_default_config)
     with bound.env:

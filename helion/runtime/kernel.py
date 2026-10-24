@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import PreparedGuardFactory
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
@@ -490,6 +491,7 @@ class _RuntimeInputSpecializationExtractor:
     classifier: Callable[[Sequence[object]], Hashable]
     reusable_tensor_properties: frozenset[str]
     specialization_key: str | None = None
+    prepared_guard_factory: PreparedGuardFactory | None = None
 
     def source_values(self, args: Sequence[object]) -> tuple[object, ...]:
         return tuple(extract(args) for extract in self.source_extractors)
@@ -502,101 +504,50 @@ def _partition_prepared_extra_guards(
     args: tuple[object, ...],
     extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
 ) -> tuple[
-    Callable[[tuple[object, ...]], bool] | None,
     tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
-    tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+    tuple[Callable[[Sequence[object]], bool], ...],
 ]:
-    """Split guards into always-check and exact-tensor reusable projections.
+    """Split guards into always-check classifiers and prepared fact guards.
 
-    Tensor shape/stride/dtype/device facts are already checked by the prepared
-    argument guard.  A runtime classifier may additionally opt in to reuse
-    when its exact source tensors still have the same pointer/storage facts.
-    Classifiers that depend on tensor contents (or arbitrary Python state)
-    remain in the always-check set.
+    Tensor type/shape/stride/dtype/device facts are already checked by the
+    prepared argument guard.  A runtime input specialization may supply a
+    ``prepared_guard_factory`` that turns its expected result into a direct
+    check of the pointer/storage facts those pins leave open, so repeat calls
+    with fresh output tensors never re-run the full classifier.  Classifiers
+    without one (tensor contents, arbitrary Python state) remain in the
+    always-check set, as does any factory guard that rejects the very
+    arguments it was prepared from.
     """
     always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    reusable: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    # One source projection is enough for duplicate tensor objects: the
-    # prepared argument guard independently preserves the input alias topology.
-    tensor_entries: dict[
-        int,
-        tuple[
-            Callable[[Sequence[object]], Hashable],
-            torch.Tensor,
-            set[str],
-        ],
-    ] = {}
+    fact_guards: list[Callable[[Sequence[object]], bool]] = []
     for extractor, expected in extra_guards:
         if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
             continue
-        if (
-            not isinstance(extractor, _RuntimeInputSpecializationExtractor)
-            or not extractor.reusable_tensor_properties
-            or not extractor.reusable_tensor_properties <= {"data_ptr", "storage_span"}
-        ):
+        guard = (
+            _build_prepared_fact_guard(extractor, expected, args)
+            if isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            else None
+        )
+        if guard is None:
             always_check.append((extractor, expected))
-            continue
-        try:
-            source_values = extractor.source_values(args)
-        except Exception:
-            always_check.append((extractor, expected))
-            continue
-        if not source_values or any(
-            type(value) not in (torch.Tensor, torch.nn.Parameter)
-            for value in source_values
-        ):
-            always_check.append((extractor, expected))
-            continue
-        reusable.append((extractor, expected))
-        for source_extractor, value in zip(
-            extractor.source_extractors, source_values, strict=True
-        ):
-            assert isinstance(value, torch.Tensor)
-            entry = tensor_entries.get(id(value))
-            if entry is None:
-                tensor_entries[id(value)] = (
-                    source_extractor,
-                    value,
-                    set(extractor.reusable_tensor_properties),
-                )
-            else:
-                entry[2].update(extractor.reusable_tensor_properties)
+        else:
+            fact_guards.append(guard)
+    return tuple(always_check), tuple(fact_guards)
 
-    if not reusable:
-        return None, tuple(always_check), ()
 
-    namespace: dict[str, object] = {}
-    checks: list[str] = []
+def _build_prepared_fact_guard(
+    extractor: _RuntimeInputSpecializationExtractor,
+    expected: Hashable,
+    args: tuple[object, ...],
+) -> Callable[[Sequence[object]], bool] | None:
+    factory = extractor.prepared_guard_factory
+    if factory is None:
+        return None
     try:
-        for index, (extractor, tensor, properties) in enumerate(
-            tensor_entries.values()
-        ):
-            namespace[f"extract_{index}"] = extractor
-            namespace[f"ref_{index}"] = weakref.ref(tensor)
-            value_name = f"value_{index}"
-            item_checks = [
-                f"(({value_name} := extract_{index}(args)) is ref_{index}())"
-            ]
-            if "data_ptr" in properties:
-                namespace[f"data_ptr_{index}"] = int(tensor.data_ptr())
-                item_checks.append(f"{value_name}.data_ptr() == data_ptr_{index}")
-            if "storage_span" in properties:
-                storage = tensor.untyped_storage()
-                namespace[f"storage_ptr_{index}"] = int(storage.data_ptr())
-                namespace[f"storage_nbytes_{index}"] = storage.nbytes()
-                storage_name = f"storage_{index}"
-                item_checks.extend(
-                    (
-                        f"(({storage_name} := {value_name}.untyped_storage()).data_ptr() == storage_ptr_{index})",
-                        f"{storage_name}.nbytes() == storage_nbytes_{index}",
-                    )
-                )
-            checks.append(f"({' and '.join(item_checks)})")
-        reuse_guard = eval(f"lambda args: {' and '.join(checks)}", namespace)
+        guard = factory(extractor.source_extractors, expected)
+        return guard if guard(args) else None
     except Exception:
-        always_check.extend(reusable)
-        return None, tuple(always_check), ()
-    return reuse_guard, tuple(always_check), tuple(reusable)
+        return None
 
 
 def _make_prepared_arg_guard(
@@ -606,7 +557,11 @@ def _make_prepared_arg_guard(
     namespace: dict[str, object] = {}
     checks = [f"len(args) == {len(args)}"]
     counter = itertools.count()
-    tensor_paths: list[tuple[str, torch.Tensor]] = []
+    tensor_paths: list[tuple[str, weakref.ReferenceType[torch.Tensor]]] = []
+    # Plain tensors whose dtype / device / shape / stride one C++ guard
+    # (dynamo's ``TensorGuards``) checks in front of the Python checks: ~0.1
+    # us per tensor against ~0.5 us for the four attribute comparisons.
+    cxx_tensor_paths: list[tuple[str, torch.Tensor]] = []
 
     def append_checks(
         value: object,
@@ -619,23 +574,28 @@ def _make_prepared_arg_guard(
         checks.append(f"type({prefix}) is type_{token}")
         if value_type in (torch.Tensor, torch.nn.Parameter):
             assert isinstance(value, torch.Tensor)
-            for previous_prefix, previous_tensor in tensor_paths:
-                relation = "is" if value is previous_tensor else "is not"
+            for previous_prefix, previous_tensor_ref in tensor_paths:
+                relation = "is" if previous_tensor_ref() is value else "is not"
                 checks.append(f"{prefix} {relation} {previous_prefix}")
-            tensor_paths.append((prefix, value))
-            namespace[f"dtype_{token}"] = value.dtype
-            namespace[f"shape_{token}"] = value.shape
-            namespace[f"stride_{token}"] = value.stride()
-            namespace[f"device_{token}"] = value.device
-            checks.extend(
-                (
-                    f"{prefix}.dtype is dtype_{token}",
-                    f"{prefix}.shape == shape_{token}",
-                    f"{prefix}.stride() == stride_{token}",
-                    f"{prefix}.device == device_{token}",
-                )
-            )
+            tensor_paths.append((prefix, weakref.ref(value)))
             static_indices = getattr(value, "_dynamo_static_indices", None)
+            if value_type is torch.Tensor and static_indices is None:
+                # (The C++ guard also pins requires_grad and the dispatch
+                # keys: a change there falls back to the full dispatch.)
+                cxx_tensor_paths.append((prefix, value))
+            else:
+                namespace[f"dtype_{token}"] = value.dtype
+                namespace[f"shape_{token}"] = value.shape
+                namespace[f"stride_{token}"] = value.stride()
+                namespace[f"device_{token}"] = value.device
+                checks.extend(
+                    (
+                        f"{prefix}.dtype is dtype_{token}",
+                        f"{prefix}.shape == shape_{token}",
+                        f"{prefix}.stride() == stride_{token}",
+                        f"{prefix}.device == device_{token}",
+                    )
+                )
             if static_indices is None:
                 checks.append(
                     f"getattr({prefix}, '_dynamo_static_indices', None) is None"
@@ -739,9 +699,65 @@ def _make_prepared_arg_guard(
         else:
             raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
 
-    for index, arg in enumerate(args):
-        append_checks(arg, f"args[{index}]", kernel._annotations[index])
+    try:
+        for index, arg in enumerate(args):
+            append_checks(arg, f"args[{index}]", kernel._annotations[index])
+    finally:
+        # Break the recursive closure cycle so its temporary C++ guard inputs
+        # are released even when cyclic GC is disabled or traversal raises.
+        append_checks = cast("Any", None)
+    if cxx_tensor_paths:
+        cxx_check = _prepared_cxx_tensor_check(
+            [tensor for _prefix, tensor in cxx_tensor_paths]
+        )
+        if cxx_check is not None:
+            namespace["cxx_tensor_check"] = cxx_check
+            paths = ", ".join(prefix for prefix, _tensor in cxx_tensor_paths)
+            # After every structural check: a path below a container or a
+            # closure cell exists only once the checks before it have held
+            # (a shorter list, a builtin in a function's place), and the
+            # chain short-circuits before reading it.
+            checks.append(f"cxx_tensor_check({paths})")
+        else:
+            for prefix, value in cxx_tensor_paths:
+                token = next(counter)
+                namespace[f"dtype_{token}"] = value.dtype
+                namespace[f"shape_{token}"] = value.shape
+                namespace[f"stride_{token}"] = value.stride()
+                namespace[f"device_{token}"] = value.device
+                checks.extend(
+                    (
+                        f"{prefix}.dtype is dtype_{token}",
+                        f"{prefix}.shape == shape_{token}",
+                        f"{prefix}.stride() == stride_{token}",
+                        f"{prefix}.device == device_{token}",
+                    )
+                )
     return eval(f"lambda args: {' and '.join(checks)}", namespace)
+
+
+def _prepared_cxx_tensor_check(
+    tensors: Sequence[torch.Tensor],
+) -> Callable[..., bool] | None:
+    """One C++ check of every tensor's type, dtype, device, requires_grad,
+    dispatch keys, sizes and strides against these tensors' (dynamo's
+    ``TensorGuards``), or None when the guard is unavailable or does not
+    accept them (the Python checks then stand alone)."""
+    try:
+        from torch._C._dynamo.guards import TensorGuards
+    except ImportError:  # pragma: no cover - older torch
+        return None
+    try:
+        guards = TensorGuards(
+            *tensors,
+            dynamic_dims_sizes=cast("Any", [list(t.shape) for t in tensors]),
+            dynamic_dims_strides=cast("Any", [list(t.stride()) for t in tensors]),
+        )
+        if not guards.check(*tensors):
+            return None
+    except Exception:
+        return None
+    return guards.check
 
 
 class _PreparedCall:
@@ -756,12 +772,11 @@ class _PreparedCall:
     __slots__ = (
         "_dist_initialized",
         "_extra_guards",
+        "_fact_guards",
         "_is_distributed",
         "_matches_args",
         "_reset_generation",
-        "_reusable_extra_guards",
         "_specialization_generation",
-        "_tensor_storage_reuse_guard",
         "bound",
     )
 
@@ -779,11 +794,9 @@ class _PreparedCall:
         self._matches_args = _make_prepared_arg_guard(bound.kernel, args)
         self._dist_initialized = dist_initialized
         self._is_distributed = is_distributed
-        (
-            self._tensor_storage_reuse_guard,
-            self._extra_guards,
-            self._reusable_extra_guards,
-        ) = _partition_prepared_extra_guards(args, extra_guards)
+        self._extra_guards, self._fact_guards = _partition_prepared_extra_guards(
+            args, extra_guards
+        )
         self._specialization_generation = bound.kernel._specialization_generation
         self._reset_generation = bound.kernel._reset_generation
         self.bound = bound
@@ -844,12 +857,9 @@ class _PreparedCall:
             for extractor, expected in self._extra_guards:
                 if extractor(args) != expected:
                     return False
-            if self._tensor_storage_reuse_guard is None or not (
-                self._tensor_storage_reuse_guard(args)
-            ):
-                for extractor, expected in self._reusable_extra_guards:
-                    if extractor(args) != expected:
-                        return False
+            for guard in self._fact_guards:
+                if not guard(args):
+                    return False
             return (
                 self._reset_generation == kernel._reset_generation
                 and self._specialization_generation == kernel._specialization_generation
@@ -1068,6 +1078,10 @@ class Kernel(Generic[_R]):
         # Cache the number of parameters to avoid accessing self.signature.parameters
         # during torch.compile tracing.
         self._num_params: int = len(self.signature.parameters)
+        self._normalize_args_plans: dict[
+            tuple[int, tuple[str, ...]],
+            tuple[tuple[object, ...], tuple[int, ...]] | None,
+        ] = {}
 
         # Expose function attributes for compatibility with torch.library.custom_op
         # These are set as instance attributes to allow the Kernel to be used
@@ -1887,9 +1901,57 @@ class Kernel(Generic[_R]):
         Returns:
             tuple[object, ...]: A tuple of normalized positional arguments.
         """
-        bound_args = self.signature.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        return tuple(bound_args.args)
+        key = (len(args), tuple(kwargs))
+        plans = self._normalize_args_plans
+        if torch.compiler.is_compiling():
+            # Dynamo would guard on the plan cache's contents and replay the
+            # write, recompiling once per call shape; trace inspect instead.
+            plan = None
+        elif key in plans:
+            plan = plans[key]
+        else:
+            plan = plans[key] = self._plan_normalize_args(*key)
+        if plan is None:
+            # Calls that ``inspect`` must reject (or that need its binding
+            # rules) raise its errors.
+            bound_args = self.signature.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            return tuple(bound_args.args)
+        defaults, positions = plan
+        normalized = [*args, *defaults[len(args) :]]
+        for position, value in zip(positions, kwargs.values(), strict=True):
+            normalized[position] = value
+        return tuple(normalized)
+
+    def _plan_normalize_args(
+        self, positional_count: int, keyword_names: tuple[str, ...]
+    ) -> tuple[tuple[object, ...], tuple[int, ...]] | None:
+        """Defaults template and keyword slots for one call shape, if bindable.
+
+        ``inspect.Signature.bind`` costs ~10us per call; a call shape (count of
+        positional arguments plus the keyword names) that binds cleanly to a
+        positional-or-keyword-only signature can be replayed from this plan.
+        """
+        parameters = list(self.signature.parameters.values())
+        if positional_count > len(parameters) or any(
+            parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        ):
+            return None
+        names = [parameter.name for parameter in parameters]
+        positions: list[int] = []
+        for name in keyword_names:
+            if name not in names or names.index(name) < positional_count:
+                return None
+            positions.append(names.index(name))
+        defaults = tuple(parameter.default for parameter in parameters)
+        if any(
+            default is inspect.Parameter.empty
+            for index, default in enumerate(defaults)
+            if index >= positional_count and index not in positions
+        ):
+            return None
+        return defaults, tuple(positions)
 
     def autotune(
         self,
@@ -2462,6 +2524,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             tuple[Hashable | None, ...],
         ] = {}
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        # Source an autotune render worker produced, keyed like the compile
+        # cache and consumed by the next compile_config of that config.
+        self._primed_renders: dict[Config, str] = {}
+        # Configs whose cached callable was loaded from a worker's source: the
+        # facts code generation records on this kernel (see to_code) are
+        # missing until the parent renders them itself.
+        self._render_only_configs: set[Config] = set()
         # Shape guards recorded past this index come from code generation.
         self._bind_guard_count = 0
         # Hint-sized CuTe reduction extents, per generated config.
@@ -2868,6 +2937,41 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             output_origin_lines=output_origin_lines,
         )
 
+    def has_compiled_config(self, config: ConfigLike) -> bool:
+        """Whether ``compile_config(config)`` would hit this kernel's compile cache.
+
+        A config the strict normalization rejects (a search candidate carrying
+        a knob its other knobs do not admit, e.g. a grouped register profile
+        on a schedule without one) is not compiled: it answers ``False`` and
+        the compile path reports the rejection for that one config, instead
+        of the rejection aborting the batch that asked.
+        """
+        try:
+            normalized = self._normalized_config_copy(self._normalize_config(config))
+        except exc.InvalidConfig:
+            return False
+        return normalized in self._compile_cache
+
+    def prime_rendered_code(self, config: ConfigLike, code: str) -> None:
+        """Hand :meth:`compile_config` the source a render worker made for ``config``.
+
+        Honoured only while the autotuner measures candidates: the next
+        ``compile_config(config)`` loads ``code`` instead of generating it,
+        and remembers that the facts code generation records on this kernel
+        (guard facts, CuTe specializations; see :meth:`to_code`) are missing
+        for that config. The first ``compile_config`` of such a config outside
+        the search renders it again so a config that runs for real always
+        went through this process's code generation; that render happens when
+        the selected config is set on the kernel, after the search returned
+        and outside its wall-clock budget. Workers render from the parent's
+        state at fork time; with ``static_shapes=False`` the guards the parent
+        accumulates meanwhile only widen the dispatch key, not the source. See
+        :mod:`helion.autotuner.render_pool`.
+        """
+        self._primed_renders[
+            self._normalized_config_copy(self._normalize_config(config))
+        ] = code
+
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
     ) -> CompiledConfig:
@@ -2888,17 +2992,30 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         dist_check_config_consistancy(
             config, process_group_name=self._env.process_group_name
         )
+        primed = self._primed_renders.pop(config, None)
         if (rv := self._compile_cache.get(config)) is not None:
-            self._register_cute_reduction_extent_specializations(config)
-            return rv
+            if config in self._render_only_configs and not _SEARCHING_CANDIDATES.get():
+                # Loaded from a render worker's source for a measurement; a
+                # config about to run for real is rendered here so to_code
+                # records its guard facts and CuTe specializations.
+                self._render_only_configs.discard(config)
+                del self._compile_cache[config]
+            else:
+                self._register_cute_reduction_extent_specializations(config)
+                return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
         )
         self.env.backend.setup_compile_cache_dir(device_index)
         try:
-            triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
-            )
+            if primed is not None and _SEARCHING_CANDIDATES.get():
+                triton_code = primed
+                self._render_only_configs.add(config)
+            else:
+                triton_code = self.to_triton_code(
+                    config, emit_repro_caller=self.settings.print_output_code
+                )
+                self._render_only_configs.discard(config)
             # static_shapes=True keys a distinct BoundKernel per input shape (see
             # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
             # two shapes that emit byte-identical source (e.g. compact_worklist, whose
@@ -3310,12 +3427,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     _inner: Callable[[Sequence[object]], Hashable] = inner,
                     _index: int | str = v.index,
                 ) -> Hashable:
-                    result = _inner(args)
+                    result: Any = _inner(args)
                     if isinstance(result, dict):
-                        return cast("Hashable", result[_index])
+                        return result[_index]
                     if isinstance(_index, str):
-                        return cast("Hashable", getattr(result, _index))
-                    return cast("Sequence[Hashable]", result)[_index]
+                        return getattr(result, _index)
+                    return result[_index]
 
                 return getitem_extractor
             if isinstance(v, LocalSource):
@@ -3325,8 +3442,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     args: Sequence[object],
                     _index: int = index,
                 ) -> Hashable:
-                    return cast("Hashable", args[_index])
+                    return args[_index]  # pyrefly: ignore[bad-return]
 
+                # The argument index, for generated guards that read the
+                # argument directly instead of calling the extractor.
+                local_extractor._helion_arg_index = index  # pyrefly: ignore[missing-attribute]
                 return local_extractor
             raise exc.SpecializeArgType(v)
 
@@ -3501,6 +3621,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     specialization.classifier,
                     frozenset(specialization.reusable_tensor_properties),
                     key,
+                    specialization.prepared_guard_factory,
                 )
             )
         return extractors

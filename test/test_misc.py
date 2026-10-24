@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _codegen_skip_reason
 from ._cute_binding import _cpu_bind
 from ._cute_binding import _forbid_native_compile
 from ._cute_binding import _mock_cuda_unavailable
@@ -52,6 +53,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1702,10 +1704,20 @@ class TestMisc(RefEagerTestBase, TestCase):
             f"{TRITON_MAX_TENSOR_NUMEL}. "
             f"This will cause Triton JIT compilation to hang.",
         )
-        # The heuristic in BlockSizeSpec._fragment() should pick default=4
-        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
-        # (safe for 64KB shared memory with bf16).
-        self.assertEqual(block_sizes, [4, 4, 4])
+        promoted = config_spec.compiler_default_config
+        if promoted is None:
+            # The heuristic in BlockSizeSpec._fragment() should pick default=4
+            # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+            # (safe for 64KB shared memory with bf16).
+            self.assertEqual(block_sizes, [4, 4, 4])
+        else:
+            # A kernel that only streams a full head_dim slab per element is
+            # pointwise; on the arches where the Triton pointwise seed is
+            # promoted (sm90/sm100) that seed is the default. Its byte budget
+            # over the 128-wide bf16 slab gives one row per CTA on the batch
+            # and head axes and 16 rows along the sequence (both arches).
+            self.assertIn("triton_pointwise", config_spec.autotuner_heuristics)
+            self.assertEqual(block_sizes, [1, 1, 16])
 
         # Also verify it actually runs successfully
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
@@ -1900,13 +1912,20 @@ class TestHelionCutePrinter(TestCase):
                 result[row] = x[row] + value
             return result
 
+        backends = [
+            backend
+            for backend in ("cute", "triton")
+            if _codegen_skip_reason(backend) is None
+        ]
+        if not backends:
+            raise unittest.SkipTest("no backend can generate device source")
         with (
             _mock_cuda_unavailable(),
             _target(),
             _forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
-            for backend in ("cute", "triton"):
+            for backend in backends:
                 kernel = helion.kernel(
                     powers, backend=backend, static_shapes=True, autotune_effort="none"
                 )
@@ -2573,6 +2592,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cutlass = pytest.importorskip("cutlass")
@@ -2677,7 +2697,7 @@ def test_cute_unsigned_scalar_load_codegen(dtype):
             assert ast.unparse(branches[0].orelse) == f"{logical}(0)"
 
 
-@skipUnlessBackends(["cute"])
+@onlyBackends(["cute"])
 class TestUnsignedScalarLoads(TestCase):
     def test_unsigned_scalar_loads_preserve_high_bits_and_tails(self):
         for dtype in (torch.uint8, torch.uint32):

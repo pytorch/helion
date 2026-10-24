@@ -6,6 +6,13 @@ fits in BF16's normal range. A sum of two E2M1 products requires at most nine
 bits; applying two E4M3FN scales requires at most seventeen, so distributing
 those scales is exact in FP32. No arbitrary FP32 tensor is narrowed here.
 
+A BF16 or FP16 operand widened to FP32 is exact as well, and goes to the
+contraction unchanged; a scale may only attach to a decoded E2M1 operand (a
+BF16 value times an E4M3FN scale needs twelve significant bits). The accepted
+shapes are ``sum((a0*b0 + a1*b1) * sa * sb, 1)`` with both operands decoded
+E2M1, and the one-scale form ``sum((a0*b0 + a1*b1) * sb, 1)`` whose other
+operand is BF16/FP16 or decoded E2M1 without a scale.
+
 The pass accepts a positive-zero FP32 matrix carry and explicit broadcasts,
 pair sums and reductions. It preserves FP32 accumulation, with the ordinary
 GEMM freedom to reorder its reduction. The positive-zero carry normalizes the
@@ -131,25 +138,79 @@ def _fp8_scale(node: Node) -> bool:
 
 @dataclass(frozen=True)
 class _ScaledPair:
+    """One ``sum((a0*b0 + a1*b1) * scales, 1)`` term of the loop carry.
+
+    ``lhs``/``rhs`` hold the two K-interleaved operand values of a side: the
+    decoded E2M1 ``getitem`` nodes of a packed side, or the BF16/FP16 tensors
+    whose exact FP32 widening the products multiply (``*_packed`` False).  A
+    side without a scale has ``None``; only a packed side may carry one.
+    """
+
     lhs: tuple[Node, Node]
     rhs: tuple[Node, Node]
-    lhs_scale: Node
-    rhs_scale: Node
+    lhs_scale: Node | None
+    rhs_scale: Node | None
+    lhs_packed: bool = True
+    rhs_packed: bool = True
 
 
-def _product(node: Node) -> tuple[Node, Node] | None:
+@dataclass(frozen=True)
+class _Operand:
+    node: Node
+    packed: bool
+
+
+def _exact_narrow_source(node: Node) -> Node | None:
+    """The BF16/FP16 tensor whose exact FP32 widening ``node`` is."""
+    if (
+        node.target is not _CONVERT
+        or len(node.args) != 2
+        or node.kwargs
+        or node.args[1] is not torch.float32
+        or _value(node, 2, torch.float32) is None
+    ):
+        return None
+    source = node.args[0]
+    for dtype in (torch.bfloat16, torch.float16):
+        if _value(source, 2, dtype) is not None:
+            return cast("Node", source)
+    return None
+
+
+def _operand(node: Node) -> _Operand | None:
+    if _fp4_value(node):
+        return _Operand(node, True)
+    source = _exact_narrow_source(node)
+    if source is not None:
+        return _Operand(source, False)
+    return None
+
+
+def _product(node: Node) -> tuple[_Operand, _Operand] | None:
     operands = _binary(node, _MUL)
     if operands is None or _value(node, 3, torch.float32) is None:
         return None
     for left, right in (operands, operands[::-1]):
         lhs, rhs = _unbroadcast(left, 2), _unbroadcast(right, 0)
-        if lhs is not None and rhs is not None and _fp4_value(lhs) and _fp4_value(rhs):
-            return lhs, rhs
+        if lhs is None or rhs is None:
+            continue
+        first, second = _operand(lhs), _operand(rhs)
+        if first is not None and second is not None and (first.packed or second.packed):
+            return first, second
+    return None
+
+
+def _scale_side(node: Node) -> tuple[Node, int] | None:
+    """An E4M3FN scale broadcast over the output: ``(scale, side)``."""
+    for side, dim in ((0, 2), (1, 0)):
+        scale = _unbroadcast(node, dim)
+        if scale is not None and _fp8_scale(scale):
+            return scale, side
     return None
 
 
 def _scaled_pair(node: Node) -> _ScaledPair | None:
-    """Match ``sum((a0*b0 + a1*b1) * sa * sb, dim=1)`` exactly."""
+    """Match ``sum((a0*b0 + a1*b1) * sa * sb, dim=1)`` or its one-scale form."""
     if (
         node.target is not _SUM
         or len(node.args) not in (2, 3)
@@ -162,49 +223,55 @@ def _scaled_pair(node: Node) -> _ScaledPair | None:
         or _value(node, 2, torch.float32) is None
     ):
         return None
-    outer = _binary(node.args[0], _MUL)
-    if outer is None:
+    # Peel the scale factors (one per side at most) off the pair sum.
+    scales: dict[int, Node] = {}
+    current = node.args[0]
+    while (pairs := _binary(current, _ADD)) is None:
+        factors = _binary(current, _MUL)
+        if factors is None or _value(current, 3, torch.float32) is None:
+            return None
+        for inner, factor in (factors, factors[::-1]):
+            scale = _scale_side(factor)
+            if scale is not None and scale[1] not in scales:
+                scales[scale[1]] = scale[0]
+                current = inner
+                break
+        else:
+            return None
+    first, second = (_product(product) for product in pairs)
+    if (
+        first is None
+        or second is None
+        or first[0].packed != second[0].packed
+        or first[1].packed != second[1].packed
+        or any(not first[side].packed for side in scales)
+    ):
         return None
-    for inner_node, scale_outer in (outer, outer[::-1]):
-        inner = _binary(inner_node, _MUL)
-        if inner is None:
-            continue
-        for pair_node, scale_inner in (inner, inner[::-1]):
-            pairs = _binary(pair_node, _ADD)
-            if pairs is None:
-                continue
-            first, second = (_product(product) for product in pairs)
-            if first is None or second is None:
-                continue
-            for a_broadcast, b_broadcast in (
-                (scale_outer, scale_inner),
-                (scale_inner, scale_outer),
-            ):
-                sa, sb = _unbroadcast(a_broadcast, 2), _unbroadcast(b_broadcast, 0)
-                if sa is None or sb is None or not _fp8_scale(sa) or not _fp8_scale(sb):
-                    continue
-                a_value, b_value = first[0].meta["val"], first[1].meta["val"]
-                output = node.meta["val"]
-                if (
-                    not all(
-                        _same_shape(term.meta["val"], a_value)
-                        for term in (second[0], sa)
-                    )
-                    or not all(
-                        _same_shape(term.meta["val"], b_value)
-                        for term in (second[1], sb)
-                    )
-                    or sympy.sympify(a_value.shape[1])
-                    != sympy.sympify(b_value.shape[0])
-                    or tuple(map(sympy.sympify, output.shape))
-                    != (
-                        sympy.sympify(a_value.shape[0]),
-                        sympy.sympify(b_value.shape[1]),
-                    )
-                ):
-                    continue
-                return _ScaledPair((first[0], second[0]), (first[1], second[1]), sa, sb)
-    return None
+    a_value, b_value = first[0].node.meta["val"], first[1].node.meta["val"]
+    output = node.meta["val"]
+    sa, sb = scales.get(0), scales.get(1)
+    if (
+        not all(
+            _same_shape(term.meta["val"], a_value)
+            for term in (second[0].node, *([sa] if sa is not None else []))
+        )
+        or not all(
+            _same_shape(term.meta["val"], b_value)
+            for term in (second[1].node, *([sb] if sb is not None else []))
+        )
+        or sympy.sympify(a_value.shape[1]) != sympy.sympify(b_value.shape[0])
+        or tuple(map(sympy.sympify, output.shape))
+        != (sympy.sympify(a_value.shape[0]), sympy.sympify(b_value.shape[1]))
+    ):
+        return None
+    return _ScaledPair(
+        (first[0].node, second[0].node),
+        (first[1].node, second[1].node),
+        sa,
+        sb,
+        first[0].packed,
+        first[1].packed,
+    )
 
 
 def _zero_carry(device_ir: DeviceIR, info: ForLoopGraphInfo, node: Node) -> bool:
@@ -304,10 +371,27 @@ def _rewrite_loop(device_ir: DeviceIR, info: ForLoopGraphInfo) -> bool:
         or any(
             not _same_shape(pair.lhs[0].meta["val"], left_value)
             or not _same_shape(pair.rhs[0].meta["val"], right_value)
+            or pair.lhs_packed != pairs[0].lhs_packed
+            or pair.rhs_packed != pairs[0].rhs_packed
             for pair in pairs[1:]
         )
     ):
         return False
+    # Every operand of the contraction shares one narrow dtype: that of the
+    # BF16/FP16 side when there is one (both sides narrow must agree), BF16
+    # otherwise.  Decoded E2M1 times E4M3FN fits FP16 as it fits BF16 (six
+    # significant bits, magnitude within 2**-10 .. 2688).
+    narrow_dtypes = {
+        value.dtype
+        for value, packed in (
+            (left_value, pairs[0].lhs_packed),
+            (right_value, pairs[0].rhs_packed),
+        )
+        if not packed
+    }
+    if len(narrow_dtypes) > 1:
+        return False
+    narrow = narrow_dtypes.pop() if narrow_dtypes else torch.bfloat16
     old_dependencies: set[Node] = set()
     pending = [result]
     while pending:
@@ -333,20 +417,30 @@ def _rewrite_loop(device_ir: DeviceIR, info: ForLoopGraphInfo) -> bool:
     with graph.inserting_before(result):
         lhs_terms, rhs_terms = [], []
         for pair in pairs:
-            for terms, source, scale in (
-                (lhs_terms, pair.lhs, pair.lhs_scale),
-                (rhs_terms, pair.rhs, pair.rhs_scale),
+            for terms, source, scale, packed in (
+                (lhs_terms, pair.lhs, pair.lhs_scale, pair.lhs_packed),
+                (rhs_terms, pair.rhs, pair.rhs_scale, pair.rhs_packed),
             ):
                 for term in source:
                     value = term.meta["val"]
-                    product = call(_MUL, (term, scale), value.new_empty(value.shape))
-                    # The byte load's zero fill does not prove a zero product:
-                    # an independently indexed scale can contain a padding NaN.
-                    # The scalar masked-value lattice otherwise folds 0*x to 0,
-                    # discarding the mask needed before K is interleaved.
-                    product.meta["masked_value"] = None
-                    narrowed_value = value.new_empty(value.shape, dtype=torch.bfloat16)
-                    narrowed = call(_CONVERT, (product, torch.bfloat16), narrowed_value)
+                    if not packed:
+                        # Already the narrow dtype; the mask keeps a padded K
+                        # lane from meeting the other side's padding.
+                        terms.append(call(_tracing_ops._mask_to, (term, 0), value))
+                        continue
+                    product = term
+                    if scale is not None:
+                        product = call(
+                            _MUL, (term, scale), value.new_empty(value.shape)
+                        )
+                        # The byte load's zero fill does not prove a zero
+                        # product: an independently indexed scale can contain
+                        # a padding NaN.  The scalar masked-value lattice
+                        # otherwise folds 0*x to 0, discarding the mask needed
+                        # before K is interleaved.
+                        product.meta["masked_value"] = None
+                    narrowed_value = value.new_empty(value.shape, dtype=narrow)
+                    narrowed = call(_CONVERT, (product, narrow), narrowed_value)
                     terms.append(
                         call(_tracing_ops._mask_to, (narrowed, 0), narrowed_value)
                     )
@@ -387,7 +481,17 @@ def _rewrite_loop(device_ir: DeviceIR, info: ForLoopGraphInfo) -> bool:
         )
         contraction.meta[MATMUL_FACT_ID_META] = fact_id
         contraction.meta[MATMUL_DIM_BLOCK_IDS_META] = (fact.m_block_id, fact.n_block_id)
-        if fact.m_block_id is not None and fact.n_block_id is not None:
+        if (
+            fact.m_block_id is not None
+            and fact.n_block_id is not None
+            and all(
+                pair.lhs_packed
+                and pair.rhs_packed
+                and pair.lhs_scale is not None
+                and pair.rhs_scale is not None
+                for pair in pairs
+            )
+        ):
             provenance = capture_block_scaled_provenance(
                 pairs,
                 lowered_operands=(lhs, rhs),

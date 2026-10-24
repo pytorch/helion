@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
+from test._cute_dense_tcgen05 import wrapper_plans
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import PUBLICATION_HOISTED
 from test.test_cute_tcgen05_fixed_chain import _bind_bias_gemm
@@ -544,11 +545,20 @@ def _bind_gemm_into(out: torch.Tensor, *, k: int = 256) -> BoundKernel:
     return helion.kernel(_gemm_into, backend="cute", static_shapes=True).bind(args)
 
 
-# Outputs the TMA store may address (a TensorMap needs a 16-byte base and
-# 16-byte outer strides over an N-contiguous matrix) ...
-TMA_STORE_LEGAL_OUTPUTS = ("contiguous", "row_stride_16B")
+# Outputs the TMA store may address: a TensorMap needs a 16-byte base and
+# 16-byte outer strides, with either matrix axis contiguous.
+TMA_STORE_LEGAL_OUTPUTS = (
+    "contiguous",
+    "row_stride_16B",
+    "column_major",
+    "column_major_stride_16B",
+)
 # ... and views that violate exactly one of those constraints.
-TMA_STORE_ILLEGAL_OUTPUTS = ("row_stride_8B", "column_major", "base_8B")
+TMA_STORE_ILLEGAL_OUTPUTS = (
+    "row_stride_8B",
+    "column_major_stride_8B",
+    "base_8B",
+)
 
 
 def _output_view(
@@ -566,6 +576,10 @@ def _output_view(
         return torch.zeros(rows, cols + pad, dtype=dtype, device=device)[:, :cols]
     if case == "column_major":
         return torch.zeros(cols, rows, dtype=dtype, device=device).T
+    if case == "column_major_stride_16B":
+        return torch.zeros(cols, rows + 2 * pad, dtype=dtype, device=device)[:, :rows].T
+    if case == "column_major_stride_8B":
+        return torch.zeros(cols, rows + pad, dtype=dtype, device=device)[:, :rows].T
     assert case == "base_8B"
     flat = torch.zeros(rows * cols + 2 * pad, dtype=dtype, device=device)
     return flat[pad : pad + rows * cols].view(rows, cols)
@@ -582,7 +596,14 @@ def test_tma_store_keeps_proven_output_arguments(case: str) -> None:
     kernel = _kernel_body(source)
     assert "cute.copy(tcgen05_tma_store_atom" in kernel
     assert "cute.nvgpu.CopyR2GOp()" not in kernel
-    assert "'kind': 'tcgen05_d_tma'" in source
+    (output_plan,) = [
+        plan for plan in wrapper_plans(source) if plan["kind"] == "tcgen05_d_tma"
+    ]
+    column_major = case.startswith("column_major")
+    assert output_plan.get("d_column_major", False) is column_major
+    assert (output_plan["bm"], output_plan["bn"]) == (128, 64)
+    layout = "COL_MAJOR" if column_major else "ROW_MAJOR"
+    assert f"tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.{layout}" in kernel
 
 
 @pytest.mark.parametrize("case", TMA_STORE_ILLEGAL_OUTPUTS)
@@ -733,10 +754,9 @@ def test_tma_store_keeps_tensor_method_factory_outputs(factory: str) -> None:
     assert "'kind': 'tcgen05_d_tma'" in source
 
 
-def test_fresh_column_major_strided_output_takes_the_simt_store() -> None:
-    # ... freshness says nothing about the layout: an N-major
-    # ``torch.empty_strided`` result is not what the staged row-major D tile
-    # addresses, so it keeps the exact SIMT store.
+def test_fresh_column_major_strided_output_keeps_the_tma_store() -> None:
+    # The fresh allocation proves the base alignment and its M-contiguous
+    # stride selects a column-major D tile and descriptor.
     source = _source(
         _bind_fresh_factory_gemm(
             _gemm_empty_strided_column_major, (512, 512, 256), torch.float16
@@ -744,9 +764,15 @@ def test_fresh_column_major_strided_output_takes_the_simt_store() -> None:
         _plain_config(pid_type="persistent_interleaved"),
     )
     kernel = _kernel_body(source)
-    assert "tcgen05_tma_store_atom" not in kernel
-    assert "'kind': 'tcgen05_d_tma'" not in source
-    assert "cute.nvgpu.CopyR2GOp()" in kernel
+    assert "cute.copy(tcgen05_tma_store_atom" in kernel
+    assert "PipelineTmaStore.create" in kernel
+    assert "cute.nvgpu.CopyR2GOp()" not in kernel
+    assert "tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR" in kernel
+    (output_plan,) = [
+        plan for plan in wrapper_plans(source) if plan["kind"] == "tcgen05_d_tma"
+    ]
+    assert output_plan["d_column_major"] is True
+    assert (output_plan["bm"], output_plan["bn"]) == (128, 64)
 
 
 # --------------------------------------------------------------------------

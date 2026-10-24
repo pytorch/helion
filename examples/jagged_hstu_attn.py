@@ -121,14 +121,26 @@ def _helion_jagged_attention_kernel(
 
         if tile_q.begin < seq_len:
             mask_q = tile_q.index < seq_len
-            q_blk = q[tile_q.index + starts, tile_h.begin, :]
+            q_blk = hl.load(
+                q,
+                [tile_q.index + starts, tile_h.begin, slice(None)],
+                extra_mask=mask_q[:, None],
+            )
             acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
 
             # Causal attention: only attend to previous tokens
             for tile_kv in hl.tile(0, tile_q.end, block_size=None):
                 mask_kv = tile_kv.index < seq_len
-                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
-                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                k_blk = hl.load(
+                    k,
+                    [tile_kv.index + starts, tile_h.begin, slice(None)],
+                    extra_mask=mask_kv[:, None],
+                )
+                v_blk = hl.load(
+                    v,
+                    [tile_kv.index + starts, tile_h.begin, slice(None)],
+                    extra_mask=mask_kv[:, None],
+                )
 
                 # Compute attention scores with SiLU activation
                 scores = (
@@ -148,7 +160,12 @@ def _helion_jagged_attention_kernel(
                 acc += torch.matmul(scores.to(v.dtype), v_blk)
 
             # Store result
-            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+            hl.store(
+                out,
+                [tile_q.index + starts, tile_h.begin, slice(None)],
+                acc.to(out.dtype),
+                extra_mask=mask_q[:, None],
+            )
 
     return out
 

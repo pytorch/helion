@@ -1284,7 +1284,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
+    @skipIfPallas("masked indirect store is unsupported by one-hot and DMA lowering")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
 
@@ -1300,13 +1300,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         helion_kernel_args = mod.moe_matmul_ogs_helion_kernel_args_gen(
             A, W, top1_expert_per_token
         )
-        check_example(
-            "moe_matmul_ogs",
-            helion_kernel_args,
-            mod.moe_matmul_ogs_reference(*args),
-            block_sizes=[16, 16, 16],
-            skip_accuracy=True,  # TODO(yf225): fix unstable numerics
-        )
+        expected = mod.moe_matmul_ogs_reference(*args)
+        # A 64-row token tile is larger than any expert's ~33 tokens, so each
+        # expert's first tile also holds padding rows that alias its first token.
+        for block_sizes in ([16, 16, 16], [64, 16, 16]):
+            check_example(
+                "moe_matmul_ogs",
+                helion_kernel_args,
+                expected,
+                block_sizes=block_sizes,
+            )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
@@ -1603,6 +1606,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Regression test: large batch, small dim."""
         self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
 
+    # MI350X CI intermittently returns wrong values for a few rows of
+    # this reduce-then-normalize kernel (tens to hundreds of elements off
+    # by up to 0.35, different rows on each failure) while every CUDA job
+    # passes; the two-pass softmax backward and the looped layernorms in
+    # test_autodiff.py and test_unroll_tuples.py fail the same way.  Seen
+    # since 2026-10-11 on one triton-rocm build; not reproduced outside CI.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -1745,6 +1755,37 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16],
                 atol=1e-2,
                 rtol=1e-2,
+            )
+
+    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
+    def test_jagged_hstu_attn_masks_sequence_tails(self):
+        max_seq_len, heads, head_dim = 16, 1, 16
+        total_seq_len = 5
+        q = torch.zeros((32, heads, head_dim), dtype=torch.bfloat16, device=DEVICE)[
+            :total_seq_len
+        ]
+        k = torch.zeros_like(q)
+        v_storage = torch.full(
+            (32, heads, head_dim),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        v = v_storage[:total_seq_len]
+        v.fill_(1)
+        seq_offsets = torch.tensor([0, 3, 5], dtype=torch.int64, device=DEVICE)
+        # Zero scores must produce zero output even when storage beyond the
+        # final sequence contains NaNs: masking scores after a load is too late.
+        with _core_silu_decomposition():
+            check_example(
+                "jagged_hstu_attn",
+                (max_seq_len, 1.0 / head_dim**2, q, k, v, seq_offsets),
+                torch.zeros_like(v),
+                fn_name="_helion_jagged_attention_kernel",
+                block_sizes=[16, 16],
+                atol=0,
+                rtol=0,
             )
 
     @parametrize(
@@ -2617,13 +2658,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        from examples.grpo_loss import extract_selected_logits_pytorch
-
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
-
+        from examples.grpo_loss import eager_selected_logits
         from examples.grpo_loss import torch_grpo_loss
+
+        # None on the GPU backends (the kernel gathers), eager on Pallas.
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         expected_loss, expected_kl, expected_clipped = torch_grpo_loss(
             logits.float(),
@@ -2640,6 +2679,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2684,18 +2724,17 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        # Pre-compute selected logits and run forward pass to get lse
-        from examples.grpo_loss import extract_selected_logits_pytorch
+        # Run the forward pass to get lse
+        from examples.grpo_loss import eager_selected_logits
         from examples.grpo_loss import grpo_loss_forward
 
         from helion._testing import code_and_output
 
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         forward_args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2736,8 +2775,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (
             grad_output,
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,

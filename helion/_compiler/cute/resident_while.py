@@ -65,6 +65,7 @@ class ResidentWhilePlan:
     invariant_slots: tuple[int, ...]
     local_allocations: frozenset[Node] = frozenset()
     composed: bool = False
+    readonly_control: bool = False
     requirements: tuple[str, ...] = (
         "whole_cta_entry_and_shared_predicate_publication",
         "predicate_reader_barrier_before_overwrite",
@@ -406,10 +407,18 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
         return _legacy_resident_while_plan(call, graphs)
     except exc.InvalidConfig as legacy_error:
         from .uniform_region_tree import uniform_local_regions
+        from .uniform_region_tree import uniform_readonly_regions
 
+        readonly_control = False
         try:
             tree = uniform_local_regions(graphs)
         except exc.InvalidConfig:
+            try:
+                tree = uniform_readonly_regions(graphs)
+                readonly_control = True
+            except exc.InvalidConfig:
+                raise legacy_error from None
+        if tree is None:
             # A second, narrower proof must not replace the failed legacy
             # obligation with an unrelated unsupported-topology diagnostic.
             raise legacy_error from None
@@ -441,6 +450,7 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
             tuple(i for i in range(len(body.captures)) if i not in destinations),
             frozenset(a for f in tree.frames for a in f.local_targets),
             composed=True,
+            readonly_control=readonly_control,
         )
 
 

@@ -4,6 +4,7 @@ import importlib
 import os
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -19,7 +20,7 @@ from helion._testing import output_only
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import skipIfXPU
+from helion._testing import skipIfTileIR
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -296,7 +297,6 @@ def _hl_randint_outer_loop_expected(
 
 
 @onlyBackends(["triton", "pallas", "cute"])
-@skipIfXPU("hl.rand/hl.randint tests crash XPU workers")
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_randint_1d(self):
         """Test hl.rand and hl.randint with 1D output using a single kernel."""
@@ -499,6 +499,10 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.all(outputs[0] >= 0.0))
         self.assertTrue(torch.all(outputs[0] < 1.0))
 
+    # The TileIR B200 job loses its xdist worker in this test with no
+    # traceback, as in test_hl_rand_rolled_reductions below; the same test
+    # takes ~5s on Triton.
+    @skipIfTileIR("TileIR job loses its xdist worker on rand with a specialized dim")
     def test_hl_rand_non_tiled_dimensions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_partial_tile(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -563,7 +567,12 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Mixed tile argument order should produce identical results",
         )
 
+    # The TileIR B200 job (eight xdist workers) has lost its worker in this test
+    # with no traceback, the signature of pytest-timeout's thread method killing
+    # a test past 60s; the two cold TileIR compiles here are the likely cause.
+    @pytest.mark.timeout(300)
     @skipIfRocm("ROCm Triton worker crashes on rand with rolled reductions")
+    @skipIfTileIR("TileIR job loses its xdist worker on rand with rolled reductions")
     def test_hl_rand_rolled_reductions(self):
         @helion.kernel(static_shapes=False)
         def rand_kernel_with_reduction(x: torch.Tensor, seed: int) -> torch.Tensor:

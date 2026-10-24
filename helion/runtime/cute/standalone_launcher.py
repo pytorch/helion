@@ -98,11 +98,17 @@ def _standalone_validate_args(
         _standalone_validate(arg, entry)
 
 
+# The compiler's persistent vec-alignment classifier keys pointer residues
+# modulo this many bytes (``_CUTE_ALIGNMENT_MAX_BYTES`` in
+# helion/_compiler/cute/memory_ops.py); the exported residues are its.
+_STANDALONE_ALIGNMENT_BYTES = 32
+
+
 def _standalone_validate_alignment(
     args: Sequence[torch.Tensor], residues: tuple[int, ...]
 ) -> None:
     if any(
-        tensor.data_ptr() % 16 != residue
+        tensor.data_ptr() % _STANDALONE_ALIGNMENT_BYTES != residue
         for tensor, residue in zip(args, residues, strict=True)
     ):
         raise ValueError(
@@ -131,11 +137,44 @@ def _standalone_validate_aliases(
         raise ValueError("Tensor aliasing does not match the exported CuTe workload")
 
 
+def _standalone_validate_mma_dag_aliases(
+    args: Sequence[object], indices: tuple[int, ...], stored: tuple[bool, ...]
+) -> None:
+    """The cute_mma_dag alias guard: the byte span of every tensor argument
+    the kernel stores to is disjoint from every other tensor argument's
+    (the kernel was compiled against distinct storages and reads them as
+    such; two loads may alias)."""
+    spans: list[tuple[int, int] | None] = []
+    for index in indices:
+        tensor = args[index]
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError("Argument does not match the exported CuTe tensor layout")
+        if tensor.numel() == 0:
+            spans.append(None)
+            continue
+        last = sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+        begin = tensor.data_ptr()
+        spans.append((begin, begin + (last + 1) * tensor.element_size()))
+    for store, is_store in enumerate(stored):
+        span = spans[store]
+        if not is_store or span is None:
+            continue
+        for other in (*spans[:store], *spans[store + 1 :]):
+            if other is not None and other[0] < span[1] and span[0] < other[1]:
+                raise ValueError(
+                    "Tensor arguments alias; the exported CuTe kernel reads and "
+                    "writes them as distinct tensors"
+                )
+
+
 def _default_cute_launcher(
     kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
 ) -> None:
     kernel_name = cast("Any", kernel).__name__
-    schema, wrapper, block, options = _STANDALONE_LAUNCHES[kernel_name]
+    schema, wrapper, block, options, alias = _STANDALONE_LAUNCHES[kernel_name]
     requested_block = tuple(cast("tuple[int, ...]", kwargs.get("block", (256, 1, 1))))
     requested_block = (*requested_block, *(1 for _ in range(3 - len(requested_block))))
     if requested_block != block or kwargs.get("cute_compile_options") != options:
@@ -162,6 +201,8 @@ def _default_cute_launcher(
             )
         elif kind != "scalar_constexpr":
             launch_args.append(arg)
+    if alias is not None:
+        _standalone_validate_mma_dag_aliases(args, *alias)
     if len(devices) != 1:
         raise ValueError("Standalone CuTe launch tensors must share one CUDA device")
     device = devices.pop()

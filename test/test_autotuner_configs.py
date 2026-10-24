@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 
 from test._autotuner_test_utils import _SM90_HARDWARE
+from test._autotuner_test_utils import _SM90_NUM_SM
 from test._autotuner_test_utils import AutotunerTestCase
 from test._autotuner_test_utils import _get_examples_matmul
 from test._autotuner_test_utils import _pin_sm90
@@ -76,6 +77,9 @@ class TestAutotunerConfigs(AutotunerTestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @patch("helion._hardware.get_hardware_info", return_value=_SM90_HARDWARE)
+    # The grid block floors share one program budget per grid, derived from
+    # the SM count: pin it so the journal does not depend on the test's GPU.
+    @patch("helion.autotuner.config_spec.num_compute_units", lambda: _SM90_NUM_SM)
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
     @skipIfCute("golden snapshot of the Triton config space")
@@ -99,6 +103,7 @@ class TestAutotunerConfigs(AutotunerTestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @patch("helion._hardware.get_hardware_info", return_value=_SM90_HARDWARE)
+    @patch("helion.autotuner.config_spec.num_compute_units", lambda: _SM90_NUM_SM)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")

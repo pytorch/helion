@@ -134,6 +134,7 @@ _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
 # across lane-loop scopes.
 PURE_DECODE_HELPERS = frozenset(
     {
+        "_cute_float4_e2m1fn_x16_dot_float32",
         "_cute_float4_e2m1fn_x2_to_float32",
         "_cute_fp8e4m3fn_to_float32",
         "_cute_fp8e4m3fn_x2_to_float32",

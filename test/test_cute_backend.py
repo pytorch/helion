@@ -44,6 +44,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -76,6 +77,9 @@ get_cute_mma_support = importlib.import_module(
 _cute_grouped_reduce_shared_tree = importlib.import_module(
     "helion._compiler.cute.reduce_helpers"
 )._cute_grouped_reduce_shared_tree
+_cute_grouped_reduce_shared_two_stage = importlib.import_module(
+    "helion._compiler.cute.reduce_helpers"
+)._cute_grouped_reduce_shared_two_stage
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
 _compiler_backend = importlib.import_module("helion._compiler.backend")
 flash_fa4_shared_storage = importlib.import_module(
@@ -484,6 +488,52 @@ def cute_shared_tree_matmul_sum(lhs, rhs, out):
     )
     if lane_in_group < 3:
         out[row, cutlass.Int32(0)] = result
+
+
+@cute.kernel
+def cute_interleaved_reduce_sum(
+    inp, out, pre: cutlass.Constexpr[int], span: cutlass.Constexpr[int]
+):
+    """``pre`` interleaved siblings per ``span``-thread group, two groups:
+    thread ``t`` of group ``g`` holds ``inp[g, t % pre, t // pre]``."""
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane_in_group = lane % span
+    lane_mod_pre = lane_in_group % pre
+    group = lane // span
+    result = _cute_grouped_reduce_shared_two_stage(
+        inp[group, lane_mod_pre, lane_in_group // pre],
+        "sum",
+        cutlass.Float32(0.0),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=pre,
+        group_span=span,
+        group_count=2,
+    )
+    out[group, lane_mod_pre, lane_in_group // pre] = result
+
+
+@cute.kernel
+def cute_interleaved_reduce_max(
+    inp, out, pre: cutlass.Constexpr[int], span: cutlass.Constexpr[int]
+):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane_in_group = lane % span
+    lane_mod_pre = lane_in_group % pre
+    group = lane // span
+    result = _cute_grouped_reduce_shared_two_stage(
+        inp[group, lane_mod_pre, lane_in_group // pre],
+        "max",
+        cutlass.Float32(float("-inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=pre,
+        group_span=span,
+        group_count=2,
+    )
+    out[group, lane_mod_pre, lane_in_group // pre] = result
 
 
 @helion.kernel(backend="cute")
@@ -10577,11 +10627,13 @@ class TestCuteBackend(TestCase):
         family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
         # The row programs are searched only on small grids of a known
-        # batch; this 512-tile surface of an unknown batch leaves them out.
+        # batch; this 512-tile surface of an unknown batch leaves them out,
+        # as does the single-tile body's cooperative pair (a family of the
+        # value widths above 128).
         self.assertEqual(
             set(family.search_choices or ()),
             set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
-            - {"fa4_2cta_causal", "row_mma", "fa4_alt"},
+            - {"fa4_2cta_causal", "row_mma", "fa4_alt", "ws_2cta"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -10706,18 +10758,23 @@ class TestCuteBackend(TestCase):
             ),
             # the alternating-warpgroup family is a head_dim-128 body
             "fa4_alt": ("fa4", False, False, False, False, False, False, False),
+            # the single-tile body's cooperative pair (cta_group::2 atoms)
+            "ws_2cta": ("ws_overlap", False, False, True, False, False, False, False),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
         with patch.dict(os.environ, {}, clear=True):
             for family_name, expected in expected_flags.items():
                 with self.subTest(family=family_name):
+                    # (The pair is a family of the value widths above 128
+                    # with the standard dense output.)
                     cfg = resolve_flash_config(
-                        128 if family_name == "fa4_alt" else 64,
+                        {"fa4_alt": 128, "ws_2cta": 256}.get(family_name, 64),
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,
                         is_causal="causal" in family_name,
+                        standard_dense_output=family_name == "ws_2cta",
                     )
                     self.assertEqual(cfg.pipeline_family, family_name)
                     self.assertEqual(
@@ -12244,6 +12301,39 @@ class TestCuteBackend(TestCase):
                 out = torch.empty_like(expected)
                 default_cute_launcher(kernel, (1,), x, out, block=(3, 16, 1))
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_interleaved_shared_reduce_helper(self) -> None:
+        """``pre`` siblings interleaved below the reduce axis: the warp form
+        (``pre < 32``, a partial butterfly) and the block form (``pre >= 32``,
+        every thread writes) both reduce each sibling over its ``span // pre``
+        threads, for every group of the CTA, and broadcast the result."""
+        from helion._compiler.cute.reduce_helpers import _use_interleaved_shared_reduce
+
+        for pre, span in [
+            (2, 64),
+            (4, 128),
+            (16, 256),
+            (32, 64),
+            (64, 512),
+            (256, 512),
+        ]:
+            self.assertTrue(_use_interleaved_shared_reduce(pre, span))
+            x = torch.randn(2, pre, span // pre, device=DEVICE, dtype=torch.float32)
+            for kernel, expected in (
+                (cute_interleaved_reduce_sum, x.sum(dim=2, keepdim=True)),
+                (cute_interleaved_reduce_max, x.amax(dim=2, keepdim=True)),
+            ):
+                with self.subTest(kernel=kernel.__name__, pre=pre, span=span):
+                    out = torch.full_like(x, float("nan"))
+                    default_cute_launcher(
+                        kernel, (1,), x, out, pre, span, block=(2 * span, 1, 1)
+                    )
+                    torch.testing.assert_close(
+                        out, expected.expand_as(x), rtol=1e-5, atol=1e-5
+                    )
+        self.assertFalse(_use_interleaved_shared_reduce(1, 64))
+        self.assertFalse(_use_interleaved_shared_reduce(3, 48))
+        self.assertFalse(_use_interleaved_shared_reduce(48, 96))
 
     def test_permute_transposes_tile_values(self) -> None:
         """The slot re-binds the transposed tile's dims: the store exchanges
@@ -14486,6 +14576,8 @@ class TestCuteBackend(TestCase):
                 (x, y, bias)
             ).config_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            # Every seed also has a cute_pdl twin; the schedule is the same.
+            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
             (seed["block_sizes"][2], seed["tcgen05_ab_stages"]) for seed in seeds
@@ -14870,28 +14962,51 @@ class TestCuteBackend(TestCase):
             ):
                 spec = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale)).config_spec
                 seeds = [dict(seed.config) for seed in spec.autotune_seed_configs()]
-            expected = {
-                (128, 3, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 1): "pre_acc_wait",
-                (64, 23 - deep_ab_stages, 2): "missing",
-                (64, 23 - deep_ab_stages, 1): "missing",
-            }
             placements = {
                 (
                     seed["block_sizes"][2],
                     seed["tcgen05_ab_stages"],
                     seed.get("tcgen05_cluster_n", 1),
-                ): seed.get("tcgen05_aux_load_placement")
+                    seed.get("tcgen05_aux_load_placement"),
+                )
                 for seed in seeds
                 if seed["block_sizes"][:2] == [256, 256]
                 and seed.get("tcgen05_cluster_m") == 2
             }
-            self.assertEqual(
-                {key: placements.get(key, "missing") for key in expected},
-                expected,
-                scale_dtype,
-            )
+            # Preserve the legacy default-K/pre-wait seeds alongside the
+            # independently budgeted post-wait pipeline family.
+            for key in (
+                (128, 3, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 1, "pre_acc_wait"),
+            ):
+                self.assertIn(key, placements, scale_dtype)
+            for cluster_n in (1, 2):
+                self.assertNotIn(
+                    (64, 23 - deep_ab_stages, cluster_n, "pre_acc_wait"),
+                    placements,
+                    scale_dtype,
+                )
+            if scale_dtype == torch.float32:
+                state = spec._cute_tcgen05_config
+                fragments = state._matmul_block_fragments()
+                assert fragments is not None
+                self.assertGreater(fragments[2].high, 128)
+                self.assertTrue(
+                    any(seed["block_sizes"][2] == fragments[2].high for seed in seeds)
+                )
+                paired = next(
+                    seed
+                    for seed in seeds
+                    if seed.get("tcgen05_cta_group") == "two"
+                    and seed["block_sizes"] == [256, 256, 64]
+                    and seed["tcgen05_ab_stages"] == 12
+                )
+                self.assertEqual(paired["tcgen05_aux_load_placement"], "post_acc_wait")
+                self.assertIn((64, 12, 1, "post_acc_wait"), placements)
+                limit = state._paired_pipeline_stage_limit(paired)
+                assert limit is not None
+                self.assertGreaterEqual(limit, 12)
 
     def test_matmul_mma_tcgen05_f32_rowvec_seeds_keep_the_stage_within_smem(
         self,
@@ -14918,6 +15033,8 @@ class TestCuteBackend(TestCase):
             dict(seed.config)
             for seed in spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            # Every seed also has a cute_pdl twin; the schedule is the same.
+            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
             (
@@ -14984,6 +15101,8 @@ class TestCuteBackend(TestCase):
             )
             for seed in chain_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            # Every seed also has a cute_pdl twin; the schedule is the same.
+            and seed.config.get("cute_pdl") is not True
         )
         self.assertEqual(
             chain_seeds, [(64, 6, "pre_acc_wait"), (128, 3, "pre_acc_wait")]
@@ -16798,6 +16917,7 @@ class TestCuteBackend(TestCase):
     def test_grouped_device_split_cluster_bound_uses_source_profile(self) -> None:
         launcher = importlib.import_module("helion.runtime.cute.launcher")
         common_plan = {
+            "orientation": "nm",
             "group_count": 8,
             "m_size": 2048,
             "n_size": 512,
@@ -18845,6 +18965,7 @@ def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 class TestCuteConfigValuePriors(TestCase):
     """The cute backend supplies per-key value priors (the learned distribution
     used by generic kernels. Flash attention instead builds structural coverage
@@ -18950,10 +19071,11 @@ class TestCuteConfigValuePriors(TestCase):
 class TestCuteBackendRequirements(TestCase):
     """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
-    This module is ``importorskip``-gated on cutlass, so the environment under
-    test already satisfies the requirements (the gate must pass here).
+    An environment that runs the cute backend's tests (HELION_BACKEND=cute)
+    must satisfy the requirements; importing cutlass alone does not imply it.
     """
 
+    @onlyBackends(["cute"])
     def test_requirements_satisfied_in_this_environment(self) -> None:
         from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
@@ -18983,11 +19105,13 @@ class TestCuteBackendRequirements(TestCase):
             )
         self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
+    @onlyBackends(["cute"])
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
 
         check_cute_backend_requirements()  # must not raise in this environment
 
+    @onlyBackends(["cute"])
     def test_validate_environment_passes(self) -> None:
         from helion._compiler.backend import CuteBackend
 

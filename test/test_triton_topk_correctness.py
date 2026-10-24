@@ -350,7 +350,7 @@ def test_float_topk_auto_dispatch_dynamic_widths(
 def test_float_topk_auto_other_targets(cpu_codegen, capability, hip, monkeypatch):
     bound = _row_topk._bind_isolated((torch.ones(3, 1024), 64, False))
     monkeypatch.setattr(bound.env.config_spec, "target_device_capability", capability)
-    monkeypatch.setattr("helion._compiler.triton.aten_lowering.is_hip", lambda: hip)
+    monkeypatch.setattr("helion._compat._is_hip", lambda: hip)
     config = bound.config_spec.default_config()
     config.config.update(block_sizes=[1], num_warps=4)
     code = bound.to_code(config)

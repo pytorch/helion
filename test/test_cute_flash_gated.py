@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import itertools
+import operator
 import os
 import re
 from typing import TYPE_CHECKING
@@ -765,6 +766,87 @@ def _rejected_variant(name: str) -> tuple[Any, tuple[Any, ...]]:
         return _store_target_kernel, args
     assert name == "head_dim_96"
     return _hstu_module()._helion_jagged_attention_kernel, _hstu_args(head_dim=96)
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+def test_explicit_row_mask_requires_the_gate_sequence_bound(role: str) -> None:
+    with _cpu_codegen_patches():
+        bound = _bind_hstu(_hstu_args())
+        matched = _match(bound)
+        assert matched is not None
+        access = {"q": matched.q, "k": matched.k, "v": matched.v, "o": matched.o}[role]
+        mask = access.extra_mask
+        assert mask is not None
+        predicate = cute_flash_gated._strip_views(mask, matched.scope)
+        assert isinstance(predicate, torch.fx.Node)
+        index, length = predicate.args
+        assert isinstance(length, torch.fx.Node)
+        with access.node.graph.inserting_before(access.node):
+            shortened = access.node.graph.call_function(operator.sub, (length, 1))
+            shortened.meta = dict(length.meta)
+            changed = access.node.graph.call_function(
+                predicate.target, (index, shortened)
+            )
+            changed.meta = dict(predicate.meta)
+            changed_mask = access.node.graph.call_function(
+                torch.ops.aten.unsqueeze.default, (changed, 1)
+            )
+            changed_mask.meta = dict(mask.meta)
+        arguments = list(access.node.args)
+        arguments[3 if role == "o" else 2] = changed_mask
+        access.node.args = tuple(arguments)
+        assert _match(bound) is None
+
+
+@pytest.mark.parametrize("q_tile", [64, 128])
+@pytest.mark.parametrize("kv_tile", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_gated_masked_v_tail_excludes_neighboring_sequence_nan(
+    q_tile: int, kv_tile: int, dtype: torch.dtype
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    q = torch.zeros((72, 2, 64), dtype=dtype, device=DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    v[33:] = float("nan")
+    offsets = torch.tensor([0, 33, 72], dtype=torch.int64, device=DEVICE)
+    args = (256, 1.0 / 64**2, q, k, v, offsets)
+    bound = _bind_hstu(args)
+    config = helion.Config(
+        block_sizes=[q_tile, kv_tile],
+        cute_flash_kv_stage=2,
+        cute_flash_gate_warpgroups=2,
+    )
+    assert _gated_markers(bound.to_code(config))
+    output = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output[:33], torch.zeros_like(output[:33]), atol=0, rtol=0
+    )
+
+
+def test_gated_masked_v_preserves_the_kv_loop_bound() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    q = torch.zeros((168, 2, 64), dtype=torch.bfloat16, device=DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    v[64:] = float("nan")
+    offsets = torch.tensor([0, 129, 168], dtype=torch.int64, device=DEVICE)
+    args = (256, 1.0 / 64**2, q, k, v, offsets)
+    bound = _bind_hstu(args)
+    config = helion.Config(
+        block_sizes=[64, 128],
+        cute_flash_kv_stage=2,
+        cute_flash_gate_warpgroups=2,
+    )
+    assert _gated_markers(bound.to_code(config))
+    output = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output[:64], torch.zeros_like(output[:64]), atol=0, rtol=0
+    )
 
 
 # ---------------------------------------------------------------------------

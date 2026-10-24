@@ -429,6 +429,11 @@ class CuteTcgen05SearchPlan:
     # searched only on static, latency-bound problems with the operand
     # layouts its ldmatrix paths move (see ``warp_mma_admission_reason``).
     warp_mma_admitted: bool = False
+    # False when an operand is a cast the tcgen05 pipeline cannot feed to the
+    # tensor core (a bare ``load.to(bf16)`` of an int16 tile): only the
+    # register-MMA family runs the kernel and the search offers that family
+    # alone.
+    tcgen05_family_admitted: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -456,12 +461,16 @@ def _plan_cute_tcgen05_search_candidate(
     lhs_source: torch.Tensor | None = None,
     rhs_source: torch.Tensor | None = None,
     operands_permuted: bool = False,
+    operand_casts: bool = False,
 ) -> _CuteTcgen05SearchPlanningResult:
     """Plan one candidate and retain guards even when the candidate is rejected.
 
     ``lhs`` / ``rhs`` are the matmul's operand values (the loaded tiles);
     ``lhs_source`` / ``rhs_source`` are the host tensors they were loaded
     from, whose layouts decide the register-MMA family's admission.
+    ``operand_casts`` says an operand is an in-register integer cast only
+    the register-MMA family lowers: the candidate is rejected unless that
+    family is admitted, and the plan withholds the tcgen05 family.
     """
     m, n, k = _dot_dimensions(lhs, rhs)
     env = CompileEnvironment.current()
@@ -688,6 +697,8 @@ def _plan_cute_tcgen05_search_candidate(
         )
         is None
     )
+    if operand_casts and not warp_mma_admitted:
+        return reject()
     return _CuteTcgen05SearchPlanningResult(
         plan=CuteTcgen05SearchPlan(
             m=m,
@@ -710,6 +721,7 @@ def _plan_cute_tcgen05_search_candidate(
             min_search_m=min_search_m,
             min_search_n=min_search_n,
             warp_mma_admitted=warp_mma_admitted,
+            tcgen05_family_admitted=not operand_casts,
         ),
         required_specialized_vars=frozen_required_specialized_vars,
         guards_complete=True,
@@ -847,7 +859,9 @@ def enable_cute_tcgen05_search(
     # root holds nothing else); kernels with several matmuls keep the tcgen05
     # surface alone.
     warp_mma_admitted = plan.warp_mma_admitted and warp_mma_plain_kernel
+    assert plan.tcgen05_family_admitted or warp_mma_admitted
     spec._cute_tcgen05_config.warp_mma_admitted = warp_mma_admitted
+    spec._cute_tcgen05_config.tcgen05_family_admitted = plan.tcgen05_family_admitted
     spec._cute_tcgen05_config.tcgen05_min_search_m = plan.min_search_m
     spec._cute_tcgen05_config.tcgen05_min_search_n = plan.min_search_n
     spec._cute_tcgen05_config.matmul_leading_block_id = leading_block_id
@@ -923,7 +937,10 @@ def enable_cute_tcgen05_search(
             floor = plan.min_search_n
             min_size = min(WARP_MMA_MIN_BN, floor) if warp_mma_admitted else floor
         env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-        env.block_sizes[block_idx].update_max_block(max_size)
+        if axis_name == "k":
+            spec._cute_tcgen05_config.cap_k_search(env.block_sizes[block_idx], max_size)
+        else:
+            env.block_sizes[block_idx].update_max_block(max_size)
         if min_size < floor:
             # The widened floor must not move the default (non-autotuned)
             # block: the default config stays the tcgen05 tile it was, and the

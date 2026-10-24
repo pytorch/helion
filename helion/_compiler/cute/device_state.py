@@ -8,8 +8,6 @@ from typing import Literal
 from typing import Protocol
 from typing import cast
 
-import torch
-
 from ... import exc
 
 if TYPE_CHECKING:
@@ -32,14 +30,17 @@ if TYPE_CHECKING:
     from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_mma_dag import MmaDagPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_bwd_match import FlexBwdMatch
     from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
+    from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
+    from .simt_gemm import SimtGemmSite
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -141,21 +143,47 @@ class CuteTcgen05GroupedPlan:
     # values on the host.
     source_m_tile: int | None = None
     m_size: int | None = None
+    # The typed device-layout initializer writes this guarded input feature
+    # extent into every group's N column. None keeps the generic panel decoder.
+    device_n_size: int | None = None
     device_layout_kind: Literal["split_sizes", "offsets"] | None = None
     # The source program drops negative-address rows before applying its
     # static M cap; its original signed offset difference remains unchanged.
     clipped_negative_start: bool = False
+    # A fixed rank-3 S2G descriptor encodes the clipped row interval through
+    # coordinates. It retains ALL_TILES tail semantics without a mutable map.
+    bounded_output_shift: bool = False
+    worker_balance: GroupedBalancedWorkersPlan | None = None
     full_coverage: Tcgen05GroupedFullCoveragePlan | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
         assert (self.orientation is Tcgen05Orientation.NM) == (self.valid_m is not None)
-        assert (self.orientation is Tcgen05Orientation.NM) == (
-            self.source_m_tile is not None
-        )
+        assert (
+            self.orientation is Tcgen05Orientation.NM or self.device_split_sizes
+        ) == (self.source_m_tile is not None)
         assert (self.direct_pointers is None) == (self.direct_strides is None)
-        assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
-        assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        assert (
+            self.d_mode is Tcgen05GroupedDMode.NONE or self.bounded_output_shift
+        ) == (self.d_tensormap is None)
+        if self.bounded_output_shift:
+            assert self.device_split_sizes
+            assert self.d_mode is Tcgen05GroupedDMode.ALL_TILES
+            assert not self.fixed_tensormaps
+            assert self.direct_pointers is None
+        if self.worker_balance is not None:
+            assert self.orientation is Tcgen05Orientation.MN
+            assert self.device_split_sizes
+            assert (
+                self.scheduler_mode is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+            )
+            assert self.direct_pointers is None
+            assert not self.fixed_tensormaps
+            assert self.full_coverage is None
+        assert not self.device_split_sizes or self.source_m_tile is not None
+        assert self.device_n_size is None or (
+            self.device_split_sizes and self.device_n_size > 0
+        )
         assert self.device_layout_kind in (None, "split_sizes", "offsets")
         assert not self.clipped_negative_start or self.device_layout_kind == "offsets"
         assert (self.device_layout_kind is not None) == self.device_split_sizes
@@ -621,6 +649,10 @@ class CuteVloopWrapperFact:
     # outside the extent: a bound on the per-element index is equivalent to
     # the same bound on the chunk base.
     uniform_vector_mask: bool
+    # The tile starts at zero with a unit step, so every per-thread chunk
+    # base is a multiple of ``vec_width`` (the extent may still be dynamic:
+    # a jagged tile's chunks can straddle it).
+    chunk_base_aligned: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -639,6 +671,29 @@ class CuteVloopLoadFact:
     dtype: torch.dtype
     # The site's cache-policy marker, applied to the vector form of the load.
     eviction_suffix: str
+    # Every V-aligned chunk whose first element the program reads lies
+    # inside the tensor (its extent along the lane dim is a multiple of V
+    # and the chunk bases are V-aligned), so a chunk straddling a dynamic
+    # tile extent may be loaded whenever its first lane is in bounds.
+    whole_chunks_in_tensor: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteVloopStoreFact:
+    """A scalar tile store that a sunk V-loop may turn into one vector store.
+
+    The store-side twin of ``CuteVloopLoadFact``: recorded by the store
+    lowering (keyed by the scalar pointer expression) when the site
+    addresses the vectorized axis at its stride-1 dim with the plain
+    per-element index inside loops nested in the V-loop.  The sink pass
+    collects the V per-lane values and flushes them after the V-loop with
+    one ``_cute_store_u32_vec`` / ``_cute_store_u16_vec``.
+    """
+
+    vec_lane_var: str
+    tensor_name: str
+    vec_width: int
+    dtype: torch.dtype
 
 
 class CuteDeviceFunctionState:
@@ -653,9 +708,14 @@ class CuteDeviceFunctionState:
         # loads (by pointer expression) for ``cute/sink_vector_loops.py``.
         self.vloop_sink_wrappers: dict[str, CuteVloopWrapperFact] = {}
         self.vloop_sink_loads: dict[str, CuteVloopLoadFact] = {}
+        self.vloop_sink_stores: dict[str, CuteVloopStoreFact] = {}
         # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
         # no V-loop is sunk after all, codegen restarts with the knob off.
         self.vloop_sink_layout_applied = False
+        # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
+        # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
+        # applies to the sunk lane loops once their packets are placed.
+        self.vloop_sink_unrolled = False
         # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
         # matmul product sum or a lane-loop reduction marker) assumed for the
         # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
@@ -669,6 +729,10 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # A trailing grid dim of CTAs forming one thread-block cluster per
+        # program id (the ``cute_mma_dag`` cluster split of a full-slice
+        # axis); 1 for an ordinary launch.
+        self.grid_cluster_n: int = 1
         # Lane loops claimed by a register/shuffle ``hl.associative_scan``
         # lowering, mapped to the direction (``True`` = reverse) their lanes
         # are visited in.  A second scan over the same lane loop must agree
@@ -749,6 +813,8 @@ class CuteDeviceFunctionState:
         # registered under this result var, even when user-visible names were
         # renamed through casts or epilogue nodes.
         self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
+        # Exact fp32 SIMT GEMM sites awaiting ``lower_simt_gemm``.
+        self.simt_gemm_sites: list[SimtGemmSite] = []
         self._fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
         # Rejected proofs are stable for this per-config codegen state. Keep
         # the tile shape in the key so callers cannot accidentally reuse a
@@ -768,6 +834,10 @@ class CuteDeviceFunctionState:
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
         self.tcgen05_pdl_wait_in_prefetch: bool = False
+        # ``cute_pdl`` on a tcgen05 kernel: the launch carries ``use_pdl`` and
+        # the generic entry wait (``DeviceFunction._cute_pdl_applies``) heads
+        # the body, ahead of every prologue read.
+        self.cute_pdl_entry_wait: bool = False
         # One-shot clustered tcgen05 kernels: the cluster ``pipeline_init_arrive``
         # statement after which ``program_id`` re-emits the TMA-load warp's
         # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
@@ -843,6 +913,10 @@ class CuteDeviceFunctionState:
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
         self.owned_root_block_dims: tuple[int, int, int] | None = None
+        # ``(needed, capacity)`` when the computed-fragment owner declined the
+        # current root because its shared memory exceeds the CTA capacity; a
+        # generic-lowering refusal of that root is then a config failure.
+        self.fragment_capacity_decline: tuple[int, int] | None = None
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
@@ -885,13 +959,27 @@ class CuteDeviceFunctionState:
         self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
+        # whole-graph-set match, probed once per device function.
+        self.attention_flex_bwd_match: FlexBwdMatch | None = None
+        self.attention_flex_bwd_probed: bool = False
         # Set by the register-MMA GEMM detector (``cute_matmul_family=
         # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
         # its tile; the dedicated codegen emits the whole device body and
         # the launch runs ``32 * warps`` threads per CTA.
         self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
+        # the matched serial MMA state recurrence and its tile / warp /
+        # stage selection; the dedicated codegen owns the matched root and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.mma_dag_plan: MmaDagPlan | None = None
+        # The mma_dag emitters' 16-bit-typed values whose fp32 widening is
+        # already at hand (name -> the exact fp32 expression: an unpacked
+        # tile element, a widening side load): the pointwise lowering's
+        # ``to_dtype(x, float32)`` takes it instead of a cast round trip.
+        self.mma_dag_exact_f32: dict[str, str] = {}
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

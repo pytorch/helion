@@ -664,19 +664,41 @@ def test_reduction_tile_heuristic_seeds_multiwarp_vector_row(
     spec = bound.config_spec
     assert CuteReductionTileHeuristic in get_heuristics("cute")
     seeds = CuteReductionTileHeuristic.get_seed_configs(bound.env, host.device_ir)
-    assert seeds is not None and len(seeds) == 2
-    primary, alternate = seeds
+    # The narrow chunk, the 16-byte one-vector row, the 32-byte row on SM100
+    # and the two-packet rolled row.
+    assert seeds is not None and len(seeds) >= 3
+    primary, alternate = seeds[:2]
     assert primary == CuteReductionTileHeuristic.get_seed_config(
         bound.env, host.device_ir
     )
+    assert "cute_reduction_reloads" not in primary.config
     reduction = _reduction_block_id(bound)
     threads_index = spec.num_threads.valid_block_ids().index(reduction)
     vec_index = spec.cute_vector_widths.valid_block_ids().index(reduction)
+    reload_index = spec.cute_reduction_reloads.valid_block_ids().index(reduction)
     assert alternate.block_sizes == [1]
     assert alternate.reduction_loops == [None]
     assert alternate.num_threads[threads_index] == threads
     assert cast("list[int]", alternate.config["cute_vector_widths"])[vec_index] == vec
+    assert (
+        cast("list[str]", alternate.config["cute_reduction_reloads"])[reload_index]
+        == "register_prefetch"
+    )
     assert alternate in spec.compiler_seed_configs
+    # Every row seed (one or two packets per thread) re-reads registers.
+    for row in seeds[1:]:
+        assert (
+            cast("list[str]", row.config["cute_reduction_reloads"])[reload_index]
+            == "register_prefetch"
+        )
+    rolled = seeds[-1]
+    assert rolled == CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
+        bound.env, host.device_ir
+    )
+    assert rolled.reduction_loops == [1024]
+    assert rolled.num_threads[threads_index] == 1024 // (2 * vec)
+    assert cast("list[int]", rolled.config["cute_vector_widths"])[vec_index] == vec
+    assert rolled in spec.compiler_seed_configs
     # The seed survives normalization and the autotuner's flat round trip.
     normalized = spec.normalized_config(alternate)
     generation = ConfigGeneration(spec)
@@ -710,9 +732,23 @@ def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> N
         is None
     )
     seeds = CuteReductionTileHeuristic.get_seed_configs(bound.env, host.device_ir)
-    assert seeds == [
-        CuteReductionTileHeuristic.get_seed_config(bound.env, host.device_ir)
-    ]
+    expected = [CuteReductionTileHeuristic.get_seed_config(bound.env, host.device_ir)]
+    rolled = CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
+        bound.env, host.device_ir
+    )
+    if width == 2048:
+        # Two whole 1024-wide chunks: 64 threads x two V8 packets per trip.
+        assert rolled is not None
+        reduction = _reduction_block_id(bound)
+        threads_index = bound.config_spec.num_threads.valid_block_ids().index(reduction)
+        assert rolled.reduction_loops == [1024]
+        assert rolled.num_threads[threads_index] == 64
+        expected.append(rolled)
+    else:
+        # 1000 is not a whole number of 16-element thread slices; 128 gives
+        # 8 threads.
+        assert rolled is None
+    assert seeds == expected
 
 
 @skipUnlessBackends(["cute"])

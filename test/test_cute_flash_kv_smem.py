@@ -219,3 +219,18 @@ def test_separate_one_cta_rings_keep_both_operand_allocations(
     assert _member_bytes(storage, "sK") == _layout_bytes(k, dtype)
     assert _member_bytes(storage, "sV") == _layout_bytes(v, dtype)
     assert _member_bytes(storage, "sO") == (_layout_bytes(o, dtype) if epi_tma else 0)
+
+
+@pytest.mark.parametrize("head_dim", (64, 128, 192))
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_one_stage_layout_has_no_stage_stride(head_dim: int, dtype: Any) -> None:
+    """A one-stage K/V layout's stage mode has stride 0: indexing its slot 1
+    reaches slot 0, not the next tile. A ring deeper than the host layout
+    (the single-tile bodies' extra K slot) must therefore size the layout by
+    the ring's own depth, not by ``kv_stage``."""
+    _q, one, _v, _o = _layouts(head_dim, 128, 1, dtype, 1)
+    _q, two, _v, _o = _layouts(head_dim, 128, 2, dtype, 1)
+    assert int(one.outer.stride[-1]) == 0
+    assert int(two.outer.stride[-1]) == int(
+        cute.cosize(cute.select(two, mode=[0, 1, 2]))
+    )

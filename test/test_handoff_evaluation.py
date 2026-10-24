@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import TYPE_CHECKING
@@ -26,6 +27,15 @@ from helion.autotuner.handoff_evaluation import evaluate_handoff
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+# Spawns real handoff-evaluation worker subprocesses -- compile-mode machinery
+# that HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker
+# with no traceback) on the single-GPU A10G ref-eager runner.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("HELION_INTERPRET") == "1",
+    reason="handoff worker subprocesses flake on the A10G ref-eager runner",
+)
 
 
 @pytest.fixture(autouse=True)

@@ -22,6 +22,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
@@ -57,6 +58,7 @@ class Config(Mapping[str, object]):
         ) = None,
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
+        cute_store_policy: CuteStorePolicyLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
         cute_async_load_group_rows: int | None = None,
@@ -113,9 +115,12 @@ class Config(Mapping[str, object]):
                 ordinary path.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
-                Valid values are "", "first", and "last".
+                Valid values are "", "first", and "last". CuTe also supports
+                "nc_l2_first" for proven read-only 16-byte or 32-byte packets.
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
+            cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
+                global store packets ("default" or "l2_evict_last").
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
@@ -238,6 +243,7 @@ class Config(Mapping[str, object]):
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
+            "cute_store_policy": cute_store_policy,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
             "cute_async_load_group_rows": cute_async_load_group_rows,
@@ -525,6 +531,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteAsyncStorePolicyLiteral",
             self.config.get("cute_async_store_policy", "default"),
+        )
+
+    @property
+    def cute_store_policy(self) -> CuteStorePolicyLiteral:
+        return cast(
+            "CuteStorePolicyLiteral",
+            self.config.get("cute_store_policy", "default"),
         )
 
     @property
