@@ -3392,10 +3392,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
 
 
 def _reduction_chunk_size(size_hint: int, max_chunk: int | None) -> int:
-    chunk = size_hint // 2
-    if max_chunk is not None:
-        chunk = min(chunk, max_chunk)
-    return prev_power_of_2(chunk)
+    return prev_power_of_2(size_hint // 2, max_chunk)
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
@@ -3461,6 +3458,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_row_ladder"
     backend = "cute"
+    MAX_CHUNK = 65536
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3488,9 +3486,12 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
         if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
             rows_per_cta = 1
-        chunk = _reduction_chunk_size(size_hint, 65536)
+        max_chunk = cls.MAX_CHUNK
+        if spec.max_reduction_loop is not None:
+            max_chunk = min(max_chunk, spec.max_reduction_loop)
+        chunk = _reduction_chunk_size(size_hint, max_chunk)
         chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
-        if chunk >= size_hint:
+        if chunk < 2 or chunk >= size_hint or chunk > max_chunk:
             return None
         rdim_id = rl_spec.block_id
         tile_id = spec.block_sizes[0].block_id
@@ -3570,9 +3571,11 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
         # 4350 GB/s) — the shorter unrolled body overlaps its loads across
         # roll iterations instead of one long dependency chain.
         slice_len = size_hint // cluster_n
-        chunk = max(threads_per_row * max(vec, 1), min(4096, slice_len))
+        chunk = prev_power_of_2(min(4096, slice_len), spec.max_reduction_loop)
         while slice_len % chunk:
             chunk //= 2
+        if chunk < threads_per_row * max(vec, 1):
+            return None
         rdim_id = rl_spec.block_id
         tile_id = spec.block_sizes[0].block_id
         seed: dict[str, Any] = {
