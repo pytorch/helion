@@ -67,6 +67,12 @@ class TritonBackend(Backend):
         return BackendState.STABLE
 
     @property
+    def pads_small_matmul_dims(self) -> bool:
+        # ``tl.dot`` over a masked tile: rows / columns past a small M / N
+        # are loaded as zero and never stored.
+        return True
+
+    @property
     def supports_debug_dtype_asserts(self) -> bool:
         return True
 
@@ -690,6 +696,11 @@ class TileIRBackend(TritonBackend):
     @property
     def codegen_name(self) -> str:
         return "triton"
+
+    @property
+    def pads_small_matmul_dims(self) -> bool:
+        # The block-size overshoot was never enabled for TileIR.
+        return False
 
     def supports_config_key(self, key: str) -> bool:
         # Override TritonBackend/Backend rejections for tileir-specific tunables

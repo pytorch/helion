@@ -1994,12 +1994,22 @@ class DeviceFunction:
                     kernel_body = lower_register_row_reduction(
                         kernel_body, constexpr_values
                     )
-            elif self.config.get("cute_cluster_warp_online", False):
+            # The rolled (``reduction_loops``) form's online pair: tried after
+            # the register-row lowering, which consumes the cluster sites when
+            # it fires, so the knob is honoured whatever ``cute_register_row``
+            # says.  Under fast_math the CTA-level pair caches sweep B's
+            # exponentials for the write sweep; otherwise the exact warp pair.
+            if self.config.get("cute_cluster_warp_online", False):
                 from .cute.rolled_cluster_online_pair import (
                     fuse_rolled_cluster_online_pair,
                 )
 
-                kernel_body = fuse_rolled_cluster_online_pair(kernel_body)
+                kernel_body = fuse_rolled_cluster_online_pair(
+                    kernel_body,
+                    constexpr_values,
+                    rename_groups=rename_groups,
+                    fast_math=CompileEnvironment.current().settings.fast_math,
+                )
             if self.config.get("cute_independent_reduction", False):
                 from .cute.rolled_vector_reduction import split_rolled_vector_sums
 

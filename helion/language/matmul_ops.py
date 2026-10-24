@@ -303,8 +303,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
             # Let the autotuner try output block sizes larger than a small matmul
-            # dimension: masked rows/cols can map to a more efficient MMA tile.
-            if is_output_dim and env.backend_name == "triton":
+            # dimension: masked rows/cols can map to a more efficient MMA tile
+            # (on the backends whose lowerings pad such tiles).
+            if is_output_dim and env.backend.pads_small_matmul_dims:
                 try:
                     spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
                 except KeyError:

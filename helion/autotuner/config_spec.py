@@ -1693,6 +1693,10 @@ class ConfigSpec:
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
+        # Cleared by the CuTe DeviceIR pass when no contraction can reach the
+        # collective marker; the ``cute_collective_*`` fragments then stay out
+        # of the search surface while normalization keeps their defaults.
+        self.cute_collective_knobs_enabled: bool = True
         self.has_pallas_inner_loops: bool = False
         # Set by the Pallas graph lowering when an inner-loop dot can consume
         # an f32 producer directly instead of its explicit bf16/f16 cast.
@@ -2189,6 +2193,14 @@ class ConfigSpec:
     @cute_tcgen05_exact_shape_aux_kernel_detected.setter
     def cute_tcgen05_exact_shape_aux_kernel_detected(self, value: bool) -> None:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
+
+    @property
+    def cute_tcgen05_aux_loads_on_every_store(self) -> bool:
+        return self._cute_tcgen05_config.aux_loads_on_every_store
+
+    @cute_tcgen05_aux_loads_on_every_store.setter
+    def cute_tcgen05_aux_loads_on_every_store(self, value: bool) -> None:
+        self._cute_tcgen05_config.aux_loads_on_every_store = value
 
     @property
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self) -> bool:
@@ -2902,8 +2914,10 @@ class ConfigSpec:
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention forward (backend 'cute')",
+            )
 
     def enable_cute_flash_gated_search(
         self,
@@ -3725,8 +3739,10 @@ class ConfigSpec:
         self._cute_flash_bwd_table_step_choices = tuple(table_step_choices)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention backward (backend 'cute')",
+            )
 
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
@@ -7445,7 +7461,8 @@ class ConfigSpec:
         ):
             return
         min_sizes = [
-            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+            max(self.block_sizes[i].min_size, self.block_sizes[i].structural_pin or 1)
+            for i in range(len(block_sizes))
         ]
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
@@ -7466,6 +7483,9 @@ class ConfigSpec:
         best_val = -1
         for i, value in enumerate(block_sizes):
             if not isinstance(value, int):
+                continue
+            if self.block_sizes[i].structural_pin is not None:
+                # Normalization would restore the pinned size: no progress.
                 continue
             if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
                 best_val = value
@@ -7602,7 +7622,12 @@ class ConfigSpec:
                 fields["cute_fragment_reduction"] = EnumFragment(
                     choices=("serial", "warp", "cta", "cta_unroll")
                 )
-            if self.cute_pointwise_region_block_ids:
+            if self.cute_pointwise_region_block_ids and any(
+                pid_type != "flat" for pid_type in self.allowed_pid_types
+            ):
+                # The pointwise launch may go flat while the native launch
+                # stays persistent; when every launch is flat already (ordered
+                # barrier phases) the knob is inert and stays off the surface.
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
@@ -7908,72 +7933,73 @@ class ConfigSpec:
                     if self.cute_split_k_workspace_available:
                         fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
                         fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
-                    fields["cute_collective_mma"] = BooleanFragment()
-                    fields["cute_collective_static_layouts"] = BooleanFragment()
-                    native_collective = (
-                        self.target_device_capability is not None
-                        and self.target_device_capability[0] == 10
-                    )
-                    gathered_collective = native_collective and any(
-                        seed.config.get("cute_collective_compute") == "tma_gather"
-                        for seed in self.compiler_seed_configs
-                    )
-                    fields["cute_collective_compute"] = EnumFragment(
-                        choices=("warp", "tcgen05", "tma_gather")
-                        if native_collective
-                        else ("warp",),
-                        search_choices=("warp", "tcgen05", "tma_gather")
-                        if gathered_collective
-                        else ("warp", "tcgen05")
-                        if native_collective
-                        else ("warp",),
-                    )
-                    fields["cute_collective_native_seeded"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_seed"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_a"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_stages"] = EnumFragment(
-                        choices=(1, 2, 3, 4)
-                    )
-                    fields["cute_collective_copy"] = EnumFragment(
-                        choices=("scalar", "async", "async_cached")
-                    )
-                    fields["cute_collective_recipe"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_collective_operand_packets"] = EnumFragment(
-                        choices=(False, True),
-                        search_choices=(False, True)
-                        if any(
-                            fact.lhs_dtype == torch.float32
-                            for fact in self.matmul_facts
+                    if self.cute_collective_knobs_enabled:
+                        fields["cute_collective_mma"] = BooleanFragment()
+                        fields["cute_collective_static_layouts"] = BooleanFragment()
+                        native_collective = (
+                            self.target_device_capability is not None
+                            and self.target_device_capability[0] == 10
                         )
-                        else (False,),
-                    )
-                    fields["cute_collective_epilogue"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_gathered_mma_n"] = EnumFragment(
-                        choices=(256, 128, 512),
-                        search_choices=(256, 128, 512)
-                        if gathered_collective
-                        else (256,),
-                    )
-                    fields["cute_gathered_mma_stages"] = EnumFragment(
-                        choices=(3, 2, 4),
-                        search_choices=(3, 2, 4) if gathered_collective else (3,),
-                    )
+                        gathered_collective = native_collective and any(
+                            seed.config.get("cute_collective_compute") == "tma_gather"
+                            for seed in self.compiler_seed_configs
+                        )
+                        fields["cute_collective_compute"] = EnumFragment(
+                            choices=("warp", "tcgen05", "tma_gather")
+                            if native_collective
+                            else ("warp",),
+                            search_choices=("warp", "tcgen05", "tma_gather")
+                            if gathered_collective
+                            else ("warp", "tcgen05")
+                            if native_collective
+                            else ("warp",),
+                        )
+                        fields["cute_collective_native_seeded"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_seed"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_a"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_stages"] = EnumFragment(
+                            choices=(1, 2, 3, 4)
+                        )
+                        fields["cute_collective_copy"] = EnumFragment(
+                            choices=("scalar", "async", "async_cached")
+                        )
+                        fields["cute_collective_recipe"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_collective_operand_packets"] = EnumFragment(
+                            choices=(False, True),
+                            search_choices=(False, True)
+                            if any(
+                                fact.lhs_dtype == torch.float32
+                                for fact in self.matmul_facts
+                            )
+                            else (False,),
+                        )
+                        fields["cute_collective_epilogue"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_gathered_mma_n"] = EnumFragment(
+                            choices=(256, 128, 512),
+                            search_choices=(256, 128, 512)
+                            if gathered_collective
+                            else (256,),
+                        )
+                        fields["cute_gathered_mma_stages"] = EnumFragment(
+                            choices=(3, 2, 4),
+                            search_choices=(3, 2, 4) if gathered_collective else (3,),
+                        )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
                 if self.cute_warp_aggregated_atomics_enabled:
@@ -8700,6 +8726,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.declared_max_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # The one block size a fused lowering's envelope admits
+        # (``pin_structurally``): the search sees a single point and a
+        # provided config's other value is normalized onto it (see
+        # ``_normalize``). ``None`` where no surface pinned this block.
+        self.structural_pin: int | None = None
+        self.structural_pin_reason: str = ""
+        self._structural_pin_warned: set[int] = set()
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -8720,9 +8753,41 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
+        if not isinstance(result, int):
+            return result
+        pin = self.structural_pin
+        if pin is not None and result != pin:
+            # A decorator / saved config written for another backend (the
+            # examples pin Triton-shaped 64x64 tiles) must not silently pick
+            # the scalar lowering: the fused family is the only one the
+            # surface offers, so the value is normalized onto its envelope.
+            if result not in self._structural_pin_warned:
+                self._structural_pin_warned.add(result)
+                log.warning(
+                    "%s=%d in the provided config is normalized onto %d: "
+                    "%s pins this block size",
+                    name,
+                    result,
+                    pin,
+                    self.structural_pin_reason,
+                )
+            return pin
+        if result < self.min_size:
             result = self.min_size
         return result
+
+    def pin_structurally(self, value: int, *, reason: str) -> None:
+        """Pin this block size to the one value a fused lowering admits.
+
+        The autotuner's range collapses to ``value`` and ``_normalize`` maps
+        any other provided value onto it (with a logged warning naming the
+        key and ``reason``), so a config pinned by a decorator or loaded from
+        a cache written for another backend still reaches the fused family.
+        """
+        self.autotuner_min = value
+        self.max_size = value
+        self.structural_pin = value
+        self.structural_pin_reason = reason
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))

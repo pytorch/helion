@@ -22,6 +22,7 @@ from helion._compiler.cute.layout_propagation import META_KEY
 from helion._compiler.cute.layout_rules import _layout_from_tensor_strides
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language import reduce_ops
 
@@ -877,3 +878,194 @@ class TestLayoutChangeCodegen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# A seeded layout must describe the whole value it is attached to
+# ---------------------------------------------------------------------------
+
+
+def _subscript_layout_strategy() -> tuple[Mock, Mock]:
+    """One ``block_size=1`` tile beside a 64-wide sliced dim on 64 threads."""
+    shape_env = ShapeEnv()
+    tile = shape_env.create_unbacked_symint()
+    env = Mock()
+    env.get_block_id.side_effect = lambda size: 0 if str(size) == str(tile) else None
+    env.block_sizes = [Mock(from_config=Mock(return_value=1))]
+    strategy = Mock(
+        strategies=[Mock(fn=Mock(config=helion.Config(block_sizes=[1])))],
+        thread_block_dims=Mock(return_value=(64, 1, 1)),
+    )
+    env.tile = tile
+    return env, strategy
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("op", ["load", "store"])
+def test_slice_dim_leaves_the_subscript_layout_unseeded(op: str) -> None:
+    """``x[idx, :]`` is a 64-element tile; a layout that only saw ``idx``
+    (one thread, one value) does not describe it and must not be a seed."""
+    from helion._compiler.cute.layout_rules import preferred_constraint_for_node
+
+    env, strategy = _subscript_layout_strategy()
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = torch.empty(8, 64)
+    index = graph.placeholder("idx")
+    index.meta["val"] = env.tile
+    value = graph.placeholder("value")
+    value.meta["val"] = torch.empty(64)
+    if op == "load":
+        sliced = graph.call_function(hl.load, args=(source, [index, slice(None)]))
+        sliced.meta["val"] = torch.empty(64)
+        scalar = graph.call_function(hl.load, args=(source, [index, 0]))
+        scalar.meta["val"] = torch.empty(())
+    else:
+        sliced = graph.call_function(
+            hl.store, args=(source, [index, slice(None)], value)
+        )
+        scalar_value = graph.placeholder("scalar_value")
+        scalar_value.meta["val"] = torch.empty(())
+        scalar = graph.call_function(hl.store, args=(source, [index, 0], scalar_value))
+
+    with patch(
+        "helion._compiler.cute.layout_rules.CompileEnvironment.current",
+        return_value=env,
+    ):
+        assert preferred_constraint_for_node(sliced, strategy) is None
+        control = preferred_constraint_for_node(scalar, strategy)
+    assert control is not None
+    seeded = control.preferred_output or control.preferred_input
+    assert seeded is not None
+    assert seeded.tile_numel() == 1
+
+
+@onlyBackends(["cute"])
+class TestLayoutChangeDescribesValue(unittest.TestCase):
+    """The scalar smem round trip needs one tile element per launch thread."""
+
+    @staticmethod
+    def _rank_mismatch_graph(numel: int) -> torch.fx.Graph:
+        from helion._compiler.cute.layout import LayoutConstraint
+
+        one = ThreadLayout(
+            thread_shape=(1,),
+            thread_stride=(1,),
+            value_shape=(1,),
+            value_stride=(1,),
+            tag=LayoutTag.INHERITED,
+        )
+        one_2d = ThreadLayout(
+            thread_shape=(1,),
+            thread_stride=(1,),
+            value_shape=(1, 1),
+            value_stride=(1, 1),
+            tag=LayoutTag.INHERITED,
+        )
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(numel)
+        x.meta[META_KEY] = LayoutConstraint(preferred_output=one, output_layout=one)
+        mul = graph.call_function(torch.mul, args=(x, x))
+        mul.meta["val"] = torch.randn(numel)
+        mul.meta[META_KEY] = LayoutConstraint(
+            preferred_input=one_2d,
+            preferred_output=one_2d,
+            input_layout=one_2d,
+            output_layout=one_2d,
+        )
+        graph.output(mul)
+        return graph
+
+    @staticmethod
+    def _count_changes(graph: torch.fx.Graph) -> int:
+        from helion._compiler.cute.layout_change import _cute_layout_change
+
+        return sum(1 for n in graph.nodes if n.target is _cute_layout_change)
+
+    def test_no_change_when_the_layout_omits_a_value_dim(self) -> None:
+        # Two one-element layouts that differ only in rank, attached to a
+        # 64-element value: the seed left the sliced dim out.
+        from helion._compiler.cute.layout_propagation import _insert_layout_changes
+
+        graph = self._rank_mismatch_graph(64)
+        _insert_layout_changes(_FakeGraphInfo(graph))  # type: ignore[arg-type]
+        self.assertEqual(self._count_changes(graph), 0)
+
+    def test_change_needs_one_element_per_launch_thread(self) -> None:
+        from helion._compiler.cute.layout_propagation import _insert_layout_changes
+
+        graph = self._rank_mismatch_graph(1)
+        wide = Mock(thread_block_dims=Mock(return_value=(64, 1, 1)))
+        _insert_layout_changes(_FakeGraphInfo(graph), wide)  # type: ignore[arg-type]
+        self.assertEqual(self._count_changes(graph), 0)
+
+        graph = self._rank_mismatch_graph(1)
+        single = Mock(thread_block_dims=Mock(return_value=(1, 1, 1)))
+        _insert_layout_changes(_FakeGraphInfo(graph), single)  # type: ignore[arg-type]
+        self.assertEqual(self._count_changes(graph), 1)
+
+
+def _recurrent_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    s = state.float() * alpha.float()[:, :, None]
+    kv = k.float()[:, :, None]
+    if beta is not None:
+        kts = (kv * s).sum(1)
+        s = s - beta.float()[:, None, None] * kv * kts[:, None, :]
+        s = s + beta.float()[:, None, None] * kv * v.float()[:, None, :]
+    else:
+        s = s + kv * v.float()[:, None, :]
+    out = (q.float()[:, :, None] * s).sum(1)
+    return out, s
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("correction", [False, True])
+def test_unit_tile_beside_a_sliced_dim_matches_reference(correction: bool) -> None:
+    """``hl.tile([BH, DV], block_size=[1, None])`` at ``block_sizes=[1]``: every
+    value is a ``[D]`` or ``[D, 1]`` tile spread over the D threads.  The
+    ``a[:, None]`` broadcast used to get a one-float shared-memory round trip
+    written by all D threads (a seed that only saw the unit tile), returning
+    garbage for the state and the output."""
+    from examples.linear.linear_attention_engine import recurrent_step_correction_fused
+    from examples.linear.linear_attention_engine import recurrent_step_fused
+
+    source = recurrent_step_correction_fused if correction else recurrent_step_fused
+    kernel = helion.kernel(
+        source.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    BH, D, DV = 64, 128, 128
+    torch.manual_seed(0)
+    q = torch.randn(BH, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(BH, D, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(BH, DV, device=DEVICE, dtype=torch.bfloat16)
+    initial = torch.randn(BH, D, DV, device=DEVICE)
+    alpha = torch.rand(BH, D, device=DEVICE)
+    beta = torch.rand(BH, device=DEVICE) if correction else None
+    state = initial.clone()
+    args = (q, k, v, state, alpha, *(() if beta is None else (beta,)))
+    bound = kernel.bind(args)
+    config = bound.config_spec.normalized_config(
+        helion.Config(block_sizes=[1], reduction_loops=[None])
+    )
+    assert config.block_sizes == [1]
+    code = bound.to_code(config)
+    assert "layout_change_smem" not in code
+    compiled = bound.compile_config(config)
+    out = compiled(*args)
+    torch.cuda.synchronize()
+    expected_out, expected_state = _recurrent_reference(q, k, v, initial, alpha, beta)
+    torch.testing.assert_close(state, expected_state, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out.float(), expected_out, rtol=2e-2, atol=2e-1)

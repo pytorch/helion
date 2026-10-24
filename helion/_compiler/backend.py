@@ -320,6 +320,18 @@ class Backend(abc.ABC):
         return TRITON_MAX_TENSOR_NUMEL
 
     @property
+    def pads_small_matmul_dims(self) -> bool:
+        """Whether a matmul output tile may be larger than a small M / N
+        dimension: the lowering masks the rows / columns past the extent, so
+        the autotuner may search output block sizes beyond the dimension
+        (``SMALL_DIM_BLOCK_SIZE_OVERSHOOT``), where a hardware-aligned MMA
+        tile runs faster than the dimension-sized one.  Backends whose
+        lowerings read and write exactly the dimension keep the search
+        ceiling at the extent.
+        """
+        return False
+
+    @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
         have their integer dim sizes rounded up to the next power of 2.

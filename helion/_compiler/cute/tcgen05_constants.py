@@ -338,6 +338,31 @@ TCGEN05_AUX_LOAD_PLACEMENTS = (
     TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
+# ``pre_acc_wait`` on an exact-shape auxiliary operand (a full ``(m, n)``
+# residual / gate input) normally issues each subtile's global read just ahead
+# of that subtile's accumulator wait; the named barriers between subtiles
+# expose every read's latency. With the whole-fragment hoist on, the epilogue
+# warps read the tile's entire auxiliary fragment into registers once, before
+# the accumulator wait, where the latency hides under the tile's MMA (the
+# register hoist the two-CTA row-vector family already takes). Off keeps the
+# per-subtile reads; the budget below bounds the live fragment so the hoist
+# cannot spill (64 32-bit registers per thread at the 256-register epilogue
+# ceiling).
+TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY = "tcgen05_aux_fragment_hoist"
+TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD = 256
+
+
+def tcgen05_aux_fragment_bytes_per_thread(
+    *, bm: int, bn: int, itemsize: int, epi_warps: int
+) -> int:
+    """Bytes of one exact-shape auxiliary tile fragment held per epilogue thread.
+
+    The epilogue partitions the ``(bm, bn)`` tile evenly over its
+    ``epi_warps * 32`` threads; the hoist keeps every element of the thread's
+    share live across the accumulator wait.
+    """
+    assert bm > 0 and bn > 0 and itemsize > 0 and epi_warps > 0
+    return -(-bm * bn * itemsize // (epi_warps * 32))
 
 
 class Tcgen05RowvecAuxRow(NamedTuple):
@@ -356,11 +381,16 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     ``output_itemsize`` is the element size of the stored output(s); ``rows``
     lists every N-broadcast aux leaf the analyzed epilogue chains load. The
     autotune seeds use them to model the SMEM the ``pre_acc_wait`` row stages
-    add (``CuteTcgen05Config.rowvec_aux_stage_fits``).
+    add (``CuteTcgen05Config.rowvec_aux_stage_fits``). ``output_count`` is the
+    number of analyzed output stores: the store lowering allocates one
+    TMA-store C ring per output, so the SMEM model charges the ring that many
+    times (two fresh outputs of one accumulator keep two rings, with or
+    without the shared fanout epilogue).
     """
 
     output_itemsize: int
     rows: tuple[Tcgen05RowvecAuxRow, ...]
+    output_count: int = 1
 
 
 def tcgen05_rowvec_stage_smem_bytes(
