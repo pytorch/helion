@@ -20,6 +20,7 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import control_flow_child_graph_ids
 from helion._compiler.device_ir import control_flow_parent_entries
 from helion._compiler.device_ir import control_flow_parent_ids
+from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -119,6 +120,51 @@ def test_unrelated_root_retains_its_default_tile(first: bool) -> None:
             helion.exc.BackendUnsupported, match=f"sibling block {other}"
         ):
             bound.to_code(invalid)
+
+
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@pytest.mark.parametrize("block_size", [96, 95])
+@skipIfNotCUDA()
+@skipIfRefEager("requires compiler seeds")
+def test_fixed_sibling_atomic_has_one_owner(compute: str, block_size: int) -> None:
+    if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("tcgen05 needs SM100")
+
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def mixed(
+        a: torch.Tensor, b: torch.Tensor, counts: torch.Tensor, width: hl.constexpr
+    ) -> torch.Tensor:
+        out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+        for m, n in hl.tile([a.size(0), b.size(1)]):
+            acc = hl.zeros([m, n], dtype=torch.float32)
+            for k in hl.tile(a.size(1)):
+                acc = hl.dot(a[m, k] * 0.5, b[k, n], acc)
+            out[m, n] = acc.to(out.dtype)
+        for i in hl.tile(counts.numel(), block_size=width):
+            hl.atomic_add(counts, [i], 1.0)
+        return out
+
+    a = torch.randn(64, 128, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+    counts = torch.zeros(4 * block_size, device=DEVICE)
+    args = (a, b, counts, block_size)
+    bound = mixed.bind(args)
+    assert bound.host_function is not None
+    spec = bound.config_spec
+    n_block_id = spec.matmul_facts[0].n_block_id
+    assert n_block_id is not None
+    seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
+        bound.env, bound.host_function.device_ir
+    )
+    seed = next(
+        seed
+        for seed in seeds
+        if seed.get("cute_collective_compute", "warp") == compute
+        and spec.num_threads.config_get(seed.num_threads, n_block_id) == 64
+    )
+    result = bound.compile_config(seed)(*args)
+    torch.testing.assert_close(result, (a * 0.5) @ b)
+    torch.testing.assert_close(counts, torch.ones_like(counts))
 
 
 @pytest.mark.parametrize("nested", [False, True])

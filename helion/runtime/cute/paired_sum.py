@@ -29,7 +29,14 @@ if TYPE_CHECKING:
 # ATen sum dispatch plus the headers that define the admitted FP32 tree. This
 # is a library-implementation compatibility gate, independent of workload or
 # GPU shape. Missing sources or a different build retain ordinary Torch calls.
-_ATEN_SUM_GIT = "332a69317e22b105a867838624a87984e05021e2"
+# torch 2.16.0.dev20261014+cu130 (nightly branch; main a970aa8b98). Audited
+# against the previous pin 332a69317e (2026-08-29 nightly, main e2dee2a4b9):
+# ReduceSumProdKernel.cu, Reduce.cuh, SharedReduceOps.h, ReduceOpsUtils.h,
+# thread_constants.h and block_reduce.cuh are unchanged; TensorIterator.cpp
+# only refactored operand bookkeeping (no byte-offset split change); the CUDA
+# float accumulate type moved verbatim to torch/headeronly; Copy.cu gained
+# vectorized copies that keep the per-element static_cast rounding.
+_ATEN_SUM_GIT = "ef46daf1aa35294a3cb297ef3f59b5a6463063f8"
 _ATEN_SUM_HEADERS = {
     "ATen/native/cuda/thread_constants.h": "61e0f733a01a729f96036cd84b78645731d126534f3ecc972a3e91d3c37416d2",
     "ATen/native/cuda/Reduce.cuh": "8f04b32331911bd301938abe566ff6b3a390bd409ec3a98e1222d7ed698de09e",

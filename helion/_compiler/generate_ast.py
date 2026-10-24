@@ -663,6 +663,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "warp_mma GEMM family failed late validation"
         )
 
+    def fragment_capacity_failure(
+        self, error: exc.BackendUnsupported
+    ) -> exc.BackendUnsupported | exc.InvalidConfig:
+        """Report a generic-lowering refusal after a fragment capacity decline.
+
+        The computed-fragment owner declines a root whose shared memory exceeds
+        the CTA capacity so the ordinary lowering can own it; when that lowering
+        refuses instead (lane restores, repeated block ids), the config, not the
+        kernel, failed: the overflow is the actionable message. Callers wrap the
+        statement visit and the device function finalization.
+        """
+        if CompileEnvironment.current().backend_name != "cute":
+            return error
+        declined = self.device_function.cute_state.fragment_capacity_decline
+        if declined is None:
+            return error
+        needed, capacity = declined
+        return exc.InvalidConfig(
+            f"computed fragments need {needed} shared bytes, exceeding {capacity}, "
+            f"and no other lowering owns this root: {error}"
+        )
+
     def _try_codegen_computed_fragment_root(self) -> bool:
         from .cute.computed_fragment import codegen_computed_fragment_root
 
@@ -2247,10 +2269,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _sink_grid_vector_loops(self) -> None:
         cute_state = self.device_function.cute_state
         fired = False
+        unrolled = False
         if cute_state.vloop_sink_wrappers:
             from .cute.sink_vector_loops import sink_grid_vector_loops
 
-            self.device_function.body, fired = sink_grid_vector_loops(
+            self.device_function.body, fired, unrolled = sink_grid_vector_loops(
                 list(self.device_function.body),
                 wrappers=cute_state.vloop_sink_wrappers,
                 loads=cute_state.vloop_sink_loads,
@@ -2268,7 +2291,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg in self.device_function.arguments
                     if isinstance(arg, TensorArg)
                 },
+                proven_disjoint_tensor_pairs=(
+                    self.device_function.proven_disjoint_tensor_pairs()
+                ),
+                stores=cute_state.vloop_sink_stores,
             )
+            cute_state.vloop_sink_unrolled = unrolled
         if not fired and cute_state.vloop_sink_layout_applied:
             # The knob shaped the thread layout but nothing was sunk.  The
             # knob must not change the code by itself, so start over with it
@@ -2853,7 +2881,12 @@ def _generate_ast(
                 ):
                     _host_prefix.extend(codegen.host_statements)
                     prefix_recorded = True
-                codegen.add_statement(codegen.visit(stmt))
+                try:
+                    codegen.add_statement(codegen.visit(stmt))
+                except exc.BackendUnsupported as error:
+                    # A lane-loop pass after the root dispatch can refuse a
+                    # root the fragment owner declined for capacity.
+                    raise codegen.fragment_capacity_failure(error) from error
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             # Re-binding checks deferred from tcgen05 epilogue chains that no
             # store drained (chains ending in an atomic or a specialized
@@ -2865,12 +2898,17 @@ def _generate_ast(
                     codegen.suppressed_lane_names,
                     codegen.device_function.dce_vars,
                 )
-            if _bounded_cache_request is None:
-                kernel_def = codegen.device_function.codegen_function_def()
-            else:
-                kernel_def = codegen.device_function.codegen_function_def(
-                    bounded_cache_request=_bounded_cache_request
-                )
+            try:
+                if _bounded_cache_request is None:
+                    kernel_def = codegen.device_function.codegen_function_def()
+                else:
+                    kernel_def = codegen.device_function.codegen_function_def(
+                        bounded_cache_request=_bounded_cache_request
+                    )
+            except exc.BackendUnsupported as error:
+                # Lane-loop finalization can refuse a root the fragment owner
+                # declined for capacity (see ``fragment_capacity_failure``).
+                raise codegen.fragment_capacity_failure(error) from error
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
                 or codegen.device_function.cute_state.owned_root_block_dims
@@ -3113,6 +3151,11 @@ def _generate_ast(
                     cast(
                         "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
                     ),
+                )
+                from .cute.host_zero_fills import lower_host_zero_fills
+
+                final_host_statements = lower_host_zero_fills(
+                    func, final_host_statements, env, codegen.device_function.config
                 )
 
             host_def = func.codegen_function_def(

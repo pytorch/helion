@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import sympy
@@ -147,7 +148,7 @@ class TileStrategyDispatch:
         collective_blocks = {
             bid
             for fact, _root in placements
-            for bid in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            for bid in (fact.m_block_id, fact.n_block_id)
             if bid is not None
         }
         for fact, _root in placements:
@@ -215,6 +216,13 @@ class TileStrategyDispatch:
                         f"but the collective launch allows {cap}",
                     )
                 extent = requested or cap
+                if not requested:
+                    size = strategy._configured_block_size_int(
+                        strategy.block_size[index]
+                    )
+                    if size is not None and size > cap and size % cap:
+                        # A divisor fits fixed tiles; surplus physical threads stay masked.
+                        extent = math.gcd(size, cap)
                 extents[bid] = extent
                 if extent > 1:
                     axis += 1
@@ -230,10 +238,6 @@ class TileStrategyDispatch:
         Only existing SIMT tile axes are widened; scalar and MMA axes keep
         their ownership model.
         """
-        if CompileEnvironment.current().config_spec.matmul_facts:
-            # Matrix layouts own additional physical-thread contracts beyond
-            # the scalar tile coordinates normalized here.
-            return
         dims = self.thread_block_dims()
         updates: list[tuple[PerThreadNDTileStrategy, dict[int, int]]] = []
         for strategy in self.strategies:
@@ -722,6 +726,10 @@ class TileStrategyDispatch:
             self._device_function
         )
 
+    def collective_sibling_thread_axis(self, target: TileStrategy) -> int | None:
+        """Return the explicit axis override for an independent collective sibling."""
+        return self._collective_sibling_thread_axes.get(target)
+
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.
 
@@ -747,8 +755,14 @@ class TileStrategyDispatch:
         whereas sharing a threaded reduction's axis would let a lookup of the
         block's axis extent read the other reduction's threads.
         """
-        if target in self._collective_sibling_thread_axes:
-            return self._collective_sibling_thread_axes[target]
+        sibling_axis = self.collective_sibling_thread_axis(target)
+        if sibling_axis is not None:
+            return sibling_axis
+        partner = getattr(target, "_cute_axis_partner", None)
+        if partner is not None:
+            # A sibling full-slice block indexing another's axis
+            # (``PersistentReductionStrategy._cute_sibling_axis_partner``).
+            return self.thread_axis_for_strategy(partner)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
@@ -828,7 +842,11 @@ class TileStrategyDispatch:
             return 0
         reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]
         return max(
-            sum(1 for s in reductions if s._reduction_thread_count() > 1),
+            sum(
+                1
+                for s in reductions
+                if s._reduction_thread_count() > 1 and s.thread_axes_used() > 0
+            ),
             1 if any(s.thread_axes_used() > 0 for s in reductions) else 0,
         )
 

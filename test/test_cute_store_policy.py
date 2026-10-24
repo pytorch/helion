@@ -21,6 +21,9 @@ from helion import exc
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from helion._compiler.cute.masked_packet_load_names import (
+    MASKED_PACKET_LOAD_HELPER_NAMES,
+)
 from helion._compiler.cute.packet_store_policy import _STORE_HELPERS
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
 from helion.autotuner.config_spec import ConfigSpec
@@ -97,9 +100,10 @@ def test_store_policy_is_cute_only() -> None:
 def test_packet_policy_helper_names_are_registered_without_cuda() -> None:
     imports = CuteBackend().library_imports
     assert set(_STORE_HELPERS.values()) <= imports.keys()
-    assert {
-        name for name in imports if name.startswith("_cute_load_")
-    } == _CUTE_CACHE_LOAD_HELPER_NAMES
+    # Cache-hinted loads plus the predicated packet loads of the sunk V-loop.
+    assert {name for name in imports if name.startswith("_cute_load_")} == (
+        _CUTE_CACHE_LOAD_HELPER_NAMES | MASKED_PACKET_LOAD_HELPER_NAMES
+    )
 
 
 def _rewrite(

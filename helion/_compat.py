@@ -756,8 +756,6 @@ def supports_torch_compile_template_lowering() -> bool:
     external template kernel and the template buffer fusion flags, without the
     scheduler's prologue/producer fusion hook.
     """
-    if torch.xpu.is_available():
-        return False
     if not requires_torch_version("2.11"):
         return False
     try:

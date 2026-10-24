@@ -1246,6 +1246,20 @@ def _region_write_roots(
         if isinstance(statement, ast.Expr):
             value = statement.value
             if (
+                isinstance(value, ast.Call)
+                and not value.args
+                and not value.keywords
+                and ast.unparse(value.func)
+                in {
+                    "cute.arch.griddepcontrol_wait",
+                    "cute.arch.griddepcontrol_launch_dependents",
+                }
+            ):
+                # Programmatic-dependent-launch control: no tensor effect of
+                # its own. The wait heads the kernel body (``cute_pdl``), and
+                # every staged load this lowering places follows it.
+                return True
+            if (
                 allow_relaxed_atomics
                 and isinstance(value, ast.Call)
                 and (root := _relaxed_atomic_add_root(value)) is not None
@@ -1318,6 +1332,228 @@ def _is_scalar_carry_alias(
                 return False
             current = statement.value.id
     return current == result_name
+
+
+# Module roots a generated body names everywhere (``cutlass.Int32``,
+# ``cute.copy``): never tensors, never loop bounds.
+_MODULE_NAMES = frozenset({"cutlass", "cute", "torch", "math", "cutlass_utils"})
+
+
+def _stored_tensor_names(body: list[ast.stmt]) -> set[str]:
+    """Tensor arguments the body writes, in every form a collective body
+    writes them: ``<name>.iterator ... .store(...)``, relaxed atomic adds on
+    ``<name>...llvm_ptr``, and the operands of ``cute.copy`` / bulk and TMA
+    copies (any tensor named in a copy counts as written: the destination
+    is not told apart from the source)."""
+    stored: set[str] = set()
+
+    def names_under(node: ast.AST) -> None:
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Name) and inner.id not in _MODULE_NAMES:
+                stored.add(inner.id)
+                # a TMA tensor view stands for the argument it was made from
+                if inner.id.startswith("tma_tensor_"):
+                    stored.add(inner.id[len("tma_tensor_") :])
+
+    for statement in body:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "store":
+                for inner in ast.walk(node.func.value):
+                    if (
+                        isinstance(inner, ast.Attribute)
+                        and inner.attr == "iterator"
+                        and isinstance(inner.value, ast.Name)
+                    ):
+                        stored.add(inner.value.id)
+                continue
+            func = ast.unparse(node.func)
+            if (
+                func.startswith("cute.arch.atomic")
+                or "atomic" in func.rsplit(".", 1)[-1]
+            ):
+                for arg in node.args:
+                    names_under(arg)
+                continue
+            if func in ("cute.copy", "cute.copy_atom") or func.startswith(
+                ("cute.nvgpu.cpasync", "cute.nvgpu.tma", "cute.arch.cp_async")
+            ):
+                for arg in node.args:
+                    names_under(arg)
+                for keyword in node.keywords:
+                    names_under(keyword.value)
+    return stored
+
+
+def _loop_bound_names(loop: ast.For, body: list[ast.stmt]) -> set[str]:
+    """Names the loop's bound depends on: those its ``iter`` reads, closed
+    over the assignments of ``body`` that feed them (``n = end - start``
+    makes ``end`` and ``start`` bound names of ``range(n)``). A hoisted load
+    must not read any of them: when the loop runs zero times such an address
+    (``x[seq_start, col]`` of an empty trailing sequence) is only valid
+    under the loop's bound."""
+    names = {
+        node.id
+        for node in ast.walk(loop.iter)
+        if isinstance(node, ast.Name) and node.id not in _MODULE_NAMES
+    }
+    # Follow the bound through arithmetic only: a loaded value (``seq_start
+    # = (offsets.iterator + b).load()``) is where a bound comes from, and
+    # its inputs (the batch index) stay valid whether or not the loop runs.
+    assignments: list[tuple[set[str], set[str]]] = []
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Assign) and not any(
+                isinstance(inner, ast.Call) for inner in ast.walk(node.value)
+            ):
+                targets = {
+                    target.id
+                    for assigned in node.targets
+                    for target in ast.walk(assigned)
+                    if isinstance(target, ast.Name)
+                }
+                reads = set(ReadWrites.from_ast(node.value).reads) - _MODULE_NAMES
+                assignments.append((targets, reads))
+    changed = True
+    while changed:
+        changed = False
+        for targets, reads in assignments:
+            if targets & names and not reads <= names:
+                names |= reads
+                changed = True
+    return names
+
+
+def _pure_global_load_tensor(value: ast.expr) -> str | None:
+    """The tensor a ``(<name>.iterator + <offset>).load()`` expression reads."""
+    if not (
+        isinstance(value, ast.Call)
+        and not value.args
+        and not value.keywords
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "load"
+    ):
+        return None
+    tensors = {
+        node.value.id
+        for node in ast.walk(value.func.value)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "iterator"
+        and isinstance(node.value, ast.Name)
+    }
+    if len(tensors) != 1:
+        return None
+    for node in ast.walk(value.func.value):
+        # Only address arithmetic: another call (a load, a reduction, a
+        # shuffle) would make the expression impure.
+        if isinstance(node, ast.Call) and not (
+            isinstance(node.func, ast.Name)
+            or (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "cutlass"
+            )
+        ):
+            return None
+    return next(iter(tensors))
+
+
+def _hoist_invariant_epilogue_loads(body: list[ast.stmt]) -> None:
+    """Issue a loop-invariant global load of a read-only tensor ahead of the loop.
+
+    The collective sites leave the scalar epilogue (and its row traversal) in
+    place, so an epilogue operand such as a per-column bias is loaded only
+    after the whole operand pipeline and the MMAs have drained: a second
+    DRAM round trip in series with the first.  A load whose address reads
+    nothing the loop writes (not the loop variable, not a stage index, not
+    the accumulator) and whose tensor the kernel never stores to is moved in
+    front of the outermost loop it is invariant to, so its latency overlaps
+    the operand loads.  Loads under a condition stay where they are (the
+    guard may be what keeps the address in bounds), and so do loads whose
+    address reads anything the loop's bound depends on (a loop with no trips
+    must not read an address only its bound keeps valid).
+    """
+    stored = _stored_tensor_names(body)
+
+    def nested_lists(statement: ast.stmt) -> list[list[ast.stmt]]:
+        lists: list[list[ast.stmt]] = []
+        for field in ("body", "orelse", "finalbody"):
+            inner = getattr(statement, field, None)
+            if isinstance(inner, list) and inner and isinstance(inner[0], ast.stmt):
+                lists.append(cast("list[ast.stmt]", inner))
+        return lists
+
+    def hoist(statements: list[ast.stmt]) -> bool:
+        changed = False
+        index = 0
+        while index < len(statements):
+            statement = statements[index]
+            if isinstance(statement, ast.For):
+                moved = _invariant_loads_of_loop(
+                    statement, stored, bound_names=_loop_bound_names(statement, body)
+                )
+                if moved:
+                    statements[index:index] = moved
+                    index += len(moved)
+                    changed = True
+            for inner in nested_lists(statement):
+                changed |= hoist(inner)
+            index += 1
+        return changed
+
+    while hoist(body):
+        pass
+
+
+def _invariant_loads_of_loop(
+    loop: ast.For, stored: set[str], *, bound_names: set[str] | None = None
+) -> list[ast.stmt]:
+    """Remove and return the hoistable pure loads nested under ``loop``."""
+    written = set(ReadWrites.from_ast(loop).writes)
+    written |= {node.id for node in ast.walk(loop.target) if isinstance(node, ast.Name)}
+    if bound_names is None:
+        bound_names = {
+            node.id for node in ast.walk(loop.iter) if isinstance(node, ast.Name)
+        }
+    written |= bound_names
+    moved: list[ast.stmt] = []
+
+    def visit(statements: list[ast.stmt]) -> None:
+        index = 0
+        while index < len(statements):
+            statement = statements[index]
+            if (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                tensor = _pure_global_load_tensor(statement.value)
+                reads = set(ReadWrites.from_ast(statement.value).reads)
+                if (
+                    tensor is not None
+                    and tensor not in stored
+                    and not (reads & written)
+                    and statement.targets[0].id in written
+                    and sum(
+                        1
+                        for node in ast.walk(loop)
+                        if isinstance(node, ast.Name)
+                        and isinstance(node.ctx, ast.Store)
+                        and node.id == statement.targets[0].id
+                    )
+                    == 1
+                ):
+                    moved.append(statement)
+                    del statements[index]
+                    continue
+            if isinstance(statement, ast.For):
+                # Only straight-line nesting: a load under an ``if`` stays.
+                visit(statement.body)
+            index += 1
+
+    visit(loop.body)
+    return moved
 
 
 def _remove_dead_staged_operands(
@@ -2018,6 +2254,31 @@ def _lower_site(
 {prefix}_bp = cute.arch.alloc_smem({dtype}, {bn * bk * stages}, alignment=1024)
 """
     )
+    # Asynchronous FP32 staging is a bit copy. The warp MMA reads those raw
+    # FP32 bytes straight into FP32 fragments and rounds each value to TF32 in
+    # registers (cvt.rna.tf32.f32 yields the b32 operand register the TF32
+    # fragment holds), so the shared ring never needs a rounding pass or the
+    # barriers that pass would add. The native (tcgen05) collective reads its
+    # operands from shared memory and keeps the in-place rounding below.
+    raw_staged = tuple(
+        native is None and tf32 and plan is not None for plan in copy_plans
+    )
+    operand_views = ""
+    operand_copy_dtype = [dtype, dtype]
+    fragment_sources = [f"{prefix}_ra", f"{prefix}_rb"]
+    for operand_index, operand in enumerate(("a", "b")):
+        if not raw_staged[operand_index]:
+            continue
+        operand_copy_dtype[operand_index] = "cutlass.Float32"
+        fragment_sources[operand_index] = f"{prefix}_r{operand}_raw"
+        operand_views += f"""
+{prefix}_{operand}_raw = cute.make_tensor(cute.recast_ptr({prefix}_{operand}p, {prefix}_{operand}s, dtype=cutlass.Float32), {prefix}_{operand}l.outer)
+{prefix}_r{operand}_raw = cute.make_fragment_like({prefix}_r{operand}, cutlass.Float32)
+"""
+    partition_sources = [
+        f"{prefix}_{operand}_raw" if raw_staged[index] else f"{prefix}_{operand}"
+        for index, operand in enumerate(("a", "b"))
+    ]
     setup = _statements(f"""
 {tid} = {thread_index}
 {operand_pointers}
@@ -2029,14 +2290,15 @@ def _lower_site(
 {prefix}_acc = cute.make_rmem_tensor({prefix}_mma.partition_shape_C(({bm}, {bn})), cutlass.Float32)
 {prefix}_ra = {prefix}_thr.make_fragment_A({prefix}_thr.partition_shape_A(({bm}, {mma_k})))
 {prefix}_rb = {prefix}_thr.make_fragment_B({prefix}_thr.partition_shape_B(({bn}, {mma_k})))
-{prefix}_ca = cute.make_tiled_copy_A(cute.make_copy_atom({copy_a}, {dtype}{copy_options}), {prefix}_mma)
-{prefix}_cb = cute.make_tiled_copy_B(cute.make_copy_atom({copy_b}, {dtype}{copy_options}), {prefix}_mma)
+{operand_views}
+{prefix}_ca = cute.make_tiled_copy_A(cute.make_copy_atom({copy_a}, {operand_copy_dtype[0]}{copy_options}), {prefix}_mma)
+{prefix}_cb = cute.make_tiled_copy_B(cute.make_copy_atom({copy_b}, {operand_copy_dtype[1]}{copy_options}), {prefix}_mma)
 {prefix}_tca = {prefix}_ca.get_slice({tid})
 {prefix}_tcb = {prefix}_cb.get_slice({tid})
-{prefix}_pa = {prefix}_tca.partition_S({prefix}_a)
-{prefix}_pb = {prefix}_tcb.partition_S({prefix}_b)
-{prefix}_da = {prefix}_tca.retile({prefix}_ra)
-{prefix}_db = {prefix}_tcb.retile({prefix}_rb)
+{prefix}_pa = {prefix}_tca.partition_S({partition_sources[0]})
+{prefix}_pb = {prefix}_tcb.partition_S({partition_sources[1]})
+{prefix}_da = {prefix}_tca.retile({fragment_sources[0]})
+{prefix}_db = {prefix}_tcb.retile({fragment_sources[1]})
 """)
     if native is not None:
         setup = native.setup(thread_index)
@@ -2316,18 +2578,18 @@ for {prefix}_bi in cutlass.range({(bn * physical_bk + 127) // 128}, unroll=1):
                 right=ast.Constant(value=plan.width),
             )
             copy_destination = tensor
-            if dtype == "cutlass.TFloat32":
+            if dtype == "cutlass.TFloat32" and native is None:
+                # The warp MMA partitions this FP32 view directly (see setup)
+                # and rounds in registers; the ring holds the original bytes.
+                copy_destination = f"{tensor}_raw"
+            elif dtype == "cutlass.TFloat32":
                 # cp.async is a bit copy. Load the original FP32 bytes into a
                 # matching shared view, then round each value exactly once
-                # before exposing that buffer to TF32 compute. Both the native
-                # and warp tensors carry their swizzle on the shared pointer.
+                # before exposing that buffer to TF32 compute. The native
+                # tensors carry their swizzle on the shared pointer.
                 operand = "a" if tensor == f"{prefix}_a" else "b"
                 copy_destination = f"{tensor}_raw"
-                byte_swizzle = (
-                    f"{prefix}_{operand}l.inner"
-                    if native is not None
-                    else f"{prefix}_{operand}s"
-                )
+                byte_swizzle = f"{prefix}_{operand}l.inner"
                 raw_view = f"cute.make_tensor(cute.recast_ptr({prefix}_{operand}p, {byte_swizzle}, dtype=cutlass.Float32), {prefix}_{operand}l.outer)"
                 setup.extend(_statements(f"{copy_destination} = {raw_view}"))
                 rounding_slot = fresh("tf32_round_slot")
@@ -2447,27 +2709,31 @@ for {rounding_slot} in cutlass.range({elements // 128}, unroll=1):
         else f"cutlass.range({bk // mma_k}, unroll=1)"
     )
     stage_index = f", {prefix}_stage_read" if stages > 1 else ""
+    register_rounding = "".join(
+        f"""
+    for {prefix}_{operand}e in cutlass.range_constexpr(cute.size({prefix}_r{operand}_raw)):
+        {prefix}_r{operand}[{prefix}_{operand}e] = cutlass.Int32(cute.arch.cvt_f32_tf32({prefix}_r{operand}_raw[{prefix}_{operand}e]))"""
+        for operand, staged in zip(("a", "b"), raw_staged, strict=True)
+        if staged
+    )
+    mma_loop = _statements(f"""
+for {prefix}_ki in {mma_range}:
+    cute.copy({prefix}_ca, {prefix}_pa[None, None, {prefix}_ki{stage_index}], {prefix}_da[None, None, 0])
+    cute.copy({prefix}_cb, {prefix}_pb[None, None, {prefix}_ki{stage_index}], {prefix}_db[None, None, 0]){register_rounding}
+    cute.gemm({prefix}_mma, {prefix}_acc, {prefix}_ra[None, None, 0], {prefix}_rb[None, None, 0], {prefix}_acc)
+""")
+    # The staged ring owns its barriers (one per K step); the single-stage
+    # body publishes the stage before the MMA and protects it after.
     compute = (
         native.compute(ast.Name(id=site.k_offset, ctx=ast.Load()), k_start)
         if native is not None
-        else _statements(f"""
-cute.arch.sync_threads()
-for {prefix}_ki in {mma_range}:
-    cute.copy({prefix}_ca, {prefix}_pa[None, None, {prefix}_ki{stage_index}], {prefix}_da[None, None, 0])
-    cute.copy({prefix}_cb, {prefix}_pb[None, None, {prefix}_ki{stage_index}], {prefix}_db[None, None, 0])
-    cute.gemm({prefix}_mma, {prefix}_acc, {prefix}_ra[None, None, 0], {prefix}_rb[None, None, 0], {prefix}_acc)
-cute.arch.sync_threads()
-""")
-    )
-    if stages > 1 and tf32_rounding:
-        # Round only the waited read stage after publishing its async copies.
-        # The original leading barrier then publishes the rounded values.
-        compute = [
+        else [
             *_statements("cute.arch.sync_threads()"),
-            *tf32_rounding,
-            *compute,
+            *mma_loop,
+            *_statements("cute.arch.sync_threads()"),
         ]
-        tf32_rounding = []
+    )
+    assert not (stages > 1 and tf32_rounding)
     reduction_body = [
         a_copy,
         *a_publish,
@@ -2500,7 +2766,7 @@ cute.arch.sync_threads()
         pipeline_collective_loop(
             collective_k,
             [a_copy, b_copy],
-            compute,
+            mma_loop,
             prefix=prefix,
             start=k_start,
             stop=k_stop,
@@ -2644,6 +2910,7 @@ def lower_collective_matmul(
         )
         lowered_sites.append((site, loop, tid, shared_result))
     _remove_dead_staged_operands(body, df)
+    _hoist_invariant_epilogue_loads(body)
     if df.config.get("cute_collective_epilogue", "scalar") != "scalar":
         from .collective_vector_epilogue import vectorize_collective_store_epilogues
 

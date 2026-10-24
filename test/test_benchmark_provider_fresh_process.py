@@ -50,6 +50,7 @@ class TestFreshFinalistProcess(unittest.TestCase):
             provider._autotune_metrics = AutotuneMetrics()
             provider._precompile_args_path = str(args_path)
             provider._subprocess_wrapper_unloadable = False
+            provider.mutated_arg_indices = []
             provider._benchmark_worker = None
             workers: list[BenchmarkWorker] = []
 
