@@ -5699,6 +5699,18 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             )
         )
         seed_facts = analysis.seed_facts
+        # The register-MMA family on the dense row union (one CTA per tile of
+        # the packed rows, membership-predicated stores): admitted on the
+        # first binding's hints, specialized under guards at codegen.
+        spec._cute_tcgen05_config.register_grouped_row_union_warp_mma(
+            env,
+            groups=seed_facts.groups_hint,
+            m=seed_facts.packed_m_hint,
+            n=seed_facts.n_hint,
+            k=seed_facts.k_hint,
+            dtype=fact.lhs_dtype,
+            b_major="row" if seed_facts.b_major == "n" else "col",
+        )
         spec._cute_tcgen05_config.grouped_device_worklist_supported = (
             seed_facts.device_split_sizes
         )
