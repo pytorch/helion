@@ -140,9 +140,12 @@ class _AddInPlace:
 
 @dataclasses.dataclass
 class _ReturnValue:
+    """Compiled-function stand-in: the job calls it once on the kernel's
+    arguments before the (mocked) timers."""
+
     value: object
 
-    def __call__(self) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         return self.value
 
 
@@ -445,6 +448,43 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         wall_clock_bench.assert_called_once()
         self.assertIsNone(wall_clock_bench.call_args.kwargs["fixed_repetitions"])
         self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], False)
+
+    def test_benchmark_job_warms_the_arguments_device(self) -> None:
+        # The worker warms the current device before every job; a kernel
+        # whose arguments live on another device gets that one warmed too.
+        fn = _ReturnValue(torch.empty(()))
+        args = (3, torch.empty(1, device=torch.device("meta")), torch.ones(1))
+        with (
+            patch("helion.autotuner.benchmark_job._load_compiled_fn", return_value=fn),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=args,
+            ),
+            patch("helion.autotuner.benchmark_job.do_bench_generic", return_value=1.0),
+            patch("helion.autotuner.benchmark_job.steady_graph_dispatch") as warmup,
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=True,
+            )()
+        # No CUDA tensor among the arguments: the current device.
+        warmup.assert_called_once_with(device=None)
+        from helion.autotuner.benchmark_job import _cuda_device_of
+
+        self.assertEqual(
+            _cuda_device_of(
+                (3, torch.empty(1, device=torch.device("meta")), [{"k": "cpu"}])
+            ),
+            None,
+        )
+        cuda_like = Mock(spec=torch.Tensor)
+        cuda_like.device = torch.device("cuda", 1)
+        with patch(
+            "helion.autotuner.benchmark_job.tree_flatten",
+            return_value=([3, cuda_like], None),
+        ):
+            self.assertEqual(_cuda_device_of(()), torch.device("cuda", 1))
 
     def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
         invocation_count = 0
