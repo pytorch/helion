@@ -32,6 +32,7 @@ from ..autotuner.config_spec import RootGridFact
 from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
 from ..language._decorators import is_api_func
+from ..language.reduce_ops import _reduce
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
@@ -39,6 +40,8 @@ from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .inductor_lowering import custom_reduction_sources
+from .inductor_lowering import reduction_block_id
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
 from .variable_origin import GridOrigin
@@ -1121,6 +1124,7 @@ class GraphAnalysis:
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
     memory_tiles: tuple[tuple[torch.fx.Node, LiveTile], ...]
+    custom_reduction_block_ids: frozenset[int] = frozenset()
     _memory_tiles_by_loop_axes: dict[frozenset[int], tuple[LiveTile, ...]] = (
         dataclasses.field(
             default_factory=dict,
@@ -1139,7 +1143,6 @@ class GraphAnalysis:
         resolve_placeholder: Callable[[torch.fx.Node], torch.fx.Node],
     ) -> GraphAnalysis:
         from ..language import memory_ops
-        from .inductor_lowering import ReductionLowering
 
         graph = graph_info.graph
         nodes = tuple(graph.nodes)
@@ -1151,6 +1154,9 @@ class GraphAnalysis:
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
+        custom_reduction_steps: list[tuple[int, tuple[LiveTile, ...]]] = []
+        custom_reduction_block_ids: set[int] = set()
+        native_reduction_block_ids: set[int] = set()
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
         operand_positions = matmul_operand_positions()
         promoted_lhs_nodes: set[torch.fx.Node] = set()
@@ -1169,6 +1175,7 @@ class GraphAnalysis:
             ):
                 promoted_lhs_nodes.add(lhs)
 
+        rolled_ids = set(env.config_spec.reduction_loops.valid_block_ids())
         for index, node in enumerate(nodes):
             for input_node in node.all_input_nodes:
                 last_use[input_node] = index
@@ -1191,14 +1198,32 @@ class GraphAnalysis:
             if node.op == "call_function" and node.target in dot_targets:
                 dot_nodes.append(node)
 
-            lowering = node.meta.get("lowering")
-            if isinstance(lowering, ReductionLowering):
-                block_id = getattr(lowering, "block_index", None)
-                if isinstance(block_id, int):
-                    reduction_axis_by_node_id[id(node)] = block_id
-                    if block_id not in seen_reductions:
-                        seen_reductions.add(block_id)
-                        reduction_occurrences.append(block_id)
+            block_id = reduction_block_id(node)
+            if block_id is not None:
+                reduction_axis_by_node_id[id(node)] = block_id
+                if node.target is _reduce:
+                    custom_reduction_block_ids.add(block_id)
+                else:
+                    native_reduction_block_ids.add(block_id)
+                if block_id not in seen_reductions:
+                    seen_reductions.add(block_id)
+                    reduction_occurrences.append(block_id)
+                if node.target is _reduce and block_id in rolled_ids:
+                    sources = custom_reduction_sources(node)
+                    # Each payload needs its own carry, even when inputs alias.
+                    custom_reduction_steps.append(
+                        (
+                            index,
+                            tuple(
+                                tile_details[source]._replace(
+                                    kind="carry",
+                                    promoted_lhs=False,
+                                    carried_reduction_block_id=block_id,
+                                )
+                                for source in sources
+                            ),
+                        )
+                    )
 
             if node.op != "call_function":
                 continue
@@ -1222,11 +1247,19 @@ class GraphAnalysis:
                 memory_tiles.append((node, memory_tile))
 
         live_tile_steps: list[tuple[LiveTile, ...]] = []
-        seen_steps: set[frozenset[int]] = set()
-        for live in _live_node_steps(nodes, tile_details, last_use):
+        seen_steps: set[tuple[frozenset[int], bool]] = set()
+        carried_tiles = tuple(
+            tile for _, tiles in custom_reduction_steps for tile in tiles
+        )
+        carry_end = max((end for end, _ in custom_reduction_steps), default=-1)
+        # Fusion can put these reductions in one loop: every carry survives
+        # the next iteration's producers, including those before its own op.
+        # The group dies before the epilogue; persistent candidates omit it.
+        for index, live in enumerate(_live_node_steps(nodes, tile_details, last_use)):
             if live:
-                step_key = frozenset(id(value) for value in live)
-                step = tuple(tile_details[value] for value in live)
+                carries = carried_tiles if index <= carry_end else ()
+                step_key = (frozenset(id(value) for value in live), bool(carries))
+                step = tuple(tile_details[value] for value in live) + carries
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)
@@ -1273,6 +1306,9 @@ class GraphAnalysis:
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
             memory_tiles=tuple(memory_tiles),
+            custom_reduction_block_ids=frozenset(
+                custom_reduction_block_ids - native_reduction_block_ids
+            ),
         )
 
     def reaches_output(self, node: torch.fx.Node, limit: int = 64) -> bool:
@@ -1906,7 +1942,6 @@ class DeviceIRAnalysis:
         from ..language.inline_asm_ops import inline_asm_elementwise
         from ..language.inline_triton_ops import inline_triton
         from ..language.inline_triton_ops import triton_kernel
-        from ..language.reduce_ops import _reduce
         from ..language.scan_ops import _associative_scan
 
         reduction_fact = spec.reduction_kernel_fact

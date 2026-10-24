@@ -85,8 +85,8 @@ def test_packet_seed_prefix_and_full_population(length, dtype):
         assert 1 + len(seeds) < full.initial_population
         population = generation.random_population_flat(full.initial_population)
         assert len(population) == full.initial_population
-        assert population[0] == default
-        assert population[1 : len(seeds) + 1] == [flat for flat, _ in seeds]
+        assert population[: len(seeds)] == [flat for flat, _ in seeds]
+        assert population[len(seeds)] == default
         assert any(config.config["cute_rng_packet"] for _, config in seeds)
         # The stored source family's prefetch/bounds alternatives survive the
         # seed expansion; no packet candidate silently changes those controls.

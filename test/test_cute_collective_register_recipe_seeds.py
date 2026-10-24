@@ -107,4 +107,4 @@ def test_register_recipe_seeds_preserve_explicit_user_priority(count: int) -> No
     with bound.env:
         generation = bound.config_spec.create_config_generation()
         _flat, normalized = generation.canonicalize_flat(generation.flatten(explicit))
-    assert population[1] == normalized
+    assert population[0] == normalized

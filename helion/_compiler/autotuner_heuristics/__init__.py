@@ -420,7 +420,7 @@ def compiler_seed_configs(
                 continue
 
             # A heuristic may plant a RANKED multi-seed list (get_seed_configs);
-            # the single get_seed_config is the primary (== the list's [0]). The
+            # the first entry is the primary seed. The
             # default base hook returns None, so existing single-seed heuristics
             # keep their exact behavior.
             ranked = heuristic.get_seed_configs(env, device_ir)

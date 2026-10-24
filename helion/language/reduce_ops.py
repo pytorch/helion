@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import itertools
-import operator
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import cast
@@ -15,6 +14,8 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .._compiler.helper_function import CombineFunction
     from .._compiler.helper_function import CombineFunctionBasic
     from .._compiler.helper_function import CombineFunctionTuple
@@ -64,7 +65,7 @@ def reduce(
         combine_fn: A binary function that combines two elements element-wise.
                    Must be associative and commutative for correct results.
                    Can be tensor->tensor or tuple->tuple function.
-        input_tensor: Input tensor or tuple of tensors to reduce
+        input_tensor: Input tensor or nonempty tuple of tensors with matching shapes
         dim: The dimension along which to reduce (None for all dimensions)
         other: Value for masked/padded elements (default: 0)
                For tuple inputs, can be tuple of values with same length
@@ -80,8 +81,17 @@ def reduce(
         - combine_fn must be associative and commutative
         - For standard reductions, use PyTorch functions directly (faster)
         - Masked elements use the 'other' value during reduction
+        - Use the combine function's identity for 'other' when padding should
+          not contribute to the result; non-identity padding is preserved
     """
     raise exc.NotInsideKernel
+
+
+def _check_tuple_reduction_ranks(tensors: Sequence[torch.Tensor]) -> None:
+    if not tensors:
+        raise ValueError("reduce tuple inputs must not be empty")
+    if any(tensor.ndim != tensors[0].ndim for tensor in tensors):
+        raise ValueError("reduce tuple inputs must have the same rank")
 
 
 @_decorators.register_fake(reduce)
@@ -94,6 +104,7 @@ def _(
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Fake implementation that returns fake tensors with reduced shape."""
     if isinstance(input_tensor, (tuple, list)):
+        _check_tuple_reduction_ranks(input_tensor)
         return tuple(_fake_reduce_tensor(t, dim, keep_dims) for t in input_tensor)
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
 
@@ -113,6 +124,8 @@ def _(
     combine_fn = extract_helper_function(combine_fn)
 
     is_tuple = isinstance(input_tensor, tuple)
+    if is_tuple:
+        _check_tuple_reduction_ranks(input_tensor)
 
     # Normalize inputs to always work with lists
     if not is_tuple:
@@ -289,8 +302,13 @@ def _(
         assert all(isinstance(t, torch.Tensor) for t in input_tensor), (
             "reduce input must be a tuple of tensors"
         )
+        _check_tuple_reduction_ranks(input_tensor)
     else:
         assert isinstance(input_tensor, torch.Tensor), "reduce input must be a tensor"
+
+    first_input = input_tensor[0] if is_tuple_input else input_tensor
+    if dim is None and first_input.ndim == 1:
+        dim = 0
 
     assert callable(combine_fn), "combine_fn must be callable"
     # Extract the function name before wrapping
@@ -374,7 +392,6 @@ def _(
 
     # Get the actual node from the proxy and apply masking
     actual_node = proxy_out.node
-
     if is_tuple_input and isinstance(other, (tuple, list)):
         # For tuple inputs with tuple others, apply masking to each tensor separately
         input_arg = actual_node.args[1]
@@ -401,21 +418,14 @@ def _(
 
     # Create output tensors with reduced shape
     if is_tuple_input:
-        output_tensors = []
         assert isinstance(input_tensor, (tuple, list))
-        for i, tensor in enumerate(input_tensor):
-            reduced_tensor = _fake_reduce_tensor(tensor, dim, keep_dims)
-            element_proxy = tracer.create_proxy(
-                "call_function",
-                operator.getitem,
-                (proxy_out, i),
-                {},
-            )
-            proxy_tensor.track_tensor_tree(
-                reduced_tensor, element_proxy, constant=None, tracer=tracer
-            )
-            output_tensors.append(reduced_tensor)
-        return tuple(output_tensors)
+        output_tensors = tuple(
+            _fake_reduce_tensor(tensor, dim, keep_dims) for tensor in input_tensor
+        )
+        proxy_tensor.track_tensor_tree(
+            output_tensors, proxy_out, constant=None, tracer=tracer
+        )
+        return output_tensors
 
     output_tensor = _fake_reduce_tensor(input_tensor, dim, keep_dims)
     proxy_tensor.track_tensor_tree(

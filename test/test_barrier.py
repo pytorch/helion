@@ -261,6 +261,9 @@ class TestBarrier(RefEagerTestBase, TestCase):
             def has_pinned_rdim(self) -> bool:
                 return False
 
+            def is_reduction(self, node: torch.fx.Node) -> bool:
+                return False
+
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
                 reduction_graph = torch.fx.Graph()
                 reduction_graph.output(())

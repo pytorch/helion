@@ -99,8 +99,9 @@ def _population(
                 search.config_gen.unflatten(search.config_gen.flatten(config))
                 for config in configs
             ] == configs
+            first = bound.config_spec.compiler_seed_configs[0]
             assert configs[0] == search.config_gen.unflatten(
-                search.config_gen.default_flat()
+                search.config_gen.flatten(first)
             )
             return configs
     finally:

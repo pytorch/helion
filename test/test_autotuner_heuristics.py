@@ -76,6 +76,7 @@ from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeur
 from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
+from helion._compiler.autotuner_heuristics.triton import _ReductionCandidate
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import _symint_free_symbols
@@ -284,6 +285,7 @@ from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
+from helion._testing import code_and_output
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
@@ -5343,6 +5345,70 @@ class TestTritonReductionHeuristicUnit(TestCase):
         )
         return env
 
+    def test_custom_default_preserves_native_axis_ownership(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=65536)
+        fact = spec.reduction_kernel_fact
+        assert fact is not None
+        native = fact.reductions[0]
+        custom = native._replace(graph_id=1, is_custom=True)
+        for reductions, expected in (
+            ((native,), 4096),
+            ((custom,), None),
+            ((native, custom), 4096),
+            ((custom, native), 4096),
+        ):
+            with self.subTest(reductions=reductions):
+                spec.reduction_kernel_fact = fact._replace(reductions=reductions)
+                self.assertEqual(
+                    spec.has_native_reductions, any(not r.is_custom for r in reductions)
+                )
+                self.assertEqual(
+                    spec.custom_only_reduction_block_ids,
+                    {1} if expected is None else set(),
+                )
+                self.assertEqual(
+                    spec.autotune_reference_config().reduction_loops, [expected]
+                )
+
+    def test_custom_carry_is_charged_only_for_rolled_candidates(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=1024)
+        fact = spec.reduction_kernel_fact
+        assert fact is not None
+        payload = LiveTile((0, 1), (None, None), 4, "load")
+        carry = payload._replace(kind="carry", carried_reduction_block_id=1)
+        spec.reduction_kernel_fact = fact._replace(live_tile_steps=((payload, carry),))
+        env = self._reduction_env(spec)
+        for width, expected in ((1024, 4096), (256, 2048)):
+            with (
+                self.subTest(width=width),
+                patch.object(
+                    TritonReductionHeuristic,
+                    "_reduction_candidate_block_map",
+                    return_value={0: 1, 1: width},
+                ),
+            ):
+                self.assertEqual(
+                    TritonReductionHeuristic._reduction_peak_live_bytes(
+                        env, _ReductionCandidate((1,), ((1, width),))
+                    ),
+                    expected,
+                )
+
+    def test_ranked_seeds_precede_reference_without_custom_reductions(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=1024)
+        spec.compiler_seed_configs = [helion.Config(block_sizes=[1], num_warps=8)]
+        generation = spec.create_config_generation()
+        pairs = generation.seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 1)
+        seed, _ = pairs[0]
+        reference = generation.default_flat()
+        self.assertNotEqual(seed, reference)
+        self.assertEqual(generation.random_population_flat(0), [reference])
+        self.assertEqual(generation.random_population_flat(1), [seed])
+        self.assertEqual(generation.random_population_flat(2), [seed, reference])
+        spec.compiler_seed_configs = []
+        self.assertEqual(generation.random_population_flat(1), [reference])
+
     def test_seed_is_persistent_with_reduction_warps(self) -> None:
         # The unified allocator may batch rows when live bytes and launch supply
         # permit it. The reduction remains persistent and its 1024-wide lane work
@@ -9899,7 +9965,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
 
         configs = config_gen.random_population(7)
-        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
+        self.assertEqual(
+            configs[: len(seed_pairs)], [seed for _flat, seed in seed_pairs]
+        )
+        self.assertEqual(configs[-1].config["tcgen05_cluster_m"], 1)
         cluster_m2_population = [
             config.config
             for config in configs
@@ -11400,6 +11469,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
 
 
+def _custom_pair_sum(
+    left: tuple[torch.Tensor, torch.Tensor],
+    right: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return left[0] + right[0], left[1] + right[1]
+
+
 class TestTritonReductionHeuristic(TestCase):
     """Lock representative liveness-based reduction seed decisions on both tracks:
 
@@ -11409,6 +11485,117 @@ class TestTritonReductionHeuristic(TestCase):
     - kl_div wide (rnumel=131072): the user-tiled path resolves the complete live
       timeline and caps R_BLOCK instead of going full-N, with M at floor 1.
     """
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Checks the promoted compiler reduction seed")
+    def test_narrow_custom_grid_reduction_default(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def reduce_grid(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.grid(x.size(0)):
+                total, _ = hl.reduce(_custom_pair_sum, (x[row, :], x[row, :]), dim=0)
+                out[row] = total
+            return out
+
+        x = torch.randn(3, 200, device=DEVICE)
+        with patch("helion._hardware.get_hardware_info", return_value=A100_HARDWARE):
+            bound = reduce_grid.bind((x,))
+            config = bound.config_spec.default_config()
+            self.assertEqual(config.block_sizes, [])
+            self.assertEqual(config.reduction_loops, [None])
+            _, output = code_and_output(reduce_grid, (x,))
+        torch.testing.assert_close(output, x.sum(dim=1))
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Checks compiler reduction facts and seeds")
+    def test_custom_tuple_reduction_facts_and_schedule_seeds(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def custom_rows(
+            x: torch.Tensor, normalize: hl.constexpr, integer: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                second = values.to(torch.int64) if integer else values
+                total, second_total = hl.reduce(
+                    _custom_pair_sum,
+                    (values, second),
+                    dim=-1,
+                    other=(0, 0),
+                    keep_dims=True,
+                )
+                if normalize:
+                    out[row, :] = values / total + second_total
+                else:
+                    out[row, :] = total + second_total
+            return out
+
+        x = torch.randn((5, 65536), device=DEVICE)
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            for normalize, integer in itertools.product((False, True), repeat=2):
+                with self.subTest(normalize=normalize, integer=integer):
+                    bound = custom_rows.bind((x, normalize, integer))
+                    fact = bound.config_spec.reduction_kernel_fact
+                    self.assertIsNotNone(fact)
+                    self.assertEqual(len(fact.reductions), 1)
+                    reduction = fact.reductions[0]
+                    self.assertEqual(reduction.row_reread, normalize)
+                    self.assertEqual(reduction.input_load_itemsize, 4)
+                    self.assertTrue(reduction.is_custom)
+                    self.assertTrue(
+                        any(
+                            any(tile.kind not in ("carry", "global") for tile in step)
+                            and len(carries := [t for t in step if t.kind == "carry"])
+                            == 2
+                            and [tile.itemsize for tile in carries]
+                            == [4, 8 if integer else 4]
+                            and all(
+                                reduction.block_id in tile.dim_block_ids
+                                for tile in carries
+                            )
+                            for step in fact.live_tile_steps
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            tile.carried_reduction_block_id is None
+                            for tile in fact.live_tile_steps[-1]
+                        )
+                    )
+                    seeds = bound.config_spec.compiler_seed_configs
+                    self.assertTrue(any(c.reduction_loops == [None] for c in seeds))
+                    self.assertTrue(any(c.reduction_loops != [None] for c in seeds))
+                    self.assertEqual(
+                        bound.config_spec.default_config().reduction_loops, [None]
+                    )
+                    self.assertEqual(
+                        bound.config_spec.autotune_reference_config().reduction_loops,
+                        [None],
+                    )
+                    generation = bound.config_spec.create_config_generation()
+                    tiny_population = generation.random_population_flat(1)
+                    self.assertEqual(
+                        generation.unflatten(tiny_population[0]),
+                        generation.unflatten(
+                            generation.flatten(bound.config_spec.default_config())
+                        ),
+                    )
+                    population = generation.random_population_flat(len(seeds) + 1)
+                    self.assertEqual(
+                        generation.unflatten(population[0]),
+                        generation.unflatten(generation.flatten(seeds[0])),
+                    )
+
+        with patch("helion._hardware.get_hardware_info", return_value=MI350_HARDWARE):
+            bound = custom_rows.bind((x, False, True))
+            self.assertEqual(bound.config_spec.default_config().reduction_loops, [None])
+            bound.config_spec.block_sizes[0].min_size = 4
+            seed = TritonNarrowReductionHeuristic.get_seed_config(
+                bound.env, bound.host_function.device_ir
+            )
+            assert seed is not None
+            self.assertEqual(seed.block_sizes, [4])
+            bound.config_spec.normalize(seed.config)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")

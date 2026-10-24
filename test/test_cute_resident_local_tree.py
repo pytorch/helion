@@ -149,8 +149,8 @@ def test_true_seeds_survive_the_actual_full_population(kind, columns):
         true = [(flat, config) for flat, config in pairs if config.config.get(KEY)]
         assert true
         population = generation.random_population_flat(100)
-        assert population[0] == generation.default_flat()
-        assert population[1 : len(pairs) + 1] == [flat for flat, config in pairs]
+        assert population[: len(pairs)] == [flat for flat, config in pairs]
+        assert population[len(pairs)] == generation.default_flat()
         for flat, config in true:
             assert generation.unflatten(flat) == config
             assert flat in population
