@@ -2348,7 +2348,8 @@ class TestBudgetedInitialPopulation(TestCase):
     compile returns at once and every search here runs in well under a
     second.  Each config's timing is a deterministic function of the config,
     so two searches with one seed walk the same trajectory; the rebenchmark
-    passes are disabled so the stubbed timings are the ones the search ranks.
+    passes and the backend's finalist preference are disabled so the stubbed
+    timings are the ones the search ranks.
     """
 
     COMPILE_SECONDS = 10.0
@@ -2434,6 +2435,16 @@ class TestBudgetedInitialPopulation(TestCase):
             ),
             patch.object(search, "benchmark_batch", benchmark_batch),
             patch.object(search, "rebenchmark", lambda *args, **kwargs: None),
+            # The stubbed timings land a few tenths of a percent apart as
+            # often as not, and the backend's preference among finalists it
+            # cannot tell apart (CuTe: the kernel that releases its
+            # programmatic dependents, within 0.5%) would then pick by knob
+            # rather than by the stubbed timing these tests rank by.
+            patch.object(
+                search,
+                "_prefer_backend_preference_within_tolerance",
+                lambda after, live: after,
+            ),
             patch.object(search, "log", log),
         ):
             best = search.autotune()

@@ -513,6 +513,16 @@ class ProgramIDs(abc.ABC):
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
 
+    def static_grid_size(self) -> int | None:
+        """The CTA count of the grid ``codegen_grid`` launches, when every
+        extent is static (``None`` otherwise).  The flat and xyz strategies
+        launch one CTA per program id; the wrappers and the persistent
+        strategies override this with what they actually launch."""
+        counts = [pid.static_num_pids() for pid in self.pid_info]
+        if None in counts:
+            return None
+        return math.prod(cast("list[int]", counts))
+
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
@@ -697,6 +707,18 @@ class ForEachProgramID(ProgramIDs):
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
         return _sum_pids(cdivs)
+
+    def static_grid_size(self) -> int | None:
+        """The launch is the persistent grid when the cases are persistent,
+        else one CTA per program id of every root (``codegen_grid``)."""
+        if not self.cases:
+            return None
+        if self.cases[0]._is_persistent():
+            return self.cases[0].static_grid_size()
+        sizes = [case.static_grid_size() for case in self.cases]
+        if None in sizes:
+            return None
+        return sum(cast("list[int]", sizes))
 
     def codegen(self, state: CodegenState) -> None:
         blocks = self._cdiv_sum(state, exclude_last=True)
@@ -980,6 +1002,10 @@ class WorklistProgramIDs(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         return expr_from_string(f"({self.upper_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        # The compact launcher overrides the grid with the traced work count.
+        return None
 
 
 class CuteProgramIDs(FlatProgramIDs):
@@ -1265,6 +1291,11 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         return self.parent_strategy.total_pids_expr(is_device=is_device)
 
+    def static_grid_size(self) -> int | None:
+        """Forward to parent strategy (the grouping reorders, never resizes)."""
+        assert self.parent_strategy is not None
+        return self.parent_strategy.static_grid_size()
+
 
 class PersistentProgramIDs(ProgramIDs):
     """Base class for persistent kernels that use num_sms grid size."""
@@ -1321,6 +1352,15 @@ class PersistentProgramIDs(ProgramIDs):
     def codegen_grid(self) -> ast.AST:
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)
         return expr_from_string(f"({self.grid_size_expr},)")
+
+    def static_grid_size(self) -> int | None:
+        """``_NUM_SM * num_sm_multiplier`` CTAs: the SM count the config spec
+        captured for the compile device (the same reserved-adjusted count the
+        host computes), ``None`` when it is unknown."""
+        num_sm = CompileEnvironment.current().config_spec.num_sm
+        if num_sm <= 1:
+            return None
+        return num_sm * self.num_sm_multiplier
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
         """Generate the preamble statements for persistent kernel setup."""
@@ -1503,6 +1543,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def __init__(self, *, is_blocked: bool) -> None:
         super().__init__(is_blocked=is_blocked)
+
+    def static_grid_size(self) -> int | None:
+        # ``codegen_grid`` launches ``min(work clusters, persistent cluster
+        # capacity)`` clusters, a host-side quantity.
+        return None
 
     def _tcgen05_plan(self) -> CuteTcgen05MatmulPlan | None:
         try:

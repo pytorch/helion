@@ -186,6 +186,49 @@ def test_persistent_kernel_with_a_scheduler_warp_waits_at_entry() -> None:
     _assert_entry_wait(body)
 
 
+def test_the_entry_wait_path_leaves_the_release_to_the_mma_warp() -> None:
+    # The generic ``cute_pdl`` path owns a release placement
+    # (``cute_pdl_release``); a tcgen05 kernel that gets the generic entry
+    # wait must not also get that release: its MMA warp releases the
+    # dependents after its last MMA, and an earlier one (``auto`` resolving
+    # to ``entry`` on this one-wave persistent grid, or an explicit
+    # placement) would make the dependents' CTAs resident during the GEMM,
+    # which the late placement exists to avoid.  Every placement renders
+    # the same kernel: one wait at the top, one release, the family's.
+    bound = _bind_gemm((1024, 1024, 1024), torch.float16)
+    sources: list[str] = []
+    for placement in (None, "auto", "entry", "exit", "none", "last_wave"):
+        config = _persistent_config(
+            cute_pdl=True,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            **({} if placement is None else {"cute_pdl_release": placement}),
+        )
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(config)
+        if normalized.config.get("tcgen05_strategy") != "role_local_with_scheduler":
+            pytest.skip("scheduler-warp strategy not admitted on this binding")
+        source = _source(bound, normalized)
+        body = _kernel_body(source)
+        assert body.count(WAIT) == 1
+        _assert_entry_wait(body)
+        assert body.count(RELEASE) == 1
+        statements = _body_statements(body)
+        wait_index = next(i for i, line in enumerate(statements) if WAIT in line)
+        release_index = next(i for i, line in enumerate(statements) if RELEASE in line)
+        # Not the generic entry release (the statement right after the wait)
+        # nor the generic exit release (a top-level last statement): the
+        # family's, under the MMA warp's role predicate.
+        assert release_index != wait_index + 1
+        release_line = statements[release_index]
+        assert len(release_line) - len(release_line.lstrip()) > len(
+            statements[wait_index]
+        ) - len(statements[wait_index].lstrip())
+        assert statements[release_index - 1].strip().startswith("if ")
+        sources.append(source)
+    assert len(set(sources)) == 1
+
+
 def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> None:
     # The CtaGroup.TWO path already waits in its TMA role and releases after
     # the MMAs (griddepcontrol is a no-op without the launch attribute): the

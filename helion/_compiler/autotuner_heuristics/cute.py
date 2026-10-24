@@ -3144,7 +3144,8 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
 
 
 def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
-    """``cute_pdl`` for the nested-row seeds where ``griddepcontrol`` exists.
+    """``cute_pdl`` (released at entry) for the nested-row seeds where
+    ``griddepcontrol`` exists.
 
     These kernels run a few microseconds per call in back-to-back streams;
     launching each as a programmatic dependent of the previous kernel overlaps
@@ -3152,7 +3153,14 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     kernel's tail: jagged_layer_norm on 16 rows x 32 features went from 2.17
     to 2.05 us per call (Triton's default 2.05) with nothing else changed.
     The kernel waits (``griddepcontrol.wait``) ahead of its first global
-    access, so the result is unchanged.
+    access, so the result is unchanged.  The kernel also releases its own
+    dependents (``cute_pdl_release``, left to its grid-aware default here:
+    right after the wait while the grid fits in one wave, from the last
+    wave's CTAs past it), which
+    is what lets the NEXT kernel of a sequence launch early too; a dependent
+    of a kernel that never releases starts later than a plain stream edge
+    would have launched it (mamba2_ssd s0 forward, 64-call graph: 9.92 us
+    per call unreleased, 9.50 without the knob, 9.37 released at entry).
     """
     capability = spec.target_device_capability
     if (
@@ -4025,7 +4033,8 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
                         ),
                         "cute_vloop_sink": True,
                         "cute_lane_unroll": 8,
-                        # The launch overlaps the output's zero fill.
+                        # The launch overlaps the output's zero fill (and the
+                        # default release lets the next kernel launch early).
                         "cute_pdl": True,
                     }
                 )
