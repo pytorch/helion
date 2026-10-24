@@ -9,8 +9,8 @@ import torch
 
 from test._cute_binding import _capture_collective_interleaving
 from test._cute_binding import _cpu_bind
-from test._cute_binding import _legacy_registered_seeds
 from test._cute_binding import _mock_cuda_unavailable
+from test._cute_binding import _uninterleaved_registered_seeds
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
@@ -104,7 +104,9 @@ def test_full_random_population_reaches_coupled_pipeline_chunk_geometries(
     partitioned_case: tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     bound, args = partitioned_case
-    legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
+    legacy = _initial_population(
+        bound, args, seeds=_uninterleaved_registered_seeds(bound)
+    )
     actual = _initial_population(bound, args)
     assert len(actual) == len(legacy)
     assert actual == _initial_population(bound, args)
@@ -135,7 +137,7 @@ def test_interleaving_preserves_the_full_seed_set_and_primary(
     partitioned_case: tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     bound, _args = partitioned_case
-    original = _legacy_registered_seeds(bound)
+    original = _uninterleaved_registered_seeds(bound)
     reordered = bound.config_spec.compiler_seed_configs
     assert len(original) == len(reordered)
     assert set(original) == set(reordered)
@@ -258,7 +260,7 @@ def test_no_config_owned_k_chunk_preserves_initial_population(
         autotune_effort="none",
     )
     bound = _cpu_bind(variant, args)
-    legacy_seeds = _legacy_registered_seeds(bound)
+    legacy_seeds = _uninterleaved_registered_seeds(bound)
     assert legacy_seeds == bound.config_spec.compiler_seed_configs
     assert _initial_population(bound, args, seeds=legacy_seeds) == _initial_population(
         bound, args

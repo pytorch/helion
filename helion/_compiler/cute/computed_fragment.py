@@ -5477,9 +5477,36 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             "shared producer caches require a known shared memory capacity"
         )
     if capacity and compiler.smem_bytes > capacity:
-        raise exc.InvalidConfig(
-            f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"
+        if (
+            local_required
+            or free_required
+            or fragment_schedule_required
+            or any(
+                node.target is _tracing_ops._while_loop
+                for info in graphs
+                for node in info.graph.nodes
+            )
+        ):
+            # These roots have no other owner: the config is invalid.
+            raise exc.InvalidConfig(
+                f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"
+            )
+        # The fragment program materializes every row of this root in shared
+        # memory, so a wide static axis can exceed the CTA capacity for every
+        # tile size (layer_norm backward at N=8192 needs 245 KB with one row).
+        # The implicit preference for this owner (captured reductions) is a
+        # performance choice; the ordinary scalar lowering owns such roots
+        # with lane/thread accumulation, so decline instead of failing the
+        # default and every other scalar-schedule config.  Nothing emitted
+        # above escaped the scratch ``body``: the compiler only allocated
+        # variable names and kernel tensor arguments.  A root only this owner
+        # can lower (repeated block ids, static matrices) makes the generic
+        # lowering refuse; GenerateAST reports that as this config failure.
+        cg.device_function.cute_state.fragment_capacity_decline = (
+            compiler.smem_bytes,
+            capacity,
         )
+        return False
     if published_scalars_required:
         from .published_scalars import PublishedScalarRequest
 

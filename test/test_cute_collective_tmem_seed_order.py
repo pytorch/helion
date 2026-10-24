@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
-from test._cute_binding import _legacy_registered_seeds as _shared_legacy
 from test._cute_binding import _mock_cuda_unavailable
+from test._cute_binding import _uninterleaved_registered_seeds as _shared_uninterleaved
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_collective_tmem_operand_codegen import _mamba_kernel
 from test.test_cute_collective_tmem_operand_codegen import _sizes
@@ -25,7 +25,9 @@ from helion.autotuner.pattern_search import PatternSearch
 
 pytestmark = skipUnlessBackends(["cute"])
 
-_legacy_registered_seeds = partial(_shared_legacy, require_no_parameters=True)
+_uninterleaved_registered_seeds = partial(
+    _shared_uninterleaved, require_no_parameters=True
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -108,7 +110,7 @@ def test_full_initial_population_reaches_complete_tmem_operand_schedule(
 ) -> None:
     args = tuple(torch.empty(size, dtype=dtype) for size in _sizes(shape))
     bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), args)
-    old_seeds = _legacy_registered_seeds(bound)
+    old_seeds = _uninterleaved_registered_seeds(bound)
     new_seeds = bound.config_spec.compiler_seed_configs
     assert old_seeds[0] == new_seeds[0]
     assert len(old_seeds) == len(new_seeds)
@@ -162,7 +164,7 @@ def test_unrelated_seed_configs_retain_their_exact_order(
     bound, _args = dependent_case
     seeds = [
         config
-        for config in _legacy_registered_seeds(bound)
+        for config in _uninterleaved_registered_seeds(bound)
         if not config.get("cute_collective_tmem_a", False)
     ]
     assert (

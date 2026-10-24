@@ -672,12 +672,14 @@ def test_admission_mirrors_the_detector_gates() -> None:
     )
 
 
-def test_fissioned_kernel_region_renders_the_family() -> None:
-    # bf16 x int16 at (128, 256, 128): ``cute_materialize_transformed_operands``
-    # fissions the kernel into an operand-materialization region and a plain
-    # bf16 GEMM region (three graphs).  The complete-root rule inspects the
-    # root that calls the K loop; the other region keeps its own lowering,
-    # so the family is admitted, seeded and renders the GEMM region.
+def test_cast_operand_kernel_stays_fused_and_converts_in_registers() -> None:
+    # bf16 x int16 at (128, 256, 128): the matmul reads ``w[k, n].to(bf16)``
+    # of an int16 tile.  TMA packets cannot carry that cast to the tensor
+    # core, so the tcgen05 family is withheld and the materialization pass
+    # keeps the single launch: the register-MMA family is admitted, offered
+    # alone, and converts the int16 packets in registers on the way to
+    # shared memory (eight words per 16-byte packet, every packet of a
+    # thread in flight before the first convert).
     import examples.bf16xint16_gemm as example
 
     bound = _bind(
@@ -687,12 +689,110 @@ def test_fissioned_kernel_region_renders_the_family() -> None:
     )
     with bound.env:
         spec = bound.config_spec
+        state = spec._cute_tcgen05_config
+        assert bound.env.cute_fission_plan is None
+        assert len(bound.host_function.device_ir.graphs) == 2
+        assert state.warp_mma_admitted and not state.tcgen05_family_admitted
+        search = state.optional_fragments(for_search=True)[FAMILY].choices
+        assert tuple(search) == (family.MATMUL_FAMILY_WARP_MMA,)
+        assert spec.default_config().config[FAMILY] == family.MATMUL_FAMILY_WARP_MMA
+        seeds = state._warp_mma_seed_configs()
+        assert seeds
+    assert all(seed.config[FAMILY] == family.MATMUL_FAMILY_WARP_MMA for seed in seeds)
+    source = _source(bound, seeds[0])
+    body = _kernel_body(source)
+    assert source.count("@cute.kernel") == 1
+    assert f"{RT}.mma_bf16(" in body
+    # A (bf16) still moves by cp.async; B (int16) is loaded as words and
+    # converted into its swizzled slot after every packet is issued.
+    assert f"{RT}.cp_async_16(wm_s_a" in body
+    assert f"{RT}.cp_async_16(wm_s_b" not in body
+    assert f"{RT}.ldg_v4_b32(wm_b_g" in body
+    assert f"{RT}.cvt_s16x8_bf16_sts(wm_b" in body
+    assert body.index(f"{RT}.ldg_v4_b32(") < body.index(f"{RT}.cvt_s16x8_bf16_sts(")
+    assert body.rindex(f"{RT}.cvt_s16x8_bf16_sts(") < body.index("cp_async_wait_group")
+    # An explicit tcgen05-family request fails closed with the reason.
+    with bound.env, pytest.raises(InvalidConfig, match="cast matmul operand"):
+        bound.config_spec.normalized_config(
+            helion.Config(block_sizes=[64, 32, 128], **{FAMILY: "tcgen05"})
+        )
+
+
+def test_cast_operand_on_the_lhs_converts_a_packets() -> None:
+    import examples.bf16xint16_gemm as example
+
+    bound = _bind(
+        example._int16xbf16_gemm.fn,
+        torch.empty((128, 256), dtype=torch.int16, device=CPU_DEVICE),
+        torch.empty((256, 128), dtype=torch.bfloat16, device=CPU_DEVICE),
+    )
+    with bound.env:
+        state = bound.config_spec._cute_tcgen05_config
+        assert state.warp_mma_admitted and not state.tcgen05_family_admitted
+        seeds = state._warp_mma_seed_configs()
+    body = _kernel_body(_source(bound, seeds[0]))
+    assert f"{RT}.ldg_v4_b32(wm_a_g" in body
+    assert f"{RT}.cvt_s16x8_bf16_sts(wm_a" in body
+    assert f"{RT}.cp_async_16(wm_s_a" not in body
+    assert f"{RT}.cp_async_16(wm_s_b" in body
+
+
+def test_cute_pdl_waits_before_the_packets_and_releases_before_the_stores() -> None:
+    bound = _bind_row_bias_gemm((256, 256, 256), torch.float16)
+    plain = _source(bound, _warp_config([64, 8, 256], 4))
+    assert "griddepcontrol" not in plain and "'use_pdl': True" not in plain
+    source = _source(bound, _warp_config([64, 8, 256], 4, cute_pdl=True))
+    body = _kernel_body(source)
+    assert "'use_pdl': True" in source
+    assert body.count("cute.arch.griddepcontrol_wait()") == 1
+    assert body.count("cute.arch.griddepcontrol_launch_dependents()") == 1
+    wait = body.index("cute.arch.griddepcontrol_wait()")
+    release = body.index("cute.arch.griddepcontrol_launch_dependents()")
+    # The wait precedes every global access (the bias row, the operand
+    # packets); the release follows the last MMA and precedes the stores.
+    assert body.index("alloc_smem") < wait < body.index(f"{RT}.ldg_b32(")
+    assert wait < body.index(f"{RT}.cp_async_16(")
+    assert body.rindex(f"{RT}.mma_f16(") < release < body.index(f"{RT}.stg_b32(")
+    # The knob survives the family's inert-knob pin.
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(
+            _warp_config([64, 8, 256], 4, cute_pdl=True)
+        )
+    assert normalized.config["cute_pdl"] is True
+    stripped = [line for line in body.splitlines() if "griddepcontrol" not in line]
+    assert "\n".join(stripped) == _kernel_body(plain)
+
+
+def test_fissioned_kernel_region_renders_the_family() -> None:
+    # A dynamic-shape bf16 x int16 kernel keeps the materialization fission
+    # (the proof specializes the shapes the fused program would lack): an
+    # operand-materialization region and a plain bf16 GEMM region (three
+    # graphs).  The complete-root rule inspects the root that calls the K
+    # loop; the other region keeps its own lowering, so the family is
+    # admitted, seeded and renders the GEMM region.
+    import examples.bf16xint16_gemm as example
+
+    bound = helion.kernel(
+        example._bf16xint16_gemm.fn,  # pyrefly: ignore[bad-argument-type]
+        backend="cute",
+        static_shapes=False,
+    ).bind(
+        (
+            torch.empty((128, 256), dtype=torch.bfloat16, device=CPU_DEVICE),
+            torch.empty((256, 128), dtype=torch.int16, device=CPU_DEVICE),
+        )
+    )
+    with bound.env:
+        spec = bound.config_spec
+        assert bound.env.cute_fission_plan is not None
         assert len(bound.host_function.device_ir.graphs) == 3
         assert spec._cute_tcgen05_config.warp_mma_admitted
+        assert spec._cute_tcgen05_config.tcgen05_family_admitted
         seeds = spec._cute_tcgen05_config._warp_mma_seed_configs()
     assert seeds
     source = _source(bound, seeds[0])
     assert f"{RT}.mma_bf16(" in source
+    assert f"{RT}.cvt_s16x8_bf16_sts(" not in source
     assert source.count("@cute.kernel") == 2  # the materialization region stays
 
 

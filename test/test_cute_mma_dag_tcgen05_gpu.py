@@ -38,6 +38,7 @@ from test.test_cute_mma_dag_gpu import _randn
 from test.test_cute_mma_dag_gpu import _run_triton
 from test.test_cute_mma_dag_gpu import _tensors
 from test.test_cute_mma_dag_tcgen05 import _bind_fwd_o_anch_f32  # noqa: F401
+from test.test_cute_mma_dag_tcgen05 import _matmul_layernorm
 from test.test_cute_mma_dag_tcgen05 import _probe_carry2
 from test.test_cute_mma_dag_tcgen05 import _probe_dotless_store
 from test.test_cute_mma_dag_tcgen05 import _probe_drainrace
@@ -432,6 +433,50 @@ def test_the_chunk_state_example_matches_the_reference(
         _source, (out,) = _run_cute(fn, args, config)
     ref = ref_chunk_state(B.float(), x.float(), dt.float(), dA.float())
     torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=1e-2)
+
+
+def test_the_region_renderer_stages_the_chunk_scan_epilogue_tile() -> None:
+    # examples/mamba2_chunk_scan.py on tensor memory: the epilogue's
+    # ``acc += x * D`` reads a loop-invariant [64, 64] tile of ``x``.  Under
+    # the ``tma`` loads mode the region renderer fetches it by TMA into the
+    # fixed region with the root's staged tiles and the epilogue reads it
+    # from shared memory behind the root's staged barrier; the ``lane`` mode
+    # keeps the per-lane global loads.  Both reach the same values (the same
+    # bf16 pairs feed the same arithmetic), matching the Triton backend.
+    from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
+
+    fn = helion_mamba2_chunk_scan_kernel.fn
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    batch, heads, groups, seq, chunk, d, ds = 2, 8, 2, 512, 64, 64, 64
+    chunks = seq // chunk
+    bf16 = torch.bfloat16
+    dt = torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g).to(bf16)
+    da = (
+        -torch.rand(batch, heads, chunks, chunk, device=DEVICE, generator=g)
+        .cumsum(-1)
+        .to(bf16)
+    )
+    args = (
+        _randn(g, batch, chunks, groups, chunk, chunk, dtype=bf16),
+        _randn(g, batch, seq, heads, d, dtype=bf16),
+        dt,
+        da,
+        _randn(g, batch, seq, groups, ds, dtype=bf16),
+        _randn(g, batch, chunks, heads, d, ds, dtype=bf16),
+        _randn(g, heads, dtype=bf16),
+    )
+    refs = _run_triton(fn, args, [64, 64, 64])
+    outs = {}
+    for loads in ("tma", "lane"):
+        source, outs[loads] = _run_cute(
+            fn, args, _config([64, 64, 64], 4, 1, cute_mma_dag_loads=loads)
+        )
+        epilogue = source[source.rindex("for md_i in cutlass.range(") :]
+        assert (f"{RT}.mbar_wait(md_sfr, 0)" in epilogue) == (loads == "tma")
+        assert ("_helion_mma_dag.ldg_b32(" in epilogue) == (loads == "lane")
+    for lhs, rhs in zip(outs["tma"], outs["lane"], strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(outs["tma"], refs, scaled=True)
 
 
 def test_the_k_loop_defaults_run_on_tensor_memory() -> None:
@@ -1463,3 +1508,156 @@ def test_a_16_bit_matmul_with_a_tile_index_mask_matches_the_triton_backend(
     _source, out = _run_cute(fn, args, _config(block_sizes, warps, stages))
     (ref,) = _run_triton(fn, args, block_sizes)
     assert torch.equal(out[0], ref)
+
+
+# (m, k, n), bm, bk, stages, cluster
+# shape, bm, bk, stages, split count, split mode
+_MLN_CASES = (
+    ((128, 256, 256), 64, 64, 2, 1, "cluster"),
+    ((128, 256, 256), 128, 64, 4, 1, "cluster"),
+    ((256, 512, 2048), 64, 64, 2, 8, "cluster"),
+    ((256, 512, 2048), 128, 128, 2, 8, "cluster"),
+    ((256, 256, 1024), 128, 64, 4, 4, "cluster"),
+    ((64, 128, 512), 64, 128, 1, 2, "cluster"),
+    ((512, 1024, 1024), 64, 64, 8, 8, "cluster"),
+    # The fixup grid: no cluster, the row sums through the workspace.
+    ((256, 512, 2048), 64, 64, 2, 8, "fixup"),
+    ((256, 512, 2048), 128, 64, 4, 8, "fixup"),
+    ((256, 512, 2048), 64, 64, 2, 16, "fixup"),
+    ((512, 1024, 1024), 64, 128, 4, 8, "fixup"),
+    ((128, 256, 256), 64, 64, 4, 4, "fixup"),
+    # More CTAs than one wave holds (1024): the row tiles' CTAs launch in
+    # order, so the waits inside a row tile never deadlock.
+    ((8192, 256, 1024), 64, 64, 2, 8, "fixup"),
+)
+
+
+@pytest.mark.parametrize(
+    ("shape", "bm", "bk", "stages", "cluster", "split"),
+    _MLN_CASES,
+    ids=[
+        f"m{s[0]}k{s[1]}n{s[2]}-{bm}x{bk}s{st}c{c}{'f' if sp == 'fixup' else ''}"
+        for s, bm, bk, st, c, sp in _MLN_CASES
+    ],
+)
+def test_full_slice_gemm_row_epilogue_matches_the_reference(
+    shape: tuple[int, int, int],
+    bm: int,
+    bk: int,
+    stages: int,
+    cluster: int,
+    split: str,
+) -> None:
+    # A GEMM over the whole ``:`` axis with a layer-norm row epilogue: the
+    # axis split over a thread-block cluster, the row sums exchanged
+    # through distributed shared memory.
+    torch.manual_seed(0)
+    m, k, n = shape
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+    y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+    weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    bias = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    config = _config(
+        [bm, bk], 4, stages, cute_mma_dag_cluster=cluster, cute_mma_dag_split=split
+    )
+    source, (out,) = _run_cute(_matmul_layernorm, (x, y, weight, bias), config)
+    if cluster > 1 and split == "fixup":
+        assert "_helion_cute_cluster_shape" not in source
+        assert f"{RT}.atom_add_release_gpu_u32(" in source
+        assert f"(({m // bm},)[0] * {cluster},)" in source
+    elif cluster > 1:
+        assert f"_helion_cute_cluster_shape = (1, {cluster}, 1)" in source
+        assert f"{RT}.st_async_remote_f32(" in source
+    else:
+        assert "cluster" not in source
+    ref = torch.nn.functional.layer_norm(
+        (x @ y).float(), [n], weight.float(), bias.float()
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_the_fixup_counters_survive_the_wrap() -> None:
+    # The arrival counters are never reset: seeded just below 2^32 (and just
+    # below 2^31), the next launches wrap them and still read right -- the
+    # base is the unsigned ticket with the period's low bits cleared and the
+    # waits compare modularly.
+    torch.manual_seed(0)
+    m, k, n = 512, 512, 2048
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+    y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+    weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    bias = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    config = _config([64, 64], 4, 2, cute_mma_dag_cluster=8, cute_mma_dag_split="fixup")
+    bound = helion.kernel(_matmul_layernorm, backend="cute", static_shapes=True).bind(
+        (x, y, weight, bias)
+    )
+    fn = bound.compile_config(bound.config_spec.normalized_config(config))
+    expected = fn(x, y, weight, bias)
+    kernel = fn.__globals__["_helion__matmul_layernorm"]
+    caches = kernel._helion_mma_dag_fixup_workspace_cache
+    (workspace,) = caches.values()
+    tiles, rounds, rows, row_tiles = 8, 1, 64, m // 64
+    period = 1 << (rounds * tiles - 1).bit_length()
+    counters = workspace[tiles * row_tiles * rows * 4 * 2 :][: row_tiles * 4].view(
+        torch.int32
+    )
+    assert counters.tolist() == [period] * row_tiles
+    for seed in (2**31 - period, 2**32 - period, 2**32 - 2 * period):
+        counters.fill_(seed - 2**32 if seed >= 2**31 else seed)
+        torch.cuda.synchronize()
+        for launch in range(3):
+            out = fn(x, y, weight, bias)
+            torch.cuda.synchronize()
+            assert torch.equal(out, expected), (seed, launch)
+            value = (seed + (launch + 1) * period) % 2**32
+            assert (
+                counters.tolist()
+                == [value - 2**32 if value >= 2**31 else value] * row_tiles
+            )
+
+
+def test_the_fixup_split_is_deterministic_and_matches_the_cluster_form() -> None:
+    # The same partials in the same tile order through the workspace as
+    # through distributed shared memory: the two forms agree bitwise, and a
+    # launch repeats bitwise (the counters only grow between launches).
+    torch.manual_seed(0)
+    m, k, n = 512, 512, 2048
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+    y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+    weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    bias = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    outs = {}
+    for split in ("cluster", "fixup"):
+        config = _config(
+            [64, 64], 4, 2, cute_mma_dag_cluster=8, cute_mma_dag_split=split
+        )
+        bound = helion.kernel(
+            _matmul_layernorm, backend="cute", static_shapes=True
+        ).bind((x, y, weight, bias))
+        fn = bound.compile_config(bound.config_spec.normalized_config(config))
+        first = fn(x, y, weight, bias)
+        second = fn(x, y, weight, bias)
+        assert torch.equal(first, second)
+        outs[split] = first
+    assert torch.equal(outs["cluster"], outs["fixup"])
+
+
+def test_the_full_slice_gemm_default_runs_on_a_cluster() -> None:
+    torch.manual_seed(0)
+    m, k, n = 512, 1024, 2048
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+    y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+    weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    bias = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    args = (x, y, weight, bias)
+    bound = helion.kernel(_matmul_layernorm, backend="cute", static_shapes=True).bind(
+        args
+    )
+    config = bound.config_spec.default_config()
+    assert config.config["cute_mma_dag"] == "tcgen05"
+    assert config.config["cute_mma_dag_cluster"] == 8
+    out = bound.compile_config(config)(*args)
+    ref = torch.nn.functional.layer_norm(
+        (x @ y).float(), [n], weight.float(), bias.float()
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

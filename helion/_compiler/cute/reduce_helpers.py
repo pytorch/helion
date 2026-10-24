@@ -651,6 +651,229 @@ def _cute_grouped_reduce_shared_columns(
     return results
 
 
+# Interleaved groups (``pre > 1``: the ``pre`` sibling coordinates occupy the
+# low strides of a group, so the threads of one reduction are ``pre`` apart)
+# combine with two barriers and no per-sibling unrolling.  The two-stage form
+# above repeats its masked shuffle stages and both barriers ``pre`` times
+# (``range_constexpr(pre)``): at ``pre`` = 256 one call site unrolls into 512
+# barriers, and a tile with 8 such sites per 16 vector copies made the DSL
+# compile consume 40 GB without finishing.
+#
+# * ``pre < 32`` (a power of two): a butterfly over the offsets ``>= pre``
+#   folds exactly the lanes of a warp that share ``lane % pre``, so lanes
+#   ``0 .. pre - 1`` hold their sibling's warp partial; after one barrier the
+#   first ``pre`` threads of the group fold the ``group_span // 32`` warp
+#   partials of their sibling.  Shared memory: the two-stage form's layout.
+# * ``pre >= 32`` (a multiple of 32): every thread writes its value, and after
+#   one barrier the first ``pre`` threads of the group fold the
+#   ``group_span // pre`` values of their sibling (at most 32 of them since
+#   ``group_span <= 1024``).  Shared memory: ``group_span`` values per group
+#   plus the results, never more than the two-stage form needs at this
+#   ``pre``, so the emitter's budget check stays conservative.
+
+
+@cute.jit
+def _cute_warp_tree_fold(
+    smem: cute.Tensor,
+    base: cutlass.Int32,
+    combine: object,
+    identity: cute.Numeric,
+    *,
+    stride: cutlass.Constexpr[int],
+    count: cutlass.Constexpr[int],
+) -> cute.Numeric:
+    """Fold ``count`` shared values ``smem[base + w * stride]`` in the order of
+    the two-stage form's second stage: a 32-lane descending butterfly
+    (offsets 16, 8, 4, 2, 1; partner second) with lane ``w`` holding value
+    ``w`` and the lanes beyond ``count`` holding the identity, as
+    ``cute.arch.warp_reduction`` computes it.  Identity partners are exact
+    no-ops, so this reproduces that reduction tree bit for bit."""
+    dtype = type(identity)
+    values = []
+    for w in cutlass.range_constexpr(32):
+        if cutlass.const_expr(w < count):
+            values.append(_smem_read(smem, base + w * stride, dtype))
+        else:
+            values.append(identity)
+    for shift in cutlass.range_constexpr(4, -1, -1):
+        for i in cutlass.range_constexpr(1 << shift):
+            values[i] = combine(values[i], values[i + (1 << shift)])
+    return values[0]
+
+
+@cute.jit
+def _cute_warp_tree_fold_strided_siblings(
+    smem: cute.Tensor,
+    base: cutlass.Int32,
+    sibling: cutlass.Int32,
+    combine: object,
+    identity: cute.Numeric,
+    *,
+    pre: cutlass.Constexpr[int],
+    count: cutlass.Constexpr[int],
+) -> cute.Numeric:
+    """Second-stage tree of the two-stage form for ``pre >= 32``: warp ``w``
+    of the group holds sibling ``sibling`` at lane ``sibling % 32`` exactly
+    when ``(w - sibling // 32) % (pre // 32) == 0`` (its masked warp reduce
+    is that one value), every other warp contributes the identity."""
+    dtype = type(identity)
+    ratio = pre // 32
+    first_warp = sibling // 32
+    lane = sibling % 32
+    values = []
+    for w in cutlass.range_constexpr(32):
+        if cutlass.const_expr(w < count):
+            held = ((w - first_warp) % ratio) == 0
+            value = _smem_read(smem, base + w * 32 + lane, dtype)
+            values.append(value if held else identity)
+        else:
+            values.append(identity)
+    for shift in cutlass.range_constexpr(4, -1, -1):
+        for i in cutlass.range_constexpr(1 << shift):
+            values[i] = combine(values[i], values[i + (1 << shift)])
+    return values[0]
+
+
+@cute.jit
+def _cute_grouped_reduce_shared_interleaved_warp_body(
+    input_value: cute.Numeric,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    *,
+    pre: cutlass.Constexpr[int],
+    group_span: cutlass.Constexpr[int],
+    group_count: cutlass.Constexpr[int],
+) -> cute.Numeric:
+    dtype = type(identity)
+    warps_per_group = group_span // 32
+    partials_size = group_count * pre * warps_per_group
+    results_size = group_count * pre
+    smem_ptr = cute.arch.alloc_smem(dtype, partials_size + results_size)
+    smem = cute.make_tensor(smem_ptr, (partials_size + results_size,))
+    group_id = lane_var // group_span
+    lane_in_warp = lane_var % 32
+    warp_in_group = lane_in_group_var // 32
+    partials_base = group_id * (pre * warps_per_group)
+    results_base = partials_size + group_id * pre
+    value = input_value
+    # The two-stage form reduces each sibling with a full-warp descending
+    # butterfly (offsets 16 .. 1, partner second) over identity-masked lanes.
+    # The stages with offset < ``pre`` pair a lane with a masked lane there
+    # (exact no-ops), so the same tree over the surviving lanes is the
+    # butterfly over the offsets >= ``pre``, in the same descending order.
+    for shift in cutlass.range_constexpr(4, pre.bit_length() - 2, -1):
+        value = combine(
+            value,
+            dtype(
+                cute.arch.shuffle_sync_bfly(
+                    value, offset=1 << shift, mask=-1, mask_and_clamp=31
+                )
+            ),
+        )
+    if lane_in_warp < pre:
+        # Warp-major partials: consecutive threads of the second stage read
+        # consecutive words.
+        smem[partials_base + warp_in_group * pre + lane_in_warp] = value
+    cute.arch.sync_threads()
+    if lane_in_group_var < pre:
+        total = _cute_warp_tree_fold(
+            smem,
+            partials_base + lane_in_group_var,
+            combine,
+            identity,
+            stride=pre,
+            count=warps_per_group,
+        )
+        smem[results_base + lane_in_group_var] = total
+    cute.arch.sync_threads()
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
+
+
+@cute.jit
+def _cute_grouped_reduce_shared_interleaved_block_body(
+    input_value: cute.Numeric,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    *,
+    pre: cutlass.Constexpr[int],
+    group_span: cutlass.Constexpr[int],
+    group_count: cutlass.Constexpr[int],
+) -> cute.Numeric:
+    dtype = type(identity)
+    partials_size = group_count * group_span
+    results_size = group_count * pre
+    smem_ptr = cute.arch.alloc_smem(dtype, partials_size + results_size)
+    smem = cute.make_tensor(smem_ptr, (partials_size + results_size,))
+    group_id = lane_var // group_span
+    group_base = group_id * group_span
+    results_base = partials_size + group_id * pre
+    smem[group_base + lane_in_group_var] = input_value
+    cute.arch.sync_threads()
+    if lane_in_group_var < pre:
+        # With ``pre`` a multiple of 32 a warp holds at most one lane of a
+        # sibling, so the two-stage form's masked warp reduce is that lane's
+        # value; its second stage is the warp-indexed butterfly below.
+        total = _cute_warp_tree_fold_strided_siblings(
+            smem,
+            group_base,
+            lane_in_group_var,
+            combine,
+            identity,
+            pre=pre,
+            count=group_span // 32,
+        )
+        smem[results_base + lane_in_group_var] = total
+    cute.arch.sync_threads()
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
+
+
+def _use_interleaved_shared_reduce(pre: int, group_span: int) -> bool:
+    return (
+        pre > 1
+        and pre & (pre - 1) == 0
+        and group_span % 32 == 0
+        and group_span % pre == 0
+        and (pre < 32 or pre % 32 == 0)
+    )
+
+
+def _cute_grouped_reduce_shared_interleaved(
+    input_value: cute.Numeric,
+    reduction_type: str,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> cute.Numeric:
+    combine = _cute_scalar_combine(reduction_type)
+    body = (
+        _cute_grouped_reduce_shared_interleaved_warp_body
+        if pre < 32
+        else _cute_grouped_reduce_shared_interleaved_block_body
+    )
+    return body(
+        input_value,
+        combine,
+        identity,
+        lane_var,
+        lane_in_group_var,
+        lane_mod_pre_var,
+        pre=pre,
+        group_span=group_span,
+        group_count=group_count,
+    )
+
+
 def _cute_grouped_reduce_shared_two_stage(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -666,7 +889,8 @@ def _cute_grouped_reduce_shared_two_stage(
 ) -> cute.Numeric:
     # Despite the name (kept for call-site stability) this dispatcher owns
     # ALL shared-memory cross-warp combines: small whole-CTA groups route
-    # to the cheaper serial form, everything else to the two-stage form.
+    # to the cheaper serial form, interleaved groups to the two-barrier
+    # interleaved form, everything else to the two-stage form.
     if _use_serial_block_reduce(pre, group_span, group_count):
         return _cute_grouped_reduce_shared_serial(
             input_value,
@@ -675,6 +899,18 @@ def _cute_grouped_reduce_shared_two_stage(
             lane_var,
             group_span=group_span,
             fp32_redux=fp32_redux,
+        )
+    if _use_interleaved_shared_reduce(pre, group_span):
+        return _cute_grouped_reduce_shared_interleaved(
+            input_value,
+            reduction_type,
+            identity,
+            lane_var,
+            lane_in_group_var,
+            lane_mod_pre_var,
+            pre=pre,
+            group_span=group_span,
+            group_count=group_count,
         )
     impl = _TWO_STAGE_DISPATCH.get(reduction_type)
     if impl is None:

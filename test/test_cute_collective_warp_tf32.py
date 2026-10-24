@@ -111,7 +111,7 @@ def test_warp_tf32_requires_sm80_or_newer(
 
 
 @pytest.mark.parametrize("stages", [2, 3, 4])
-def test_async_tf32_rounds_only_the_waited_shared_stage(
+def test_async_tf32_rounds_in_registers_with_one_barrier_per_stage(
     cpu_only: None, stages: int
 ) -> None:
     arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
@@ -120,6 +120,10 @@ def test_async_tf32_rounds_only_the_waited_shared_stage(
     config.config["cute_collective_stages"] = stages
     source = bound.to_code(config)
     tree = ast.parse(source)
+    # cp.async stages the original FP32 bytes; the warp MMA partitions that
+    # raw ring and rounds each fragment value in registers, so no shared
+    # rounding pass (and none of its barriers) exists.
+    assert "tf32_round_slot" not in source
     conversions = [
         node
         for node in ast.walk(tree)
@@ -127,29 +131,58 @@ def test_async_tf32_rounds_only_the_waited_shared_stage(
         and ast.unparse(node.func) == "cute.arch.cvt_f32_tf32"
     ]
     assert len(conversions) == 2
-    for conversion in conversions:
-        assert isinstance(conversion.args[0], ast.Subscript)
-        index = conversion.args[0].slice
-        assert isinstance(index, ast.Tuple) and len(index.elts) == 3
-        assert isinstance(index.elts[-1], ast.Name)
-        assert index.elts[-1].id.endswith("_stage_read")
-    assert f"cute.arch.cp_async_wait_group({stages - 1})" in source
-    assert "cute.arch.cp_async_wait_group(0)" in source
-    assert (
-        "cute.recast_ptr(collective_ap, collective_as, dtype=cutlass.Float32)" in source
-    )
-    assert (
-        "cute.recast_ptr(collective_bp, collective_bs, dtype=cutlass.Float32)" in source
-    )
+    assert sorted(ast.unparse(node.args[0]) for node in conversions) == [
+        "collective_ra_raw[collective_ae]",
+        "collective_rb_raw[collective_be]",
+    ]
     for operand in ("a", "b"):
         assert (
             f"collective_{operand}s = cute.recast_layout(8, cutlass.TFloat32.width, collective_{operand}l).inner"
             in source
         )
         assert (
-            f"cute.recast_ptr(collective_{operand}p, collective_{operand}s, dtype=cutlass.TFloat32)"
+            f"collective_{operand}_raw = cute.make_tensor(cute.recast_ptr(collective_{operand}p, collective_{operand}s, dtype=cutlass.Float32), collective_{operand}l.outer)"
             in source
         )
+        assert (
+            f"collective_r{operand}_raw = cute.make_fragment_like(collective_r{operand}, cutlass.Float32)"
+            in source
+        )
+        assert (
+            f"collective_p{operand} = collective_tc{operand}.partition_S(collective_{operand}_raw)"
+            in source
+        )
+        assert (
+            f"collective_d{operand} = collective_tc{operand}.retile(collective_r{operand}_raw)"
+            in source
+        )
+    assert source.count("CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=32") == 2
+    assert "warp.MmaTF32Op((16, 8, 8))" in source
+    # One CTA barrier per K step: wait for this stage, publish it, and only
+    # then refill the stage the previous step consumed before the MMAs.
+    k_loops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and any(
+            isinstance(inner, ast.For) and ast.unparse(inner.target) == "collective_ki"
+            for inner in node.body
+        )
+    ]
+    assert len(k_loops) == 1
+    body = [ast.unparse(statement) for statement in k_loops[0].body]
+    waits = [i for i, text in enumerate(body) if "cp_async_wait_group" in text]
+    barriers = [i for i, text in enumerate(body) if "sync_threads" in text]
+    refills = [
+        i for i, text in enumerate(body) if text.startswith("if collective_prefetch_k")
+    ]
+    mma = [i for i, text in enumerate(body) if text.startswith("for collective_ki")]
+    assert (
+        len(waits) == 1 and len(barriers) == 1 and len(refills) == 1 and len(mma) == 1
+    )
+    assert waits[0] < barriers[0] < refills[0] < mma[0]
+    assert body[waits[0]] == f"cute.arch.cp_async_wait_group({stages - 2})"
+    assert "cute.arch.cp_async_wait_group(0)" in source
     async_atoms = [
         node
         for node in ast.walk(tree)
@@ -179,6 +212,36 @@ def test_async_tf32_rounds_only_the_waited_shared_stage(
     assert "warp.MmaTF32Op((16, 8, 8))" in bound.to_code(roundtrip)
 
 
+def test_single_stage_async_tf32_keeps_shared_publication_barriers(
+    cpu_only: None,
+) -> None:
+    arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
+    bound = _cpu_bind(_kernel(), arguments)
+    config = _config(32, 32, 32, compute="warp", copy="async_cached")
+    config.config["cute_collective_stages"] = 1
+    source = bound.to_code(config)
+    assert "tf32_round_slot" not in source
+    assert "collective_ra_raw[collective_ae]" in source
+    assert "collective_prefetch_k" not in source
+    tree = ast.parse(source)
+    k_loops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and any(
+            isinstance(inner, ast.For) and ast.unparse(inner.target) == "collective_ki"
+            for inner in node.body
+        )
+    ]
+    assert len(k_loops) == 1
+    body = [ast.unparse(statement) for statement in k_loops[0].body]
+    mma = next(i for i, text in enumerate(body) if text.startswith("for collective_ki"))
+    # The single stage is published before the MMA and protected after it.
+    assert body[mma - 1] == "cute.arch.sync_threads()"
+    assert body[mma + 1] == "cute.arch.sync_threads()"
+    assert "cute.arch.cp_async_wait_group(0)" in body[mma - 2]
+
+
 def test_fp32_seed_uses_exact_register_accumulator(cpu_only: None) -> None:
     arguments = (torch.empty((65, 48)), torch.empty((48, 70)), torch.empty((65, 70)))
     bound = _cpu_bind(_seeded_fp32, arguments)
@@ -195,6 +258,32 @@ def test_fp32_seed_uses_exact_register_accumulator(cpu_only: None) -> None:
     assert "cute.autovec_copy(collective_seed, collective_acc)" in source
     assert source.count("cvt_f32_tf32") == 2
     assert "TmemAllocator" not in source
+
+
+def test_collective_kernel_honors_cute_pdl(cpu_only: None) -> None:
+    arguments = _jagged_inputs(batch=3, rows=137, k=64, n=64)
+    bound = _cpu_bind(_kernel(), arguments)
+    bound.config_spec.target_device_capability = (10, 0)
+    config = _config(32, 32, 32, compute="warp", copy="async_cached")
+    config.config["cute_collective_stages"] = 4
+    config.config["cute_pdl"] = True
+    source = bound.to_code(config)
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    # The generic dependent-launch wait heads the kernel body; the collective
+    # lowering accepts it as effect-free and still owns the contraction.
+    assert ast.unparse(kernel.body[0]) == "cute.arch.griddepcontrol_wait()"
+    assert source.count("griddepcontrol_wait()") == 1
+    assert f"{kernel.name}._helion_cute_use_pdl = True" in source
+    assert "cute.gemm(" in source and "MmaTF32Op" in source
+    assert "cp_async_wait_group(2)" in source
+    config.config["cute_pdl"] = False
+    plain = bound.to_code(config)
+    assert "griddepcontrol" not in plain and "cute.gemm(" in plain
 
 
 def _require_sm80() -> None:

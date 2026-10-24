@@ -21,6 +21,24 @@ primitives:
   previous one was waited, so the parity never aliases.
 - Per-loop running counters (``md_rk{L}``: iterations so far, across
   re-entries) give the ring slot, its phase and the staging parity.
+- A fragment chain (a store or reduce value, a derived value, a dot's
+  accumulator) may read a row vector along its fragment's rows: the
+  thread's own register (``chain_vecs_reason``).
+- A *streaming loop* (``streaming_loop``: one batch of dots accumulating
+  in place into the loop's carries over TMA ring tiles, nothing else) is
+  rendered by warp 0 alone: the batch commits to its ring slot's "empty"
+  barrier (``md_empty{L}``), the refill of the slot the previous iteration
+  read waits for that iteration's commit behind this iteration's MMAs, and
+  one commit after the loop serves the epilogue.
+- ``MmaDagPlan.cluster`` > 1 splits a full-slice fragment axis over a
+  thread-block cluster (the trailing grid dim is the rank): every base and
+  TMA coordinate along the axis starts at the rank's slice, and a row
+  reduction along it exchanges the CTAs' partial sums through distributed
+  shared memory (``emit_cluster_allreduce``: a cluster-scope mbarrier
+  ``md_clb`` with one arrival per peer per round, double-buffered exchange
+  copies behind the vector scratch, peers' values added in rank order so
+  every CTA holds the same sum; cluster barriers after the barrier init
+  and before the exit keep remote accesses inside every CTA's lifetime).
 """
 
 from __future__ import annotations
@@ -34,7 +52,10 @@ import torch
 from ..compile_environment import CompileEnvironment
 from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
+from .cute_mma_dag import AXIS_ROOT
+from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
+from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
 from .cute_mma_dag import ROUTE_CONVERT
 from .cute_mma_dag import ROUTE_DIRECT
@@ -51,7 +72,9 @@ from .cute_mma_dag import Store
 from .cute_mma_dag import VecOp
 from .cute_mma_dag import VecStore
 from .cute_mma_dag import _decline
+from .cute_mma_dag import _is_call
 from .cute_mma_dag import async_tile_reason
+from .cute_mma_dag import cluster_split_axis
 from .cute_mma_dag import staged_store_reason
 from .cute_mma_dag_codegen import _RUNTIME
 from .cute_mma_dag_codegen import _shape
@@ -60,6 +83,7 @@ from .cute_mma_dag_tcgen05 import _RT
 from .cute_mma_dag_tcgen05 import _SWIZZLE_BY_ROW_BYTES
 from .cute_mma_dag_tcgen05 import ATOM_32B_SWIZZLE
 from .cute_mma_dag_tcgen05 import ATOM_MAX_BYTES
+from .cute_mma_dag_tcgen05 import FIXUP_WORKSPACE_PARAM
 from .cute_mma_dag_tcgen05 import REGION_EPILOGUE
 from .cute_mma_dag_tcgen05 import REGION_EXCHANGE
 from .cute_mma_dag_tcgen05 import REGION_LOOP
@@ -114,6 +138,13 @@ EPILOGUE_BARRIER_ID = 1
 # Entries of one warp's vector scratch (the TMEM lane count: a vector never
 # exceeds the fragment rows it is relaid into).
 SCRATCH_ENTRIES = 128
+# Scratch copies behind the epilogue warps' for the cluster exchange of row
+# sums along a cluster-split axis: one buffer of ``SCRATCH_ENTRIES`` rows per
+# round parity per CTA of the largest cluster, into which every peer pushes
+# its partial sums (a peer may still read round ``k`` while round ``k + 1``
+# is published into the other buffer; by round ``k + 2`` every peer has
+# passed round ``k + 1``, which it does after reading round ``k``).
+CLUSTER_EXCHANGE_COPIES = 2 * MMA_DAG_CLUSTER_MAX
 # 16-bit operands take the F16 MMA kind, fp32 operands the TF32 kind (the
 # tensor core truncates to tf32 as Triton's dot does on this target).
 OPERAND_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
@@ -159,6 +190,42 @@ def region_program_reason(program: MmaDagProgram) -> str | None:
             program.vec_slots[slot].axis is not None
         ):
             return "a store of a column vector"
+    return chain_vecs_reason(program)
+
+
+def chain_vecs_reason(program: MmaDagProgram) -> str | None:
+    """Why a fragment chain's vector inputs cannot be read here (None: they
+    can).  A vector is one register per epilogue thread holding the value
+    of the thread's row, so a chain over a fragment may read a row vector
+    along that fragment's rows axis (the same ``md_row`` variable) or a
+    scalar; a column vector would need the scratch relay."""
+    readers: list[tuple[Node, int]] = []
+    for store in program.stores:
+        readers.append((store.value, program.frag_slots[store.frag]))
+    for reduce in program.reduces:
+        if reduce.frag is not None:
+            readers.append((reduce.value, program.frag_slots[reduce.frag]))
+    for derived in program.derived:
+        readers.append((derived.node, derived.slot))
+    for dot in program.dots:
+        if dot.acc is not None and dot.acc_frag is not None:
+            readers.append((dot.acc, program.frag_slots[dot.acc_frag]))
+        for operand in (dot.a, dot.b):
+            if program.chain_vecs.get(operand.value):
+                # Operand tiles are rewritten packet by packet by every
+                # thread: no thread-row vector there.
+                return f"the operand {operand.value.name} reads a vector"
+    for value, slot in readers:
+        rows = program.slots[slot][0]
+        for vec in program.chain_vecs.get(value, ()):
+            vec_slot = program.vec_slots[program.vec_leaves[vec]]
+            if vec_slot.axis is None:
+                continue
+            if vec_slot.orient != "rows" or vec_slot.axis is not rows:
+                return (
+                    f"{value.name} reads the vector {vec.name} along another "
+                    "axis than its fragment's rows"
+                )
     return None
 
 
@@ -490,10 +557,17 @@ def aux_tile_loads(program: MmaDagProgram) -> list[tuple[Derived, Access]]:
     seen: set[tuple[Node, int]] = set()
     for derived in program.derived:
         for access in derived.loads:
+            # A loop's ring tile, or an epilogue value's loop-invariant tile
+            # (the residual term of a state-space kernel), staged once in the
+            # fixed region with the root's staged tiles: it lands during the
+            # loops instead of after the last MMA.
             if (
                 len(access.tile_dims) == 2
                 and access.tile_dim_strides[1] == 1
-                and program.ring_derived_load(derived, access)
+                and (
+                    program.ring_derived_load(derived, access)
+                    or (derived.loop < 0 and not access.loops)
+                )
                 and (access.node, derived.loop) not in seen
                 and aux_shared_operand(program, derived, access) is None
             ):
@@ -897,7 +971,9 @@ def region_items(
                     access.dims[positions[0]].index,
                     access.dims[positions[1]].index,
                     access.dtype.itemsize,
-                    0,
+                    # A ring slot per stage in a loop; one fixed copy, live
+                    # across the loops, for the epilogue's tiles.
+                    0 if derived.loop >= 0 else 1,
                 ),
                 (derived, access),
             )
@@ -921,10 +997,14 @@ def region_items(
         )
     if program.vec_slots:
         # One vector (at most the TMEM lane count of entries) per epilogue
-        # warp.
+        # warp; a program a cluster may split adds the exchange buffers of
+        # the row sums along the split axis.
+        copies = TCGEN05_EPILOGUE_WARPS
+        if cluster_split_axis(program) is not None:
+            copies += CLUSTER_EXCHANGE_COPIES
         items.append(
             (
-                Tcgen05SmemItem(ITEM_SCRATCH, -1, -1, -1, 4, TCGEN05_EPILOGUE_WARPS),
+                Tcgen05SmemItem(ITEM_SCRATCH, -1, -1, -1, 4, copies),
                 None,
             )
         )
@@ -1734,6 +1814,9 @@ def plan_tcgen05_regions(
                 slabs=(cols * es) // atom,
                 offset=offset,
                 tma=spec,
+                # The epilogue's tiles sit in the fixed region (absolute
+                # offset), issued with the root's staged tiles.
+                ring=item.frame >= 0,
             )
         )
     # Aux reads sharing a ring operand's tile (TMA'd straight or rewritten
@@ -1817,8 +1900,18 @@ def plan_tcgen05_regions(
     for store in staged:
         slot = slots[program.frag_slots[store.frag]]
         row_bytes = slot.cols * store.access.dtype.itemsize
+        # Rows of one swizzle atom are one box; an epilogue store's wider
+        # rows (a multiple of 128 bytes) are staged slab by slab in the atom
+        # layout (``emit_stage_in``) and stored as one box per slab (a loop
+        # store keeps its packet drain: its buffers turn over per iteration).
+        atom_bytes = min(row_bytes, ATOM_MAX_BYTES)
+        wide = (
+            store.region == "epilogue"
+            and row_bytes > ATOM_MAX_BYTES
+            and row_bytes % ATOM_MAX_BYTES == 0
+        )
         if (
-            row_bytes in (16, 32, 64, 128)
+            (row_bytes in (16, 32, 64, 128) or wide)
             and len(_tma_dims(store.access)) <= TMA_MAX_RANK
             and len(tma) < TMA_MAX_MAPS
         ):
@@ -1830,11 +1923,12 @@ def plan_tcgen05_regions(
                 slot.rows,
                 slot.cols,
                 store.access.dtype.itemsize,
-                _SWIZZLE_BY_ROW_BYTES.get(row_bytes, "none"),
-                row_bytes,
+                _SWIZZLE_BY_ROW_BYTES.get(atom_bytes, "none"),
+                atom_bytes,
                 staging_offsets[store.access.node],
             )
-    smem = layout.total + region_barrier_bytes(tc, stages)
+    barrier_bytes = region_barrier_bytes(tc, stages)
+    smem = layout.total + barrier_bytes
     if facts.smem_capacity and smem > facts.smem_capacity:
         raise _decline(
             f"{smem} B of shared memory exceed the capacity {facts.smem_capacity}"
@@ -1850,9 +1944,10 @@ def plan_tcgen05_regions(
         for loop, group in ring_tiles.items()
     }
     for loop, aux_group in aux_tiles.items():
-        ring_tx[loop] = ring_tx.get(loop, 0) + sum(
-            tile.tma.bytes for tile in aux_group if tile.tma is not None
-        )
+        if loop >= 0:
+            ring_tx[loop] = ring_tx.get(loop, 0) + sum(
+                tile.tma.bytes for tile in aux_group if tile.tma is not None
+            )
     staged_tx = {
         region: sum(
             (tile.tma or tile.raw_tma).bytes  # type: ignore[union-attr]
@@ -1861,6 +1956,11 @@ def plan_tcgen05_regions(
         )
         for region, group in staged_tiles.items()
     }
+    for frame, aux_group in aux_tiles.items():
+        if frame < 0:
+            staged_tx[frame] = staged_tx.get(frame, 0) + sum(
+                tile.tma.bytes for tile in aux_group if tile.tma is not None
+            )
     return Tcgen05Plan(
         warps=warps,
         stages=stages,
@@ -1902,8 +2002,16 @@ def plan_tcgen05_regions(
 class _Tcgen05RegionEmitter(_Tcgen05Emitter):
     """The tcgen05 renderer over the region tree (see the module doc)."""
 
+    # A vector is one register per epilogue thread (the thread's row), so
+    # every chain -- vector ops and stores, and the fragment chains reading
+    # row vectors (``chain_vecs``) -- evaluates a vector leaf as that
+    # register.
+    vec_reg_default = (0, 0)
+
     def __init__(self, cg: GenerateAST, plan: MmaDagPlan) -> None:
         super().__init__(cg, plan)
+        # Loop-invariant side vectors come in 16-byte packets.
+        self.side_packets = {}
         self.values = {}
         # Exchange tiles valid at this point (sharing keys), the fragments
         # defined so far, the staged tiles whose passes ran in the current
@@ -1915,6 +2023,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # Staged body stores waiting for the next CTA barrier: (store,
         # parity expression, loop values).
         self.drains: list[tuple[Store, str, dict[int, str]]] = []
+        # Rounds and partial slabs of the fixup split's exchange emitted so
+        # far, rounds of the cluster's, the fused pair's second moment, and
+        # the fused-pair memo (None: not looked up; (): none).
+        self.fixup_round = 0
+        self.fixup_slab = 0
+        self.cluster_round = 0
+        self.fused_m2 = ""
+        self._fused_variance: tuple[Reduce, Reduce, int] | tuple[()] | None = None
         self.current_blocks: list[Block] = []
         self.ring_waited: set[int] = set()
         # Exchange tiles written at the root (valid for the whole kernel).
@@ -1924,6 +2040,15 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # (``register_carries``, ``resident_slots``): ``md_rc{slot}_{chunk}_{j}``
         # scalars, defined at the kernel's start, never loaded or stored.
         self.resident: set[int] = set(self.tc.register_carries)
+        # Programmatic dependent launch (``cute_pdl``): this renderer waits
+        # for the previous kernel after its prologue (barriers, tensor
+        # memory, the cluster sync) and releases its dependents once the
+        # last top-level loop issued, so consecutive launches overlap their
+        # prologue and epilogue (the generic top-of-kernel wait stays out:
+        # the body carries the griddepcontrol calls itself).
+        self.pdl = self.df.config.config.get("cute_pdl") is True and (
+            CompileEnvironment.current().config_spec.target_device_capability or (0, 0)
+        ) >= (9, 0)
         self.ring_loops = [
             loop.index
             for loop in program.loops
@@ -1937,6 +2062,64 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             or loop.index in self.tc.staged_tiles
             or any(store.loop == loop.index for store in self.tc.staged_stores)
         }
+        self.streaming_loops = {
+            loop.index for loop in program.loops if self.streaming_loop(loop)
+        }
+
+    def streaming_loop(self, loop: Loop) -> bool:
+        """A loop whose iterations are one batch of dots accumulating in
+        place into this loop's tensor-memory carries over TMA ring tiles,
+        and nothing else (no pass, stage, snapshot, derived value, vector
+        step or carry copy): ``emit_streaming_iteration`` keeps the tensor
+        core fed across iterations instead of waiting for every batch's
+        commit (a GEMM K loop: 0.043 -> 0.021 ms at 2048^3)."""
+        tc, program = self.tc, self.program
+        index = loop.index
+        if (
+            not loop.innermost
+            or index not in self.ring_loops
+            or not tc.ring_tx.get(index)
+            or tc.stages < 2
+            or tc.aux_tiles.get(index)
+            or tc.staged_tiles.get(index)
+            or loop.vec_carries
+            or any(store.loop == index for store in program.stores)
+            or any(step.loop == index for step in program.derived)
+            or any(step.loop == index for step in (*program.reduces, *program.vec_ops))
+            or any(step.loop == index for step in program.vec_stores)
+        ):
+            return False
+        if self.has_passes(tc.ring_tiles.get(index, ())):
+            return False
+        carries = {carry.slot: carry for carry in loop.carries}
+        if not carries or any(slot in self.resident for slot in carries):
+            return False
+        for step in loop.steps:
+            if (
+                not isinstance(step, Dot)
+                or step.acc is None
+                or step.acc_frag is None
+                or step.acc_frag not in loop.carry_placeholders
+                or dot_prepares(step)
+                or self.prepares(step)
+                or step.slot not in carries
+            ):
+                return False
+            for operand in (step.a, step.b):
+                if operand.kind != "load" or not tc.tile(step, operand).ring:
+                    return False
+        # Every carry's loop output is its own dot (no copy at the end).
+        for carry in loop.carries:
+            output = program.resolve(carry.output)
+            if not any(
+                isinstance(step, Dot)
+                and step.node is output
+                and step.slot == carry.slot
+                for step in loop.steps
+            ):
+                return False
+        blocks = region_block_steps(program, loop.steps)
+        return len(blocks) == 1 and not blocks[0][0]
 
     # -- naming ---------------------------------------------------------------
 
@@ -2183,6 +2366,357 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         assert self.tc.scratch_offset >= 0
         return f"md_s0 + {self.tc.scratch_offset}"
 
+    def cluster_exchange_base(self) -> str:
+        """The first cluster exchange buffer (behind the warps' scratch)."""
+        return f"{self.scratch_base()} + {TCGEN05_EPILOGUE_WARPS * SCRATCH_ENTRIES * 4}"
+
+    @property
+    def split_reduces(self) -> list[Reduce]:
+        """The row reductions along the split axis, in program order (one
+        exchange round each)."""
+        if self.plan.cluster <= 1:
+            return []
+        program = self.program
+        return [
+            step
+            for step in program.reduces
+            if step.frag is not None
+            and step.orient == "rows"
+            and self.is_split_axis(program.slots[program.frag_slots[step.frag]][1])
+        ]
+
+    @property
+    def fixup(self) -> bool:
+        """Whether the split's CTAs form the fixup grid (``cute_mma_dag_split
+        = "fixup"``): the N tiles of a row tile folded into the launch dim,
+        the row sums exchanged through a global workspace."""
+        return self.plan.cluster > 1 and self.plan.split_mode == MMA_DAG_SPLIT_FIXUP
+
+    @property
+    def cluster_reduces(self) -> bool:
+        """Whether some row reduction runs along the cluster-split axis
+        through distributed shared memory (the cluster barrier and exchange
+        buffers are needed)."""
+        return bool(self.split_reduces) and not self.fixup
+
+    @property
+    def fixup_rows(self) -> int:
+        """Rows of the fragments the fixup rounds reduce (one partial per
+        row and round; the root tile's rows)."""
+        program = self.program
+        rows = {
+            self.slot(program.frag_slots[cast("Node", step.frag)]).rows
+            for step in self.split_reduces
+        }
+        assert len(rows) == 1, rows
+        return rows.pop()
+
+    def define_axis_bases(self) -> None:  # type: ignore[override]
+        if not self.fixup:
+            super().define_axis_bases()
+            return
+        # The fixup grid: the launch dim holds the row tiles times the N
+        # tiles, the N tile fastest (``md_mtile``, ``md_crank``).
+        for axis in self.program.axes:
+            if self.is_split_axis(axis):
+                self.emit(f"{self.axis_base(axis)} = md_crank * {self.plan.size(axis)}")
+            elif axis.kind == AXIS_ROOT:
+                self.emit(f"{self.axis_base(axis)} = md_mtile * {self.plan.size(axis)}")
+            elif axis.kind not in (AXIS_LOOP, AXIS_RDIM):
+                self.emit(
+                    f"{self.axis_base(axis)} = cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})"
+                )
+
+    # -- the split's exchange rounds --------------------------------------------
+
+    @property
+    def fused_variance(self) -> tuple[Reduce, Reduce, int] | None:
+        """``(sum, var, width)`` when the split reduces are exactly the row
+        sum of a fragment and the row sum of its squared deviations from
+        that sum over the axis extent (a layer norm's mean and centered
+        variance): one exchange round carries each tile's sum and its
+        second moment about the tile's own mean, combined pairwise in tile
+        order (Chan et al.), instead of a round per reduction.  ``width``
+        is the columns of a tile (the CTA's slice)."""
+        if self._fused_variance is not None:
+            return self._fused_variance or None
+        self._fused_variance = ()
+        reduces = self.split_reduces
+        if len(reduces) != 2:
+            return None
+        first, second = reduces
+        program = self.program
+        # The values through their ``_mask_to`` wrappers (whole tiles).
+        if (
+            first.frag is None
+            or first.frag is not second.frag
+            or program.resolve(first.value) is not program.resolve(first.frag)
+        ):
+            return None
+        axis = program.axes[self.plan.split_axis]
+        means = [op for op in program.vec_ops if op.slot == first.slot]
+        if len(means) != 1:
+            return None
+        mean = means[0].node
+        if not (
+            _is_call(mean, torch.ops.aten.div.Tensor)
+            and len(mean.args) == 2
+            and mean.args[0] is first.node
+            and mean.args[1] == axis.extent
+        ):
+            return None
+        value = program.resolve(second.value)
+        # The Inductor lowering masks a repeated input to None (``x * x``
+        # arrives as ``mul(x, None)``).
+        if (
+            _is_call(value, torch.ops.aten.mul.Tensor)
+            and len(value.args) == 2
+            and value.args[1] in (None, value.args[0])
+        ) or (
+            _is_call(value, torch.ops.aten.pow.Tensor_Scalar)
+            and len(value.args) == 2
+            and value.args[1] == 2
+        ):
+            deviation = value.args[0]
+        else:
+            return None
+        if not isinstance(deviation, torch.fx.Node):
+            return None
+        deviation = program.resolve(deviation)
+        if not (
+            _is_call(deviation, torch.ops.aten.sub.Tensor)
+            and len(deviation.args) == 2
+            and isinstance(deviation.args[0], torch.fx.Node)
+            and program.resolve(deviation.args[0]) is program.resolve(first.frag)
+            and deviation.args[1] is mean
+        ):
+            return None
+        self._fused_variance = (first, second, self.plan.size(axis))
+        return self._fused_variance
+
+    @property
+    def split_rounds(self) -> int:
+        """Exchange rounds of the split (counter arrivals per launch and row
+        tile of the fixup grid): one per split reduce, the fused pair one."""
+        return len(self.split_reduces) - (1 if self.fused_variance is not None else 0)
+
+    @property
+    def fixup_slabs(self) -> int:
+        """Partial vectors the fixup workspace holds per row tile (one per
+        split reduce: the fused pair's round carries two)."""
+        return len(self.split_reduces)
+
+    def emit_split_exchange(
+        self, partials: Sequence[str], frag_slot: int
+    ) -> list[list[str]]:
+        """One round of the split's exchange: this CTA's row ``partials``
+        (one fp32 per row each) go out, every tile's come back -- per
+        partial the T values in tile (rank) order, the same order in every
+        CTA, so sums over them agree bitwise across the split."""
+        if self.fixup:
+            return self.emit_fixup_exchange(partials, frag_slot)
+        return self.emit_cluster_exchange(partials, frag_slot)
+
+    def emit_ordered_sum(self, values: Sequence[str]) -> str:
+        """The values added in order (the tile order of an exchange)."""
+        total = values[0]
+        for value in values[1:]:
+            total = self.bind("md_s", f"{total} + {value}")
+        return total
+
+    def emit_fused_variance(
+        self, total: str, values: Sequence[str], frag_slot: int, width: int
+    ) -> str:
+        """The fused pair's round (``fused_variance``): this tile's sum
+        ``total`` and its second moment about its own mean (over the
+        thread's ``values``, the lane halves and the tile's columns), then
+        the tiles' pairs combined in tile order -- the sum exactly as the
+        plain round would (bitwise the mean of the two-round form), the
+        second moments by Chan's update.  Returns the sum; the variance
+        reduce reads ``fused_m2``."""
+        mean = self.bind("md_s", f"{total} / cutlass.Float32({width}.0)")
+        squares = []
+        for value in values:
+            deviation = self.bind("md_s", f"{value} - {mean}")
+            squares.append(self.bind("md_s", f"{deviation} * {deviation}"))
+        m2 = self.emit_tree_sum(squares)
+        if self.half_cols(frag_slot):
+            m2 = self.bind("md_s", f"{m2} + cute.arch.shuffle_sync_bfly({m2}, 16)")
+        sums, moments = self.emit_split_exchange([total, m2], frag_slot)
+        s_run, m2_run, n_run = sums[0], moments[0], width
+        for tile in range(1, len(sums)):
+            n_new = n_run + width
+            mean_run = self.bind("md_s", f"{s_run} / cutlass.Float32({n_run}.0)")
+            mean_tile = self.bind("md_s", f"{sums[tile]} / cutlass.Float32({width}.0)")
+            delta = self.bind("md_s", f"{mean_tile} - {mean_run}")
+            coefficient = n_run * width / n_new
+            m2_run = self.bind(
+                "md_s",
+                f"{m2_run} + {moments[tile]} + {delta} * {delta} "
+                f"* cutlass.Float32({coefficient!r})",
+            )
+            s_run = self.bind("md_s", f"{s_run} + {sums[tile]}")
+            n_run = n_new
+        self.fused_m2 = m2_run
+        return s_run
+
+    def emit_tree_sum(self, values: Sequence[str]) -> str:
+        """A pairwise tree over ``values`` (eight dependent adds for 256
+        columns instead of 255: the serial chain was ~0.5 us of a 128-row
+        epilogue's pass at one CTA per SM)."""
+        level = list(values)
+        while len(level) > 1:
+            level = [
+                self.bind("md_s", f"{level[i]} + {level[i + 1]}")
+                if i + 1 < len(level)
+                else level[i]
+                for i in range(0, len(level), 2)
+            ]
+        return level[0]
+
+    def emit_fixup_exchange(
+        self, partials: Sequence[str], frag_slot: int
+    ) -> list[list[str]]:
+        """A round through the fixup workspace: the owner lanes store the
+        rows' partials (one slab each), thread 0 arrives on the row tile's
+        counter behind a CTA barrier (release; the first arrival's ticket
+        fixes this launch's base) and spins until the T tiles of this round
+        arrived (acquire), then every thread reads the T partials of its
+        row from L2 (``ld.global.cg``, never a stale L1 line)."""
+        tiles = self.plan.cluster
+        rounds = self.split_rounds
+        index = self.fixup_round
+        self.fixup_round += 1
+        assert index < rounds, (index, rounds)
+        rows = self.slot(frag_slot).rows
+        assert rows == self.fixup_rows
+        row = self.row_var(frag_slot)
+        bases = []
+        for partial in partials:
+            slab = self.fixup_slab
+            self.fixup_slab += 1
+            assert slab < self.fixup_slabs
+            # The slab's partials of this row tile: [n tile][row] fp32.
+            base = self.bind(
+                "md_fx",
+                f"{FIXUP_WORKSPACE_PARAM} + cutlass.Int64({slab} * md_rows + md_mtile) "
+                f"* {tiles * rows * 4}",
+            )
+            with self.block("if md_lane < 16:" if self.half_rows(frag_slot) else None):
+                self.emit(
+                    f"{_RUNTIME}.stg_f32({base} + cutlass.Int64(md_crank * {rows} + {row}) * 4, {partial})"
+                )
+            bases.append(base)
+        self.emit(self.sync)
+        counter = self.bind(
+            "md_fc",
+            f"{FIXUP_WORKSPACE_PARAM} + cutlass.Int64(md_rows) "
+            f"* {self.fixup_slabs * tiles * rows * 4} + cutlass.Int64(md_mtile) * 4",
+        )
+        # The CTA barrier orders every thread's partial store before thread
+        # 0's release arrival (release cumulativity: CUTLASS's barrier
+        # arrives the same way, without a fence).  The counter is unsigned
+        # and never reset: every launch advances it by ``period`` (the
+        # arrivals rounded up to a power of two, the last arrival padding
+        # the rest), so the launch's base is the ticket with the period's
+        # low bits cleared however often the counter wrapped, and a round
+        # is reached when ``counter - target`` (mod 2^32) is below 2^31.
+        arrivals = rounds * tiles
+        period = 1 << (arrivals - 1).bit_length()
+        with self.nest("if md_tidx == 0:"):
+            ticket = self.bind("md_ft", f"{_RT}.atom_add_release_gpu_u32({counter}, 1)")
+            if index == 0:
+                self.emit(
+                    f"md_gen = {ticket} & cutlass.Uint32({(~(period - 1)) & 0xFFFFFFFF})"
+                )
+            if index == rounds - 1 and period > arrivals:
+                with self.nest(
+                    f"if {ticket} == md_gen + cutlass.Uint32({arrivals - 1}):"
+                ):
+                    self.emit(
+                        f"{_RT}.atom_add_release_gpu_u32({counter}, {period - arrivals})"
+                    )
+            self.emit(
+                f"{_RT}.spin_until_reached_acquire_gpu_u32({counter}, "
+                f"md_gen + cutlass.Uint32({(index + 1) * tiles}))"
+            )
+        self.emit(self.sync)
+        return [
+            [
+                self.bind(
+                    "md_s",
+                    f"{_RT}.ldcg_f32({base} + cutlass.Int64({tile * rows} + {row}) * 4)",
+                )
+                for tile in range(tiles)
+            ]
+            for base in bases
+        ]
+
+    def emit_cluster_exchange(
+        self, partials: Sequence[str], frag_slot: int
+    ) -> list[list[str]]:
+        """A round through distributed shared memory: every thread pushes
+        its row's partials into the exchange buffers of every CTA of the
+        cluster (``st.async`` completing bytes on the peer's barrier of this
+        round's parity; one thread expects the cluster's bytes on its own),
+        waits for its own barrier (every peer's partials landed) and reads
+        the ranks' values from local shared memory."""
+        cluster = self.plan.cluster
+        rows = self.slot(frag_slot).rows
+        row = self.row_var(frag_slot)
+        index = self.cluster_round
+        self.cluster_round += 1
+        copies = len(partials)
+        # A single-partial round alternates the two buffer halves by round
+        # parity (the wait for round r+1 proves every peer read round r);
+        # the fused pair's round (the only one) takes both halves.
+        first = (index % 2) if copies == 1 else 0
+        region = CLUSTER_EXCHANGE_COPIES * SCRATCH_ENTRIES * 4
+        if (first + copies) * cluster * rows * 4 > region:
+            raise _decline(
+                f"{copies} partials of {rows} rows over {cluster} CTAs exceed the "
+                "cluster exchange buffers"
+            )
+        buffers = [
+            self.bind(
+                "md_cx",
+                f"{self.cluster_exchange_base()} + {(first + copy) * cluster * rows * 4}",
+            )
+            for copy in range(copies)
+        ]
+        barrier = self.bind("md_cxb", f"md_clb + {index % 2}")
+        with self.nest("if md_tidx == 0:"):
+            self.emit(
+                f"{_PRIMS}.mbarrier_arrive_expect_tx({barrier}, {copies * cluster * rows * 4})"
+            )
+        # One push per row: the lanes 16-31 of a 64-row fragment hold the
+        # rows of lanes 0-15 (the same total, or idle copies), and every
+        # pushed word counts against the peers' expected bytes.  Those lanes
+        # read the buffers of every round but push against none: the warp
+        # barrier orders their reads of the previous round that used this
+        # half ahead of this warp's pushes (a peer pushes into the half
+        # again only after waiting for the round these pushes complete).
+        if self.half_rows(frag_slot) and index >= 2:
+            self.emit("cute.arch.sync_warp()")
+        with self.block("if md_lane < 16:" if self.half_rows(frag_slot) else None):
+            for buffer, partial in zip(buffers, partials, strict=True):
+                for rank in range(cluster):
+                    self.emit(
+                        f"{_RT}.st_async_remote_f32({buffer} + (md_crank * {rows} + {row}) * 4, "
+                        f"md_clb_addr + {(index % 2) * 8}, {rank}, {partial})"
+                    )
+        self.emit(f"{_RT}.mbar_wait_cluster({barrier}, {(index // 2) & 1})")
+        return [
+            [
+                self.bind(
+                    "md_s",
+                    f"{_RUNTIME}.lds_f32({buffer} + ({rank * rows} + {row}) * 4)",
+                )
+                for rank in range(cluster)
+            ]
+            for buffer in buffers
+        ]
+
     @property
     def epilogue_sync(self) -> str:
         return (
@@ -2230,6 +2764,20 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         if tile is None:
             super().emit_derived_access_prefetch(step, access)
             return
+        if (
+            not tile.ring
+            and tile.owner_key is None
+            and tile.tma is not None
+            and tile.key not in self.settled
+            and self.tc.staged_tx.get(tile.frame)
+        ):
+            # An epilogue tile of the fixed region: its TMA landed on the
+            # root's staged barrier (issued ahead of the loops; a wait on a
+            # completed phase returns at once).
+            self.emit(
+                f"{_RT}.mbar_wait({self.sf_name(tile.frame)}, {self.staged_phase(tile.frame)})"
+            )
+            self.settled.add(tile.key)
         if (
             not tile.ring
             and tile.owner_key is not None
@@ -2332,7 +2880,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             else:
                 axis = subscript.axis
                 assert axis is not None
-                if axis.kind == AXIS_RDIM:
+                if axis.kind == AXIS_RDIM and not self.is_split_axis(axis):
                     value = "0"
                 elif axis.kind == AXIS_LOOP:
                     offset = self.axis_offset(axis, values[axis.loop])
@@ -2686,13 +3234,19 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                         continue
                     spec = self.tc.store_tma[store.access.node]
                     base = self.staging_base(store, parity).replace("md_s0 + ", "", 1)
-                    coords = ", ".join(
-                        self.region_tma_coords(spec, cast("dict[int, str]", values), 0)
-                    )
-                    self.emit(
-                        f"{_PRIMS}.cp_async_bulk_tensor_global_shared_cta({spec.param}.get_ptr(), "
-                        f"md_smem + ({base}), [{coords}])"
-                    )
+                    for slab in range(spec.slabs):
+                        coords = ", ".join(
+                            self.region_tma_coords(
+                                spec, cast("dict[int, str]", values), slab
+                            )
+                        )
+                        slab_base = (
+                            f"{base} + {slab * spec.slab_bytes}" if slab else base
+                        )
+                        self.emit(
+                            f"{_PRIMS}.cp_async_bulk_tensor_global_shared_cta({spec.param}.get_ptr(), "
+                            f"md_smem + ({slab_base}), [{coords}])"
+                        )
                 self.emit(f"{_PRIMS}.cp_async_bulk_commit_group()")
         self.drains = []
 
@@ -2760,6 +3314,11 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         if step.vec is not None:
             self.emit_scalar_reduce(step)
             return
+        fused = self.fused_variance
+        if fused is not None and step is fused[1]:
+            # The variance: its second moments went with the sum's round.
+            self.emit(f"{self.vreg(step.slot)} = {self.fused_m2}")
+            return
         assert step.frag is not None
         frag_slot = program.frag_slots[step.frag]
         if frag_slot not in loaded:
@@ -2773,13 +3332,17 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             values.append(self.evaluator.evaluate(step.value, coords))
         self.evaluator.reg = None
         if step.orient == "rows":
-            total = values[0]
-            for value in values[1:]:
-                total = self.bind("md_s", f"{total} + {value}")
+            total = self.emit_tree_sum(values)
             if self.half_cols(frag_slot):
                 total = self.bind(
                     "md_s", f"{total} + cute.arch.shuffle_sync_bfly({total}, 16)"
                 )
+            if self.is_split_axis(program.slots[frag_slot][1]):
+                if fused is not None and step is fused[0]:
+                    total = self.emit_fused_variance(total, values, frag_slot, fused[2])
+                else:
+                    (tiles,) = self.emit_split_exchange([total], frag_slot)
+                    total = self.emit_ordered_sum(tiles)
             self.emit(f"{self.vreg(step.slot)} = {total}")
             return
         # Column sums: the lanes holding the warp's rows meet by shuffles
@@ -2857,10 +3420,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
 
     def emit_vec_op(self, step: VecOp) -> None:  # type: ignore[override]
         self.hoist_scalars(step.node)
-        self.evaluator.vec_reg = (0, 0)
         coords = self.vector_coords(step.node, step.slot)
         value = self.evaluator.define(step.node, coords)
-        self.evaluator.vec_reg = None
         self.emit(f"{self.vreg(step.slot)} = {value}")
 
     def emit_vec_store(self, step: VecStore) -> None:  # type: ignore[override]
@@ -2870,10 +3431,8 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.hoist_scalars(step.value)
         owner = self.vec_owner(slot)
         with self.block(f"if {owner}:" if owner else None):
-            self.evaluator.vec_reg = (0, 0)
             coords = self.vector_coords(step.value, slot)
             value = self.evaluator.evaluate(step.value, coords)
-            self.evaluator.vec_reg = None
             element = ["0"] * len(access.dims)
             if positions:
                 element[positions[0]] = self.vec_row(slot)
@@ -2965,7 +3524,12 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                                 coords[positions[0]] = self.row_var(slot)
                                 coords[positions[1]] = self.col_expr(slot, col)
                                 address = self.address(init, tuple(coords))
-                                lo, hi = self.pair_load(address, init.dtype, paired)
+                                lo, hi = self.pair_load(
+                                    address,
+                                    init.dtype,
+                                    paired,
+                                    readonly=self.readonly(init),
+                                )
                                 self.emit(f"{name}[{j}] = cutlass.Float32({lo})")
                                 self.emit(f"{name}[{j + 1}] = cutlass.Float32({hi})")
                     self.emit_carry_registers(name, slot, chunk)
@@ -3094,6 +3658,17 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # staged tiles, staging and exchange tiles): they convert here, with
         # the prologue in flight.
         self.settle_keys({tile.key for tile in self.pending_root_raw()}, region)
+        streaming = index in self.streaming_loops
+        if streaming:
+            # The carries' seeds (tcgen05.st by the epilogue warps) and the
+            # enclosing regions' tensor-memory writes are ordered before
+            # the loop's MMAs once, here, instead of behind a barrier per
+            # iteration; an earlier batch's commit is waited the same way.
+            self.wait_latest()
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)"
+            )
+            self.emit(self.sync)
         with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
             self.values[index] = var
             if loop.innermost:
@@ -3103,6 +3678,13 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             if index in self.counted:
                 self.emit(f"{self.counter(index)} = {self.counter(index)} + 1")
             del self.values[index]
+        if streaming:
+            # One commit tracks every MMA of the loop: the epilogue (and a
+            # following loop) waits for it as for any batch.
+            with self.nest("if md_warp == 0:"):
+                self.emit_commit()
+            self.emit("md_cn = md_cn + 1")
+            self.waited = False
         self.forget_iteration_bases(index)
         self.evaluator = _PassEvaluator(self)
         self.waited = False
@@ -3116,6 +3698,15 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.written = {key for key in self.written if key in self.root_written}
         self.emit_tma_store_wait(read=True)
         self.emit(self.sync)
+        if self.pdl and region < 0 and self.last_root_loop(loop):
+            # The dependents may launch (their pre-wait prologue overlaps
+            # this kernel's epilogue; their wait still covers every write).
+            self.emit("cute.arch.griddepcontrol_launch_dependents()")
+
+    def last_root_loop(self, loop: Loop) -> bool:
+        """Whether ``loop`` is the last top-level loop of the program."""
+        loops = [step for step in self.program.body if isinstance(step, Loop)]
+        return bool(loops) and loops[-1] is loop
 
     def enter_iteration(self, loop: Loop) -> None:  # type: ignore[override]
         var = self.loop_index_var(loop.index)
@@ -3135,11 +3726,66 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         for tile in self.tc.staged_tiles.get(loop.index, ()):
             self.settled.discard(tile.key)
 
+    def emit_streaming_iteration(
+        self, loop: Loop, begin: str, end: str, trip: int | None
+    ) -> None:
+        """One iteration of a ``streaming_loop``, two warps: warp 0 (the
+        consumer) waits for the iteration's ring slot, issues the batch and
+        commits it to the slot's empty barrier; warp 1 (the producer) waits
+        for the commit of the iteration that read the slot of iteration ``i
+        + stages - 1`` and refills it.  The two chains of waits and issues
+        overlap instead of following each other in one thread.  No other
+        warp takes part: they meet at the barrier after the loop."""
+        tc = self.tc
+        index = loop.index
+        var = self.loop_index_var(index)
+        self.enter_iteration(loop)
+        self.ring_waited = set()
+        dots = [step for step in loop.steps if isinstance(step, Dot)]
+        count = self.counter(index)
+        stages = tc.stages
+        with self.nest("if md_warp == 0:"):
+            self.emit(
+                f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"
+            )
+            self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
+            for dot in dots:
+                self.emit_dot_mmas(dot, self.stage_expr(index), accumulate=True)
+                self.defined.add(dot.node)
+            with self.nest(f"if {_PRIMS}.elect_sync():"):
+                self.emit(
+                    f"{_PRIMS}.tcgen05_commit(md_empty{index} + md_st{index}, "
+                    f"group={_PRIMS}.CTAGroup.CTA_1)"
+                )
+        ahead = stages - 1
+        offset = var if begin == "0" else f"({var} - {begin})"
+        with (
+            self.nest("if md_warp == 1:"),
+            self.nest(f"if {offset} + {ahead} < {end} - {begin}:"),
+            self.nest(f"if {_PRIMS}.elect_sync():"),
+        ):
+            # The slot of iteration ``count + ahead`` is the one iteration
+            # ``count - 1`` read: its commit's phase is ``(count - 1) //
+            # stages`` (the first use of a slot waits for the phase before a
+            # fresh barrier's, which completes at once).
+            self.emit(
+                f"{_RT}.mbar_wait(md_empty{index} + ({count} + {stages - 1}) % {stages}, "
+                f"(({count} + {stages - 1}) // {stages} + 1) & 1)"
+            )
+            self.emit_ring_issue(
+                index,
+                {**self.values, index: f"({var} + {ahead})"},
+                f"{count} + {ahead}",
+            )
+
     def emit_ring_iteration(
         self, loop: Loop, begin: str, end: str, trip: int | None
     ) -> None:
         tc, program = self.tc, self.program
         index = loop.index
+        if index in self.streaming_loops:
+            self.emit_streaming_iteration(loop, begin, end, trip)
+            return
         var = self.loop_index_var(index)
         self.enter_iteration(loop)
         self.ring_waited = set()
@@ -3376,6 +4022,15 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     self.emit(f"md_cb{index} = (md_lane // 16) * {slot.cols // 2}")
         if 128 in heights:
             self.emit("md_row128 = (md_warp % 4) * 32 + md_lane")
+        if self.fixup:
+            # The fixup grid's coordinates: the N tile and the row tile of
+            # this CTA, the row tile count (the workspace's extent), and
+            # this launch's arrival base (set by the first exchange round).
+            tiles = self.plan.cluster
+            self.emit(f"md_crank = cutlass.Int32(cute.arch.block_idx()[0]) % {tiles}")
+            self.emit(f"md_mtile = cutlass.Int32(cute.arch.block_idx()[0]) // {tiles}")
+            self.emit(f"md_rows = cutlass.Int32(cute.arch.grid_dim()[0]) // {tiles}")
+            self.emit("md_gen = cutlass.Uint32(0)")
         self.define_axis_bases()
         self.emit(
             f"md_smem = cute.arch.alloc_smem(cutlass.Uint8, {max(self.smem_bytes, 16)}, alignment={SLAB_ALIGNMENT})"
@@ -3387,6 +4042,12 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             self.emit(
                 f"md_full{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
             )
+        for loop in sorted(self.streaming_loops):
+            # Per-slot "empty" barriers: the batch that read a ring slot
+            # commits to it, the refill of the slot waits for it.
+            self.emit(
+                f"md_empty{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
+            )
         staged_regions = sorted(region for region, tx in tc.staged_tx.items() if tx)
         for region in staged_regions:
             self.emit(
@@ -3394,12 +4055,27 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             )
             barriers.append(self.sf_name(region))
         self.emit("md_tslot = cute.arch.alloc_smem(cutlass.Int32, 1, alignment=4)")
+        cluster_reduces = self.cluster_reduces
+        if cluster_reduces:
+            # The cluster barriers of the row-sum exchanges, one per round
+            # parity (the rounds are static, ``cluster_round``): the one
+            # arrival is the local expect-tx, the transactions the peers'
+            # pushed partials.
+            self.emit("md_clb = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)")
+            self.emit("md_clb_addr = cutlass.Int32(md_clb.toint())")
+            self.emit("md_crank = cutlass.Int32(cute.arch.block_idx()[1])")
         with self.nest("if md_tidx == 0:"):
             for name in barriers:
                 self.emit(f"{_PRIMS}.mbarrier_init({name}, 1)")
             for loop in self.ring_loops:
                 for stage in range(tc.stages):
                     self.emit(f"{_PRIMS}.mbarrier_init(md_full{loop} + {stage}, 1)")
+            for loop in sorted(self.streaming_loops):
+                for stage in range(tc.stages):
+                    self.emit(f"{_PRIMS}.mbarrier_init(md_empty{loop} + {stage}, 1)")
+            if cluster_reduces:
+                self.emit(f"{_PRIMS}.mbarrier_init(md_clb, 1)")
+                self.emit(f"{_PRIMS}.mbarrier_init(md_clb + 1, 1)")
             self.emit(f"{_PRIMS}.fence_mbarrier_init()")
             self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
         with self.nest("if md_warp == 0:"):
@@ -3410,6 +4086,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 f"{_PRIMS}.tcgen05_relinquish_alloc_permit(group={_PRIMS}.CTAGroup.CTA_1)"
             )
         self.emit(self.sync)
+        if cluster_reduces:
+            # Every peer's barrier is initialized before any remote arrival.
+            self.emit("cute.arch.cluster_arrive_relaxed()")
+            self.emit("cute.arch.cluster_wait()")
         self.emit("md_tmem = cute.make_tensor(md_tslot, cute.make_layout((1,)))[0]")
         for index, slot in enumerate(tc.slots):
             self.emit(
@@ -3421,6 +4101,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             # epilogue warps' assignments keep their type across the loops).
             for _chunk, _j, scalar in self.resident_names(slot):
                 self.emit(f"{scalar} = cutlass.Float32(0.0)")
+        if self.pdl:
+            # Every global memory access follows this wait; the prologue
+            # above overlapped the previous kernel in the stream.
+            self.emit("cute.arch.griddepcontrol_wait()")
         self.define_bases()
         for access in program.accesses:
             self.tensor_names[access.node] = self.df.tensor_arg(
@@ -3447,7 +4131,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     self.emit(f"{_PRIMS}.prefetch_tensormap({spec.param}.get_ptr())")
                 if tc.staged_tx.get(-1):
                     self.emit_tma_group(
-                        tc.staged_tiles[-1], {}, self.sf_name(-1), tc.staged_tx[-1], "0"
+                        [
+                            *tc.staged_tiles.get(-1, ()),
+                            *(t for t in tc.aux_tiles.get(-1, ()) if not t.ring),
+                        ],
+                        {},
+                        self.sf_name(-1),
+                        tc.staged_tx[-1],
+                        "0",
                     )
         self.emit(self.sync)
         self.emit_region(program.body, -1)
@@ -3459,6 +4150,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.wait_latest()
         self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.BEFORE_THREAD_SYNC)")
         self.emit(self.sync)
+        if cluster_reduces:
+            # No CTA exits while a peer may still read its exchange buffer.
+            self.emit("cute.arch.cluster_arrive()")
+            self.emit("cute.arch.cluster_wait()")
         with self.nest("if md_warp == 0:"):
             self.emit(
                 f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)"

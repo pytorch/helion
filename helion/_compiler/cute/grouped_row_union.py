@@ -168,19 +168,49 @@ def resident_ctas_supported(value: object, shared_capacity: int) -> bool:
     )
 
 
-def index_domain(groups: int, m: int, n: int, k: int) -> bool:
+LEGACY_BLOCKS = (128, 64, 128)
+# One-CTA dense tiles the legacy carrier may also run: the UMMA M of 64 or
+# 128 rows, N tiles of 16..64 columns and K steps of 64 or 128. Smaller tiles
+# spread a small grouped problem over more CTAs and shrink the per-CTA operand
+# loads and predicated epilogue, which is what bounds the one-K-step shapes.
+LEGACY_BLOCK_M = (64, 128)
+LEGACY_BLOCK_N = (16, 32, 64)
+LEGACY_BLOCK_K = (64, 128)
+
+
+def legacy_blocks_supported(blocks: tuple[int, int, int]) -> bool:
+    bm, bn, bk = blocks
+    return (
+        type(bm) is int
+        and type(bn) is int
+        and type(bk) is int
+        and bm in LEGACY_BLOCK_M
+        and bn in LEGACY_BLOCK_N
+        and bk in LEGACY_BLOCK_K
+    )
+
+
+def index_domain(
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    blocks: tuple[int, int, int] = LEGACY_BLOCKS,
+) -> bool:
     """Bound every dense tile/address expression; offsets retain Int32 wrap."""
     limit = (1 << 31) - 1
+    bm, bn, bk = blocks
     return (
         all(type(value) is int and 0 < value <= limit for value in (groups, m, n, k))
-        and m % 128 == n % 64 == k % 128 == 0
+        and legacy_blocks_supported(blocks)
+        and m % bm == n % bn == k % bk == 0
         and m * k <= limit
         and m * n <= limit
         and k * n <= limit
-        and m + 127 <= limit
-        and n + 63 <= limit
+        and m + bm - 1 <= limit
+        and n + bn - 1 <= limit
         # PID decomposition still names the original group axis, fixed to zero.
-        and groups * (m // 128) * (n // 64) <= limit
+        and groups * (m // bm) * (n // bn) <= limit
     )
 
 
@@ -219,10 +249,10 @@ def schedule_supported(
         "tcgen05_diagnostic_invalid_output": False,
     }
     profile = physical_schedule(config)
-    expected_blocks = (128, 64, 128)
+    expected_blocks = blocks if legacy_blocks_supported(blocks) else LEGACY_BLOCKS
     allowed_layout_keys: tuple[str, ...] = ()
     if profile is not None:
-        expected_blocks = (128, 64, 128)
+        expected_blocks = LEGACY_BLOCKS
         if blocks == profile.source_tile:
             expected_blocks = profile.source_tile
             fixed.update(profile.codegen_values())

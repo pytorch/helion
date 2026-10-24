@@ -38,6 +38,7 @@ from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Collection
     import contextlib
 
     from torch._inductor.ops_handler import OpsHandler
@@ -1641,8 +1642,16 @@ def _rank3_rhs_grouped_nt_can_use_specialized_mma(
 def _specialized_mma_root_mn_block_ids(
     candidate: _CuteMmaNode,
     config: Config,
+    *,
+    inactive_root_block_ids: Collection[int] = (),
 ) -> tuple[int, int] | None:
-    """Return exact root-grid matrix axes for an analyzed MMA candidate."""
+    """Return exact root-grid matrix axes for an analyzed MMA candidate.
+
+    ``inactive_root_block_ids`` names root axes whose elements the body never
+    observes (a split-K outer K tile that only supplies the inner loop's
+    begin/end/id).  The exact fp32 SIMT GEMM owns the remaining axes; every
+    other lowering keeps requiring the root to be exactly the output tile.
+    """
     from .compile_environment import CompileEnvironment
     from .host_function import HostFunction
 
@@ -1650,8 +1659,24 @@ def _specialized_mma_root_mn_block_ids(
     if len(device_ir.grid_block_ids) != 1:
         return None
     operands = candidate.operands
-    if tuple(device_ir.grid_block_ids[0]) != operands.output_block_ids:
-        return None
+    root_block_ids = tuple(device_ir.grid_block_ids[0])
+    if root_block_ids != operands.output_block_ids:
+        from .cute.mma_support import cute_fp32_dot_uses_tf32
+        from .cute.simt_gemm import simt_mma_requested
+
+        if (
+            not simt_mma_requested(config)
+            or operands.lhs.source_fake.dtype != torch.float32
+            or cute_fp32_dot_uses_tf32()
+        ) or (
+            tuple(
+                block_id
+                for block_id in root_block_ids
+                if block_id not in inactive_root_block_ids
+            )
+            != operands.output_block_ids
+        ):
+            return None
     if (leading_id := operands.leading_passthrough_block_id) is not None:
         block_size = (
             CompileEnvironment.current().block_sizes[leading_id].from_config(config)

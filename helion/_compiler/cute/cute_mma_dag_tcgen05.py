@@ -89,6 +89,7 @@ from .cute_mma_dag import AXIS_RDIM
 from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_K_STEP
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
+from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
 from .cute_mma_dag import MMA_DAG_TCGEN05
@@ -213,6 +214,11 @@ _DESC_SWIZZLE = {
     ATOM_32B_SWIZZLE: "SWIZZLE_128B_ATOM_32B",
 }
 _RT = "_helion_mma_dag_tc"
+# The fixup split's workspace parameter (``helion_mma_dag_fixup``).
+FIXUP_WORKSPACE_PARAM = "md_ws"
+# Side vectors read in 16-byte packets by the region renderer's epilogue.
+_PACKET_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_STATIC_COLUMN = re.compile(r"^(?:\((md_cb\d+) \+ )?(\d+)\)?$")
 _PRIMS = f"{_RT}.prims"
 _PREAMBLE = f"import helion._compiler.cute._mma_dag_tcgen05_runtime as {_RT}\n"
 REGION_LOOP = "loop"
@@ -358,7 +364,25 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
     target = env.config_spec.target_device_capability
     if target is None or target[0] != 10:
         return None
-    if not program.simple:
+    from .cute_mma_dag import cluster_split_axis
+
+    vector_steps = (*program.reduces, *program.vec_ops, *program.vec_stores)
+    split = cluster_split_axis(program)
+    if (
+        not program.simple
+        or (vector_steps and all(step.loop < 0 for step in vector_steps))
+        or (split is not None and split.extent > TCGEN05_MAX_N)
+        or any(step.loop < 0 for step in program.derived)
+        or any(loop.tile_end is not None for loop in program.loops)
+    ):
+        # The region renderer lowers the general shapes, a single-loop
+        # program whose epilogue has vector values (row sums and the vector
+        # ops / stores over them: a GEMM with a layer-norm epilogue) or
+        # epilogue derived values the emitter below has no place for, a
+        # full-slice fragment axis wider than one tcgen05 tile, which only
+        # the renderer's cluster split (``cute_mma_dag_cluster``) can hold,
+        # and the varying-bound loops (per-CTA trip counts).  Vector values
+        # inside the loop stay declined.
         from .cute_mma_dag_tcgen05_regions import region_facts
 
         return region_facts(program)
@@ -372,11 +396,6 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         output = program.resolve(carry.output)
         if output is not carry.placeholder and program.frag_slots[output] != carry.slot:
             return None
-    # This emitter's epilogue issues dots and stores only: a derived value
-    # there (a pointwise value over a fragment and a 2-D tile input) would
-    # be dropped, its store staging the input fragment instead.
-    if any(step.loop < 0 for step in program.derived):
-        return None
     # The single-loop emitter packs 16-bit operands only (tf32 dots take the
     # region renderer).
     if any(
@@ -395,6 +414,9 @@ def tcgen05_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
     # without the reduction, the load or the store).
     if program.reduces or program.vec_ops or program.vec_stores or program.vec_leaves:
         return None
+    # This emitter's epilogue issues dots and stores only: a derived value
+    # there (a pointwise value over a fragment and a 2-D tile input) would
+    # be dropped, its store staging the input fragment instead.
     tiles: list[Tcgen05TileFacts] = []
     exchanges: list[Tcgen05ExchangeFacts] = []
     seen: set[tuple[object, ...]] = set()
@@ -613,6 +635,12 @@ def tcgen05_config_reason(
     tc = facts.tcgen05
     if tc is None:
         return f"the kernel or the target does not admit {MMA_DAG_TCGEN05}"
+    if (
+        facts.split_axis >= 0
+        and resolved[facts.split_axis] != facts.axes[facts.split_axis].extent
+        and not tc.regions
+    ):
+        return "the cluster split of a full-slice axis needs the region renderer"
     for rows, cols in facts.frags:
         bm, bn = resolved[rows], resolved[cols]
         if bm not in TCGEN05_M_CHOICES:
@@ -714,10 +742,42 @@ def region_iterations(
 
 def _ladder_for(facts: CuteMmaDagFacts, index: int) -> tuple[int, ...]:
     """The seed ladder of tunable axis ``index``: fragment rows take the
-    {64, 128} M ladder, everything else the N ladder."""
+    {64, 128} M ladder, the cluster-split axis its per-CTA slices (the
+    extent over every cluster size), everything else the N ladder."""
+    if index == facts.split_axis:
+        from .cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
+        from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
+
+        # The slices of a portable cluster (every seed also gets a fixup
+        # twin at the same slice; the wider fixup splits are the search's).
+        extent = facts.axes[index].extent
+        return tuple(
+            extent // cluster
+            for cluster in MMA_DAG_CLUSTER_CHOICES
+            if cluster <= MMA_DAG_CLUSTER_MAX and extent % cluster == 0
+        )
     if any(rows == index for rows, _cols in facts.frags):
         return TCGEN05_TILE_LADDER
     return TCGEN05_N_LADDER
+
+
+def _tunable_axes(facts: CuteMmaDagFacts) -> list[tuple[int, AxisFacts]]:
+    """The axes a tcgen05 seed / repair chooses sizes for: the root and
+    loop tiles and the cluster-split axis's per-CTA slice."""
+    return [
+        (index, axis)
+        for index, axis in enumerate(facts.axes)
+        if axis.kind in (AXIS_ROOT, AXIS_LOOP) or index == facts.split_axis
+    ]
+
+
+def _fixed_sizes(facts: CuteMmaDagFacts) -> dict[int, int]:
+    """The block sizes of the other axes: one row per lead, the extent."""
+    return {
+        axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
+        for index, axis in enumerate(facts.axes)
+        if axis.kind not in (AXIS_ROOT, AXIS_LOOP) and index != facts.split_axis
+    }
 
 
 def tcgen05_repair(
@@ -734,19 +794,14 @@ def tcgen05_repair(
     tc = facts.tcgen05
     if tc is None:
         return None
-    tunable = [
-        (index, axis)
-        for index, axis in enumerate(facts.axes)
-        if axis.kind in (AXIS_ROOT, AXIS_LOOP)
-    ]
-    current: dict[int, int] = {
-        axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
-        for axis in facts.axes
-        if axis.kind not in (AXIS_ROOT, AXIS_LOOP)
-    }
-    for _index, axis in tunable:
+    tunable = _tunable_axes(facts)
+    current: dict[int, int] = _fixed_sizes(facts)
+    for index, axis in tunable:
         value = sizes.get(axis.block_id)
-        current[axis.block_id] = value if type(value) is int else 64
+        if type(value) is int:
+            current[axis.block_id] = value
+        else:
+            current[axis.block_id] = axis.extent if index == facts.split_axis else 64
     warps_now = warps if warps in TCGEN05_WARP_CHOICES else TCGEN05_DEFAULT_WARPS
     stages_now = stages if stages in MMA_DAG_STAGE_CHOICES else TCGEN05_DEFAULT_STAGES
     assert type(warps_now) is int and type(stages_now) is int
@@ -800,8 +855,8 @@ def tcgen05_persistent_ctas(
         smem, facts.smem_capacity, tmem, max(MMA_DAG_PERSISTENT_CHOICES)
     )
     grid = facts.grid_blocks
-    for axis, size in zip(facts.axes, resolved, strict=True):
-        if axis.kind == AXIS_ROOT:
+    for index, (axis, size) in enumerate(zip(facts.axes, resolved, strict=True)):
+        if axis.kind == AXIS_ROOT or index == facts.split_axis:
             grid *= axis.extent // size
     if not facts.sm_count or grid < 2 * ctas * facts.sm_count:
         return 0
@@ -829,16 +884,8 @@ def tcgen05_seed_configs(
     tc = facts.tcgen05
     if tc is None:
         return []
-    tunable = [
-        (index, axis)
-        for index, axis in enumerate(facts.axes)
-        if axis.kind in (AXIS_ROOT, AXIS_LOOP)
-    ]
-    fixed = {
-        axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
-        for axis in facts.axes
-        if axis.kind not in (AXIS_ROOT, AXIS_LOOP)
-    }
+    tunable = _tunable_axes(facts)
+    fixed = _fixed_sizes(facts)
     ladders = [
         [tile for tile in _ladder_for(facts, index) if axis.extent % tile == 0]
         for index, axis in tunable
@@ -904,8 +951,11 @@ def tcgen05_seed_configs(
             root_area = 1
             root_perimeter = 0
             loop_area = 1
-            for (_index, axis), tile in zip(tunable, choice, strict=True):
-                if axis.kind == AXIS_ROOT:
+            for (index, axis), tile in zip(tunable, choice, strict=True):
+                if index == facts.split_axis:
+                    # The cluster's CTAs each take a slice of the axis.
+                    ctas *= axis.extent // tile
+                elif axis.kind == AXIS_ROOT:
                     ctas *= axis.extent // tile
                     root_area *= tile
                     root_perimeter += tile
@@ -957,6 +1007,8 @@ def tcgen05_seed_configs(
                     stages,
                     loop_area,
                     -warps,
+                    # A cluster split's slices (equal otherwise): more CTAs.
+                    ctas,
                 )
             elif chain:
                 waves = -(-ctas // facts.sm_count) if facts.sm_count else 1
@@ -974,6 +1026,64 @@ def tcgen05_seed_configs(
             ranked.append((rank, (sizes, warps, stages)))
     ranked.sort(key=operator.itemgetter(0), reverse=True)
     return [seed for _rank, seed in ranked]
+
+
+def tcgen05_corner_seeds(
+    facts: CuteMmaDagFacts,
+    ranked: Sequence[tuple[dict[int, int], int, int]],
+    seeded: Sequence[tuple[dict[int, int], int, int]],
+) -> list[tuple[dict[int, int], int, int]]:
+    """The opposite corner of the ranked seeds' tile / warp / stage box for
+    a region program: for each of the first two fragment-row tiles in
+    ``ranked``, the largest column tile at the most warps and the fewest
+    stages (the highest-ranked such entry), minus those in ``seeded``.
+
+    The ranking's priors all pull one way -- small column tiles for the CTA
+    count, four warps, a two-stage ring -- and the autotuner's polish moves
+    one knob at a time.  Where the priors are wrong they tend to be wrong
+    together (chunk_scan at s2: [128, 64, 64] at eight warps and one stage
+    runs 13.8 us against 14.3 for the four-warp two-stage form and 38 for
+    the 16-column tile; both single-knob neighbours of the ranked form are
+    slower than it), so the far corner is seeded too and the search starts
+    from both ends of the trade-off."""
+    tc = facts.tcgen05
+    if tc is None or not tc.regions or not ranked:
+        return []
+    rows_axes = sorted({rows for rows, _cols in facts.frags})
+    root_axes = [
+        index
+        for index, axis in enumerate(facts.axes)
+        if axis.kind == AXIS_ROOT and index not in rows_axes
+    ]
+
+    def rows_key(sizes: dict[int, int]) -> tuple[int, ...]:
+        return tuple(sizes[facts.axes[index].block_id] for index in rows_axes)
+
+    def cols_area(sizes: dict[int, int]) -> int:
+        area = 1
+        for index in root_axes:
+            area *= sizes[facts.axes[index].block_id]
+        return area
+
+    corners: list[tuple[dict[int, int], int, int]] = []
+    row_tiles: list[tuple[int, ...]] = []
+    for sizes, _warps, _stages in ranked:
+        key = rows_key(sizes)
+        if key not in row_tiles:
+            row_tiles.append(key)
+        if len(row_tiles) == 2:
+            break
+    for key in row_tiles:
+        group = [entry for entry in ranked if rows_key(entry[0]) == key]
+        area = max(cols_area(entry[0]) for entry in group)
+        group = [entry for entry in group if cols_area(entry[0]) == area]
+        warps = max(entry[1] for entry in group)
+        group = [entry for entry in group if entry[1] == warps]
+        stages = min(entry[2] for entry in group)
+        corner = next(entry for entry in group if entry[2] == stages)
+        if corner not in seeded and corner not in corners:
+            corners.append(corner)
+    return corners
 
 
 # ---------------------------------------------------------------------------
@@ -1632,8 +1742,40 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
                 f"cutlass.GridConstant[{_RT}.cuda.TensorMap]"
             )
         cg.cute_wrapper_plans.append(wrapper)
-    cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
+    alias_plan = mma_dag_alias_plan(df, plan.program)
+    if getattr(emitter, "pdl", False):
+        # The renderer placed the griddepcontrol calls itself; the launcher
+        # still needs the programmatic-dependent-launch attribute.
+        alias_plan["use_pdl"] = True
+    cg.cute_wrapper_plans.append(alias_plan)
     df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
+    if plan.cluster > 1 and plan.split_mode == MMA_DAG_SPLIT_FIXUP:
+        # The fixup grid: ``cluster`` N tiles per root tile folded into the
+        # one launch dim (the N tile fastest, so a row tile's CTAs launch
+        # together), and the workspace of their row-sum exchange, allocated
+        # by the launcher (``helion_mma_dag_fixup``) and passed as an Int64
+        # pointer after the ordinary arguments.
+        from .cute_mma_dag_tcgen05_regions import _Tcgen05RegionEmitter
+
+        assert isinstance(emitter, _Tcgen05RegionEmitter)
+        df.cute_state.launch_grid_multiplier = plan.cluster
+        if emitter.split_reduces:
+            cg.cute_wrapper_plans.append(
+                {
+                    "kind": "helion_mma_dag_fixup",
+                    "param": FIXUP_WORKSPACE_PARAM,
+                    "tiles": plan.cluster,
+                    "rounds": emitter.split_rounds,
+                    "slabs": emitter.fixup_slabs,
+                    "rows": emitter.fixup_rows,
+                }
+            )
+            df.wrapper_only_params.append(FIXUP_WORKSPACE_PARAM)
+            df.wrapper_only_param_annotations[FIXUP_WORKSPACE_PARAM] = "cutlass.Int64"
+    elif plan.cluster > 1:
+        # The launch adds a trailing grid dim of ``cluster`` CTAs forming
+        # one thread-block cluster per root tile.
+        df.cute_state.grid_cluster_n = plan.cluster
 
 
 class _PassEvaluator(_Evaluator):
@@ -1702,7 +1844,66 @@ class _PassEvaluator(_Evaluator):
             return em.bind("md_v", em.typed(register, access.dtype))
         if em.recording is not None:
             em.recording.append(key)
+        packet = self._packet_load(node, access, coords)
+        if packet is not None:
+            return packet
         return super()._load(node, coords)
+
+    def _packet_load(self, node: Node, access: Access, coords: Coords) -> str | None:
+        """A loop-invariant side vector read at this thread's static columns
+        (``weight[:]`` along the fragment's columns in a row epilogue) comes
+        in 16-byte packets: the first element of a packet loads the eight
+        16-bit (four fp32) elements of its aligned group once, the others
+        read the registers.  None where the renderer has no packet cache,
+        the access varies with a loop, is not contiguous, or the column is
+        not a static local column (``(md_cb{slot} + j)`` or ``j``)."""
+        em = cast("_Tcgen05Emitter", self.emitter)
+        packets = em.side_packets
+        if packets is None or len(access.tile_dims) != 1 or em.loop_dependent(access):
+            return None
+        if access.dtype not in _PACKET_DTYPES or not em.packets_aligned(access):
+            return None
+        position = access.tile_positions[0]
+        column = coords[position]
+        match = _STATIC_COLUMN.fullmatch(column)
+        if match is None:
+            return None
+        base, j = match.group(1) or "", int(match.group(2))
+        per_packet = 16 // access.dtype.itemsize
+        if base:
+            # The half-row's first column (``md_cb{slot}``) must keep the
+            # packets aligned: a multiple of the packet's elements.
+            slot = int(base[len("md_cb") :])
+            if (em.slot(slot).cols // 2) % per_packet:
+                return None
+        first = j - j % per_packet
+        key = (
+            node,
+            base,
+            first,
+            tuple(c for p, c in enumerate(coords) if p != position),
+        )
+        values = packets.get(key)
+        if values is None:
+            start = list(coords)
+            start[position] = f"({base} + {first})" if base else str(first)
+            address = em.address(access, tuple(start))
+            words = [em.df.new_var("md_pw") for _ in range(4)]
+            em.emit(f"{', '.join(words)} = {_RUNTIME}.ldg_v4_b32({address})")
+            values = []
+            if access.dtype == torch.float32:
+                for word in words:
+                    values.append(em.bind("md_pv", f"{_RUNTIME}.bits_f32({word})"))
+            else:
+                unpack = (
+                    "unpack_f16x2" if access.dtype == torch.float16 else "unpack_bf16x2"
+                )
+                for word in words:
+                    lo, hi = em.df.new_var("md_pv"), em.df.new_var("md_pv")
+                    em.emit(f"{lo}, {hi} = {_RUNTIME}.{unpack}({word})")
+                    values.extend((lo, hi))
+            packets[key] = values
+        return values[j - first]
 
     def _lowered(self, node: Node, coords: Coords) -> str:
         import ast
@@ -1827,6 +2028,8 @@ class _Tcgen05Emitter(_Emitter):
         self.next_pid: str | None = None
         self.next_coords: dict[str, str] = {}
         self.hoists = []
+        # No aux ring in this mode; ``insert_line`` walks the anchors.
+        self.aux_anchors = {}
         self.name_depth = {}
         self.stored_storages = {
             _storage(store.access)
@@ -1846,6 +2049,10 @@ class _Tcgen05Emitter(_Emitter):
         self.early_prologues = {}
         self.early_issued = set()
         self.evaluator: _Evaluator = _PassEvaluator(self)
+        # 16-byte packets of loop-invariant side vectors keyed by (load
+        # node, half-row base, first column, other coordinates) -> the fp32
+        # element registers; None: every element loads on its own.
+        self.side_packets: dict[tuple[object, ...], list[str]] | None = None
         self.es = self.program.elem_bytes
         self.kind = "bf16" if self.program.dtype == torch.bfloat16 else "f16"
         self.sync = "cute.arch.barrier()"
@@ -1968,6 +2175,36 @@ class _Tcgen05Emitter(_Emitter):
             with self.nest(header):
                 yield
         self.evaluator.pop()
+
+    def packets_aligned(self, access: Access) -> bool:
+        """Whether 16-byte packets along the one tile dim of side vector
+        ``access`` start at 16-byte addresses: a proven base, a unit stride
+        along the dim, every other stride a multiple of 16 bytes, and every
+        tile base along the dim (a root tile's begin, the cluster rank's
+        slice) a multiple of the packet's elements."""
+        from .memory_ops import cute_tensor_base_is_aligned
+
+        es = access.dtype.itemsize
+        per_packet = 16 // es
+        if access.tile_dim_strides != (1,):
+            return False
+        if not cute_tensor_base_is_aligned(self.env, access.fake, 16):
+            return False
+        if any((stride * es) % 16 for stride in access.strides if stride != 1):
+            return False
+        for subscript in access.subscripts:
+            if subscript.kind != "axis":
+                continue
+            if subscript.offset is not None:
+                # A uniform offset along the dim: not proven a packet multiple.
+                return False
+            axis = subscript.axis
+            assert axis is not None
+            if axis.kind == AXIS_LEAD:
+                continue
+            if self.plan.size(axis) % per_packet:
+                return False
+        return True
 
     def row_guard(self, slot: int) -> contextlib.AbstractContextManager[None]:
         """The epilogue-warp lanes that own a row of ``slot`` (lanes 16-31
@@ -2278,7 +2515,9 @@ class _Tcgen05Emitter(_Emitter):
                 f"{self.iter_vars[load.node]} + cutlass.Int64({prow}) * {row_stride} "
                 f"+ cutlass.Int64({pcol}) * {2 * load_es}"
             )
-            lo, hi = self.pair_load(address, load.dtype, paired)
+            lo, hi = self.pair_load(
+                address, load.dtype, paired, readonly=self.readonly(load)
+            )
             self.evaluator.tile_leaves[(load.node, 0)] = lo
             self.evaluator.tile_leaves[(load.node, 1)] = hi
             values = []
@@ -2286,7 +2525,9 @@ class _Tcgen05Emitter(_Emitter):
                 self.evaluator.element = half
                 col = f"(2 * {pcol} + {half})" if half else f"(2 * {pcol})"
                 values.append(
-                    self.evaluator.evaluate(value, self.tile_coords(operand, prow, col))
+                    self.evaluator.unrounded(
+                        value, self.tile_coords(operand, prow, col)
+                    )
                 )
             self.evaluator.element = None
             per_chunk = 16 // es
@@ -2333,7 +2574,9 @@ class _Tcgen05Emitter(_Emitter):
                 for e in (2 * q, 2 * q + 1):
                     self.evaluator.element = e
                     coords = self.tile_coords(operand, prow, f"({pch} * 8 + {e})")
-                    values.append(self.evaluator.evaluate(value, coords))
+                    # The pack rounds: a 16-bit root cast, or a where over
+                    # one, hands it the fp32 value (``unrounded``).
+                    values.append(self.evaluator.unrounded(value, coords))
                 self.evaluator.element = None
                 packed.append(self.pack(values[0], values[1], operand.dtype))
             self.emit(f"{_RUNTIME}.sts_v4_b32({address}, {', '.join(packed)})")
@@ -2479,7 +2722,7 @@ class _Tcgen05Emitter(_Emitter):
                 for e in (2 * q, 2 * q + 1):
                     self.evaluator.element = e
                     coords = self.tile_coords(operand, prow, f"({pch} * 4 + {e})")
-                    pair.append(self.evaluator.evaluate(value, coords))
+                    pair.append(self.evaluator.unrounded(value, coords))
                 self.evaluator.element = None
                 packed.append(self.pack(pair[0], pair[1], operand.dtype))
             # Raw packet p holds columns 4p..4p+3: 16-bit chunk p // 2, byte
@@ -2821,7 +3064,11 @@ class _Tcgen05Emitter(_Emitter):
             access = self.accesses[node]
             if node not in self.iter_vars:
                 self.iter_vars[node] = self.iteration_base(access, loop_value)
-            load = self.scalar_load(self.address(access, coords), access.dtype)
+            load = self.scalar_load(
+                self.address(access, coords),
+                access.dtype,
+                readonly=self.readonly(access),
+            )
             self.emit(f"{register} = {load}")
         self.iter_vars = saved
 
@@ -2960,7 +3207,11 @@ class _Tcgen05Emitter(_Emitter):
                         guards.append(guard)
                 else:
                     resolved.append(c)
-            load = self.scalar_load(self.address(access, tuple(resolved)), access.dtype)
+            load = self.scalar_load(
+                self.address(access, tuple(resolved)),
+                access.dtype,
+                readonly=self.readonly(access),
+            )
             with self.nest(f"if {' and '.join(guards)}:") if guards else _NoNest():
                 self.emit(f"{register} = {load}")
         self.iter_vars = saved
@@ -3049,7 +3300,7 @@ class _Tcgen05Emitter(_Emitter):
             access = self.accesses[node]
             self.emit(
                 f"md_ex{index} = "
-                f"{self.scalar_load(self.address(access, coords), access.dtype)}"
+                f"{self.scalar_load(self.address(access, coords), access.dtype, readonly=self.readonly(access))}"
             )
 
     # -- fragments in TMEM ---------------------------------------------------------
@@ -3111,7 +3362,12 @@ class _Tcgen05Emitter(_Emitter):
                                 coords[positions[0]] = self.row_var(slot)
                                 coords[positions[1]] = self.col_expr(slot, col)
                                 address = self.address(init, tuple(coords))
-                                lo, hi = self.pair_load(address, init.dtype, paired)
+                                lo, hi = self.pair_load(
+                                    address,
+                                    init.dtype,
+                                    paired,
+                                    readonly=self.readonly(init),
+                                )
                                 self.emit(f"{name}[{j}] = cutlass.Float32({lo})")
                                 self.emit(f"{name}[{j + 1}] = cutlass.Float32({hi})")
                     self.emit_st_array(name, slot, chunk)
@@ -3183,7 +3439,9 @@ class _Tcgen05Emitter(_Emitter):
                 word = self.bind("md_u", f"{_RUNTIME}.ldg_b32({address})")
                 self.derived_words[(access.node, col)] = (word,)
             else:
-                lo, hi = self.pair_load(address, access.dtype, paired)
+                lo, hi = self.pair_load(
+                    address, access.dtype, paired, readonly=self.readonly(access)
+                )
                 self.derived_words[(access.node, col)] = (lo, hi)
 
     def emit_derived_line_prefetch(self, loop_value: str) -> None:

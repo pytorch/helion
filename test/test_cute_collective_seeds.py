@@ -13,6 +13,7 @@ from test._cute_binding import _capture_collective_interleaving
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _forbid_cuda_work
 from test._cute_binding import _mock_cuda_unavailable
+from test._cute_binding import _uninterleaved_registered_seeds
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
@@ -263,6 +264,8 @@ def test_collective_async_priority_preserves_candidates(
                         bound.env, actual[0], axes[0], sites[0][0]
                     )
         if preferred and m == 128:
+            uninterleaved = _uninterleaved_registered_seeds(bound)
+            assert uninterleaved[0]["cute_collective_copy"] == "async"
             group = next(
                 group
                 for group in bound.config_spec.compiler_coverage_groups

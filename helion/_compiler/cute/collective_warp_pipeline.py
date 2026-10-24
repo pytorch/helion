@@ -44,10 +44,13 @@ def pipeline_collective_loop(
 
     The caller proves uniform loop bounds, a positive tile-size step, disjoint
     input/output storage, and exclusively asynchronous A/B staging. It supplies
-    a separate ring stage in every shared copy destination and MMA source.
-    Scalar vector tails remain legal: the CTA barrier publishes those writes
-    together with the waited asynchronous copies. The compute body ends with
-    a CTA barrier, so the next iteration cannot recycle a still-live stage.
+    a separate ring stage in every shared copy destination and MMA source, and
+    a compute body without CTA barriers. Each iteration waits for its own
+    stage, publishes it with one CTA barrier, and only then refills the stage
+    consumed by the previous iteration: every thread has passed the barrier,
+    so no thread still reads that stage. Scalar vector tails remain legal: the
+    barrier of the iteration that consumes the stage publishes those writes
+    together with the waited asynchronous copies.
     """
     assert stages in (2, 3, 4) and block_k > 0
     assert signed_int32_bound(start) and signed_int32_bound(stop)
@@ -91,14 +94,13 @@ for {prefetch_index} in cutlass.range_constexpr({stages - 1}):
     index = f"((cutlass.Int64({offset}) - cutlass.Int64({first})) // {block_k})"
     loop.body = [
         *_statements(f"""
+cute.arch.cp_async_wait_group({stages - 2})
+{stage_read} = cutlass.Int32({index} % {stages})
+cute.arch.sync_threads()
 {stage_write} = cutlass.Int32(({index} + {stages - 1}) % {stages})
 {prefetch} = cutlass.Int64({offset}) + {(stages - 1) * block_k}
 """),
         *issue(),
-        *_statements(f"""
-cute.arch.cp_async_wait_group({stages - 1})
-{stage_read} = cutlass.Int32({index} % {stages})
-"""),
         *compute,
     ]
     return [

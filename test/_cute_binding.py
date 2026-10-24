@@ -75,9 +75,10 @@ def _legacy_order(
     return seeds
 
 
-def _legacy_registered_seeds(
+def _uninterleaved_registered_seeds(
     bound: BoundKernel, *, require_no_parameters: bool = False
 ) -> list[Config]:
+    """Remove collective interleaving while preserving current copy priority."""
     assert bound.host_function is not None
     with (
         bound.env,

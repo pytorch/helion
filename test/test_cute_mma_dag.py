@@ -32,6 +32,8 @@ import helion
 from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute.cute_mma_dag_codegen import _Layout
+from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
+from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from helion._compiler.cute.cute_warp_mma_gemm import _swizzled_chunk
 from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
 from helion._compiler.host_function import SymbolOrigin
@@ -527,6 +529,10 @@ def _program(bound: BoundKernel) -> dag.MmaDagProgram:
 def _config(
     *block_sizes: int, warps: int, stages: int, **extra: object
 ) -> helion.Config:
+    # The warp mode's ring tiles ride per-thread packets unless a test asks
+    # for the TMA ring (``cute_mma_dag_loads="tma"``).
+    if extra.get("cute_mma_dag", "warp") == "warp":
+        extra.setdefault("cute_mma_dag_loads", "lane")
     return helion.Config(
         block_sizes=list(block_sizes),
         cute_mma_dag="warp",
@@ -4358,7 +4364,7 @@ def test_a_root_dot_rescaling_its_loops_carry_takes_a_fresh_slot() -> None:
 def _scalar_global_loads(body: str) -> list[tuple[str, str, str]]:
     """``(indent, name, address)`` of every per-thread scalar global load."""
     return re.findall(
-        rf"^( *)(\w+) = {RT}\.ldg_(?:f32|f16_as_f32|bf16_as_f32)\((.*)\)$",
+        rf"^( *)(\w+) = {RT}\.ldg_(?:f32|f16_as_f32|bf16_as_f32)\((.*?)(?:, nc=True)?\)$",
         body,
         re.MULTILINE,
     )
@@ -4672,9 +4678,16 @@ def test_a_side_load_hoists_only_out_of_loops_nested_in_the_one_it_varies_with()
         )
     )
     assert "md_sl" not in inner
-    # gdv's column reads (one per packet element) all sit in the inner loop.
+    # gdv's column reads (one per packet element) are prefetched one inner
+    # iteration ahead: the first iteration's loads sit in the outer loop's
+    # body ahead of the inner ``for``, the refills inside the inner loop
+    # under the trip guard; none is hoisted ahead of the outer loop.
     loads = _scalar_global_loads(inner)
-    assert loads and all(indent == "            " for indent, _n, _a in loads)
+    assert loads and all(name.startswith("md_px") for _i, name, _a in loads)
+    ahead = [load for load in loads if load[0] == "        "]
+    refills = [load for load in loads if load[0] == "                "]
+    assert ahead and len(ahead) == len(refills) == len(loads) // 2
+    assert "if md_i1 + 1 < " in inner
     outer = _kernel_body(
         _source(
             _bind_fn(_inner_varying_row_gate, (do, h, g)),
@@ -4699,6 +4712,709 @@ def test_a_side_load_hoists_only_out_of_loops_nested_in_the_one_it_varies_with()
         outer,
         re.MULTILINE,
     )
+
+
+def _loop_body(body: str, var: str) -> str:
+    """The lines of the ``for var in`` loop's body (up to the first line back
+    at the ``for``'s indentation)."""
+    lines = body.splitlines()
+    start = next(i for i, line in enumerate(lines) if f"for {var} in" in line)
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines) and (
+        not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip()) > indent
+    ):
+        end += 1
+    return "\n".join(lines[start + 1 : end])
+
+
+def test_the_aux_ring_stages_vectors_along_the_contiguous_dim_once_per_cta() -> None:
+    # ``cute_mma_dag_aux="ring"``: gdv, an fp32 vector along the source
+    # tile's contiguous dim varying with the inner loop, is copied once per
+    # CTA and stage (its 64-element block: 256 B, a 16-byte cp.async per
+    # thread of the first 16) with the ring's prologue and refills; every
+    # packet reads its 8-element run with two 16-byte shared reads behind
+    # the barrier ahead of the passes.  No per-thread global side load (nor
+    # its prefetch) remains.
+    bf16, f32 = torch.bfloat16, torch.float32
+    do = torch.empty((4, 64, 128), dtype=bf16, device=CPU_DEVICE)
+    h = torch.empty((4, 128, 128), dtype=bf16, device=CPU_DEVICE)
+    g = torch.empty((4, 128), dtype=f32, device=CPU_DEVICE)
+    bound = _bind_fn(_inner_varying_gate, (do, h, g))
+    config = _config(64, 64, warps=4, stages=2, cute_mma_dag_aux="ring")
+    body = _kernel_body(_source(bound, config))
+    assert not _scalar_global_loads(body)
+    copies = re.findall(
+        rf"^( *)if md_tidx < 16:\n\1    {RT}\.cp_async_16\(md_aux1 \+ (.*?) \+ md_tidx \* 16,"
+        rf" (md_ar\w*) \+ cutlass\.Int64\(md_tidx\) \* 16\)$",
+        body,
+        re.MULTILINE,
+    )
+    # The peeled prologue ahead of the outer loop, the refill in the inner
+    # loop, and the early prologue of the outer loop's next iteration (its
+    # first stage again) each copy the vector.
+    assert [offset for _i, offset, _src in copies] == [
+        "0",
+        "(md_stage1 + 1) % 2 * 256 + 0",
+        "0",
+    ]
+    inner = _loop_body(body, "md_i1")
+    wait = inner.index("cute.arch.cp_async_wait_group(0)")
+    barrier = inner.index("cute.arch.barrier()")
+    reads = [
+        m.start()
+        for m in re.finditer(
+            rf"{RT}\.lds_v4_f32\(md_aux1 \+ md_stage1 \* 256 \+ 0"
+            rf" \+ cutlass\.Int32\(md_pc8\) \* 32( \+ 16)?\)",
+            inner,
+        )
+    ]
+    assert len(reads) == 8 and wait < barrier < reads[0]
+    plan = _plan_of(bound, config)
+    ring = plan.aux_rings[1]
+    assert (ring.words, ring.vector_bytes, ring.stage_bytes) == (0, 256, 256)
+    assert plan.aux_bytes == 512 and f"md_aux1 = md_s0 + {ring.offset}" in body
+    assert f"alloc_smem(cutlass.Uint8, {plan.smem_bytes}," in body
+
+
+def test_the_aux_ring_gives_per_thread_words_to_scalars_and_row_vectors() -> None:
+    # fwd_h's gated chain: the per-chunk decay scalar and gc's two
+    # packet-row elements ride the ring as this thread's 4-byte slots
+    # (copied and read by the same thread: no barrier), read behind the
+    # stage's wait, which moves ahead of the scalar hoists consuming them.
+    bound = _bind_fwd("gated")
+    config = _config(16, 16, warps=2, stages=8, cute_mma_dag_aux="ring")
+    body = _kernel_body(_source(bound, config))
+    loop = _loop_body(body, "md_i")
+    assert not _scalar_global_loads(loop)
+    copies = re.findall(
+        rf"^ *{RT}\.cp_async_4\(md_aux0 \+ (.*?) \+ md_tidx \* 4, (.*)\)$",
+        body,
+        re.MULTILINE,
+    )
+    # Seven prologue stages and the refill, three slots each.
+    assert len(copies) == 8 * 3
+    reads = re.findall(
+        rf"^ *(\w+) = {RT}\.lds_f32\(md_aux0 \+ md_stage \* 768 \+ (\d+) \+ md_tidx \* 4\)$",
+        loop,
+        re.MULTILINE,
+    )
+    assert [int(offset) for _n, offset in reads] == [0, 256, 512]
+    first = loop.index(f"{reads[0][0]} = ")
+    assert loop.index("cute.arch.cp_async_wait_group(6)") < first
+    assert "cute.arch.barrier()" not in loop[:first]
+    plan = _plan_of(bound, config)
+    ring = plan.aux_rings[0]
+    assert (ring.words, ring.vector_bytes, ring.stage_bytes) == (3, 0, 768)
+    assert plan.aux_bytes == 8 * 768
+    assert f"alloc_smem(cutlass.Uint8, {plan.smem_bytes}," in body
+
+
+def test_the_aux_ring_stages_16_bit_vectors_as_packed_runs() -> None:
+    # mamba2 chunk scan: dt and dA_cumsum (bf16 vectors along the chunk, the
+    # cb tile's contiguous dim) are two 128-byte vectors per stage; a packet
+    # reads its eight elements as one 16-byte shared read it unpacks.
+    bound = _bind_chunk_scan()
+    config = _config(16, 64, 64, warps=2, stages=2, cute_mma_dag_aux="ring")
+    body = _kernel_body(_source(bound, config))
+    loop = _loop_body(body, "md_i")
+    assert f"{RT}.ldg_" not in loop
+    copies = re.findall(
+        rf"^( *)if md_tidx < 8:\n\1    {RT}\.cp_async_16\(md_aux0 \+ (.*?) \+ md_tidx \* 16, ",
+        body,
+        re.MULTILINE,
+    )
+    assert [offset for _i, offset in copies] == [
+        "0",
+        "128",
+        "(md_stage + 1) % 2 * 256 + 0",
+        "(md_stage + 1) % 2 * 256 + 128",
+    ]
+    reads = re.findall(
+        rf"^ *(\w+), \w+, \w+, \w+ = {RT}\.lds_v4_b32\(md_aux0 \+ md_stage \* 256"
+        rf" \+ (\d+) \+ cutlass\.Int32\(md_pc8\) \* 16\)$",
+        loop,
+        re.MULTILINE,
+    )
+    assert sorted(int(offset) for _w, offset in reads) == [0, 0, 128, 128]
+    for word, _offset in reads:
+        assert f"{RT}.unpack_bf16x2({word})" in loop
+    plan = _plan_of(bound, config)
+    ring = plan.aux_rings[0]
+    assert (ring.words, ring.vector_bytes, plan.aux_bytes) == (0, 256, 512)
+    assert f"alloc_smem(cutlass.Uint8, {plan.smem_bytes}," in body
+
+
+def test_the_aux_knob_has_a_subject_only_with_loop_varying_side_loads() -> None:
+    gated = _bind_fwd("gated").config_spec
+    assert gated.cute_mma_dag_facts is not None
+    assert gated.cute_mma_dag_facts.aux_candidates
+    assert gated.cute_mma_dag_aux is not None
+    assert gated.cute_mma_dag_aux.choices == ("register", "ring")
+    plain = _bind_fwd_o()
+    spec = plain.config_spec
+    assert spec.cute_mma_dag_facts is not None
+    assert not spec.cute_mma_dag_facts.aux_candidates
+    assert spec.cute_mma_dag_aux is None
+    config = _config(1, 64, 64, warps=4, stages=2, cute_mma_dag_aux="ring").config
+    with plain.env:
+        spec.normalize(config)
+    assert config["cute_mma_dag_aux"] == "register"
+
+
+def test_exact_16_bit_values_widen_without_a_cast_pair() -> None:
+    # The pass holds a 16-bit tile element (an unpacked packet half) and a
+    # widening side load exactly in fp32; the pointwise lowering's implicit
+    # promotion to fp32 (``cb_local *= exp2(...)``: bf16 times fp32) reads
+    # that value instead of re-typing it (``cutlass.BFloat16(x)``, a
+    # ``cvt`` on the conversion pipe) and widening it back.
+    bound = _bind_chunk_scan()
+    body = _kernel_body(_source(bound, _config(16, 64, 64, warps=2, stages=2)))
+    loop = _loop_body(body, "md_i")
+    assert re.search(r"^ *v_\d+ = md_lo \* md_v\w*$", loop, re.MULTILINE)
+    assert re.search(r"^ *v_\d+ = md_hi \* md_v\w*$", loop, re.MULTILINE)
+    typed = re.findall(
+        r"^ *(md_v\w*) = cutlass\.BFloat16\(md_(?:lo|hi)\w*\)$", loop, re.MULTILINE
+    )
+    assert typed and all(
+        f"cutlass.Float32({name})" not in body
+        and len(re.findall(rf"\b{name}\b", loop)) == 1
+        for name in typed
+    )
+    # The bf16 side vectors (dt, dA_cumsum) likewise: their fp32 loads feed
+    # the arithmetic directly.
+    assert re.search(
+        rf"^ *(md_v\w*) = {RT}\.ldg_bf16_as_f32\([^\n]*\)\n *md_v\w* = cutlass\.BFloat16\(\1\)\n"
+        rf"(?: *v_\d+ = [^\n]*\n)? *v_\d+ = \1 \* ",
+        loop,
+        re.MULTILINE,
+    )
+
+
+def test_the_tma_ring_fetches_each_ring_tile_as_one_bulk_tensor_copy() -> None:
+    # ``cute_mma_dag_loads="tma"`` in the warp mode: the K loop's two ring
+    # tiles (cb [16, 64] and x [64, 64], 128-byte rows) arrive by one bulk
+    # tensor copy each, issued by thread 0 behind a proxy fence and an
+    # expect-tx of the stage's bytes on the slot's mbarrier; every thread
+    # waits on the slot's barrier with the parity of the loop's running
+    # count where the cp.async wait sat; the root dot's staged tiles keep
+    # their packets.  The host builds one tensor map per tile (grid
+    # constants after the arguments), the shared allocation is 1024-byte
+    # aligned for the address-based swizzle.
+    bound = _bind_chunk_scan()
+    assert bound.config_spec.cute_mma_dag_facts is not None
+    assert bound.config_spec.cute_mma_dag_facts.tma_ring
+    config = _config(16, 64, 64, warps=2, stages=2, cute_mma_dag_loads="tma")
+    with bound.env:
+        assert (
+            bound.config_spec.normalized_config(config).config["cute_mma_dag_loads"]
+            == "tma"
+        )
+    source = _source(bound, config)
+    body = _kernel_body(source)
+    assert "md_tma0: cutlass.GridConstant[_helion_mma_dag_tc.cuda.TensorMap]" in body
+    # 30720 of ring and staged tiles + the epilogue's [16, 64] x tile staged
+    # ahead of the loops under ``tma``.
+    assert "alloc_smem(cutlass.Uint8, 32768, alignment=1024)" in body
+    assert "md_full0 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in body
+    assert "md_cnt0 = cutlass.Int32(0)" in body
+    for stage in range(2):
+        assert f"_helion_mma_dag_tc.prims.mbarrier_init(md_full0 + {stage}, 1)" in body
+    assert "_helion_mma_dag_tc.prims.fence_mbarrier_init()" in body
+    expects = re.findall(
+        r"^( *)_helion_mma_dag_tc\.prims\.mbarrier_arrive_expect_tx\(md_full0 \+ (.*), 10240\)$",
+        body,
+        re.MULTILINE,
+    )
+    assert [slot for _i, slot in expects] == ["(md_cnt0 + 0) % 2", "(md_stage + 1) % 2"]
+    copies = re.findall(
+        r"^ *_helion_mma_dag_tc\.prims\.cp_async_bulk_tensor_shared_cta_global\("
+        r"md_smem \+ \((\d+) \+ (.*?) \* (\d+)\), (md_tma\d)\.get_ptr\(\), \[(.*)\], md_full0 \+ (.*)\)$",
+        body,
+        re.MULTILINE,
+    )
+    assert [(c[0], c[2], c[3]) for c in copies] == [
+        ("0", "2048", "md_tma0"),
+        ("4096", "8192", "md_tma1"),
+    ] * 2
+    # cb's coordinates: K (the loop axis) innermost, then the M tile's base.
+    assert copies[0][4].startswith("cutlass.Int32(0 * 64), cutlass.Int32(md_a0)")
+    assert copies[2][4].startswith(
+        "cutlass.Int32((md_i + 1) * 64), cutlass.Int32(md_a0)"
+    )
+    loop = _loop_body(body, "md_i")
+    assert "md_stage = (md_cnt0 + md_i) % 2" in loop
+    assert re.search(r"^ *md_par = \(md_cnt0 \+ md_i\) // 2 & 1$", loop, re.MULTILINE)
+    wait = loop.index("_helion_mma_dag_tc.mbar_wait(md_full0 + md_stage, md_par)")
+    assert (
+        loop.index("cute.arch.cp_async_wait_group(0)")
+        < wait
+        < loop.index("cute.arch.barrier()")
+    )
+    # Fences precede every issue (thread 0's, ahead of its expect-tx), and
+    # every thread fences at the top of the iteration, past its waits and
+    # ahead of the in-place pass (its previous pass's stores precede the
+    # barrier before the refill of that slot); the ring tiles have no
+    # packets left; the root dot's staged tiles (md_t0 / md_t1) still ride
+    # cp.async.
+    assert body.count("cute.arch.fence_proxy(kind='async.shared', space='cta')") == 4
+    writer_fence = loop.index("cute.arch.fence_proxy(kind='async.shared', space='cta')")
+    assert wait < writer_fence < loop.index(f"{RT}.lds_v4_b32(")
+    assert "if md_tidx == 0:" not in loop[wait:writer_fence]
+    assert (
+        f"{RT}.cp_async_16(md_t2" not in body and f"{RT}.cp_async_16(md_t3" not in body
+    )
+    assert f"{RT}.cp_async_16(md_t0" in body
+    assert re.search(r"^ {4}md_cnt0 = md_cnt0 \+ \(1 - 0\)$", body, re.MULTILINE)
+    assert "'kind': 'helion_mma_dag_tma', 'tma_count': 2" in source
+    assert (
+        "'tma0_box': [64, 16, 1, 1, 1], 'tma0_swizzle': 's128b', 'tma0_elem': 2"
+        in source
+    )
+    assert "'tma1_box': [64, 1, 64, 1], 'tma1_swizzle': 's128b'" in source
+    # The packet ring on request.
+    lane = _kernel_body(_source(bound, _config(16, 64, 64, warps=2, stages=2)))
+    assert (
+        "md_full" not in lane and "mbar_wait" not in lane and "alignment=128)" in lane
+    )
+
+
+def test_a_re_entered_tma_ring_counts_its_iterations_across_the_outer_loop() -> None:
+    # The nested ring's slot and barrier parity follow a running count the
+    # outer loop never resets: the count advances by the inner trip count
+    # after the inner loop, ahead of the next iteration's early prologue.
+    bf16, f32 = torch.bfloat16, torch.float32
+    do = torch.empty((4, 64, 128), dtype=bf16, device=CPU_DEVICE)
+    h = torch.empty((4, 128, 128), dtype=bf16, device=CPU_DEVICE)
+    g = torch.empty((4, 128), dtype=f32, device=CPU_DEVICE)
+    bound = _bind_fn(_inner_varying_gate, (do, h, g))
+    body = _kernel_body(
+        _source(bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_loads="tma"))
+    )
+    outer = _loop_body(body, "md_i")
+    inner_end = outer.index("md_cnt1 = md_cnt1 + (2 - 0)")
+    assert outer.index("for md_i1 in") < inner_end
+    early = outer.index(
+        "_helion_mma_dag_tc.prims.mbarrier_arrive_expect_tx(md_full1 + (md_cnt1 + 0) % 2, 16384)",
+        inner_end,
+    )
+    assert early > inner_end
+    inner = _loop_body(body, "md_i1")
+    assert "md_stage1 = (md_cnt1 + md_i1) % 2" in inner
+    assert "_helion_mma_dag_tc.mbar_wait(md_full1 + md_stage1, md_par)" in inner
+    # The aux ring shares the slot expression.
+    ring = _kernel_body(
+        _source(
+            bound,
+            _config(
+                64,
+                64,
+                warps=4,
+                stages=2,
+                cute_mma_dag_loads="tma",
+                cute_mma_dag_aux="ring",
+            ),
+        )
+    )
+    assert re.search(r"cp_async_16\(md_aux1 \+ \(md_cnt1 \+ 0\) % 2 \* 256", ring)
+
+
+def test_the_region_renderer_stages_epilogue_tile_inputs_in_the_fixed_region() -> None:
+    # chunk_scan's epilogue ``acc += x_residual * D`` reads a loop-invariant
+    # [64, 64] tile of ``x`` at the fragment coordinates: the region renderer
+    # fetches it by TMA into the fixed region with the root's staged tiles
+    # (issued ahead of the loops, landing on the root's staged barrier) and
+    # the epilogue reads its rows from shared memory, instead of per-lane
+    # global pairs issued after the last MMA.  Under the ``lane`` loads mode
+    # the tile keeps the per-lane global loads.
+    bound = _bind_chunk_scan()
+    spec = bound.config_spec
+    tcgen05 = {
+        "cute_mma_dag": "tcgen05",
+        "cute_mma_dag_warps": 4,
+        "cute_mma_dag_stages": 1,
+        "cute_mma_dag_store": "staged",
+        "cute_mma_dag_exchange": "auto",
+        "cute_mma_dag_pass_warps": "off",
+        "cute_mma_dag_persistent": 0,
+    }
+    bodies = {}
+    for loads in ("tma", "lane"):
+        with bound.env:
+            config = spec.normalized_config(
+                helion.Config(
+                    block_sizes=[64, 64, 64], cute_mma_dag_loads=loads, **tcgen05
+                )
+            )
+        bodies[loads] = _kernel_body(bound.to_code(config))
+    expects = {
+        loads: [
+            int(n)
+            for n in re.findall(r"mbarrier_arrive_expect_tx\(md_sfr, (\d+)\)", body)
+        ]
+        for loads, body in bodies.items()
+    }
+    assert len(expects["tma"]) == 1
+    assert expects["tma"][0] == expects["lane"][0] + 64 * 64 * 2
+    # One more bulk copy ahead of the loops than the lane render's (the
+    # root operands' staged tiles), into the fixed region behind them.
+    copies = {
+        loads: set(
+            re.findall(
+                r"cp_async_bulk_tensor_shared_cta_global\(md_smem \+ \((\d+ \+ \d+)\), "
+                r"(md_tma\d+)\.get_ptr\(\), \[[^\]]*\], md_sfr\)",
+                body[: body.index("for md_i in cutlass.range(")],
+            )
+        )
+        for loads, body in bodies.items()
+    }
+    assert len(copies["tma"]) == len(copies["lane"]) + 1
+    [(fixed_offset, _param)] = copies["tma"] - copies["lane"]
+    offset = sum(int(n) for n in fixed_offset.split(" + "))
+    assert offset == max(
+        sum(int(n) for n in fixed.split(" + ")) for fixed, _ in copies["tma"]
+    )
+    body = bodies["tma"]
+    # The epilogue waits on the root's staged barrier and reads the tile's
+    # rows from the fixed region; no per-lane global load remains there.
+    epilogue = body[body.rindex("for md_i in cutlass.range(") :]
+    wait = epilogue.index("mbar_wait(md_sfr, 0)")
+    read = epilogue.index(f"{RT}.lds_v4_b32(md_s0 + {offset} + md_row64 * 128")
+    assert wait < read
+    assert f"{RT}.ldg_b32(" not in epilogue
+    lane = bodies["lane"]
+    assert f"{RT}.ldg_b32(" in lane[lane.rindex("for md_i in cutlass.range(") :]
+
+
+def test_the_warp_mode_stages_epilogue_tile_inputs_ahead_of_the_loops() -> None:
+    # The warp mode's sibling of the region renderer's fixed-region tiles:
+    # chunk_scan's epilogue ``acc += x_residual * D`` reads a loop-invariant
+    # [64, 64] tile of ``x``.  Under ``cute_mma_dag_loads="tma"`` the tile is
+    # a shared tile of the root frame (``md_d0``, after the loops' frames),
+    # cp.async'd in the root's staged group ahead of the ring prologue, and
+    # the epilogue reads its pairs from the swizzled rows behind a drain and
+    # a barrier; under ``lane`` the epilogue keeps its per-lane global pairs.
+    # The facts name the subject and count the tile once in the root frame.
+    bound = _bind_chunk_scan()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.fixed_derived
+    assert [(tile.ring, tile.frame, tile.copies) for tile in facts.tiles].count(
+        (False, -1, 1)
+    ) == 3
+    bodies = {}
+    for loads in ("tma", "lane"):
+        config = _config(64, 64, 64, warps=8, stages=2, cute_mma_dag_loads=loads)
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(config)
+        assert normalized.config["cute_mma_dag_loads"] == loads
+        bodies[loads] = _kernel_body(_source(bound, config))
+    body = bodies["tma"]
+    assert "alloc_smem(cutlass.Uint8, 57344, alignment=1024)" in body
+    assert "alloc_smem(cutlass.Uint8, 49152, alignment=128)" in bodies["lane"]
+    assert "md_d0 = md_s0 + 49152" in body
+    assert "md_d0" not in bodies["lane"]
+    prologue = body[: body.index("for md_i in cutlass.range(")]
+    issues = re.findall(
+        r"^ *_helion_mma_dag\.cp_async_16\(md_d0 \+ md_pr8 \* 128 \+ (?:4096 \+ )?md_pz8 \* 16, "
+        r"(md_base_\d+) \+ cutlass\.Int64\(md_pr8\) \* 1024 \+ cutlass\.Int64\(md_pc8 \* 16\)(?: \+ 32768)?\)$",
+        prologue,
+        re.MULTILINE,
+    )
+    assert len(issues) == 2 and len(set(issues)) == 1
+    # Its group is the root's staged group (committed once, before the
+    # ring prologue's commits).
+    first_commit = prologue.index("cute.arch.cp_async_commit_group()")
+    assert prologue.rindex(f"{RT}.cp_async_16(md_d0") < first_commit
+    epilogue = body[body.rindex("for md_i in cutlass.range(") :]
+    epilogue = epilogue[epilogue.index("\n    ") :]  # past the loop header
+    reads = re.findall(rf"{RT}\.lds_b32\(md_d0 \+ ", epilogue)
+    assert len(reads) == 8
+    drain = epilogue.index("cute.arch.cp_async_wait_group(0)\n    cute.arch.barrier()")
+    assert drain < epilogue.index(f"{RT}.lds_b32(md_d0")
+    assert f"{RT}.ldg_b32(" not in epilogue
+    lane = bodies["lane"]
+    lane_epilogue = lane[lane.rindex("for md_i in cutlass.range(") :]
+    assert lane_epilogue.count(f"{RT}.ldg_b32(") == 8
+
+
+def test_the_root_loops_ring_prologue_goes_out_ahead_of_the_root_dots_wait() -> None:
+    # chunk_scan's root: a dot on two staged tiles, then the K loop, then the
+    # epilogue.  The K loop's ring prologue (its first ``stages - 1`` stages)
+    # used to follow the root dot (issued after the staged tiles' wait and
+    # the MMAs: the ring tiles' latency sat in series with the staged
+    # tiles').  Now it goes out right behind the root's staged group, and
+    # the root dot's settle waits for all but those younger groups
+    # (``cp_async_wait_group(stages - 1)``), with either ring form.
+    bound = _bind_chunk_scan()
+    for loads, stages, issue in (
+        ("tma", 2, "_helion_mma_dag_tc.prims.cp_async_bulk_tensor_shared_cta_global("),
+        ("lane", 2, f"{RT}.cp_async_16(md_t2"),
+        ("lane", 3, f"{RT}.cp_async_16(md_t2"),
+    ):
+        config = _config(64, 64, 64, warps=4, stages=stages, cute_mma_dag_loads=loads)
+        body = _kernel_body(_source(bound, config))
+        prologue = body[: body.index("for md_i in cutlass.range(")]
+        staged = prologue.index(f"{RT}.cp_async_16(md_t0")
+        commits = [
+            m.start()
+            for m in re.finditer(r"cute\.arch\.cp_async_commit_group\(\)", prologue)
+        ]
+        assert len(commits) == stages
+        wait = prologue.index(f"cute.arch.cp_async_wait_group({stages - 1})")
+        assert staged < commits[0] < prologue.index(issue) < commits[-1] < wait
+        assert wait < prologue.index("cute.arch.barrier()", wait)
+        assert prologue.index(f"{RT}.mma_bf16(") > wait
+        # No prologue is left at the loop; its first iteration's wait depth
+        # is unchanged.
+        # (The K loop's static trip here is 1: only the first stage is
+        # issued -- two bulk copies, or four 16-byte packets per thread of
+        # the [64, 64] tile at 128 threads; later stages commit empty.)
+        assert prologue.count(issue) == (2 if loads == "tma" else 4)
+        loop = _loop_body(body, "md_i")
+        assert f"cute.arch.cp_async_wait_group({max(stages - 2, 0)})" in loop
+    # A root that starts with its loop keeps the prologue at the loop and the
+    # plain drain.
+    a = torch.empty((256, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((256, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_causal_plain, (a, b))
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    assert "cute.arch.cp_async_wait_group(1)" not in body
+    assert body.index(f"{RT}.cp_async_16(md_t0") < body.index(
+        "for md_i in cutlass.range("
+    )
+
+
+def _chunk_scan_s2_inputs() -> tuple[torch.Tensor, ...]:
+    # The catalogue's s2 shape (chunk 128, 16 heads, 4 groups, seq 2048).
+    bf16 = torch.bfloat16
+    batch, heads, groups, seq, chunk, d, ds = 2, 16, 4, 2048, 128, 64, 128
+    chunks = seq // chunk
+    empty = functools.partial(torch.empty, dtype=bf16, device=CPU_DEVICE)
+    return (
+        empty((batch, chunks, groups, chunk, chunk)),
+        empty((batch, seq, heads, d)),
+        empty((batch, heads, chunks, chunk)),
+        empty((batch, heads, chunks, chunk)),
+        empty((batch, seq, groups, ds)),
+        empty((batch, chunks, heads, d, ds)),
+        empty((heads,)),
+    )
+
+
+def test_region_programs_seed_the_far_corner_of_the_tile_warp_stage_box() -> None:
+    # chunk_scan at the s2 shape: the ranked tensor-memory seeds are 64-row
+    # tiles at four warps and two stages with the smallest column tiles (the
+    # ranking's CTA-count prior); the measured winner is [128, 64, 64] at
+    # eight warps and one stage, two knob moves away with both single-knob
+    # neighbours slower.  The heuristic now seeds, per fragment-row tile,
+    # the largest column tile at the most warps and the fewest stages too.
+    fn = importlib.import_module(
+        "examples.mamba2_chunk_scan"
+    ).helion_mamba2_chunk_scan_kernel.fn
+    bound = _bind_fn(fn, _chunk_scan_s2_inputs())
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    ranked = tcgen05_seed_configs(facts)
+    top = ranked[: CuteMmaDagHeuristic.SEED_TCGEN05]
+    corners = tcgen05_corner_seeds(facts, ranked, top)
+    forms = [
+        (sizes[0], sizes[1], sizes[2], warps, stages)
+        for sizes, warps, stages in corners
+    ]
+    # (A 128-deep K tile at 64 rows is a partial trip for the odd row tiles:
+    # not a tcgen05 config, so the 64-row corner keeps K = 64.)
+    assert forms == [(64, 64, 64, 8, 1), (128, 64, 128, 8, 1)]
+    seeds = [
+        (
+            tuple(c.config["block_sizes"]),
+            c.config["cute_mma_dag_warps"],
+            c.config["cute_mma_dag_stages"],
+        )
+        for c in bound.config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "tcgen05"
+    ]
+    assert seeds[: len(top)] == [
+        (tuple(sizes[i] for i in range(3)), warps, stages)
+        for sizes, warps, stages in top
+    ]
+    assert ((64, 64, 64), 8, 1) in seeds and ((128, 64, 128), 8, 1) in seeds
+    # Outside the region programs the seed list is the ranked one.
+    fwd_o = _bind_fwd_o(True, bhn=2048, d=128, dv=128).config_spec
+    ofacts = fwd_o.cute_mma_dag_facts
+    assert ofacts is not None and ofacts.tcgen05 is not None
+    assert not ofacts.tcgen05.regions
+    assert tcgen05_corner_seeds(ofacts, tcgen05_seed_configs(ofacts), []) == []
+
+
+def test_the_top_warp_seed_comes_again_with_the_one_cta_occupancy_hint() -> None:
+    # chunk_scan at s1: the same warp tile / warps / stages ran 4.22 us at
+    # the default occupancy hint and 3.95 with ``cute_min_blocks_per_mp``
+    # 1 (ptxas budgets registers for one CTA per SM instead of the CTAs the
+    # shared-memory footprint admits; a single-wave grid loses nothing).
+    # The heuristic seeds that twin right behind the top warp seed (behind
+    # the aux-ring twin when there is one), so the search starts from it.
+    bound = _bind_chunk_scan()
+    seeds = [c.config for c in bound.config_spec.compiler_seed_configs]
+    top = next(i for i, c in enumerate(seeds) if c.get("cute_mma_dag") == "warp")
+    assert seeds[top].get("cute_min_blocks_per_mp", 0) == 0
+    twins = seeds[top + 1 : top + 3]
+    hinted = [c for c in twins if c.get("cute_min_blocks_per_mp") == 1]
+    assert len(hinted) == 1
+    assert {k: v for k, v in hinted[0].items() if k != "cute_min_blocks_per_mp"} == {
+        k: v for k, v in seeds[top].items() if k != "cute_min_blocks_per_mp"
+    }
+    # The aux-ring twin of chunk_scan (side loads of the K loop) is the other.
+    assert [c.get("cute_mma_dag_aux") for c in twins].count("ring") == 1
+    # The hint is a searched knob of these kernels (the twin normalizes
+    # unchanged).
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(helion.Config(**hinted[0]))
+    assert normalized.config["cute_min_blocks_per_mp"] == 1
+
+
+def _nested_gated_probe(
+    k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """An outer tile loop whose innermost ring loop scales the A operand by
+    a per-row gate (a loop-variant side load of the pass) and stores the
+    accumulator after it: the early-prologue shape with an aux ring."""
+    c, d = k.size()
+    dv = v.size(1)
+    out = torch.empty([d, dv], dtype=k.dtype, device=k.device)
+    for tile_dv in hl.tile(dv):
+        for tile_d in hl.tile(d):
+            acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+            for tile_c in hl.tile(c):
+                kt = (
+                    k[tile_c, tile_d].to(torch.float32)
+                    * g[tile_c].to(torch.float32)[:, None]
+                )
+                acc = hl.dot(
+                    kt.to(k.dtype).transpose(0, 1), v[tile_c, tile_dv], acc=acc
+                )
+            out[tile_d, tile_dv] = acc.to(out.dtype)
+    return out
+
+
+def _bind_nested_gated(c: int = 512, d: int = 128, dv: int = 128) -> BoundKernel:
+    bf16 = torch.bfloat16
+    return _bind_fn(
+        _nested_gated_probe,
+        (
+            torch.empty((c, d), dtype=bf16, device=CPU_DEVICE),
+            torch.empty((c, dv), dtype=bf16, device=CPU_DEVICE),
+            torch.empty((c,), dtype=bf16, device=CPU_DEVICE),
+        ),
+    )
+
+
+def test_the_early_nested_prologue_copies_the_aux_ring_words() -> None:
+    # The nested ring's prologue for the outer loop's next iteration is
+    # issued in the outer iteration's epilogue (``emit_early_prologue``),
+    # after the inner loop's body was rendered and its aux anchors filled.
+    # Its own anchors must be filled too, or iteration i+1 starts with the
+    # operand tiles in flight and no copy of the gate words: the pass then
+    # reads the previous iteration's slot (silently wrong values).
+    bound = _bind_nested_gated()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.aux_candidates
+    config = _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_aux="ring")
+    with bound.env:
+        normalized = spec.normalized_config(config)
+    plan = _plan_of(bound, normalized)
+    assert plan.early_prologues() == {0: 1}
+    assert plan.aux_rings[1].words == 4
+    body = _kernel_body(_source(bound, normalized))
+    outer = _loop_body(body, "md_i")
+    early = outer[outer.index("if md_i + 1 < 2:") :]
+    inner = _loop_body(body, "md_i1")
+    # The peeled prologue ahead of the outer loop, the refill inside the
+    # inner loop and the early prologue each copy the four gate words.
+    peeled = body[: body.index("for md_i in cutlass.range(")]
+    assert peeled.count(f"{RT}.cp_async_4(md_aux1 + ") == 4
+    assert inner.count(f"{RT}.cp_async_4(md_aux1 + (md_stage1 + 1) % 2 * 2048 + ") == 4
+    assert early.count(f"{RT}.cp_async_4(md_aux1 + ") == 4
+    # Their copies precede the commit of the early prologue's group.
+    assert early.rindex(f"{RT}.cp_async_4(md_aux1") < early.index(
+        "cute.arch.cp_async_commit_group()"
+    )
+    # A 16-bit side load's word: the low two address bits by a mask, not a
+    # signed remainder of the truncated address (negative at bit 31).
+    assert body.count("- (cutlass.Int32(md_aw") == 12
+    assert (
+        len(
+            re.findall(
+                rf"{RT}\.lds_bf16_as_f32\(md_aux1 \+ .*\) & 3\)\)$", body, re.MULTILINE
+            )
+        )
+        == 4
+    )
+    assert "% 4" not in body.split("md_aux1 =")[1]
+
+
+def test_a_partial_trip_zeroes_the_other_operands_tail_in_shared_memory() -> None:
+    # chunk_scan at a 32-row tile: the causal K loop's bound (32 at the first
+    # row tile) leaves a partial 64-deep trip.  cb's pass masks its elements
+    # past the bound; x's tile (direct, K along its rows) is zeroed there in
+    # shared memory by the threads owning the packets, after the passes
+    # and before the iteration barrier, so an Inf or NaN past the bound
+    # cannot reach the accumulator through ``0 * x``.
+    bound = _bind_chunk_scan()
+    for loads in ("lane", "tma"):
+        body = _kernel_body(
+            _source(
+                bound, _config(32, 64, 64, warps=4, stages=2, cute_mma_dag_loads=loads)
+            )
+        )
+        loop = _loop_body(body, "md_i")
+        zeros = re.findall(
+            r"^ *if md_a1 \+ (?:\(\d+ \+ )?md_pr8\)? >= md_end0:\n"
+            rf" *{re.escape(RT)}\.sts_v4_b32\(md_t3 \+ md_stage \* 8192 \+ md_pr8 \* 128"
+            r"(?: \+ \d+)? \+ md_pz8 \* 16, cutlass\.Int32\(0\), cutlass\.Int32\(0\), "
+            r"cutlass\.Int32\(0\), cutlass\.Int32\(0\)\)$",
+            loop,
+            re.MULTILINE,
+        )
+        assert len(zeros) == 4, loads
+        # After the pass (its shared reads issue first: zero stores ahead of
+        # them cost chunk_scan s0 7 %), before the iteration barrier.
+        first_zero = loop.index(">= md_end0:")
+        pass_read = loop.index(f"{RT}.lds_v4_b32(md_pa")
+        assert pass_read < first_zero < loop.index("cute.arch.barrier()", pass_read)
+    # An aligned bound (64-row tiles: every CTA's bound a multiple of the K
+    # block) needs none of it.
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    assert ">= md_end0:" not in body and "sts_v4_b32(md_t3" not in body
+
+
+def _causal_shifted(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A causal K bound whose constant term mixes two block sizes
+    (``2 * block_m - block_n``): positive at unit block sizes, not at every
+    real pair."""
+    m, k = a.size()
+    _, n = b.size()
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(64, 64)
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[block_m, block_n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile((tile_m.id + 2) * block_m - block_n, block_size=block_k):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def test_a_varying_bound_with_a_mixed_block_coefficient_is_not_admitted() -> None:
+    # The nondecreasing proof must hold at every block size, not at 1: a
+    # coefficient (or constant) that is not a single nonnegative monomial
+    # in the block sizes is refused (``2 * block_m - block_n`` is 1 at unit
+    # sizes and negative at block_n > 2 * block_m).
+    a = torch.empty((256, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((256, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    assert _bind_fn(_causal_plain, (a, b)).config_spec.cute_mma_dag is not None
+    assert _bind_fn(_causal_shifted, (a, b)).config_spec.cute_mma_dag is None
 
 
 def _rmw_view(k: torch.Tensor, v: torch.Tensor, s_out: torch.Tensor) -> torch.Tensor:
@@ -4949,7 +5665,9 @@ def test_addresses_share_one_lane_base_and_fold_the_immediates() -> None:
     assert "cutlass.Int64(md_L0_coll + " not in loops
     assert "cutlass.Int64(16 + md_pr8)" not in body
     # The pass's side loads read the hoisted base with the round's offset.
-    assert f"{RT}.ldg_bf16_as_f32(md_lb + 32)" in body[:first]
+    assert re.search(
+        rf"{RT}\.ldg_bf16_as_f32\(md_lb \+ 32(?:, nc=True)?\)", body[:first]
+    )
     assert _split_coord_cases()
 
 
@@ -4982,7 +5700,9 @@ def _plan_of(bound: BoundKernel, config: helion.Config) -> dag.MmaDagPlan:
 
     with patch.object(dag.MmaDagPlan, "smem_layout", wrapped):
         _source(bound, config)
-    return captured[0]
+    # The last plan laid out is the one rendered (an aux ring replaces the
+    # plan after its tiles are laid out).
+    return captured[-1]
 
 
 def test_the_next_iterations_nested_prologue_overlaps_the_epilogue() -> None:
@@ -5289,10 +6009,18 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     # leads with the four tensor-memory seeds, then the warp ladder.
     dqkw = _bind_dqkw(True, bhn=2048, d=128, dv=128).config_spec
     seeds = [_seed_knobs(c) for c in dqkw.compiler_seed_configs]
-    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
+    # (The four ranked tensor-memory seeds, then the corner seeds of the
+    # region programs -- see ``tcgen05_corner_seeds`` -- then the ladder.)
+    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
+    assert first >= 4 and all(
+        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
+    )
+    seeds = seeds[first:]
     top = ([64, 32, 64, 64, 64], "warp", 4, 2, "auto")
-    assert seeds[4] == top
-    assert seeds[12:17] == [
+    assert seeds[0] == top
+    # (The top warp seed's twins -- aux ring, occupancy hint -- sit between
+    # it and the ladder.)
+    assert seeds[9:14] == [
         ([64, 32, 64, 64, 64], "warp", 4, 3, "auto"),
         ([64, 32, 64, 64, 64], "warp", 4, 3, "smem"),
         ([64, 32, 64, 64, 64], "warp", 4, 2, "smem"),
@@ -5302,14 +6030,18 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
         ([128, 32, 64, 64, 64], "warp", 4, 2, "auto"),
         ([128, 32, 64, 64, 64], "warp", 4, 2, "smem"),
     ]
-    assert seeds[17:] == []
+    assert seeds[14:] == []
     # The flat streaming programs (wy_dL, dk) lead with the four
     # tensor-memory seeds; the warp ladder and its neighbours follow.
     wy_dl = _bind_wy_dl(True, bf16, bf16, bhn=2048, d=128, dv=128).config_spec
     seeds = [_seed_knobs(c) for c in wy_dl.compiler_seed_configs]
-    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
-    assert seeds[4] == ([64, 64, 64], "warp", 4, 2, "auto")
-    assert seeds[12:17] == [
+    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
+    assert first >= 4 and all(
+        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
+    )
+    seeds = seeds[first:]
+    assert seeds[0] == ([64, 64, 64], "warp", 4, 2, "auto")
+    assert seeds[9:14] == [
         ([64, 64, 64], "warp", 4, 3, "auto"),
         ([64, 64, 64], "warp", 4, 3, "smem"),
         ([64, 64, 64], "warp", 4, 2, "smem"),
@@ -5320,9 +6052,13 @@ def test_cta_rich_programs_seed_the_top_tiles_measured_neighbours() -> None:
     ]
     dk = _bind_dk(bhn=2048, d=128, dv=128).config_spec
     seeds = [_seed_knobs(c) for c in dk.compiler_seed_configs]
-    assert all(mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:4])
-    assert seeds[4] == ([64], "warp", 4, 2, "auto")
-    assert seeds[12:14] == [
+    first = next(i for i, (_s, mode, _w, _st, _e) in enumerate(seeds) if mode == "warp")
+    assert first >= 4 and all(
+        mode == "tcgen05" for _s, mode, _w, _st, _e in seeds[:first]
+    )
+    seeds = seeds[first:]
+    assert seeds[0] == ([64], "warp", 4, 2, "auto")
+    assert seeds[9:11] == [
         ([64], "warp", 4, 1, "auto"),
         ([32], "warp", 2, 1, "auto"),
     ]
@@ -5359,8 +6095,13 @@ def test_every_seed_variant_normalizes_and_renders(kernel: str) -> None:
     variants = dag.mma_dag_seed_variants(facts, ladder)
     assert variants
     warp = [c for c in spec.compiler_seed_configs if c.config["cute_mma_dag"] == "warp"]
+    # The top warp seed's occupancy-hint twin sits behind it; the ladder and
+    # its measured neighbours are the rest.
+    hinted = [c for c in warp if c.config.get("cute_min_blocks_per_mp") == 1]
+    assert len(hinted) == 1
+    warp = [c for c in warp if c.config.get("cute_min_blocks_per_mp") != 1]
     assert len(warp) == len(ladder) + len(variants)
-    for config in warp[len(ladder) :]:
+    for config in [*warp[len(ladder) :], *hinted]:
         with bound.env:
             normalized = spec.normalized_config(config)
         assert normalized.config["cute_mma_dag"] == "warp"
@@ -5454,3 +6195,180 @@ def test_a_16_bit_matmul_read_as_it_is_stays_simt() -> None:
     with bound.env, bound.host_function:
         assert dag.match_mma_dag(bound.host_function.device_ir.graphs) is None
     assert bound.config_spec.cute_mma_dag is None
+
+
+# --------------------------------------------------------------------------
+# Tile loops whose bound varies with the CTA's root tile coordinates
+# --------------------------------------------------------------------------
+
+
+def _chunk_scan_inputs(chunk: int = 64) -> tuple[torch.Tensor, ...]:
+    bf16 = torch.bfloat16
+    batch, heads, groups, seq, d, ds = 2, 8, 2, 1024, 64, 64
+    chunks = seq // chunk
+    empty = functools.partial(torch.empty, dtype=bf16, device=CPU_DEVICE)
+    return (
+        empty((batch, chunks, groups, chunk, chunk)),
+        empty((batch, seq, heads, d)),
+        empty((batch, heads, chunks, chunk)),
+        empty((batch, heads, chunks, chunk)),
+        empty((batch, seq, groups, ds)),
+        empty((batch, chunks, heads, d, ds)),
+        empty((heads,)),
+    )
+
+
+def _bind_chunk_scan(chunk: int = 64) -> BoundKernel:
+    fn = importlib.import_module(
+        "examples.mamba2_chunk_scan"
+    ).helion_mamba2_chunk_scan_kernel.fn
+    return _bind_fn(fn, _chunk_scan_inputs(chunk))
+
+
+def _causal_plain(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A causal K loop over operands read as they are: no pass can mask a
+    partial last trip."""
+    m, k = a.size()
+    _, n = b.size()
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(64, 64)
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[block_m, block_n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile((tile_m.id + 1) * block_m, block_size=block_k):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def _axis_sizes(facts: dag.CuteMmaDagFacts, sizes: dict[int, int]) -> list[int]:
+    return [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
+
+
+def test_varying_bound_loops_are_admitted_with_their_largest_extent() -> None:
+    # mamba2_chunk_scan: the first dot accumulates onto a fresh ``hl.zeros``
+    # (no accumulator), the causal K loop walks ``(tile_m.id + 1) * block_m``
+    # (the chunk at the last row tile), its mask compares ``tile_m.index``
+    # with the loop tile's ``tile_k.index`` and falls back to ``zeros_like``.
+    bound = _bind_chunk_scan()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    program = _program(bound)
+    root_dot, loop_dot = program.dots
+    assert root_dot.acc is None and root_dot.loop == -1
+    assert loop_dot.loop == 0 and loop_dot.a.pointwise
+    (loop,) = program.loops
+    (axis,) = loop.axes
+    assert axis.extent == 64
+    rows = next(a for a in program.axes if a.kind == dag.AXIS_ROOT and a.block_id == 0)
+    assert loop.tile_end == sympy.expand(
+        dag.bound_symbol(dag.BOUND_BLOCK, rows.index)
+        * (dag.bound_symbol(dag.BOUND_ID, rows.index) + 1)
+    )
+    assert any(
+        program.tile_index_loads[node] is axis for node in program.tile_index_loads
+    )
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    (loop_facts,) = facts.loops
+    assert loop_facts.end == loop.tile_end
+    assert loop_facts.axis == axis.index and loop_facts.maskable
+    # Row tiles below the K block leave partial trips (one trip each); a
+    # whole-chunk row tile walks exactly one aligned trip.
+    for bm, expected in ((16, (1, 1, False)), (32, (1, 1, False)), (64, (1, 1, True))):
+        sizes = _axis_sizes(facts, {0: bm, 1: 64, 2: 64})
+        assert (
+            dag.loop_trip_range(loop.tile_end, facts.axes, sizes, axis.index)
+            == expected
+        )
+        assert dag.mma_dag_config_reason(facts, {0: bm, 1: 64, 2: 64}, 4, 2) is None
+
+
+def test_varying_bound_loops_render_the_bound_mask_and_dynamic_trips() -> None:
+    bound = _bind_chunk_scan()
+    body = _kernel_body(_source(bound, _config(16, 64, 64, warps=4, stages=2)))
+    assert SIMT_FALLBACK not in body
+    assert "md_end0 = cutlass.Int32(16 + 16 * (md_a0 // 16))" in body
+    # Every element of the cb pass is zeroed at K positions past the bound.
+    assert "< md_end0 else cutlass.Float32(0.0)" in body
+    assert "md_trips0" not in body
+    # The kernel's own causal ``where`` over the bf16-cast operand selects the
+    # unrounded fp32 value (the pack rounds once): no scalar converts of
+    # either branch.
+    assert re.search(
+        r"cutlass\.Float32\(md_v\w*\) if md_v\w* else cutlass\.Float32\(0\.0\)", body
+    )
+    assert "if md_v" in body and "else cutlass.BFloat16(0.0)" not in body
+    # Side loads of tensors the program never stores take the read-only path
+    # (dA_cumsum / dt rows of the pass, the residual x pairs of the epilogue);
+    # the stored tensor is never read through it.
+    assert re.search(rf"{RT}\.ldg_bf16_as_f32\([^\n]*, nc=True\)", body)
+    assert re.search(rf"{RT}\.ldg_b32\([^\n]*, nc=True\)", body)
+    assert not re.search(rf"{RT}\.ldg_\w+\([^\n]*md_base_9[^\n]*nc=True", body)
+    # A whole-chunk row tile needs no mask (every CTA's bound is the chunk).
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    assert "< md_end0 else" not in body
+    assert "for md_i in cutlass.range(0, 1):" in body
+    # Trip counts that differ between CTAs are computed per CTA.
+    a = torch.empty((256, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((256, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_causal_plain, (a, b))
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    assert "md_end0 = cutlass.Int32(64 + 64 * (md_a0 // 64))" in body
+    assert "md_trips0 = cutlass.Int32((md_end0 + 63) // 64)" in body
+    assert "for md_i in cutlass.range(0, md_trips0):" in body
+    assert "else cutlass.Float32(0.0)" not in body
+
+
+def test_varying_bound_programs_take_the_tcgen05_region_renderer() -> None:
+    # The single-loop tcgen05 emitter walks a static trip count and drops an
+    # epilogue derived value; the region renderer takes both, with the trip
+    # count per CTA, as long as no CTA runs a partial last trip.
+    bound = _bind_chunk_scan()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None and "tcgen05" in spec.cute_mma_dag.choices
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    tcgen05 = {
+        "cute_mma_dag": "tcgen05",
+        "cute_mma_dag_warps": 4,
+        "cute_mma_dag_stages": 1,
+        "cute_mma_dag_store": "staged",
+        "cute_mma_dag_exchange": "auto",
+        "cute_mma_dag_pass_warps": "off",
+        "cute_mma_dag_loads": "tma",
+        "cute_mma_dag_persistent": 0,
+    }
+    with bound.env:
+        aligned = spec.normalized_config(
+            helion.Config(block_sizes=[64, 64, 64], **tcgen05)
+        )
+    body = _kernel_body(bound.to_code(aligned))
+    assert "md_trips0" not in body  # 64-row tiles of a 64-wide chunk: one trip
+    # A 128-wide chunk at 64-row tiles: one or two aligned trips per CTA.
+    bound = _bind_chunk_scan(chunk=128)
+    with bound.env:
+        dynamic = bound.config_spec.normalized_config(
+            helion.Config(block_sizes=[64, 64, 64], **tcgen05)
+        )
+    body = _kernel_body(bound.to_code(dynamic))
+    assert "md_trips0 = cutlass.Int32((md_end0 + 63) // 64)" in body
+    assert "for md_i in cutlass.range(0, md_trips0):" in body
+    assert "tcgen05" in body
+
+
+def test_a_varying_bound_without_an_operand_pass_refuses_partial_trips() -> None:
+    a = torch.empty((256, 256), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((256, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
+    bound = _bind_fn(_causal_plain, (a, b))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    (loop_facts,) = facts.loops
+    assert loop_facts.end is not None and not loop_facts.maskable
+    reason = dag.mma_dag_config_reason(facts, {0: 16, 1: 64, 2: 64}, 4, 2)
+    assert reason is not None and "no operand pass" in reason
+    assert dag.mma_dag_config_reason(facts, {0: 64, 1: 64, 2: 64}, 4, 2) is None
+    assert dag.mma_dag_config_reason(facts, {0: 128, 1: 64, 2: 64}, 4, 2) is None
+    with bound.env, pytest.raises(InvalidConfig):
+        bound.config_spec.normalized_config(_config(16, 64, 64, warps=4, stages=2))
