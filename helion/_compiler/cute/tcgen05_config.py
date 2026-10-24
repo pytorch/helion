@@ -6477,9 +6477,19 @@ class CuteTcgen05Config:
             and config.get("tcgen05_cluster_n", 1) == 1
             and config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY) is not True
         )
+        # The single-CTA N,M grouped worklist publishes per-stage mailboxes,
+        # so its TMA producer can fetch work tiles ahead of the epilogue.
+        is_grouped_worklist_nm_one_cta = (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is False
+        )
         if (
             TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY in config
             and config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY) != 1
+            and not is_grouped_worklist_nm_one_cta
             and (
                 config.get(TCGEN05_STRATEGY_CONFIG_KEY)
                 != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
