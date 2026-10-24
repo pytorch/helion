@@ -1727,7 +1727,7 @@ def test_se_block_dx_derived_operand_routes_match_the_triton_backend(
     from test.test_cute_mma_dag_gpu import _se_block_inputs
 
     t = _se_block_inputs()
-    fn = _se_block().se_block_bwd_dx.fn
+    fn = _se_block("se_block_bwd_dx")
     args = (t["grad"], t["x"], t["w"], t["s"])
     source, (out,) = _run_cute(
         fn, args, _config([128, 64, 64], warps, 2, cute_mma_dag_derived=derived)
@@ -1979,7 +1979,7 @@ def test_se_block_dx_streamed_ring_matches_the_triton_backend(
     from test.test_cute_mma_dag_gpu import _se_block_inputs
 
     t = _se_block_inputs()
-    fn = _se_block().se_block_bwd_dx.fn
+    fn = _se_block("se_block_bwd_dx")
     args = (t["grad"], t["x"], t["w"], t["s"])
     source, (out,) = _run_cute(
         fn, args, _config(block_sizes, warps, stages, cute_mma_dag_derived="pass")
@@ -2013,7 +2013,7 @@ def test_se_block_dw_mn_major_tf32_a_matches_the_triton_backend(
     from test.test_cute_mma_dag_gpu import _se_block_inputs
 
     t = _se_block_inputs()
-    fn = _se_block().se_block_bwd_dw.fn
+    fn = _se_block("se_block_bwd_dw")
     args = (t["grad"], t["x"], t["s"])
     source, (out,) = _run_cute(
         fn,
@@ -2459,7 +2459,7 @@ def test_the_streamed_ring_runs_as_a_persistent_launch_bitwise() -> None:
     from test.test_cute_mma_dag_gpu import _se_block_inputs
 
     t = _se_block_inputs()
-    fn = _se_block().se_block_bwd_dx.fn
+    fn = _se_block("se_block_bwd_dx")
     args = (t["grad"], t["x"], t["w"], t["s"])
     _source, (base,) = _run_cute(
         fn, args, _config([64, 64, 64], 4, 2, cute_mma_dag_derived="pass")

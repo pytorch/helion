@@ -1,22 +1,24 @@
 """Real CUDA coverage for two-CTA persistent GEMM launches of a barrier chain.
 
 ``tcgen05_region_pid_types`` runs chosen GEMM phases of an ordered
-``hl.barrier()`` chain (``squeeze_and_excitation_net_bwd_dx`` / ``_bwd_da``)
-as the static persistent CtaGroup.TWO pipeline while the chain and its
-pointwise phase stay flat; the exact-shape auxiliary epilogues (the
-relu-backward mask, ``grad_out * d + acc``) ride along.  Each render is
-checked against the fp32 torch reference and must match the flat chain's
-numerics bitwise (same tiles, same K order, same epilogue arithmetic).
+``hl.barrier()`` chain (the two-GEMM ``squeeze_and_excitation_net`` backward
+chains of ``test._cute_se_bwd_chains``) as the static persistent CtaGroup.TWO
+pipeline while the chain and its pointwise phase stay flat; the exact-shape
+auxiliary epilogues (the relu-backward mask, ``grad_out * d + acc``) ride
+along.  Each render is checked against the fp32 torch reference and must
+match the flat chain's numerics bitwise (same tiles, same K order, same
+epilogue arithmetic).
 """
 
 from __future__ import annotations
 
 from typing import cast
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_da
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dx
 import pytest
 import torch
+
+from test._cute_se_bwd_chains import se_bwd_da_chain
+from test._cute_se_bwd_chains import se_bwd_dx_chain
 
 import helion
 from helion._testing import DEVICE
@@ -130,7 +132,7 @@ def _check_bwd_dx(
     args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
     grad_x_ref, _grad_a_ref = _reference(t)
     kernel = helion.kernel(
-        squeeze_and_excitation_net_bwd_dx.fn,
+        se_bwd_dx_chain,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
@@ -173,7 +175,7 @@ def test_bwd_da_two_cta_region_launches(pdl: bool) -> None:
     args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
     _grad_x_ref, grad_a_ref = _reference(t)
     kernel = helion.kernel(
-        squeeze_and_excitation_net_bwd_da.fn,
+        se_bwd_da_chain,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
@@ -205,7 +207,7 @@ def test_chain_seeds_compile_and_match() -> None:
     t = _inputs()
     args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
     kernel = helion.kernel(
-        squeeze_and_excitation_net_bwd_dx.fn,
+        se_bwd_dx_chain,
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
