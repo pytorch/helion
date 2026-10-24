@@ -349,6 +349,9 @@ _KERNELS = {
     "state_du_kda": "chunk_bwd_state_du_kda_helion",
     "wu_kda": "chunk_bwd_wu_kda_helion",
     "fwd_o_anch": "chunk_fwd_o_diag_anchored_helion",
+    "state_dwk_kda": "chunk_bwd_state_dwk_kda_helion",
+    "wy_anch": "chunk_fwd_wy_delta_helion",
+    "dqkg": "chunk_bwd_dqkg_scalar_helion",
 }
 
 
@@ -1106,6 +1109,13 @@ def _inputs_kda(
     }
 
 
+def _anchored_gram(t: dict[str, torch.Tensor]) -> torch.Tensor:
+    """The anchored k-gram the WY transform inverts: strictly lower
+    triangular and small, so the Neumann doubling converges (the engine's
+    gram carries the decay and the strict mask)."""
+    return (torch.tril(t["A"].float(), -1) * 0.05).to(torch.bfloat16)
+
+
 def _kda_args(kernel: str, t: dict[str, torch.Tensor], bh: int) -> tuple[object, ...]:
     if kernel == "bwd_o_kda":
         return (t["q"], t["v"], t["h"], t["A"], t["gc"], t["do"], 0.125)
@@ -1134,6 +1144,33 @@ def _kda_args(kernel: str, t: dict[str, torch.Tensor], bh: int) -> tuple[object,
             t["dw"],
             t["du"],
         )
+    if kernel == "state_dwk_kda":
+        n = t["k"].shape[0] // bh
+
+        def chunks(x: torch.Tensor) -> torch.Tensor:
+            return x.reshape(bh, n, *x.shape[1:])
+
+        return (
+            chunks(t["k"]),
+            chunks(t["gc"]),
+            chunks(t["h"]),
+            chunks(t["v"]),
+            chunks(t["du"]),
+            chunks(t["dh"]),
+        )
+    if kernel == "wy_anch":
+        # (The state key ``k_state_out`` is written in place: a fresh buffer
+        # per call, compared by ``test_anchored_wy_state_key_...``.)
+        return (
+            t["k"],
+            t["v"],
+            t["beta"],
+            t["gc"],
+            _anchored_gram(t),
+            torch.empty_like(t["k"]),
+            False,
+            True,
+        )
     assert kernel == "fwd_o_anch"
     return (t["q"], t["v"], t["gc"], t["h"], t["A"], 0.125)
 
@@ -1142,7 +1179,9 @@ def _kda_args(kernel: str, t: dict[str, torch.Tensor], bh: int) -> tuple[object,
 # fragment dim (summation order), and the serially carried fp32 state whose
 # bf16 operand roundings flip where the backends' fp32 op order differs (a
 # few bf16 ulps of the large terms, so the tolerance follows the magnitude).
-_KDA_INEXACT = {"state_du_kda": {0, 1}, "wu_kda": {3}}
+# dwk's ``dgc_s`` adds the column sum of a fragment and a loop-carried row
+# reduction (summation order).
+_KDA_INEXACT = {"state_du_kda": {0, 1}, "wu_kda": {3}, "state_dwk_kda": {2}}
 _KDA_SCALED = {"state_du_kda"}
 # kernel, (d, dv), block sizes, warps, stages
 _KDA_CASES = (
@@ -1158,6 +1197,17 @@ _KDA_CASES = (
     ("fwd_o_anch", (64, 64), [1, 32, 32], 4, 2),
     ("fwd_o_anch", (128, 128), [1, 64, 64], 8, 1),
     ("fwd_o_anch", (64, 64), [1, 16, 32], 2, 3),
+    # The epilogue reads the column sum of its own fragment (``dgc_last``)
+    # beside the fragment under the ``is_last`` row mask: the vector is
+    # relaid through the scratch into the fragment's register positions.
+    ("state_dwk_kda", (64, 64), [1, 64, 32], 8, 2),
+    ("state_dwk_kda", (128, 64), [1, 32, 32], 4, 2),
+    ("state_dwk_kda", (64, 128), [1, 64, 64], 8, 1),
+    # The Neumann chain's carries are seeded with pointwise values over the
+    # loaded gram (``A = -(beta * Akk[b])``, ``T = eye + A``).
+    ("wy_anch", (64, 64), [32, 32], 4, 2),
+    ("wy_anch", (128, 128), [64, 64], 8, 1),
+    ("wy_anch", (128, 64), [32, 64], 4, 2),
 )
 
 
@@ -1934,3 +1984,495 @@ def test_the_aux_ring_matches_the_register_form_on_the_gated_chain(
         assert "cp_async_bulk_tensor_shared_cta_global" in source
         for lhs, rhs in zip(bulk, register, strict=True):
             assert torch.equal(lhs, rhs)
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps"), (([1, 128], 8), ([1, 64], 4), ([1, 256], 8))
+)
+def test_a_loop_less_batched_matmul_matches_the_triton_backend(
+    block_sizes: list[int], warps: int
+) -> None:
+    # The indexer's decode form: no device loop, one ``aten.bmm`` over the
+    # 32 heads staged once per CTA, the head sum a column reduction, the
+    # masked store a vector store.  Bit-equal to Triton over eight launches.
+    fn = _probe_kernels()._head_sum_logits_batched
+    args = _head_sum_args(h=32)
+    source, out = _run_cute(fn, args, _config(block_sizes, warps, 4))
+    assert "for md_i" not in source and f"{RT}.octet_sum(" in source
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out[0], ref)
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+@pytest.mark.parametrize(("block_size", "warps"), ((64, 4), (256, 8), (32, 1)))
+def test_a_cumsum_of_a_fragment_matches_torch(
+    reverse: bool, block_size: int, warps: int
+) -> None:
+    # Integer bf16 operands: the fp32 products and their prefix sums are
+    # exact in any order, so the scan (octet shuffles, chained halves and
+    # atoms, the warps along M through the scratch tile) must be bit-equal
+    # to torch's cumsum of the product.
+    fn = _probe_kernels()._loop_less_dot_scanned
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    a = torch.randint(-4, 5, (6, 32, 128), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    b = torch.randint(-4, 5, (6, 128, 512), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    source, out = _run_cute(fn, (a, b, reverse), _config([block_size], warps, 4))
+    assert f"{RT}.{'shfl_down' if reverse else 'shfl_up'}_add_f32(" in source
+    product = torch.bmm(a.float(), b.float()) * 0.5
+    ref = product.flip(1).cumsum(1).flip(1) if reverse else product.cumsum(1)
+    assert torch.equal(out[0], ref)
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages"), (([64, 64], 4, 2), ([128, 32], 8, 3))
+)
+def test_a_cumsum_inside_a_k_loop_matches_torch(
+    reverse: bool, block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # The scan of the K-loop carry runs inside the loop (a slot of its
+    # own, the carry stays live; the cross-warp exchange behind the
+    # iteration's barriers).  Integer operands: the last iteration's
+    # prefix sums down each M tile are exact, bit-equal to torch's cumsum
+    # of the product per tile.
+    fn = _probe_kernels()._k_loop_dot_scanned
+    g = torch.Generator(device=DEVICE).manual_seed(7)
+    a = torch.randint(-4, 5, (256, 512), device=DEVICE, generator=g).to(torch.bfloat16)
+    b = torch.randint(-4, 5, (512, 64), device=DEVICE, generator=g).to(torch.bfloat16)
+    source, out = _run_cute(fn, (a, b, reverse), _config(block_sizes, warps, stages))
+    assert "for md_i" in source
+    assert f"{RT}.{'shfl_down' if reverse else 'shfl_up'}_add_f32(" in source
+    product = (a.float() @ b.float()).view(-1, block_sizes[0], 64)
+    ref = product.flip(1).cumsum(1).flip(1) if reverse else product.cumsum(1)
+    assert torch.equal(out[0], ref.view(256, 64))
+
+
+def test_a_cumsum_inside_an_inner_tile_loop_matches_torch() -> None:
+    fn = _probe_kernels()._inner_loop_dot_scanned
+    g = torch.Generator(device=DEVICE).manual_seed(9)
+    a = torch.randint(-4, 5, (6, 32, 128), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    b = torch.randint(-4, 5, (6, 128, 512), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    source, out = _run_cute(fn, (a, b), _config([64], 4, 2))
+    assert "for md_i" in source and f"{RT}.shfl_up_add_f32(" in source
+    assert torch.equal(out[0], (torch.bmm(a.float(), b.float()) * 0.5).cumsum(1))
+
+
+def test_a_cumsum_of_a_live_fragment_keeps_its_input() -> None:
+    # The scanned value is stored too, so the scan writes a fresh slot and
+    # the dot's registers reach their store unchanged.
+    fn = _probe_kernels()._loop_less_dot_scanned_and_stored
+    g = torch.Generator(device=DEVICE).manual_seed(3)
+    a = torch.randint(-4, 5, (6, 32, 128), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    b = torch.randint(-4, 5, (6, 128, 512), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    _source, (scanned, plain) = _run_cute(fn, (a, b), _config([64], 4, 4))
+    product = torch.bmm(a.float(), b.float()) * 0.5
+    assert torch.equal(plain, product)
+    assert torch.equal(scanned, product.cumsum(1))
+
+
+@pytest.mark.parametrize(("block_size", "warps"), ((64, 4), (128, 8), (32, 2)))
+def test_a_cumsum_whose_value_reads_a_vector_matches_torch(
+    block_size: int, warps: int
+) -> None:
+    # dqkg's tail in miniature: the fragment's column sums folded into its
+    # last row under an iota mask, then the reverse prefix sum.  Integer
+    # operands keep the products, the column sums and the prefix sums exact,
+    # so the scan over a value that reads the reduction's vector must be
+    # bit-equal to torch.
+    fn = _probe_kernels()._loop_less_dot_scanned_with_a_vector
+    g = torch.Generator(device=DEVICE).manual_seed(17)
+    a = torch.randint(-4, 5, (6, 32, 128), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    b = torch.randint(-4, 5, (6, 128, 512), device=DEVICE, generator=g).to(
+        torch.bfloat16
+    )
+    source, out = _run_cute(fn, (a, b), _config([block_size], warps, 4))
+    assert f"{RT}.shfl_down_add_f32(" in source and f"{RT}.octet_sum(" in source
+    product = torch.bmm(a.float(), b.float())
+    value = product.clone()
+    value[:, -1, :] += product.sum(1)
+    assert torch.equal(out[0], value.flip(1).cumsum(1).flip(1))
+
+
+def _dqkg_args(
+    t: dict[str, torch.Tensor], diag: bool, compute_dg: bool = True
+) -> tuple[object, ...]:
+    if diag:
+        g = torch.Generator(device=DEVICE).manual_seed(11)
+        bhn, c, d = t["q"].shape
+        gcs = _randn(g, bhn, c, d, scale=0.1, dtype=torch.float32)
+        gl = None
+    else:
+        gcs, gl = t["gcs"], t["gl"]
+    return (
+        t["q"],
+        t["k"],
+        t["v"],
+        gcs,
+        t["h"],
+        t["do"],
+        t["dh"],
+        gl,
+        diag,
+        compute_dg,
+        0.125,
+    )
+
+
+# diag_anchored, (d, dv), block sizes (lead, tile_d, tile_dv), warps, stages
+_DQKG_CASES = (
+    (False, (128, 128), [1, 128, 32], 8, 2),
+    (False, (64, 64), [1, 32, 64], 4, 2),
+    (False, (128, 64), [1, 64, 64], 8, 1),
+    (True, (128, 128), [1, 64, 64], 8, 2),
+    (True, (64, 128), [1, 32, 64], 4, 2),
+)
+
+
+@pytest.mark.parametrize(
+    ("diag", "shape", "block_sizes", "warps", "stages"),
+    _DQKG_CASES,
+    ids=[
+        f"{'anchored' if dg else 'scalar'}-d{s[0]}dv{s[1]}-{'x'.join(map(str, bs))}w{w}s{st}"
+        for dg, s, bs, w, st in _DQKG_CASES
+    ],
+)
+def test_dqkg_with_the_gate_gradient_matches_the_triton_backend(
+    diag: bool,
+    shape: tuple[int, int],
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+) -> None:
+    # ``chunk_bwd_dqkg_scalar_helion(compute_dg=True)``: the training
+    # backward of simple_gla / full_gla (the gate's gradient).  dq is
+    # bit-equal; dk differs from Triton by one bf16 ulp on a few elements
+    # (``dot * scale + dk_state`` is one FMA there, a mul and an add here --
+    # the same elements as the ``compute_dg=False`` path); dg_by_d (fp32,
+    # the reverse prefix sum of ``dg_raw`` with the state-carry term folded
+    # into the last row) differs by fp32 summation order only.
+    d, dv = shape
+    t = _inputs3(bhn=6, d=d, dv=dv, dtype=torch.bfloat16)
+    args = _dqkg_args(t, diag)
+    fn = _kernel_fn("dqkg")
+    source, (dq, dk, dg) = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    assert f"{RT}.shfl_down_add_f32(" in source
+    rq, rk, rg = _run_triton(fn, args, block_sizes)
+    assert torch.equal(dq, rq)
+    _assert_close((dk,), (rk,), scaled=True)
+    _assert_close((dg,), (rg,))
+
+
+def test_anchored_wy_state_key_matches_the_triton_backend() -> None:
+    # The anchored WY transform's side output ``k_state_out = k *
+    # exp2(gc[C-1] - gc)`` (a derived value over two loaded tiles, stored
+    # from the loop body) is written in place: separate buffers per backend.
+    t = _inputs_kda(bh=2, n=3, d=64, dv=64)
+    fn = _kernel_fn("wy_anch")
+    outs = []
+    akk = _anchored_gram(t)
+    for backend in ("cute", "triton"):
+        kso = torch.empty_like(t["k"])
+        args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
+        if backend == "cute":
+            _source, out = _run_cute(fn, args, _config([32, 32], 4, 2))
+        else:
+            out = _run_triton(fn, args, [32, 32])
+        outs.append((*out, kso))
+    for lhs, rhs in zip(*outs, strict=True):
+        assert torch.equal(lhs, rhs)
+
+
+def _se_block() -> ModuleType:
+    return importlib.import_module("examples.se_block")
+
+
+def _se_block_inputs(m: int = 512, n: int = 256) -> dict[str, torch.Tensor]:
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    x = _randn(g, m, n, dtype=torch.float16)
+    w = _randn(g, n, n, scale=0.05, dtype=torch.float16)
+    grad = _randn(g, m, n, dtype=torch.float16)
+    return {"x": x, "w": w, "s": torch.sigmoid(x @ w), "grad": grad}
+
+
+@pytest.mark.parametrize("derived", ("exchange", "pass"))
+@pytest.mark.parametrize(
+    ("kernel", "block_sizes", "warps"),
+    (
+        ("se_block_bwd_dw", [64, 64, 64], 4),
+        ("se_block_bwd_dx", [64, 64, 64], 8),
+        ("se_block_bwd_dx", [64, 64, 64], 4),
+    ),
+)
+def test_se_block_backward_matches_the_triton_backend(
+    kernel: str, block_sizes: list[int], warps: int, derived: str
+) -> None:
+    # fp32 ``acc += a @ b`` (``aten.addmm``) over pointwise-derived fp32
+    # operands: tf32 MMAs under the default dot precision, as Triton's
+    # ``tl.dot(..., input_precision='tf32')`` runs the same source.  dx's
+    # pre-seed ``acc += 2.0 * grad_out * s`` is a half-typed derived value
+    # (torch promotion) widened into the fp32 registers.  The derived
+    # operand ``2 * g * x * s * (1 - s)`` (dx's A, dw's B) either goes
+    # through the register-direct fragment (``exchange``) or is written by
+    # the derived pass from the staged source tiles (``pass``).  Bit-equal
+    # either way.
+    t = _se_block_inputs()
+    fn = getattr(_se_block(), kernel).fn
+    if kernel == "se_block_bwd_dw":
+        args: tuple[object, ...] = (t["grad"], t["x"], t["s"])
+    else:
+        args = (t["grad"], t["x"], t["w"], t["s"])
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, warps, 2, cute_mma_dag_derived=derived)
+    )
+    assert f"{RT}.mma_tf32(" in source
+    if derived == "pass":
+        assert "md_x0" not in source
+        assert f"{RT}.lds_v4_b32(md_d" in source
+    ref = _run_triton(fn, args, block_sizes)
+    for lhs, rhs in zip(out, ref, strict=True):
+        assert torch.equal(lhs, rhs)
+
+
+def _half_chain_args() -> tuple[torch.Tensor, ...]:
+    g = torch.Generator(device=DEVICE).manual_seed(3)
+    m, k, n = 512, 256, 256
+    grad = _randn(g, m, k, dtype=torch.bfloat16)
+    x = _randn(g, m, k, dtype=torch.bfloat16)
+    s = torch.sigmoid(_randn(g, m, k, dtype=torch.bfloat16))
+    w = _randn(g, k, n, scale=0.1, dtype=torch.bfloat16)
+    return grad, x, s, w
+
+
+@pytest.mark.parametrize(
+    ("derived", "warps"), (("exchange", 4), ("pass", 4), ("pass", 8))
+)
+def test_a_half_typed_pass_chain_matches_the_triton_backend(
+    derived: str, warps: int
+) -> None:
+    # A bf16-typed chain ``2 * g * x * (1 - s)`` (torch promotion) feeding a
+    # bf16 dot.  The pass evaluates the chain as the SIMT lowering does and
+    # packs each eight-element group once into the 16-bit A tile; the
+    # exchange route rounds the same values into the fragment registers.
+    # Bit-equal to Triton either way.
+    fn = _probe_kernels()._half_chain_operand
+    args = _half_chain_args()
+    source, (out,) = _run_cute(
+        fn, args, _config([64, 64, 64], warps, 2, cute_mma_dag_derived=derived)
+    )
+    assert f"{RT}.mma_bf16(" in source
+    if derived == "pass":
+        assert f"{RT}.sts_v4_b32(md_t0 + " in source
+        assert f"{RT}.pack_bf16x2(" in source
+    (ref,) = _run_triton(fn, args, [64, 64, 64])
+    assert torch.equal(out, ref)
+
+
+def _masked_neg_inf_args() -> tuple[torch.Tensor, ...]:
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    a = _randn(g, 4, 64, 128, dtype=torch.bfloat16)
+    w = _randn(g, 4, 128, 64, dtype=torch.bfloat16)
+    out = torch.empty((4, 64, 64), dtype=torch.float32, device=DEVICE)
+    return a, w, out
+
+
+@pytest.mark.parametrize("warps", (4, 8))
+def test_a_non_finite_fill_beside_a_fragment_matches_the_triton_backend(
+    warps: int,
+) -> None:
+    # ``where(mask, acc, hl.full(..., float("-inf")))``: the fill renders
+    # as a ``float('-inf')`` call (a bare ``-inf`` is a NameError at the
+    # DSL compile); the masked elements are ``-inf``, the rest bit-equal.
+    fn = _probe_kernels()._masked_neg_inf_stored
+    args = _masked_neg_inf_args()
+    source, (out,) = _run_cute(fn, args, _config([64], warps, 2))
+    assert "cutlass.Float32(float('-inf'))" in source
+    (ref,) = _run_triton(fn, _masked_neg_inf_args(), [64])
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out, ref)
+
+
+# m, block_sizes, warps: a 16-row tile over 8 rows; blocks of 8 computed at
+# the atom (one CTA owning the rows it stores); one row (the frontend pins
+# the block to 1); two CTAs with a ragged tail (24 under 16); two CTAs of 8
+# rows each computed at the atom (16 under 8).
+_RAGGED_CASES = (
+    (8, [16, 128], 4),
+    (8, [8, 128], 4),
+    (1, [16, 64], 2),
+    (24, [16, 128], 4),
+    (16, [8, 64], 2),
+)
+
+
+@pytest.mark.parametrize(("m", "block_sizes", "warps"), _RAGGED_CASES)
+def test_ragged_root_tiles_match_the_triton_backend(
+    m: int, block_sizes: list[int], warps: int
+) -> None:
+    # The indexer's logits with M below (or not a multiple of) the 16-row
+    # MMA atom: the rows past the extent are zero-filled operand packets,
+    # zero side loads and dropped stores.  Integer inputs: bit-equal to
+    # Triton's masked tile over eight launches.
+    fn = _probe_kernels()._head_sum_logits
+    args = _head_sum_args(m=m)
+    source, out = _run_cute(fn, args, _config(block_sizes, warps, 2))
+    assert f"{RT}.cp_async_16_zfill(" in source
+    assert f"{RT}.ldg_s32_pred(" in source and f"{RT}.ldg_f32_pred(" in source
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out[0], ref)
+
+
+def _ragged_sum_args(m: int, k: int = 64, n: int = 256) -> tuple[torch.Tensor, ...]:
+    g = torch.Generator(device=DEVICE).manual_seed(m)
+    a = torch.randint(-4, 5, (m, k), device=DEVICE, generator=g).to(torch.bfloat16)
+    b = torch.randint(-4, 5, (k, n), device=DEVICE, generator=g).to(torch.bfloat16)
+    return a, b
+
+
+@pytest.mark.parametrize(
+    ("m", "block_sizes", "warps"),
+    ((8, [16, 128], 4), (1, [16, 64], 2), (24, [32, 128], 4)),
+)
+def test_a_reduction_over_ragged_rows_matches_torch(
+    m: int, block_sizes: list[int], warps: int
+) -> None:
+    # ``(a @ b + 1).sum(0)`` with the rows in one tile: the frontend's
+    # ``_mask_to`` zeroes the rows past the extent ahead of the sum (the
+    # add's masked value is one), rendered as a select per register.
+    # Integer inputs: exact.
+    fn = _probe_kernels()._ragged_rows_summed
+    a, b = _ragged_sum_args(m)
+    source, (out,) = _run_cute(fn, (a, b), _config(block_sizes, warps, 2))
+    assert " else cutlass.Float32(0.0)" in source
+    ref = (a.float() @ b.float() + 1.0).sum(0)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("m", "block_size", "warps"), ((8, 16, 4), (24, 16, 4), (24, 32, 4), (1, 16, 2))
+)
+def test_a_vector_along_ragged_rows_matches_torch(
+    m: int, block_size: int, warps: int
+) -> None:
+    # ``(a @ b + 1).sum(1)`` over the whole ``b``: a vector along the ragged
+    # rows stored under the row guard (two CTAs at 24 under 16, the second
+    # with eight rows past the extent).
+    fn = _probe_kernels()._ragged_cols_summed
+    a, b = _ragged_sum_args(m, n=128)
+    kernel = helion.kernel(
+        fn,  # type: ignore[arg-type]
+        backend="cute",
+        static_shapes=True,
+        cute_full_slice_matmul_tiling=False,
+    )
+    bound = kernel.bind((a, b))
+    config = _config([block_size], warps, 2)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    assert f"{RT}.mma_bf16(" in source and f"{RT}.cp_async_16_zfill(" in source
+    compiled = bound.compile_config(normalized)
+    outputs = [cast_tensor(compiled(a, b)).clone() for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    ref = (a.float() @ b.float() + 1.0).sum(1)
+    for out in outputs:
+        assert torch.equal(out, ref)
+
+
+def _half_addmm_db(
+    grad_out: torch.Tensor, x: torch.Tensor, d: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """squeeze_and_excitation_net's ``bwd_db``: ``torch.addmm(acc, c[tile_m,
+    tile_k].T, grad_d)`` with an fp32 accumulator over half operands -- the
+    B operand a half pass chain, the A operand a transposed half tile."""
+    m, n = grad_out.size()
+    k = c.size(1)
+    grad_b = torch.empty([k, n], dtype=grad_out.dtype, device=grad_out.device)
+    for tile_k, tile_n in hl.tile([k, n]):
+        acc = hl.zeros([tile_k, tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m):
+            grad_d = (
+                grad_out[tile_m, tile_n]
+                * x[tile_m, tile_n]
+                * d[tile_m, tile_n]
+                * (1.0 - d[tile_m, tile_n])
+            )
+            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
+        grad_b[tile_k, tile_n] = acc
+    return grad_b
+
+
+_HALF_ADDMM_CASES = (
+    ("warp", [32, 32, 64], 4, 2, "exchange"),
+    ("warp", [64, 64, 64], 8, 2, "pass"),
+    ("tcgen05", [64, 16, 128], 4, 2, "exchange"),
+    ("tcgen05", [64, 32, 128], 4, 2, "pass"),
+)
+
+
+@pytest.mark.parametrize(
+    ("mode", "block_sizes", "warps", "stages", "derived"),
+    _HALF_ADDMM_CASES,
+    ids=[
+        f"{m}-{'x'.join(map(str, b))}-w{w}s{s}-{d}"
+        for m, b, w, s, d in _HALF_ADDMM_CASES
+    ],
+)
+def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
+    mode: str, block_sizes: list[int], warps: int, stages: int, derived: str
+) -> None:
+    # ``acc = torch.addmm(acc, a16, b16)`` is a dot of this owner (the
+    # ``hl.dot(a16, b16, acc=acc)`` contract): fp32 products into the fp32
+    # accumulator, no rounding, on both emitters and both derived routes.
+    g = torch.Generator(device=DEVICE).manual_seed(29)
+    m, k, n = 1024, 256, 512
+    grad_out = _randn(g, m, n, dtype=torch.float16)
+    x = _randn(g, m, n, dtype=torch.float16)
+    d = torch.sigmoid(_randn(g, m, n, dtype=torch.float16))
+    c = torch.relu(_randn(g, m, k, dtype=torch.float16))
+    args = (grad_out, x, d, c)
+    config = helion.Config(
+        block_sizes=block_sizes,
+        cute_mma_dag=mode,
+        cute_mma_dag_warps=warps,
+        cute_mma_dag_stages=stages,
+        cute_mma_dag_loads="tma",
+        cute_mma_dag_derived=derived,
+    )
+    kernel = helion.kernel(_half_addmm_db, backend="cute", static_shapes=True)  # type: ignore[arg-type]
+    bound = kernel.bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    assert "_cute_grouped_reduce_shared_two_stage" not in source
+    if mode == "warp":
+        assert f"{RT}.mma_f16(" in source
+    else:
+        assert "_helion_mma_dag_tc" in source
+    compiled = bound.compile_config(normalized)
+    outputs = [cast_tensor(compiled(*args)) for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    for other in outputs[1:]:
+        assert torch.equal(outputs[0], other)
+    out = outputs[0]
+    grad_d = grad_out.float() * x.float() * d.float() * (1.0 - d.float())
+    ref = (c.float().T @ grad_d).to(torch.float16)
+    rel_l2 = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel_l2 < 1e-3, rel_l2
+    (triton,) = _run_triton(_half_addmm_db, args, block_sizes)
+    _assert_close((out,), (triton,))

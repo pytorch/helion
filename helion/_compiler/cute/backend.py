@@ -1679,11 +1679,15 @@ class CuteBackend(Backend):
 
     @property
     def pads_small_matmul_dims(self) -> bool:
-        # The SIMT matmul lowering masks the rows / columns past the extent,
-        # and the ``cute_mma_dag`` warp mode runs ragged root tiles (a
-        # 16-row MMA atom over M < 16: zero-filled operand rows, zero side
-        # loads, guarded stores) -- the padded tile the search may select.
-        return True
+        # The ordinary lowerings read and write exactly the extent (a tile
+        # past a small M / N is declined or mis-folded, not masked), so the
+        # frontend keeps every matmul dim's search ceiling at the extent.
+        # The one lowering that runs a padded tile -- the ``cute_mma_dag``
+        # warp mode over a ragged root axis (a 16-row MMA atom over M < 16:
+        # zero-filled operand rows, zero side loads, guarded stores) --
+        # raises that block's ceiling to its atom from its own facts
+        # registration (``mma_dag_ragged_ceilings``).
+        return False
 
     @property
     def dynamo_captures_kernel_launch(self) -> bool:
@@ -2044,6 +2048,7 @@ class CuteBackend(Backend):
                 "cute_materialized_operand_schedule",
                 "cute_fragment_scan",
                 "cute_fragment_reduction",
+                "cute_fp32_dot",
                 "cute_fragment_threads",
                 "cute_fragment_register_loads",
                 "cute_fragment_producer_cache",
@@ -2080,6 +2085,13 @@ class CuteBackend(Backend):
                 "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
+                "cute_fragment_padded_rows",
+                "cute_fragment_unrolled_loops",
+                "cute_fragment_vector_io",
+                "cute_fragment_batched_loads",
+                "cute_fragment_split_k",
+                "cute_fragment_mma_rows",
+                "cute_fragment_slab_loads",
                 "cute_fragment_warp_results",
                 "cute_fragment_private_scalar_loops",
                 "cute_pointwise_pid_type",
@@ -2180,6 +2192,7 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_persistent"
             or key == "cute_mma_dag_cluster"
             or key == "cute_mma_dag_split"
+            or key == "cute_mma_dag_derived"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )

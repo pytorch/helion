@@ -13,6 +13,9 @@ from ..cute.cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute.cute_mma_dag import MMA_DAG_AUX_RING
 from ..cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from ..cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
+from ..cute.cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
+from ..cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
+from ..cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from ..cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_KEY
@@ -98,12 +101,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             program = match_mma_dag(device_ir.graphs)
             if program is None:
                 return None
-            facts = mma_dag_facts(program)
-            if facts.chain_vecs and facts.tcgen05 is None:
-                # Only the tensor-memory region renderer lowers a fragment
-                # chain over a row vector: no mode would run the program.
-                return None
-            return facts
+            return mma_dag_facts(program)
 
     @classmethod
     def register_facts(
@@ -251,6 +249,26 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     ranked.insert(at, (top[0], (sizes, warps, depth), *top[2:]))
                     persistent[at] = ctas
                     at += 1
+        # Pass chains (a dot operand that is a pointwise chain over loaded
+        # tiles): the first seed of each mode again with the chain written
+        # by the derived pass (``cute_mma_dag_derived='pass'``) right behind
+        # it, so the autotuner compares the two routes at the same tile.
+        derived_variants: dict[int, str] = {}
+        if facts.pass_chains:
+            seen_modes: set[str] = set()
+            at = 0
+            while at < len(ranked):
+                mode = ranked[at][0]
+                if mode not in seen_modes:
+                    seen_modes.add(mode)
+                    ranked.insert(at + 1, ranked[at])
+                    derived_variants[at + 1] = MMA_DAG_DERIVED_PASS
+                    persistent = {
+                        (key + 1 if key > at else key): value
+                        for key, value in persistent.items()
+                    }
+                    at += 1
+                at += 1
         for index, (mode, (sizes, warps, stages), exchange, pass_warps) in enumerate(
             ranked
         ):
@@ -268,6 +286,9 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                 ),
                 MMA_DAG_PASS_WARPS_KEY: pass_warps,
                 MMA_DAG_LOADS_KEY: MMA_DAG_LOADS_TMA,
+                MMA_DAG_DERIVED_KEY: derived_variants.get(
+                    index, MMA_DAG_DERIVED_EXCHANGE
+                ),
             }
             if exchange != MMA_DAG_EXCHANGE_AUTO:
                 config[MMA_DAG_EXCHANGE_KEY] = exchange
@@ -303,28 +324,45 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         )
                     continue
             seeds.append(Config.from_dict(config))
-        if facts.aux_candidates:
-            # The top warp seed again with the loop-varying side loads staged
-            # through the operand ring (gated fwd_h behind the writer of its
-            # gates in the mamba2 ssd pipeline: the fresh-line stall of the
-            # per-thread loads leaves the serial chain).
-            for at, seed in enumerate(seeds):
-                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP:
-                    ring = {**seed.config, MMA_DAG_AUX_KEY: MMA_DAG_AUX_RING}
-                    seeds.insert(at + 1, Config.from_dict(ring))
-                    break
-        if spec.supports_config_key(MIN_BLOCKS_KEY):
-            # The top warp seed again with the one-CTA occupancy hint: ptxas
-            # otherwise budgets registers for the CTAs the shared-memory
-            # footprint admits, and a single-wave kernel gains nothing from
-            # that occupancy (chunk_scan at s1, 256 CTAs: 4.22 -> 3.95 us
-            # with the hint on the same tile / warps / stages; the search
-            # found it in one of three cold draws).
-            for at, seed in enumerate(seeds):
-                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP:
-                    hinted = {**seed.config, MIN_BLOCKS_KEY: 1}
-                    seeds.insert(at + 1, Config.from_dict(hinted))
-                    break
+        # The top warp seed's twins sit right behind it and its derived-pass
+        # variant (the two routes stay adjacent at the same tile).
+        top_warp = next(
+            (
+                at
+                for at, seed in enumerate(seeds)
+                if seed.config[MMA_DAG_KEY] == MMA_DAG_WARP
+            ),
+            None,
+        )
+        if top_warp is not None:
+            twin_at = top_warp + 1
+            if (
+                twin_at < len(seeds)
+                and seeds[twin_at].config[MMA_DAG_DERIVED_KEY] == MMA_DAG_DERIVED_PASS
+                and seeds[twin_at].config["block_sizes"]
+                == seeds[top_warp].config["block_sizes"]
+            ):
+                twin_at += 1
+            top = seeds[top_warp].config
+            if facts.aux_candidates:
+                # The top warp seed again with the loop-varying side loads
+                # staged through the operand ring (gated fwd_h behind the
+                # writer of its gates in the mamba2 ssd pipeline: the
+                # fresh-line stall of the per-thread loads leaves the serial
+                # chain).
+                ring = {**top, MMA_DAG_AUX_KEY: MMA_DAG_AUX_RING}
+                seeds.insert(twin_at, Config.from_dict(ring))
+                twin_at += 1
+            if spec.supports_config_key(MIN_BLOCKS_KEY):
+                # The top warp seed again with the one-CTA occupancy hint:
+                # ptxas otherwise budgets registers for the CTAs the
+                # shared-memory footprint admits, and a single-wave kernel
+                # gains nothing from that occupancy (chunk_scan at s1, 256
+                # CTAs: 4.22 -> 3.95 us with the hint on the same tile /
+                # warps / stages; the search found it in one of three cold
+                # draws).
+                hinted = {**top, MIN_BLOCKS_KEY: 1}
+                seeds.insert(twin_at, Config.from_dict(hinted))
         return seeds or None
 
     @classmethod

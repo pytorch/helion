@@ -114,6 +114,19 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    the same uniform stream but rejects these other RNG operations. The policy
    is serialized with settings and emitted reproduction decorators.
 
+.. autoattribute:: Settings.cute_graph_cse
+
+   CuTe only. When ``True`` (the default) duplicate reductions of the traced
+   device IR, and the pure chains between them, are merged before code
+   generation: a ``softmax`` and a ``log_softmax`` of one operand share their
+   ``amax``, ``exp`` and ``sum`` sweeps. Two identical pure operators on the
+   same inputs are bitwise identical, so results never change. Set
+   ``cute_graph_cse=False`` or ``HELION_CUTE_GRAPH_CSE=0`` to keep the graph as
+   traced, which bisects a structural-matcher regression against the pass. The
+   two graphs roll different reduction sweeps, so their configs differ in shape;
+   printed repros record the value in their ``@helion.kernel`` decorator and
+   replay the graph they were emitted from whatever the replay environment.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -418,6 +431,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
+| ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
