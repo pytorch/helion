@@ -149,6 +149,56 @@ def col_sum_nested(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def rms_norm_bwd(
+    grad_out: torch.Tensor,
+    grad_inv_rms: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The backward ``helion.experimental.backward`` generates for the
+    ``rms_norm_fwd`` of ``test_autodiff.py`` (``test_rms_norm_multiout``):
+    two chained feature reductions over the row tile's columns (the mean that
+    feeds ``inv_rms``, the ``grad_x`` sum) beside the ``grad_weight`` partial,
+    a reduction over the row tile itself."""
+    m, n = x.size()
+    grad_x = torch.empty_like(x)
+    block_m = hl.register_block_size(m)
+    num_blocks = (m + block_m - 1) // block_m
+    grad_weight_parts = torch.zeros(
+        [num_blocks, n], dtype=torch.float32, device=x.device
+    )
+    for tile_m in hl.tile(m, block_size=block_m):
+        go = grad_out[tile_m, :]
+        g_inv = grad_inv_rms[tile_m]
+        xt = x[tile_m, :]
+        w = weight[:]
+        mean = torch.mean(xt * xt, [-1])
+        inv_rms = torch.rsqrt(mean + 1e-5)
+        normalized = xt * inv_rms.reshape(-1, 1)
+        go_w = go * w
+        grad_weight_parts[tile_m.id, :] = torch.sum(go * normalized, [0], True)
+        d_inv = g_inv + torch.sum(go_w * xt, [1], True).reshape(-1)
+        d_mean = (d_inv * -0.5 * torch.pow(inv_rms, 3)).reshape(-1, 1) / n
+        grad_x[tile_m, :] = go_w * inv_rms.reshape(-1, 1) + 2 * (d_mean * xt)
+    return grad_x, grad_weight_parts.sum(0).to(weight.dtype)
+
+
+def rms_norm_bwd_arguments(m: int = 64, n: int = 32) -> tuple[torch.Tensor, ...]:
+    """``(grad_out, grad_inv_rms, x, weight)`` of ``rms_norm_bwd`` on CPU."""
+    return (
+        torch.empty((m, n), dtype=torch.float32),
+        torch.empty((m,), dtype=torch.float32),
+        torch.empty((m, n), dtype=torch.float32),
+        torch.empty((n,), dtype=torch.float32),
+    )
+
+
 def column_config(
     bound: Any,
     *,

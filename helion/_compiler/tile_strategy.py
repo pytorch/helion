@@ -35,6 +35,7 @@ from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.masked_packet_load_names import MASKED_PACKET_LOAD_HELPER_NAMES
 from .cute.persistent_branch_vec import PACKET_STORE_BYTES
+from .cute.register_tile_admission import RegisterTileOptions
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
 from .cute.scalar_recipe import is_rounded_fp32_multiply
@@ -828,6 +829,7 @@ def split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -853,6 +855,7 @@ def split_lane_loop_reductions(
         scalar_definitions=scalar_definitions,
         rename_groups=rename_groups,
         running_sums=running_sums,
+        register_tile_options=register_tile_options,
     )
     pin_atomics_left_in_lane_loops(result)
     return result
@@ -868,6 +871,7 @@ def _split_lane_loop_reductions(
     scalar_definitions: dict[str, ast.AST] | None = None,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
@@ -889,6 +893,7 @@ def _split_lane_loop_reductions(
                 proven_scalar_definitions,
                 rename_groups or {},
                 running_sums or set(),
+                register_tile_options,
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -944,6 +949,7 @@ def _split_stmt_lane_reductions(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -970,6 +976,7 @@ def _split_stmt_lane_reductions(
                     ),
                     rename_groups=rename_groups,
                     running_sums=running_sums,
+                    register_tile_options=register_tile_options,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -990,6 +997,7 @@ def _split_stmt_lane_reductions(
         body_definitions,
         rename_groups,
         running_sums,
+        register_tile_options,
     )
 
 
@@ -1230,6 +1238,7 @@ def _split_one_lane_loop(
     scalar_definitions: dict[str, ast.AST],
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
+    register_tile_options: RegisterTileOptions | None = None,
 ) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
@@ -1265,6 +1274,7 @@ def _split_one_lane_loop(
                         thread_axis_names=thread_axis_names,
                         scalar_definitions=scalar_definitions,
                         rename_groups=rename_groups,
+                        options=register_tile_options,
                     )
                 except RegisterTileUnsupported as failure:
                     register_tile_failure = failure
@@ -1288,6 +1298,7 @@ def _split_one_lane_loop(
                 scalar_definitions=dict(scalar_definitions),
                 rename_groups=rename_groups,
                 running_sums=running_sums,
+                register_tile_options=register_tile_options,
             )
         if register_tile_failure is not None:
             # ``generate_ast`` regenerates the kernel with the rolled lane
@@ -5453,6 +5464,18 @@ def _interchange_one_lane_loop(
         return [loop]
     mb_loop = cast("ast.For", body[mb_index])
     if getattr(mb_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var:
+        if _is_constexpr_lane_iter(loop):
+            # Only ``nest_reduction_lane_outside_vector_tiles`` makes a tile
+            # lane's one-vector wrapper a trace-time loop, so this reduction
+            # over the tile's own axis sits under a register-tile owner, whose
+            # schedule lowers only the markers the synthetic reduction lane
+            # owns (``cute/register_tile_reductions.py``).  ``generate_ast``
+            # regenerates the kernel with the rolled nesting, where the
+            # wrapper is a rolled loop and the flattening below applies.
+            raise RegisterTileUnsupported(
+                f"a reduction over the tile axis of lane {lane_var} is owned "
+                "by that tile lane, not by the register-tile owner"
+            )
         # These slots partition the SAME reduced axis, unlike an independent
         # serial row loop. Reducing each slot separately overwrites the output.
         return [_flatten_vector_reduction_lane(loop, mb_loop, lane_var)]

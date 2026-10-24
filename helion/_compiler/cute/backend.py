@@ -2155,6 +2155,8 @@ class CuteBackend(Backend):
             or key == "cute_scalar_epilogue_keep_inputs"
             or key == "cute_scalar_epilogue_owner_fold"
             or key == "cute_warp_fp32_redux"
+            or key == "cute_register_tile_warp_fold"
+            or key == "cute_register_tile_store_first"
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
