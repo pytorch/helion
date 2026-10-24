@@ -100,6 +100,12 @@ def _without_later_fragment_coverage():
             "register_fragment_integer_atomic_epochs_coverage",
             "register_fragment_packet_loads_coverage",
             "register_fragment_register_producers_coverage",
+            "register_fragment_padded_rows_coverage",
+            "register_fragment_unrolled_loops_coverage",
+            "register_fragment_vector_io_coverage",
+            "register_fragment_batched_loads_coverage",
+            "register_fragment_split_k_coverage",
+            "register_fragment_slab_loads_coverage",
         ):
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)

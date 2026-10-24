@@ -439,11 +439,23 @@ def ldg_bf16_as_f32(
 def _unpack_x2(
     kind: str, word: object, *, loc: object, ip: object
 ) -> tuple[object, ...]:
+    if kind == "bf16":
+        # A bf16 is the high half of its fp32: the low element shifts up,
+        # the high element masks (two integer ops; ``cvt.f32.bf16`` of the
+        # halves lowers to a PRMT plus a shift for the high half).  Exact.
+        asm = (
+            "{ .reg .b32 lo, hi; shl.b32 lo, $2, 16; and.b32 hi, $2, 0xffff0000; "
+            "mov.b32 $0, lo; mov.b32 $1, hi; }"
+        )
+    else:
+        asm = (
+            "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
+            f"cvt.f32.{kind} $0, lo; cvt.f32.{kind} $1, hi; }}"
+        )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
         [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
-        f"cvt.f32.{kind} $0, lo; cvt.f32.{kind} $1, hi; }}",
+        asm,
         "=f,=f,r",
         has_side_effects=False,
         loc=loc,
@@ -467,6 +479,31 @@ def unpack_bf16x2(
 ) -> tuple[object, ...]:
     """``(low, high)`` fp32 values of a packed bf16x2 word (exact)."""
     return _unpack_x2("bf16", word, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def round_bf16_f32(
+    value: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``value`` rounded to bf16 (round to nearest even) and widened back to
+    fp32: the bits of ``float32(bfloat16(value))``.  ``cvt.rn.bf16x2.f32``
+    of the value with itself puts the rounded half-word in the high half
+    (``F2FP.BF16.F32.PACK_AB``, an FMA-pipe instruction) and the mask is the
+    exact widening; the scalar ``cvt.rn.bf16.f32`` the DSL's cast emits
+    runs on the conversion unit (``F2F``, the MIO queue) and its widening
+    is a shift behind it."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 w; cvt.rn.bf16x2.f32 w, $1, $1; "
+        "and.b32 w, w, 0xffff0000; mov.b32 $0, w; }",
+        "=f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
 
 
 @dsl_user_op

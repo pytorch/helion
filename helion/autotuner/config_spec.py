@@ -99,12 +99,16 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_TMA
 from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
@@ -129,6 +133,8 @@ from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
 from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
 from .._compiler.cute.cute_mma_dag import fixup_admitted
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_ragged_ceilings
+from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
@@ -1113,6 +1119,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1135,6 +1142,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1256,6 +1270,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1278,6 +1293,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1418,6 +1440,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1440,6 +1463,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1775,6 +1805,10 @@ class ConfigSpec:
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
+        # How a dot operand that is a pointwise chain over loaded tiles
+        # reaches its tile (``cute_mma_dag_derived``: the exchange of a
+        # derived fragment, or a packet pass from the staged sources).
+        self.cute_mma_dag_derived: EnumFragment | None = None
         # The tcgen05 mode's persistent launch (CTAs per SM); None where the
         # mode or its one-tile-per-CTA region programs leave it no subject.
         self.cute_mma_dag_persistent: EnumFragment | None = None
@@ -1821,6 +1855,9 @@ class ConfigSpec:
         self.cute_fragment_scan_search_enabled = False
         self.cute_fragment_reduction_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_reduction_search_enabled = False
+        self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
+        self.cute_fp32_dot_search_enabled = False
+        self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False
         self.cute_fragment_producer_cache_root_ids: frozenset[int] = frozenset()
@@ -1864,6 +1901,20 @@ class ConfigSpec:
         self.cute_fragment_register_snapshot_min_threads = 0
         self.cute_fragment_packet_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_packet_loads_search_enabled = False
+        self.cute_fragment_padded_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_padded_rows_search_enabled = False
+        self.cute_fragment_unrolled_loops_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_unrolled_loops_search_enabled = False
+        self.cute_fragment_vector_io_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_vector_io_search_enabled = False
+        self.cute_fragment_batched_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_batched_loads_search_enabled = False
+        self.cute_fragment_split_k_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_split_k_search_enabled = False
+        self.cute_fragment_mma_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_mma_rows_search_enabled = False
+        self.cute_fragment_slab_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_slab_loads_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
@@ -3350,12 +3401,16 @@ class ConfigSpec:
         targets, the promoted default) selects ``warp``.
         """
         self.cute_mma_dag_facts = facts
+        # A ragged root axis below its MMA atom (M = 8 under the 16-row atom)
+        # is computed at the atom on the warp path, and the seeds walk that
+        # tile: its search ceiling, the extent where the frontend left it,
+        # admits the atom.  The default block size stays clamped to the
+        # extent (``BlockSizeSpec._fragment``); no other block widens.
+        block_ids = self.block_sizes.valid_block_ids()
+        for block_id, atom in mma_dag_ragged_ceilings(facts).items():
+            if block_id in block_ids:
+                self.block_sizes.block_id_lookup(block_id).allow_overshoot(atom)
         modes = MMA_DAG_MODES
-        if facts.chain_vecs:
-            # No warp config runs a fragment chain over a row vector: the
-            # choice would only be repaired to ``off`` (and the random half
-            # of a search spent on the SIMT lowering).
-            modes = tuple(mode for mode in modes if mode != MMA_DAG_WARP)
         if facts.tcgen05 is not None:
             modes = (*modes, MMA_DAG_TCGEN05)
         search = modes
@@ -3366,8 +3421,15 @@ class ConfigSpec:
             # random "off" configs at 2048^3 and 49 of 56 at 512x1024x1024
             # failed to compile, every tensor-memory config compiled), so
             # the search samples the tensor-memory mode; "off" stays a legal
-            # value (the repair fallback, explicit configs).
-            search = tuple(mode for mode in modes if mode != MMA_DAG_OFF)
+            # value (the repair fallback, explicit configs).  The warp mode
+            # holds the whole axis in one CTA: it is sampled only when some
+            # tile of its seed ladder runs the program (a 2048-column
+            # fragment exceeds its register budget at every tiling, and a
+            # random warp draw would only be repaired away).
+            skipped = {MMA_DAG_OFF}
+            if not mma_dag_seed_configs(facts):
+                skipped.add(MMA_DAG_WARP)
+            search = tuple(mode for mode in modes if mode not in skipped)
         self.cute_mma_dag = EnumFragment(
             choices=modes, search_choices=search if search != modes else None
         )
@@ -3389,6 +3451,7 @@ class ConfigSpec:
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
         if facts.aux_candidates:
             self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
+        self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
         if facts.tcgen05 is not None and not facts.tcgen05.regions:
             self.cute_mma_dag_persistent = EnumFragment(
                 choices=MMA_DAG_PERSISTENT_CHOICES
@@ -3431,6 +3494,7 @@ class ConfigSpec:
             (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
             (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
+            (MMA_DAG_DERIVED_KEY, self.cute_mma_dag_derived),
         ):
             if fragment is None:
                 # The aux knob has no subject here: inert, no choices.
@@ -3515,10 +3579,20 @@ class ConfigSpec:
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
             config[MMA_DAG_PERSISTENT_KEY] = 0
             config[MMA_DAG_CLUSTER_KEY] = 1
             config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
             return
+        # The derived route has a subject only where some dot operand is a
+        # pass chain, and its pass reads the chain's tiles from the ring:
+        # the tensor-memory mode's ``lane`` loads leave them to the lanes.
+        if not facts.pass_chains or (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and config[MMA_DAG_LOADS_KEY] != MMA_DAG_LOADS_TMA
+        ):
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+        derived = cast("str", config[MMA_DAG_DERIVED_KEY])
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
         indices = {
@@ -3546,7 +3620,21 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
             config[MMA_DAG_CLUSTER_KEY] = 1
-        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+        reason = mma_dag_config_reason(
+            facts, sizes_by_block, warps, stages, mode, derived
+        )
+        if (
+            reason is not None
+            and derived == MMA_DAG_DERIVED_PASS
+            and mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+            is None
+        ):
+            # The pass route alone (its ring tiles) overflows the shared
+            # memory the exchange route fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_DERIVED_KEY}={derived!r}: {reason}")
+            derived = config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            reason = None
         if reason is not None:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
@@ -3565,6 +3653,7 @@ class ConfigSpec:
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
                 config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
                 config[MMA_DAG_PERSISTENT_KEY] = 0
                 config[MMA_DAG_CLUSTER_KEY] = 1
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
@@ -3578,6 +3667,19 @@ class ConfigSpec:
             config[MMA_DAG_CLUSTER_KEY] = facts.cluster_of(new_sizes)
             if cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX:
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_FIXUP
+            if derived == MMA_DAG_DERIVED_PASS and (
+                mma_dag_config_reason(
+                    facts,
+                    new_sizes,
+                    config[MMA_DAG_WARPS_KEY],
+                    config[MMA_DAG_STAGES_KEY],
+                    cast("str", config[MMA_DAG_KEY]),
+                    derived,
+                )
+                is not None
+            ):
+                # (The repair searched under the exchange route.)
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
         if config[MMA_DAG_CLUSTER_KEY] == 1:
             # The whole axis in one CTA: the combine mode has no subject.
             config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
@@ -3601,13 +3703,15 @@ class ConfigSpec:
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
-        # snapshot to stage.
+        # snapshot to stage, no device loop whose ring the stage depth sizes.
         if not facts.identity_candidates:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
         if not facts.aux_candidates:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        if not facts.loops:
+            config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
         if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
             mma_dag_pass_warps_reason(
                 facts,
@@ -4800,6 +4904,101 @@ class ConfigSpec:
             fix_invalid=fix_invalid,
         )
 
+    def _normalize_cute_fragment_padded_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_padded_rows",
+            self.cute_fragment_padded_rows_root_ids,
+            "a complete fragment root staging a tile whose rows are a multiple of 128 bytes",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_unrolled_loops(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_unrolled_loops",
+            self.cute_fragment_unrolled_loops_root_ids,
+            "a complete fragment root",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_vector_io(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_vector_io",
+            self.cute_fragment_vector_io_root_ids,
+            "a complete fragment root moving a 16-byte-packetizable host window",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_batched_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_batched_loads",
+            self.cute_fragment_batched_loads_root_ids,
+            "a complete fragment root with two or more host loads",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_split_k(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The split rides the tf32 mma phase: without it the knob is inert.
+        if config.get("cute_fragment_split_k") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_split_k=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_split_k", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_split_k",
+            self.cute_fragment_split_k_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_mma_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The row walk is a form of the tf32 mma phase: inert without it.
+        if config.get("cute_fragment_mma_rows") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_mma_rows=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_mma_rows", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_mma_rows",
+            self.cute_fragment_mma_rows_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_slab_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_slab_loads",
+            self.cute_fragment_slab_loads_root_ids,
+            "a complete fragment root with repeated static windows of one tensor",
+            fix_invalid=fix_invalid,
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4859,6 +5058,18 @@ class ConfigSpec:
             "a supported computed scalar reduction",
             fix_invalid=fix_invalid,
             choices=("serial", "warp", "cta", "cta_unroll"),
+        )
+
+    def _normalize_cute_fp32_dot(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fp32_dot",
+            self.cute_fp32_dot_root_ids,
+            "an fp32 hl.dot in a computed fragment under tf32 dot precision",
+            fix_invalid=fix_invalid,
+            choices=("simt", "tf32_mma"),
         )
 
     def _normalize_cute_fragment_scan(
@@ -5979,6 +6190,7 @@ class ConfigSpec:
             self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_reduction(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fp32_dot(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_threads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_producer_cache(
                 config, fix_invalid=_fix_invalid
@@ -6008,6 +6220,17 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_padded_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_unrolled_loops(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_vector_io(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_batched_loads(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_split_k(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_mma_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_slab_loads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
@@ -7346,6 +7569,13 @@ class ConfigSpec:
                 "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
+                "cute_fragment_padded_rows",
+                "cute_fragment_unrolled_loops",
+                "cute_fragment_vector_io",
+                "cute_fragment_batched_loads",
+                "cute_fragment_split_k",
+                "cute_fragment_mma_rows",
+                "cute_fragment_slab_loads",
             ):
                 return True, False
             if key == "cute_topk_key_recovery":
@@ -7354,6 +7584,8 @@ class ConfigSpec:
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
                 return True, "serial"
+            if key == "cute_fp32_dot":
+                return True, "simt"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
@@ -7629,6 +7861,40 @@ class ConfigSpec:
                 fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
             if self.cute_fragment_packet_loads_search_enabled:
                 fields["cute_fragment_packet_loads"] = BooleanFragment()
+            if self.cute_fragment_padded_rows_search_enabled:
+                fields["cute_fragment_padded_rows"] = BooleanFragment()
+            if self.cute_fragment_unrolled_loops_search_enabled:
+                fields["cute_fragment_unrolled_loops"] = BooleanFragment()
+            # The tile transport knobs (one statement: this method sits at a
+            # size past which pyrefly drops its narrowing of the fields below).
+            fields.update(
+                {
+                    key: BooleanFragment()
+                    for enabled, key in (
+                        (
+                            self.cute_fragment_vector_io_search_enabled,
+                            "cute_fragment_vector_io",
+                        ),
+                        (
+                            self.cute_fragment_batched_loads_search_enabled,
+                            "cute_fragment_batched_loads",
+                        ),
+                        (
+                            self.cute_fragment_split_k_search_enabled,
+                            "cute_fragment_split_k",
+                        ),
+                        (
+                            self.cute_fragment_mma_rows_search_enabled,
+                            "cute_fragment_mma_rows",
+                        ),
+                        (
+                            self.cute_fragment_slab_loads_search_enabled,
+                            "cute_fragment_slab_loads",
+                        ),
+                    )
+                    if enabled
+                }
+            )
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_topk_network_search_enabled:
@@ -7673,6 +7939,8 @@ class ConfigSpec:
                 fields["cute_fragment_reduction"] = EnumFragment(
                     choices=("serial", "warp", "cta", "cta_unroll")
                 )
+            if self.cute_fp32_dot_search_enabled:
+                fields["cute_fp32_dot"] = EnumFragment(choices=("simt", "tf32_mma"))
             if self.cute_pointwise_region_block_ids and any(
                 pid_type != "flat" for pid_type in self.allowed_pid_types
             ):
@@ -8014,9 +8282,9 @@ class ConfigSpec:
                     if self.cute_collective_knobs_enabled:
                         fields["cute_collective_mma"] = BooleanFragment()
                         fields["cute_collective_static_layouts"] = BooleanFragment()
+                        capability = self.target_device_capability
                         native_collective = (
-                            self.target_device_capability is not None
-                            and self.target_device_capability[0] == 10
+                            capability is not None and capability[0] == 10
                         )
                         gathered_collective = native_collective and any(
                             seed.config.get("cute_collective_compute") == "tma_gather"
@@ -8256,20 +8524,28 @@ class ConfigSpec:
                 assert self.cute_mma_dag_exchange is not None
                 assert self.cute_mma_dag_pass_warps is not None
                 assert self.cute_mma_dag_loads is not None
+                assert self.cute_mma_dag_derived is not None
                 fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
                 fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
                 fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
-                if self.cute_mma_dag_aux is not None:
-                    fields[MMA_DAG_AUX_KEY] = self.cute_mma_dag_aux
-                if self.cute_mma_dag_persistent is not None:
-                    fields[MMA_DAG_PERSISTENT_KEY] = self.cute_mma_dag_persistent
-                if self.cute_mma_dag_cluster is not None:
-                    fields[MMA_DAG_CLUSTER_KEY] = self.cute_mma_dag_cluster
-                if self.cute_mma_dag_split is not None:
-                    fields[MMA_DAG_SPLIT_KEY] = self.cute_mma_dag_split
+                # (Locals: the type checker's attribute narrowing does not
+                # reach this far into the function.)
+                aux_fragment = self.cute_mma_dag_aux
+                if aux_fragment is not None:
+                    fields[MMA_DAG_AUX_KEY] = aux_fragment
+                fields[MMA_DAG_DERIVED_KEY] = self.cute_mma_dag_derived
+                persistent_fragment = self.cute_mma_dag_persistent
+                if persistent_fragment is not None:
+                    fields[MMA_DAG_PERSISTENT_KEY] = persistent_fragment
+                cluster_fragment = self.cute_mma_dag_cluster
+                if cluster_fragment is not None:
+                    fields[MMA_DAG_CLUSTER_KEY] = cluster_fragment
+                split_fragment = self.cute_mma_dag_split
+                if split_fragment is not None:
+                    fields[MMA_DAG_SPLIT_KEY] = split_fragment
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule

@@ -7,6 +7,16 @@ import json
 from typing import Literal
 from typing import cast
 
+# The opt-in structural features (default False; ``cute_structural_policy="auto"``
+# proposes them all) whose selection is recorded as a versioned envelope beside
+# a config, read back exactly from AOT caches, heuristic files and measurement
+# rows.  ``Settings.cute_graph_cse`` also changes the flat axis layout (the
+# merged and the traced device IR roll different reduction sweeps) but is not a
+# member: it is a default-on kill switch for one pass rather than a selectable
+# feature, persistent caches already key the layout it changes
+# (``ConfigSpec.cache_fingerprint_hash`` covers every flat field), and printed
+# repros record it in the kernel decorator; a sixth member would need a new
+# envelope version and a migration of every recorded one for no new identity.
 CUTE_STRUCTURAL_SETTINGS = (
     "cute_region_fission",
     "cute_full_slice_matmul_tiling",

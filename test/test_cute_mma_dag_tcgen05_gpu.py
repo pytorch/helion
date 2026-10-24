@@ -745,10 +745,17 @@ _M4_CASES = (
     ("fwd_o_anch", False, [1, 16, 16], 4, 4),
     ("fwd_o_anch", False, [1, 64, 64], 4, 2),
     ("fwd_o_anch", False, [1, 32, 128], 8, 1),
+    # dwk's masked epilogue store reads the column sum of its own fragment
+    # (relaid through the scratch into the thread rows); the anchored WY
+    # seeds its TMEM carries from pointwise values over the loaded gram.
+    ("state_dwk_kda", False, [1, 64, 64], 4, 2),
+    ("state_dwk_kda", False, [1, 64, 32], 4, 1),
+    ("wy_anch", False, [32, 64], 4, 1),
+    ("wy_anch", False, [64, 64], 4, 2),
 )
 
 
-_KDA_KERNELS = ("bwd_o_kda", "state_du_kda", "fwd_o_anch")
+_KDA_KERNELS = ("bwd_o_kda", "state_du_kda", "fwd_o_anch", "state_dwk_kda", "wy_anch")
 
 
 def _assert_region_outputs(
@@ -1661,3 +1668,45 @@ def test_the_full_slice_gemm_default_runs_on_a_cluster() -> None:
         (x @ y).float(), [n], weight.float(), bias.float()
     )
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_a_non_finite_fill_beside_a_fragment_matches_the_triton_backend() -> None:
+    # ``where(mask, acc, hl.full(..., float("-inf")))`` stored from tensor
+    # memory: the fill renders as a ``float('-inf')`` call.
+    from test.test_cute_mma_dag_gpu import _masked_neg_inf_args
+
+    fn = _probe_kernels()._masked_neg_inf_stored
+    source, (out,) = _run_cute(fn, _masked_neg_inf_args(), _config([64], 4, 2))
+    assert "cutlass.Float32(float('-inf'))" in source
+    (ref,) = _run_triton(fn, _masked_neg_inf_args(), [64])
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("derived", "warps"), (("exchange", 4), ("pass", 4), ("pass", 8))
+)
+def test_se_block_dx_derived_operand_routes_match_the_triton_backend(
+    derived: str, warps: int
+) -> None:
+    # se_block dx's tf32 A operand ``2 * g * x * s * (1 - s)`` on the region
+    # renderer: through the derived fragment's tensor-memory round trip and
+    # exchange tile (``exchange``), or written by the derived pass from the
+    # chain's aux tiles into a ring tile (``pass``: no ``tcgen05_st`` of the
+    # chain, the A descriptor reads the ring slot).  Bit-equal to Triton.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block().se_block_bwd_dx.fn
+    args = (t["grad"], t["x"], t["w"], t["s"])
+    source, (out,) = _run_cute(
+        fn, args, _config([128, 64, 64], warps, 2, cute_mma_dag_derived=derived)
+    )
+    loop = source[source.index("for md_i in cutlass.range(") :]
+    if derived == "pass":
+        assert f"{RT}.prims.tcgen05_st(" not in loop
+    else:
+        assert f"{RT}.prims.tcgen05_st(" in loop
+    (ref,) = _run_triton(fn, args, [128, 64, 64])
+    assert torch.equal(out, ref)

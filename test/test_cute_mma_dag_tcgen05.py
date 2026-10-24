@@ -28,11 +28,13 @@ from test.test_cute_mma_dag import _bind_dqk
 from test.test_cute_mma_dag import _bind_dqkw
 from test.test_cute_mma_dag import _bind_dstate
 from test.test_cute_mma_dag import _bind_dv
+from test.test_cute_mma_dag import _bind_dwk
 from test.test_cute_mma_dag import _bind_fn
 from test.test_cute_mma_dag import _bind_fwd
 from test.test_cute_mma_dag import _bind_fwd_h_delta
 from test.test_cute_mma_dag import _bind_fwd_o
 from test.test_cute_mma_dag import _bind_wy
+from test.test_cute_mma_dag import _bind_wy_anchored
 from test.test_cute_mma_dag import _bind_wy_dl
 from test.test_cute_mma_dag import _gen_epi
 from test.test_cute_mma_dag import _gen_epi_stored
@@ -6050,21 +6052,20 @@ def test_full_slice_gemm_row_epilogue_is_matched() -> None:
     assert [r.orient for r in program.reduces] == ["rows", "rows"]
     assert len(program.vec_ops) == 4 and len(program.stores) == 1
     (store,) = program.stores
-    # The variance's value and the store's value read the row vectors.
-    chains = {
-        node.name: tuple(v.name for v in vecs)
-        for node, vecs in program.chain_vecs.items()
-    }
-    assert set(chains) == {program.reduces[1].value.name, store.value.name}
-    assert chains[store.value.name] == ("rsqrt", "mean")
+    # The variance's value and the store's value read the row vectors
+    # (``check_vecs``: a vector of the program beside a fragment value, read
+    # at the element's row by either emitter).
+    mean, rsqrt = program.reduces[0].node, program.vec_ops[-1].node
+    assert {mean, rsqrt} <= set(program.vec_leaves)
     facts = bound.config_spec.cute_mma_dag_facts
-    assert facts is not None and facts.chain_vecs
+    assert facts is not None
     assert facts.tcgen05 is not None and facts.tcgen05.regions
     assert facts.axes[facts.split_axis].kind == dag.AXIS_RDIM
     assert facts.axes[facts.split_axis].extent == 2048
-    # The warp mode has no lane map for a row vector read by a fragment chain.
+    # The warp mode reads the row vectors at the fragment's rows, but the
+    # 2048-column fragment exceeds its register budget.
     reason = dag.mma_dag_config_reason(facts, {0: 64, 1: 64}, 4, 4, dag.MMA_DAG_WARP)
-    assert reason is not None and "row vector" in reason
+    assert reason is not None and "registers per thread" in reason
 
 
 def test_cluster_split_knob_seeds_and_normalization() -> None:
@@ -6074,12 +6075,14 @@ def test_cluster_split_knob_seeds_and_normalization() -> None:
     assert spec.cute_mma_dag_cluster.choices == (1, 2, 4, 8, 16)
     assert spec.cute_mma_dag_split is not None
     assert spec.cute_mma_dag_split.choices == ("cluster", "fixup")
-    # The warp mode cannot run a fragment chain over a row vector: it is not
-    # a choice (a random config would only be repaired to ``off``).
+    # The warp mode is a choice (a fragment chain may read a row vector on
+    # either emitter) but no sample: the 2048-column fragment exceeds its
+    # register budget at every tiling.
     assert spec.cute_mma_dag is not None
-    assert spec.cute_mma_dag.choices == ("off", "tcgen05")
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
     # The search samples the tensor-memory mode alone: the SIMT fallback's
-    # lane-restore pass declines most tilings of the full-row epilogue.
+    # lane-restore pass declines most tilings of the full-row epilogue, and
+    # no warp tile of the seed ladder holds the 2048-column fragment.
     assert spec.cute_mma_dag.search_choices == ("tcgen05",)
     assert spec.cute_mma_dag.random() == "tcgen05"
     facts = spec.cute_mma_dag_facts
@@ -6136,8 +6139,8 @@ def test_cluster_split_knob_seeds_and_normalization() -> None:
         assert repaired["cute_mma_dag_cluster"] == 8
         with pytest.raises(InvalidConfig, match="up to 256"):
             spec.normalize(dict(_mln_config(64, 64, 2, 2).config))
-        with pytest.raises(InvalidConfig, match="must be one of"):
-            # The warp mode is no choice here (a chain reads a row vector).
+        with pytest.raises(InvalidConfig, match="needs the tcgen05 mode"):
+            # The warp mode runs one CTA per root tile: no split of the axis.
             spec.normalize({**_mln_config(64, 64, 2, 8).config, "cute_mma_dag": "warp"})
         with pytest.raises(InvalidConfig, match="portable cluster"):
             spec.normalize(dict(_mln_config(64, 64, 2, 16).config))
@@ -6527,7 +6530,6 @@ def test_a_wide_full_slice_gemm_takes_the_cluster_split_without_reductions() -> 
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
     assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
-    assert not facts.chain_vecs
     assert spec.cute_mma_dag is not None
     assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
     assert spec.cute_mma_dag_cluster is not None
@@ -6585,3 +6587,178 @@ def test_cute_pdl_waits_after_the_prologue_and_releases_after_the_loop() -> None
     # Without the knob: no griddepcontrol calls, no use_pdl.
     source = _source(bound, _mln_config(64, 32, 4, 8))
     assert "griddepcontrol" not in source and "use_pdl" not in source
+
+
+def test_dwk_relays_the_column_sum_into_the_fragment_rows() -> None:
+    # Tensor-memory rows are threads: ``dgc_last`` (a vector along the
+    # ``[C, bk]`` fragment's columns) is held one element per thread-row of
+    # its family, so the masked store reads it through the scratch at the
+    # register's column (``md_fv_{c}``), behind the epilogue barrier.
+    bound = _bind_dwk()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    relaid = re.findall(r"(md_fv_\d+) = _helion_mma_dag\.lds_f32\(", body)
+    assert relaid and len(relaid) == len(set(relaid))
+    first = body.index("md_fv_0 = ")
+    # The owning thread-rows write their element (guarded by the vector's
+    # extent), the epilogue barrier, the reads at the columns, a barrier.
+    writes = body.rindex(f"{WARP_RT}.sts_f32(", 0, first)
+    assert writes < first
+    assert re.search(r"if .*md_row\d+ < \d+:", body[writes - 200 : writes])
+    assert re.search(r"= md_vv\d+ \* md_v_\d+|= md_v_\d+ \* md_fv_0\b", body[first:])
+
+
+def test_anchored_wy_seeds_the_tmem_carries_from_the_loaded_gram() -> None:
+    # Both Neumann carries are seeded per element of the thread's row: the
+    # gram's bf16 pairs unpacked, the chain evaluated, the row stored to
+    # tensor memory (``md_seed``) -- before any accumulator is read (the
+    # first ``tcgen05_ld`` is the Apow operand's exchange).
+    bound = _bind_wy_anchored()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    program = _match(bound)
+    assert not program.simple
+    body = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=1)))
+    assert f"{P}.tcgen05_mma(" in body
+    seed = body[: body.index(f"{P}.tcgen05_ld(")]
+    assert f"{WARP_RT}.unpack_bf16x2({WARP_RT}.ldg_b32(" in seed
+    assert re.search(r"md_seed\[\d+\] = cutlass\.Float32\(md_v_\d+\)", seed)
+    assert f"{P}.tcgen05_mma(" not in seed
+
+
+def test_a_seed_derived_at_the_root_takes_a_tmem_slot() -> None:
+    # se_block dx's ``acc += 2.0 * grad_out * s`` before the K loop: the
+    # half-typed derived value computed at the root seeds the loop's carry,
+    # so it crosses into tensor memory (a reader the block renderer must not
+    # keep in registers).
+    from test.test_cute_mma_dag import _bind_se_block
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    program = _match(bound)
+    (loop,) = program.loops
+    (carry,) = loop.carries
+    (seed,) = [d for d in program.derived if d.node is carry.init_frag]
+    assert regions.derived_crosses(program, seed)
+    assert seed.slot in regions.tmem_slots(program)
+    body = _kernel_body(_source(bound, _config(128, 64, 64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    assert "tf32" in body.lower()
+
+
+def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:
+    # The region renderer evaluates the ``where(mask, acc, -inf)`` store per
+    # element of the thread's row through the same evaluator: the ``hl.full``
+    # fill is spelled ``float('-inf')``, never the bare name.
+    from test.test_cute_mma_dag import _masked_neg_inf_inputs
+    from test.test_cute_mma_dag import _masked_neg_inf_stored
+
+    bound = _bind_fn(_masked_neg_inf_stored, _masked_neg_inf_inputs())
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    assert "cutlass.Float32(float('-inf'))" in body
+    assert "Float32(-inf)" not in body
+    assert "Float32(inf)" not in body
+
+
+def test_a_pass_chain_operand_is_a_ring_tile_written_by_the_derived_pass() -> None:
+    # se_block dx under ``cute_mma_dag_derived='pass'`` on the region
+    # renderer: the chain's exchange item becomes a ring tile of the loop
+    # (``derived_items``), its three source tiles are aux items the layout
+    # never drops, and the render has no tensor-memory round trip of the
+    # chain (``tcgen05_st`` / ``md_dr`` arrays): the pass loads the aux
+    # chunks, writes two fp32 packets per group into the ring slot and the
+    # A descriptor reads that slot.  The exchange route is unchanged.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    from helion._compiler.cute.cute_mma_dag_tcgen05 import derived_items
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    tc = facts.tcgen05
+    (item,) = [item for item in tc.items if item.pass_ring]
+    assert item.kind == "exchange" and item.copies == 1
+    assert sum(1 for item in tc.items if item.pass_source) == 3
+    passed = derived_items(tc.items, "pass")
+    assert derived_items(tc.items, "exchange") == tc.items
+    (ring_item,) = [item for item in passed if item.pass_ring]
+    assert (ring_item.kind, ring_item.copies, ring_item.segment) == ("tile", 0, -1)
+    sizes = {0: 128, 1: 64, 2: 64}
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert all(isinstance(size, int) for size in resolved)
+    exchange_bytes = regions.region_smem_bytes(facts, resolved, 2)  # type: ignore[arg-type]
+    pass_bytes = regions.region_smem_bytes(facts, resolved, 2, derived="pass")  # type: ignore[arg-type]
+    # One more ring slot of the 128x64 fp32 A tile against the one exchange copy.
+    assert pass_bytes - exchange_bytes == 128 * 64 * 4
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 2, "tcgen05", "pass") is None
+    # The loads route ``lane`` leaves the aux tiles to the lanes: the pass
+    # has no sources there, so the knob is pinned to the exchange route.
+    with bound.env:
+        lane = bound.config_spec.normalized_config(
+            _config(
+                128,
+                64,
+                64,
+                warps=4,
+                stages=2,
+                cute_mma_dag_loads="lane",
+                cute_mma_dag_derived="pass",
+            )
+        )
+        # Three stages of ring tiles overflow the shared memory under
+        # ``pass`` alone (the exchange route fits): an explicit pin is
+        # invalid, the autotuner's repair yields the route and keeps the
+        # tile.
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_derived='pass'"):
+            bound.config_spec.normalized_config(
+                _config(128, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass")
+            )
+        over = dict(
+            _config(128, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass").config
+        )
+        bound.config_spec.normalize(over, _fix_invalid=True)
+    assert lane.config["cute_mma_dag_derived"] == "exchange"
+    assert over["cute_mma_dag_derived"] == "exchange"
+    assert over["block_sizes"] == [128, 64, 64]
+    assert over["cute_mma_dag_stages"] == 3
+    exchange = _loop(
+        _kernel_body(_source(bound, _config(128, 64, 64, warps=4, stages=2)))
+    )
+    passed_body = _kernel_body(
+        _source(
+            bound,
+            _config(128, 64, 64, warps=4, stages=2, cute_mma_dag_derived="pass"),
+        )
+    )
+    loop = _loop(passed_body)
+    assert f"{P}.tcgen05_st(" in exchange and "md_dr_" in exchange
+    assert f"{P}.tcgen05_st(" not in loop and "md_dr_" not in loop
+    assert f"{P}.tcgen05_mma({P}.Tcgen05MMAKind.TF32" in loop
+    # The pass: 128x64 / 8 = 1024 groups over 128 threads, eight per thread,
+    # three source chunks each, two fp32 packets out.
+    assert (
+        loop.count(f"{WARP_RT}.lds_v4_b32(")
+        == 8 * 3 + exchange.count(f"{WARP_RT}.lds_v4_b32(") - 4 * 8
+    )
+    assert loop.count(f"{RT}.sts_v4_f32(md_s0 + 0 + md_st0 * ") >= 16
+    # A reads its ring slot; in the exchange render A was the fixed tile.
+    assert re.search(
+        r"md_da0 = .*Tcgen05SmemDesc\.build\(md_s0 \+ 0 \+ md_st0 \* ", loop
+    )
+    assert re.search(r"md_da0 = .*Tcgen05SmemDesc\.build\(md_s0 \+ \d+,", exchange)
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{RT}.sts_v4_f32(md_s0 + 0 + md_st0 * ",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+        ],
+    )
