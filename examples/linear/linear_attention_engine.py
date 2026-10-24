@@ -2879,6 +2879,7 @@ def _helion_chunked_fwd_delta(
 def _kda_varlen_chunk_tables(
     cu_seqlens: torch.Tensor,
     C: int,
+    T_total: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Place every chunk: sequence n owns chunk_offsets[n] : chunk_offsets[n + 1], and
     chunk j of it starts at token_base[j] with valid_len[j] rows of its own.
@@ -2897,7 +2898,20 @@ def _kda_varlen_chunk_tables(
     an edited one. Comparing values instead would need the same device-to-host sync
     this exists to skip. FLA holds its own varlen tables under the same rule, in
     fla.utils.tensor_cache.
+
+    The vector is validated here as well, on the same first sight: every kernel
+    indexes tokens through cu_seqlens, so one that does not partition [0, T_total)
+    reads the wrong rows rather than failing (an end below T_total leaves that much
+    of the output at its zero initialization). Reading its ends is a device-to-host
+    sync too, so checking per call would forbid CUDA-graph capture of the forward;
+    a captured forward replays with the cu_seqlens tensor it was captured with.
     """
+    if int(cu_seqlens[-1]) != T_total:
+        raise ValueError(
+            f"cu_seqlens must end at T_total={T_total}, got {int(cu_seqlens[-1])}"
+        )
+    if int(cu_seqlens[0]) != 0 or not bool((cu_seqlens[1:] > cu_seqlens[:-1]).all()):
+        raise ValueError("cu_seqlens must start at 0 and strictly increase")
     N = cu_seqlens.numel() - 1
     device = cu_seqlens.device
     lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -2959,7 +2973,9 @@ def _helion_chunked_fwd_kda_varlen(
     DV = v.shape[-1]
     N = cu_seqlens.numel() - 1
 
-    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(cu_seqlens, C)
+    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(
+        cu_seqlens, C, T_total
+    )
 
     HNT = H * NT
     g_cs = torch.empty(HNT, C, D, dtype=torch.float32, device=q.device)
@@ -3188,14 +3204,23 @@ def _helion_chunked_bwd(
     dhf2 = dh_all.reshape(BHN, D, DV)
 
     dq_raw, dk_raw, dg_by_d = chunk_bwd_dqkg_scalar_helion(
-        qb, kb, vb, gc, hb, dob, dhf2, diag_anchored=True, scale=scale
+        qb,
+        kb,
+        vb,
+        gc,
+        hb,
+        dob,
+        dhf2,
+        diag_anchored=True,
+        compute_dg=needs_dg,
+        scale=scale,
     )
 
     dv_raw = chunk_bwd_dv_helion(
         qb, kb, kb, gc, dob, dhf2, A=A, diag_anchored=True, scale=scale
     )
 
-    dg = dg_by_d.reshape(B, H, T, D).to(g.dtype)
+    dg = dg_by_d.reshape(B, H, T, D).to(g.dtype) if needs_dg else None
 
     return (
         dq_raw.reshape(B, H, T, D),
@@ -3842,17 +3867,10 @@ def helion_chunk_kda(
             raise ValueError(
                 f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG} for KDA, got {C}"
             )
-        # Every kernel indexes tokens through cu_seqlens, so a vector that does not
-        # partition [0, T_total) reads the wrong rows rather than failing: an end
-        # below T_total leaves that much of the output at its zero initialization.
-        if int(cu_seqlens[-1]) != q.size(1):
-            raise ValueError(
-                f"cu_seqlens must end at T_total={q.size(1)}, got {int(cu_seqlens[-1])}"
-            )
-        if int(cu_seqlens[0]) != 0 or not bool(
-            (cu_seqlens[1:] > cu_seqlens[:-1]).all()
-        ):
-            raise ValueError("cu_seqlens must start at 0 and strictly increase")
+        # cu_seqlens itself (ends at T_total, starts at 0, strictly increasing) is
+        # checked by _kda_varlen_chunk_tables on the first sight of the tensor: the
+        # check reads device memory, and a per-call read would break CUDA-graph
+        # capture of the forward.
         # Grouped-query: give every query head its own key/value head, matching what
         # chunked_linear_attn does for the dense path.
         H_kv = k.size(2)
