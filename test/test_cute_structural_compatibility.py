@@ -483,14 +483,20 @@ def test_policy_seed_and_override_preserve_actual_full_initial_population() -> N
                 search.config_gen.unflatten(flat)
                 for flat in checked_initial_population(search)
             ]
-            user_pair = search.config_gen.user_seed_flat_config_pairs(
-                search._autotune_seed_configs()
-            )[0]
+            pairs = (
+                search.config_gen.user_seed_flat_config_pairs(
+                    search._autotune_seed_configs()
+                )
+                + search.config_gen.seed_flat_config_pairs()
+            )
+            expected_prefix = list(
+                dict.fromkeys(
+                    [config for _, config in pairs]
+                    + [search.config_gen.unflatten(search.config_gen.default_flat())]
+                )
+            )
         # The helper checks 100 base rows and accounts for each coverage addition.
-        assert population[0] == search.config_gen.unflatten(
-            search.config_gen.default_flat()
-        )
-        assert population[1] == user_pair[1]
+        assert population[: len(expected_prefix)] == expected_prefix
         assert all(not config.cute_proven_bounds for config in population)
         results.append([config.to_json() for config in population])
     assert results[0] == results[1]

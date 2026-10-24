@@ -1175,8 +1175,10 @@ class DeviceIR:
             # stacking with rdim, or reduces over rdim along a non-tile
             # (hl.arange) axis that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
+            rollers: dict[int, ReductionRoller] = {}
             for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {})
+                roller = ReductionRoller(self, rdim, graph_to_info)
+                rollers[graph_info.graph_id] = roller
                 if (
                     roller.has_matmul_with_rdim(graph_info.graph)
                     or roller.has_gather_along_rdim(graph_info.graph)
@@ -1198,7 +1200,7 @@ class DeviceIR:
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                roller = rollers[graph_id]
                 try:
                     roller.process(graph_info.graph)
                 except NotImplementedError:

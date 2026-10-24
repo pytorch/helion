@@ -16,7 +16,6 @@ from torch._inductor.codegen.simd import constant_repr
 
 from ...language import _decorators
 from ...language.reduce_ops import _reduce
-from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -36,18 +35,10 @@ if TYPE_CHECKING:
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     """Generate a persistent or rolled custom reduction."""
     # reduction_strategy imports DeviceIR before helion.Config is initialized.
-    from ..device_ir import HelperFunctionGraphInfo
     from ..reduction_strategy import LoopedReductionStrategy
 
-    raw_input = state.ast_args[1]
-    input_tensor = (
-        create(ast.Tuple, elts=list(raw_input), ctx=ast.Load())
-        if isinstance(raw_input, tuple)
-        else state.ast_arg(1)
-    )
-    helper_graph = state.get_graph(cast("int", state.proxy_arg(0)))
-    assert isinstance(helper_graph, HelperFunctionGraphInfo)
-    combine_func = state.device_function.register_helper_function(helper_graph)
+    input_tensor = state.ast_arg(1)
+    combine_func = state.register_helper_function(0)
     assert state.fx_node is not None
     block_id = reduction_block_id(state.fx_node)
     loops = (
@@ -111,20 +102,29 @@ def _codegen_rolled_reduce(
     targets = ", ".join(accumulators)
     assignment_target = f"({targets},)" if is_tuple_input else targets
     values = cast("ast.Tuple", input_tensor).elts if is_tuple_input else [input_tensor]
+    # Arithmetic can emit a wider dtype; the loop carry has the declared tensor type.
+    values = [
+        env.backend.cast_ast(value, fake.dtype)
+        for value, fake in zip(values, fake_inputs, strict=True)
+    ]
     source = ", ".join(ast.unparse(value) for value in values)
+    initial_values = f"({source},)" if is_tuple_input else source
+    carry_combine = _register_reduce_combine(
+        state, combine_func, len(fake_inputs), is_tuple_input
+    )
     offset = strategy.offset_var(strategy.block_index)
     # The first chunk seeds the state; zero only establishes its tensor type.
     state.add_statement(
         statement_from_string(
-            f"if {offset} == 0:\n    {assignment_target} = {ast.unparse(input_tensor)}\n"
-            f"else:\n    {assignment_target} = {combine_func}({targets}, {source})"
+            f"if {offset} == 0:\n    {assignment_target} = {initial_values}\n"
+            f"else:\n    {assignment_target} = {carry_combine}({targets}, {source})"
         )
     )
     padded, dynamic = _emit_reduction_padding(
-        state, loop, combine_func, targets, assignment_target, padding_values
+        state, loop, carry_combine, targets, assignment_target, padding_values
     )
     reduction_input = expr_from_string(assignment_target)
-    final_combine = combine_func
+    final_combine = carry_combine
     if dynamic:
         chunk_var = strategy.block_size_var(strategy.block_index)
         assert chunk_var is not None
@@ -134,8 +134,8 @@ def _codegen_rolled_reduce(
             dim % fake_inputs[0].ndim,
         )
         reduction_input = expr_from_string(f"({targets}, {valid})")
-        final_combine = _register_valid_combine(
-            state, combine_func, len(fake_inputs), is_tuple_input
+        final_combine = _register_reduce_combine(
+            state, combine_func, len(fake_inputs), is_tuple_input, with_validity=True
         )
     keep_dims_arg = ", keep_dims=True" if keep_dims else ""
     reduction = expr_from_string(
@@ -177,6 +177,7 @@ def _emit_reduction_padding(
             return padded, dynamic
     else:
         padded = device_function.new_var("custom_reduce_padded")
+        # Keep the logical padding bound runtime; the fixed chunk width is independent.
         # Widen before rounding the runtime extent up to a power of two.
         loop.outer_suffix.append(
             statement_from_string(
@@ -190,11 +191,12 @@ def _emit_reduction_padding(
         loop.outer_suffix.append(statement_from_string(f"{padded} = {padded} + 1"))
     padding = device_function.new_var("custom_reduce_padding")
     padding_args = ", ".join(padding_values)
+    padding_initial = f"({padding_args},)" if state.proxy_arg(4) else padding_args
     loop.outer_suffix.append(
         statement_from_string(
             f"for {padding} in range((({numel_expr} + {chunk_var} - 1) // {chunk_var}) * {chunk_var}, {padded}, {chunk_var}):\n"
             f"    if {padding} == 0:\n"
-            f"        {assignment_target} = ({padding_args})\n"
+            f"        {assignment_target} = {padding_initial}\n"
             f"    else:\n"
             f"        {assignment_target} = {combine_func}({targets}, {padding_args})"
         )
@@ -202,32 +204,52 @@ def _emit_reduction_padding(
     return padded, dynamic
 
 
-def _register_valid_combine(
+def _register_reduce_combine(
     state: CodegenState,
     combine_func: str,
     input_count: int,
     is_tuple_input: bool,
+    *,
+    with_validity: bool = False,
 ) -> str:
-    """Extend the combine function with validity flags without assuming an identity."""
+    """Preserve payload dtypes and optionally propagate lane validity."""
+    key = (combine_func, input_count, is_tuple_input, with_validity)
+    wrappers = state.device_function.helper_manager.custom_reduction_combiners
+    # Look up first: a setdefault default would emit a helper even on a cache hit.
+    if key in wrappers:
+        return wrappers[key]
     left = [f"left_{i}" for i in range(input_count)]
     right = [f"right_{i}" for i in range(input_count)]
-    args = ", ".join([*left, "left_valid", *right, "right_valid"])
+    args = ", ".join(
+        [*left, "left_valid", *right, "right_valid"]
+        if with_validity
+        else [*left, *right]
+    )
     call_args = ", ".join([*left, *right])
     outputs = []
     for index, (left_value, right_value) in enumerate(zip(left, right, strict=True)):
         combined = f"combined[{index}]" if is_tuple_input else "combined"
+        combined = f"tl.cast({combined}, {left_value}.dtype)"
         outputs.append(
             f"tl.where(left_valid, tl.where(right_valid, {combined}, {left_value}), {right_value})"
+            if with_validity
+            else combined
         )
-    name = state.device_function.new_var("custom_reduce_valid_combine")
+    if with_validity:
+        outputs.append("left_valid | right_valid")
+    result = (
+        f"({', '.join(outputs)},)" if is_tuple_input or with_validity else outputs[0]
+    )
+    name = state.device_function.new_var("custom_reduce_combine")
     state.codegen.module_statements.append(
         cast(
             "ast.stmt",
             statement_from_string(
                 f"@triton.jit\ndef {name}({args}):\n"
                 f"    combined = {combine_func}({call_args})\n"
-                f"    return {', '.join([*outputs, 'left_valid | right_valid'])}"
+                f"    return {result}"
             ),
         )
     )
+    wrappers[key] = name
     return name

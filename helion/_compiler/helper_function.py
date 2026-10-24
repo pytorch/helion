@@ -172,6 +172,7 @@ class HelperFunctionManager:
     def __init__(self) -> None:
         self.helper_functions: dict[str, HelperFunctionGraphInfo] = {}
         self._final_names: dict[str, str] = {}
+        self.custom_reduction_combiners: dict[tuple[str, int, bool, bool], str] = {}
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo, final_name: str

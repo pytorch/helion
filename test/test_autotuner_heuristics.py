@@ -68,6 +68,7 @@ from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeur
 from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
+from helion._compiler.autotuner_heuristics.triton import _ReductionCandidate
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import _symint_free_symbols
@@ -5347,8 +5348,54 @@ class TestTritonReductionHeuristicUnit(TestCase):
             with self.subTest(reductions=reductions):
                 spec.reduction_kernel_fact = fact._replace(reductions=reductions)
                 self.assertEqual(
+                    spec.has_native_reductions, any(not r.is_custom for r in reductions)
+                )
+                self.assertEqual(
+                    spec.custom_only_reduction_block_ids,
+                    {1} if expected is None else set(),
+                )
+                self.assertEqual(
                     spec.autotune_reference_config().reduction_loops, [expected]
                 )
+
+    def test_custom_carry_is_charged_only_for_rolled_candidates(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=1024)
+        fact = spec.reduction_kernel_fact
+        assert fact is not None
+        payload = LiveTile((0, 1), (None, None), 4, "load")
+        carry = payload._replace(kind="carry", carried_reduction_block_id=1)
+        spec.reduction_kernel_fact = fact._replace(live_tile_steps=((payload, carry),))
+        env = self._reduction_env(spec)
+        for width, expected in ((1024, 4096), (256, 2048)):
+            with (
+                self.subTest(width=width),
+                patch.object(
+                    TritonReductionHeuristic,
+                    "_reduction_candidate_block_map",
+                    return_value={0: 1, 1: width},
+                ),
+            ):
+                self.assertEqual(
+                    TritonReductionHeuristic._reduction_peak_live_bytes(
+                        env, _ReductionCandidate((1,), ((1, width),))
+                    ),
+                    expected,
+                )
+
+    def test_ranked_seeds_precede_reference_without_custom_reductions(self) -> None:
+        spec = self._reduction_spec(reduction_size_hint=1024)
+        spec.compiler_seed_configs = [helion.Config(block_sizes=[1], num_warps=8)]
+        generation = spec.create_config_generation()
+        pairs = generation.seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 1)
+        seed, _ = pairs[0]
+        reference = generation.default_flat()
+        self.assertNotEqual(seed, reference)
+        self.assertEqual(generation.random_population_flat(0), [reference])
+        self.assertEqual(generation.random_population_flat(1), [seed])
+        self.assertEqual(generation.random_population_flat(2), [seed, reference])
+        spec.compiler_seed_configs = []
+        self.assertEqual(generation.random_population_flat(1), [reference])
 
     def test_seed_is_persistent_with_reduction_warps(self) -> None:
         # The unified allocator may batch rows when live bytes and launch supply
@@ -11428,6 +11475,12 @@ class TestTritonReductionHeuristic(TestCase):
                                 for tile in carries
                             )
                             for step in fact.live_tile_steps
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            tile.carried_reduction_block_id is None
+                            for tile in fact.live_tile_steps[-1]
                         )
                     )
                     seeds = bound.config_spec.compiler_seed_configs

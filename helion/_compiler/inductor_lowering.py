@@ -930,10 +930,7 @@ class PointwiseLowering(InductorLowering):
         and rejects with its own actionable diagnostics.
         """
         env = CompileEnvironment.current()
-        if not any(
-            isinstance(inp.meta.get("lowering"), ReductionLowering)
-            for inp in node.all_input_nodes
-        ):
+        if not any(is_reduction_node(inp) for inp in node.all_input_nodes):
             return
         inputs = self.input_fake_tensors(node)
         if len(inputs) < 2:
@@ -1244,6 +1241,18 @@ class ReductionLowering(InductorLowering):
         return result
 
 
+def is_reduction_node(node: torch.fx.Node) -> bool:
+    """Recognize native/custom reductions and their tuple output projections."""
+    if node.target is getitem and isinstance(node.args[0], torch.fx.Node):
+        source = node.args[0]
+        if source.target is _reduce:
+            node = source
+    return (
+        isinstance(node.meta.get("lowering"), ReductionLowering)
+        or node.target is _reduce
+    )
+
+
 def custom_reduction_sources(node: torch.fx.Node) -> tuple[torch.fx.Node, ...]:
     """Normalize the tensor payloads of an ``_reduce`` node."""
     inputs = node.args[1]
@@ -1272,10 +1281,11 @@ def reduction_block_id(node: torch.fx.Node) -> int | None:
     assert isinstance(dim, int)
     block_id = env.get_block_id(value.size(dim))
     if any(
-        env.get_block_id(payload.meta["val"].size(dim)) != block_id
+        payload.meta["val"].ndim != value.ndim
+        or env.get_block_id(payload.meta["val"].size(dim)) != block_id
         for payload in inputs
     ):
-        # Every payload must follow the same chunk coordinate to be rolled.
+        # Every payload must follow the same axis and rank to be rolled.
         return None
     return block_id
 
@@ -2045,6 +2055,15 @@ class CodegenState(NamedTuple):
         rv = self.ast_args[i]
         if isinstance(rv, int | float | bool | None):
             rv = ast.Constant(value=rv)
+        elif isinstance(rv, tuple):
+            rv = create(
+                ast.Tuple,
+                elts=[
+                    value if isinstance(value, ast.AST) else ast.Constant(value=value)
+                    for value in rv
+                ],
+                ctx=ast.Load(),
+            )
         assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
         return rv
 
@@ -2056,6 +2075,13 @@ class CodegenState(NamedTuple):
     def get_graph(self, graph_id: int | object) -> GraphInfo:
         assert isinstance(graph_id, int)
         return self.codegen.get_graph(graph_id)
+
+    def register_helper_function(self, argument: int) -> str:
+        from .device_ir import HelperFunctionGraphInfo
+
+        graph = self.get_graph(self.proxy_arg(argument))
+        assert isinstance(graph, HelperFunctionGraphInfo)
+        return self.device_function.register_helper_function(graph)
 
     @property
     def device_function(self) -> DeviceFunction:

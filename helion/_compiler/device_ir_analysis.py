@@ -1154,7 +1154,7 @@ class GraphAnalysis:
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
-        custom_reduction_steps: list[tuple[LiveTile, ...]] = []
+        custom_reduction_steps: list[tuple[int, tuple[LiveTile, ...]]] = []
         custom_reduction_block_ids: set[int] = set()
         native_reduction_block_ids: set[int] = set()
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
@@ -1212,11 +1212,16 @@ class GraphAnalysis:
                     sources = custom_reduction_sources(node)
                     # Each payload needs its own carry, even when inputs alias.
                     custom_reduction_steps.append(
-                        tuple(
-                            tile_details[source]._replace(
-                                kind="carry", promoted_lhs=False
-                            )
-                            for source in sources
+                        (
+                            index,
+                            tuple(
+                                tile_details[source]._replace(
+                                    kind="carry",
+                                    promoted_lhs=False,
+                                    carried_reduction_block_id=block_id,
+                                )
+                                for source in sources
+                            ),
                         )
                     )
 
@@ -1242,15 +1247,19 @@ class GraphAnalysis:
                 memory_tiles.append((node, memory_tile))
 
         live_tile_steps: list[tuple[LiveTile, ...]] = []
-        seen_steps: set[frozenset[int]] = set()
-        # Carries survive across the producer and combine steps of a rolled
-        # loop. Conservatively overlap all custom carries in this graph with
-        # its ordinary live values, rather than treating them as disjoint.
-        carried_tiles = tuple(tile for step in custom_reduction_steps for tile in step)
-        for live in _live_node_steps(nodes, tile_details, last_use):
+        seen_steps: set[tuple[frozenset[int], bool]] = set()
+        carried_tiles = tuple(
+            tile for _, tiles in custom_reduction_steps for tile in tiles
+        )
+        carry_end = max((end for end, _ in custom_reduction_steps), default=-1)
+        # Fusion can put these reductions in one loop: every carry survives
+        # the next iteration's producers, including those before its own op.
+        # The group dies before the epilogue; persistent candidates omit it.
+        for index, live in enumerate(_live_node_steps(nodes, tile_details, last_use)):
             if live:
-                step_key = frozenset(id(value) for value in live)
-                step = tuple(tile_details[value] for value in live) + carried_tiles
+                carries = carried_tiles if index <= carry_end else ()
+                step_key = (frozenset(id(value) for value in live), bool(carries))
+                step = tuple(tile_details[value] for value in live) + carries
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)

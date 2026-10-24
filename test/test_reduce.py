@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import operator
+from types import SimpleNamespace
 import unittest
+from unittest.mock import MagicMock
 from unittest.mock import PropertyMock
 from unittest.mock import patch
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion import exc
@@ -16,9 +20,11 @@ from helion._compiler.cute.canonicalize_reductions import _independent_combines
 from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import HelperFunctionGraphInfo
+from helion._compiler.inductor_lowering import PointwiseLowering
 from helion._compiler.inductor_lowering import ReductionLowering
 from helion._compiler.inductor_lowering import reduction_block_id
 from helion._compiler.node_masking import remove_unnecessary_masking
+from helion._compiler.triton.reduce_ops import _register_reduce_combine
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -35,6 +41,11 @@ from helion.language.reduce_ops import _reduce
 def add_combine_fn(x, y):
     """Simple addition combine function for sum reduction."""
     return x + y
+
+
+def add_division_combine_fn(left, right):
+    """Addition on finite inputs, with a promoted Triton division result."""
+    return (left + right) / (left - left + 1)
 
 
 def max_combine_fn(x, y):
@@ -71,6 +82,10 @@ def keep_left_max_combine_fn(x, y):
 def tuple_add_alpha_combine_fn(left_x, left_y, right_x, right_y):
     """Adds the right operand twice to the first tuple element."""
     return torch.add(left_x, right_x, alpha=2), left_y + right_y
+
+
+def singleton_add_combine_fn(left, right):
+    return (left[0] + right[0],)
 
 
 def tuple_add_combine_fn(left_tuple, right_tuple):
@@ -384,26 +399,25 @@ class TestReduce(RefEagerTestBase, TestCase):
         """Test reduce with dim=None (reduce all dimensions)."""
 
         @helion.kernel(autotune_effort="none")
-        def reduce_all_kernel(x: torch.Tensor) -> torch.Tensor:
+        def reduce_all_kernel(
+            x: torch.Tensor, tuple_input: hl.constexpr
+        ) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.grid(x.size(0)):
-                result[i] = hl.reduce(add_combine_fn, x[i, :])
+                if tuple_input:
+                    first, second = hl.reduce(tuple_add_combine_fn, (x[i], x[i]))
+                    result[i] = first + second
+                else:
+                    result[i] = hl.reduce(add_combine_fn, x[i])
             return result
 
-        x = torch.randn(3, 200, device=DEVICE)
-        _, result = code_and_output(reduce_all_kernel, (x,))
-        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
-
-        @helion.kernel(autotune_effort="none")
-        def reduce_all_2d_kernel(x: torch.Tensor) -> torch.Tensor:
-            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-            for i in hl.grid(x.size(0)):
-                result[i] = hl.reduce(add_combine_fn, x[i, :, :])
-            return result
-
-        x = torch.randn(3, 4, 8, device=DEVICE)
-        _, result = code_and_output(reduce_all_2d_kernel, (x,))
-        torch.testing.assert_close(result, x.sum((1, 2)), rtol=1e-4, atol=1e-4)
+        for shape in ((3, 200), (3, 4, 8)):
+            x = torch.randn(shape, device=DEVICE)
+            for tuple_input in (False, True):
+                with self.subTest(shape=shape, tuple_input=tuple_input):
+                    _, result = code_and_output(reduce_all_kernel, (x, tuple_input))
+                    expected = x.flatten(1).sum(1) * (2 if tuple_input else 1)
+                    torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     def test_reduce_rows_wider_than_a_warp(self):
         """Built-in combines over rows of 200 elements, wider than one warp."""
@@ -1240,6 +1254,64 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(result, (x - x.sum(1, keepdim=True)).amax(1))
 
+    @skipIfRefEager("checks declared dtypes on custom reduction carries")
+    def test_low_precision_computed_payload(self) -> None:
+        def reduce_computed(x: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = hl.reduce(
+                    add_division_combine_fn, x[row, :] / divisor[row, :], dim=1
+                )
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.ones((3, 513), device=DEVICE, dtype=dtype)
+            divisor = torch.full_like(x, 2)
+            expected = (x.float().sum(1) / 2).to(dtype)
+            for static_shapes in (True, False):
+                kernel = helion.kernel(
+                    reduce_computed,
+                    backend="triton",
+                    static_shapes=static_shapes,
+                    autotune_effort="none",
+                )
+                for chunk in (None, 256):
+                    with self.subTest(
+                        dtype=dtype, static_shapes=static_shapes, chunk=chunk
+                    ):
+                        _, result = code_and_output(
+                            kernel,
+                            (x, divisor),
+                            block_sizes=[2],
+                            reduction_loops=[chunk],
+                        )
+                        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("checks rolled singleton-tuple padding")
+    def test_singleton_tuple_padding(self) -> None:
+        def reduce_singleton(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                (total,) = hl.reduce(
+                    singleton_add_combine_fn, (x[row, :],), dim=1, other=(2,)
+                )
+                out[row] = total
+            return out
+
+        x = torch.randint(-10, 10, (2, 513), device=DEVICE).float()
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                kernel = helion.kernel(
+                    reduce_singleton,
+                    backend="triton",
+                    static_shapes=static_shapes,
+                    autotune_effort="none",
+                )
+                _, output = code_and_output(
+                    kernel, (x,), block_sizes=[2], reduction_loops=[256]
+                )
+                torch.testing.assert_close(output, x.sum(1) + (1024 - 513) * 2)
+
     @skipIfRefEager("checks custom reduction tuple-axis admission")
     def test_custom_tuple_with_fixed_payload_stays_persistent(self) -> None:
         @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
@@ -1287,10 +1359,16 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             bound.env, bound.host_function.device_ir
         )
         assert narrow is not None
-        self.assertEqual(
-            narrow.config["load_eviction_policies"],
-            default.config["load_eviction_policies"],
-        )
+        for memory in spec.memory_op_facts:
+            if memory.eviction_index is not None:
+                expected = (
+                    "last"
+                    if memory.tensor_name == "y"
+                    else default.load_eviction_policies[memory.eviction_index]
+                )
+                self.assertEqual(
+                    narrow.load_eviction_policies[memory.eviction_index], expected
+                )
         for seed in (
             TritonReductionHeuristic.get_seed_configs(
                 bound.env, bound.host_function.device_ir
@@ -1345,11 +1423,12 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                 seeds = TritonReductionHeuristic.get_seed_configs(env, ir)
                 with patch.object(
                     type(bound.config_spec),
-                    "has_custom_reduction_loops",
+                    "custom_only_reduction_block_ids",
                     new_callable=PropertyMock,
-                    return_value=False,
-                ):
+                    return_value=frozenset(),
+                ) as custom_ids:
                     native_seed = TritonReductionHeuristic.get_seed_configs(env, ir)[0]
+                custom_ids.assert_called()
                 self.assertEqual(seeds[0], native_seed)
                 native_ids = {
                     r.block_id
@@ -1357,6 +1436,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                     if not r.is_custom
                 }
                 for seed in seeds:
+                    self.assertEqual(seed.num_warps, native_seed.num_warps)
                     for block_id in native_ids:
                         self.assertEqual(
                             bound.config_spec.reduction_loops.config_get(
@@ -1368,6 +1448,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                         )
 
                 if bound.config_spec.has_custom_reduction_loops:
+                    self.assertFalse(TritonNarrowReductionHeuristic.should_promote(env))
                     narrow = TritonNarrowReductionHeuristic.get_seed_config(env, ir)
                     default = bound.config_spec._base_default_config()
                     for block_id in native_ids:
@@ -1379,8 +1460,33 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                                 default.reduction_loops, block_id
                             ),
                         )
-                    self.assertEqual(narrow.block_sizes, default.block_sizes)
+                    native_grid = env.config_spec.kernel_grid_fact.roots[0].block_ids
+                    for block in env.config_spec.block_sizes:
+                        expected = (
+                            default.block_sizes[
+                                env.config_spec.block_sizes.block_id_to_index(
+                                    block.block_id
+                                )
+                            ]
+                            if block.block_id in native_grid
+                            else TritonReductionHeuristic._block_floor(block)
+                        )
+                        self.assertEqual(
+                            env.config_spec.block_sizes.config_get(
+                                narrow.block_sizes, block.block_id
+                            ),
+                            expected,
+                        )
                     self.assertEqual(narrow.num_warps, default.num_warps)
+                    for memory in env.config_spec.memory_op_facts:
+                        if (
+                            memory.eviction_index is not None
+                            and memory.tensor_name == "x"
+                        ):
+                            self.assertEqual(
+                                narrow.load_eviction_policies[memory.eviction_index],
+                                default.load_eviction_policies[memory.eviction_index],
+                            )
 
     @skipIfRefEager("checks generated reduction-loop code")
     def test_nonzero_identity_and_nonidentity_padding(self) -> None:
@@ -1415,7 +1521,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                         self.assertNotIn("custom_reduce_padding", code)
                     else:
                         self.assertIn("custom_reduce_padding", code)
-                    self.assertNotIn("custom_reduce_valid_combine", code)
+                    self.assertNotIn("left_valid | right_valid", code)
 
     @skipIfRefEager("Checks dynamic reduction results")
     def test_dynamic_tuple_padding(self) -> None:
@@ -1446,7 +1552,7 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
             block_sizes=[2],
             reduction_loops=[256],
         )
-        self.assertIn("custom_reduce_valid_combine", code)
+        self.assertIn("left_valid | right_valid", code)
         for width in (5000, 2, 33):
             x = storage[:, :width]
             padding = (1 << (width - 1).bit_length()) - width
@@ -1487,32 +1593,121 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
     @skipIfRefEager("checks generated reduction-loop code")
     def test_mixed_reduction_fusion(self) -> None:
         @helion.kernel(backend="triton", autotune_effort="none")
-        def two_reductions(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def two_reductions(
+            x: torch.Tensor, custom_second: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             totals = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
             squares = torch.empty_like(totals)
             for row in hl.tile(x.size(0)):
                 values = x[row, :]
                 total = hl.reduce(add_combine_fn, values, dim=1, keep_dims=True)
                 totals[row] = total.squeeze(1)
-                squares[row] = (values * values).sum(1)
+                if custom_second:
+                    squares[row] = hl.reduce(add_combine_fn, values * values, dim=1)
+                else:
+                    squares[row] = (values * values).sum(1)
             return totals, squares
 
         x = torch.randn((5, 2051), device=DEVICE)
-        bound = two_reductions.bind((x,))
-        self.assertTrue(bound.env.config_spec.reduction_fusion_available)
-        code, (totals, squares) = code_and_output(
-            two_reductions,
-            (x,),
-            block_sizes=[2],
-            reduction_loops=[256],
-            reduction_fusion=True,
-        )
-        torch.testing.assert_close(totals, x.sum(1), atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(squares, x.square().sum(1))
-        self.assertEqual(code.count("for roffset_"), 1)
+        for custom_second in (False, True):
+            with self.subTest(custom_second=custom_second):
+                bound = two_reductions.bind((x, custom_second))
+                self.assertTrue(bound.env.config_spec.reduction_fusion_available)
+                if custom_second:
+                    for step in bound.config_spec.reduction_kernel_fact.live_tile_steps:
+                        self.assertIn(
+                            sum(
+                                tile.carried_reduction_block_id is not None
+                                for tile in step
+                            ),
+                            (0, 2),
+                        )
+                code, (totals, squares) = code_and_output(
+                    two_reductions,
+                    (x, custom_second),
+                    block_sizes=[2],
+                    reduction_loops=[256],
+                    reduction_fusion=True,
+                )
+                torch.testing.assert_close(totals, x.sum(1), atol=1e-4, rtol=1e-4)
+                torch.testing.assert_close(squares, x.square().sum(1))
+                self.assertEqual(code.count("for roffset_"), 1)
 
 
 class TestCustomReductionMasks(unittest.TestCase):
+    def test_combine_wrapper_is_reused_within_one_codegen(self) -> None:
+        device_function = MagicMock()
+        device_function.new_var.side_effect = ("wrapper_0", "wrapper_1", "wrapper_2")
+        device_function.helper_manager.custom_reduction_combiners = {}
+        codegen = SimpleNamespace(module_statements=[])
+        state = SimpleNamespace(device_function=device_function, codegen=codegen)
+        first = _register_reduce_combine(state, "combine", 1, False)
+        self.assertEqual(_register_reduce_combine(state, "combine", 1, False), first)
+        self.assertNotEqual(_register_reduce_combine(state, "combine", 2, True), first)
+        self.assertNotEqual(
+            _register_reduce_combine(state, "combine", 1, False, with_validity=True),
+            first,
+        )
+        self.assertEqual(len(codegen.module_statements), 3)
+
+    def test_custom_reduction_broadcast_requires_keepdims(self) -> None:
+        shapes = ShapeEnv()
+        rows, cols = shapes.create_unbacked_symint(), shapes.create_unbacked_symint()
+        with FakeTensorMode(shape_env=shapes):
+            values = torch.empty(rows, cols)
+            total = torch.empty(rows)
+            kept_total = torch.empty(rows, 1)
+        block_ids = {rows.node.expr: 0, cols.node.expr: 1}
+        env = SimpleNamespace(
+            get_block_id=lambda size: block_ids.get(size.node.expr),
+            resolve_block_id=lambda size: block_ids.get(size.node.expr),
+            canonical_block_id=lambda block_id: block_id,
+            block_sizes=[
+                SimpleNamespace(symbol=lambda: rows.node.expr, block_size_source=None),
+                SimpleNamespace(symbol=lambda: cols.node.expr, block_size_source=None),
+            ],
+        )
+        for tuple_input in (False, True):
+            graph = torch.fx.Graph()
+            source = graph.placeholder("source")
+            source.meta["val"] = values
+            reduced = graph.call_function(_reduce, (0, source, 1, False, tuple_input))
+            if tuple_input:
+                reduced = graph.call_function(operator.getitem, (reduced, 0))
+            reduced.meta["val"] = total
+            subtract = graph.call_function(torch.ops.aten.sub.Tensor, (source, reduced))
+            lowering = object.__new__(PointwiseLowering)
+            with (
+                self.subTest(tuple_input=tuple_input),
+                patch(
+                    "helion._compiler.inductor_lowering.CompileEnvironment.current",
+                    return_value=env,
+                ),
+            ):
+                with self.assertRaises(exc.ShapeMismatch):
+                    lowering._check_reduction_broadcast_keepdim(subtract)
+                reduced.meta["val"] = kept_total
+                lowering._check_reduction_broadcast_keepdim(subtract)
+
+    def test_mismatched_tuple_ranks_have_no_rolled_axis(self) -> None:
+        graph = torch.fx.Graph()
+        first = graph.placeholder("first")
+        second = graph.placeholder("second")
+        first.meta["val"] = torch.empty(2, 3)
+        second.meta["val"] = torch.empty(3)
+        node = graph.call_function(_reduce, (0, (first, second), -1, False, True))
+        env = SimpleNamespace(backend_name="triton", get_block_id=lambda size: 1)
+        with patch(
+            "helion._compiler.inductor_lowering.CompileEnvironment.current",
+            return_value=env,
+        ):
+            self.assertIsNone(reduction_block_id(node))
+        for implementation in (hl.reduce._fake_fn, hl.reduce._ref_fn):
+            with self.assertRaisesRegex(ValueError, "same rank"):
+                implementation(
+                    tuple_add_combine_fn, (first.meta["val"], second.meta["val"])
+                )
+
     def test_reduction_dependent_padding_keeps_its_mask(self) -> None:
         for custom_before, custom_after in ((False, True), (True, False), (True, True)):
             with self.subTest(custom_before=custom_before, custom_after=custom_after):

@@ -14,6 +14,8 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .._compiler.helper_function import CombineFunction
     from .._compiler.helper_function import CombineFunctionBasic
     from .._compiler.helper_function import CombineFunctionTuple
@@ -63,7 +65,7 @@ def reduce(
         combine_fn: A binary function that combines two elements element-wise.
                    Must be associative and commutative for correct results.
                    Can be tensor->tensor or tuple->tuple function.
-        input_tensor: Input tensor or tuple of tensors to reduce
+        input_tensor: Input tensor or nonempty tuple of tensors with matching shapes
         dim: The dimension along which to reduce (None for all dimensions)
         other: Value for masked/padded elements (default: 0)
                For tuple inputs, can be tuple of values with same length
@@ -85,6 +87,13 @@ def reduce(
     raise exc.NotInsideKernel
 
 
+def _check_tuple_reduction_ranks(tensors: Sequence[torch.Tensor]) -> None:
+    if not tensors:
+        raise ValueError("reduce tuple inputs must not be empty")
+    if any(tensor.ndim != tensors[0].ndim for tensor in tensors):
+        raise ValueError("reduce tuple inputs must have the same rank")
+
+
 @_decorators.register_fake(reduce)
 def _(
     combine_fn: CombineFunction,
@@ -95,6 +104,7 @@ def _(
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Fake implementation that returns fake tensors with reduced shape."""
     if isinstance(input_tensor, (tuple, list)):
+        _check_tuple_reduction_ranks(input_tensor)
         return tuple(_fake_reduce_tensor(t, dim, keep_dims) for t in input_tensor)
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
 
@@ -114,6 +124,8 @@ def _(
     combine_fn = extract_helper_function(combine_fn)
 
     is_tuple = isinstance(input_tensor, tuple)
+    if is_tuple:
+        _check_tuple_reduction_ranks(input_tensor)
 
     # Normalize inputs to always work with lists
     if not is_tuple:
@@ -290,6 +302,7 @@ def _(
         assert all(isinstance(t, torch.Tensor) for t in input_tensor), (
             "reduce input must be a tuple of tensors"
         )
+        _check_tuple_reduction_ranks(input_tensor)
     else:
         assert isinstance(input_tensor, torch.Tensor), "reduce input must be a tensor"
 

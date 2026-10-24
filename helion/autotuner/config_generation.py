@@ -2557,10 +2557,9 @@ class ConfigGeneration:
         default_flat = self.default_flat()
 
         if not self.config_spec.cute_flash_search_enabled:
-            # New custom reductions must compare their schedules before a
-            # generic fallback can consume a bounded search's budget.
-            prioritize_seeds = self.config_spec.has_custom_reduction_loops
-            result = [] if prioritize_seeds else [default_flat]
+            # Compare ranked seeds before a generic fallback consumes a
+            # bounded search's budget, regardless of the kernel feature.
+            result: list[FlatConfig] = []
             for flat, _config in self.user_seed_flat_config_pairs(
                 user_seed_configs, log_func
             ):
@@ -2575,7 +2574,7 @@ class ConfigGeneration:
                 result.append(flat)
                 if len(result) >= n:
                     return result[:n]
-            if prioritize_seeds and not any(default_flat == flat for flat in result):
+            if not any(default_flat == flat for flat in result):
                 result.append(default_flat)
             priors_present = bool(self._config_value_priors)
             for j in range(n - len(result)):

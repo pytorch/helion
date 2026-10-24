@@ -425,6 +425,9 @@ class LiveTile(NamedTuple):
     kind: str
     stageable: bool | None = None
     promoted_lhs: bool = False
+    # Present only for carries created by rolling a custom reduction. Persistent
+    # candidates have no such tile; ordinary loop-carried values are unconditional.
+    carried_reduction_block_id: int | None = None
 
 
 class SymbolicLoopBound(NamedTuple):
@@ -690,7 +693,8 @@ class ReductionDescriptor(NamedTuple):
       feeding it.
     - ``fixed_tile_size_hint``: fixed per-iteration width for ``FIXED_TILE``; ``None`` otherwise.
     - ``row_reread`` / ``reread_eviction_index``: per-reduction memory-op signals.
-    - ``is_custom``: whether this occurrence includes a user-defined combine.
+    - ``is_custom``: whether only user-defined combines own this graph-axis occurrence.
+      Native reductions take scheduling ownership of axes shared within one graph.
     """
 
     category: ReductionCategory
@@ -1951,7 +1955,9 @@ class ConfigSpec:
         # independent of which heuristic runs.
         self.kernel_matmul_fact: KernelMatmulFact | None = None
         # The Stage-1 categorizing product the reduction seed + allocator consume.
-        self.reduction_kernel_fact: ReductionKernelFact | None = None
+        self._reduction_kernel_fact: ReductionKernelFact | None = None
+        self._native_reduction_block_ids: frozenset[int] = frozenset()
+        self._custom_only_reduction_block_ids: frozenset[int] = frozenset()
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
         self.pointwise_facts: list[PointwiseElementwiseFact] = []
@@ -7075,8 +7081,35 @@ class ConfigSpec:
             )
 
     @property
+    def reduction_kernel_fact(self) -> ReductionKernelFact | None:
+        return self._reduction_kernel_fact
+
+    @reduction_kernel_fact.setter
+    def reduction_kernel_fact(self, fact: ReductionKernelFact | None) -> None:
+        self._reduction_kernel_fact = fact
+        reductions = fact.reductions if fact is not None else ()
+        native = frozenset(r.block_id for r in reductions if not r.is_custom)
+        self._native_reduction_block_ids = native
+        self._custom_only_reduction_block_ids = (
+            frozenset(r.block_id for r in reductions if r.is_custom) - native
+        )
+
+    @property
+    def has_native_reductions(self) -> bool:
+        return bool(self._native_reduction_block_ids)
+
+    @property
+    def custom_only_reduction_block_ids(self) -> frozenset[int]:
+        return self._custom_only_reduction_block_ids
+
+    @property
     def has_custom_reduction_loops(self) -> bool:
-        """Whether a custom reduction has an available loop-size coordinate."""
+        """Whether a custom reduction has an available loop-size coordinate.
+
+        Axes shared by native and custom reductions across graphs count here;
+        within one graph, shared axes are classified as native. Persistent
+        defaults use custom_only_reduction_block_ids to preserve native ownership.
+        """
         fact = self.reduction_kernel_fact
         rolled_ids = self.reduction_loops.valid_block_ids()
         return fact is not None and any(
@@ -8563,13 +8596,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
-        fact = base.reduction_kernel_fact
-        axis_reductions = (
-            [r for r in fact.reductions if r.block_id == self.block_id]
-            if fact is not None
-            else []
-        )
-        if axis_reductions and all(r.is_custom for r in axis_reductions):
+        if self.block_id in base.custom_only_reduction_block_ids:
             # Keep custom axes persistent unless a native occurrence shares them.
             default = high
         if high == self._full_extent_chunk():
