@@ -2073,6 +2073,37 @@ class DeviceFunction:
                         )
                     ),
                 )
+            # Without fast_math, hoist the divisor-only work of an fp32
+            # ``x / d`` with a loop-invariant divisor as the Markstein
+            # sequence, speculated over the loop and redone with div.rn
+            # when a dividend left the admitted window: the IEEE quotient
+            # bit for bit (exact_division.py), at three FMA-pipe
+            # instructions and two FMNMX per element.  Last among the
+            # structural passes: the sweep matchers above (independent
+            # partial accumulators, pipelined and packed loads, the cluster
+            # pairs, the scalar epilogue) recognize the plain ``v = x / d``
+            # sweeps, so the redo render keeps the plain render's structure
+            # and summation order.  ``cute_exact_div_form="plain"`` keeps
+            # the plain division.  Not for matmul kernels, whose tcgen05
+            # scheduling passes pin exact statement sequences (as fuse_fma).
+            if (
+                CompileEnvironment.current().settings.cute_exact_division
+                and not CompileEnvironment.current().settings.fast_math
+                and self.config.cute_exact_div_form == "redo"
+                and not env.config_spec.matmul_facts
+            ):
+                from .cute.hoist_loop_invariant_recip import (
+                    hoist_exact_invariant_divisions,
+                )
+
+                kernel_body = hoist_exact_invariant_divisions(
+                    kernel_body,
+                    rename_groups,
+                    float_scalar_names=float_scalar_names,
+                    tensor_dtypes=tensor_dtypes,
+                    argument_names={arg.arg for arg in args},
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                )
         definition = ast_rename(
             create(
                 ast.FunctionDef,

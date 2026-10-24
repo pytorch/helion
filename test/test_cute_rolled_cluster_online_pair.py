@@ -134,8 +134,12 @@ def test_fast_math_rolled_pair_caches_the_exponentials(register_row: bool) -> No
 @pytest.mark.parametrize("register_row", [False, True])
 def test_exact_rolled_pair_keeps_every_exponential(register_row: bool) -> None:
     """Without fast_math the warp pair exchanges once but both sweeps keep
-    their ``exp2`` as written (sweep B in the warp's own frame)."""
-    code = _render(softmax_exact, cute_register_row=register_row)
+    their ``exp2`` as written (sweep B in the warp's own frame).  The plain
+    division form keeps the ``exp2`` count structural (the exact hoist's
+    redo copy of the write sweep would add a third)."""
+    code = _render(
+        softmax_exact, cute_register_row=register_row, cute_exact_div_form="plain"
+    )
     assert code.count(WARP_PAIR) == 1
     assert code.count("_cute_grouped_reduce_warp(") == 1
     assert CLUSTER not in code
