@@ -8,11 +8,24 @@ from ...exc import InvalidConfig
 
 BLOCK_SCALED_CHOICES: dict[str, tuple[object, ...]] = {
     "cute_scaled_mma": (False, True),
-    "cute_scaled_tile_n": (256, 128),
+    # bn=128 with the 2-CTA pair (cute_scaled_cluster_m=2, the first cluster
+    # choice) is the default: it halves the B traffic per K step and wins the
+    # cold autotunes at 512^3 and 1024^3 against the 256-wide tile.
+    "cute_scaled_tile_n": (128, 256, 64),
     "cute_scaled_tile_k": (256, 128, 64),
     "cute_scaled_stages": (4, 2, 3, 5),
     "cute_scaled_cluster_m": (2, 1),
     "cute_scaled_persistent": (True, False),
+    # Preparation of a row-contiguous (transposed) packed operand: through a
+    # shared-memory tile with coalesced qword and scale stores, or one thread
+    # per (row, group) with coalesced byte loads (fewer phases; wins when the
+    # problem is a single small wave).
+    # ``fused``: no preparation kernel; the consumer reads the packed sides and
+    # swizzled scales directly (``block_scaled_fused``), falling back to the
+    # tiled preparation where the sources do not allow it.
+    "cute_scaled_prepare": ("tiled", "linear", "fused"),
+    # Rows of a tiled-preparation tile (``block_scaled_prepare.PREPARE_ROWS_CHOICES``).
+    "cute_scaled_prepare_rows": (32, 16),
 }
 MXFP8_CONFIG_KEYS = frozenset(
     {
@@ -181,6 +194,17 @@ def normalize_block_scaled_config(
             config["cute_scaled_mma"] = False
         else:
             raise InvalidConfig("native block scaling requires SM100-family hardware")
+    if mxfp8 and config["cute_scaled_prepare"] == "fused":
+        if fix_invalid:
+            config["cute_scaled_prepare"] = "tiled"
+        else:
+            raise InvalidConfig("the fused preparation applies to NVFP4 only")
+    if mxfp8 and config["cute_scaled_prepare_rows"] != 32:
+        # The MXFP8 preparation has no tiled transpose: the knob is inert.
+        if fix_invalid:
+            config["cute_scaled_prepare_rows"] = 32
+        else:
+            raise InvalidConfig("cute_scaled_prepare_rows applies to NVFP4 only")
     if mxfp8 and config["cute_scaled_tile_k"] == 64:
         if fix_invalid:
             config["cute_scaled_tile_k"] = 128

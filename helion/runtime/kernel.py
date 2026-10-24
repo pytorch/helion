@@ -557,7 +557,7 @@ def _make_prepared_arg_guard(
     namespace: dict[str, object] = {}
     checks = [f"len(args) == {len(args)}"]
     counter = itertools.count()
-    tensor_paths: list[tuple[str, torch.Tensor]] = []
+    tensor_paths: list[tuple[str, weakref.ReferenceType[torch.Tensor]]] = []
     # Plain tensors whose dtype / device / shape / stride one C++ guard
     # (dynamo's ``TensorGuards``) checks in front of the Python checks: ~0.1
     # us per tensor against ~0.5 us for the four attribute comparisons.
@@ -574,10 +574,10 @@ def _make_prepared_arg_guard(
         checks.append(f"type({prefix}) is type_{token}")
         if value_type in (torch.Tensor, torch.nn.Parameter):
             assert isinstance(value, torch.Tensor)
-            for previous_prefix, previous_tensor in tensor_paths:
-                relation = "is" if value is previous_tensor else "is not"
+            for previous_prefix, previous_tensor_ref in tensor_paths:
+                relation = "is" if previous_tensor_ref() is value else "is not"
                 checks.append(f"{prefix} {relation} {previous_prefix}")
-            tensor_paths.append((prefix, value))
+            tensor_paths.append((prefix, weakref.ref(value)))
             static_indices = getattr(value, "_dynamo_static_indices", None)
             if value_type is torch.Tensor and static_indices is None:
                 # (The C++ guard also pins requires_grad and the dispatch
@@ -699,8 +699,13 @@ def _make_prepared_arg_guard(
         else:
             raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
 
-    for index, arg in enumerate(args):
-        append_checks(arg, f"args[{index}]", kernel._annotations[index])
+    try:
+        for index, arg in enumerate(args):
+            append_checks(arg, f"args[{index}]", kernel._annotations[index])
+    finally:
+        # Break the recursive closure cycle so its temporary C++ guard inputs
+        # are released even when cyclic GC is disabled or traversal raises.
+        append_checks = cast("Any", None)
     if cxx_tensor_paths:
         cxx_check = _prepared_cxx_tensor_check(
             [tensor for _prefix, tensor in cxx_tensor_paths]
@@ -2933,11 +2938,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
 
     def has_compiled_config(self, config: ConfigLike) -> bool:
-        """Whether ``compile_config(config)`` would hit this kernel's compile cache."""
-        return (
-            self._normalized_config_copy(self._normalize_config(config))
-            in self._compile_cache
-        )
+        """Whether ``compile_config(config)`` would hit this kernel's compile cache.
+
+        A config the strict normalization rejects (a search candidate carrying
+        a knob its other knobs do not admit, e.g. a grouped register profile
+        on a schedule without one) is not compiled: it answers ``False`` and
+        the compile path reports the rejection for that one config, instead
+        of the rejection aborting the batch that asked.
+        """
+        try:
+            normalized = self._normalized_config_copy(self._normalize_config(config))
+        except exc.InvalidConfig:
+            return False
+        return normalized in self._compile_cache
 
     def prime_rendered_code(self, config: ConfigLike, code: str) -> None:
         """Hand :meth:`compile_config` the source a render worker made for ``config``.

@@ -20,6 +20,18 @@ emitted transposed, so its mask relabels by coordinates and no exchange is
 needed).  Later increments (Frag reductions, tf32) extend the typed IR below
 rather than rewrite it.
 
+A GEMM over a whole ``:`` axis with a row epilogue (``acc = torch.addmm(acc,
+x[tile_m, tile_k], y[tile_k, :])`` in a K loop, then ``acc - acc.sum(-1,
+keepdim=True) / n`` and a store of the whole row) is the same IR: the
+``addmm`` is a dot accumulating into the carry, the ``keepdim`` sums are
+row ``Vec`` values, and a fragment chain may read a row vector
+(``MmaDagProgram.chain_vecs``; the tensor-memory region renderer holds a
+vector as the thread's own row, the warp mode declines).  The ``:`` axis
+is an ``rdim`` fragment axis the ``cute_mma_dag_cluster`` knob splits over
+a thread-block cluster (``cluster_split_axis`` / ``apply_mma_dag_cluster``:
+each CTA owns ``extent // cluster`` of its columns and a row sum along it
+adds the peers' partials through distributed shared memory).
+
 The module is split in three layers:
 
 * the *typed IR* (:class:`MmaDagProgram`): value kinds ``Scalar`` (uniform
@@ -153,6 +165,17 @@ MMA_DAG_LOADS_LANE = "lane"
 # stay lane loads), ``lane`` keeps every lane's global pair loads (one sector
 # per lane per load) and the shared memory for occupancy.  Inert elsewhere.
 MMA_DAG_LOADS_CHOICES: tuple[str, ...] = (MMA_DAG_LOADS_TMA, MMA_DAG_LOADS_LANE)
+# How the warp mode's loop-variant per-thread side loads (a decay row of the
+# operand pass, a scalar of the carry rescale) reach the iteration:
+# ``register`` loads them one iteration ahead into registers; ``ring``
+# cp.asyncs each thread's elements into a per-stage shared slot together
+# with the operand tiles (a ring depth ahead, no register waits).
+MMA_DAG_AUX_KEY = "cute_mma_dag_aux"
+MMA_DAG_AUX_REGISTER = "register"
+MMA_DAG_AUX_RING = "ring"
+MMA_DAG_AUX_CHOICES: tuple[str, ...] = (MMA_DAG_AUX_REGISTER, MMA_DAG_AUX_RING)
+# The most shared bytes a thread's side-load slots take per ring stage.
+MMA_DAG_AUX_MAX_BYTES = 64
 MMA_DAG_PERSISTENT_KEY = "cute_mma_dag_persistent"
 # The tcgen05 mode's launch: 0 runs one root tile per CTA over the flat grid;
 # ``k`` launches ``k`` CTAs per SM that loop over the tiles (the generic
@@ -168,6 +191,27 @@ MMA_DAG_PERSISTENT_CHOICES: tuple[int, ...] = (0, 1, 2, 3, 4)
 MMA_DAG_SMEM_CTA_RESERVED = 1024
 # Tensor memory columns of one SM (the tcgen05 mode's second occupancy limit).
 MMA_DAG_TMEM_COLUMNS = 512
+# The tcgen05 region renderer's thread-block cluster: the CTAs a full-slice
+# (``rdim``) fragment axis is split across (``CuteMmaDagFacts.split_axis``),
+# each holding ``extent // cluster`` of its columns; a row reduction along
+# the axis adds the peers' partial sums through distributed shared memory.
+MMA_DAG_CLUSTER_KEY = "cute_mma_dag_cluster"
+# The split count of the full-slice axis: CTAs per thread-block cluster
+# (``cute_mma_dag_split = "cluster"``, at most ``MMA_DAG_CLUSTER_MAX``, a
+# portable cluster) or N tiles of the fixup grid (``"fixup"``, at most
+# ``MMA_DAG_FIXUP_MAX_TILES``: a CTA waits for the peers of its row tile,
+# launched in order right behind it).
+MMA_DAG_CLUSTER_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
+MMA_DAG_CLUSTER_MAX = 8
+MMA_DAG_FIXUP_MAX_TILES = 16
+# How the CTAs sharing a row tile of a split full-slice axis combine their
+# row reductions: through distributed shared memory inside one cluster, or
+# through a global workspace with per-row-tile arrival counters (the
+# region renderer's ``emit_fixup_allreduce``).
+MMA_DAG_SPLIT_KEY = "cute_mma_dag_split"
+MMA_DAG_SPLIT_CLUSTER = "cluster"
+MMA_DAG_SPLIT_FIXUP = "fixup"
+MMA_DAG_SPLIT_CHOICES: tuple[str, ...] = (MMA_DAG_SPLIT_CLUSTER, MMA_DAG_SPLIT_FIXUP)
 MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_KEY,
     MMA_DAG_WARPS_KEY,
@@ -176,7 +220,10 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_EXCHANGE_KEY,
     MMA_DAG_PASS_WARPS_KEY,
     MMA_DAG_LOADS_KEY,
+    MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,
+    MMA_DAG_CLUSTER_KEY,
+    MMA_DAG_SPLIT_KEY,
 )
 # Live fp32 fragment words per thread the carry may occupy.
 MMA_DAG_MAX_FRAG_REGS = 128
@@ -544,6 +591,9 @@ class Operand:
     # ``ldmatrix`` serves the tf32 fragments; the pass / exchange writes
     # scatter).  ``rows`` / ``cols`` and ``trans`` describe the stored tile.
     transposed_tile: bool = False
+    # The axis of each dim of ``value`` (None for a size-1 dim): the frame
+    # of the coordinates a pass evaluates the value at.
+    dims: tuple[Axis | None, ...] = ()
 
     @property
     def cols_pos(self) -> int:
@@ -743,6 +793,12 @@ class Loop:
     vec_carries: tuple[VecCarry, ...]
     steps: tuple[Step, ...]
     innermost: bool
+    # A single-axis tile loop whose ``hl.tile`` bound varies with the CTA's
+    # root tile coordinates: the bound over the ``bound_symbol``
+    # placeholders, else None.  The axis' ``extent`` is the bound's largest
+    # value; the loop's trip count is the bound in block steps, per CTA
+    # (``loop_bound_range``).
+    tile_end: sympy.Expr | None = None
 
     @property
     def carry_placeholders(self) -> frozenset[Node]:
@@ -820,6 +876,10 @@ class MmaDagProgram:
     vec_frag_slots: dict[int, tuple[int, ...]] = dataclasses.field(default_factory=dict)
     # ``tile.index`` values (``tile.index[None, :]``) -> their root axis.
     tile_index_loads: dict[Node, Axis] = dataclasses.field(default_factory=dict)
+    # Fragment-valued chain (a store / reduce value, a derived value, a dot
+    # accumulator) -> the vector leaves it reads, broadcast along the
+    # fragment's other dim (``acc - mean`` with ``mean`` a row sum).
+    chain_vecs: dict[Node, tuple[Node, ...]] = dataclasses.field(default_factory=dict)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -914,6 +974,13 @@ class MmaDagProgram:
             and self.loops[derived.loop].innermost
             and self.level(access) == derived.loop
         )
+
+    def fixed_derived_load(self, derived: Derived, access: Access) -> bool:
+        """Whether ``access`` is a loop-invariant 2-D tile of a derived value
+        outside every loop (an epilogue's residual term): staged once in the
+        root frame ahead of the loops instead of loaded per lane after
+        them."""
+        return derived.loop < 0 and not access.loops and len(access.tile_dims) == 2
 
     def loop_has_ring(self, loop: int) -> bool:
         """Whether loop ``loop`` stages tiles through the cp.async ring (its
@@ -1086,10 +1153,17 @@ class TileFacts:
 @dataclasses.dataclass(frozen=True)
 class LoopFacts:
     """A device loop's place in the nest: its parent (-1: root) and whether
-    it is innermost (owns a cp.async ring of ``stages`` slots)."""
+    it is innermost (owns a cp.async ring of ``stages`` slots).  A tile loop
+    whose bound varies with the CTA's root tile coordinates carries the
+    bound (``Loop.tile_end``), its tile axis index and whether a dot
+    operand over that axis is rewritten by a pass that can mask the
+    elements past the bound of a partial last trip."""
 
     parent: int
     innermost: bool
+    axis: int = -1
+    end: sympy.Expr | None = None
+    maskable: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1182,15 +1256,46 @@ class CuteMmaDagFacts:
     # straight, or any B): only then can the exchange knob choose between
     # the registers and the shared tile.
     identity_candidates: bool = False
+    # Fragment chains read row vectors (``acc - acc.sum(-1, keepdim=True) /
+    # n``): the tensor-memory region renderer's, where a vector is the
+    # thread's own row; the warp mode has no lane map for them.
+    chain_vecs: bool = False
+    # The full-slice fragment axis a thread-block cluster may split
+    # (``cluster_split_axis``; -1: none).  ``sizes`` then carries its
+    # per-CTA extent under its block id (``apply_mma_dag_cluster``).
+    split_axis: int = -1
+    # Some innermost ring loop has per-thread side loads varying with it:
+    # ``MMA_DAG_AUX_KEY`` has a subject.
+    aux_candidates: bool = False
+    # Some innermost ring loop has an operand tile a tensor map can fetch
+    # (a contiguous, 16-byte aligned source): ``MMA_DAG_LOADS_KEY`` has a
+    # subject in the warp mode (``MMA_DAG_LOADS_TMA``).
+    tma_ring: bool = False
+    # Whether an epilogue value reads a loop-invariant 2-D tile with
+    # contiguous columns (the loads knob's other warp subject: staged once
+    # ahead of the loops under ``tma``, loaded per lane under ``lane``).
+    fixed_derived: bool = False
 
     def block_size(self, axis: int, sizes: Mapping[int, object]) -> int | None:
         facts = self.axes[axis]
         if facts.kind == AXIS_LEAD:
             return 1
         if facts.kind == AXIS_RDIM:
-            return facts.extent
+            value = sizes.get(facts.block_id)
+            return value if type(value) is int else facts.extent
         value = sizes.get(facts.block_id)
         return value if type(value) is int else None
+
+    def cluster_of(self, sizes: Mapping[int, object]) -> int:
+        """The cluster size ``sizes`` encodes: the split axis's extent over
+        its per-CTA size (1 without a split)."""
+        if self.split_axis < 0:
+            return 1
+        axis = self.axes[self.split_axis]
+        size = sizes.get(axis.block_id)
+        if type(size) is not int or size <= 0 or axis.extent % size:
+            return 1
+        return axis.extent // size
 
     @property
     def live_groups(self) -> tuple[tuple[int, ...], ...]:
@@ -1234,6 +1339,28 @@ class SmemTileSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class AuxRing:
+    """The ``MMA_DAG_AUX_RING`` slots of one innermost ring loop: per stage,
+    ``words`` 4-byte slots per thread (``[slot][thread]`` words: a scalar or
+    a row-vector element the thread's packets read, copied and read by the
+    same thread) followed by the vectors along the source tiles' contiguous
+    dim (``vector_bytes`` in all, copied once per CTA with 16-byte
+    ``cp.async`` by the first threads and read behind a barrier: a packet
+    reads its run of ``run`` elements).  ``runs`` maps those accesses to
+    ``(elements per packet run, bytes per run, byte offset in the stage)``."""
+
+    offset: int
+    words: int
+    vector_bytes: int
+    runs: dict[Node, tuple[int, int, int]]
+    threads: int
+
+    @property
+    def stage_bytes(self) -> int:
+        return self.threads * self.words * 4 + self.vector_bytes
+
+
+@dataclasses.dataclass(frozen=True)
 class MmaDagPlan:
     """The program plus the config-selected tiles, warps and routes."""
 
@@ -1258,6 +1385,25 @@ class MmaDagPlan:
     tcgen05: Tcgen05Plan | None = None
     # CTAs per SM of a persistent tcgen05 launch (0: one tile per CTA).
     persistent: int = 0
+    # The split count of axis ``split_axis`` (an axis index): the CTAs of
+    # the thread-block cluster (the trailing grid dim indexes them) or the
+    # N tiles of the fixup grid (``split_mode``); 1 without a split.
+    cluster: int = 1
+    split_axis: int = -1
+    split_mode: str = MMA_DAG_SPLIT_CLUSTER
+    # Dots contracting over a varying-bound loop axis whose bound leaves
+    # some CTA a partial last trip: dot node -> the role of the load operand
+    # whose pass zeroes the elements past the bound (``mma_dag_bound_masks``).
+    bound_masks: dict[Node, str] = dataclasses.field(default_factory=dict)
+    # ``MMA_DAG_AUX_RING``: loop index -> the per-stage side-load slots of
+    # that innermost ring loop (empty: the register form); ``aux_bytes``
+    # their total.
+    aux_rings: dict[int, AuxRing] = dataclasses.field(default_factory=dict)
+    aux_bytes: int = 0
+    # ``MMA_DAG_LOADS_KEY``: in the warp mode ``tma`` fetches the ring tiles
+    # whose box one tensor map covers (the emitter decides per tile),
+    # ``lane`` keeps the per-thread cp.async packets.
+    loads: str = MMA_DAG_LOADS_TMA
 
     @property
     def threads(self) -> int:
@@ -1269,7 +1415,24 @@ class MmaDagPlan:
         seen: set[Node] = set()
         result = []
         for derived in self.program.derived:
-            if loop != -2 and derived.loop != loop:
+            if derived.loop < 0 or (loop != -2 and derived.loop != loop):
+                continue
+            for access in derived.loads:
+                if (
+                    self.derived_routes.get(access.node) == DERIVED_SHARED
+                    and access.node not in seen
+                ):
+                    seen.add(access.node)
+                    result.append((derived, access))
+        return tuple(result)
+
+    def fixed_derived(self) -> tuple[tuple[Derived, Access], ...]:
+        """Derived tile loads staged once in the root frame (the epilogue
+        values' loop-invariant tiles), in program order, one per load node."""
+        seen: set[Node] = set()
+        result = []
+        for derived in self.program.derived:
+            if derived.loop >= 0:
                 continue
             for access in derived.loads:
                 if (
@@ -1564,6 +1727,21 @@ class MmaDagPlan:
                 self.stages,
             )
             items.append((owner.loop, "derived", access.node, spec))
+        # The epilogue values' loop-invariant tiles: one copy in the root
+        # frame, live across the loops.
+        for index, (_owner, access) in enumerate(
+            self.fixed_derived(), start=len(self.ring_derived())
+        ):
+            rows, cols = access.tile_dims
+            spec = SmemTileSpec(
+                f"md_d{index}",
+                0,
+                self.size(rows),
+                self.size(cols),
+                access.dtype.itemsize,
+                1,
+            )
+            items.append((-1, "derived", access.node, spec))
         for index, store in enumerate(self.staged_stores):
             rows, cols = self.slot_shape(program.frag_slots[store.frag])
             spec = SmemTileSpec(
@@ -1666,7 +1844,7 @@ class MmaDagPlan:
 
     @property
     def smem_bytes(self) -> int:
-        return self.smem_layout()[3]
+        return self.smem_layout()[3] + self.aux_bytes
 
 
 # Fragment operand routes: ``identity`` repacks the producer's registers into
@@ -1924,6 +2102,89 @@ def mma_dag_transient_regs(
     return most
 
 
+def cluster_split_axis(program: MmaDagProgram) -> Axis | None:
+    """The full-slice (``rdim``) axis a thread-block cluster may split so
+    each CTA holds a slice of its columns: the columns of some fragment
+    slot, the rows of none, no dot's K extent, and no vector along it (a
+    vector along the split axis would be scattered over the cluster, a
+    contraction over it would be cut short).  None when there is no such
+    axis or there are several."""
+    cols = {cols for _rows, cols in program.slots if cols.kind == AXIS_RDIM}
+    rows = {rows for rows, _cols in program.slots}
+    k_axes = {dot.k for dot in program.dots}
+    vec_axes = {slot.axis for slot in program.vec_slots if slot.axis is not None}
+    candidates = [
+        axis
+        for axis in program.axes
+        if axis in cols
+        and axis not in rows
+        and axis not in k_axes
+        and axis not in vec_axes
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def fixup_admitted(facts: CuteMmaDagFacts) -> bool:
+    """Whether the fixup split (``cute_mma_dag_split = "fixup"``) can lower
+    the program: a split axis, and the fixup grid folds the row tile and
+    the N tile into one launch dim (``pid // tiles``, ``pid % tiles``), so
+    exactly one root tile axis and no leading (batch) axes.  The knob's
+    fragment, the seeds and the repairs offer the fixup form only here."""
+    if facts.split_axis < 0:
+        return False
+    kinds = [axis.kind for axis in facts.axes]
+    return kinds.count(AXIS_ROOT) == 1 and AXIS_LEAD not in kinds
+
+
+def apply_mma_dag_cluster(
+    facts: CuteMmaDagFacts,
+    sizes: dict[int, object],
+    cluster: object,
+    split: object = MMA_DAG_SPLIT_CLUSTER,
+) -> str | None:
+    """Resolve the ``cute_mma_dag_cluster`` knob (under the ``split`` mode)
+    into ``sizes``: the split axis's per-CTA extent under its block id.
+    Returns why ``cluster`` is illegal for the program (None: applied; 1
+    leaves ``sizes`` alone)."""
+    if type(cluster) is not int or cluster not in MMA_DAG_CLUSTER_CHOICES:
+        return f"{MMA_DAG_CLUSTER_KEY} {cluster!r} must be one of {MMA_DAG_CLUSTER_CHOICES}"
+    if split not in MMA_DAG_SPLIT_CHOICES:
+        return f"{MMA_DAG_SPLIT_KEY} {split!r} must be one of {MMA_DAG_SPLIT_CHOICES}"
+    if cluster == 1:
+        return None
+    if split == MMA_DAG_SPLIT_CLUSTER and cluster > MMA_DAG_CLUSTER_MAX:
+        return (
+            f"{MMA_DAG_CLUSTER_KEY}={cluster}: a portable thread-block cluster "
+            f"holds at most {MMA_DAG_CLUSTER_MAX} CTAs ({MMA_DAG_SPLIT_KEY}="
+            f"{MMA_DAG_SPLIT_FIXUP!r} splits the axis over a grid)"
+        )
+    if split == MMA_DAG_SPLIT_FIXUP:
+        if cluster > MMA_DAG_FIXUP_MAX_TILES:
+            return (
+                f"{MMA_DAG_CLUSTER_KEY}={cluster}: the fixup grid holds at most "
+                f"{MMA_DAG_FIXUP_MAX_TILES} tiles of a row (its CTAs wait for "
+                "each other)"
+            )
+        if not fixup_admitted(facts):
+            return (
+                f"{MMA_DAG_SPLIT_KEY}={MMA_DAG_SPLIT_FIXUP!r} needs one root tile "
+                "axis and no leading axes"
+            )
+    if facts.split_axis < 0:
+        return (
+            f"{MMA_DAG_CLUSTER_KEY}={cluster}: the program has no full-slice "
+            "fragment axis a cluster could split"
+        )
+    axis = facts.axes[facts.split_axis]
+    if axis.extent % cluster:
+        return (
+            f"{MMA_DAG_CLUSTER_KEY}={cluster} must divide the extent "
+            f"{axis.extent} of the split axis"
+        )
+    sizes[axis.block_id] = axis.extent // cluster
+    return None
+
+
 def mma_dag_config_reason(
     facts: CuteMmaDagFacts,
     sizes: Mapping[int, object],
@@ -1934,7 +2195,8 @@ def mma_dag_config_reason(
     """Why the block sizes / warps / stages cannot run the program in
     ``mode`` (None: they can).
 
-    ``sizes`` maps block ids to the config's block sizes.
+    ``sizes`` maps block ids to the config's block sizes (the split axis's
+    per-CTA extent included, see ``apply_mma_dag_cluster``).
     """
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_warps_reason
@@ -1961,11 +2223,37 @@ def mma_dag_config_reason(
     for index in facts.k_axes:
         if resolved[index] % MMA_DAG_K_STEP:
             return f"the dot K extent {resolved[index]} must be a multiple of {MMA_DAG_K_STEP}"
+    for loop in facts.loops:
+        if loop.end is None:
+            continue
+        _lo, _hi, aligned = loop_trip_range(loop.end, facts.axes, resolved, loop.axis)
+        if not aligned and mode == MMA_DAG_TCGEN05:
+            # The tcgen05 emitters walk a static trip count (the planner
+            # declines the partial trip; the seeds and the search must not
+            # offer it).
+            return (
+                f"the bound of the loop over tile axis {facts.axes[loop.axis].block_id}"
+                f" is not a multiple of its block size {resolved[loop.axis]} in every"
+                " CTA: the tcgen05 mode runs no partial trip"
+            )
+        if not aligned and not loop.maskable:
+            return (
+                f"the bound of the loop over tile axis {facts.axes[loop.axis].block_id}"
+                f" is not a multiple of its block size {resolved[loop.axis]} in every"
+                " CTA and no operand pass can mask the partial trip"
+            )
     assert type(warps) is int
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_config_reason
 
         return tcgen05_config_reason(facts, resolved, warps, stages)
+    if facts.chain_vecs:
+        return (
+            f"{MMA_DAG_WARP}: a fragment chain reads a row vector (the "
+            f"{MMA_DAG_TCGEN05} mode's region renderer lowers it)"
+        )
+    if facts.cluster_of(sizes) > 1:
+        return f"{MMA_DAG_WARP}: one CTA per root tile (no cluster split)"
     frag_words: list[int] = []
     for rows, cols in facts.frags:
         bm, bn = resolved[rows], resolved[cols]
@@ -2430,6 +2718,102 @@ def mma_dag_seed_variants(
 # ---------------------------------------------------------------------------
 
 
+# Placeholders of a varying loop bound (``Loop.tile_end``), indexed by axis:
+# a tile's id, a root tile's begin and a root axis' block size.
+BOUND_ID = "md_id"
+BOUND_BEGIN = "md_begin"
+BOUND_BLOCK = "md_bs"
+
+
+def bound_symbol(kind: str, axis: int) -> sympy.Symbol:
+    return sympy.Symbol(f"{kind}{axis}", integer=True, nonnegative=True)
+
+
+def _bound_placeholder(symbol: sympy.Symbol) -> tuple[str, int]:
+    for kind in (BOUND_BEGIN, BOUND_BLOCK, BOUND_ID):
+        if symbol.name.startswith(kind):
+            return kind, int(symbol.name[len(kind) :])
+    raise AssertionError(f"not a bound placeholder: {symbol}")
+
+
+def loop_bound_terms(
+    end: sympy.Expr, sizes: Sequence[int]
+) -> tuple[int, dict[tuple[str, int], int]]:
+    """``end`` at the config's block ``sizes`` (by axis index) as an affine
+    form: the constant and the integer coefficient of each remaining
+    coordinate placeholder ``(kind, axis)``."""
+    blocks = {
+        symbol: sympy.Integer(
+            sizes[_bound_placeholder(cast("sympy.Symbol", symbol))[1]]
+        )
+        for symbol in end.free_symbols
+        if cast("sympy.Symbol", symbol).name.startswith(BOUND_BLOCK)
+    }
+    expr = sympy.expand(end.xreplace(blocks))
+    symbols = sorted(expr.free_symbols, key=str)
+    if not symbols:
+        return int(expr), {}
+    poly = sympy.Poly(expr, *symbols)
+    terms: dict[tuple[str, int], int] = {}
+    for symbol in symbols:
+        terms[_bound_placeholder(cast("sympy.Symbol", symbol))] = int(
+            poly.coeff_monomial(symbol)
+        )
+    return int(poly.coeff_monomial(1)), terms
+
+
+def _bound_coordinate_steps(
+    terms: Mapping[tuple[str, int], int],
+    axes: Sequence[AxisFacts] | Sequence[Axis],
+    sizes: Sequence[int],
+) -> list[tuple[int, int]]:
+    """Per coordinate term of a varying bound: the bound's step between
+    neighbouring coordinate values and the number of values."""
+    steps: list[tuple[int, int]] = []
+    for (kind, axis), coefficient in terms.items():
+        facts = axes[axis]
+        if kind == BOUND_ID:
+            count = (
+                facts.extent if facts.kind == AXIS_LEAD else facts.extent // sizes[axis]
+            )
+            steps.append((coefficient, count))
+        else:
+            steps.append((coefficient * sizes[axis], facts.extent // sizes[axis]))
+    return steps
+
+
+def loop_bound_range(
+    end: sympy.Expr, axes: Sequence[AxisFacts] | Sequence[Axis], sizes: Sequence[int]
+) -> tuple[int, int]:
+    """The smallest and largest value of a varying loop bound over the
+    CTAs at block ``sizes`` (the bound is nondecreasing in every
+    coordinate)."""
+    constant, terms = loop_bound_terms(end, sizes)
+    hi = constant
+    for step, count in _bound_coordinate_steps(terms, axes, sizes):
+        hi += step * (count - 1)
+    return constant, hi
+
+
+def loop_trip_range(
+    loop_end: sympy.Expr,
+    axes: Sequence[AxisFacts] | Sequence[Axis],
+    sizes: Sequence[int],
+    axis: int,
+) -> tuple[int, int, bool]:
+    """``(fewest trips, most trips, aligned)`` of a varying-bound tile loop
+    over tile axis ``axis``: ``aligned`` says every CTA's bound is a
+    multiple of the block size (no partial last trip anywhere)."""
+    size = sizes[axis]
+    constant, terms = loop_bound_terms(loop_end, sizes)
+    lo, hi = loop_bound_range(loop_end, axes, sizes)
+    aligned = constant % size == 0 and all(
+        step % size == 0 or count <= 1
+        for step, count in _bound_coordinate_steps(terms, axes, sizes)
+    )
+    return -(-lo // size), -(-hi // size), aligned
+
+
 def _static_int(value: object) -> int | None:
     from ...language.matmul_ops import _static_dim_value
 
@@ -2472,25 +2856,86 @@ def rounded_dot_dtype(node: object) -> torch.dtype | None:
     return val.dtype
 
 
+def _is_addmm(node: object) -> bool:
+    """``torch.addmm(acc, a, b)`` over an fp32 accumulator, without ``alpha``
+    / ``beta``: a dot accumulating into ``acc`` (the ``acc = torch.addmm(acc,
+    x[tile_m, tile_k], y[tile_k, tile_n])`` K loop)."""
+    if not _is_call(node, torch.ops.aten.addmm.default):
+        return False
+    assert isinstance(node, torch.fx.Node)
+    if len(node.args) != 3 or node.kwargs:
+        return False
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or val.dtype != torch.float32:
+        return False
+    acc = node.args[0]
+    if not isinstance(acc, torch.fx.Node):
+        return False
+    acc_val = acc.meta.get("val")
+    return isinstance(acc_val, torch.Tensor) and acc_val.dtype == torch.float32
+
+
 def _is_dot(node: object) -> bool:
-    """An ``hl.dot`` or a rounded 16-bit ``aten.mm`` (``rounded_dot_dtype``)."""
+    """An ``hl.dot``, an fp32 ``aten.addmm`` or a rounded 16-bit ``aten.mm``
+    (``rounded_dot_dtype``)."""
     from ...language.matmul_ops import dot
 
-    return _is_call(node, dot) or rounded_dot_dtype(node) is not None
+    return _is_call(node, dot) or _is_addmm(node) or rounded_dot_dtype(node) is not None
+
+
+def _dot_operands(node: Node) -> tuple[object, object]:
+    """The ``(A, B)`` arguments of a dot (``addmm`` puts its accumulator first)."""
+    if _is_addmm(node):
+        return node.args[1], node.args[2]
+    return node.args[0], node.args[1]
 
 
 def _dot_acc(node: Node) -> object:
-    """The accumulator argument of a dot (``aten.mm`` has none)."""
-    return node.args[2] if rounded_dot_dtype(node) is None else None
+    """The accumulator argument of a dot (``aten.mm`` has none; ``addmm``
+    puts it first).  A fresh fp32 ``hl.zeros`` read only by this dot
+    (``hl.dot(a, b, acc=hl.zeros(...))``) is no accumulator: the dot opens
+    its own slot."""
+    if _is_addmm(node):
+        acc = node.args[0]
+    elif rounded_dot_dtype(node) is not None:
+        return None
+    else:
+        acc = node.args[2]
+    if (
+        isinstance(acc, torch.fx.Node)
+        and _is_zero_full(acc)
+        and all(user is node for user in acc.users)
+    ):
+        return None
+    return acc
+
+
+def _is_zero_full(node: Node) -> bool:
+    """An fp32 ``hl.zeros`` / ``hl.full(..., 0.0)`` with no device argument."""
+    from ...language import creation_ops
+
+    if not _is_call(node, creation_ops.full):
+        return False
+    if len(node.args) not in (3, 4) or (
+        len(node.args) == 4 and node.args[3] is not None
+    ):
+        return False
+    fill = node.args[1]
+    if type(fill) not in (int, float) or fill != 0:
+        return False
+    return node.args[2] is torch.float32
 
 
 def _tile_index_position(node: Node) -> int | None:
-    """``tile.index`` broadcast by ``None`` subscripts (``tile.index[None, :]``
-    is a ``load`` of the ``tile_index`` value): the position of its one tile
-    dim, None for any other node."""
+    """``tile.index`` (the 1-D ``tile_index`` value itself, position 0) or
+    broadcast by ``None`` subscripts (``tile.index[None, :]`` is a ``load`` of
+    the ``tile_index`` value): the position of its one tile dim, None for
+    any other node."""
     from ...language import memory_ops
     from ...language import tile_ops
 
+    if _is_call(node, tile_ops.tile_index):
+        return 0
     if not _is_call(node, memory_ops.load) or len(node.args) < 4:
         return None
     source, indices = node.args[0], node.args[1]
@@ -2742,8 +3187,17 @@ class _Matcher:
         # them) and the fragment slots reduced into each.
         self.vec_parent: list[int] = []
         self.vec_frags: dict[int, list[int]] = {}
-        # ``tile.index`` values (``_tile_index_position``) -> their root axis.
+        # ``tile.index`` values (``_tile_index_position``) -> their root /
+        # loop axis.
         self.tile_index_loads: dict[Node, Axis] = {}
+        # Fragment-valued chain (a store / reduce value, a derived value, a
+        # dot accumulator) -> the vector leaves it reads (``chain_vecs``);
+        # ``_vec_reads`` collects them while one chain is traced.
+        self.chain_vecs: dict[Node, tuple[Node, ...]] = {}
+        self._vec_reads: list[Node] = []
+        # Tile loops whose ``hl.tile`` bound varies with the CTA's root tile
+        # coordinates (``(tile_m.id + 1) * block_m``): block id -> the bound.
+        self.loop_ends: dict[int, tuple[sympy.Expr, sympy.Expr]] = {}
 
     # -- axes ------------------------------------------------------------------
 
@@ -2767,7 +3221,10 @@ class _Matcher:
                     loop = self.loop_blocks[block_id]
                 else:
                     raise _NotMine
-            extent = _static_int(info.size)
+            if kind == AXIS_LOOP:
+                extent = self.loop_axis_extent(block_id, info.size)
+            else:
+                extent = _static_int(info.size)
             if extent is None or extent <= 0:
                 raise _NotMine
             if kind == AXIS_RDIM and (extent & (extent - 1) or extent % MMA_DAG_K_STEP):
@@ -2776,6 +3233,97 @@ class _Matcher:
             self.axes[block_id] = axis
             self.axis_list.append(axis)
         return axis
+
+    def loop_axis_extent(self, block_id: int, size: object) -> int | None:
+        """The static extent a tile loop's axis walks: its ``hl.tile`` bound
+        when that is static, else the bound's largest value over the root
+        tile coordinates it depends on (``(tile_m.id + 1) * block_m`` walks
+        the chunk at the last row tile), recorded in ``loop_ends``.  The
+        bound must be affine and nondecreasing in those coordinates (a
+        block size divides its axis' extent, so the last tile's id is
+        ``extent / block - 1``); anything else is not this owner's."""
+        from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
+        from ..variable_origin import TileBeginOrigin
+        from ..variable_origin import TileIdOrigin
+
+        if isinstance(size, int) and not isinstance(size, bool):
+            return size
+        if not isinstance(size, torch.SymInt):
+            return None
+        expr = self.env.specialize_expr(self.env.shape_env.replace(size._sympy_()))
+        if not expr.free_symbols:
+            return int(expr) if expr.is_Integer else None
+        expr_to_origin = HostFunction.current().expr_to_origin
+        largest: dict[sympy.Symbol, sympy.Expr] = {}
+        ones: dict[sympy.Symbol, sympy.Expr] = {}
+        # The bound over the axis-indexed placeholders of ``bound_symbol``
+        # (env-independent: the facts and the emitter evaluate it).
+        placeholders: dict[sympy.Symbol, sympy.Expr] = {}
+        coordinates: list[sympy.Symbol] = []
+        for symbol in sorted(expr.free_symbols, key=str):
+            symbol = cast("sympy.Symbol", symbol)
+            info = expr_to_origin.get(symbol)
+            if info is None:
+                raise _NotMine
+            origin = info.origin
+            if isinstance(origin, BlockSizeOrigin):
+                if self.canonical(origin.block_id) not in self.root_block_ids:
+                    raise _NotMine
+                ones[symbol] = sympy.Integer(1)
+                placeholders[symbol] = bound_symbol(
+                    BOUND_BLOCK, self.axis_of_block(origin.block_id).index
+                )
+                continue
+            if not isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
+                raise _NotMine
+            axis = self.axis_of_block(origin.block_id)
+            if axis.kind == AXIS_LEAD:
+                largest[symbol] = sympy.Integer(axis.extent - 1)
+                placeholders[symbol] = bound_symbol(BOUND_ID, axis.index)
+            elif axis.kind == AXIS_ROOT:
+                block = self.env.block_sizes[axis.block_id].symbol()
+                ones[block] = sympy.Integer(1)
+                if isinstance(origin, TileIdOrigin):
+                    largest[symbol] = sympy.Add(
+                        sympy.Mul(sympy.Integer(axis.extent), sympy.Pow(block, -1)),
+                        sympy.Integer(-1),
+                    )
+                    placeholders[symbol] = bound_symbol(BOUND_ID, axis.index)
+                else:
+                    largest[symbol] = sympy.Integer(axis.extent) - block
+                    placeholders[symbol] = bound_symbol(BOUND_BEGIN, axis.index)
+            else:
+                raise _NotMine
+            coordinates.append(symbol)
+        if not coordinates:
+            raise _NotMine
+        try:
+            poly = sympy.Poly(expr, *coordinates)
+        except sympy.PolynomialError:
+            raise _NotMine from None
+        if poly.total_degree() > 1:
+            raise _NotMine
+        for coefficient in poly.coeffs():
+            # Nonnegative at every block size: a single monomial in the
+            # block sizes with a nonnegative integer coefficient (a
+            # difference such as ``block_m - block_n`` is positive at 1 and
+            # negative at real sizes).
+            coefficient = sympy.expand(sympy.sympify(coefficient))
+            blocks = sorted(coefficient.free_symbols, key=str)
+            if blocks and (
+                not all(symbol in ones for symbol in blocks)
+                or len(sympy.Poly(coefficient, *blocks).terms()) != 1
+            ):
+                raise _NotMine
+            unit = coefficient.xreplace(ones)
+            if not unit.is_Integer or unit < 0:
+                raise _NotMine
+        extent = sympy.simplify(expr.xreplace(largest))
+        if not extent.is_Integer or int(extent) <= 0:
+            raise _NotMine
+        self.loop_ends[block_id] = (expr, sympy.expand(expr.xreplace(placeholders)))
+        return int(extent)
 
     def axis_of_size(self, size: object) -> Axis | None:
         """The axis behind a value dim size (None for a size-1 dim)."""
@@ -3127,6 +3675,10 @@ class _Matcher:
         resolved = self.resolve(node)
         if self.is_frag_leaf(resolved):
             result = True
+        elif resolved in self.vec_leaves:
+            # A reduction / vector op: a vector, however many fragments
+            # were reduced into it.
+            result = False
         elif _is_call(resolved, memory_ops.load):
             result = len(self.tile_dims(resolved)) == 2
         elif resolved.op != "call_function":
@@ -3149,6 +3701,14 @@ class _Matcher:
         if node in self.aliases:
             self.aux_dag(self.aliases[node], aux, seen)
             return
+        if node in self.vec_leaves:
+            # A vector value (a row sum, a vector op over one) read by a
+            # fragment chain, broadcast along the fragment's other dim
+            # (``acc - acc.sum(-1, keepdim=True) / n``): recorded for the
+            # chain's step; the renderer's legality rule checks its axis.
+            if node not in self._vec_reads:
+                self._vec_reads.append(node)
+            return
         if node.op != "call_function":
             raise _NotMine
         if _is_call(node, torch.ops.aten.expand.default):
@@ -3158,14 +3718,19 @@ class _Matcher:
             return
         position = _tile_index_position(node)
         if position is not None:
-            # A root tile's global indices: the CTA's base plus the
-            # coordinate (``hl.arange`` relabels the same way).
+            # A root / loop tile's global indices: the CTA's (iteration's)
+            # base plus the coordinate (``hl.arange`` relabels the same way).
             axis = self.shape_axes(node)[position]
             val = node.meta.get("val")
+            source = node.args[0]
             if (
                 axis is None
-                or axis.kind != AXIS_ROOT
-                or self.shape_axes(cast("Node", node.args[0])) != (axis,)
+                or axis.kind not in (AXIS_ROOT, AXIS_LOOP)
+                or (
+                    isinstance(source, torch.fx.Node)
+                    and isinstance(source.meta.get("val"), torch.Tensor)
+                    and self.shape_axes(source) != (axis,)
+                )
                 or not isinstance(val, torch.Tensor)
                 or val.dtype != torch.int32
             ):
@@ -3194,6 +3759,13 @@ class _Matcher:
         if _is_call(node, torch.ops.aten.scalar_tensor.default):
             if not isinstance(node.args[0], (int, float)):
                 raise _NotMine
+            return
+        if _is_call(node, torch.ops.aten.full.default):
+            # ``torch.zeros_like(v)`` / ``hl.full``: a constant at every
+            # coordinate.
+            if len(node.args) < 2 or type(node.args[1]) not in (int, float):
+                raise _NotMine
+            self.shape_axes(node)
             return
         if _is_call(node, _tracing_ops._new_var) or _is_call(
             node, _tracing_ops._mask_to
@@ -3240,6 +3812,7 @@ class _Matcher:
         swap = False
         pointwise = False
         current = node
+        self._vec_reads = []
         for _ in range(64):
             if _is_call(current, _tracing_ops._new_var) or _is_call(
                 current, _tracing_ops._mask_to
@@ -3250,10 +3823,12 @@ class _Matcher:
                 current = self.aliases[current]
                 continue
             if self.is_frag_leaf(current):
+                self._record_vec_reads(node)
                 return current, swap, aux, _chain_key(chain), pointwise
             if _is_call(current, memory_ops.load):
                 if len(self.tile_dims(current)) != 2:
                     raise _NotMine
+                self._record_vec_reads(node)
                 return current, swap, aux, _chain_key(chain), pointwise
             if _is_swap_permute(current):
                 swap = not swap
@@ -3266,7 +3841,10 @@ class _Matcher:
                 raise _NotMine
             pointwise = True
             inputs = _node_inputs(current)
-            sources = [inp for inp in inputs if self.has_source(inp, memo)]
+            # One source, however often the op reads it (``c * c``).
+            sources = list(
+                dict.fromkeys(inp for inp in inputs if self.has_source(inp, memo))
+            )
             if len(sources) != 1:
                 raise _NotMine
             for inp in inputs:
@@ -3284,6 +3862,13 @@ class _Matcher:
             )
             current = sources[0]
         raise _NotMine
+
+    def _record_vec_reads(self, node: Node) -> None:
+        """Attach the vector leaves ``aux_dag`` met under ``node`` (a traced
+        chain) to it; an earlier trace of the same value is kept."""
+        if self._vec_reads and node not in self.chain_vecs:
+            self.chain_vecs[node] = tuple(self._vec_reads)
+        self._vec_reads = []
 
     def slot_dims(self, leaf: Node) -> tuple[Axis, Axis]:
         """The (rows, cols) axes of the registers holding fragment ``leaf``
@@ -3369,6 +3954,7 @@ class _Matcher:
                 cols=cols,
                 trans=trans,
                 aux_loads=tuple(aux),
+                dims=self.shape_axes(value),
                 chain_key=(source, chain),
                 flip=flip,
                 transposed_tile=transposed_tile,
@@ -3428,6 +4014,7 @@ class _Matcher:
             cols=cols,
             trans=trans,
             aux_loads=tuple(aux),
+            dims=self.shape_axes(value),
             chain_key=(source, chain),
             flip=flip,
             rows_pos=rows_pos,
@@ -3556,7 +4143,7 @@ class _Matcher:
         def visit(current: Node, parity: bool) -> bool:
             for user in self.users_of(current):
                 if _is_dot(user):
-                    if _dot_acc(user) is current or current not in user.args[:2]:
+                    if _dot_acc(user) is current or current not in _dot_operands(user):
                         return False
                     parities.append(parity)
                 elif _is_swap_permute(user):
@@ -3739,7 +4326,7 @@ class _Matcher:
                 block_id = self.env.resolve_block_id(size)
                 if block_id is not None:
                     tiled_blocks.add(self.canonical(block_id))
-            for operand in node.args[:2]:
+            for operand in _dot_operands(node):
                 if isinstance(operand, torch.fx.Node):
                     operand_val = operand.meta.get("val")
                     if isinstance(operand_val, torch.Tensor):
@@ -3816,6 +4403,7 @@ class _Matcher:
             frag_regions=dict(self.region_of),
             vec_slots=tuple(self.vec_slot_list),
             vec_leaves=dict(self.vec_leaves),
+            chain_vecs=dict(self.chain_vecs),
             reduces=tuple(self.reduces),
             vec_ops=tuple(self.vec_ops),
             vec_stores=tuple(self.vec_stores),
@@ -3964,6 +4552,7 @@ class _Matcher:
         axes: list[Axis] = []
         begin: object = begins[0]
         end: object = ends[0]
+        tile_end: sympy.Expr | None = None
         for block_id, lo, hi in zip(block_ids, begins, ends, strict=True):
             if block_id in self.root_block_ids:
                 raise _NotMine
@@ -3989,13 +4578,24 @@ class _Matcher:
                     raise _NotMine
                 axis = self.axis_of_block(block_id, AXIS_LOOP, loop=index)
                 axes.append(axis)
-                if (
-                    lo != 0
-                    or _static_int(
-                        hi if not isinstance(hi, torch.fx.Node) else hi.meta.get("val")
-                    )
-                    != axis.extent
-                ):
+                if lo != 0:
+                    raise _NotMine
+                hi_val = hi if not isinstance(hi, torch.fx.Node) else hi.meta.get("val")
+                if block_id in self.loop_ends:
+                    # The bound varies with the CTA's root tile coordinates:
+                    # the loop walks it in block steps, its trip count per
+                    # CTA (``tile_end`` renders it in the kernel).
+                    if not isinstance(hi_val, torch.SymInt) or (
+                        self.env.specialize_expr(
+                            self.env.shape_env.replace(hi_val._sympy_())
+                        )
+                        != self.loop_ends[block_id][0]
+                    ):
+                        raise _NotMine
+                    if len(block_ids) != 1:
+                        raise _NotMine
+                    tile_end = self.loop_ends[block_id][1]
+                elif _static_int(hi_val) != axis.extent:
                     raise _NotMine
         if len(axes) > 1:
             # A multi-dim tile loop has no single bound; its iteration
@@ -4165,6 +4765,7 @@ class _Matcher:
             vec_carries=tuple(small),
             steps=steps,
             innermost=not any(isinstance(step, Loop) for step in steps),
+            tile_end=tile_end,
         )
         self.loops[index] = loop
         return loop
@@ -4238,8 +4839,10 @@ class _Matcher:
         dims = node.args[1]
         if not isinstance(dims, (list, tuple)) or len(dims) != 1:
             raise _NotMine
-        if len(node.args) == 3 and node.args[2]:
-            raise _NotMine
+        # ``keepdim`` leaves a size-1 dim behind the reduced one: the vector
+        # value has the same tile dims either way (``tile_dims`` drops size-1
+        # dims) and a pointwise consumer broadcasts it along the reduced axis
+        # just as a ``[:, None]`` view would.
         value = node.args[0]
         if not isinstance(value, torch.fx.Node):
             raise _NotMine
@@ -4433,14 +5036,7 @@ class _Matcher:
         from ...language import memory_ops
 
         if _is_call(init, creation_ops.full):
-            if len(init.args) not in (3, 4) or (
-                len(init.args) == 4 and init.args[3] is not None
-            ):
-                raise _NotMine
-            fill = init.args[1]
-            if type(fill) not in (int, float) or fill != 0:
-                raise _NotMine
-            if init.args[2] is not torch.float32:
+            if not _is_zero_full(init):
                 raise _NotMine
             return None, None, -1
         source = self.resolve(init)
@@ -4491,6 +5087,8 @@ class _Matcher:
             # evaluates it; no reader takes its registers as they are.
             if not all(_is_pointwise(user) for user in self.users_of(node)):
                 raise _NotMine
+        elif _is_addmm(node):
+            pass
         elif len(node.args) not in (3, 4) or (
             len(node.args) == 4 and node.args[3] not in (None, torch.float32)
         ):
@@ -4499,7 +5097,7 @@ class _Matcher:
         if len(result_dims) != 2:
             raise _NotMine
         rows, cols = result_dims
-        a_node, b_node = node.args[0], node.args[1]
+        a_node, b_node = _dot_operands(node)
         if not isinstance(a_node, torch.fx.Node) or not isinstance(
             b_node, torch.fx.Node
         ):
@@ -4677,7 +5275,14 @@ class _Matcher:
 
     def aux_of(self, node: Node) -> list[Access]:
         """The scalar / vector loads under ``node`` beside its sources (the
-        inputs with no source go through ``aux_dag``)."""
+        inputs with no source go through ``aux_dag``); the vector leaves
+        met on the way are recorded as ``node``'s chain vectors."""
+        self._vec_reads = []
+        result = self._aux_of(node)
+        self._record_vec_reads(node)
+        return result
+
+    def _aux_of(self, node: Node) -> list[Access]:
         from ...language import memory_ops
         from ...language import view_ops
 
@@ -4864,6 +5469,17 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
                 frame=derived.loop,
             )
         )
+    # The epilogue values' loop-invariant tiles: one copy in the root frame
+    # (counted whatever the loads route: a config legal under ``tma`` is
+    # legal under ``lane``).
+    fixed_loads: dict[Node, tuple[Derived, Access]] = {}
+    for derived in program.derived:
+        for access in derived.loads:
+            if program.fixed_derived_load(derived, access):
+                fixed_loads.setdefault(access.node, (derived, access))
+    for _derived, access in fixed_loads.values():
+        rows, cols = access.tile_dims
+        tiles.append(TileFacts(rows.index, cols.index, access.dtype.itemsize, False))
     snapshots = [
         store
         for store in program.stores
@@ -4879,6 +5495,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
     )
     from .cute_mma_dag_tcgen05 import tcgen05_facts
 
+    split = cluster_split_axis(program)
     return CuteMmaDagFacts(
         axes=tuple(
             AxisFacts(a.block_id, a.kind, a.extent, a.loop) for a in program.axes
@@ -4913,6 +5530,9 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             )
             for dot in program.dots
         ),
+        aux_candidates=mma_dag_aux_candidates(program),
+        tma_ring=mma_dag_tma_ring(program),
+        fixed_derived=mma_dag_fixed_derived(program),
         identity_candidates=any(
             ((dot.a.kind == "frag" and not dot.a.logical_swap) or dot.b.kind == "frag")
             and (
@@ -4924,7 +5544,25 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             )
             for dot in program.dots
         ),
-        loops=tuple(LoopFacts(loop.parent, loop.innermost) for loop in program.loops),
+        loops=tuple(
+            LoopFacts(
+                loop.parent,
+                loop.innermost,
+                axis=loop.axes[0].index if loop.tile_end is not None else -1,
+                end=loop.tile_end,
+                maskable=loop.tile_end is not None
+                and any(
+                    dot.loop == loop.index
+                    and dot.k is loop.axes[0]
+                    and any(
+                        operand.kind == "load" and operand.pointwise
+                        for operand in (dot.a, dot.b)
+                    )
+                    for dot in program.dots
+                ),
+            )
+            for loop in program.loops
+        ),
         staging_frames=tuple(store.loop for store in snapshots),
         vecs=tuple(
             VecFacts(
@@ -4934,6 +5572,8 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             )
             for index, slot in enumerate(program.vec_slots)
         ),
+        chain_vecs=bool(program.chain_vecs),
+        split_axis=split.index if split is not None else -1,
     )
 
 
@@ -5208,6 +5848,64 @@ def solve_mma_dag_layouts(
     return layouts, keyed
 
 
+def mma_dag_bound_masks(
+    program: MmaDagProgram, sizes: Sequence[int]
+) -> dict[Node, str]:
+    """The operand each dot over a varying-bound loop axis masks when the
+    bound leaves some CTA a partial last trip at block ``sizes``: a load
+    operand rewritten by a pointwise pass (A first), which zeroes the
+    elements at K positions past the bound.  ``BackendUnsupported`` when a
+    dot has no such operand (the config cannot run exactly)."""
+    masks: dict[Node, str] = {}
+    for loop in program.loops:
+        if loop.tile_end is None:
+            continue
+        (axis,) = loop.axes
+        _lo, _hi, aligned = loop_trip_range(
+            loop.tile_end, program.axes, sizes, axis.index
+        )
+        if aligned:
+            continue
+        for dot in program.dots:
+            if dot.k is not axis:
+                continue
+            for operand in (dot.a, dot.b):
+                if operand.kind == "load" and operand.pointwise:
+                    masks[dot.node] = operand.role
+                    break
+            else:
+                raise _decline(
+                    f"the bound of the loop over tile axis {axis.block_id} is not a"
+                    f" multiple of its block size {sizes[axis.index]} in every CTA"
+                    " and no operand pass of the dot can mask the partial trip"
+                )
+            # The other operand's tile is zeroed past the bound in shared
+            # memory, a 16-byte packet at a time (``emit_bound_tail_zero``):
+            # with K along the packets every CTA's bound must sit on a
+            # packet boundary.
+            constant, terms = loop_bound_terms(loop.tile_end, sizes)
+            steps = _bound_coordinate_steps(terms, program.axes, sizes)
+            for operand in (dot.a, dot.b):
+                load = operand.load
+                if (
+                    operand.role == masks[dot.node]
+                    or load is None
+                    or axis not in load.tile_dims
+                    or load.tile_dims.index(axis) == operand.rows_pos
+                ):
+                    continue
+                elems = 16 // load.dtype.itemsize
+                if constant % elems or any(
+                    step % elems and count > 1 for step, count in steps
+                ):
+                    raise _decline(
+                        f"the bound of the loop over tile axis {axis.block_id} is not a"
+                        f" multiple of the {elems} elements of a 16-byte packet of the"
+                        f" operand {operand.role!r} tile in every CTA"
+                    )
+    return masks
+
+
 def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | None:
     """The plan for ``config`` (None when the knob is off); raises
     ``BackendUnsupported`` when the knob is on but the kernel or the config
@@ -5238,7 +5936,14 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     exchange_mode = get(MMA_DAG_EXCHANGE_KEY, MMA_DAG_EXCHANGE_AUTO)
     pass_warps = get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_OFF)
     loads_mode = get(MMA_DAG_LOADS_KEY, MMA_DAG_LOADS_TMA)
+    cluster = get(MMA_DAG_CLUSTER_KEY, 1)
+    split_mode = get(MMA_DAG_SPLIT_KEY, MMA_DAG_SPLIT_CLUSTER)
+    aux_mode = get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER)
     facts = mma_dag_facts(program)
+    reason = apply_mma_dag_cluster(facts, sizes_by_block, cluster, split_mode)
+    if reason is not None:
+        raise _decline(reason)
+    assert type(cluster) is int and isinstance(split_mode, str)
     reason = mma_dag_config_reason(
         facts, sizes_by_block, warps, stages, cast("str", mode)
     )
@@ -5260,6 +5965,10 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         raise _decline(
             f"{MMA_DAG_LOADS_KEY} {loads_mode!r} must be one of {MMA_DAG_LOADS_CHOICES}"
         )
+    if aux_mode not in MMA_DAG_AUX_CHOICES:
+        raise _decline(
+            f"{MMA_DAG_AUX_KEY} {aux_mode!r} must be one of {MMA_DAG_AUX_CHOICES}"
+        )
     assert type(warps) is int and type(stages) is int
     if pass_warps == MMA_DAG_PASS_WARPS_ON:
         reason = mma_dag_pass_warps_reason(facts, warps, stages, cast("str", mode))
@@ -5273,6 +5982,10 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if persistent:
         if mode != MMA_DAG_TCGEN05:
             raise _decline(f"{MMA_DAG_PERSISTENT_KEY} needs the tcgen05 mode")
+        if cluster > 1:
+            raise _decline(
+                f"{MMA_DAG_PERSISTENT_KEY}: a persistent launch has no cluster split"
+            )
         if (
             get("pid_type", "flat") != "persistent_interleaved"
             or get("num_sm_multiplier", 1) != persistent
@@ -5288,6 +6001,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         for axis in program.axes
     )
     layouts, routes = solve_mma_dag_layouts(program, facts, sizes, warps)
+    bound_masks = mma_dag_bound_masks(program, sizes)
     if mma_dag_vec_violations(facts, sizes, layouts, warps):
         raise _decline("the warp layouts cannot carry a vector reduction")
     for dot in program.dots:
@@ -5314,7 +6028,13 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             # fragment coordinates.
             derived_routes[access.node] = (
                 DERIVED_SHARED
-                if program.ring_derived_load(derived, access)
+                if (
+                    program.ring_derived_load(derived, access)
+                    or (
+                        program.fixed_derived_load(derived, access)
+                        and loads_mode == MMA_DAG_LOADS_TMA
+                    )
+                )
                 and async_tile_reason(env, access, 1) is None
                 else DERIVED_GLOBAL
             )
@@ -5346,6 +6066,21 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             raise _decline(
                 f"{MMA_DAG_PERSISTENT_KEY}: the region programs launch one tile per CTA"
             )
+        for loop in program.loops:
+            if loop.tile_end is None:
+                continue
+            # The tcgen05 emitters walk a static trip count: every CTA must
+            # run the same, aligned number of trips (the bound equals the
+            # axis extent at every root tile).
+            (axis,) = loop.axes
+            lo, hi, aligned = loop_trip_range(
+                loop.tile_end, program.axes, sizes, axis.index
+            )
+            if not aligned:
+                raise _decline(
+                    "the tcgen05 mode runs a varying-bound loop only when every"
+                    " CTA's bound is a multiple of the K block (no partial trip)"
+                )
         return MmaDagPlan(
             program=program,
             sizes=sizes,
@@ -5357,6 +6092,9 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             compute=MMA_DAG_TCGEN05,
             tcgen05=tc,
             persistent=cast("int", persistent),
+            cluster=cluster,
+            split_axis=facts.split_axis if cluster > 1 else -1,
+            split_mode=split_mode if cluster > 1 else MMA_DAG_SPLIT_CLUSTER,
         )
     plan = MmaDagPlan(
         program=program,
@@ -5368,12 +6106,185 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         exchange_mode=cast("str", exchange_mode),
         layouts=layouts,
         derived_routes=derived_routes,
+        bound_masks=bound_masks,
+        loads=cast("str", loads_mode),
     )
+    if aux_mode == MMA_DAG_AUX_RING:
+        aux_rings, aux_bytes = mma_dag_aux_rings(plan)
+        if not aux_rings:
+            raise _decline(f"{MMA_DAG_AUX_KEY}: no loop has side loads to stage")
+        plan = dataclasses.replace(plan, aux_rings=aux_rings, aux_bytes=aux_bytes)
     if facts.smem_capacity and plan.smem_bytes > facts.smem_capacity:
         raise _decline(
             f"{plan.smem_bytes} B of shared memory exceed the capacity {facts.smem_capacity}"
         )
     return plan
+
+
+def tma_tile_source(load: Access, cols_pos: int) -> bool:
+    """Whether a 2-D tile of ``load`` (tile dim ``cols_pos`` contiguous) has
+    the strides a tensor map needs: contiguous columns and every other
+    stride a multiple of 16 bytes.  (The base alignment is a bind-time fact
+    the emitter checks per config, through ``async_tile_reason``.)"""
+    es = load.dtype.itemsize
+    return (
+        len(load.tile_dims) == 2
+        and load.tile_dim_strides[cols_pos] == 1
+        and all(stride == 1 or (stride * es) % 16 == 0 for stride in load.strides)
+    )
+
+
+def mma_dag_fixed_derived(program: MmaDagProgram) -> bool:
+    """Whether an epilogue value reads a loop-invariant 2-D tile with
+    contiguous columns (the alignment check is per config, the planner's)."""
+    return any(
+        program.fixed_derived_load(derived, access) and access.tile_dim_strides[1] == 1
+        for derived in program.derived
+        for access in derived.loads
+    )
+
+
+def mma_dag_tma_ring(program: MmaDagProgram) -> bool:
+    """Whether some innermost ring loop has a tile a tensor map can fetch
+    (the subject of ``MMA_DAG_LOADS_KEY`` in the warp mode): a contiguous
+    source with 16-byte strides.  The alignment, box and slot checks are per
+    config, the emitter's (a tile failing them keeps its packets)."""
+    for dot in program.dots:
+        for operand in (dot.a, dot.b):
+            load = operand.load
+            if load is None or not program.is_ring(dot, operand):
+                continue
+            if tma_tile_source(load, operand.cols_pos):
+                return True
+    return any(
+        program.ring_derived_load(derived, access) and tma_tile_source(access, 1)
+        for derived in program.derived
+        for access in derived.loads
+    )
+
+
+def mma_dag_aux_candidates(program: MmaDagProgram) -> bool:
+    """Whether some innermost ring loop has a pass operand with a per-thread
+    side load varying with the loop (the subject of ``MMA_DAG_AUX_KEY``)."""
+    return any(
+        program.level(access) == dot.loop
+        for dot in program.dots
+        if dot.loop >= 0 and program.loops[dot.loop].innermost
+        for operand in (dot.a, dot.b)
+        if operand.kind == "load"
+        and operand.pointwise
+        and program.is_ring(dot, operand)
+        for access in operand.aux_loads
+    )
+
+
+def aux_run_reason(env: CompileEnvironment, access: Access) -> str | None:
+    """Why the elements of vector ``access`` one packet reads cannot be
+    copied as 16-byte ``cp.async`` runs (None: they can): the vector must be
+    contiguous and every run start 16-byte aligned."""
+    from .memory_ops import cute_tensor_base_is_aligned
+
+    es = access.dtype.itemsize
+    if access.tile_dim_strides[0] != 1:
+        return "the vector is not contiguous"
+    if not cute_tensor_base_is_aligned(env, access.fake, 16):
+        return "the tensor base is not provably 16-byte aligned"
+    for stride in access.strides:
+        if stride != 1 and (stride * es) % 16:
+            return "a non-contiguous stride is not a multiple of 16 bytes"
+    return None
+
+
+def mma_dag_aux_ring(
+    env: CompileEnvironment,
+    program: MmaDagProgram,
+    loop: Loop,
+    sizes: Sequence[int],
+    threads: int,
+) -> AuxRing | None:
+    """The side-load slots of innermost ring loop ``loop`` per stage (None:
+    it has none): per pass operand (a load rewritten by a pointwise pass)
+    and per aux load varying with the loop, a scalar takes a word per
+    thread, a vector along the tile's rows a word per packet the thread
+    owns, one along the contiguous dim its block extent once per CTA (a word
+    per packet element when its runs cannot be 16-byte copies)."""
+    words = 0
+    vector_bytes = 0
+    runs: dict[Node, tuple[int, int, int]] = {}
+    for dot in program.dots:
+        if dot.loop != loop.index:
+            continue
+        for operand in (dot.a, dot.b):
+            load = operand.load
+            if load is None or operand.kind != "load" or not operand.pointwise:
+                continue
+            es = load.dtype.itemsize
+            run_elems = 16 // es
+            # The source tile's packets run along its contiguous dim.
+            along = (
+                operand.cols
+                if load.tile_dim_strides[operand.cols_pos] == 1
+                else operand.rows
+            )
+            cpr = sizes[along.index] * es // 16
+            packets = sizes[operand.rows.index] * sizes[operand.cols.index] * es // 16
+            per_thread = -(-packets // threads)
+            for access in operand.aux_loads:
+                if program.level(access) != loop.index:
+                    continue
+                if not access.tile_dims:
+                    words += 1
+                elif access.tile_dims[0] is not along:
+                    words += per_thread
+                elif (
+                    len(access.tile_dims) == 1
+                    and access.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and (run_elems * access.dtype.itemsize) % 16 == 0
+                    and aux_run_reason(env, access) is None
+                ):
+                    run_bytes = run_elems * access.dtype.itemsize
+                    if access.node not in runs:
+                        runs[access.node] = (run_elems, run_bytes, vector_bytes)
+                        vector_bytes += cpr * run_bytes
+                else:
+                    words += run_elems * per_thread
+    if not words and not vector_bytes:
+        return None
+    if words * 4 + -(-vector_bytes // threads) > MMA_DAG_AUX_MAX_BYTES:
+        raise _decline(
+            f"{MMA_DAG_AUX_KEY}: loop {loop.index}'s side loads take"
+            f" {words * 4 * threads + vector_bytes} B per stage, more than"
+            f" {MMA_DAG_AUX_MAX_BYTES} per thread"
+        )
+    return AuxRing(0, words, vector_bytes, runs, threads)
+
+
+def mma_dag_aux_rings(plan: MmaDagPlan) -> tuple[dict[int, AuxRing], int]:
+    """The side-load slot regions of the plan's innermost ring loops, placed
+    after the operand tiles (loop index -> ring), and their total bytes."""
+    env = CompileEnvironment.current()
+    program = plan.program
+    rings: dict[int, AuxRing] = {}
+    base = plan.smem_bytes
+    offset = base
+    for loop in program.loops:
+        if not loop.innermost:
+            continue
+        if not any(
+            program.is_ring(dot, operand)
+            for dot in program.dots
+            if dot.loop == loop.index
+            for operand in (dot.a, dot.b)
+            if operand.load is not None
+        ):
+            continue
+        ring = mma_dag_aux_ring(env, program, loop, plan.sizes, plan.threads)
+        if ring is None:
+            continue
+        offset = (offset + 127) // 128 * 128
+        rings[loop.index] = dataclasses.replace(ring, offset=offset)
+        offset += ring.stage_bytes * plan.stages
+    return rings, (offset - base if rings else 0)
 
 
 __all__ = [
@@ -5383,10 +6294,19 @@ __all__ = [
     "AXIS_ROOT",
     "DERIVED_GLOBAL",
     "DERIVED_SHARED",
+    "MMA_DAG_AUX_CHOICES",
+    "MMA_DAG_AUX_KEY",
+    "MMA_DAG_AUX_MAX_BYTES",
+    "MMA_DAG_AUX_REGISTER",
+    "MMA_DAG_AUX_RING",
+    "MMA_DAG_CLUSTER_CHOICES",
+    "MMA_DAG_CLUSTER_KEY",
+    "MMA_DAG_CLUSTER_MAX",
     "MMA_DAG_DEFAULT_STAGES",
     "MMA_DAG_DEFAULT_WARPS",
     "MMA_DAG_EXCHANGE_CHOICES",
     "MMA_DAG_EXCHANGE_KEY",
+    "MMA_DAG_FIXUP_MAX_TILES",
     "MMA_DAG_KEY",
     "MMA_DAG_KEYS",
     "MMA_DAG_LOADS_CHOICES",
@@ -5402,6 +6322,10 @@ __all__ = [
     "MMA_DAG_PASS_WARP_STAGES",
     "MMA_DAG_SEED_STAGES",
     "MMA_DAG_SMEM_CTA_RESERVED",
+    "MMA_DAG_SPLIT_CHOICES",
+    "MMA_DAG_SPLIT_CLUSTER",
+    "MMA_DAG_SPLIT_FIXUP",
+    "MMA_DAG_SPLIT_KEY",
     "MMA_DAG_STAGES_KEY",
     "MMA_DAG_STAGE_CHOICES",
     "MMA_DAG_STORE_CHOICES",
@@ -5435,9 +6359,12 @@ __all__ = [
     "Store",
     "Subscript",
     "accumulator_coordinates",
+    "apply_mma_dag_cluster",
     "async_route_reason",
     "async_tile_reason",
+    "cluster_split_axis",
     "emulate_ldmatrix",
+    "fixup_admitted",
     "frag_register_route",
     "ldmatrix_lane_address",
     "match_mma_dag",

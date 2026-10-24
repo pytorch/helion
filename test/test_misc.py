@@ -1704,10 +1704,20 @@ class TestMisc(RefEagerTestBase, TestCase):
             f"{TRITON_MAX_TENSOR_NUMEL}. "
             f"This will cause Triton JIT compilation to hang.",
         )
-        # The heuristic in BlockSizeSpec._fragment() should pick default=4
-        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
-        # (safe for 64KB shared memory with bf16).
-        self.assertEqual(block_sizes, [4, 4, 4])
+        promoted = config_spec.compiler_default_config
+        if promoted is None:
+            # The heuristic in BlockSizeSpec._fragment() should pick default=4
+            # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+            # (safe for 64KB shared memory with bf16).
+            self.assertEqual(block_sizes, [4, 4, 4])
+        else:
+            # A kernel that only streams a full head_dim slab per element is
+            # pointwise; on the arches where the Triton pointwise seed is
+            # promoted (sm90/sm100) that seed is the default. Its byte budget
+            # over the 128-wide bf16 slab gives one row per CTA on the batch
+            # and head axes and 16 rows along the sequence (both arches).
+            self.assertIn("triton_pointwise", config_spec.autotuner_heuristics)
+            self.assertEqual(block_sizes, [1, 1, 16])
 
         # Also verify it actually runs successfully
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))

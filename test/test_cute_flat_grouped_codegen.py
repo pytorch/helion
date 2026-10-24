@@ -168,6 +168,52 @@ def test_original_static_schedule_preserves_physical_budget_and_arrivals(
                 construct()
 
 
+@pytest.mark.parametrize("pdl", [False, True])
+def test_native_schedule_honors_cute_pdl(pdl: bool) -> None:
+    with cuda_binding(static=True, original=True) as bound:
+        bound.config_spec.target_device_capability = (10, 0)
+        config = helion.Config.from_dict(_config().config | {"cute_pdl": pdl})
+
+        def generate(host, config, repro):
+            return generate_flat_grouped_native_candidate(
+                host,
+                config,
+                repro,
+                converter_warps=4,
+                block_k=32,
+                ab_stages=6,
+                shared_capacity=232448,
+            )
+
+        with (
+            bound.env.suspend(),
+            patch("helion.runtime.kernel.generate_ast", side_effect=generate),
+        ):
+            source = bound.to_code(config)
+    device = next(
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and "def _helion_native_grouped_rna(" in node.args[0].value
+    )
+    kernel = next(
+        node
+        for node in ast.parse(device).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_helion_native_grouped_rna"
+    )
+    # The wait precedes the shared allocations, the descriptor prefetch and
+    # the first offset load of every role; the launcher adds ``use_pdl``.
+    assert (ast.unparse(kernel.body[0]) == "cute.arch.griddepcontrol_wait()") is pdl
+    assert device.count("griddepcontrol") == (1 if pdl else 0)
+    assert ("_helion_native_grouped_rna._helion_cute_use_pdl = True" in device) is pdl
+
+
 @pytest.mark.parametrize(
     "case",
     [

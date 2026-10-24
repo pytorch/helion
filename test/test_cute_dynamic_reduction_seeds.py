@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
+from unittest.mock import patch
 
 from examples.softmax import softmax_two_pass
 import pytest
@@ -251,6 +252,25 @@ def test_dynamic_persistent_seed_keeps_scalar_memory(dtype: torch.dtype) -> None
             )
             == 16 // dtype.itemsize
         )
+        assert (
+            CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
+                bound.env, bound.host_function.device_ir
+            )
+            is None
+        )
+        block = bound.env.block_sizes[reduction_id]
+        assert not block.numel.is_Integer
+        # A guard-proven extent admits both row seed forms.
+        with patch.object(
+            bound.env,
+            "specialized_vars",
+            bound.env.specialized_vars | block.numel.free_symbols,
+        ):
+            for make_seed in (
+                CuteReductionTileHeuristic.multiwarp_vector_row_seed_config,
+                CuteReductionTileHeuristic.two_packet_rolled_row_seed_config,
+            ):
+                assert make_seed(bound.env, bound.host_function.device_ir) is not None
 
 
 @pytest.mark.parametrize("source", [None, _host_tensor, language_load])

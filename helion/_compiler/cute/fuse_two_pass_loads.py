@@ -588,17 +588,30 @@ def _is_store_call(node: ast.Call) -> bool:
     """Whether this is a generated memory write."""
     func = node.func
     is_store = (
-        isinstance(func, ast.Attribute) and func.attr in ("store", "__setitem__")
+        isinstance(func, ast.Attribute)
+        and (
+            func.attr in ("store", "__setitem__")
+            # ``cute.copy(atom, src, dst)``: a bulk write to its destination.
+            or (
+                func.attr == "copy"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "cute"
+            )
+        )
     ) or (
         isinstance(func, ast.Name)
         and (
-            func.id.startswith("_cute_store_")
+            func.id.startswith(("_cute_store_", "_cute_rank1_store_"))
             or func.id == _PERSISTENT_BRANCH_VEC_STORE
         )
     )
     is_atomic = (
         isinstance(func, ast.Attribute) and func.attr.startswith("atomic_")
-    ) or (isinstance(func, ast.Name) and func.id.startswith("_cute_atomic_"))
+    ) or (
+        isinstance(func, ast.Name)
+        # ``_cute_red_add_f32_vec(ptr, vals)``: a vector reduction into memory.
+        and func.id.startswith(("_cute_atomic_", "_cute_red_"))
+    )
     return is_store or is_atomic
 
 
@@ -648,10 +661,17 @@ def _store_tensor_roots(
     ):
         pointer = node.args[3]
     elif isinstance(func, ast.Name) and func.id.startswith(
-        ("_cute_store_", "_cute_atomic_")
+        ("_cute_store_", "_cute_atomic_", "_cute_red_")
     ):
         pointer = node.args[0] if node.args else None
+    elif isinstance(func, ast.Name) and func.id.startswith("_cute_rank1_store_"):
+        # Destination not resolved here: every tensor counts as written.
+        return None
     elif isinstance(func, ast.Attribute):
+        if func.attr == "copy":
+            # ``cute.copy(atom, src, dst)``: the destination is the last
+            # operand, a tensor view whose argument root is not tracked here.
+            return None
         if func.attr.startswith("atomic_"):
             pointer = node.args[0] if node.args else None
         elif func.attr == "store":

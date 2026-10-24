@@ -1413,10 +1413,16 @@ class DeviceIRAnalysis:
             if not graph.is_reduction_loop
             for node in graph.dot_nodes
         )
+        # A rolled reduction's lane-loop graph (``ReductionLoopGraphInfo``)
+        # is the compiler's: its node args are the body's live-ins (a
+        # broadcast factor read by every lane), never a loop-carried
+        # accumulator, so they must not pull a pure pointwise kernel out of
+        # the pointwise family.
         accumulator_inputs = tuple(
             node
             for graph_info in device_ir.graphs
             if isinstance(graph_info, ForLoopGraphInfo)
+            and not isinstance(graph_info, ReductionLoopGraphInfo)
             for node in graph_info.node_args
         )
         roots = tuple(

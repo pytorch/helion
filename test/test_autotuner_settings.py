@@ -1685,6 +1685,20 @@ class TestAutotuneBudget(TestCase):
 
         self.assertFalse(provider._subprocess_benchmark_enabled())
 
+    def test_mutated_args_keep_subprocess_benchmark(self) -> None:
+        # A kernel writing into an ``out`` argument (most examples) must still
+        # compile and run in the killable worker: a stalled or crashing JIT of
+        # one config otherwise takes down the whole autotune.
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+        provider.mutated_arg_indices = [3]
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_accuracy_check_enabled())
+
     def test_missing_device_env_does_not_break_subprocess_check(self) -> None:
         # Stub kernels mock env without a device; the MTIA carve-out must
         # tolerate that instead of raising AttributeError.

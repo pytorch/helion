@@ -948,6 +948,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             rep: int,
             args_slot: int | None = None,
             timeout: float | None = None,
+            l2_flush_mode: str | None = None,
         ) -> float:
             runs.append(fn)
             if len(runs) == 2:
@@ -974,6 +975,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             rep: int,
             args_slot: int | None = None,
             timeout: float | None = None,
+            l2_flush_mode: str | None = None,
         ) -> float:
             runs.append(fn)
             provider._benchmark_worker = worker
@@ -1004,6 +1006,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             rep: int,
             args_slot: int | None = None,
             timeout: float | None = None,
+            l2_flush_mode: str | None = None,
         ) -> None:
             nonlocal isolated_calls
             isolated_calls += 1

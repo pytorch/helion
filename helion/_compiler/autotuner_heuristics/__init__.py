@@ -162,11 +162,13 @@ from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
+from .cute_simt_mma import CuteSimtMmaHeuristic
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
 from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
+from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
 from .cute_warp_atomic import CuteWarpAtomicHeuristic
@@ -213,6 +215,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFixedTokenRank1Heuristic,
         CuteSplitKWorkspaceHeuristic,
         CuteCollectiveMatmulHeuristic,
+        CuteSimtMmaHeuristic,
         CuteGroupedRnaHeuristic,
         CuteBlockScaledMmaHeuristic,
         CuteMaterializedMmaHeuristic,
@@ -238,6 +241,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteTilePackWarpPerRowHeuristic,
         CuteColumnReductionHeuristic,
         CuteSiblingRowHeuristic,
         CuteNestedRowHeuristic,
