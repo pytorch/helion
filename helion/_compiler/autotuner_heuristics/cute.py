@@ -28,6 +28,7 @@ from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
+from ...language._tracing_ops import _host_tensor
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import load as language_load
 from ...language.scan_ops import _associative_scan
@@ -35,6 +36,7 @@ from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
 from ..compile_environment import FixedBlockSizeSource
 from ..compile_environment import _symint_sympy_expr
+from ..compile_environment import _to_sympy
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -708,11 +710,17 @@ class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
         return Config.from_dict(values)
 
 
+def _cute_static_block_extent(env: CompileEnvironment, block_id: int) -> int | None:
+    size = env.block_sizes[block_id].size
+    if not isinstance(size, (int, torch.SymInt)):
+        return None
+    extent = env.specialize_expr(env.shape_env.replace(_to_sympy(size)))
+    return int(extent) if extent.is_Integer else None
+
+
 def _cute_seed_vec_width(
     env: CompileEnvironment,
     rl_spec: ReductionLoopSpec,
-    max_threads: int,
-    size_hint: int,
     device_ir: DeviceIR,
 ) -> int:
     """Pick a default vector width for the cute_vector_widths seed.
@@ -731,29 +739,15 @@ def _cute_seed_vec_width(
     spec = env.config_spec
     if not spec.cute_vector_widths.valid_block_ids():
         return 1
-    if size_hint < max_threads:
+    if rl_spec.size_hint < (spec.max_reduction_threads or 1024):
         # Reduction extent barely fits in one wide chunk; vec wouldn't
         # remove enough loop iters to matter.
         return 1
     return _cute_tile_seed_vec_width_for_dtype(
-        _cute_seed_reduction_dtype(rl_spec, device_ir)
+        _cute_tile_inner_block_dtype(
+            env, device_ir, rl_spec.block_id, allow_symbolic=True
+        )
     )
-
-
-def _cute_seed_reduction_dtype(
-    rl_spec: ReductionLoopSpec, device_ir: DeviceIR
-) -> torch.dtype | None:
-    """Find the dtype of the reduction-source tensor by walking nodes that
-    have a fake-tensor value matching the reduction extent."""
-    rdim_size = rl_spec.size_hint
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            val = node.meta.get("val")
-            if isinstance(val, torch.Tensor) and val.ndim >= 1:
-                last = val.shape[-1]
-                if isinstance(last, int) and last == rdim_size:
-                    return val.dtype
-    return None
 
 
 def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
@@ -837,7 +831,12 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": reduction_loops,
         }
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = 1
+        if (
+            reduction_loops[0] is not None
+            or _cute_static_block_extent(env, rl_spec.block_id) is not None
+        ):
+            vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if vec > 1:
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
@@ -868,10 +867,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         block_id = rl_spec.block_id
-        numel = env.block_sizes[block_id].numel
-        if not numel.is_Integer:
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None:
             return None
-        extent = int(numel)
         if (
             extent > max_threads
             or extent & (extent - 1)
@@ -879,9 +877,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             or block_id not in spec.cute_vector_widths.valid_block_ids()
         ):
             return None
-        dtype = _cute_seed_reduction_dtype(rl_spec, device_ir)
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1 or dtype is None:
+        if vec <= 1:
             return None
         vec = vec * packet_bytes // 16
         choices = (
@@ -925,10 +923,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         block_id = rl_spec.block_id
-        numel = env.block_sizes[block_id].numel
-        if not numel.is_Integer:
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None:
             return None
-        extent = int(numel)
         chunk = min(extent, max_threads)
         if spec.max_reduction_loop is not None:
             chunk = min(chunk, spec.max_reduction_loop)
@@ -939,9 +936,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             or block_id not in spec.cute_vector_widths.valid_block_ids()
         ):
             return None
-        dtype = _cute_seed_reduction_dtype(rl_spec, device_ir)
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1 or dtype is None:
+        if vec <= 1:
             return None
         choices = (
             spec.cute_vector_widths.block_id_lookup(block_id)._fragment(spec).choices
@@ -1049,13 +1046,13 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
         (tile_block_id,) = tile_block_ids
         if rl_spec.block_id not in spec.num_threads.valid_block_ids():
             return None
+        numel = env.block_sizes[tile_block_id].numel
+        if not isinstance(numel, (int, sympy.Integer)):
+            return None
         vec = _cute_tile_seed_vec_width_for_dtype(
             _cute_tile_inner_block_dtype(env, device_ir, tile_block_id)
         )
         if vec <= 1:
-            return None
-        numel = env.block_sizes[tile_block_id].numel
-        if not isinstance(numel, (int, sympy.Integer)):
             return None
         tile_block = min(int(numel), cls.VECTOR_THREADS * vec)
         if tile_block % vec or (int(numel) % tile_block):
@@ -1148,42 +1145,99 @@ def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
 
 
 def _cute_tile_inner_block_dtype(
-    env: CompileEnvironment, device_ir: DeviceIR, block_id: int
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    block_id: int,
+    *,
+    allow_symbolic: bool = False,
 ) -> torch.dtype | None:
-    """Walk the device graphs to find the dtype of any tensor whose
-    LAST dim corresponds to ``block_id``'s tile.  Used to seed the per-
-    block vec width when the kernel has no rolled reduction (e.g.
-    softmax_two_pass — its two ``hl.tile`` loops over the reduction
-    axis don't go through the ``ReductionLoopSpec`` path)."""
+    """Find ordinary vector-load payloads on the block's innermost axis.
+
+    Prefer floating memory payloads over masks and indices, then indexed loads
+    over raw host buffer sizes to identify the axis precisely. Derived values
+    remain a fallback for jagged axes. Within a source category choose a width
+    fitting every dtype. Conversions alone cannot establish a memory dtype.
+    Rolled reductions opt into unresolved extents; other callers stay static.
+    """
     bs = env.block_sizes[block_id]
-    if env.is_jagged_tile(block_id):
-        # Jagged lengths have no static numel. Their tile symbol still
-        # identifies data values in the traced body; ignore index/mask tensors.
-        for graph_info in device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                val = node.meta.get("val")
-                if (
-                    isinstance(val, torch.Tensor)
-                    and val.ndim >= 1
-                    and val.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                    and isinstance(val.shape[-1], torch.SymInt)
-                    and val.shape[-1]._sympy_() == bs.var._sympy_()
-                ):
-                    return val.dtype
+    jagged = env.is_jagged_tile(block_id)
+    tile_extent = _to_sympy(bs.var)
+    extent = env.specialize_expr(
+        env.shape_env.replace(tile_extent if jagged else bs.numel)
+    )
+    if not jagged and not allow_symbolic and not extent.is_Integer:
         return None
-    block_numel = bs.numel
-    try:
-        block_numel_int = int(block_numel)
-    except (TypeError, ValueError):
-        return None
+    best_dtype = None
+    best_priority = (False, False, False, -1, 0)
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
+            if node.target is language_load:
+                source_priority = 2
+            elif node.target is _host_tensor:
+                source_priority = 1
+            elif jagged:
+                source_priority = 0
+            else:
+                continue
             val = node.meta.get("val")
-            if isinstance(val, torch.Tensor) and val.ndim >= 1:
-                last = val.shape[-1]
-                if isinstance(last, int) and last == block_numel_int:
-                    return val.dtype
-    return None
+            if not isinstance(val, torch.Tensor) or val.ndim < 1:
+                continue
+            width = _cute_tile_seed_vec_width_for_dtype(val.dtype)
+            if source_priority == 0 and width <= 1:
+                continue
+            last = _to_sympy(val.shape[-1])
+            same_axis = last == tile_extent
+            # Memory > derived values; exact axis > coincidental buffer size;
+            # floating payload > mask/index; indexed load > raw buffer;
+            # FP32's V4 also fits FP16/BF16.
+            priority = (
+                source_priority > 0,
+                same_axis,
+                width > 1,
+                source_priority,
+                -width,
+            )
+            if priority <= best_priority:
+                continue
+            if (
+                not same_axis
+                and env.specialize_expr(env.shape_env.replace(last)) != extent
+            ):
+                continue
+            best_dtype, best_priority = val.dtype, priority
+    return best_dtype
+
+
+def _cute_tile_vector_axis(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    require_lane_layout: bool = False,
+) -> tuple[int, int, int, int | None] | None:
+    """Row/inner axes, vector width and static extent (absent for jagged)."""
+    spec = env.config_spec
+    if (
+        spec.matmul_facts
+        or len(spec.block_sizes) != 2
+        or spec.reduction_loops
+        or (spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1)
+    ):
+        return None
+    blocks = _cute_tile_row_blocks(env)
+    if blocks is None:
+        return None
+    outer_block_id, block_id = blocks
+    if block_id not in spec.cute_vector_widths.valid_block_ids() or (
+        require_lane_layout and block_id not in spec.cute_lane_layouts.valid_block_ids()
+    ):
+        return None
+    extent = _cute_static_block_extent(env, block_id)
+    if extent is None and not env.is_jagged_tile(block_id):
+        return None
+    vec = _cute_tile_seed_vec_width_for_dtype(
+        _cute_tile_inner_block_dtype(env, device_ir, block_id)
+    )
+    return (outer_block_id, block_id, vec, extent) if vec > 1 else None
 
 
 def _cute_persistent_contiguous_block(
@@ -1765,46 +1819,17 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        spec = env.config_spec
-        if spec.matmul_facts:
-            return False
-        # Two-tile pattern: outer row + inner reduction (no rolled
-        # reductions registered — those use the
-        # CuteReductionTileHeuristic seed instead).
-        if (
-            len(spec.block_sizes) != 2
-            or spec.reduction_loops
-            or (
-                spec.kernel_grid_fact is not None
-                and len(spec.kernel_grid_fact.roots) > 1
-            )
-        ):
-            return False
-        # The inner tile block must have a vec slot registered
-        # (added by ``register_rollable_reductions`` for cute tile blocks).
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return False
-        inner_block_id = blocks[1]
-        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
-            return False
-        # Need a recognisable dtype to seed V.
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        return _cute_tile_seed_vec_width_for_dtype(dtype) > 1
+        return _cute_tile_vector_axis(env, device_ir) is not None
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return None
+        outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return None
-        outer_block_id, inner_block_id = blocks
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return None
         # Pick a reasonable inner block_size: prefer 1024 (matches
         # SM100 warp + L2 hit cadence) when reachable, else cap at the
         # inner tile's fragment.high.  ``num_threads`` is sized so the
@@ -2076,28 +2101,11 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return False
+        _, inner_block_id, vec, _extent = axis
         spec = env.config_spec
-        if spec.matmul_facts:
-            return False
-        if (
-            len(spec.block_sizes) != 2
-            or spec.reduction_loops
-            or (
-                spec.kernel_grid_fact is not None
-                and len(spec.kernel_grid_fact.roots) > 1
-            )
-        ):
-            return False
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return False
-        inner_block_id = blocks[1]
-        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
-            return False
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return False
         # Only worth it when the reduction extent is wide enough that
         # the warp-only reduction's many outer iters still amortise
         # against the launch cost (and an autotuner-picked warp lattice
@@ -2110,15 +2118,11 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return None
+        outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return None
-        outer_block_id, inner_block_id = blocks
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return None
         # Each thread owns V contiguous elements; one warp = 32 threads
         # = 32 * V elements per outer-tile iter. Cap by the fragment's
         # high bound so the seed is reachable for short reduction axes.
@@ -3279,34 +3283,13 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
     ) -> tuple[int, int, int, int] | None:
         """Return ``(row_extent, num_threads, vec, cluster_n)`` or None."""
         spec = env.config_spec
-        if spec.matmul_facts:
+        axis = _cute_tile_vector_axis(env, device_ir, require_lane_layout=True)
+        if axis is None:
             return None
-        if (
-            len(spec.block_sizes) != 2
-            or spec.reduction_loops
-            or (
-                spec.kernel_grid_fact is not None
-                and len(spec.kernel_grid_fact.roots) > 1
-            )
-        ):
+        _, inner_block_id, vec, n = axis
+        if n is None:
             return None
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return None
-        inner_block_id = blocks[1]
         inner = spec.block_sizes.block_id_lookup(inner_block_id)
-        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
-            return None
-        if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
-            return None
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return None
-        try:
-            n = int(env.block_sizes[inner_block_id].numel)
-        except (TypeError, ValueError):
-            return None
         # The whole-row block must be a reachable block size (power of 2)
         # and fit the per-thread register budget at some thread count.
         if n & (n - 1) or n <= 0:
@@ -3484,34 +3467,13 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> tuple[int, int] | None:
         spec = env.config_spec
-        if spec.matmul_facts:
+        axis = _cute_tile_vector_axis(env, device_ir, require_lane_layout=True)
+        if axis is None:
             return None
-        if (
-            len(spec.block_sizes) != 2
-            or spec.reduction_loops
-            or (
-                spec.kernel_grid_fact is not None
-                and len(spec.kernel_grid_fact.roots) > 1
-            )
-        ):
+        _, inner_block_id, vec, n = axis
+        if n is None:
             return None
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return None
-        inner_block_id = blocks[1]
         inner = spec.block_sizes.block_id_lookup(inner_block_id)
-        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
-            return None
-        if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
-            return None
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return None
-        try:
-            n = int(env.block_sizes[inner_block_id].numel)
-        except (TypeError, ValueError):
-            return None
         if n & (n - 1) or n <= 0 or n > cls._MAX_ROW_EXTENT:
             return None
         if n % (cls._THREADS_PER_ROW * vec) != 0:
@@ -3596,28 +3558,11 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return False
+        outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
-        if spec.matmul_facts:
-            return False
-        if (
-            len(spec.block_sizes) != 2
-            or spec.reduction_loops
-            or (
-                spec.kernel_grid_fact is not None
-                and len(spec.kernel_grid_fact.roots) > 1
-            )
-        ):
-            return False
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return False
-        outer_block_id, inner_block_id = blocks
-        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
-            return False
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return False
         bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         if bn_high < vec * 32:
             return False
@@ -3630,15 +3575,11 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return None
+        outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
-        blocks = _cute_tile_row_blocks(env)
-        if blocks is None:
-            return None
-        outer_block_id, inner_block_id = blocks
-        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
-        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
-        if vec <= 1:
-            return None
         bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = vec * 32
         if bn_high < block_n:
@@ -3957,7 +3898,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
             "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": [chunk],
         }
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if vec > 1:
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
@@ -3991,9 +3932,8 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
-        max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
-        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         if size_hint <= 2048:
             threads_per_row = 32
         elif size_hint <= 8192:
@@ -4068,9 +4008,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         size_hint = rl_spec.size_hint
-        vec = _cute_seed_vec_width(
-            env, rl_spec, spec.max_reduction_threads or 1024, size_hint, device_ir
-        )
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
         # Power of two only: the cute_cluster_n EnumFragment enumerates
         # {1,2,4,8,16}, and an off-surface value would one-hot encode as
         # all zeros in the search surrogate.
@@ -4158,7 +4096,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
         if extent < 16384:
             return []
         vec = _cute_tile_seed_vec_width_for_dtype(
-            _cute_seed_reduction_dtype(reduction, device_ir)
+            _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
         )
         if vec <= 1 or extent % vec:
             return []
