@@ -599,6 +599,14 @@ class ReductionRoller:
             return False
 
         def unrollable(reduction: torch.fx.Node) -> bool:
+            # Custom helpers preserve their input dtypes. Sequential low-precision
+            # carries can stagnate, and widening arbitrary helpers changes semantics.
+            if reduction.target is _reduce and any(
+                source.meta["val"].dtype.is_floating_point
+                and source.meta["val"].dtype.itemsize < 4
+                for source in custom_reduction_sources(reduction)
+            ):
+                return True
             free_iota = False
             seen: set[torch.fx.Node] = set()
             stack = list(reduction.all_input_nodes)

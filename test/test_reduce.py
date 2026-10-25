@@ -1257,16 +1257,19 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("checks declared dtypes on custom reduction carries")
     def test_low_precision_computed_payload(self) -> None:
-        def reduce_computed(x: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
+        def reduce_computed(
+            x: torch.Tensor, divisor: torch.Tensor, payload_dtype: hl.constexpr
+        ) -> torch.Tensor:
             out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
             for row in hl.tile(x.size(0)):
+                values = x[row, :] / divisor[row, :]
                 out[row] = hl.reduce(
-                    add_division_combine_fn, x[row, :] / divisor[row, :], dim=1
+                    add_division_combine_fn, values.to(payload_dtype), dim=1
                 )
             return out
 
         for dtype in (torch.float16, torch.bfloat16):
-            x = torch.ones((3, 513), device=DEVICE, dtype=dtype)
+            x = torch.ones((3, 32768), device=DEVICE, dtype=dtype)
             divisor = torch.full_like(x, 2)
             expected = (x.float().sum(1) / 2).to(dtype)
             for static_shapes in (True, False):
@@ -1276,17 +1279,51 @@ class TestRolledCustomReduce(RefEagerTestBase, TestCase):
                     static_shapes=static_shapes,
                     autotune_effort="none",
                 )
-                for chunk in (None, 256):
+                for widen in (False, True):
                     with self.subTest(
-                        dtype=dtype, static_shapes=static_shapes, chunk=chunk
+                        dtype=dtype, static_shapes=static_shapes, widen=widen
                     ):
+                        args = (x, divisor, torch.float32 if widen else dtype)
+                        bound = kernel.bind(args)
+                        if not widen:
+                            self.assertFalse(bound.config_spec.reduction_loops)
+                            with self.assertRaises(exc.InvalidConfig):
+                                bound.compile_config(
+                                    helion.Config(block_sizes=[1], reduction_loops=[8])
+                                )
                         _, result = code_and_output(
                             kernel,
-                            (x, divisor),
-                            block_sizes=[2],
-                            reduction_loops=[chunk],
+                            args,
+                            block_sizes=[1],
+                            reduction_loops=[8] if widen else [],
                         )
-                        torch.testing.assert_close(result, expected)
+                        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    @skipIfRefEager("checks shared low-precision custom reduction axes")
+    def test_low_precision_tuple_keeps_shared_native_axis_persistent(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+        def mixed(x: torch.Tensor):
+            native = torch.empty(x.size(0), device=x.device, dtype=torch.float32)
+            count = torch.empty(x.size(0), device=x.device, dtype=torch.int32)
+            custom = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                native[row] = values.float().sum(1)
+                count[row], custom[row] = hl.reduce(
+                    tuple_add_combine_fn,
+                    (torch.ones_like(values, dtype=torch.int32), values),
+                    dim=1,
+                )
+            return native, count, custom
+
+        x = torch.ones((3, 32768), device=DEVICE, dtype=torch.bfloat16)
+        bound = mixed.bind((x,))
+        self.assertFalse(bound.config_spec.reduction_loops)
+        result = bound.compile_config(bound.config_spec.default_config())(x)
+        for actual in result:
+            torch.testing.assert_close(
+                actual, torch.full_like(actual, 32768), rtol=0, atol=0
+            )
 
     @skipIfRefEager("checks rolled singleton-tuple padding")
     def test_singleton_tuple_padding(self) -> None:

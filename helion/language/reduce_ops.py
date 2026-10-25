@@ -83,6 +83,9 @@ def reduce(
         - Masked elements use the 'other' value during reduction
         - Use the combine function's identity for 'other' when padding should
           not contribute to the result; non-identity padding is preserved
+        - Triton keeps custom reductions with floating-point inputs narrower
+          than FP32 persistent to avoid low-precision loop accumulation. Cast
+          these inputs to FP32 explicitly to allow rolled reduction schedules.
     """
     raise exc.NotInsideKernel
 
