@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from helion import Config
 from helion._compiler.autotuner_heuristics.cute import CuteReductionWideChunkHeuristic
@@ -12,6 +13,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteRolledClusterLadderHe
 from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.flydsl.backend import FlyDSLBackend
+from helion._testing import DEVICE
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import CuteLaneLayoutSpec
@@ -64,9 +66,10 @@ def test_reduction_chunks_survive_seed_transfer(
         spec.cute_lane_layouts.append(CuteLaneLayoutSpec(block_id=block_id))
     env = MagicMock(config_spec=spec)
     graph = torch.fx.Graph()
-    graph.placeholder("x").meta["val"] = torch.empty(
-        (rows, columns), dtype=dtype, device="meta"
-    )
+    with FakeTensorMode():
+        graph.placeholder("x").meta["val"] = torch.empty(
+            (rows, columns), dtype=dtype, device=DEVICE
+        )
     device_ir = MagicMock(graphs=[SimpleNamespace(graph=graph)])
 
     assert heuristic.is_eligible(env, device_ir)
