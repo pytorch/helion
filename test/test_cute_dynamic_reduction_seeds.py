@@ -24,6 +24,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteTileVecHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpPerRowHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTileVecWarpReduceHeuristic
 from helion._compiler.autotuner_heuristics.cute import _cute_tile_inner_block_dtype
+from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
@@ -160,7 +161,7 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
     kernel = helion.kernel(
         _softmax, backend="cute", static_shapes=False, autotune_effort="none"
     )
-    first = torch.randn(5, hint, device="cuda", dtype=dtype)
+    first = torch.randn(5, hint, device=DEVICE, dtype=dtype)
     bound = kernel.bind((first,))
     assert bound.host_function is not None
     seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
@@ -177,11 +178,11 @@ def test_dynamic_seed_handles_changed_extent_and_alignment(
     aligned = seeded.bind((first,))
     for width in (hint, hint + 4):
         if layout == "padded":
-            x = torch.randn(5, width + 3, device="cuda", dtype=dtype)[:, :width]
+            x = torch.randn(5, width + 3, device=DEVICE, dtype=dtype)[:, :width]
         elif layout == "offset":
-            x = torch.randn(5, width + 1, device="cuda", dtype=dtype)[:, 1:]
+            x = torch.randn(5, width + 1, device=DEVICE, dtype=dtype)[:, 1:]
         else:
-            x = torch.randn(5, width, device="cuda", dtype=dtype)
+            x = torch.randn(5, width, device=DEVICE, dtype=dtype)
         actual = seeded(x)
         expected = torch.softmax(x.float(), dim=-1).to(dtype)
         torch.testing.assert_close(actual, expected)
