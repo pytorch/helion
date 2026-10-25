@@ -1809,6 +1809,49 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_watchdog_keeps_connection_open_until_poll_returns(self) -> None:
+        worker = BenchmarkWorker()
+        connection, child_connection = mp.Pipe()
+        process = Mock(pid=123)
+        process.is_alive.side_effect = (True, False)
+        worker._process = process
+        worker._parent_connection = connection
+        watchdog_finished = threading.Event()
+        original_kill = worker._kill_if_current
+        original_poll = connection.poll
+
+        def kill_then_notify(*args: Any, **kwargs: Any) -> None:
+            try:
+                original_kill(*args, **kwargs)
+            finally:
+                watchdog_finished.set()
+
+        def poll_after_watchdog(timeout: float | None = None) -> bool:
+            # Force the watchdog to finish before the waiting thread handles
+            # EOF. Closing this descriptor from the watchdog can lose the
+            # poll wakeup on macOS and hang the caller indefinitely.
+            self.assertTrue(watchdog_finished.wait(timeout=5))
+            self.assertFalse(connection.closed)
+            return original_poll(1.0)
+
+        try:
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker.signal_process_tree",
+                    side_effect=lambda *_args: child_connection.close(),
+                ),
+                patch.object(worker, "_kill_if_current", kill_then_notify),
+                patch.object(connection, "poll", poll_after_watchdog),
+                self.assertRaises(BenchmarkTimeout),
+            ):
+                worker.run(_ReturnValue(7), timeout=0.1)
+            self.assertTrue(connection.closed)
+            self.assertFalse(worker.alive())
+        finally:
+            connection.close()
+            child_connection.close()
+            worker.shutdown()
+
     def test_sticky_error_kills_worker(self) -> None:
         # Errors matching _UNRECOVERABLE_RUNTIME_ERROR_RE force the worker
         # to be killed so the next call spawns a fresh CUDA context.

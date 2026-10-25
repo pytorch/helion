@@ -213,7 +213,12 @@ class BenchmarkWorker:
                 if done.is_set() or timer is not expected:
                     return
                 timed_out.set()
-            self._kill_if_current(process, connection, raise_on_failure=False)
+            # Killing the child makes its pipe readable at EOF. Leave the
+            # parent's descriptor open until run() leaves poll/recv: closing
+            # it from this thread can lose the poll wakeup on macOS.
+            self._kill_if_current(
+                process, connection, raise_on_failure=False, close_connection=False
+            )
 
         def arm(seconds: float) -> float:
             nonlocal timer
@@ -306,6 +311,7 @@ class BenchmarkWorker:
         connection: Connection,
         *,
         raise_on_failure: bool = True,
+        close_connection: bool = True,
     ) -> None:
         with self._lock:
             if (
@@ -313,7 +319,12 @@ class BenchmarkWorker:
                 and connection is self._parent_connection
                 and self._fatal_error is None
             ):
-                self._kill()
+                self._kill(close_connection=False)
+            # The watchdog may already have cleared the worker's state. The
+            # waiting thread still owns this connection and must close it.
+            if close_connection:
+                with contextlib.suppress(Exception):
+                    connection.close()
             fatal_error = self._fatal_error
         if raise_on_failure and fatal_error is not None:
             raise BenchmarkWorkerUnkillable(fatal_error)
@@ -323,14 +334,14 @@ class BenchmarkWorker:
         if fatal_error is not None:
             raise BenchmarkWorkerUnkillable(fatal_error)
 
-    def _kill(self) -> None:
+    def _kill(self, *, close_connection: bool = True) -> None:
         process, connection = self._process, self._parent_connection
         if process is not None:
             with contextlib.suppress(Exception):
                 signal_process_tree(process, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 process.join(timeout=_REAP_TIMEOUT_SECONDS)
-        if connection is not None:
+        if close_connection and connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()
         if process is not None and process.is_alive():
