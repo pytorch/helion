@@ -102,6 +102,8 @@ class _EvaluateCase:
     repetitions: int
     alias_signature: list[int] | None = None
     progress_path: str | None = None
+    # Bundles written before the mode was recorded carry the bitwise 0/0 rule.
+    fp8_accuracy: str = "bitwise"
 
     def __call__(self) -> _CaseOutcome:
         # Each measured call receives its original inputs; implicit graph
@@ -156,6 +158,7 @@ class _EvaluateCase:
                         self.atol,
                         self.rtol,
                         self.scale_atol,
+                        self.fp8_accuracy,
                     )
 
                 with _device_context(inputs), torch.no_grad():
@@ -364,8 +367,16 @@ def _check_result(
     atol: float,
     rtol: float,
     scale_atol: bool,
+    fp8_accuracy: str = "bitwise",
 ) -> None:
-    assert_close(output, reference, atol, rtol, scale_atol_by_expected_rms=scale_atol)
+    assert_close(
+        output,
+        reference,
+        atol,
+        rtol,
+        scale_atol_by_expected_rms=scale_atol,
+        fp8_accuracy=fp8_accuracy,
+    )
     actual_flat, actual_spec = tree_flatten(args)
     expected_flat, expected_spec = tree_flatten(post_args)
     pristine_flat, pristine_spec = tree_flatten(inputs)
@@ -392,7 +403,12 @@ def _check_result(
                 _assert_exact(actual, expected)
                 continue
         assert_close(
-            actual, expected, atol, rtol, scale_atol_by_expected_rms=scale_atol
+            actual,
+            expected,
+            atol,
+            rtol,
+            scale_atol_by_expected_rms=scale_atol,
+            fp8_accuracy=fp8_accuracy,
         )
     if _alias_signature((output, args)) != aliases:
         raise AssertionError(
@@ -529,6 +545,7 @@ def evaluate_handoff(
                             repetitions,
                             case.get("alias_signature"),
                             str(progress_path),
+                            fp8_accuracy=case.get("fp8_accuracy", "bitwise"),
                         ),
                         timeout=remaining,
                     )

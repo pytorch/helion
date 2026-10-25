@@ -33,6 +33,9 @@ from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
 from .active_blocks import active_block_ids
 from .host_zero_fills import lower_host_zero_fills
+from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
+from .tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
@@ -150,29 +153,62 @@ def _stage_config(
     # kernels ahead of it still run, and the consumer's TMA role loads the
     # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it.
     drop_pdl = releases_dependents_at_entry and config.get("cute_pdl") is True
+    region_pid_types = config.get(TCGEN05_REGION_PID_TYPES_CONFIG_KEY)
     if (
         "cute_pointwise_pid_type" not in config.config
         and not project_ffi
         and not has_region_stages
         and not fanout
         and not drop_pdl
+        and region_pid_types is None
     ):
         return config
     result = copy.deepcopy(config)
     if drop_pdl:
         result.config.pop("cute_pdl")
+    positions: tuple[int, ...] = ()
+    if region_pid_types is not None or has_region_stages:
+        # One entry per GEMM launch; launches without a native MMA (plain
+        # barrier phases) have no entry.
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        positions = state.materialized_matmul_region_indices
+    result.config.pop(TCGEN05_REGION_PID_TYPES_CONFIG_KEY, None)
+    if region_pid_types is not None:
+        # An ordered barrier chain: normalization admitted the knob only with
+        # the complete two-CTA region schedule.  A persistent GEMM launch runs
+        # the static persistent clustered pipeline under its entry; every
+        # other launch (the SIMT phases, a GEMM left ``inherit``) stays the
+        # flat one-CTA launch the chain's ``pid_type`` names and sheds the
+        # cluster coordinates, which only the clustered launches own.
+        assert config.pid_type == "flat", config.pid_type
+        assert isinstance(region_pid_types, list) and len(region_pid_types) == len(
+            positions
+        )
+        region_pid_type = (
+            region_pid_types[positions.index(stage_index)]
+            if stage_index in positions
+            else TCGEN05_REGION_PID_TYPE_INHERIT
+        )
+        if region_pid_type != TCGEN05_REGION_PID_TYPE_INHERIT:
+            result.config["pid_type"] = region_pid_type
+            result.config.update(TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION)
+        else:
+            result.config["tcgen05_cluster_m"] = 1
+            result.config["tcgen05_cluster_n"] = 1
+            result.config["tcgen05_cta_group"] = "auto"
     for kind in ("ab", "c"):
         key = f"tcgen05_region_{kind}_stages"
         region_stages = result.config.pop(key, None)
         if region_stages is not None:
-            assert (
-                isinstance(region_stages, list)
-                and len(region_stages) == plan.region_count
+            # Launches without an entry keep the shared knobs.
+            assert isinstance(region_stages, list) and len(region_stages) == len(
+                positions
             )
-            count = region_stages[stage_index]
-            assert type(count) is int and 0 <= count <= 16
-            if count:
-                result.config[f"tcgen05_{kind}_stages"] = count
+            if stage_index in positions:
+                count = region_stages[positions.index(stage_index)]
+                assert type(count) is int and 0 <= count <= 16
+                if count:
+                    result.config[f"tcgen05_{kind}_stages"] = count
     if fanout:
         assert stage is not None
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config

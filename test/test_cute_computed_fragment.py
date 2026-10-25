@@ -4636,7 +4636,28 @@ def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
         assert actual[-1]["cute_fragment_packet_loads"] is True
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float64, torch.int32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
+    # Four 16-bit scalars per packet: the same loop body as the fp32 packet
+    # (the DSL's AST preprocessing of its conditionals stays bounded) over an
+    # 8-byte vector copy.
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
+        assert bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_packet_loads"] = True
+        code = bound.to_code(config)
+    scalar = "cutlass.Float16" if dtype is torch.float16 else "cutlass.BFloat16"
+    assert f"cute.make_rmem_tensor(cute.make_layout((4,)), {scalar})" in code
+    assert ".align(8), cute.make_layout((4,))" in code
+    assert (
+        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy=64)"
+        in code
+    )
+    assert "fragment_packet_address % 4 == 0" in code
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int32])
 def test_fragment_packet_loads_unsupported_dtype_default_parity(dtype):
     with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
         bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
@@ -4753,6 +4774,33 @@ def test_fragment_packet_loads_declines_aliasing_host_mutation():
             bound.to_code(config)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_packet_zero_filled_outputs(x: torch.Tensor, modulus: hl.constexpr):
+    """The masked scan writing ``torch.zeros_like`` outputs: fresh storage
+    with a runtime-strided layout, which no input can alias."""
+    raw = torch.zeros_like(x)
+    out = torch.zeros_like(x)
+    for row in hl.tile(x.size(0)):
+        index = hl.arange(x.size(1))
+        value = hl.load(x, [row, index], extra_mask=index % modulus != 0)
+        raw[row, :] = value
+        out[row, :] = hl.cumsum(value + 1, dim=-1) + value.sum(-1)[:, None]
+    return raw, out
+
+
+def test_fragment_packet_loads_admit_loads_beside_fresh_outputs():
+    # ``torch.zeros_like`` is not a layout-exact factory, but it is a fresh
+    # allocation on every call: the loads beside its stores are readonly.
+    x = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_packet_zero_filled_outputs, (x, 13))
+        assert bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [2]
+        config.config["cute_fragment_packet_loads"] = True
+        assert "num_bits_per_copy=128" in bound.to_code(config)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
     x = torch.empty((3, 0), dtype=dtype)
@@ -4760,13 +4808,10 @@ def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
         bound = _cpu_bind(_fragment_uncached_cheap, (x,))
         config = bound.config_spec.default_config()
         before = bound.to_code(config)
-        assert "num_bits_per_copy=128" not in before
+        assert "num_bits_per_copy=" not in before
         config.config["cute_fragment_packet_loads"] = True
-        if dtype == torch.float32:
-            assert bound.to_code(config) == before
-        else:
-            with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
-                bound.to_code(config)
+        # No element, no packet, for the 16-byte and the 8-byte packet alike.
+        assert bound.to_code(config) == before
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

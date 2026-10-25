@@ -306,15 +306,59 @@ def mark_intra_loop_raw_barriers(
         marker.run_graph(graph_id, set())
 
 
+def intra_loop_raw_reread_block_ids(
+    graphs: list[GraphInfo],
+    root_graph_ids: list[int],
+    grid_block_ids: list[list[int]],
+) -> set[int]:
+    """Block ids of the device loops whose region re-reads storage it stores.
+
+    A loop's region is its body with every loop nested in it.  The walk of
+    ``mark_intra_loop_raw_barriers`` is run once per loop (grid loops
+    included) from an empty pending-write set, so only a store issued inside
+    the region arms a load inside it; a store before the loop does not count.
+
+    Such a loop cannot be warp-specialized: Triton's warp specialization
+    distributes the body over partitions by data flow -- an epilogue that
+    depends only on loads (a descriptor load and the re-read) lands in the
+    load partition while the store stays with the MMA's partition -- and the
+    CTA barrier Helion emits between the store and the re-read is split per
+    partition, so the re-read returned the buffer's previous contents.
+    """
+    from .device_ir import ForLoopGraphInfo
+
+    regions: list[tuple[int, list[int]]] = [
+        (graph_id, block_ids)
+        for graph_id, block_ids in zip(root_graph_ids, grid_block_ids, strict=True)
+    ]
+    regions.extend(
+        (info.graph_id, info.block_ids)
+        for info in graphs
+        if isinstance(info, ForLoopGraphInfo)
+    )
+    result: set[int] = set()
+    for graph_id, block_ids in regions:
+        marker = _IntraLoopRawBarrierMarker(graphs, mark=False)
+        marker.run_graph(graph_id, set())
+        if marker.rereads:
+            result.update(block_ids)
+    return result
+
+
 class _IntraLoopRawBarrierMarker:
     def __init__(
         self,
         graphs: list[GraphInfo],
         *,
         mark_in_divergent_control_flow: bool = True,
+        mark: bool = True,
     ) -> None:
         self.graphs = graphs
         self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
+        # ``mark=False`` only counts the loads a marking walk would mark
+        # (``rereads``), leaving the graphs and earlier marks untouched.
+        self.mark = mark
+        self.rereads = 0
 
     def run_graph(
         self, graph_id: int, written: set[int], *, divergent: bool = False
@@ -336,14 +380,16 @@ class _IntraLoopRawBarrierMarker:
                 pending.update(_storage_ids(self.graphs, graph_id, node.args[0]))
                 continue
             if node.target is memory_ops.load:
-                if node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
+                if self.mark and node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
                     pending.clear()
                 elif pending & _storage_ids(self.graphs, graph_id, node.args[0]):
                     if divergent and not self.mark_in_divergent_control_flow:
                         # Cannot place a convergent barrier here; leave the
                         # hazard pending so a later uniform load re-arms it.
                         continue
-                    node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
+                    if self.mark:
+                        node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
+                    self.rereads += 1
                     pending.clear()
                 continue
             if node.target is _if:

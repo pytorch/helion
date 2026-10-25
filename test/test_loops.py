@@ -189,6 +189,38 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+@helion.kernel()
+def reread_in_inner_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    # ``d`` is stored and re-read inside the ``tile_n`` loop: that loop and
+    # the grid loop around it hold the pair; the K loop does not.
+    m, k = x.size()
+    n = w.size(1)
+    d = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+            d[tile_m, tile_n] = acc.to(x.dtype)
+            out[tile_m, tile_n] = d[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel()
+def reread_after_inner_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # The store precedes the inner loop that re-reads it: only the grid
+    # loop's region holds both.
+    m, n = y.size()
+    d = torch.empty_like(x)
+    out = torch.empty_like(y)
+    for tile_m in hl.tile(m):
+        d[tile_m] = x[tile_m] + 1
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = y[tile_m, tile_n] * d[tile_m][:, None]
+    return out
+
+
 @helion.kernel(autotune_effort="none")
 def long_elif_chain(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -1343,6 +1375,38 @@ class TestLoops(RefEagerTestBase, TestCase):
             helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
         )
         self.assertEqual(normalized.range_num_stages, [0] * slots)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="range_warp_specialize is offered from Blackwell on"
+    )
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_warp_specialize_pinned_for_rereads(self):
+        # Triton's warp specialization distributes a loop body over partitions
+        # by data flow, so a store and a later load of the same storage in one
+        # loop region end up unordered (the re-read saw stale memory).  Such a
+        # loop keeps its slot, pinned to None; loops whose region holds only
+        # one side of the pair keep the knob.
+        x = torch.randn([64, 32], device=DEVICE, dtype=torch.float16)
+        w = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        spec = reread_in_inner_loop.bind((x, w)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize],
+            [True, True, False],
+        )
+        normalized = spec.normalized_config(
+            helion.Config(
+                block_sizes=[16, 16, 16], range_warp_specializes=[True, True, True]
+            )
+        )
+        self.assertEqual(normalized.range_warp_specializes, [None, None, True])
+
+        x = torch.randn([64], device=DEVICE)
+        y = torch.randn([64, 32], device=DEVICE)
+        spec = reread_after_inner_loop.bind((x, y)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize], [True, False]
+        )
 
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_pinned_for_host_aliases(self):

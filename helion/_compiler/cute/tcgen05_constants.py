@@ -338,6 +338,77 @@ TCGEN05_AUX_LOAD_PLACEMENTS = (
     TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
+# The pid type of each GEMM launch of an ordered ``hl.barrier()`` chain (one
+# entry per ``materialized_matmul_block_ids`` triple, like
+# ``tcgen05_region_ab_stages``).  The chain's own ``pid_type`` is ``flat``
+# (one ordered launch per phase, the SIMT phases flat); ``inherit`` keeps a
+# GEMM launch flat, while a persistent value runs it as the static persistent
+# two-CTA pipeline (``tcgen05_cta_group="two"``, ``tcgen05_cluster_m=2``) of
+# the standalone single-GEMM surface, its ring depths per region
+# (``tcgen05_region_ab_stages`` / ``tcgen05_region_c_stages``).  Pure
+# scheduling: the same tiles, operands and epilogue arithmetic.
+TCGEN05_REGION_PID_TYPES_CONFIG_KEY = "tcgen05_region_pid_types"
+TCGEN05_REGION_PID_TYPE_INHERIT = "inherit"
+TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
+    TCGEN05_REGION_PID_TYPE_INHERIT,
+    "persistent_blocked",
+    "persistent_interleaved",
+)
+# The recipe a persistent GEMM launch of a chain runs under, projected onto
+# its launch config by ``materialized_fission_codegen._stage_config`` (the
+# standalone paired pipeline's fixed coordinates, ``_paired_pipeline_parameters``).
+# The chain's whole-kernel config keeps the flat recipe of its ``inherit``
+# launches (a scheduler warp, a one-slot accumulator ring, direct stores ...),
+# which these launches do not see.
+TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION: tuple[tuple[str, object], ...] = (
+    ("tcgen05_persistence_model", "static_persistent"),
+    ("tcgen05_strategy", "role_local_monolithic"),
+    ("tcgen05_layout_strategy", "default"),
+    ("tcgen05_warp_spec_mma_warps", 1),
+    ("tcgen05_warp_spec_ab_load_warps", 1),
+    ("tcgen05_warp_spec_epi_load_warps", 0),
+    ("tcgen05_warp_spec_scheduler_warps", 0),
+    ("tcgen05_warp_spec_c_input_warps", 0),
+    ("tcgen05_warp_spec_store_warps", 0),
+    ("tcgen05_num_epi_warps", 4),
+    ("tcgen05_acc_stages", 2),
+    ("tcgen05_c_store_mode", "normal"),
+    ("tcgen05_aux_load_mode", "simt"),
+    ("tcgen05_acc_wait_placement", "subtile_loop"),
+    ("tcgen05_epilogue_layout", "normal"),
+    ("tcgen05_tvm_ffi_launch", False),
+    ("tcgen05_flat_role_coordinates", False),
+    ("tcgen05_layout_overrides_epi_tile_m", None),
+    ("tcgen05_layout_overrides_epi_tile_n", None),
+    ("tcgen05_layout_overrides_smem_swizzle_a", None),
+    ("tcgen05_layout_overrides_smem_swizzle_b", None),
+    ("tcgen05_layout_overrides_d_store_box_n", None),
+)
+# ``pre_acc_wait`` on an exact-shape auxiliary operand (a full ``(m, n)``
+# residual / gate input) normally issues each subtile's global read just ahead
+# of that subtile's accumulator wait; the named barriers between subtiles
+# expose every read's latency. With the whole-fragment hoist on, the epilogue
+# warps read the tile's entire auxiliary fragment into registers once, before
+# the accumulator wait, where the latency hides under the tile's MMA (the
+# register hoist the two-CTA row-vector family already takes). Off keeps the
+# per-subtile reads; the budget below bounds the live fragment so the hoist
+# cannot spill (64 32-bit registers per thread at the 256-register epilogue
+# ceiling).
+TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY = "tcgen05_aux_fragment_hoist"
+TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD = 256
+
+
+def tcgen05_aux_fragment_bytes_per_thread(
+    *, bm: int, bn: int, itemsize: int, epi_warps: int
+) -> int:
+    """Bytes of one exact-shape auxiliary tile fragment held per epilogue thread.
+
+    The epilogue partitions the ``(bm, bn)`` tile evenly over its
+    ``epi_warps * 32`` threads; the hoist keeps every element of the thread's
+    share live across the accumulator wait.
+    """
+    assert bm > 0 and bn > 0 and itemsize > 0 and epi_warps > 0
+    return -(-bm * bn * itemsize // (epi_warps * 32))
 
 
 class Tcgen05RowvecAuxRow(NamedTuple):
@@ -356,11 +427,16 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     ``output_itemsize`` is the element size of the stored output(s); ``rows``
     lists every N-broadcast aux leaf the analyzed epilogue chains load. The
     autotune seeds use them to model the SMEM the ``pre_acc_wait`` row stages
-    add (``CuteTcgen05Config.rowvec_aux_stage_fits``).
+    add (``CuteTcgen05Config.rowvec_aux_stage_fits``). ``output_count`` is the
+    number of analyzed output stores: the store lowering allocates one
+    TMA-store C ring per output, so the SMEM model charges the ring that many
+    times (two fresh outputs of one accumulator keep two rings, with or
+    without the shared fanout epilogue).
     """
 
     output_itemsize: int
     rows: tuple[Tcgen05RowvecAuxRow, ...]
+    output_count: int = 1
 
 
 def tcgen05_rowvec_stage_smem_bytes(

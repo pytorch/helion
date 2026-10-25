@@ -612,6 +612,93 @@ def has_collective_matmul_candidate(graphs: Sequence[GraphInfo]) -> bool:
     )
 
 
+# A K-loop-less contraction over a static full-slice K takes the collective
+# marker's synthetic-lane route only up to this extent; ``collective_knobs_apply``
+# mirrors the bound so the search surface matches what the marker can reach.
+SYNTHETIC_K_MAX_EXTENT = 128
+
+
+def _contraction_block_id(
+    env: CompileEnvironment, device_ir: DeviceIR, node: Node
+) -> int | None:
+    """The K block of ``node``'s contraction, through a packed axis if needed."""
+    from .packed_matmul import packed_axis_for_fact
+
+    facts = env.config_spec.matmul_facts
+    fact_id = node.meta.get(matmul_ops.MATMUL_FACT_ID_META)
+    if not isinstance(fact_id, int) or not 0 <= fact_id < len(facts):
+        return None
+    fact = facts[fact_id]
+    if fact.k_block_id is not None:
+        return fact.k_block_id
+    packed = packed_axis_for_fact(env, device_ir, fact)
+    return packed.block_id if packed is not None else None
+
+
+def collective_knobs_apply(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether any contraction can reach ``_mark_collective`` at all.
+
+    The marker runs only from the addmm/baddbmm lowering and from ``hl.dot``
+    with an accumulator, and needs a contraction block that is either a
+    tiled K loop or a full-slice reduction over a static K in
+    (1, ``SYNTHETIC_K_MAX_EXTENT``] (the synthetic-lane route). A kernel
+    without such a site, for example a plain
+    ``aten.mm`` with no K loop that lowers through the direct grouped-N or
+    serial paths, cannot act on any ``cute_collective_*`` knob, so the search
+    surface leaves them out there (normalization still records the
+    defaults, so recorded configs keep their keys).
+    """
+    for graph in device_ir.graphs:
+        for node in graph.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target in (
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.baddbmm.default,
+            ):
+                if not all(isinstance(arg, torch.fx.Node) for arg in node.args):
+                    continue
+            elif node.target is matmul_ops.dot:
+                if len(node.args) < 3 or not all(
+                    isinstance(arg, torch.fx.Node) for arg in node.args[:3]
+                ):
+                    continue
+            else:
+                continue
+            k_block_id = _contraction_block_id(env, device_ir, node)
+            if k_block_id is None:
+                continue
+            block = env.block_sizes[k_block_id]
+            if not block.reduction:
+                return True
+            numel = block.numel
+            if numel.is_Integer and 1 < int(numel) <= SYNTHETIC_K_MAX_EXTENT:
+                return True
+    return False
+
+
+def has_k_loop_less_matmul(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether some ``aten.mm``/``bmm`` lowers without an active K tile.
+
+    Such a contraction takes the direct grouped-N or serial scalar paths of
+    ``codegen_mm_cute``; those own the whole root's thread mapping and do
+    not survive the ``epilogue_subtile`` store split, which rewrites the
+    graphs the matmul planners read (the result is an unresolved layout
+    contract between the matmul's pointwise users and the split store).
+    """
+    for graph in device_ir.graphs:
+        for node in graph.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                torch.ops.aten.mm.default,
+                torch.ops.aten.bmm.default,
+            ):
+                continue
+            k_block_id = _contraction_block_id(env, device_ir, node)
+            if k_block_id is None or env.block_sizes[k_block_id].reduction:
+                return True
+    return False
+
+
 def has_collective_tmem_operand_candidate(graphs: Sequence[GraphInfo]) -> bool:
     """Seed register-produced half A operands, leaving final admission to AST.
 
@@ -919,7 +1006,7 @@ def _mark_collective(
                 zero_seed=zero_seed,
             )
             or static_k_extent is None
-            or not 1 < static_k_extent <= 128
+            or not 1 < static_k_extent <= SYNTHETIC_K_MAX_EXTENT
             or synthetic_k_lane is None
             or (
                 dependencies := _exclusive_synthetic_k_operands(

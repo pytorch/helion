@@ -155,6 +155,16 @@ class TileStrategyDispatch:
             axis = contraction_axis_for_fact(env, device_ir, fact)
             if axis is not None:
                 collective_blocks.add(axis.block_id)
+        # Ancestors and other loops in a matmul root own its layout too.
+        # Only loops in separate roots may be fitted to the collective launch.
+        matmul_roots = {root for _fact, root in placements}
+        matmul_blocks = collective_blocks | {
+            bid
+            for path in self._cute_tile_loop_paths
+            if path[0] in matmul_roots
+            for block_ids in path
+            for bid in block_ids
+        }
         # Include owned device loops as well as root grids. This is the same
         # per-axis maximum used at launch; final collective proofs still reject
         # incompatible matrix layouts rather than silently changing them.
@@ -176,7 +186,7 @@ class TileStrategyDispatch:
             if (
                 not isinstance(strategy, PerThreadNDTileStrategy)
                 or strategy.mma_mode
-                or collective_blocks.intersection(strategy.block_ids)
+                or matmul_blocks.intersection(strategy.block_ids)
                 or env.config_spec.cute_pointwise_region_block_ids.issuperset(
                     strategy.block_ids
                 )

@@ -230,9 +230,9 @@ def test_mixed_root_seed_executes(
 ) -> None:
     if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("tcgen05 needs SM100")
-    a = torch.randn(64, 128, device="cuda", dtype=torch.float16)
-    b = torch.randn(128, 64, device="cuda", dtype=torch.float16)
-    x = torch.randn(1029, device="cuda")
+    a = torch.randn(64, 128, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+    x = torch.randn(1029, device=DEVICE)
     args = (a, b, x)
     bound = (_pointwise_first if first else _pointwise_last).bind(args)
     assert bound.host_function is not None
@@ -328,9 +328,9 @@ def test_inactive_leading_sibling_axis_keeps_the_collective_launch(
 ) -> None:
     if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("tcgen05 needs SM100")
-    a = torch.randn(64, 128, device="cuda", dtype=torch.float16)
-    b = torch.randn(128, 64, device="cuda", dtype=torch.float16)
-    x = torch.randn(257, device="cuda")
+    a = torch.randn(64, 128, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+    x = torch.randn(257, device=DEVICE)
     bound = _inactive_sibling_axis.bind((a, b, x))
     assert bound.host_function is not None
     seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -437,10 +437,10 @@ def test_two_sibling_roots_reuse_the_collective_launch(compute: str) -> None:
         return out, px, py
 
     args = (
-        torch.randn(64, 128, device="cuda", dtype=torch.float16),
-        torch.randn(128, 64, device="cuda", dtype=torch.float16),
-        torch.randn(257, device="cuda"),
-        torch.randn(5, 2, 257, device="cuda"),
+        torch.randn(64, 128, device=DEVICE, dtype=torch.float16),
+        torch.randn(128, 64, device=DEVICE, dtype=torch.float16),
+        torch.randn(257, device=DEVICE),
+        torch.randn(5, 2, 257, device=DEVICE),
     )
     bound = mixed.bind(args)
     assert bound.host_function is not None

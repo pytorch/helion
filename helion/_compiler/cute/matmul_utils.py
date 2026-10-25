@@ -1727,16 +1727,21 @@ def cute_outer_accumulator_out_dtype(
 class CuteFoldLoad:
     """A matmul operand traced back to a direct memory load.
 
-    The contraction (K) axis is the load's dimension ``k_position`` and
-    ``free_sizes`` are the symbolic sizes of its other dimensions in storage
-    order. ``index_offsets`` is the start of each dimension's slice (0 for a
-    full slice or a tile), added to the block index or K variable the fold
-    re-reads that dimension with. ``scale`` folds in any scalar multipliers
-    seen on the way to the load. Any ``permute`` chain is accepted: the fold
-    re-reads each dimension through its own block index variable (K through
-    the fold's loop variable) at the tensor's own stride, so neither the order
-    the operand presents its dimensions in nor the position of K matters
-    (``w[:, :]`` as a matmul rhs contracts its leading dimension).
+    The contraction (K) axis is the loaded value's dimension ``k_position``
+    and ``free_sizes`` are the symbolic sizes of its other dimensions in
+    storage order. ``positions[d]`` is the subscript position of the load
+    that value dimension ``d`` reads and ``index_offsets[d]`` the start of
+    that position's slice (0 for a full slice or a tile), added to the block
+    index or K variable the fold re-reads that dimension with.
+    ``scalar_positions`` are the subscript positions a uniform scalar index
+    (an ``hl.grid`` index, ``tile.begin``, a host integer) drops from the
+    value; the fold re-reads them with the scalar's own expression. ``scale``
+    folds in any scalar multipliers seen on the way to the load. Any
+    ``permute`` chain is accepted: the fold re-reads each dimension through
+    its own block index variable (K through the fold's loop variable) at the
+    tensor's own stride, so neither the order the operand presents its
+    dimensions in nor the position of K matters (``w[:, :]`` as a matmul rhs
+    contracts its leading dimension).
     """
 
     load_node: torch.fx.Node
@@ -1744,8 +1749,46 @@ class CuteFoldLoad:
     free_sizes: tuple[int | torch.SymInt, ...]
     k_size: int | torch.SymInt
     k_position: int
+    positions: tuple[int, ...]
     index_offsets: tuple[int, ...]
+    scalar_positions: tuple[int, ...]
     scale: float
+
+
+# Storage the fold cannot re-read element by element: ``_cute_scalar_load_expr``
+# reads these as raw bytes and only e4m3 has a scalar decode helper.
+_CUTE_FOLD_UNDECODABLE_DTYPES = frozenset(
+    {
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+        torch.float8_e8m0fnu,
+        torch.float4_e2m1fn_x2,
+    }
+)
+
+
+def _cute_fold_scalar_index(index: object) -> bool:
+    """Whether a load subscript entry is a uniform scalar coordinate.
+
+    Integers, and ``SymInt`` values that are not a tile's own index (``hl.grid``
+    indices, ``tile.begin``/``tile.id``, host scalars), drop their dimension
+    from the loaded value and lower to one expression shared by every lane;
+    the fold re-reads them exactly as the load did.
+    """
+    from .memory_ops import _cute_tile_axis_block_id
+
+    if type(index) is int:
+        return True
+    if isinstance(index, torch.fx.Node):
+        index_val = index.meta.get("val")
+        if type(index_val) is int:
+            return True
+        return (
+            isinstance(index_val, torch.SymInt)
+            and _cute_tile_axis_block_id(index_val) is None
+        )
+    return False
 
 
 def _cute_trace_matmul_operand_load(
@@ -1793,11 +1836,12 @@ def _cute_trace_matmul_operand_load(
                 source_val, torch.Tensor
             ):
                 return None
-            if val.ndim < 2 or val.ndim != source_val.ndim:
+            if val.ndim < 2 or source_val.dtype in _CUTE_FOLD_UNDECODABLE_DTYPES:
                 return None
             # The re-read rebuilds each address from a block index (or the K
-            # variable) plus the dim's slice start; a masked load, a gather and
-            # an offset tile index have no such form.
+            # variable) plus the dim's slice start, or from a uniform scalar
+            # coordinate; a masked load, a gather and an offset tile index
+            # have no such form.
             if len(current.args) > 2 and current.args[2] is not None:
                 return None
             if _cute_matmul_reread_unsafe(cg, current):
@@ -1805,12 +1849,25 @@ def _cute_trace_matmul_operand_load(
             subscript = current.args[1]
             if not isinstance(subscript, (list, tuple)):
                 return None
-            index_offsets = []
+            positions: list[int] = []
+            index_offsets: list[int] = []
+            scalar_positions: list[int] = []
             for position, index in enumerate(subscript):
                 offset = _cute_fold_index_offset(current, position, index)
-                if offset is None:
+                if offset is not None:
+                    positions.append(position)
+                    index_offsets.append(offset)
+                elif _cute_fold_scalar_index(index):
+                    scalar_positions.append(position)
+                else:
                     return None
-                index_offsets.append(offset)
+            # Slices and tiles keep their dimension in subscript order; every
+            # other position must be a dropped scalar.
+            if (
+                len(positions) != val.ndim
+                or len(positions) + len(scalar_positions) != source_val.ndim
+            ):
+                return None
             return CuteFoldLoad(
                 load_node=current,
                 tensor=source_val,
@@ -1819,7 +1876,9 @@ def _cute_trace_matmul_operand_load(
                 ),
                 k_size=val.shape[k_dim],
                 k_position=k_dim,
+                positions=tuple(positions),
                 index_offsets=tuple(index_offsets),
+                scalar_positions=tuple(scalar_positions),
                 scale=scale,
             )
         if target is torch.ops.aten.mul.Tensor and len(current.args) == 2:
@@ -1928,7 +1987,7 @@ def cute_synthetic_lane_k_extent(
 
 
 def emit_cute_synthetic_lane_fold_mm(
-    ctx: LoweringContext,
+    cg: CodegenInterface,
     lhs_node: torch.fx.Node,
     rhs_node: torch.fx.Node,
     *,
@@ -1948,11 +2007,14 @@ def emit_cute_synthetic_lane_fold_mm(
     self-contained serial loop over the full K extent that re-reads both
     operands directly from their tensors, so each (free-dim) thread computes the
     complete dot product. Returns None when either operand is not a simple
-    scaled/permuted direct load that can be re-read this way.
+    scaled/permuted direct load that can be re-read this way.  Raw e4m3
+    storage is read as bytes and decoded (``_cute_fp8e4m3fn_to_float32``), as
+    the scalar fallback does for its own operands.
     """
+    from ...language.memory_ops import _cute_index_exprs
     from ...language.memory_ops import _cute_scalar_pointer_expr
+    from ..inductor_lowering import CodegenState
 
-    cg = ctx.cg
     lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node, contraction_dim=-1)
     rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node, contraction_dim=-2)
     if lhs_fold is None or rhs_fold is None:
@@ -1994,43 +2056,82 @@ def emit_cute_synthetic_lane_fold_mm(
     lhs_indices, lhs_masks = lhs_indexed
     rhs_indices, rhs_masks = rhs_indexed
 
-    backend = CompileEnvironment.current().backend
+    env = CompileEnvironment.current()
+    backend = env.backend
+    # The kernel's index type: Int64 once an input passes 2**31 elements.  The
+    # base pointers (``_cute_scalar_pointer_expr``) and the K steps use it
+    # alike, so a K stride past Int32 cannot wrap in the fold.
+    index_type = env.index_type()
     reduction_dtype = (
         cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype or out_dtype)
         or torch.float32
     )
-    k_var = cg.device_function.new_var("mm_fold_k", dce=False)
 
-    def load_expr(fold: CuteFoldLoad, indices: list[str]) -> str:
+    def operand_exprs(fold: CuteFoldLoad, indices: list[str]) -> tuple[str, str]:
+        """The pointer to element 0 of the operand's K axis and that axis's
+        element stride; the free dims read at this thread's block indices."""
         tensor_name = cg.device_function.tensor_arg(fold.tensor).name
+        k_source = fold.positions[fold.k_position]
         index_vars = list(indices)
-        index_vars.insert(fold.k_position, k_var)
-        index_exprs = [
-            index_var if offset == 0 else f"({index_var}) + {offset}"
-            for index_var, offset in zip(index_vars, fold.index_offsets, strict=True)
-        ]
-        # The kernel's index type: Int64 once an input passes 2**31 elements.
-        return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+        index_vars.insert(fold.k_position, "0")
+        kept = {
+            position: (index_var if offset == 0 else f"({index_var}) + {offset}")
+            for position, index_var, offset in zip(
+                fold.positions, index_vars, fold.index_offsets, strict=True
+            )
+        }
+        subscript = fold.load_node.args[1]
+        assert isinstance(subscript, (list, tuple))
+        if fold.scalar_positions:
+            # Scalar entries (``hl.grid`` indices, ``tile.begin``, constants)
+            # lower as in the load itself; the re-read axes stand in as ``0``.
+            scalar_exprs = _cute_index_exprs(
+                CodegenState(cast("Any", cg), fx_node=fold.load_node),
+                [
+                    0
+                    if position in kept
+                    else (
+                        index.meta["val"] if isinstance(index, torch.fx.Node) else index
+                    )
+                    for position, index in enumerate(subscript)
+                ],
+                tensor=fold.tensor,
+            )
+            index_exprs = [
+                kept.get(position, scalar_exprs[position])
+                for position in range(len(subscript))
+            ]
+        else:
+            index_exprs = [kept[position] for position in range(len(subscript))]
+        base = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+        step = f"{index_type}({tensor_name}.layout.stride[{k_source}])"
+        return base, step
 
-    lhs_load = load_expr(lhs_fold, lhs_indices)
-    rhs_load = load_expr(rhs_fold, rhs_indices)
+    lhs_base, lhs_step = operand_exprs(lhs_fold, lhs_indices)
+    rhs_base, rhs_step = operand_exprs(rhs_fold, rhs_indices)
     fold_scale = lhs_fold.scale * rhs_fold.scale
     reduction_str = backend.dtype_str(reduction_dtype)
-    term = f"{reduction_str}({lhs_load}) * {reduction_str}({rhs_load})"
-    if fold_scale != 1.0:
-        term = f"{term} * {reduction_str}({fold_scale!r})"
     mask_vars = list(dict.fromkeys([*lhs_masks, *rhs_masks]))
+    valid = " and ".join(mask_vars) if mask_vars else "True"
+    # One assignment at the call site: the helper owns the K loop, so a lane
+    # loop around this matmul keeps a straight-line body for the
+    # lane-reduction splitter (``tile_strategy``), which stashes the value
+    # once per lane instead of re-running the fold in every pass.
     acc_var = cg.device_function.new_var("mm_fold_acc")
-    cg.add_statement(f"{acc_var} = {reduction_str}(0.0)")
-    body = f"{acc_var} = {acc_var} + {term}"
-    if mask_vars:
-        guard = " and ".join(mask_vars)
-        loop = f"for {k_var} in range({k_extent}):\n    if {guard}:\n        {body}"
-    else:
-        loop = f"for {k_var} in range({k_extent}):\n    {body}"
-    cg.add_statement(statement_from_string(loop))
+    cg.add_statement(
+        f"{acc_var} = _cute_fold_dot({lhs_base}, {lhs_step}, {rhs_base}, {rhs_step}, "
+        f"cutlass.Boolean({valid}), {reduction_str}(0), k={k_extent}, "
+        f"lhs_e4m3={lhs_fold.tensor.dtype is torch.float8_e4m3fn}, "
+        f"rhs_e4m3={rhs_fold.tensor.dtype is torch.float8_e4m3fn})"
+    )
 
     result: ast.AST = expr_from_string(acc_var)
+    if fold_scale != 1.0:
+        result = expr_from_string(
+            "{acc} * {scale}",
+            acc=result,
+            scale=expr_from_string(f"{reduction_str}({fold_scale!r})"),
+        )
     if acc is not None:
         base = acc
         if acc_dtype is not None and acc_dtype != reduction_dtype:
