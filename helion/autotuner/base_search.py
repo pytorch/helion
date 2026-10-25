@@ -125,6 +125,15 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"
 )
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
+# The single-pass final verification re-times only the shortlist entries the
+# search measured within this factor of its best reading: a finalist 1.5x
+# slower by the search's own (median, L2-flushed) timing cannot overturn the
+# ranking, and every isolated steady window costs seconds (the target window
+# plus a worker round trip). The clock regimes a search spans (boost vs. the
+# sustained power-limited clock) move a reading by 10-15%, well inside the
+# margin; ``inf`` keeps the whole ``top_k``.
+_FINAL_REBENCHMARK_MAX_SPREAD_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD"
+_FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT = 1.5
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 # The only env override of the harness-grade final selection (full effort):
@@ -147,6 +156,7 @@ _INITIAL_POPULATION_BUDGET_FRACTION = 0.5
 _FINAL_SELECTION_IGNORED_ENVS = (
     _FINAL_REBENCHMARK_TARGET_MS_ENV,
     _FINAL_REBENCHMARK_ISOLATED_ENV,
+    _FINAL_REBENCHMARK_MAX_SPREAD_ENV,
 )
 _final_selection_ignored_envs_warned = False
 _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 8
@@ -720,6 +730,7 @@ class BaseSearch(BaseAutotuner):
             self.benchmark_provider.set_compiler_seed_configs(
                 [config for _flat, config in seed_config_gen.seed_flat_config_pairs()]
             )
+        self.benchmark_provider.set_config_roles(self._search_config_roles())
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _is_restricted_search(self) -> bool:
@@ -1155,12 +1166,24 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to accuracy checks."
             )
+        if not self.settings.autotune_accuracy_check:
+            # Say so where the selection is reported: a log that names a
+            # selected config without this line reads as if the config had
+            # passed a check it never saw (a kernel that disables the check
+            # relies on its caller's own comparison).
+            self.log.warning(
+                "Accuracy checks were disabled (autotune_accuracy_check=False): "
+                f"the selected config was ranked among "
+                f"{self._autotune_metrics.num_configs_tested} configs by timing "
+                "alone and was never compared with the baseline output."
+            )
         if self._autotune_metrics.num_compile_failures:
             self.log.warning(
                 f"{self._autotune_metrics.num_compile_failures} of "
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to compile failures."
             )
+            self._log_unmeasured_config_values()
         if self._autotune_metrics.num_worker_failures:
             self.log.warning(
                 f"{self._autotune_metrics.num_worker_failures} of "
@@ -1366,8 +1389,44 @@ class BaseSearch(BaseAutotuner):
             ),
         )
 
+    def _search_config_roles(self) -> dict[Config, str]:
+        """The configs this search benchmarks for a reason of their own, by
+        role (see :meth:`BenchmarkProvider.set_config_roles`); a search over
+        user-given configs has none."""
+        return {}
+
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
+
+    # Most lines the unmeasured-values summary prints.
+    _UNMEASURED_CONFIG_VALUES_SHOWN = 8
+
+    def _log_unmeasured_config_values(self) -> None:
+        """Surface the lowerings the search could not reach.
+
+        A config value every attempted candidate failed to compile with (a
+        tensor-core family on a kernel its matcher declines, a lane layout the
+        lowering rejects) never appears in the result: the winner simply has
+        the knob off, and only ``HELION_AUTOTUNE_LOG_LEVEL=DEBUG`` or a
+        hand-compiled config shows why. One INFO line per such value names the
+        first failure's reason.
+        """
+        facts = self.benchmark_provider.unmeasured_config_values()
+        if not facts:
+            return
+        shown = facts[: self._UNMEASURED_CONFIG_VALUES_SHOWN]
+        lines = [
+            f"  {fact.key}={fact.value!r}: {fact.count} config(s) failed to "
+            f"compile; first: {fact.first_error}"
+            for fact in shown
+        ]
+        if len(facts) > len(shown):
+            lines.append(f"  ... and {len(facts) - len(shown)} more")
+        self.log(
+            "Config values no measured candidate carried (every config using "
+            "them failed to compile, so the selected config has none):\n"
+            + "\n".join(lines)
+        )
 
     def _finalize_autotune_metrics(self, best_config: Config | None = None) -> None:
         """Finalize run metrics and link population winners to measured source.
@@ -1539,6 +1598,7 @@ class _WorkerFinalSelectionMeasurer:
         private_copies: bool,
         timeout_s: float,
         l2_flush_mode: str | None = None,
+        desc: str = "Final selection",
     ) -> None:
         self.provider = provider
         self.fns = list(fns)
@@ -1555,6 +1615,7 @@ class _WorkerFinalSelectionMeasurer:
             if provider._subprocess_benchmark_uses_wall_clock()
             else l2_flush_mode or "call"
         )
+        self.desc = desc
 
     def __enter__(self) -> Self:
         return self
@@ -1567,12 +1628,12 @@ class _WorkerFinalSelectionMeasurer:
             self.provider.release_private_argument_copies()
 
     def warm(self, index: int, duration_ms: int) -> None:
-        self._window(index, warmup=duration_ms, rep=1, desc="Final selection warmup")
+        self._window(index, warmup=duration_ms, rep=1, desc=f"{self.desc} warmup")
 
     def measure(
         self, index: int, warmup_ms: int, rep_ms: int
     ) -> IsolatedBenchmarkTiming:
-        return self._window(index, warmup=warmup_ms, rep=rep_ms, desc="Final selection")
+        return self._window(index, warmup=warmup_ms, rep=rep_ms, desc=self.desc)
 
     def _window(
         self, index: int, *, warmup: int, rep: int, desc: str
@@ -1734,6 +1795,27 @@ class PopulationBasedSearch(BaseSearch):
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
 
+    def _search_config_roles(self) -> dict[Config, str]:
+        # The normalized forms the population builders benchmark: the user's
+        # seeds, the compiler's seeds and the fragment default (which differs
+        # from the execution default whenever a seed is promoted or a knob is
+        # overridden). The default's role wins when a seed coincides with it.
+        roles: dict[Config, str] = {}
+        for _flat, config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs()
+        ):
+            roles[config] = "user seed config"
+        for _flat, config in self.config_gen.seed_flat_config_pairs():
+            roles[config] = "compiler seed"
+        try:
+            default = self.config_gen.unflatten(self.config_gen.default_flat())
+        except exc.InvalidConfig:
+            # A fragment default the spec refuses to normalize (seen under
+            # HELION_INTERPRET=1) is never benchmarked, so it names no role.
+            return roles
+        roles[default] = "default config"
+        return roles
+
     def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
         return {
             "enabled": True,
@@ -1742,13 +1824,18 @@ class PopulationBasedSearch(BaseSearch):
             # 3: an in-process fallback for a mutated-argument kernel gives
             # every finalist private storage, preventing cross-config L2
             # eviction-priority leakage.
-            # Fresh finalist processes cannot inherit cached argument storage
-            # or live allocations from candidates measured earlier in search.
-            "timing_version": 4,
+            # 4: fresh finalist processes cannot inherit cached argument
+            # storage or live allocations from candidates measured earlier
+            # in search.
+            # 5: isolated finalists read private argument copies in one
+            # long-lived worker (fresh processes only when the copies do not
+            # fit), and the shortlist is sized to the search's spread.
+            "timing_version": 5,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
             "pinned_tolerance": self._final_rebenchmark_pinned_tolerance(),
+            "max_spread": self._final_rebenchmark_max_spread(),
             "repeat_cap": os.getenv("HELION_CAP_REBENCHMARK_REPEAT"),
             # The harness-grade final selection replaces the pass above at
             # full effort; like the knobs above it decides which finalist is
@@ -2860,6 +2947,54 @@ class PopulationBasedSearch(BaseSearch):
             return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
         return tolerance
 
+    def _final_rebenchmark_max_spread(self) -> float:
+        raw = os.getenv(_FINAL_REBENCHMARK_MAX_SPREAD_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT
+        try:
+            spread = float(raw)
+        except ValueError:
+            spread = math.nan
+        if math.isnan(spread) or spread < 1.0:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_MAX_SPREAD_ENV}={raw!r} "
+                f"(a factor >= 1, or inf); using "
+                f"{_FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT
+        return spread
+
+    def _within_final_rebenchmark_spread(
+        self,
+        finalists: list[PopulationMember],
+        keep: Sequence[PopulationMember],
+    ) -> list[PopulationMember]:
+        """The finalists the search measured within ``max_spread`` of its
+        best shortlist reading, plus ``keep`` (pinned seeds, the incumbent).
+
+        The single-pass verification exists to correct a noisy reading of a
+        near-tied candidate, not to re-time configs the search already found
+        far slower; each dropped finalist saves one isolated steady window.
+        """
+        spread = self._final_rebenchmark_max_spread()
+        if not math.isfinite(spread):
+            return finalists
+        best = min(self._finalist_history_perf(member) for member in finalists)
+        kept_ids = {id(member) for member in keep}
+        kept = [
+            member
+            for member in finalists
+            if id(member) in kept_ids
+            or self._finalist_history_perf(member) <= best * spread
+        ]
+        if len(kept) < len(finalists):
+            self.log(
+                f"Final verification shortlist: {len(kept)} of {len(finalists)} "
+                f"configs measured within {spread:g}x of the best search reading "
+                f"({self.format_performance(best)}); the rest are not re-timed."
+            )
+        return kept
+
     @staticmethod
     def _repeat_for_target_ms(target_ms: float, best_perf_so_far: float) -> int:
         if math.isfinite(best_perf_so_far) and best_perf_so_far > 0:
@@ -2996,6 +3131,15 @@ class PopulationBasedSearch(BaseSearch):
             # explicitly opts into isolated finalist timing, keep suspicious
             # confirmation enabled for the in-process fallback.
             use_isolated = self._final_rebenchmark_use_isolated()
+            finalists = self._within_final_rebenchmark_spread(
+                finalists,
+                [*pinned, *([incumbent] if incumbent is not None else [])],
+            )
+            if len(finalists) < 2:
+                live_finalists = [
+                    member for member in finalists if math.isfinite(member.perf)
+                ]
+                return min(live_finalists, key=performance, default=fallback)
             self.rebenchmark(
                 finalists,
                 desc=f"Final verification top {len(finalists)} configs",
@@ -3084,6 +3228,10 @@ class PopulationBasedSearch(BaseSearch):
         if isinstance(provider, LocalBenchmarkProvider):
             private_copies = provider.private_argument_copies_affordable(len(finalists))
             if provider.steady_window_benchmark_available():
+                provider.register_isolated_candidates(
+                    [member.fn for member in finalists],
+                    [member.config for member in finalists],
+                )
                 return _WorkerFinalSelectionMeasurer(
                     provider,
                     [member.fn for member in finalists],
@@ -3421,14 +3569,13 @@ class PopulationBasedSearch(BaseSearch):
         in_process_isolation = False
         if use_isolated and self.settings.autotune_benchmark_fn is None:
             try:
-                isolated_results = self.benchmark_provider.benchmark_isolated(
-                    [m.fn for m in members],
-                    warmup=1,
+                isolated_results = self._isolated_rebenchmark_results(
+                    members,
                     rep=PopulationBasedSearch._isolated_rep_ms(
                         target_ms, self.settings.autotune_benchmark_timeout
                     ),
                     desc=desc,
-                    fresh_process=candidate_private_args,
+                    candidate_private_args=candidate_private_args,
                 )
             except BenchmarkWorkerUnkillable as error:
                 self._record_unkillable(members, error)
@@ -3584,6 +3731,75 @@ class PopulationBasedSearch(BaseSearch):
             resolved_timings,
             failure_statuses=failure_statuses,
             trace_results=new_timings,
+        )
+
+    def _isolated_rebenchmark_results(
+        self,
+        members: Sequence[PopulationMember],
+        *,
+        rep: int,
+        desc: str,
+        candidate_private_args: bool,
+    ) -> list[IsolatedBenchmarkTiming] | None:
+        """One isolated steady window per member in the killable worker;
+        ``None`` when the worker cannot time them (the caller falls back to
+        the in-process timers).
+
+        With ``candidate_private_args`` every member reads its own copy of the
+        kernel arguments in the one long-lived worker -- the regime of the
+        full-effort final selection: a candidate's L2-resident (or
+        ``evict_last``-pinned) input lines cannot become hits for the next
+        candidate because the next one reads different addresses. That keeps
+        the isolation a fresh process per finalist provided without its cost
+        (a spawn re-imports torch, the backend and the caller's ``__main__``,
+        then loads the arguments: 7 s per finalist here, 45-60 s under a heavy
+        ``__main__``). The copies are released when the batch ends. A fresh
+        process per finalist remains the fallback when the copies do not fit
+        on the device next to the originals.
+        """
+        provider = self.benchmark_provider
+        fns = [member.fn for member in members]
+        if isinstance(provider, LocalBenchmarkProvider):
+            # A failed re-timing names its candidate in the log.
+            provider.register_isolated_candidates(
+                fns, [member.config for member in members]
+            )
+        if (
+            candidate_private_args
+            and isinstance(provider, LocalBenchmarkProvider)
+            and provider.steady_window_benchmark_available()
+            and provider.private_argument_copies_affordable(len(fns))
+        ):
+            # The timer sizes its repetitions from an estimate pass, so a
+            # window can stretch; three windows plus the wrapper and argument
+            # loads still finish (see ``_final_selection_measurer``).
+            window_s = (1 + rep) / 1000.0
+            timeout_s = max(
+                float(self.settings.autotune_benchmark_timeout),
+                3.0 * window_s + 15.0,
+            )
+            results: list[IsolatedBenchmarkTiming] = []
+            with _WorkerFinalSelectionMeasurer(
+                provider,
+                fns,
+                private_copies=True,
+                timeout_s=timeout_s,
+                desc=desc,
+            ) as measurer:
+                for index in range(len(fns)):
+                    results.append(measurer.measure(index, 1, rep))
+                    if not provider.steady_window_benchmark_available():
+                        # A wrapper the worker cannot load disables it for
+                        # the rest of the batch; time every finalist
+                        # in-process rather than mixing regimes.
+                        return None
+            return results
+        return provider.benchmark_isolated(
+            fns,
+            warmup=1,
+            rep=rep,
+            desc=desc,
+            fresh_process=candidate_private_args,
         )
 
     def mirrored_rebenchmark(

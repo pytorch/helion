@@ -59,7 +59,12 @@ def deepest_fitting_ab_stages(
 
 
 class Tcgen05PipelineSmemFacts(NamedTuple):
-    """One store ring and its proved FP32 broadcast rows; no other scratch."""
+    """One store ring and its proved FP32 broadcast rows; no other scratch.
+
+    ``has_auxiliary_loads`` records exact-shape (or, for FP8, broadcast)
+    auxiliary operands of the epilogue chain: register-resident SIMT loads
+    that add no shared memory but offer the aux-placement seeds.
+    """
 
     input_dtype_bytes: int
     output_dtype_bytes: int
@@ -180,7 +185,13 @@ def analyze_pipeline_smem_facts(
                 or tensor.ndim != 0
             ):
                 return None
-    elif chain.auxiliary_tensor_loads:
+    elif any(leaf.broadcast_axis is not None for leaf in chain.auxiliary_tensor_loads):
+        # A 16-bit epilogue may read exact-shape auxiliary tiles (a residual,
+        # a mask of the output's shape): the SIMT aux path loads them per
+        # subtile into registers and allocates no shared memory, so the
+        # static two-CTA arena is the plain one-ring budget.  Broadcast rows
+        # and columns stage through shared memory under ``pre_acc_wait`` and
+        # are modeled only for the FP8 family above.
         return None
     # A second output can introduce another store ring, even when it does not
     # consume this MMA. Do not borrow its memory for the AB pipeline.

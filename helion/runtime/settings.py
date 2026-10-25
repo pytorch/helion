@@ -51,6 +51,9 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
+# How the autotuner compares fp8 outputs against the baseline: dequantized
+# values within one fp8 ulp plus the tolerances, or exact bytes.
+AutotuneFp8Accuracy = Literal["ulp", "bitwise"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -590,6 +593,14 @@ class _Settings:
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
+    autotune_fp8_accuracy: AutotuneFp8Accuracy = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_literal,
+            "HELION_AUTOTUNE_FP8_ACCURACY",
+            cast("AutotuneFp8Accuracy", "ulp"),
+            mapping={"ulp": "ulp", "bitwise": "bitwise"},
+        )
+    )
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
@@ -644,6 +655,14 @@ class _Settings:
     cute_flatten_nested_reductions: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS", False
+        )
+    )
+    cute_graph_cse: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
+    )
+    cute_exact_division: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
         )
     )
     triton_do_not_specialize: bool = dataclasses.field(
@@ -755,11 +774,22 @@ class Settings(_Settings):
             "Timeout in seconds for one autotune precompile subprocess "
             "(autotune_precompile); a CuTe render worker past it is given up "
             "and its config rendered in-process instead (never failed for the "
-            "timeout alone). Default is 60 seconds. In-process compiles cannot "
-            "be interrupted by it; the autotune budget bounds them instead."
+            "timeout alone). Also the benchmark worker's deadline for a "
+            "candidate's compile and first call (the backend JIT; never below "
+            "autotune_benchmark_timeout): a candidate past it is killed and "
+            "recorded as failed to compile, and the search goes on. Default "
+            "is 60 seconds. In-process compiles cannot be interrupted by it; "
+            "the autotune budget bounds them instead."
         ),
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
-        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
+        "autotune_benchmark_timeout": (
+            "Per-config wall-clock timeout in seconds for the subprocess "
+            "benchmark phase, counted once the candidate's compile and first "
+            "call are done (those have autotune_compile_timeout). Only applies "
+            "when autotune_benchmark_subprocess is enabled. Default 30 seconds, "
+            "raised automatically on environments with a heavier subprocess "
+            "cold-start."
+        ),
         "autotune_precompile": (
             "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to "
             "disable. Defaults to 'fork' on non-Windows platforms. With a pool "
@@ -884,6 +914,26 @@ class Settings(_Settings):
             "independent fresh-output stores on CuTe. Defaults to "
             "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS (False)."
         ),
+        "cute_graph_cse": (
+            "If True (the default), merge duplicate reductions and the pure "
+            "chains between them in the traced device IR before CuTe code "
+            "generation (one amax/exp/sum per operand for a softmax and a "
+            "log_softmax of it). Results are bitwise unchanged; set False "
+            "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
+            "regression against the traced graph."
+        ),
+        "cute_exact_division": (
+            "If True (the default), an fp32 division by a loop-invariant scalar "
+            "(a row sum, a scalar kernel argument) on CuTe hoists the divisor's "
+            "correctly rounded reciprocal and admission window out of the "
+            "element loop and divides with the Markstein sequence, re-running "
+            "the loop with div.rn when a dividend left the window: the IEEE "
+            "round-to-nearest quotient bit for bit, without one div.rn "
+            "expansion per element. Set False (HELION_CUTE_EXACT_DIVISION=0) "
+            "to keep the plain per-element division; the config knob "
+            "cute_exact_div_form picks the form (redo / plain) per kernel. "
+            "Independent of fast_math, whose fp32 division is approximate."
+        ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "
             "arg so a single Triton binary handles any value, avoiding Triton-level "
@@ -937,15 +987,30 @@ class Settings(_Settings):
             "Absolute tolerance for baseline output comparison during autotuning accuracy checks. "
             "When unset, defaults to 1e-2 scaled per output tensor by max(1, rms(baseline)) "
             "so large-magnitude reductions tolerate accumulation-order noise, or 0.0 for fp8 "
-            "dtypes (automatic bitwise comparison). Setting an explicit value disables the "
-            "RMS scaling and is applied exactly. "
+            "dtypes under autotune_fp8_accuracy='bitwise'. Setting an explicit value disables the "
+            "RMS scaling and is applied exactly; an explicit 0 together with "
+            "autotune_baseline_rtol=0 compares fp8 outputs bitwise. "
             "Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
         ),
         "autotune_baseline_rtol": (
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
-            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes under autotune_fp8_accuracy='bitwise'. "
             "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3). "
             "See autotune_baseline_atol for how the absolute-tolerance floor scales when unset."
+        ),
+        "autotune_fp8_accuracy": (
+            "How autotuning accuracy checks compare fp8 output tensors against the baseline. "
+            "'ulp' (default) compares dequantized values: every element must lie within one fp8 "
+            "ulp of max(|actual|, |baseline|) plus the atol/rtol tolerances (atol scaled by the "
+            "baseline RMS as usual), and the one-ulp differences must not be systematically "
+            "one-directional. This admits the one-bucket flips a kernel that quantizes an "
+            "intermediate to fp8 (e.g. an online-softmax P) produces when its reduction blocking "
+            "changes, while still rejecting multi-ulp and biased differences. "
+            "'bitwise' requires identical bytes whenever every output is fp8 and no explicit "
+            "tolerance is set (the previous behavior). "
+            "Explicit zero tolerances (autotune_baseline_atol=0 with autotune_baseline_rtol=0) "
+            "ask for exact outputs and select 'bitwise' whatever this setting says. "
+            "Set HELION_AUTOTUNE_FP8_ACCURACY=bitwise to override."
         ),
         "autotune_baseline_accuracy_check_fn": (
             "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "
@@ -1065,6 +1130,12 @@ class Settings(_Settings):
 
         if self.autotune_handoff_budget_seconds < 1:
             raise ValueError("autotune_handoff_budget_seconds must be positive")
+
+        if self.autotune_fp8_accuracy not in ("ulp", "bitwise"):
+            raise ValueError(
+                "autotune_fp8_accuracy must be 'ulp' or 'bitwise', "
+                f"got {self.autotune_fp8_accuracy!r}"
+            )
 
         self._check_ref_eager_mode_before_print_output_code()
 

@@ -17,6 +17,7 @@ from typing import Any
 from typing import Iterator
 from typing import cast
 from unittest.mock import MagicMock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
@@ -1078,7 +1079,8 @@ class TestAutotunerHeuristic(TestCase):
         # The autotuning reference produces the baseline only while it is what
         # the kernel runs by default; a promoted execution default (whose
         # arithmetic the fast candidates share) takes over as soon as it
-        # differs from the reference.
+        # differs from the reference -- which then runs as well, to agree
+        # with it (``_compute_reference_baseline``).
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
         for default in (reference, execution_default):
@@ -1099,8 +1101,10 @@ class TestAutotunerHeuristic(TestCase):
                 self.assertEqual(output, "baseline")
                 self.assertEqual(mutated, [])
                 self.assertEqual(post_args, ())
-                provider.kernel.compile_config.assert_called_once_with(
-                    default, allow_print=False
+                compiled = [default] if default is reference else [default, reference]
+                self.assertEqual(
+                    provider.kernel.compile_config.call_args_list,
+                    [call(config, allow_print=False) for config in compiled],
                 )
 
     def test_should_promote_gate(self) -> None:
@@ -4455,9 +4459,19 @@ class TestMatmulFacts(TestCase):
             {axis.block_id for axis in region.loop_axes}
             for region in fact.pipelined_regions
         ]
-        self.assertTrue(
-            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
-        )
+        # ``out[batch, :, tile_q, :]`` partitions the fresh output by the
+        # query tile, so the CuTe backend promotes that tile into the launch
+        # grid (promote_partitioned_output_axis); the key loop then nests
+        # directly under the grid.  Triton keeps both as nested loop axes.
+        if query_block_id in spec.grid_block_ids:
+            self.assertTrue(any(key_block_id in axes for axes in nested_axes))
+        else:
+            self.assertTrue(
+                any(
+                    {query_block_id, key_block_id}.issubset(axes)
+                    for axes in nested_axes
+                )
+            )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
@@ -11005,13 +11019,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        for tcfg in (bias_tcfg, residual_tcfg):
-            self.assertIsNone(tcfg.pipeline_smem_facts)
-            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(
-                ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
-            )
-            self.assertEqual(ab_fragment.high, 12)
+        # The broadcast (rowvec) bias keeps the legacy fragment: no allocation
+        # proof, the dtype hard cap. An exact-shape 16-bit auxiliary load is a
+        # register-resident SIMT load that takes no shared memory, so the
+        # residual kernel keeps the complete allocation proof (facts that record
+        # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
+        self.assertIsNone(bias_tcfg.pipeline_smem_facts)
+        bias_ab_fragment = bias_tcfg.optional_fragments(for_search=True)[
+            "tcgen05_ab_stages"
+        ]
+        self.assertEqual(
+            bias_ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
+        )
+        self.assertEqual(bias_ab_fragment.high, 12)
+        self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
+        self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
+        self.assertEqual(
+            residual_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -12043,3 +12069,77 @@ def test_cute_row_hints_preserve_fixed_leading_axis(
             spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
             == 1
         )
+
+
+def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
+    """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
+    the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
+    so the row statistics and the ``p @ v`` running sum stay in registers."""
+    from examples.fp8_attention import fp8_attention_kernel
+
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    kernel = helion.kernel(
+        fp8_attention_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    batch, heads, seq_len, head_dim = 1, 4, 256, 64
+    q = torch.empty((batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn)
+    v = torch.empty((batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, (q, q, v, batch, heads))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        assert CuteDotRowReductionHeuristic.is_eligible(bound.env, device_ir)
+        seed = CuteDotRowReductionHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        spec = bound.config_spec
+        key_tile = next(
+            graph.block_ids[0]
+            for graph in device_ir.graphs
+            if type(graph).__name__ == "ForLoopGraphInfo" and len(graph.block_ids) == 1
+        )
+        slot = [item.block_id for item in spec.num_threads].index(key_tile)
+        assert seed["num_threads"][slot] == 1
+        assert sum(seed["num_threads"]) == 1
+        assert "cute_dot_row_reduction" in spec.autotuner_heuristics
+        assert spec.default_config()["num_threads"] == seed["num_threads"]
+        code = bound.to_code(spec.default_config())
+        # The key tile runs as a per-thread lane loop: the row max and sum
+        # accumulate in registers instead of block-wide grouped reductions.
+        assert "qk_max_lane_acc" in code
+        assert "l_ij_lane_acc" in code
+
+
+def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
+    """A dot whose N axis is only stored (no reduction over it) gets no seed."""
+    from helion._compiler.autotuner_heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        batch_heads, seq_len, _ = q.shape
+        out = torch.empty(
+            [batch_heads, seq_len, seq_len], dtype=torch.float32, device=q.device
+        )
+        for bh in hl.grid(batch_heads):
+            for tile_m in hl.tile(seq_len):
+                q_tile = q[bh, tile_m, :]
+                for tile_n in hl.tile(seq_len):
+                    k_tile = k[bh, tile_n, :]
+                    out[bh, tile_m, tile_n] = hl.dot(q_tile, k_tile.transpose(0, 1))
+        return out
+
+    q = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(scores, (q, q))
+        assert bound.host_function is not None
+        assert not CuteDotRowReductionHeuristic.is_eligible(
+            bound.env, bound.host_function.device_ir
+        )
+        assert "cute_dot_row_reduction" not in bound.config_spec.autotuner_heuristics

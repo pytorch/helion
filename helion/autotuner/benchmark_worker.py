@@ -5,11 +5,14 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
+import dataclasses
+import functools
 import multiprocessing as mp
 import os
 import signal
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import TypeVar
@@ -56,7 +59,10 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
         if job is None:
             return
         try:
-            result: object = job()
+            if isinstance(job, PhasedJob):
+                result: object = job(functools.partial(_report_phase, connection))
+            else:
+                result = job()
         except BaseException as e:
             # Tracebacks pin the job's locals (tensors); strip before pickle.
             e.__traceback__ = None
@@ -78,6 +84,36 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
                 return
 
 
+# The phase a ``PhasedJob`` reports once its candidate is compiled and has
+# run once: from here on the parent holds it to the benchmark timeout.
+PHASE_COMPILED = "compiled"
+
+
+@dataclasses.dataclass(frozen=True)
+class _PhaseReport:
+    """Progress marker a phased job sends ahead of its result."""
+
+    phase: str
+
+
+def _report_phase(connection: Connection, phase: str) -> None:
+    connection.send(_PhaseReport(phase))
+
+
+class PhasedJob:
+    """A worker job that reports its phases to the parent.
+
+    ``BenchmarkWorker.run`` holds such a job to two deadlines: the
+    ``compile_timeout`` until it reports :data:`PHASE_COMPILED` (the candidate
+    is loaded, compiled and has run once), then the benchmark ``timeout`` for
+    the timing that follows. A job that never reports is held to the whole-job
+    ``timeout`` like any other callable.
+    """
+
+    def __call__(self, report_phase: Callable[[str], None] | None = None) -> object:
+        raise NotImplementedError
+
+
 class BenchmarkSubprocessError(Exception):
     """Worker-subprocess failure, distinct from exceptions raised by the
     user job (which are re-raised verbatim)."""
@@ -85,6 +121,12 @@ class BenchmarkSubprocessError(Exception):
 
 class BenchmarkTimeout(BenchmarkSubprocessError):
     pass
+
+
+class BenchmarkCompileTimeout(BenchmarkSubprocessError):
+    """A phased job did not finish compiling (and running once) within the
+    compile deadline. Not a :class:`BenchmarkTimeout`: the candidate was never
+    timed, so it counts as a compile failure rather than a slow kernel."""
 
 
 class BenchmarkWorkerDied(BenchmarkSubprocessError):
@@ -116,7 +158,13 @@ class BenchmarkWorker:
     def alive(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
-    def run(self, job: Callable[[], _T], timeout: float) -> _T:
+    def run(
+        self,
+        job: Callable[[], _T],
+        timeout: float,
+        *,
+        compile_timeout: float | None = None,
+    ) -> _T:
         """Execute ``job`` in the worker.
 
         Raises ``BenchmarkTimeout`` if the job exceeds ``timeout`` seconds,
@@ -124,6 +172,13 @@ class BenchmarkWorker:
         the job raised. Sticky CUDA errors additionally kill the worker so the
         next call respawns it. If a killed worker remains alive, raises
         ``BenchmarkWorkerUnkillable`` and permanently disables this instance.
+
+        With ``compile_timeout`` a :class:`PhasedJob` is held to two
+        deadlines: ``compile_timeout`` seconds for the compile phase (until
+        it reports :data:`PHASE_COMPILED`; past it the worker is killed and
+        ``BenchmarkCompileTimeout`` is raised) and then ``timeout`` seconds,
+        counted from that report, for the timing. Any other job keeps the
+        single whole-job ``timeout``.
         """
         self._raise_if_unusable()
         if not self.alive():
@@ -133,68 +188,93 @@ class BenchmarkWorker:
         assert connection is not None
         assert process is not None
 
+        phased = compile_timeout is not None and isinstance(job, PhasedJob)
+        compiling = phased
         timed_out = threading.Event()
         done = threading.Event()
         completion_lock = threading.Lock()
+        # The timer is re-armed when the compile phase ends; ``timer`` is read
+        # under ``completion_lock`` so a stale timer never kills the worker
+        # after the job completed.
+        timer: threading.Timer | None = None
 
-        def on_timeout() -> None:
+        def timeout_error() -> BenchmarkSubprocessError:
+            if compiling:
+                assert compile_timeout is not None
+                return BenchmarkCompileTimeout(
+                    f"compile and first call exceeded {compile_timeout:.1f}s "
+                    "in the benchmark worker"
+                )
+            return BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
+
+        def on_timeout(expected: threading.Timer) -> None:
             with completion_lock:
-                if done.is_set():
+                # A timer the compile phase's end replaced must not fire.
+                if done.is_set() or timer is not expected:
                     return
                 timed_out.set()
-            self._kill_if_current(process, connection, raise_on_failure=False)
+            # Killing the child makes its pipe readable at EOF. Leave the
+            # parent's descriptor open until run() leaves poll/recv: closing
+            # it from this thread can lose the poll wakeup on macOS.
+            self._kill_if_current(
+                process, connection, raise_on_failure=False, close_connection=False
+            )
 
-        timer = threading.Timer(timeout, on_timeout)
-        timer.daemon = True
-        timer.start()
+        def arm(seconds: float) -> float:
+            nonlocal timer
+            with completion_lock:
+                if timer is not None:
+                    timer.cancel()
+                armed = threading.Timer(seconds, lambda: on_timeout(armed))
+                armed.daemon = True
+                timer = armed
+                armed.start()
+            return time.monotonic() + seconds
+
+        deadline = arm(compile_timeout if phased else timeout)
         try:
             try:
                 connection.send(job)
             except (BrokenPipeError, OSError) as e:
                 if timed_out.is_set():
                     self._kill_if_current(process, connection)
-                    raise BenchmarkTimeout(
-                        f"benchmark timeout after {timeout:.1f}s"
-                    ) from e
+                    raise timeout_error() from e
                 self._kill_if_current(process, connection)
                 raise BenchmarkWorkerDied("failed to send job to worker") from e
 
-            try:
-                if not connection.poll(timeout):
-                    timed_out.set()
+            while True:
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not connection.poll(remaining):
+                        timed_out.set()
+                        self._kill_if_current(process, connection)
+                        raise timeout_error()
+                    message = connection.recv()
+                except (EOFError, OSError) as e:
+                    if timed_out.is_set():
+                        self._kill_if_current(process, connection)
+                        raise timeout_error() from e
                     self._kill_if_current(process, connection)
-                    raise BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
-            except (EOFError, OSError) as e:
-                if timed_out.is_set():
-                    self._kill_if_current(process, connection)
-                    raise BenchmarkTimeout(
-                        f"benchmark timeout after {timeout:.1f}s"
+                    raise BenchmarkWorkerDied(
+                        "worker pipe closed before sending result"
+                        + (" during compile and first call" if compiling else "")
                     ) from e
-                self._kill_if_current(process, connection)
-                raise BenchmarkWorkerDied(
-                    "worker pipe closed before sending result"
-                ) from e
-
-            try:
-                result = connection.recv()
-            except (EOFError, OSError) as e:
-                if timed_out.is_set():
-                    self._kill_if_current(process, connection)
-                    raise BenchmarkTimeout(
-                        f"benchmark timeout after {timeout:.1f}s"
-                    ) from e
-                self._kill_if_current(process, connection)
-                raise BenchmarkWorkerDied(
-                    "worker pipe closed before sending result"
-                ) from e
+                if isinstance(message, _PhaseReport):
+                    if compiling and message.phase == PHASE_COMPILED:
+                        compiling = False
+                        deadline = arm(timeout)
+                    continue
+                result = message
+                break
         finally:
             with completion_lock:
                 done.set()
-            timer.cancel()
+                if timer is not None:
+                    timer.cancel()
 
         if timed_out.is_set():
             self._kill_if_current(process, connection)
-            raise BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
+            raise timeout_error()
 
         if isinstance(result, BaseException):
             if _UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(result)):
@@ -231,6 +311,7 @@ class BenchmarkWorker:
         connection: Connection,
         *,
         raise_on_failure: bool = True,
+        close_connection: bool = True,
     ) -> None:
         with self._lock:
             if (
@@ -238,7 +319,12 @@ class BenchmarkWorker:
                 and connection is self._parent_connection
                 and self._fatal_error is None
             ):
-                self._kill()
+                self._kill(close_connection=False)
+            # The watchdog may already have cleared the worker's state. The
+            # waiting thread still owns this connection and must close it.
+            if close_connection:
+                with contextlib.suppress(Exception):
+                    connection.close()
             fatal_error = self._fatal_error
         if raise_on_failure and fatal_error is not None:
             raise BenchmarkWorkerUnkillable(fatal_error)
@@ -248,14 +334,14 @@ class BenchmarkWorker:
         if fatal_error is not None:
             raise BenchmarkWorkerUnkillable(fatal_error)
 
-    def _kill(self) -> None:
+    def _kill(self, *, close_connection: bool = True) -> None:
         process, connection = self._process, self._parent_connection
         if process is not None:
             with contextlib.suppress(Exception):
                 signal_process_tree(process, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 process.join(timeout=_REAP_TIMEOUT_SECONDS)
-        if connection is not None:
+        if close_connection and connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()
         if process is not None and process.is_alive():

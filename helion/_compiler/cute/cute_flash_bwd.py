@@ -32,6 +32,11 @@ Emission follows flash-attention main's SM100 backward: 512 threads /
 16 warps (4 dQ-reduce, 8 compute, 1 MMA, 1 load), TMEM-resident dK/dV,
 P/dS written back over S/dP in TMEM, and dQ accumulated into the row-major
 fp32 buffer with ``cp.reduce.async.bulk``.
+
+``cute_flash_bwd_family`` = "row_mma" (``cute_flash_bwd_row_mma.py``) swaps
+this body for register-MMA row programs on small grids, where the per-CTA
+fixed cost of the tcgen05 kernel dominates; the surface, matcher and host
+tensors are shared.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ import torch
 if TYPE_CHECKING:
     import sympy
 
+    from ..device_function import TensorArg
     from ..device_ir import DeviceIR
     from ..generate_ast import GenerateAST
     from .flex_bwd_match import FlexBwdPlan
@@ -2562,6 +2568,23 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     env = CompileEnvironment.current()
     io_dtype_str = env.backend.dtype_str(plan.io_dtype)
+    from .cute_flash_bwd_row_mma import FLASH_BWD_FAMILY_KEY
+    from .cute_flash_bwd_row_mma import FLASH_BWD_ROW_FAMILY
+
+    if df.config.config.get(FLASH_BWD_FAMILY_KEY) == FLASH_BWD_ROW_FAMILY:
+        # The register-MMA row programs (``cute_flash_bwd_family`` =
+        # "row_mma"): one CTA per (group, kv_rows) tile, no TMA / TMEM. A
+        # knob triple the plan cannot run is declined (fail closed; the
+        # normalizer keeps searched configs legal).
+        return _codegen_flash_bwd_row_mma(
+            cg,
+            match,
+            args=args,  # type: ignore[arg-type]
+            io_dtype=io_dtype_str,
+            scale2_expr=scale2_expr,
+            out_scale_expr=out_scale_expr,
+            dk_scale_expr=dk_scale_expr,
+        )
     # The 2-CTA cluster family (FA4's d128 configuration): a cluster of two
     # CTAs shares one 256-row KV tile, each CTA loads half of Q/dO and drains
     # half of dQ, and the dS halves are exchanged over DSMEM. An autotuner
@@ -2660,6 +2683,75 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     return True
 
 
+def _codegen_flash_bwd_row_mma(
+    cg: GenerateAST,
+    match: AttentionBwdMatch,
+    *,
+    args: dict[str, TensorArg],
+    io_dtype: str,
+    scale2_expr: str,
+    out_scale_expr: str,
+    dk_scale_expr: str,
+) -> bool:
+    """Emit the register-MMA row-program backward (``cute_flash_bwd_row_mma``)."""
+    import ast as ast_module
+
+    from .cute_flash_bwd_row_mma import FLASH_BWD_ROW_PLAN_KIND
+    from .cute_flash_bwd_row_mma import emit_flash_bwd_row_mma_device_body
+    from .cute_flash_bwd_row_mma import emit_flash_bwd_row_mma_module_statements
+    from .cute_flash_bwd_row_mma import flash_bwd_row_facts
+    from .cute_flash_bwd_row_mma import flash_bwd_row_knobs
+    from .cute_flash_bwd_row_mma import flash_bwd_row_plan
+    from .cute_flash_bwd_row_mma import flash_bwd_row_warps
+
+    df = cg.device_function
+    plan = match.plan
+    facts = flash_bwd_row_facts(plan)
+    kv_rows, q_split, q_chunk = flash_bwd_row_knobs(df.config.config)
+    stages = flash_bwd_row_plan(
+        facts, kv_rows=kv_rows, q_split=q_split, q_chunk=q_chunk
+    )
+    if stages is None:
+        return False
+    warps = flash_bwd_row_warps(kv_rows, q_split)
+    emit_flash_bwd_row_mma_module_statements(cg)
+    names = {role: arg.name for role, arg in args.items()}
+    cg.cute_wrapper_plans.append(  # type: ignore[attr-defined]
+        {
+            "kind": FLASH_BWD_ROW_PLAN_KIND,
+            **{f"{role}_name": name for role, name in names.items()},
+            "head_dim": plan.head_dim,
+            "dtype": io_dtype,
+            "kv_rows": kv_rows,
+            "q_split": q_split,
+            "q_chunk": q_chunk,
+            "stages": stages,
+            "row_warps": warps,
+            "total_tiles": plan.num_groups * (plan.n_dim // kv_rows),
+        }
+    )
+    df.placeholder_args.update(names.values())
+    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    df.cute_state.attention_flash_threads = 32 * warps
+    body_src = emit_flash_bwd_row_mma_device_body(
+        plan=plan,
+        io_dtype=io_dtype,
+        scale2_expr=scale2_expr,
+        out_scale_expr=out_scale_expr,
+        dk_scale_expr=dk_scale_expr,
+        kv_rows=kv_rows,
+        q_split=q_split,
+        q_chunk=q_chunk,
+        stages=stages,
+        **{f"{role}_name": name for role, name in names.items()},
+    )
+    wrapped = ast_module.parse("if True:\n" + body_src)
+    assert isinstance(wrapped.body[0], ast_module.If)
+    df.body = list(wrapped.body[0].body)
+    df.preamble = []
+    return True
+
+
 def _flash_bwd_two_cta_allowed(plan: AttentionBwdPlan) -> bool:
     """Shapes the cluster-of-2 family supports: head_dim 128 with 256-row
     cluster KV tiles that never straddle a (batch, head) group; causal walks
@@ -2697,9 +2789,12 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
 
     if not _flash_block_sizes_reachable(env, targets):
         return False
+    from .cute_flash_bwd_row_mma import flash_bwd_row_facts
+
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=_flash_bwd_two_cta_allowed(match.plan),
+        row_mma_facts=flash_bwd_row_facts(match.plan),
     )
     return True
 

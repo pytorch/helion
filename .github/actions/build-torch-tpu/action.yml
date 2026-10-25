@@ -12,8 +12,9 @@ runs:
       run: |
         set -euxo pipefail
         source .venv/bin/activate
+        # Use PyPI for dependencies: the JAX mirror can advertise missing
+        # transitive-dependency wheels (e.g. ml-dtypes). Keep libtpu's wheel links.
         uv pip install \
-          --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
           --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
           --pre \
           'jax==0.11.2' 'jaxlib==0.11.2' 'libtpu==0.0.50' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'

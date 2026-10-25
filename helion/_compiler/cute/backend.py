@@ -28,6 +28,7 @@ from ..backend import BackendState
 from ..backend import _active_loop_block_ids
 from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
+from ..backend import _attention_pattern_fits_root
 from ..backend import _attention_softmax_pattern_head_dim
 from ..backend import _grouped_rank3_specialized_mma_plan
 from ..backend import _kernel_specialized_mma_impl
@@ -958,6 +959,13 @@ def _attention_loop_shape(
     )
     if pattern is None:
         return None
+    # Operand facts without a fused body (fp8 operands on an odd KV tile count
+    # or with the canonical V) or a K/V batch index off the root keep the
+    # generic lowering; the search surface declines them the same way.
+    if not _attention_pattern_fits_root(
+        pattern, root_grid_ids, kv_block_id=block_ids[0]
+    ):
+        return None
 
     env = CompileEnvironment.current()
 
@@ -1670,6 +1678,18 @@ class CuteBackend(Backend):
         return True
 
     @property
+    def pads_small_matmul_dims(self) -> bool:
+        # The ordinary lowerings read and write exactly the extent (a tile
+        # past a small M / N is declined or mis-folded, not masked), so the
+        # frontend keeps every matmul dim's search ceiling at the extent.
+        # The one lowering that runs a padded tile -- the ``cute_mma_dag``
+        # warp mode over a ragged root axis (a 16-row MMA atom over M < 16:
+        # zero-filled operand rows, zero side loads, guarded stores) --
+        # raises that block's ceiling to its atom from its own facts
+        # registration (``mma_dag_ragged_ceilings``).
+        return False
+
+    @property
     def dynamo_captures_kernel_launch(self) -> bool:
         return False
 
@@ -1728,6 +1748,10 @@ class CuteBackend(Backend):
             "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
             "cute_async_store_policy": weighted_choice(async_store_policy_weights),
             "cute_store_policy": weighted_choice(async_store_policy_weights),
+            # The exact division forms are bitwise identical; the redo form
+            # is the measured row-kernel winner, the plain form covers
+            # kernels at the register cap (see hoist_loop_invariant_recip).
+            "cute_exact_div_form": weighted_choice({"redo": 3.0, "plain": 1.0}),
             "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
             "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
@@ -1771,8 +1795,16 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_AUX_KEY
+        from .cute_mma_dag import MMA_DAG_AUX_REGISTER
         from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
+        from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
+        from .cute_mma_dag import MMA_DAG_DERIVED_KEY
+        from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+        from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
         from .cute_mma_dag import MMA_DAG_KEY
+        from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+        from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
         from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
         from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
@@ -1785,7 +1817,13 @@ class CuteBackend(Backend):
         if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
             return True
         # Pre-screen the register / shared-memory budget of the warp-MMA
-        # dataflow owner (``normalize`` repairs or refuses the same configs).
+        # dataflow owner (``normalize`` repairs or refuses the same configs)
+        # under the config's own routes and layouts: the split epilogue
+        # admits the 128-column tensor-memory tiles the row layout's budget
+        # refuses (the indexer's 128 x 128 split at (512, 4096) screened
+        # under the row layout never reached a benchmark), the lookahead
+        # schedule doubles the dot slot, the pass route sizes the chains'
+        # tiles.
         block_sizes = config.config.get("block_sizes")
         if not isinstance(block_sizes, list):
             return True
@@ -1824,6 +1862,21 @@ class CuteBackend(Backend):
                 config.config.get("cute_mma_dag_warps"),
                 config.config.get("cute_mma_dag_stages"),
                 cast("str", mode),
+                cast(
+                    "str",
+                    config.config.get(MMA_DAG_DERIVED_KEY, MMA_DAG_DERIVED_EXCHANGE),
+                ),
+                epilogue=cast(
+                    "str", config.config.get(MMA_DAG_EPILOGUE_KEY, MMA_DAG_EPILOGUE_ROW)
+                ),
+                lookahead=cast(
+                    "str",
+                    config.config.get(MMA_DAG_LOOKAHEAD_KEY, MMA_DAG_LOOKAHEAD_OFF),
+                ),
+                aux=cast(
+                    "str",
+                    config.config.get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER),
+                ),
             )
             is None
         )
@@ -2028,6 +2081,7 @@ class CuteBackend(Backend):
                 "cute_materialized_operand_schedule",
                 "cute_fragment_scan",
                 "cute_fragment_reduction",
+                "cute_fp32_dot",
                 "cute_fragment_threads",
                 "cute_fragment_register_loads",
                 "cute_fragment_producer_cache",
@@ -2064,12 +2118,20 @@ class CuteBackend(Backend):
                 "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
+                "cute_fragment_padded_rows",
+                "cute_fragment_unrolled_loops",
+                "cute_fragment_vector_io",
+                "cute_fragment_batched_loads",
+                "cute_fragment_split_k",
+                "cute_fragment_mma_rows",
+                "cute_fragment_slab_loads",
                 "cute_fragment_warp_results",
                 "cute_fragment_private_scalar_loops",
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
             or key == "cute_store_policy"
+            or key == "cute_exact_div_form"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
             or key == "cute_simt_mma"
@@ -2098,6 +2160,8 @@ class CuteBackend(Backend):
             or key == "cute_scalar_epilogue_keep_inputs"
             or key == "cute_scalar_epilogue_owner_fold"
             or key == "cute_warp_fp32_redux"
+            or key == "cute_register_tile_warp_fold"
+            or key == "cute_register_tile_store_first"
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
@@ -2164,6 +2228,9 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_persistent"
             or key == "cute_mma_dag_cluster"
             or key == "cute_mma_dag_split"
+            or key == "cute_mma_dag_derived"
+            or key == "cute_mma_dag_epilogue"
+            or key == "cute_mma_dag_lookahead"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -2210,6 +2277,17 @@ class CuteBackend(Backend):
         # The CuTe DSL does not expose a Triton-style precompile entry point;
         # the autotuner has to compile + benchmark each config inline.
         return False
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        # A SIMT default config can run 1000x slower than the kernel's best
+        # (an fp8 attention default at 1.5-11 s per launch): the timer's
+        # five-launch estimate plus its warmup then exceeds the benchmark
+        # timeout, the default and every seed are dropped, and the search
+        # ends in NoConfigFound. A launch that already exceeds the timing
+        # window is its own sample (the regular path times one repetition of
+        # such a kernel too), so probing first costs nothing in precision and
+        # keeps a slow seed inside the timeout.
+        return True
 
     def supports_parallel_render(self) -> bool:
         # Code generation only reads the device facts the render pool
@@ -2491,6 +2569,7 @@ class CuteBackend(Backend):
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
+            "_cute_fold_dot": "from helion._compiler.cute.fold_helpers import fold_dot as _cute_fold_dot",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_float4_e2m1fn_x16_dot_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_dot_float32 as _cute_float4_e2m1fn_x16_dot_float32",
@@ -2537,6 +2616,9 @@ class CuteBackend(Backend):
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
+            "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
+            "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
+            "_cute_exact_div_redo_f32": "from helion._compiler.cute.exact_division import exact_div_redo_f32 as _cute_exact_div_redo_f32",
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",

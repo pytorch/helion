@@ -38,7 +38,12 @@ if __name__ == "__main__":
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", required=True)
-    parser.add_argument("--shape", required=True, type=int, choices=[0, 1, 2])
+    parser.add_argument(
+        "--shape",
+        required=True,
+        type=int,
+        help="Shape index of the module (see example_cases.shape_count)",
+    )
     parser.add_argument("--case", default="00_forward")
     parser.add_argument(
         "--provider", default="cute", choices=["cute", "triton", "baselines"]
@@ -161,9 +166,15 @@ def main() -> None:
     configure_environment(args)
     from benchmarks.cute import example_baselines as baseline
     from benchmarks.cute.example_cases import collect
+    from benchmarks.cute.example_cases import shape_count
     import torch
     from torch.utils._pytree import tree_map_only
 
+    if not 0 <= args.shape < shape_count(args.module):
+        raise SystemExit(
+            f"--shape {args.shape} out of range: {args.module} has "
+            f"{shape_count(args.module)} shapes"
+        )
     torch.cuda.set_device(0)
     cases = collect(args.module, args.shape)
     case = next(c for c in cases if c.name == args.case)

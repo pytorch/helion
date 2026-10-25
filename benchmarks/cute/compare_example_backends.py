@@ -50,6 +50,7 @@ def write_json(path: Path, value: object) -> None:
 def worker(args: argparse.Namespace) -> None:
     from benchmarks.cute import example_baselines as baseline
     from benchmarks.cute.example_cases import collect
+    from benchmarks.cute.example_cases import shape_count
     import torch
     from torch.utils._pytree import tree_map_only
 
@@ -67,6 +68,9 @@ def worker(args: argparse.Namespace) -> None:
     started = time.monotonic()
     try:
         torch.cuda.set_device(0)
+        if args.provider == "inventory" and args.shape >= shape_count(args.module):
+            result.update(status="skipped", cases=[])
+            return
         cases = collect(args.module, args.shape)
         if args.provider == "inventory":
             result.update(
@@ -265,8 +269,8 @@ def run(args: argparse.Namespace) -> None:
     if len(set(modules)) != len(modules):
         raise ValueError("Duplicate example modules")
     shapes = [int(value) for value in args.shapes.split(",")]
-    if not shapes or len(set(shapes)) != len(shapes) or set(shapes) - {0, 1, 2}:
-        raise ValueError("Shapes must be distinct members of 0,1,2")
+    if not shapes or len(set(shapes)) != len(shapes) or min(shapes) < 0:
+        raise ValueError("Shapes must be distinct non-negative workload indices")
     cases = set(args.cases.split(",")) if args.cases else set()
     seed = args.seed if args.seed is not None else secrets.randbits(63)
     args.output.mkdir(parents=True, exist_ok=False)

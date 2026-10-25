@@ -9,6 +9,11 @@ whole K through the synthetic-lane fold, with the contraction at any position
 of the operand (``w[:, :]`` or ``wt[:, :].T``).  A matmul that contracts the
 flattened tile's own rows cannot use that tile's lane loop and is refused
 rather than keeping one lane's products.
+
+The kernels pin ``dot_precision="ieee"``: under Helion's default (``"tf32"``, the
+same as Triton's ``tl.dot``) an fp32 dot now takes the tf32 tensor-core path on
+the CuTe backend too, and this module tests the exact SIMT fallback's thread
+plans.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from helion._testing import onlyBackends
 import helion.language as hl
 
 
-@helion.kernel(backend="cute", static_shapes=True)
+@helion.kernel(backend="cute", static_shapes=True, dot_precision="ieee")
 def _full_slice_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0), w.size(1)], device=x.device)
     for tile_m in hl.tile(x.size(0)):
@@ -32,7 +37,7 @@ def _full_slice_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel(backend="cute", static_shapes=True)
+@helion.kernel(backend="cute", static_shapes=True, dot_precision="ieee")
 def _full_slice_matmul_transposed(x: torch.Tensor, wt: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0), wt.size(0)], device=x.device)
     for tile_m in hl.tile(x.size(0)):
@@ -40,7 +45,7 @@ def _full_slice_matmul_transposed(x: torch.Tensor, wt: torch.Tensor) -> torch.Te
     return out
 
 
-@helion.kernel(backend="cute", static_shapes=True)
+@helion.kernel(backend="cute", static_shapes=True, dot_precision="ieee")
 def _row_contraction(
     x: torch.Tensor, g: torch.Tensor, parts: torch.Tensor
 ) -> torch.Tensor:
@@ -74,7 +79,7 @@ class TestCuteFullSliceMatmulThreads(TestCase):
             with self.subTest(fn=fn.name):
                 code, out = code_and_output(fn, (x, rhs), block_sizes=[32])
                 torch.testing.assert_close(out, x @ w, rtol=1e-3, atol=1e-3)
-                self.assertIn("mm_fold_k", code)
+                self.assertIn("_cute_fold_dot", code)
                 # The fold covers the whole K per output element, so K runs
                 # on one thread and the 32 rows and 16 columns keep theirs.
                 self.assertIn("block=(16, 32, 1)", code)

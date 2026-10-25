@@ -19,6 +19,7 @@ from helion._compiler.cute.epilogue_fanout import combine_stores
 from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -296,6 +297,54 @@ def test_late_acquire_requires_shared_fanout_during_normalization() -> None:
     repaired = helion.Config.from_dict(raw)
     bound.config_spec.normalize(repaired, _fix_invalid=True)
     assert "tcgen05_c_acquire_placement" not in repaired.config
+
+
+def test_fanout_repair_is_a_fixed_point_of_strict_normalization() -> None:
+    """A neighbour keeping ``before_store`` beside an unsupported shared fanout.
+
+    The autotuner canonicalizes candidates with ``_fix_invalid=True`` once and
+    then validates them strictly (render-ahead, ``has_compiled_config``), so
+    the repair has to drop the acquire placement together with the fanout it
+    depends on; repairing only the fanout key left a config strict
+    normalization rejected ("before_store requires a proved shared fanout").
+    """
+    bound = original_bound()
+    spec = bound.config_spec
+    raw = deepcopy(paired_config(bound).config)
+    for key in (
+        "tcgen05_region_ab_stages",
+        "tcgen05_region_c_stages",
+        "tcgen05_materialized_pdl",
+    ):
+        raw.pop(key)
+    # The shape-2 offender: a flat non-persistent one-CTA neighbour, outside
+    # the fanout's static-persistent role-local schedule.
+    raw["pid_type"] = "flat"
+    raw["tcgen05_persistence_model"] = "non_persistent"
+    raw["tcgen05_cluster_m"] = 1
+    raw["tcgen05_cta_group"] = "auto"
+    raw["block_sizes"] = [128, 256, 128, 256, 128, 128]
+    assert raw["tcgen05_epilogue_fanout"] == "shared"
+    assert raw["tcgen05_c_acquire_placement"] == "before_store"
+    repaired = helion.Config.from_dict(deepcopy(raw))
+    spec.normalize(repaired, _fix_invalid=True)
+    assert "tcgen05_epilogue_fanout" not in repaired.config
+    assert "tcgen05_c_acquire_placement" not in repaired.config
+    # Fixed point: strict normalization accepts the repaired config unchanged
+    # and a second repair is the identity.
+    strict = deepcopy(repaired)
+    spec.normalize(strict)
+    assert strict.config == repaired.config
+    again = deepcopy(repaired)
+    spec.normalize(again, _fix_invalid=True)
+    assert again.config == repaired.config
+    # The autotuner's own candidate path produces a strictly valid config.
+    generation = ConfigGeneration(spec)
+    _flat, canonical = generation.canonicalize_flat(
+        generation.flatten(helion.Config.from_dict(deepcopy(raw)))
+    )
+    assert canonical.config.get("tcgen05_c_acquire_placement") != "before_store"
+    spec.normalize(deepcopy(canonical))
 
 
 @pytest.mark.parametrize("fault", ("pre_mismatch", "late_mismatch", "unsafe"))

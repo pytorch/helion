@@ -421,10 +421,12 @@ def host_function_tcgen05_rowvec_aux_facts(
         return None
     output_itemsize: int | None = None
     rows: list[Tcgen05RowvecAuxRow] = []
+    output_count = 0
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
         analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
             continue
+        output_count = max(output_count, len(analyzed_stores))
         for store_node, chain in analyzed_stores:
             output = _output_tensor_from_store_node(store_node)
             if output is None or (
@@ -450,7 +452,42 @@ def host_function_tcgen05_rowvec_aux_facts(
                 )
     if output_itemsize is None:
         return None
-    return Tcgen05RowvecAuxFacts(output_itemsize=output_itemsize, rows=tuple(rows))
+    return Tcgen05RowvecAuxFacts(
+        output_itemsize=output_itemsize,
+        rows=tuple(rows),
+        output_count=max(output_count, 1),
+    )
+
+
+def host_function_tcgen05_aux_loads_on_every_store(
+    host_function: HostFunction,
+) -> bool:
+    """Whether every analyzed tcgen05 store chain carries an auxiliary load.
+
+    ``tcgen05_aux_load_placement="pre_acc_wait"`` places *per-subtile*
+    auxiliary loads; the store lowering refuses the placement at a store whose
+    epilogue chain has none (``memory_ops``: "no per-subtile auxiliary loads
+    to place") unless the shared fanout epilogue merges that chain with one
+    that has. :func:`host_function_has_tcgen05_aux_kernel_pattern` is True as
+    soon as *some* store loads an auxiliary operand (two fresh outputs of one
+    accumulator where only the second reads a residual), which is the surface
+    for the aux-fused knobs but not a proof that the placement renders. This
+    is that proof for the plain (non-fanout) epilogue: every store that
+    consumes a detected matmul loads an auxiliary operand. False without an
+    analyzed matmul store.
+    """
+    graphs = host_function.device_ir.graphs
+    if not graphs:
+        return False
+    found = False
+    for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        if analyzed_stores is None:
+            continue
+        found = True
+        if not all(chain.auxiliary_tensor_loads for _, chain in analyzed_stores):
+            return False
+    return found
 
 
 def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
