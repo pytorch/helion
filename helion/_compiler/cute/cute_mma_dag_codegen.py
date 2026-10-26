@@ -206,7 +206,7 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
             )
         cg.cute_wrapper_plans.append(wrapper)
     cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
-    df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
+    df.cute_state.owned_root_block_dims = (plan.launch_threads, 1, 1)
     return True
 
 
@@ -877,11 +877,16 @@ class _Evaluator:
         # unpredicated loads.
         pred = None if bounds is None else em.bind("md_ok", em.pred_int(bounds))
         shared = em.aux_shared_level(access) if pred is None else None
-        if shared is not None and em.aux_synced:
-            # An fp32 vector the aux ring copies once per CTA (``AuxRing.
-            # shared``: the carry rescale's decay row, a derived value's gate
-            # row): this iteration's stage holds its block extent, published
-            # by the iteration barrier, read at the lane's own coordinate.
+        if shared is not None:
+            # An fp32 scalar / vector the aux ring copies once per CTA into
+            # the loop's side tile (``AuxRing.shared``: the pass's decay
+            # scalar and gate row, the carry rescale's, a derived value's
+            # row): this iteration's slot holds its block extent, landed and
+            # published by the previous iteration's wait and barrier (the
+            # tile rides one group ahead of the operand tiles), so it is
+            # read at the lane's own coordinate anywhere in the iteration.
+            if not em.aux_synced:
+                em.aux_shared_early.add(shared)
             return em.bind("md_v", em.aux_shared_read(shared, access, coords))
         aux = em.aux_level(access, coords) if pred is None else None
         if aux is not None:
@@ -1453,10 +1458,22 @@ class _Emitter:
         self.aux_sites: dict[int, dict[tuple[Node, Coords], int]] = {}
         self.aux_anchors: dict[int, list[tuple[_Hoist, dict[int, str], str]]] = {}
         self.aux_closed: set[int] = set()
+        # The ``for`` lines of the innermost loops being emitted (the pre-loop
+        # wait of a side tile read ahead of the iteration barrier goes right
+        # ahead of the ``for``, once the body is rendered): kept current by
+        # ``insert_line`` like the hoist anchors, since the body's hoisted
+        # lines land ahead of the loop's prologue, above the ``for``.
+        self.loop_entries: list[_Hoist] = []
         # The current iteration of an aux-ring loop waited for its stage /
         # passed the barrier that publishes the stage's vectors.
         self.aux_waited = False
         self.aux_synced = False
+        # Per aux-ring loop being iterated, the side tile slot of the current
+        # iteration (``AuxRing.shared``; bound at the iteration top), and the
+        # loops whose side tile is read ahead of the iteration barrier (the
+        # first iteration then needs the pre-loop wait and barrier).
+        self.aux_shared_stage: dict[int, str] = {}
+        self.aux_shared_early: set[int] = set()
         # The TMA ring (``MMA_DAG_LOADS_TMA`` in the warp mode): (tile name,
         # load node) -> (its tensor map, its loop) -- a tile shared by two
         # loops' operands is fetched by each loop's own access --, the maps,
@@ -1615,8 +1632,9 @@ class _Emitter:
             )
             for node, spec in staging_specs.items()
         }
-        # The fp32 vectors the aux rings copy once per CTA and the lanes
-        # read by coordinate (``AuxRing.shared``), by node.
+        # The fp32 scalars and vectors the aux rings copy once per CTA into
+        # their side tiles and the lanes read by coordinate
+        # (``AuxRing.shared``), by node.
         self.shared_aux_nodes: set[Node] = {
             node for ring in plan.aux_rings.values() for node in ring.shared
         }
@@ -1669,9 +1687,9 @@ class _Emitter:
             if access.node in stored or access.node in result:
                 continue
             if access.node in self.shared_aux_nodes:
-                # Staged in its loop's aux ring (``cute_mma_dag_aux='ring'``):
-                # read from there, behind the iteration barrier; the two
-                # routes never share a load.
+                # Staged in its loop's aux ring's side tile (``cute_mma_dag_
+                # aux='ring'``): read from there; the two routes never share
+                # a load.
                 continue
             if len(access.tile_dims) != 1 or access.dtype.itemsize != 4:
                 continue
@@ -1749,13 +1767,15 @@ class _Emitter:
         self.insert_line(hoist, line)
 
     def insert_line(self, anchor: _Hoist, line: str) -> None:
-        """Insert ``line`` at ``anchor`` (a loop's hoist point or an aux issue
-        anchor), keeping every later anchor's position current."""
+        """Insert ``line`` at ``anchor`` (a loop's hoist point, an aux issue
+        anchor or a loop's ``for`` line), keeping every later anchor's
+        position current."""
         position = anchor.position
         self.lines.insert(position, f"{anchor.indent}{line}")
         anchors = [
             *self.hoists,
             *(a for v in self.aux_anchors.values() for a, _, _ in v),
+            *self.loop_entries,
         ]
         for later in anchors:
             if later is not anchor and later.position >= position:
@@ -2389,10 +2409,11 @@ class _Emitter:
         return f"{_RUNTIME}.{op}({address} + {half})"
 
     def aux_shared_level(self, access: Access) -> int | None:
-        """The innermost ring loop being emitted whose aux ring copies vector
-        ``access`` once per CTA (``AuxRing.shared``; None: none does): read
-        by coordinate at any site of the loop body, behind the iteration
-        barrier (``aux_synced``)."""
+        """The innermost ring loop being iterated whose aux ring copies
+        scalar / vector ``access`` once per CTA into its side tile
+        (``AuxRing.shared``; None: none does): read by coordinate at any
+        site of the iteration (the slot landed and was published an
+        iteration ahead)."""
         if not self.hoists:
             return None
         loop = self.hoists[-1].loop
@@ -2401,23 +2422,102 @@ class _Emitter:
             ring is None
             or access.node not in ring.shared
             or self.program.level(access) != loop
+            or loop not in self.aux_shared_stage
         ):
             return None
         return loop
 
+    def has_aux_shared(self, loop: int) -> bool:
+        """Whether ``loop``'s aux ring has a side tile."""
+        ring = self.plan.aux_rings.get(loop)
+        return ring is not None and bool(ring.shared)
+
+    def aux_shared_base(self, loop: int, slot: str) -> str:
+        """Shared address of side tile slot ``slot`` of ``loop``'s aux ring
+        (the slots follow the ring's ``stages`` stages of per-thread words
+        and runs)."""
+        ring = self.plan.aux_rings[loop]
+        base = self.aux_base(loop)
+        region = ring.shared_base - ring.offset
+        if region:
+            base = f"{base} + {region}"
+        return f"{base} + {slot} * {ring.shared_bytes}"
+
+    def aux_shared_slot(self, loop: Loop, value: str) -> str:
+        """The side tile slot of ``loop``'s iteration ``value``: the
+        iteration's ordinal modulo the ``stages + 1`` slots."""
+        ring = self.plan.aux_rings[loop.index]
+        begin = self.loop_bounds(loop)[0]
+        offset = f"({value})" if begin == "0" else f"(({value}) - {begin})"
+        return f"{offset} % {ring.shared_slots}"
+
     def aux_shared_read(self, loop: int, access: Access, coords: Coords) -> str:
-        """The current iteration's element of shared vector ``access`` at
-        ``coords`` (its one tile coordinate) from the aux ring's stage."""
+        """The current iteration's element of side tile entry ``access`` at
+        ``coords`` (its one tile coordinate; a scalar has none) from the
+        iteration's slot."""
         ring = self.plan.aux_rings[loop]
         _elements, offset = ring.shared[access.node]
-        address = (
-            f"{self.aux_stage_base(loop, self.stage_var(loop))}"
-            f" + {ring.shared_offset + offset}"
-        )
-        coord = coords[access.tile_positions[0]]
-        if coord != "0":
-            address = f"{address} + ({coord}) * 4"
+        address = self.aux_shared_base(loop, self.aux_shared_stage[loop])
+        if offset:
+            address = f"{address} + {offset}"
+        if access.tile_dims:
+            coord = coords[access.tile_positions[0]]
+            if coord != "0":
+                address = f"{address} + ({coord}) * 4"
         return f"{_RUNTIME}.lds_f32({address})"
+
+    def emit_aux_shared(
+        self, loop: Loop, values: dict[int, str], slot: str | None = None
+    ) -> None:
+        """``cp.async`` the side tile of ``loop``'s iteration at ``values``
+        into its slot (``slot``, or the iteration's own): the scalar by
+        thread 0, element ``t`` of each vector by thread ``t`` round robin
+        over the CTA, 4 bytes each (no commit: the tile rides the group
+        being issued)."""
+        ring = self.plan.aux_rings[loop.index]
+        threads = ring.threads
+        if slot is None:
+            slot = self.aux_shared_slot(loop, values[loop.index])
+        slot = self.aux_shared_base(loop.index, slot)
+        for node, (elements, offset) in ring.shared.items():
+            access = self.accesses[node]
+            source = self.iteration_base_expr(access, values)
+            target = f"{slot} + {offset}" if offset else slot
+            if elements == 1:
+                with self.nest("if md_tidx == 0:"):
+                    self.emit(f"{_RUNTIME}.cp_async_4({target}, {source})")
+                continue
+            stride = access.tile_dim_strides[0] * access.dtype.itemsize
+            for first in range(0, elements, threads):
+                idx = f"(md_tidx + {first})" if first else "md_tidx"
+                with (
+                    self.nest(f"if {idx} < {elements}:")
+                    if elements - first < threads
+                    else contextlib.nullcontext()
+                ):
+                    self.emit(
+                        f"{_RUNTIME}.cp_async_4({target} + {idx} * 4,"
+                        f" {source} + cutlass.Int64({idx}) * {stride})"
+                    )
+
+    def emit_aux_shared_ahead(
+        self, loop: Loop, outer: dict[int, str], ahead: int
+    ) -> None:
+        """The side tile of iteration ``begin + ahead`` of ``loop`` (at the
+        enclosing loops' values ``outer``; slot ``ahead`` of the fresh
+        ring), guarded against the trip count where it is not static."""
+        if not self.has_aux_shared(loop.index):
+            return
+        begin, end, trip_static = self.loop_bounds(loop)
+        value = f"({begin} + {ahead})" if ahead else begin
+        values = {**outer, loop.index: value}
+        slot = str(ahead % self.plan.aux_rings[loop.index].shared_slots)
+        if trip_static is not None:
+            if ahead < trip_static:
+                self.emit_aux_shared(loop, values, slot)
+            return
+        with self.nest(f"if {value} < {end}:"):
+            self.emit_aux_shared(loop, values, slot)
 
     def aux_run_values(self, loop: int, access: Access, packet: str) -> list[str]:
         """The fp32 values of the run of ``access`` the packet at chunk
@@ -2468,7 +2568,8 @@ class _Emitter:
     ) -> list[str]:
         """``cp.async`` of each aux site's word (a 16-bit element copies the
         aligned word holding it) and of each run of the iteration at
-        ``values`` into the thread's slots at ``stage``."""
+        ``values`` into the thread's slots at ``stage`` (the side tile of
+        an iteration rides one group ahead: ``emit_aux_shared``)."""
         lines: list[str] = []
         for (node, coords), slot in self.aux_sites.get(loop, {}).items():
             access = self.accesses[node]
@@ -2501,27 +2602,6 @@ class _Emitter:
                 )
                 if units - first < threads:
                     lines.extend((f"if {chunk} < {units}:", f"    {copy}"))
-                else:
-                    lines.append(copy)
-        for node, (elements, offset) in ring.shared.items():
-            # The vector's block extent: element ``t`` by thread ``t``, round
-            # robin over the CTA, 4 bytes each (read by coordinate behind the
-            # iteration barrier).
-            access = self.accesses[node]
-            source = self.df.new_var("md_as")
-            lines.append(f"{source} = {self.iteration_base_expr(access, values)}")
-            target = (
-                f"{self.aux_stage_base(loop, stage)} + {ring.shared_offset + offset}"
-            )
-            stride = access.tile_dim_strides[0] * access.dtype.itemsize
-            for first in range(0, elements, threads):
-                idx = f"(md_tidx + {first})" if first else "md_tidx"
-                copy = (
-                    f"{_RUNTIME}.cp_async_4({target} + {idx} * 4,"
-                    f" {source} + cutlass.Int64({idx}) * {stride})"
-                )
-                if elements - first < threads:
-                    lines.extend((f"if {idx} < {elements}:", f"    {copy}"))
                 else:
                     lines.append(copy)
         return lines
@@ -4722,10 +4802,40 @@ class _Emitter:
                     self.async_pending = True
                 else:
                     self.emit_ring_prologue(loop, self.values)
+            elif ring and self.has_aux_shared(loop.index):
+                # One stage: the first iteration's side tile goes out ahead
+                # of the loop in a group of its own.
+                self.emit_aux_shared_ahead(loop, self.values, 0)
+                self.commit_group()
+                self.async_pending = True
+            # The ``for`` line: the body's loop-invariant side loads and
+            # redirected values are hoisted ahead of the prologue while it
+            # renders, so ``insert_line`` keeps the entry current.
+            entry = _Hoist(len(self.lines), self.indent, len(self.values), loop.index)
+            self.loop_entries.append(entry)
             with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
                 self.values[loop.index] = var
                 self.emit_iteration(loop, begin, end, ring, body_written)
                 del self.values[loop.index]
+            self.aux_shared_stage.pop(loop.index, None)
+            assert self.loop_entries.pop() is entry
+            assert self.lines[entry.position].lstrip().startswith(f"for {var} in ")
+            if ring and loop.index in self.aux_shared_early:
+                # The side tile is read ahead of the iteration barrier (the
+                # carry rescale's scalar at the top, the pass's gate row):
+                # the first iteration's tile rode the first group, so it is
+                # landed, and published to every lane, before the loop
+                # (iteration ``i``'s wait and barrier do the same for the
+                # side tile of ``i + 1``).  Read behind the barrier alone,
+                # the tile needs nothing ahead of the loop: the first
+                # iteration's wait and barrier publish the tiles of
+                # iterations 0 and 1 together, and the group's operand
+                # packets keep landing under the iteration's early work.
+                for line in (
+                    f"cute.arch.cp_async_wait_group({max(self.plan.stages - 2, 0)})",
+                    self.sync,
+                ):
+                    self.insert_line(entry, line)
             if loop.index in self.tma_tx:
                 count = self.tma_count(loop.index)
                 self.emit(f"{count} = {count} + ({end} - {begin})")
@@ -4761,7 +4871,10 @@ class _Emitter:
         ``outer``: the first ``stages - 1`` iterations' tiles, one commit
         group each (an iteration past the end commits an empty group so the
         wait depth stays uniform); iteration ``ahead`` takes ring and raw
-        slot ``ahead`` (below the raw ring's depth of ``stages - 1``)."""
+        slot ``ahead`` (below the raw ring's depth of ``stages - 1``).  The
+        aux ring's side tiles ride one group ahead of their operand tiles:
+        group ``ahead`` carries iteration ``ahead + 1``'s (and the first
+        group iteration ``begin``'s, waited for before the loop)."""
         ring = self.ring_items(loop.index)
         begin, end, trip_static = self.loop_bounds(loop)
         stages = self.plan.stages
@@ -4783,6 +4896,9 @@ class _Emitter:
                 with self.nest(f"if {value} < {end}:"):
                     self.emit_issue(ring, values, slot, str(ahead))
                     self.aux_anchor(loop.index, values, slot)
+            if ahead == 0:
+                self.emit_aux_shared_ahead(loop, outer, 0)
+            self.emit_aux_shared_ahead(loop, outer, ahead + 1)
             self.commit_group()
         self.async_pending = True
 
@@ -4878,11 +4994,20 @@ class _Emitter:
         staged_stores = [store for store in plan.staged_stores if store.loop == index]
         if staged_stores or parity in self.tile_buffers.values():
             self.emit(f"{parity} = {var} % 2")
+        if ring and self.has_aux_shared(index):
+            self.aux_shared_stage[index] = self.bind(
+                "md_sstage", self.aux_shared_slot(loop, var)
+            )
         self.define_iteration_bases(index)
         self.evaluator = _Evaluator(self)
         if ring and stages == 1:
             self.emit_issue(ring, self.values, "0")
             self.aux_anchor(index, self.values, "0")
+            if self.has_aux_shared(index):
+                # The next iteration's side tile, landed with this group and
+                # published by the barrier below.
+                with self.nest(f"if {var} + 1 < {end}:"):
+                    self.emit_aux_shared(loop, {**self.values, index: f"({var} + 1)"})
             self.commit_group()
             self.async_pending = True
         # Work that needs no shared data overlaps the copies in flight.
@@ -4914,14 +5039,9 @@ class _Emitter:
                 (ROUTE_EXCHANGE,),
             )
             if program.early_exchange(dot, operand)
-            # (A chain reading a row of this iteration's ring slot, or a
-            # vector the aux ring copies once per CTA, waits for the slot /
-            # the barrier: its exchange runs in the body, behind its own
-            # barrier.)
-            and not any(
-                a.node in self.ring_aliases or a.node in self.shared_aux_nodes
-                for a in operand.aux_loads
-            )
+            # (A chain reading a row of this iteration's ring slot waits for
+            # the slot: its exchange runs in the body, behind its own barrier.)
+            and not any(a.node in self.ring_aliases for a in operand.aux_loads)
         ]
         for dot, operand in early:
             self.emit_exchange(dot, operand)
@@ -4965,8 +5085,8 @@ class _Emitter:
             self.emit_convert_pass(dot, operand, stage)
         self.emit_bound_tail_zero(index, stage)
         self.emit(self.sync)
-        # Every lane's aux copies of this stage (its shared vectors
-        # included) are landed and published.
+        # Every lane's aux copies of this stage are landed and published
+        # (the next iteration's side tile with them).
         self.aux_synced = True
         # The next iteration's side loads of the passes and the carry
         # rescale land in their registers while the MMAs run (issued after
@@ -5001,6 +5121,15 @@ class _Emitter:
                 ):
                     self.emit(line)
                 self.aux_closed.add(index)
+            if self.has_aux_shared(index):
+                # The side tile one iteration further: waited for at
+                # iteration ``var + ahead``, published by its barrier, read
+                # at ``var + ahead + 1`` (its slot was last read at ``var +
+                # ahead - stages``, two barriers ago).
+                with self.nest(f"if {var} + {ahead + 1} < {end}:"):
+                    self.emit_aux_shared(
+                        loop, {**self.values, index: f"({var} + {ahead + 1})"}
+                    )
             self.commit_group()
         derived_passes = plan.derived_pairs(index)
         if derived_passes:
@@ -5106,13 +5235,12 @@ class _Emitter:
             if step.acc_frag not in loop.carry_placeholders:
                 continue
             if any(
-                access.node in self.ring_aliases or access.node in self.shared_aux_nodes
+                access.node in self.ring_aliases
                 for access in program.acc_loads.get(step.node, ())
             ):
                 # The rescale reads a row of this iteration's ring slot
-                # (``_ring_aliases``) or a vector the aux ring copies once
-                # per CTA (``AuxRing.shared``): it runs behind the iteration
-                # barrier, at the dot.
+                # (``_ring_aliases``): it runs behind the iteration barrier,
+                # at the dot.
                 continue
             slot = step.slot
             reads_slot = False

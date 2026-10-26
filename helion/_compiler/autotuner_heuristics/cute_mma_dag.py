@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 from ...runtime.config import Config
@@ -26,9 +27,11 @@ from ..cute.cute_mma_dag import MMA_DAG_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute.cute_mma_dag import MMA_DAG_LOADS_TMA
 from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from ..cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from ..cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
@@ -58,6 +61,19 @@ from .registry import AutotunerHeuristic
 if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
+
+
+def _twin_maps(at: int, *maps: dict[int, Any]) -> tuple[dict[int, Any], ...]:
+    """``maps`` (seed rank -> value) after a twin of the seed at rank ``at``
+    was inserted right behind it: every key past ``at`` moves up one and
+    the twin inherits the seed's value."""
+    return tuple(
+        {
+            **{(key + 1 if key > at else key): value for key, value in m.items()},
+            **({at + 1: m[at]} if at in m else {}),
+        }
+        for m in maps
+    )
 
 
 class CuteMmaDagHeuristic(AutotunerHeuristic):
@@ -467,6 +483,72 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         lookaheads[at + 1] = lookaheads[at]
                     at += 1
                 at += 1
+        # The MMA warp (``cute_mma_dag_pass_warps='mma'``): the first
+        # tensor-memory seed -- and its pass-route twin -- again with the
+        # streamed K loop warp-specialized (the config's warps run the
+        # operand passes, one more warp issues the batches and refills; no
+        # CTA barrier in the loop), right behind each, where the loop's
+        # passes give the warp a subject at that route (se_block backward
+        # at 4096x1024 on a B200: dx 22.1 -> 21.1 us, dw 39.9 -> 35.9
+        # against the exchange-route winners, the cell 69.6 -> 63.4 us
+        # graph).  The plain seed stays the promoted default; the autotuner
+        # measures both.
+        if facts.tcgen05 is not None and facts.tcgen05.streamed:
+            top_at = next(
+                (i for i, entry in enumerate(ranked) if entry[0] == MMA_DAG_TCGEN05),
+                None,
+            )
+            twins = (
+                []
+                if top_at is None
+                else [
+                    at
+                    for at in (top_at, top_at + 1)
+                    if at < len(ranked)
+                    and ranked[at][0] == MMA_DAG_TCGEN05
+                    and (
+                        at == top_at
+                        or at in derived_variants
+                        or top_at in derived_variants
+                    )
+                    and ranked[at][1] == ranked[top_at][1]
+                ]
+            )
+            for at in sorted(twins, reverse=True):
+                mode, (sizes, warps, stages), exchange, _pass_warps = ranked[at]
+                route = derived_variants.get(at, MMA_DAG_DERIVED_EXCHANGE)
+                if (
+                    mma_dag_pass_warps_reason(
+                        facts,
+                        warps,
+                        stages,
+                        MMA_DAG_TCGEN05,
+                        MMA_DAG_PASS_WARPS_MMA,
+                        route,
+                    )
+                    is not None
+                    or mma_dag_config_reason(
+                        facts,
+                        sizes,
+                        warps,
+                        stages,
+                        MMA_DAG_TCGEN05,
+                        route,
+                        epilogue=epilogues.get(at, MMA_DAG_EPILOGUE_ROW),
+                        lookahead=lookaheads.get(at, MMA_DAG_LOOKAHEAD_OFF),
+                        persistent=at in persistent,
+                        pass_warps=MMA_DAG_PASS_WARPS_MMA,
+                    )
+                    is not None
+                ):
+                    continue
+                ranked.insert(
+                    at + 1,
+                    (mode, (sizes, warps, stages), exchange, MMA_DAG_PASS_WARPS_MMA),
+                )
+                persistent, epilogues, lookaheads, derived_variants = _twin_maps(
+                    at, persistent, epilogues, lookaheads, derived_variants
+                )
         # The first warp seed again with its side loads riding the ring
         # (``cute_mma_dag_aux='ring'``), right behind the seed (and its
         # derived-route twin, when it has one): a serial chunk loop's decay

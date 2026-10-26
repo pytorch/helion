@@ -98,6 +98,9 @@ from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
@@ -159,6 +162,11 @@ TCGEN05_SPLIT_MIN_COLS = 8
 EPILOGUE_WARPS_BARRIER = (
     f"cute.arch.barrier(barrier_id=1, number_of_threads={32 * TCGEN05_EPILOGUE_WARPS})"
 )
+# The pass threads' own barrier under ``cute_mma_dag_pass_warps='mma'`` (an
+# in-place convert pass reads every packet before any thread rewrites the
+# tile; the MMA warp is in its own loop, or predicated off the passes, so
+# the CTA barrier would hang).
+PASS_BARRIER_ID = 2
 TCGEN05_M_CHOICES: tuple[int, ...] = (64, 128)
 TCGEN05_MAX_N = 256
 TCGEN05_MAX_ROWS = 256
@@ -302,6 +310,22 @@ class RegisterCarryFacts:
 
 
 @dataclasses.dataclass(frozen=True)
+class StreamedLoopFacts:
+    """A region program's loop the streamed ring schedule may render
+    (``cute_mma_dag_tcgen05_regions.streamed_loop_candidates``): its index,
+    the fragment slots its batch accumulates into, its load operands taking
+    a pass (a dtype conversion or pointwise rewrite of the staged tile) and
+    its pass-chain operands (written by the derived pass under
+    ``cute_mma_dag_derived='pass'``; exchange tiles otherwise, which keep
+    the loop off the streamed schedule)."""
+
+    loop: int
+    slots: tuple[int, ...]
+    passes: int
+    chains: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Tcgen05Facts:
     tiles: tuple[Tcgen05TileFacts, ...]
     exchanges: tuple[Tcgen05ExchangeFacts, ...]
@@ -341,6 +365,9 @@ class Tcgen05Facts:
     # (``cute_mma_dag_tcgen05_regions.streamed_loop_candidates``); each
     # takes one more mbarrier per ring slot.
     streamed_loops: int = 0
+    # Region programs: the streamed candidates themselves (the subject of
+    # ``cute_mma_dag_pass_warps='mma'``: one with an operand pass).
+    streamed: tuple[StreamedLoopFacts, ...] = ()
     staged_regions: int = 0
     # Derived values' tile inputs that may ride a loop ring (the
     # ``cute_mma_dag_loads`` knob has a subject).
@@ -847,6 +874,7 @@ def tcgen05_config_reason(
     epilogue: str = MMA_DAG_EPILOGUE_ROW,
     lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
     persistent: bool = False,
+    pass_warps: str = MMA_DAG_PASS_WARPS_OFF,
 ) -> str | None:
     """Why the resolved block sizes cannot run the tcgen05 mode (None: they
     can).  The caller checked the warp / stage choices, the power-of-two and
@@ -856,7 +884,10 @@ def tcgen05_config_reason(
     thread's half rows in the derived-value register budget), ``lookahead``
     the ``cute_mma_dag_lookahead`` schedule (it doubles the ring loop's dot
     slot in tensor memory), ``persistent`` the ``cute_mma_dag_persistent``
-    launch (a region program's root items then live beside the frames)."""
+    launch (a region program's root items then live beside the frames),
+    ``pass_warps`` the ``cute_mma_dag_pass_warps`` schedule (``mma``: the
+    region programs' streamed loops take ``ready`` barriers and must keep
+    their accumulators in tensor memory)."""
     tc = facts.tcgen05
     if tc is None:
         return f"the kernel or the target does not admit {MMA_DAG_TCGEN05}"
@@ -940,6 +971,7 @@ def tcgen05_config_reason(
             split=split,
             lookahead=ahead,
             persistent=persistent,
+            mma_warp=pass_warps == MMA_DAG_PASS_WARPS_MMA,
         )
     smem = tcgen05_smem_bytes(facts, resolved, stages, True)
     if facts.smem_capacity and smem > facts.smem_capacity:
@@ -1806,6 +1838,10 @@ class Tcgen05Plan:
     # read from tensor memory, (dot node, role) -> the fragment slot (no
     # shared tile exists for them; ``tile`` must not be asked).
     tmem_operands: dict[tuple[Node, str], int] = dataclasses.field(default_factory=dict)
+    # Region programs under ``cute_mma_dag_pass_warps='mma'``: one warp
+    # beyond ``warps`` issues the streamed loops' MMAs and ring refills while
+    # the config's warps run the operand passes (``_Tcgen05RegionEmitter``).
+    mma_warp: bool = False
 
     @property
     def store_warps(self) -> int:
@@ -1832,9 +1868,11 @@ def plan_tcgen05(
     epilogue: str = MMA_DAG_EPILOGUE_ROW,
     lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
     exchange_mode: str = MMA_DAG_EXCHANGE_AUTO,
+    mma_warp: bool = False,
 ) -> Tcgen05Plan:
     """The tcgen05 plan for the resolved ``sizes`` (the config passed
-    :func:`tcgen05_config_reason`)."""
+    :func:`tcgen05_config_reason`); ``mma_warp`` is
+    ``cute_mma_dag_pass_warps='mma'`` (the region renderer's)."""
     env = CompileEnvironment.current()
     tc = facts.tcgen05
     assert tc is not None
@@ -1855,6 +1893,12 @@ def plan_tcgen05(
             lookahead=lookahead,
             exchange_mode=exchange_mode,
             persistent=persistent,
+            mma_warp=mma_warp,
+        )
+    if mma_warp:
+        raise _decline(
+            f"{MMA_DAG_PASS_WARPS_KEY}={MMA_DAG_PASS_WARPS_MMA!r}: the single-loop "
+            "renderer has no streamed loop for the MMA warp"
         )
     if epilogue != MMA_DAG_EPILOGUE_ROW:
         raise _decline(
@@ -2283,7 +2327,7 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
         # still needs the programmatic-dependent-launch attribute.
         alias_plan["use_pdl"] = True
     cg.cute_wrapper_plans.append(alias_plan)
-    df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
+    df.cute_state.owned_root_block_dims = (plan.launch_threads, 1, 1)
     if plan.cluster > 1 and plan.split_mode == MMA_DAG_SPLIT_FIXUP:
         # The fixup grid: ``cluster`` N tiles per root tile folded into the
         # one launch dim (the N tile fastest, so a row tile's CTAs launch
@@ -2585,6 +2629,7 @@ class _Tcgen05Emitter(_Emitter):
         self.hoists = []
         # No aux ring in this mode; ``insert_line`` walks the anchors.
         self.aux_anchors = {}
+        self.loop_entries = []
         self.name_depth = {}
         self.stored_storages = {
             _storage(store.access)
@@ -2611,6 +2656,10 @@ class _Tcgen05Emitter(_Emitter):
         self.es = self.program.elem_bytes
         self.kind = "bf16" if self.program.dtype == torch.bfloat16 else "f16"
         self.sync = "cute.arch.barrier()"
+        # Inside the pass warps' branch of a warp-specialized streamed loop
+        # (``emit_ws_loop``): the MMA warp cannot reach the passes there,
+        # so ``pass_guard`` emits no guard.
+        self.pass_warps_branch = False
         # The loop body's thread count: the epilogue warps alone when the
         # pass warps run their own loop.
         self.loop_threads = (
@@ -3353,6 +3402,20 @@ class _Tcgen05Emitter(_Emitter):
             rewrite,
         )
 
+    def pass_guard(self, threads: int) -> str | None:
+        """The ``if`` header confining a packet partition over the config's
+        ``threads`` threads (``md_tidx`` round-robin) to those threads where
+        the launch has one more warp (``MmaDagPlan.mma_warp``): the MMA warp
+        owns no packet -- a full round would hand its threads the packets
+        past the tile's count -- so every pass and drain it reaches runs
+        under this guard, the CTA barriers around them outside it.  None
+        where the partition spans the launch, and inside the pass warps'
+        branch of a warp-specialized loop (``pass_warps_branch``)."""
+        plan = self.plan
+        if plan.mma_warp and threads == plan.threads and not self.pass_warps_branch:
+            return f"if md_tidx < {threads}:"
+        return None
+
     def emit_passes(
         self,
         tiles: Sequence[Tcgen05Tile],
@@ -3365,23 +3428,37 @@ class _Tcgen05Emitter(_Emitter):
         """Every pass of ``tiles`` by the ``threads`` threads with local
         index ``idx_base``: ``wait`` (the TMA of in-place rewrites), the
         passes, then publish the generic writes to the async proxy (unless
-        a later fence of the same threads precedes the reading batch)."""
+        a later fence of the same threads precedes the reading batch).
+        Under ``pass_guard`` the passes (and their internal barrier, a
+        named barrier over the pass threads) run on the pass threads alone;
+        the wait stays with every thread."""
         if wait is not None and any(
             tile.route in (ROUTE_INPLACE, ROUTE_CONVERT, ROUTE_DERIVED)
             for tile in tiles
         ):
             self.emit(wait)
-        for tile in tiles:
-            if tile.route == ROUTE_SYNC:
-                self.emit_sync_pass(tile, stage, idx_base, threads)
-            elif tile.route == ROUTE_INPLACE:
-                self.emit_inplace_pass(tile, stage, idx_base, threads)
-            elif tile.route == ROUTE_CONVERT:
-                self.emit_convert_pass(tile, stage, idx_base, threads)
-            elif tile.route == ROUTE_DERIVED:
-                self.emit_derived_pass(tile, stage, idx_base, threads)
-        if fence:
-            self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+        guard = self.pass_guard(threads)
+        sync = self.sync
+        if guard is not None:
+            self.sync = (
+                f"cute.arch.barrier(barrier_id={PASS_BARRIER_ID}, "
+                f"number_of_threads={threads})"
+            )
+        try:
+            with self.block(guard) if guard else contextlib.nullcontext():
+                for tile in tiles:
+                    if tile.route == ROUTE_SYNC:
+                        self.emit_sync_pass(tile, stage, idx_base, threads)
+                    elif tile.route == ROUTE_INPLACE:
+                        self.emit_inplace_pass(tile, stage, idx_base, threads)
+                    elif tile.route == ROUTE_CONVERT:
+                        self.emit_convert_pass(tile, stage, idx_base, threads)
+                    elif tile.route == ROUTE_DERIVED:
+                        self.emit_derived_pass(tile, stage, idx_base, threads)
+                if fence:
+                    self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
+        finally:
+            self.sync = sync
 
     def emit_derived_pass(  # type: ignore[override]
         self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int
@@ -4303,7 +4380,9 @@ class _Tcgen05Emitter(_Emitter):
                 f"+ cutlass.Int64({pch} * 16), {', '.join(words)})"
             )
 
-        self.packets(geometry.rows * cpr, threads, idx, cpr, body)
+        guard = self.pass_guard(threads)
+        with self.block(guard) if guard else contextlib.nullcontext():
+            self.packets(geometry.rows * cpr, threads, idx, cpr, body)
 
     def tma_stores(self, stores: Sequence[Store]) -> list[Store]:
         """The staged stores of ``stores`` that go out by TMA."""

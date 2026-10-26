@@ -60,6 +60,7 @@ from test.test_cute_mma_dag_tcgen05 import _probe_rawlate
 from test.test_cute_mma_dag_tcgen05 import _probe_recompute
 from test.test_cute_mma_dag_tcgen05 import _probe_register_carry
 from test.test_cute_mma_dag_tcgen05 import _probe_register_carry_budget
+from test.test_cute_mma_dag_tcgen05 import _probe_root_pass
 from test.test_cute_mma_dag_tcgen05 import _probe_update_first
 from test.test_cute_mma_dag_tcgen05 import _rmw_scalar_first
 from test.test_cute_mma_dag_tcgen05 import _snap_reread
@@ -2481,3 +2482,228 @@ def test_the_streamed_ring_runs_as_a_persistent_launch_bitwise() -> None:
     assert "for virtual_pid in range(" in source
     assert "md_tn = md_tn + 1" in source
     assert torch.equal(out, base)
+
+
+# --------------------------------------------------------------------------
+# The MMA warp (``cute_mma_dag_pass_warps='mma'``)
+# --------------------------------------------------------------------------
+
+# kernel, block sizes, warps, stages, extra knobs
+_MMA_WARP_CASES = (
+    ("se_block_bwd_dx", [64, 64, 64], 4, 3, {}),
+    ("se_block_bwd_dx", [64, 64, 64], 8, 4, {}),
+    ("se_block_bwd_dx", [64, 64, 64], 4, 1, {}),
+    ("se_block_bwd_dx", [128, 64, 64], 8, 2, {"cute_mma_dag_epilogue": "split"}),
+    ("se_block_bwd_dw", [64, 64, 64], 4, 2, {}),
+    ("se_block_bwd_dw", [64, 64, 64], 8, 4, {}),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "block_sizes", "warps", "stages", "extra"),
+    _MMA_WARP_CASES,
+    ids=[
+        f"{k[-2:]}-{'x'.join(map(str, bs))}w{w}s{st}{'-split' if ex else ''}"
+        for k, bs, w, st, ex in _MMA_WARP_CASES
+    ],
+)
+def test_the_mma_warp_matches_the_pass_schedule_and_the_triton_backend(
+    kernel: str,
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+    extra: dict[str, object],
+) -> None:
+    # se_block dx / dw under ``pass`` with the MMA warp
+    # (``cute_mma_dag_pass_warps='mma'``): the launch adds one warp, the
+    # pass warps hand every slot over through ``md_ready`` (no CTA barrier
+    # in their loop), the MMA warp issues the batches and commits the slots
+    # (no ``md_cb`` commit).  Bit-equal to the chain schedule's render of
+    # the same tile (``off``), to Triton, and launch to launch -- at four
+    # and eight warps, one stage (no overlap, no barrier either) and under
+    # the split epilogue.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block(kernel)
+    args = (
+        (t["grad"], t["x"], t["w"], t["s"])
+        if kernel == "se_block_bwd_dx"
+        else (t["grad"], t["x"], t["s"])
+    )
+    source, (out,) = _run_cute(
+        fn,
+        args,
+        _config(
+            block_sizes,
+            warps,
+            stages,
+            cute_mma_dag_derived="pass",
+            cute_mma_dag_pass_warps="mma",
+            **extra,
+        ),
+    )
+    assert f"block=({32 * (warps + 1)}, 1, 1)" in source
+    assert (
+        f"md_ready0 = cute.arch.alloc_smem(cutlass.Int64, {stages}, alignment=8)"
+        in source
+    )
+    passes, mmas = source[source.index(f"if md_warp < {warps}:") :].split(
+        "    else:\n", 1
+    )
+    assert "cute.arch.barrier()" not in passes
+    assert f"{RT}.prims.mbarrier_arrive(md_ready0 + md_st0)" in passes
+    loop = mmas.split("md_rk0 = md_rk0 + 1", 1)[0]
+    assert f"{RT}.mbar_wait(md_ready0 + md_st0, md_rd0)" in loop
+    assert f"{RT}.prims.tcgen05_commit(md_empty0 + md_st0" in loop
+    assert "tcgen05_commit(md_cb" not in loop and "cute.arch.barrier" not in loop
+    _plain, (base,) = _run_cute(
+        fn,
+        args,
+        _config(block_sizes, warps, stages, cute_mma_dag_derived="pass", **extra),
+    )
+    assert torch.equal(out, base)
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("stages", "persistent"), ((2, 0), (1, 2)), ids=["s2", "s1-persistent2"]
+)
+def test_full_gla_dv_under_the_mma_warp_matches_the_pass_schedule(
+    stages: int, persistent: int
+) -> None:
+    # full_gla's training backward dv (``chunk_bwd_dv_helion(diag_anchored=
+    # True)``): the K loop over tile_d accumulates ``kg @ dh`` with ``kg = k
+    # * exp2(gc_last - gc)`` a pass chain over the staged k and g_cs tiles
+    # -- a streamed loop with a pass, the MMA warp's subject under the pass
+    # route.  The campaign's winner at (8, 8, 1024, 64, 64) is [1, 64, 64]
+    # at eight warps, one stage, two persistent CTAs per SM.  Bit-equal to
+    # the chain schedule at two stages and at the winner's one-stage
+    # persistent config (the slot barriers' phases run on the loop counter
+    # across the CTA's tiles).
+    t = _inputs3(bhn=24, d=64, dv=64, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    bhn, c, d = t["q"].shape
+    gcs = _randn(g, bhn, c, d, scale=0.1, dtype=torch.float32)
+    a = _randn(g, bhn, c, c, dtype=torch.bfloat16)
+    args = (
+        t["q"],
+        t["k"],
+        t["k"],
+        gcs,
+        t["do"],
+        t["dh"],
+        None,
+        a,
+        True,
+        False,
+        True,
+        0.125,
+    )
+    fn = _kernel_fn("dv")
+    extra: dict[str, object] = (
+        {
+            "cute_mma_dag_persistent": persistent,
+            "pid_type": "persistent_interleaved",
+            "num_sm_multiplier": persistent,
+        }
+        if persistent
+        else {}
+    )
+    source, (out,) = _run_cute(
+        fn,
+        args,
+        _config(
+            [1, 64, 64],
+            8,
+            stages,
+            cute_mma_dag_derived="pass",
+            cute_mma_dag_pass_warps="mma",
+            **extra,
+        ),
+    )
+    assert "block=(288, 1, 1)" in source
+    assert (
+        f"md_ready0 = cute.arch.alloc_smem(cutlass.Int64, {stages}, alignment=8)"
+        in source
+    )
+    assert ("for virtual_pid in range(" in source) == bool(persistent)
+    _plain, (base,) = _run_cute(
+        fn,
+        args,
+        _config([1, 64, 64], 8, stages, cute_mma_dag_derived="pass", **extra),
+    )
+    assert torch.equal(out, base)
+
+
+# kernel, gated, block sizes (None: the kernel's ``mma`` seed), warps, stages
+_MMA_WARP_REGION_CASES = (
+    ("dqkw", False, None, 0, 0),
+    ("dqkw", True, None, 0, 0),
+    ("dqkw", False, [64, 64, 64], 8, 2),
+    ("root_pass", False, [64], 4, 2),
+    ("root_pass", False, [64], 8, 2),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "gated", "block_sizes", "warps", "stages"),
+    _MMA_WARP_REGION_CASES,
+    ids=[
+        f"{k}{'-gated' if g else ''}-"
+        + ("seed" if bs is None else f"{'x'.join(map(str, bs))}w{w}s{st}")
+        for k, g, bs, w, st in _MMA_WARP_REGION_CASES
+    ],
+)
+def test_the_mma_warp_owns_no_packet_outside_its_loop(
+    kernel: str, gated: bool, block_sizes: list[int] | None, warps: int, stages: int
+) -> None:
+    # Programs with passes and packet drains beside the warp-specialized
+    # loop: dqkw (plain and gated, at its ``mma`` seed and at eight warps)
+    # -- a chain-schedule ring loop's in-place pass and two staged stores
+    # drained in packets -- and the root-pass probe (a root fp32 tile's
+    # convert pass behind the staged wait, at four and eight warps).  The
+    # MMA warp runs them under ``if md_tidx < threads:`` (it owns no
+    # packet; without the guard the seed's drain wrote rows past the tile:
+    # an illegal address on the first launch).  Bit-equal to the chain
+    # schedule's render (``off``), launch to launch, and to Triton.
+    if kernel == "root_pass":
+        t = _regions_probe_inputs()
+        args: tuple[object, ...] = (t["q"], t["k"], t["x64"], t["q2"])
+        fn: Callable[..., object] = _probe_root_pass
+        extra: dict[str, object] = {"cute_mma_dag_derived": "pass"}
+    else:
+        args = _m4_args(kernel, gated)
+        fn = _kernel_fn(kernel)
+        extra = {}
+    if block_sizes is None:
+        bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+        (seed,) = [
+            c.config
+            for c in bound.config_spec.compiler_seed_configs
+            if c.config.get("cute_mma_dag_pass_warps") == "mma"
+        ]
+        config = helion.Config(**seed)
+        warps = seed["cute_mma_dag_warps"]
+    else:
+        config = _config(
+            block_sizes, warps, stages, cute_mma_dag_pass_warps="mma", **extra
+        )
+    source, out = _run_cute(fn, args, config)
+    assert f"block=({32 * (warps + 1)}, 1, 1)" in source
+    assert "md_ready" in source
+    assert f"if md_tidx < {32 * warps}:" in source
+    plain, base = _run_cute(
+        fn, args, helion.Config(**{**config.config, "cute_mma_dag_pass_warps": "off"})
+    )
+    assert "md_ready" not in plain and f"if md_tidx < {32 * warps}:" not in plain
+    for lhs, rhs in zip(out, base, strict=True):
+        assert torch.equal(lhs, rhs)
+    ref = _run_triton(fn, args, config.config["block_sizes"])
+    if kernel == "dqkw":
+        _assert_region_outputs(kernel, out, ref)
+    else:
+        for lhs, rhs in zip(out, ref, strict=True):
+            assert torch.equal(lhs, rhs)

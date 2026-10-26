@@ -125,8 +125,8 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
-from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_SPLIT_CHOICES
@@ -3693,6 +3693,25 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
             config[MMA_DAG_CLUSTER_KEY] = 1
+        # The MMA warp (``cute_mma_dag_pass_warps='mma'``) has a subject
+        # only in the tensor-memory region programs with a streamed K loop
+        # whose operand tiles take a pass (a pass chain's under the pass
+        # route); elsewhere the knob is inert and pinned off here, ahead of
+        # the tile check (the warp's barriers count in the shared memory).
+        # (``on`` is pinned below, once the tile is settled.)
+        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_MMA and (
+            mma_dag_pass_warps_reason(
+                facts,
+                cast("int", warps),
+                cast("int", stages),
+                mode,
+                MMA_DAG_PASS_WARPS_MMA,
+                derived,
+            )
+            is not None
+        ):
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+        pass_warps = cast("str", config[MMA_DAG_PASS_WARPS_KEY])
         # The split epilogue has a subject only in the tensor-memory region
         # programs without reductions, at eight warps; elsewhere the knob is
         # inert and pinned to the row layout.
@@ -3740,7 +3759,34 @@ class ConfigSpec:
             lookahead=lookahead,
             aux=aux,
             persistent=persistent > 0,
+            pass_warps=pass_warps,
         )
+        if (
+            reason is not None
+            and pass_warps == MMA_DAG_PASS_WARPS_MMA
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+                aux=aux,
+                persistent=persistent > 0,
+            )
+            is None
+        ):
+            # The MMA warp's barriers overflow the shared memory the chain
+            # schedule fits, or the streamed loops' accumulators live in
+            # registers at this tile: the tile stays, the warp goes.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}: {reason}"
+                )
+            pass_warps = config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            reason = None
         if (
             reason is not None
             and persistent
@@ -3932,12 +3978,14 @@ class ConfigSpec:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         if not facts.loops:
             config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
-        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
+        if config[MMA_DAG_PASS_WARPS_KEY] != MMA_DAG_PASS_WARPS_OFF and (
             mma_dag_pass_warps_reason(
                 facts,
                 cast("int", config[MMA_DAG_WARPS_KEY]),
                 cast("int", config[MMA_DAG_STAGES_KEY]),
                 cast("str", config[MMA_DAG_KEY]),
+                cast("str", config[MMA_DAG_PASS_WARPS_KEY]),
+                cast("str", config[MMA_DAG_DERIVED_KEY]),
             )
             is not None
         ):
