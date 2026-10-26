@@ -2808,6 +2808,20 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # Staged body stores waiting for the next CTA barrier: (store,
         # parity expression, loop values).
         self.drains: list[tuple[Store, str, dict[int, str]]] = []
+        # A loop store goes out by TMA: its staging buffer turns over per
+        # iteration, so the store thread's group waits sit ahead of the
+        # commits inside the loops and at their exits (``emit_tma_store_wait``).
+        # A program whose TMA stores are all root stores emits none there:
+        # a root buffer is written once per tile, ahead of which the stage-in
+        # waits itself (``emit_blocks``), and its overlay of a later loop's
+        # frame is waited ahead of that loop (``emit_region``) -- only once
+        # a TMA store was issued earlier in the body (``tma_issued``).
+        self.loop_store_tma = bool(
+            self.tma_stores(
+                [store for store in self.tc.staged_stores if store.loop >= 0]
+            )
+        )
+        self.tma_issued = False
         # Rounds and partial slabs of the fixup split's exchange emitted so
         # far, rounds of the cluster's, the fused pair's second moment, and
         # the fused-pair memo (None: not looked up; (): none).
@@ -4114,7 +4128,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                         dot, self.stage_expr(dot.loop), accumulate=dot.acc is not None
                     )
                     self.defined.add(dot.node)
-                self.emit_tma_store_wait(read=True)
+                self.emit_tma_store_wait(read=True, loop_stores=True)
                 self.emit_commit()
             self.emit("md_cn = md_cn + 1")
             self.waited = False
@@ -4122,7 +4136,9 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
             self.flush_drains()
         self.current_blocks = []
 
-    def emit_tma_store_wait(self, read: bool, pending: int = 0) -> None:
+    def emit_tma_store_wait(
+        self, read: bool, pending: int = 0, *, loop_stores: bool = False
+    ) -> None:
         """The store thread waits until at most ``pending`` of its TMA store
         groups are outstanding (``read``: their reads of the staging
         buffers).  Ahead of a commit: the stage-in reusing a buffer two
@@ -4130,13 +4146,30 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         wait precedes; ahead of a loop: its prologue TMA may land on a
         staging buffer overlaying the frames; at the top of a dot-less
         loop's iteration (no commit to wait behind): all but the previous
-        iteration's group, whose buffer this iteration does not touch."""
-        if not self.tc.store_tma:
+        iteration's group, whose buffer this iteration does not touch.
+        ``loop_stores``: the wait orders a loop store's buffer turnover
+        (ahead of a commit inside a loop, at a loop's exit) and is emitted
+        only when a loop store goes by TMA -- for a program whose TMA
+        stores are all root stores it would be dead, yet it blocks the
+        MMA-issuing thread once per batch (mqa_logits at [128, 128]: 32
+        waits per CTA, 16% of the kernel)."""
+        if not self.tc.store_tma or (loop_stores and not self.loop_store_tma):
             return
         with self.nest(f"if md_tidx == {TMA_STORE_THREAD}:"):
             self.emit(
                 f"{_PRIMS}.cp_async_bulk_wait_group({pending}{', read=True' if read else ''})"
             )
+
+    def tma_store_pending(self) -> bool:
+        """A TMA store group may still be reading a staging buffer at this
+        point of the body: a loop store's (any iteration's), a root store's
+        issued earlier in the body, or -- in a persistent launch -- the
+        previous tile's."""
+        return (
+            self.loop_store_tma
+            or self.tma_issued
+            or (self.persistent and bool(self.tc.store_tma))
+        )
 
     def emit_store_step(self, store: Store, loaded: set[int], parity: str) -> None:
         slot = self.program.frag_slots[store.frag]
@@ -4186,6 +4219,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                             f"md_smem + ({slab_base}), [{coords}])"
                         )
                 self.emit(f"{_PRIMS}.cp_async_bulk_commit_group()")
+            self.tma_issued = True
         self.drains = []
 
     def emit_segment(self, steps: Sequence[Step], loop: Loop | None) -> None:
@@ -4793,7 +4827,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # groups finish reading their staging buffers first: the following
         # root segment's exchange tiles and staging overlay the frames.
         self.written = {key for key in self.written if key in self.root_written}
-        self.emit_tma_store_wait(read=True)
+        self.emit_tma_store_wait(read=True, loop_stores=True)
         self.emit(self.sync)
         if ahead_issued and ring and tc.ring_tx.get(index):
             self.emit_next_tile_prologue(loop, begin, trip)
@@ -5106,7 +5140,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         for carry in loop.carries:
             self.defined.add(carry.phi)
         self.written = {key for key in self.written if key in self.root_written}
-        self.emit_tma_store_wait(read=True)
+        self.emit_tma_store_wait(read=True, loop_stores=True)
         self.emit(self.sync)
 
     def emit_lookahead_mma(self, dot: Dot, count: str) -> None:
@@ -5127,7 +5161,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         self.acc_names[dot.slot] = "md_lka"
         self.emit_dot_mmas(dot, stage, accumulate=False)
         del self.acc_names[dot.slot]
-        self.emit_tma_store_wait(read=True)
+        self.emit_tma_store_wait(read=True, loop_stores=True)
         with self.nest(f"if {_PRIMS}.elect_sync():"):
             self.emit(
                 f"{_PRIMS}.tcgen05_commit(md_lkb + ({count}) % 2, "
@@ -5400,7 +5434,7 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     tiles.append(tile)
         if not tiles:
             return
-        if tc.store_tma:
+        if self.tma_store_pending():
             self.emit_tma_store_wait(read=True)
             self.emit(self.sync)
         self.wait_latest()
@@ -5430,21 +5464,15 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 if self.drains:
                     self.emit(self.sync)
                     self.flush_drains()
-                if self.tc.store_tma and not (
-                    self.persistent
-                    and all(
-                        store.loop < 0
-                        for store in self.program.stores
-                        if store.access.node in self.tc.store_tma
-                    )
-                ):
+                if self.loop_store_tma or (self.tma_issued and not self.persistent):
                     # The staging buffers may overlay the loop's frames (a
                     # root buffer; a sibling loop's): every TMA store group
                     # issued so far -- behind a batch's commit, or just now
                     # -- finishes reading before the prologue TMA lands.  (A
-                    # persistent launch's root staging lives beside the
-                    # frames, ``persistent_items``: only a loop store's
-                    # buffer can overlay a sibling's frame.)
+                    # root store issued later in the body has no group in
+                    # flight here; a persistent launch's root staging lives
+                    # beside the frames, ``persistent_items``: only a loop
+                    # store's buffer can overlay a sibling's frame.)
                     self.emit_tma_store_wait(read=True)
                     self.emit(self.sync)
                 if loop is None:

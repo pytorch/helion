@@ -10051,6 +10051,14 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             packed = packed_grid_block(CompileEnvironment.current(), fn.config)
             if packed is not None and packed[0] in block_ids:
                 self._cute_pack_by_block[packed[0]] = packed[1]
+                # The packed axis is a thread axis whether or not the body
+                # observes the tile's elements: the pid itself varies per
+                # sub-group.  A one-element axis used only through
+                # ``tile.id`` / ``tile.begin`` arrives here inactive (no graph
+                # distributes over it), which would otherwise leave the pid
+                # reading a thread axis the launch never raises (or one the
+                # next block owns).
+                self.inactive_block_ids = self.inactive_block_ids - {packed[0]}
         # Per-block vec width for the lane loop (1 = scalar).  Populated
         # from the autotuner-selected ``cute_vector_widths`` config when
         # the block has a lane loop and its ``elements_per_thread`` is
