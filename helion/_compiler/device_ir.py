@@ -3725,6 +3725,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
                     standard_dense_output=flash_shape.standard_dense_output,
+                    dense_lse_output=flash_shape.dense_lse_output,
                     standard_causal_output=flash_shape.standard_causal_output,
                     tmem_rowmax_compatible=flash_shape.tmem_rowmax_compatible,
                     causal_resident_compatible=flash_shape.causal_resident_compatible,

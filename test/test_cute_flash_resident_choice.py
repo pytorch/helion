@@ -16,6 +16,7 @@ from .test_cute_flash_exp2 import _flash_runtime
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -35,6 +36,8 @@ def _resolve(
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     standard_dense_output: bool = True,
+    dense_lse_output: bool = False,
+    has_row_epilogue: bool = False,
 ) -> cute_flash.FlashAttentionConfig:
     values = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
@@ -49,6 +52,9 @@ def _resolve(
             dtype=dtype,
             is_causal=is_causal,
             standard_dense_output=standard_dense_output,
+            dense_lse_output=dense_lse_output,
+            has_row_epilogue=has_row_epilogue,
+            plain_row_body=not has_row_epilogue,
             target_device_capability=(10, 3),
         )
 
@@ -215,13 +221,104 @@ def test_resident_alpha_precedes_value_graph(
 def test_resident_rejects_unsupported_workload(
     dtype: torch.dtype, is_causal: bool, standard_dense_output: bool
 ) -> None:
-    with pytest.raises(
-        InvalidConfig, match="FP16/BF16 dense output on an FA4 pipeline"
-    ):
+    with pytest.raises(InvalidConfig, match="FP16/BF16 dense output .*FA4 pipeline"):
         _resolve(
             dtype=dtype,
             is_causal=is_causal,
             standard_dense_output=standard_dense_output,
+        )
+
+
+def _lse_surface_facts(**overrides: object) -> dict[str, object]:
+    """The dense attention surface whose epilogue is ``O`` plus the LSE row
+    (the examples' ``attention`` and the dense-BlockMask flex kernel)."""
+    return {
+        "dtype": torch.bfloat16,
+        "num_bh": 32,
+        "is_causal": False,
+        "standard_dense_output": False,
+        "dense_lse_output": True,
+        "target_device_capability": (10, 0),
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize("family", ("fa4", "fa4_2cta"))
+def test_resident_is_offered_on_the_dense_lse_surface(family: str) -> None:
+    """The LSE output needs only the final row statistics, which the resident
+    lowering keeps where the standard one does: the explicit request resolves
+    on the dense LSE surface, the fragment offers it and the seeds carry the
+    two-tile fa4 body with it."""
+    config = _resolve(
+        128,
+        16,
+        dtype=torch.bfloat16,
+        standard_dense_output=False,
+        dense_lse_output=True,
+        overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: family},
+    )
+    assert config.softmax_lowering == "resident_value_graph"
+    assert config.pipeline_family == family
+    assert config.q_tile_count == 2
+    with patch.dict(os.environ, {}, clear=True):
+        fragments = cute_flash.flash_autotune_fragments(128, 16, **_lse_surface_facts())
+        lowering = fragments[cute_flash.FLASH_SOFTMAX_LOWERING_KEY]
+        assert isinstance(lowering, EnumFragment)
+        assert "resident_value_graph" in lowering._active_choices()
+        seeds = cute_flash.flash_attention_seed_configs(
+            128,
+            16,
+            num_sm=148,
+            block_size_targets=(1, 128, 128),
+            **_lse_surface_facts(),
+        )
+    resident_seeds = [
+        seed
+        for seed in seeds
+        if seed.config.get(cute_flash.FLASH_SOFTMAX_LOWERING_KEY)
+        == "resident_value_graph"
+    ]
+    assert resident_seeds, "the dense LSE surface seeds no resident body"
+    for seed in resident_seeds:
+        resolved = cute_flash.resolve_flash_config(
+            128,
+            16,
+            {key: value for key, value in seed.config.items() if key != "block_sizes"},
+            **_lse_surface_facts(),
+        )
+        assert resolved.softmax_lowering == "resident_value_graph"
+        assert resolved.pipeline_family == "fa4"
+        assert resolved.q_tile_count == 2
+
+
+def test_resident_stays_off_without_a_dense_surface_or_with_a_row_program() -> None:
+    """Anything beyond ``out + lse`` fails closed: a surface that is neither
+    dense fact, and the fused row program on ``O`` even with the LSE fact."""
+    with patch.dict(os.environ, {}, clear=True):
+        for facts in (
+            _lse_surface_facts(dense_lse_output=False),
+            _lse_surface_facts(has_row_epilogue=True, plain_row_body=False),
+        ):
+            fragments = cute_flash.flash_autotune_fragments(128, 16, **facts)
+            lowering = fragments[cute_flash.FLASH_SOFTMAX_LOWERING_KEY]
+            assert isinstance(lowering, EnumFragment)
+            assert "resident_value_graph" not in lowering._active_choices()
+            seeds = cute_flash.flash_attention_seed_configs(
+                128, 16, num_sm=148, block_size_targets=(1, 128, 128), **facts
+            )
+            assert not any(
+                seed.config.get(cute_flash.FLASH_SOFTMAX_LOWERING_KEY)
+                == "resident_value_graph"
+                for seed in seeds
+            )
+    with pytest.raises(InvalidConfig, match="FP16/BF16 dense output .*FA4 pipeline"):
+        _resolve(dtype=torch.bfloat16, standard_dense_output=False)
+    with pytest.raises(InvalidConfig, match="without a row epilogue"):
+        _resolve(
+            dtype=torch.bfloat16,
+            standard_dense_output=False,
+            dense_lse_output=True,
+            has_row_epilogue=True,
         )
 
 
@@ -413,27 +510,35 @@ def test_sampled_resident_keeps_compatible_fixed_controls(dtype: torch.dtype) ->
 @pytest.mark.parametrize("fast_math", (False, True))
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize(
-    ("standard_dense_output", "block_size_targets"),
+    ("standard_dense_output", "dense_lse_output", "block_size_targets"),
     (
         # the dense-output kernel (``attention_output``)
-        (True, {0: 1, 1: 128, 2: 128}),
-        # an LSE-producing kernel (``attention``): no resident value graph
-        (False, {0: 1, 1: 128, 2: 128}),
-        # the flex forward surface (unit b/h axes fixed)
-        (False, {0: 128, 1: 128}),
+        (True, False, {0: 1, 1: 128, 2: 128}),
+        # the LSE-producing kernel (``attention``): ``out + lse`` is a dense
+        # surface of the resident value graph too
+        (False, True, {0: 1, 1: 128, 2: 128}),
+        # the dense-BlockMask flex forward surface (unit b/h axes fixed; the
+        # flex kernel returns the LSE)
+        (False, True, {0: 128, 1: 128}),
+        # a dense hd128 surface with neither fact (a fused row program or an
+        # epilogue beyond ``out + lse``): no resident value graph
+        (False, False, {0: 1, 1: 128, 2: 128}),
     ),
 )
 def test_two_tile_dense_hd128_seed_follows_the_surface(
     standard_dense_output: bool,
+    dense_lse_output: bool,
     block_size_targets: dict[int, int],
     dtype: torch.dtype,
     fast_math: bool,
 ) -> None:
     """The measured two-tile fa4 body of the dense hd128 shape is seeded on
     every dense hd128 surface, with the softmax lowering the surface offers:
-    the resident value graph on a dense FP16/BF16 output, the auto lowering
-    on an LSE output; the seed survives legalization, normalization and
-    reaches the seeded population (see ``flash_attention_seed_configs``)."""
+    the resident value graph on a dense FP16/BF16 output, with or without the
+    LSE row (``standard_dense_output`` / ``dense_lse_output``), the auto
+    lowering where the surface has neither fact; the seed survives
+    legalization, normalization and reaches the seeded population (see
+    ``flash_attention_seed_configs``)."""
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, size_hint in enumerate(block_size_targets.values()):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=size_hint))
@@ -445,6 +550,7 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
         num_bh=32,
         dtype=dtype,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         fast_math=fast_math,
     )
     seeds = spec._legalize_cute_flash_compiler_seeds(
@@ -457,6 +563,7 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
             num_bh=32,
             dtype=dtype,
             standard_dense_output=standard_dense_output,
+            dense_lse_output=dense_lse_output,
             fast_math=fast_math,
         )
     )
@@ -472,6 +579,7 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
                 num_bh=32,
                 dtype=dtype,
                 standard_dense_output=standard_dense_output,
+                dense_lse_output=dense_lse_output,
                 fast_math=fast_math,
             )
 
@@ -493,7 +601,9 @@ def test_two_tile_dense_hd128_seed_follows_the_surface(
             and resolved.epi_tma
         )
 
-    expected_lowering = "resident_value_graph" if standard_dense_output else "auto"
+    expected_lowering = (
+        "resident_value_graph" if standard_dense_output or dense_lse_output else "auto"
+    )
     matches = [seed for seed in seeds if is_two_tile_body(resolve(seed.config))]
     assert matches, "the two-tile fa4 body is not seeded"
     assert {resolve(seed.config).softmax_lowering for seed in matches} == {

@@ -2066,6 +2066,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk: bool = False
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
+        self._cute_flash_dense_lse_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_tmem_rowmax_compatible: bool = False
         self._cute_flash_causal_resident_compatible: bool = False
@@ -2453,6 +2454,7 @@ class ConfigSpec:
                 flex_hook_ops=self._cute_flash_flex_hook_ops,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
+                dense_lse_output=self._cute_flash_dense_lse_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
                 tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
                 causal_resident_compatible=self._cute_flash_causal_resident_compatible,
@@ -2494,6 +2496,7 @@ class ConfigSpec:
             flex_trivial_walk=self._cute_flash_flex_trivial_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
+            dense_lse_output=self._cute_flash_dense_lse_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
             tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
             causal_resident_compatible=self._cute_flash_causal_resident_compatible,
@@ -3019,6 +3022,7 @@ class ConfigSpec:
         requires_ws_overlap: bool = False,
         small_biased_candidate: bool = False,
         standard_dense_output: bool = False,
+        dense_lse_output: bool = False,
         standard_causal_output: bool = False,
         tmem_rowmax_compatible: bool | None = None,
         causal_resident_compatible: bool = False,
@@ -3069,6 +3073,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
+        self._cute_flash_dense_lse_output = dense_lse_output
         self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_causal_resident_compatible = causal_resident_compatible
         self._cute_flash_tmem_rowmax_compatible = (
@@ -4716,6 +4721,7 @@ class ConfigSpec:
                     flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
+                    dense_lse_output=self._cute_flash_dense_lse_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
                     causal_resident_compatible=self._cute_flash_causal_resident_compatible,
