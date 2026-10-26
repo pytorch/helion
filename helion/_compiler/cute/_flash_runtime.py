@@ -1233,10 +1233,31 @@ def mbar_spin_wait(
     flips. ``phase`` is i32 0/1 matching mbarrier_wait's parity. Verbatim port of
     the spike helper.
     """
+    mbar_spin_wait_addr(
+        mbar_ptr.toint(),  # pyrefly: ignore[missing-attribute]
+        phase,
+        wait_hint,
+    )
+
+
+def mbar_spin_wait_addr(
+    mbar_addr: object, phase: object, wait_hint: int = 10_000_000
+) -> None:
+    """``mbar_spin_wait`` on the barrier's 32-bit shared-window address.
+
+    A role that waits on several barriers derives their pointers from the
+    shared-storage struct; ptxas keeps the per-thread pointer base in a
+    register it may spill, and every wait then reloads it (an ``LDL`` and an
+    ``R2UR`` in front of each ``SYNCS.PHASECHK ... TRYWAIT``). An emitter
+    computes each barrier's address once, warp-uniform
+    (``cute.arch.make_warp_uniform(cutlass.Int32(ptr.toint()))``), and hands
+    it (plus ``8 * stage``) to this form; the wait then addresses the barrier
+    through a uniform register. Arrives keep their pointers.
+    """
     llvm.inline_asm(
         None,
         [
-            cutlass.Int32(mbar_ptr.toint()).ir_value(),  # pyrefly: ignore[missing-attribute]
+            cutlass.Int32(mbar_addr).ir_value(),  # pyrefly: ignore[bad-argument-type]
             cutlass.Int32(phase).ir_value(),  # pyrefly: ignore[bad-argument-type]
         ],
         "{\n\t"
