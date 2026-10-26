@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import logging
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -64,6 +65,8 @@ if TYPE_CHECKING:
 # state is currently CUDA-only, where 128 bytes is a conservative L2 line
 # alignment. The layout is expressed in bytes rather than a model-shaped
 # counter count.
+log: logging.Logger = logging.getLogger(__name__)
+
 _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES = 128
 _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
@@ -1924,6 +1927,98 @@ def _root_task_load_bytes(
                     cost = numel * value.element_size() * count
         totals[root] = None if cost is None else cast("int", totals[root]) + cost
     return tuple(totals)
+
+
+def static_root_workers(
+    task_count: int, rotation: int, worker_count: int
+) -> frozenset[int]:
+    """Workers ``w`` that run a static resident root whose lane is
+    ``(w + rotation) % worker_count``: lanes ``[0, min(task_count, W))``."""
+    active = min(task_count, worker_count)
+    return frozenset(
+        w for w in range(worker_count) if (w + rotation) % worker_count < active
+    )
+
+
+def code_layout_order(
+    roots: tuple[int, ...],
+    workers: Mapping[int, frozenset[int] | None],
+    dependencies: Iterable[tuple[int, int]],
+    costs: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Code-layout order of a static persistent kernel's root blocks.
+
+    Every worker runs the root blocks it belongs to in textual order, so the
+    textual order of two blocks that share a worker is that worker's execution
+    order and must stay; blocks that share no worker can swap without changing
+    what any worker runs (``None``: the root's workers are unknown, so it keeps
+    its place relative to every other block).  Within that freedom the order
+    decides only where each root's instructions lie in the binary, and
+    instruction fetch is slow for code that is not resident and lies beyond the
+    first ~64 KB of the kernel (B200: ~0.2 us per KB of executed code past the
+    knee).  So the blocks of the latency-critical roots go first, in the order
+    they run, and roots with slack (their completion can be later without
+    delaying the kernel) go after them, each as late as the blocks that share
+    its workers allow.
+
+    The timing model is the one the dynamic pipeline's ordering uses: a task
+    lasts as long as the bytes it loads (``costs``: bytes per worker, i.e. per
+    task times the root's waves); a root starts after its producers
+    (``dependencies``: producer -> consumer pairs) and after the roots textually
+    before it on a shared worker; slack = latest - earliest start.  A root is
+    critical if its slack is within 1/32 of the kernel's span.  Without costs
+    (span 0) the order is unchanged.
+    """
+    position = {root: i for i, root in enumerate(roots)}
+    preds: dict[int, set[int]] = {root: set() for root in roots}
+    for i, a in enumerate(roots):
+        for b in roots[i + 1 :]:
+            wa, wb = workers.get(a), workers.get(b)
+            if wa is None or wb is None or wa & wb:
+                preds[b].add(a)
+    timing = {root: set(preds[root]) for root in roots}
+    for producer, consumer in dependencies:
+        if producer in position and consumer in position and producer != consumer:
+            timing[consumer].add(producer)
+    # Producers always precede consumers in source order (and so here).
+    if any(position[p] >= position[c] for c, ps in timing.items() for p in ps):
+        return roots
+    duration = {root: max(0, int(costs.get(root, 0))) for root in roots}
+    start: dict[int, int] = {}
+    for root in roots:
+        start[root] = max((start[p] + duration[p] for p in timing[root]), default=0)
+    span = max((start[r] + duration[r] for r in roots), default=0)
+    if span <= 0:
+        return roots
+    successors: dict[int, set[int]] = {root: set() for root in roots}
+    for consumer, producers in timing.items():
+        for producer in producers:
+            successors[producer].add(consumer)
+    latest: dict[int, int] = {}
+    for root in reversed(roots):
+        finish = min((latest[s] for s in successors[root]), default=span)
+        latest[root] = finish - duration[root]
+    critical = [r for r in roots if (latest[r] - start[r]) * 32 <= span]
+
+    order: list[int] = []
+    placed: set[int] = set()
+
+    def key(root: int) -> tuple[int, int]:
+        return (start[root], position[root])
+
+    def place(root: int) -> None:
+        if root in placed:
+            return
+        for pred in sorted(preds[root], key=key):
+            place(pred)
+        placed.add(root)
+        order.append(root)
+
+    for root in sorted(critical, key=key):
+        place(root)
+    for root in sorted(roots, key=key):
+        place(root)
+    return tuple(order)
 
 
 def emit_cross_loop_schedule(
@@ -4027,6 +4122,58 @@ def emit_cross_loop_schedule(
             f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
         )
 
+    def static_root_layout_order() -> tuple[int, ...]:
+        """Textual order of the resident root blocks (:func:`code_layout_order`):
+        latency-critical roots first, roots with slack later, every worker's
+        sequence of blocks unchanged.  Source order where a root's workers are
+        not static (guarded live tasks, continuations) or the kernel talks to
+        peers."""
+        roots = static_pipeline_plan.resident_roots
+        if (
+            not CompileEnvironment.current().settings.cross_loop_code_layout
+            or len(roots) < 3
+            or peer is not None
+            or static_pipeline_plan.continuation_roots
+            or guarded_extents
+            or resident_live_tasks
+            or not isinstance(launch_worker_count, int)
+        ):
+            return roots
+        workers: dict[int, frozenset[int] | None] = {}
+        waves: dict[int, int] = {}
+        for root in roots:
+            task_count = static_pipeline_plan.execution_orders[root].task_count
+            if not isinstance(task_count, int):
+                return roots
+            rotation = (
+                placement_rotation[root]
+                if placement_rotation is not None
+                else -static_pipeline_plan.static_base(root) % launch_worker_count
+            )
+            workers[root] = static_root_workers(
+                task_count, rotation, launch_worker_count
+            )
+            waves[root] = -(-task_count // launch_worker_count)
+        task_bytes = _root_task_load_bytes(
+            dependency_graph, axis_geometry, len(root_task_orders), device_function
+        )
+        if any(task_bytes[root] is None for root in roots):
+            return roots
+        costs = {
+            root: cast("int", task_bytes[root]) * max(1, waves[root]) for root in roots
+        }
+        order = code_layout_order(
+            roots,
+            workers,
+            _prerequisite_root_pairs(
+                static_pipeline_plan, dependency_graph.obligations_by_root_pair()
+            ),
+            costs,
+        )
+        if order != roots:
+            log.debug("cross-loop code layout: root blocks %s -> %s", roots, order)
+        return order
+
     def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
         live = device_function.new_var("tile_dependency_live_tasks", dce=False)
         # redux.sync makes the bound provably warp-uniform, so tcgen05 issue
@@ -4310,15 +4457,18 @@ def emit_cross_loop_schedule(
 
     if not uses_packet_dispatch:
         assert state_arg is not None
+        root_blocks: dict[int, list[ast.stmt]] = {}
         for root in static_pipeline_plan.resident_roots:
             body = static_root_body(root)
             # The gate precedes the first task loop, after its hoisted loads.
             first = next(
                 (i for i, stmt in enumerate(body) if isinstance(stmt, ast.For)), 0
             )
-            result.extend([*body[:first], *entry_gate, *body[first:]])
+            root_blocks[root] = [*body[:first], *entry_gate, *body[first:]]
             entry_gate = []
         assert not entry_gate, "inband scatters need a resident root"
+        for root in static_root_layout_order():
+            result.extend(root_blocks[root])
         result.append(
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
         )

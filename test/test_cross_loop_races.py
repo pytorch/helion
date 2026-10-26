@@ -530,6 +530,57 @@ def _edges(bound: Any) -> set[tuple[int, int]]:
     return {(edge.producer_root, edge.consumer_root) for edge in graph.edges}
 
 
+def _early_descriptor_copies(ttgir: str, names: tuple[str, ...]) -> dict[str, int]:
+    """TMA copies of each named descriptor that read ahead of a readiness poll:
+    copies hoisted above the entry's first ``ld.acquire`` (outside any
+    warp_specialize partition), plus copies a warp-specialized ring's producer
+    partition issues before any poll of its own (the partition runs ahead of
+    the consumer's poll).  A partition sees a descriptor as the block argument
+    at the descriptor's position in the warp_specialize capture list."""
+    body = ttgir[ttgir.index("tt.func public") :]
+    found = dict.fromkeys(names, 0)
+
+    def tma_of(lines: list[str], operand: str) -> int:
+        return sum(
+            1
+            for line in lines
+            if "async_tma_copy_global_to_local" in line
+            and re.search(rf"{re.escape(operand)}\[", line)
+        )
+
+    head = (
+        body.split("ttg.warp_specialize(", 1)[0]
+        if "ttg.warp_specialize(" in body
+        else body
+    )
+    before = head.partition("ld.acquire")[0].splitlines()
+    for n in names:
+        found[n] += sum(
+            1
+            for line in before
+            if "async_tma_copy_global_to_local" in line
+            and re.search(rf"%{n}(_\d+)?\[", line)
+        )
+    m = re.search(r"ttg\.warp_specialize\(([^)]*)\)", body)
+    if m is None:
+        return found
+    captures = [c.strip() for c in m.group(1).split(",")]
+    for part in re.finditer(r"partition\d+\((.*?)\)\s*num_warps\(", body):
+        block_args = re.findall(r"(%[\w.$-]+)\s*:", part.group(1))
+        text = body[part.end() :]
+        nxt = re.search(r"\n\s*(partition\d+\(|\} : \()", text)
+        early = (
+            (text[: nxt.start()] if nxt else text)
+            .partition("ld.acquire")[0]
+            .splitlines()
+        )
+        for n in names:
+            for k, cap in enumerate(captures):
+                if re.fullmatch(rf"%{n}(_\d+)?", cap) and k < len(block_args):
+                    found[n] += tma_of(early, block_args[k])
+    return found
+
+
 class TestStorageClasses(TestCase):
     """CPU: separately constructed storages over one buffer are one class."""
 
@@ -1124,27 +1175,15 @@ class TestCrossLoopRaces(TestCase):
         def early_copies(kernel: helion.Kernel) -> list[dict[str, int]]:
             """Per compiled binary of the kernel's Triton function (codegen is
             cached by content, so every kernel built here shares it): copies of
-            each descriptor issued before the first readiness poll."""
+            each descriptor issued ahead of a readiness poll, in either form the
+            pass produces (see ``_early_descriptor_copies``)."""
             bound = kernel.bind(args)
             module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
-            counts = []
-            for caches in module._helion_tma_alias.device_caches.values():
-                for compiled in caches[0].values():
-                    ttgir = compiled.asm["ttgir"]
-                    body = ttgir[ttgir.index("tt.func public") :]
-                    before = body[: body.index("ld.acquire")].splitlines()
-                    counts.append(
-                        {
-                            name: sum(
-                                1
-                                for line in before
-                                if "async_tma_copy_global_to_local" in line
-                                and re.search(rf"%{name}(_\d+)?\[", line)
-                            )
-                            for name in ("w_desc", "a_desc")
-                        }
-                    )
-            return counts
+            return [
+                _early_descriptor_copies(compiled.asm["ttgir"], ("w_desc", "a_desc"))
+                for caches in module._helion_tma_alias.device_caches.values()
+                for compiled in caches[0].values()
+            ]
 
         kernel = helion.kernel(tma_alias, config=config, static_shapes=True)
         code = kernel.bind(args).to_triton_code(config)

@@ -467,6 +467,11 @@ class _Settings:
             _env_get_bool, "HELION_CROSS_LOOP_INLINE_SINGLE_TRIP_PUBLISHERS", True
         )
     )
+    cross_loop_code_layout: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CROSS_LOOP_CODE_LAYOUT", True
+        )
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -816,6 +821,16 @@ class Settings(_Settings):
             "task that starts at once fetches it cold. Waiting roots and wrappers with nested "
             "work or peer publication stay noinline. "
             "Set HELION_CROSS_LOOP_INLINE_SINGLE_TRIP_PUBLISHERS=0 for the old form."
+        ),
+        "cross_loop_code_layout": (
+            "If True (default), a static persistent cross-loop kernel lays out its root blocks "
+            "latency-critical roots first, in the order they run, and roots with slack after "
+            "them (by the dynamic pipeline's bytes-per-task timing model), changing only the "
+            "textual order of blocks that share no worker, so every worker runs the same blocks "
+            "in the same order.  Instruction fetch is slow for code that is not resident and lies "
+            "beyond the first ~64 KB of a kernel (B200: ~0.2 us per KB of executed code), so the "
+            "code of the critical path should come first.  "
+            "Set HELION_CROSS_LOOP_CODE_LAYOUT=0 to keep source order."
         ),
         "cross_loop_sink_lpt_order": (
             "If True (default), a dynamic cross-loop pipeline claims the run of sink roots at "

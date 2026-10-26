@@ -32,6 +32,7 @@ import torch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
 try:
     import triton
@@ -300,7 +301,12 @@ def default_launcher(
         else None
     )
     with ttgir_weight_prefetch_context(
-        alias_classes is not None, alias_classes or (), ring=_ttgir_weight_ring
+        alias_classes is not None,
+        alias_classes or (),
+        ring=_ttgir_weight_ring,
+        resident_ctas=ring_resident_ctas(
+            args, _minimum_resident_programs, _ttgir_weight_ring
+        ),
     ):
         if _minimum_resident_programs:
             # ``triton_kernel`` is a JITFunction.  Resource information belongs to
@@ -421,19 +427,55 @@ def ttgir_weight_prefetch_context(
     enable: bool,
     alias_classes: tuple[tuple[str, ...], ...] = (),
     ring: bool = False,
+    resident_ctas: int = 0,
 ) -> contextlib.AbstractContextManager[None]:
     """Compile kernels with the TTGIR weight prefetch pass inside the context;
     ``alias_classes``: argument names that may share a storage; ``ring``: the
     pass tries its warp-specialized weight ring first (the kernel's
-    ``ttgir_weight_ring`` setting, emitted as ``_ttgir_weight_ring``)."""
+    ``ttgir_weight_ring`` setting, emitted as ``_ttgir_weight_ring``);
+    ``resident_ctas``: CTAs per SM the launch requires co-resident (the ring
+    keeps that occupancy)."""
     if enable:
         try:
             from .ttgir_weight_prefetch import enabled
         except ImportError:  # a standalone export runs without the pass
             pass
         else:
+            if resident_ctas > 1:
+                return enabled(alias_classes, ring=ring, resident_ctas=resident_ctas)
             return enabled(alias_classes, ring=ring)
     return contextlib.nullcontext()
+
+
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def ring_resident_ctas(
+    args: Sequence[object], required_programs: int, ring: bool
+) -> int:
+    """The prefetch pass's ``resident_ctas`` fact of a launch: CTAs per SM a
+    polling schedule's ``required_programs`` (``_minimum_resident_programs``)
+    need co-resident on the launch's device; 0 without the ring, without a
+    requirement or without a CUDA tensor (or descriptor base) among ``args``.
+    The launcher and the autotuner's precompile both key compiles with it."""
+    if not ring or not required_programs:
+        return 0
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    tensor = next(
+        (
+            t
+            for t in (a.base if isinstance(a, TensorDescriptor) else a for a in args)
+            if isinstance(t, torch.Tensor) and t.device.type == "cuda"
+        ),
+        None,
+    )
+    if tensor is None:
+        return 0
+    sms = _sm_count(tensor.device.index if tensor.device.index is not None else 0)
+    return -(-int(required_programs) // sms)
 
 
 def compile_only_launch_args(

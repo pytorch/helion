@@ -91,6 +91,97 @@ class TestPrecompileShim(unittest.TestCase):
         self.assertEqual(probed[1], 148)
         self.assertEqual(_find_argument_device(probed), base.device)
 
+    def test_precompile_keys_the_launch_resident_fact(self) -> None:
+        """The autotuner's precompile compiles (and keys) the binary the launch
+        ships: the prefetch pass gets the launch's resident cohort (verify5 C0-a:
+        it was missing, so a resident launch's precompile built another binary)."""
+        from helion.runtime.triton import ttgir_weight_prefetch as twp
+
+        kernel_cache: dict[object, object] = {}
+        fn = Mock()
+        fn.debug = False
+        fn.device_caches = {
+            0: (
+                kernel_cache,
+                object(),
+                object(),
+                Mock(),
+                Mock(return_value=(OrderedDict(), [], SimpleNamespace())),
+            )
+        }
+        fn._pack_args.return_value = (SimpleNamespace(), {}, {}, {})
+        fn.compile.return_value = Mock()
+        seen: list[tuple[object, str]] = []
+        real_context = importlib.import_module(
+            "helion.runtime.precompile_shim"
+        ).ttgir_weight_prefetch_context
+
+        def context(*a: object, **k: object) -> object:
+            ctx = real_context(*a, **k)
+
+            class _Spy:
+                def __enter__(self) -> None:
+                    ctx.__enter__()
+                    facts = twp._current_facts()
+                    seen.append((k.get("resident_ctas"), facts.key() if facts else ""))
+
+                def __exit__(self, *exc: object) -> None:
+                    ctx.__exit__(*exc)
+
+            return _Spy()
+
+        resident_calls: list[tuple[object, ...]] = []
+
+        def resident(args: object, required: object, ring: object) -> int:
+            resident_calls.append((required, ring))
+            return 2
+
+        kernel_module = importlib.import_module("helion.runtime.kernel")
+        with (
+            patch.object(kernel_module, "_find_device", return_value=0),
+            patch(
+                "helion.runtime.precompile_shim.get_triton_version",
+                return_value=Version("3.7.0"),
+            ),
+            patch("triton.runtime.jit.compute_cache_key", return_value="k"),
+            patch(
+                "helion.runtime.precompile_shim.prefetch_alias_classes",
+                return_value=(),
+            ),
+            patch("helion.runtime.precompile_shim.ring_resident_ctas", resident),
+            patch(
+                "helion.runtime.precompile_shim.ttgir_weight_prefetch_context",
+                context,
+            ),
+        ):
+            precompile = make_precompiler(fn, Config(), Mock())(
+                object(),
+                _ttgir_weight_prefetch=True,
+                _ttgir_weight_ring=True,
+                _minimum_resident_programs=296,
+            )
+            self.assertTrue(precompile(in_child_process=False))
+        self.assertEqual(resident_calls, [(296, True)])
+        # both the key computation and the compile run with the launch's fact,
+        # keyed exactly as the launcher keys it
+        self.assertEqual(seen, [(2, "-resident2"), (2, "-resident2")])
+        self.assertEqual(twp._Facts(ring=True, resident_ctas=2).key(), "-resident2")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_ring_resident_ctas_matches_the_launch(self) -> None:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        from helion.runtime.triton.launcher import ring_resident_ctas
+
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        t = torch.zeros(32, 64, device="cuda")
+        self.assertEqual(ring_resident_ctas((t, 3), 2 * sms, True), 2)
+        # descriptor-only launches find the device through the base tensor
+        d = TensorDescriptor.from_tensor(t, [16, 16])
+        self.assertEqual(ring_resident_ctas((d,), 2 * sms, True), 2)
+        self.assertEqual(ring_resident_ctas((t,), 2 * sms, False), 0)
+        self.assertEqual(ring_resident_ctas((t,), 0, True), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -383,7 +383,9 @@ def test_carried_slot_view_read_after_yield_is_refused():
 # ---------------------------------------------------------------------------------------------------------------------
 # Compile-time fallback chain: ring -> hoist -> unchanged when a later stage (make_llir, ptxas) fails or the ring spills.
 
-def _compile_under_hook(tmp_path, monkeypatch, previous=None, chain=False):
+def _compile_under_hook(tmp_path, monkeypatch, previous=None, chain=False, ka=512):
+    # shapes whose ring keeps the fallback's CTAs per SM (R6: a ring that runs fewer is refused after ptxas; the
+    # BN=16 kernels of the structure tests run 8-9 CTAs/SM as is and 4-6 with the 8-warp ring)
     from triton import knobs
 
     from helion.runtime.triton import ttgir_weight_prefetch as pf
@@ -395,8 +397,8 @@ def _compile_under_hook(tmp_path, monkeypatch, previous=None, chain=False):
     try:
         with pf.enabled(ring=True):
             if chain:
-                return _compile_jit(_chain_k, SIGC, dict(K=2048, T=16, BN=16, BK=128, NS=4, RA=1, KA=512), num_warps=4)
-            return _compile_jit(kern.gemv, SIG, dict(K=2048, T=16, BN=16, BK=128, NS=4), num_warps=4)
+                return _compile_jit(_chain_k, SIGC, dict(K=2048, T=16, BN=128, BK=128, NS=4, RA=1, KA=ka), num_warps=4)
+            return _compile_jit(kern.gemv, SIG, dict(K=2048, T=16, BN=64, BK=128, NS=4), num_warps=4)
     finally:
         knobs.runtime.add_stages_inspection_hook = saved
 
@@ -1509,6 +1511,225 @@ def test_fallback_restores_the_config_warp_count():
         fb.advance(md, RuntimeError("boom"))
 
 
+# ---- R6 (verify5 V4/V7): a ring binary never runs fewer CTAs per SM than the binary it falls back to, judged on real
+# resources after ptxas (registers x threads, shared memory, the thread limit), whether or not the launch is resident.
+@triton.jit
+def _occ_k(w_desc, x_ptr, out_ptr, N, K: tl.constexpr, T: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+           NS: tl.constexpr, EPI: tl.constexpr):
+    """verify5/synth/occ_probe.py: a persistent TMA GEMV (no spin, no route) with an EPI-deep register-heavy
+    epilogue."""
+    pid = tl.program_id(0)
+    npid = tl.num_programs(0)
+    n_tiles = tl.cdiv(N, BN)
+    rk = tl.arange(0, BK)
+    rt = tl.arange(0, T)
+    for tile in tl.range(pid, n_tiles, npid, num_stages=1):
+        acc = tl.zeros([BN, T], dtype=tl.float32)
+        for k in tl.range(0, K, BK, num_stages=NS):
+            w = w_desc.load([tile * BN, k])
+            x = tl.load(x_ptr + rt[:, None] * K + (k + rk)[None, :])
+            acc = tl.dot(w, tl.trans(x), acc)
+        y = acc
+        for e in tl.static_range(EPI):
+            y = y * tl.sigmoid(y + e) + tl.sqrt(tl.abs(acc) + e)
+        rn = tile * BN + tl.arange(0, BN)
+        tl.store(out_ptr + rn[:, None] * T + rt[None, :], y.to(tl.bfloat16))
+
+
+def test_ctas_per_sm_counts_registers_threads_and_shared():
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    # the occ probe: 4 warps x 182 registers (23 x 256 per warp) and 98336 B: two CTAs, by registers and shared
+    assert pf.ctas_per_sm(98336, 182, 4) == 2
+    # its ring: 8 warps x 184 registers no longer fit twice in the 64K-register file
+    assert pf.ctas_per_sm(82972, 184, 8) == 1
+    # GLM-5 dynamic Fw_f3's ring: 8 warps x 97 registers, 82972 B: two CTAs
+    assert pf.ctas_per_sm(82972, 97, 8) == 2
+    assert pf.ctas_per_sm(0, 0, 32) == 2  # the 2048-thread limit
+    assert pf.ctas_per_sm(1024, 16, 1, tmem_columns=256) == 2
+    assert pf.ctas_per_sm(1024, 16, 1) == 32
+
+
+def test_entry_registers_reads_the_entry_function():
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    log = ("ptxas info    : Compiling function 'helper' for 'sm_100a'\n"
+           "ptxas info    : Used 250 registers, used 0 barriers\n"
+           "ptxas info    : Compiling entry function 'k' for 'sm_100a'\n"
+           "ptxas info    : Function properties for k\n"
+           "ptxas info    : Used 182 registers, used 1 barriers, 448 bytes cmem[0]\n")
+    assert pf._entry_registers(log) == 182
+    assert pf._entry_registers("ptxas info : 0 bytes gmem\n") is None
+
+
+def _compile_occ_under_hook(tmp_path, monkeypatch, epi):
+    from triton import knobs
+
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(knobs.cache, "dir", str(tmp_path), raising=False)
+    saved = knobs.runtime.add_stages_inspection_hook
+    knobs.runtime.add_stages_inspection_hook = None
+    sig = dict(w_desc="tensordesc<bf16[128, 128]>", x_ptr="*bf16", out_ptr="*bf16", N="i32")
+    try:
+        with pf.enabled(ring=True):
+            return _compile_jit(_occ_k, sig, dict(K=4096, T=64, BN=128, BK=128, NS=2, EPI=epi), num_warps=4)
+    finally:
+        knobs.runtime.add_stages_inspection_hook = saved
+
+
+def _shipped_registers(ptx):
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    d = tempfile.mkdtemp(prefix="ringtest_occ_")
+    pp = os.path.join(d, "k.ptx")
+    with open(pp, "w") as f:
+        f.write(ptx)
+    ptxas = os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/bin/ptxas-blackwell")
+    r = subprocess.run([ptxas, "-v", "--regAllocOptLevel=2", "--gpu-name", "sm_100a", pp, "-o", pp + ".cubin"],
+                       capture_output=True, text=True, check=True)
+    return pf._entry_registers(r.stderr)
+
+
+class _PassLog:
+    """The pass's debug messages while compiling (no caplog: the suites run with ``-p no:logging``)."""
+
+    def __enter__(self):
+        import logging
+
+        from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+        self.messages = []
+        self.logger = logging.getLogger(pf.__name__)
+        self.level = self.logger.level
+        self.handler = logging.Handler(logging.DEBUG)
+        self.handler.emit = lambda r: self.messages.append(r.getMessage())
+        self.logger.addHandler(self.handler)
+        self.logger.setLevel(logging.DEBUG)
+        return self
+
+    def __exit__(self, *exc):
+        self.logger.removeHandler(self.handler)
+        self.logger.setLevel(self.level)
+
+    @property
+    def text(self):
+        return "\n".join(self.messages)
+
+
+def test_ring_that_costs_a_cta_per_sm_ships_its_fallback(tmp_path, monkeypatch):
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    with _PassLog() as log:
+        ck = _compile_occ_under_hook(tmp_path, monkeypatch, epi=4)
+    # every ring form doubles the warps of a ~180-register kernel: one CTA per SM where the fallback runs two
+    assert re.search(r"ring binary runs 1 CTA\(s\) per SM \(\d+ registers x 8 warps\), its fallback 2", log.text)
+    assert ck.metadata.num_warps == 4 and "cp.async.bulk.tensor" in ck.asm["ptx"]
+    regs = _shipped_registers(ck.asm["ptx"])
+    assert pf.ctas_per_sm(ck.metadata.shared, regs, ck.metadata.num_warps) == 2
+
+
+def test_ring_between_two_ctas_and_its_fallback_ships_the_fallback(tmp_path, monkeypatch):
+    """(R6-7) A ring that keeps 2+ CTAs per SM but fewer than its fallback is refused too: the BN16 gemv's 8-warp ring
+    runs 6 CTAs/SM where the 4-warp module runs 9 (measured on B200, one tile per CTA: +0.8 % at K 2048, +4.3 % at
+    K 4096)."""
+    from triton import knobs
+
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(knobs.cache, "dir", str(tmp_path), raising=False)
+    saved = knobs.runtime.add_stages_inspection_hook
+    knobs.runtime.add_stages_inspection_hook = None
+    try:
+        with _PassLog() as log, pf.enabled(ring=True):
+            ck = _compile_jit(kern.gemv, SIG, dict(K=2048, T=16, BN=16, BK=128, NS=4), num_warps=4)
+    finally:
+        knobs.runtime.add_stages_inspection_hook = saved
+    assert re.search(r"ring binary runs 6 CTA\(s\) per SM \(\d+ registers x 8 warps\), its fallback 9", log.text)
+    assert ck.metadata.num_warps == 4 and "cp.async.mbarrier.arrive" not in ck.asm["ptx"]
+
+
+def _hook_compile(tmp_path, monkeypatch, fn, sig, constexprs):
+    from triton import knobs
+
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(knobs.cache, "dir", str(tmp_path), raising=False)
+    saved = knobs.runtime.add_stages_inspection_hook
+    knobs.runtime.add_stages_inspection_hook = None
+    try:
+        with _PassLog() as log, pf.enabled(ring=True):
+            ck = _compile_jit(fn, sig, constexprs, num_warps=4)
+    finally:
+        knobs.runtime.add_stages_inspection_hook = saved
+    return ck, log.text
+
+
+def test_spin_gated_ring_keeps_two_ctas_a_no_spin_ring_all_of_them(tmp_path, monkeypatch):
+    """(R6-8) Both directions of the occupancy band. A spin-gated ring (root B's consumer waits on the readiness
+    counter before the first stage; the weight producer streams past it) ships at 4 CTAs/SM where its 4-warp fallback
+    runs 8: it keeps min(fallback, 2). A ring with no spin before its stages (the plain gemv) keeps all of its
+    fallback's CTAs/SM: 6 < 9 is refused. (B200, one tile per CTA: Helion's spin-gated GEMV megakernels at 4-6 of 6-9
+    CTAs/SM win 2-11 %; plain GEMVs at 6 of 9 lose up to 4 %.)"""
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    gated, log = _hook_compile(tmp_path / "gated", monkeypatch, _chain_k, SIGC,
+                               dict(K=2048, T=16, BN=16, BK=128, NS=4, RA=0, KA=512))
+    assert "'spin_gated': True" in log and "CTA(s) per SM (" not in log
+    assert gated.metadata.num_warps == 8 and "cp.async.mbarrier.arrive" in gated.asm["ptx"]
+    ring_ctas = pf.ctas_per_sm(gated.metadata.shared, _shipped_registers(gated.asm["ptx"]), 8)
+    assert 2 <= ring_ctas < 8 <= pf.ctas_per_sm(24576, 0, 4)   # below the fallback's shared-memory/thread bound
+    plain, log = _hook_compile(tmp_path / "plain", monkeypatch, kern.gemv, SIG, dict(K=2048, T=16, BN=16, BK=128, NS=4))
+    assert "'spin_gated': False" in log
+    assert re.search(r"ring binary runs 6 CTA\(s\) per SM \(\d+ registers x 8 warps\), its fallback 9", log)
+    assert plain.metadata.num_warps == 4
+
+
+def test_occupancy_floor_of_a_spin_gated_ring(monkeypatch):
+    """(R6-8) The guard's floor: a spin-gated ring keeps min(fallback, SPIN_GATED_KEPT); one CTA/SM below a fallback of
+    two or more is refused in every case; any other ring keeps its fallback's CTAs/SM."""
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    assert ringws2.SPIN_GATED_KEPT == 2
+    fb = pf._Fallback({}, None, None)
+    fb.cands = [("ring", "x"), ("hoist", "y"), ("unchanged", None)]
+    fallback = {"ctas": 9}
+    monkeypatch.setattr(pf._Fallback, "_fallback_ctas_per_sm", lambda self, md, occ: fallback["ctas"])
+    for gated, occ, fb_ctas, floor in ((True, 4, 9, 2), (True, 2, 9, 2), (True, 1, 2, 2), (True, 1, 1, 1),
+                                       (False, 4, 9, 9), (False, 6, 6, 6)):
+        fb.cand_facts = {"ring": {"spin_gated": gated}}
+        fallback["ctas"] = fb_ctas
+        assert fb._occupancy_floor({}, occ) == floor, (gated, occ, fb_ctas)
+
+
+def test_spin_gated_shared_memory_rule_keeps_two():
+    """(R6-8) The shared-memory rule agrees with the guard: a spin-gated ring keeps min(module, 2) CTAs/SM of shared
+    memory, so the BN32 chain kernel (6 as is) keeps its full-depth ring (D3, 37948 B) instead of one lowered to keep 6
+    (measured on the Helion BN32 megakernel: D3 at 5 CTAs -3.4..-5.2 %, the lowered D2 at 6 +2.8..+4.1 % vs the hoist);
+    a ring with no spin keeps the module's 6."""
+    src = _chain(0, bn=32)
+    occ = ringws2.kept_occupancy(src)
+    t, info = ringws2.rewrite_budgeted(src)
+    assert occ == 6 and info["spin_gated"] and info["D"] == info["want_D"] == 3
+    assert ringws2.resident_limit(occ) < info["smem"] <= ringws2.resident_limit(2)
+    g = _gemv(32)
+    _, ginfo = ringws2.rewrite_budgeted(g)
+    assert not ginfo["spin_gated"] and ginfo["smem"] <= ringws2.resident_limit(ringws2.kept_occupancy(g))
+
+
+def test_ring_that_keeps_its_ctas_per_sm_ships(tmp_path, monkeypatch):
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    with _PassLog() as log:
+        ck = _compile_occ_under_hook(tmp_path, monkeypatch, epi=0)
+    assert ck.metadata.num_warps == 8 and "CTA(s) per SM (" not in log.text
+    regs = _shipped_registers(ck.asm["ptx"])
+    assert pf.ctas_per_sm(ck.metadata.shared, regs, 8) == 2
+
+
 def test_per_loop_stage_count_invariant_backs_up_the_sequence_guard(monkeypatch):
     # defense in depth: with the global stage-sequence guard neutralized, a pipelined loop whose producer would issue
     # fewer stages than the consumer reads (pipeliner predicate iv < K - 3 BK lowered by one BK) is still refused
@@ -1593,7 +1814,8 @@ def _two_gemv_k(w1_ptr, w2_ptr, x_ptr, y_ptr, out_ptr, state_ptr, epoch_ptr, N2,
 def test_ring_takes_the_longest_suffix_that_fits_at_full_depth():
     sig = dict(w1_ptr="*bf16", w2_ptr="*bf16", x_ptr="*bf16", y_ptr="*bf16", out_ptr="*bf16", state_ptr="*i32",
                epoch_ptr="*i32", N2="i32")
-    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=4096, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
+    # root A's K (1024) keeps root B's ring above MIN_COPY_COVERAGE of the trip-weighted copy bytes (B5-9)
+    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=1024, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
                        num_warps=4).asm["ttgir"]
     starts = ringws2._ring_starts(src)
     assert len(starts) == 2
@@ -1913,7 +2135,7 @@ def test_prefix_hoist_of_the_suffix_policy_gets_the_alias_classes(monkeypatch):
     monkeypatch.setattr(ringws2.P, "rewrite", spy)
     sig = dict(w1_ptr="*bf16", w2_ptr="*bf16", x_ptr="*bf16", y_ptr="*bf16", out_ptr="*bf16", state_ptr="*i32",
                epoch_ptr="*i32", N2="i32")
-    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=4096, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
+    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=1024, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
                        num_warps=4).asm["ttgir"]
     _, info = ringws2.rewrite_budgeted(src, alias_classes=(("w1_ptr", "x_ptr"),))
     assert info["from_top"] is not None and seen and all(s == (("w1_ptr", "x_ptr"),) for s in seen)
@@ -2049,8 +2271,40 @@ def test_pass_digest_hashes_the_ring_module():
 
     from helion.runtime.triton import ttgir_weight_prefetch as pf
 
-    want = hashlib.sha256(Path(pf.__file__).read_bytes() + Path(ringws2.__file__).read_bytes()).hexdigest()
+    family = sorted(Path(pf.__file__).parent.glob("ttgir_*.py"))
+    assert {"ttgir_weight_prefetch.py", "ttgir_weight_ring.py"} <= {f.name for f in family}
+    want = hashlib.sha256(b"".join(f.name.encode() + b"\0" + f.read_bytes() for f in family)).hexdigest()
     assert pf._DIGEST == want
+
+
+def test_ring_compile_key_follows_the_ring_decisions(monkeypatch):
+    """(ATT6 verify, mutant K15) A ring binary depends on the automatic decisions' values (size-twin budget, ladder,
+    coverage threshold, defaults, shared-memory limit); a value changed at run time (a tool, a test) must change both
+    cache keys of a ring compile, and nothing else may; kernels without the ring do not depend on them."""
+    from helion.runtime.triton import ttgir_weight_prefetch as pf
+
+    def keys():
+        with pf.enabled(ring=True):
+            on = pf._StagesHook(None)()
+        with pf.enabled(ring=False):
+            off = pf._StagesHook(None)()
+        return on, off
+
+    base_on, base_off = keys()
+    assert base_on[0].endswith("-ring1")
+    for name, value in (
+        ("CODE_BUDGET", ringws2.CODE_BUDGET + 1024),
+        ("SIZE_LADDER", ringws2.SIZE_LADDER[:1]),
+        ("MIN_COPY_COVERAGE", ringws2.MIN_COPY_COVERAGE / 2),
+        ("RING_DEFAULTS", {**ringws2.RING_DEFAULTS, "unroll": 0}),
+        ("SMEM_LIMIT", ringws2.SMEM_LIMIT - 1024),
+    ):
+        monkeypatch.setattr(ringws2, name, value)
+        on, off = keys()
+        assert on[0] != base_on[0] and on[1] != base_on[1], name
+        assert off == base_off, name
+        monkeypatch.undo()
+        assert keys() == (base_on, base_off)
 
 
 def test_candidates_pass_the_alias_classes_to_ring_and_hoist(monkeypatch):
@@ -2168,7 +2422,9 @@ def _cw(mode):
 def test_v2_a_callee_writer_root_gets_an_ordering_point():
     src = _cw(0)
     assert "tt.call" in src
-    t, info = ringws2.rewrite_budgeted(src)
+    # the whole-module ring (the policy itself starts at root B here: the whole-module ring's 28748 B would lower the
+    # module's 8 CTAs/SM of shared memory, R6-7)
+    t, info = ringws2._act_or_wonly(src, ringws2.SMEM_LIMIT, True, {**ringws2.ring_options(), "from_top": None})
     assert info["act"] and info["order_points"] == 1
     default, _, aprod = _parts(t)
     arrive = default.index("ttng.arrive_barrier %rg_wov0, 1")
@@ -2590,7 +2846,8 @@ def _labels_under_hook(tmp_path, monkeypatch, budget, codes=None):
     monkeypatch.setattr(pf._Fallback, "ttgir", ttgir)
     monkeypatch.setattr(pf._Fallback, "cubin", cubin)
     monkeypatch.setattr(ringws2, "CODE_BUDGET", budget)
-    ck = _compile_under_hook(tmp_path, monkeypatch, chain=True)
+    # KA=1024: root A's ring loop is long enough that rolling its producer shrinks the code at BN=128
+    ck = _compile_under_hook(tmp_path, monkeypatch, chain=True, ka=1024)
     return seen["cands"], seen["used"], ck
 
 
@@ -2685,6 +2942,344 @@ def test_size_twins_only_where_they_change_the_ring():
     assert len(texts) == len(set(texts))
 
 
+def test_roll_refuses_a_loop_copy_that_is_not_the_peeled_successor():
+    """(ATT6 verify, mutants RM4 / RM4c) The rolled-producer re-check compares stage counts and order only; it cannot see
+    tile addresses.  The cone rule must refuse a loop whose in-loop copy issues tile iv + step instead of the
+    pipeliner's peeled successor iv + K * step (K = 3 prologue stages of step 128 here): rolled, the producer would issue
+    other tiles than the prologue it replaces (wrong data, out-of-bounds reads) with the same stage word."""
+    src = _chain(0)
+    succ = re.compile(r"(%[\w.]+ = arith\.addi %[\w.]+), %c384_i32 : i32")
+    assert len(succ.findall(src)) == 1 and "%c128_i32 = arith.constant 128 : i32" in src
+    witness = succ.sub(r"\1, %c128_i32 : i32", src)
+    assert ringws2.rewrite(src, shared=True, act=True, roll=True)[1]["rolled"] == 1  # the fixture itself rolls
+    unrolled, _ = ringws2.rewrite(witness, shared=True, act=True)
+    log = []
+    rolled, info = ringws2.rewrite(witness, shared=True, act=True, roll=True, log=log)
+    assert info["rolled"] == 0
+    assert rolled == unrolled
+    assert any("not rolled" in m for m in log)
+
+
+def test_roll_refuses_the_successor_constant_under_another_op():
+    """(ATT7 verify, mutant RM4c3) The peeled successor is iv + K * step exactly: the same K * step constant under
+    another op (iv - 384, iv * 384) issues other tiles, so the cone rule must check the op, not only the constant."""
+    src = _chain(0)
+    succ = re.compile(r"(%[\w.]+) = arith\.addi (%[\w.]+), %c384_i32 : i32")
+    assert len(succ.findall(src)) == 1
+    for op in ("arith.subi", "arith.muli"):
+        witness = succ.sub(rf"\1 = {op} \2, %c384_i32 : i32", src)
+        unrolled, _ = ringws2.rewrite(witness, shared=True, act=True)
+        log = []
+        rolled, info = ringws2.rewrite(witness, shared=True, act=True, roll=True, log=log)
+        assert info["rolled"] == 0, op
+        assert rolled == unrolled, op
+        assert any("not rolled" in m for m in log), op
+
+
 def test_roll_has_no_environment_switch(monkeypatch):
     monkeypatch.setenv("HELION_TTGIR_RING_ROLL", "1")
     assert "roll" not in ringws2.options_from_env()
+
+
+# ---------------------------------------------------------------- TMA rings (Triton-pipelined descriptor loads)
+@triton.jit
+def _tma_gemv_k(w_desc, x_ptr, route_ptr, out_ptr, state_ptr, N, K: tl.constexpr, T: tl.constexpr,
+                BN: tl.constexpr, BK: tl.constexpr, NS: tl.constexpr, ROUTED: tl.constexpr, WRITE: tl.constexpr,
+                SPIN: tl.constexpr, RED: tl.constexpr, PUB: tl.constexpr = 0):
+    """Persistent GEMV whose weight tiles are TMA loads Triton pipelines (barrier_expect + async_tma_copy per stage).
+    ROUTED: the tile's weight row comes from a route table (a dependent address, DESIGN rule E); WRITE: the kernel also
+    writes the route table inside the tile loop; SPIN: an acquire spin precedes the route load; RED: the row is an
+    integer reduction (tt.reduce) of a loaded route vector; PUB: the kernel itself publishes the state the spin polls
+    (a release add after each tile, like Helion's tile-dependency counters)."""
+    pid = tl.program_id(0)
+    npid = tl.num_programs(0)
+    n_tiles = tl.cdiv(N, BN)
+    rk = tl.arange(0, BK)
+    rt = tl.arange(0, T)
+    for tile in tl.range(pid, n_tiles, npid, num_stages=1):
+        if SPIN:
+            c = _acq(state_ptr)
+            while c != tile:
+                c = _acq(state_ptr)
+            tl.inline_asm_elementwise("bar.warp.sync 0xffffffff; mov.u32 $0, $1;", "=r,r", [tl.arange(0, 32)],
+                                      dtype=tl.int32, is_pure=False, pack=1)
+        if RED:
+            row = tl.sum(tl.load(route_ptr + tile * 8 + tl.arange(0, 8))) * BN
+        elif ROUTED:
+            row = tl.load(route_ptr + tile) * BN
+        else:
+            row = tile * BN
+        acc = tl.zeros([BN, T], dtype=tl.float32)
+        for k in tl.range(0, K, BK, num_stages=NS):
+            w = w_desc.load([row, k])
+            x = tl.load(x_ptr + rt[:, None] * K + (k + rk)[None, :])
+            acc = tl.dot(w, tl.trans(x), acc)
+        rn = tile * BN + tl.arange(0, BN)
+        tl.store(out_ptr + rn[:, None] * T + rt[None, :], acc.to(tl.bfloat16))
+        if WRITE:
+            tl.store(route_ptr + tile, 0)
+        if PUB:
+            tl.atomic_add(state_ptr, 1, sem="release", scope="gpu")
+
+
+def _tma(routed=0, write=0, spin=0, red=0, bn=128, bk=128, ns=4, pub=0):
+    sig = dict(w_desc=f"tensordesc<bf16[{bn}, {bk}]>", x_ptr="*bf16", route_ptr="*i32", out_ptr="*bf16",
+               state_ptr="*i32", N="i32")
+    return _compile_jit(_tma_gemv_k, sig, dict(K=2048, T=16, BN=bn, BK=bk, NS=ns, ROUTED=routed, WRITE=write,
+                                               SPIN=spin, RED=red, PUB=pub), num_warps=4).asm["ttgir"]
+
+
+def test_tma_ring_structure_and_compiles():
+    src = _tma()
+    assert src.count("ttng.async_tma_copy_global_to_local") >= 2 and "ttng.barrier_expect" in src
+    t, info = ringws2.rewrite(src, shared=True)
+    default, prod = _split(t)
+    # the producer issues every TMA copy into the ring's slots, completing on the ring's ready barrier
+    assert "ttng.async_tma_copy_global_to_local" not in default and "ttng.barrier_expect" not in default
+    assert prod.count("ttng.async_tma_copy_global_to_local") == info["pstages"]
+    expects = re.findall(r"ttng\.barrier_expect (%pr_rb\d+), (\d+), %pr_true", prod)
+    assert len(expects) == info["pstages"] and {b for _, b in expects} == {str(128 * 128 * 2)}
+    for bar, _ in expects:
+        assert re.search(rf"async_tma_copy_global_to_local [^\n]* %pr_slot\d+, {bar}, %pr_true :", prod)
+    # Triton's per-stage TMA barriers are gone; the ready barrier counts the expect arrival + the cp.async arrivals of
+    # the 4 weight-producer warps (x is read-only: its copies move to the same producer)
+    assert re.search(r"ttng\.init_barrier %rg_r0, 129 :", t)
+    assert len(re.findall(r"ttng\.init_barrier %\S+, 1 : !ttg\.memdesc<1xi64, #shared\d*", default)) <= 2
+    s = offc.compile_ttgir_text(t)
+    assert s["num_warps"] == 8 and s["spill"] == "0"
+
+
+def test_tma_rule_e_clones_the_routing_load():
+    t, info = ringws2.rewrite(_tma(routed=1), shared=True)
+    default, prod = _split(t)
+    assert default.count("tt.load %") >= 1 and re.search(r"= tt\.load %pu\S+ : !tt\.ptr<i32>", prod)
+    assert prod.count("ttng.async_tma_copy_global_to_local") == info["pstages"]
+    offc.compile_ttgir_text(t)
+
+
+def test_tma_rule_e_clones_an_integer_reduction():
+    t, _ = ringws2.rewrite(_tma(red=1), shared=True)
+    _, prod = _split(t)
+    assert prod.count('"tt.reduce"') == 1 and "tt.reduce.return" in prod
+    offc.compile_ttgir_text(t)
+
+
+def test_tma_rule_e_clones_the_preceding_spin():
+    t, _ = ringws2.rewrite(_tma(routed=1, spin=1), shared=True)
+    default, prod = _split(t)
+    # the producer performs the consumer's acquire before it reads the route table
+    assert prod.count("ld.acquire.gpu") == 2 and prod.index("ld.acquire.gpu") < prod.index("tt.load %pu")
+    assert default.count("ld.acquire.gpu") == 2
+    offc.compile_ttgir_text(t)
+
+
+def test_tma_rule_e_refuses_a_route_table_written_in_the_region():
+    with pytest.raises(ringws2.Fail):
+        ringws2.rewrite(_tma(routed=1, write=1), shared=True)
+
+
+def test_tma_expect_bytes_mismatch_is_refused():
+    src = _tma()
+    assert "ttng.barrier_expect" in src
+    with pytest.raises(ringws2.Fail):
+        ringws2.rewrite(re.sub(r"(ttng\.barrier_expect %\S+), 32768,", r"\1, 16384,", src, count=1), shared=True)
+
+
+def test_tma_barrier_with_a_foreign_use_is_refused():
+    src = _tma()
+    m = re.search(r"ttng\.barrier_expect (%\S+), 32768, (%\S+) : (!ttg\.memdesc<1xi64[^>]*>)", src)
+    # an extra arrive on a TMA stage barrier: it orders something else -> refuse
+    extra = f"ttng.arrive_barrier {m.group(1)}, 1 : {m.group(3)}\n    "
+    with pytest.raises(ringws2.Fail):
+        ringws2.rewrite(src.replace(m.group(0), extra + m.group(0), 1), shared=True)
+
+
+def test_tma_source_written_in_kernel_stays():
+    src = _tma()
+    # a TMA store through the weight descriptor: the TMA ring must not move (the x ring may)
+    m = re.search(r"^(\s*)(%\S+) = ttg\.memdesc_index (%\S+)\[%c0_i32\] : !ttg\.memdesc<4x128x128xbf16.*$", src, re.M)
+    assert m is not None
+    store = (f"{m.group(1)}ttng.async_tma_copy_local_to_global %w_desc[%c0_i32, %c0_i32] {m.group(2)} : "
+             "!tt.tensordesc<128x128xbf16, #shared>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>")
+    src2 = src.replace(m.group(0), m.group(0) + "\n" + store, 1)
+    log = []
+    t, info = ringws2.rewrite(src2, shared=True, log=log)
+    assert any("TMA source written in-kernel, stays" in l for l in log)
+    assert len(info["rings"]) == 1 and "_x" in info["rings"][0]
+    default, prod = _split(t)
+    assert "ttng.async_tma_copy_global_to_local" not in prod and "ttng.barrier_expect" in default
+    offc.compile_ttgir_text(t)
+
+
+def test_resident_ring_keeps_occupancy_and_register_budget():
+    src = _tma()
+    plain, pinfo = ringws2.rewrite_budgeted(src)
+    assert pinfo["smem"] > ringws2.resident_limit(2)  # D4: one CTA per SM
+    t, info = ringws2.rewrite_budgeted(src, resident_ctas=2)
+    assert info["smem"] <= ringws2.resident_limit(2) == 233472 // 2 - 1024 and info["D"] < pinfo["D"]
+    assert info["resident_ctas"] == 2 and "nvvm.minctasm = 2 : i32" in t
+    assert '"ttg.maxnreg" = 128 : i32' in t and "requestedRegisters = array<i32: 40>" in t
+    s = offc.compile_ttgir_text(t)
+    assert s["num_warps"] == 8 and s["setmaxnreg"] > 0
+    # one CTA per SM (or no requirement): the ring is the default one
+    assert ringws2.rewrite_budgeted(src, resident_ctas=1) == (plain, pinfo)
+    assert ringws2.rewrite_budgeted(src, resident_ctas=0) == (plain, pinfo)
+
+
+def test_resident_fact_is_part_of_the_key():
+    from helion.runtime.triton import ttgir_weight_prefetch as twp
+
+    assert twp._Facts(ring=True, resident_ctas=2).key() == "-resident2"
+    assert twp._Facts(ring=True, resident_ctas=1).key() == ""
+    assert twp._Facts(ring=False, resident_ctas=2).key() == ""
+    fb = twp._Fallback({}, None, None, (), 2)
+    assert fb._spill_allowance() == ringws2.RESIDENT_SPILL_BYTES
+    assert twp._Fallback({}, None, None, ())._spill_allowance() == 0
+
+
+@pytest.mark.parametrize("ns", [2, 3, 4])
+def test_ring_keeps_the_module_occupancy(ns):
+    """(B5-8, R6-7) A ring with no spin-gated first stage (R6-8) keeps the module's shared-memory occupancy, all of it
+    (depth lowered to fit), up to what a warp-specialized kernel of it reaches at all (2048 threads / (32 x (4 + 4)) =
+    8 CTAs for a 4-warp module)."""
+    src = _tma(ns=ns)
+    occ = ringws2.SMEM_PER_SM // (ringws2.smem_of(src) + ringws2.SMEM_RESERVED)
+    assert ringws2.kept_occupancy(src) == max(1, min(occ, 8))
+    if ns == 2:
+        # 73760 B: 3 CTAs/SM as is; no TMA ring depth keeps 3 (D2 needs 77860 B > 76800): refused
+        assert occ == 3
+        with pytest.raises(ringws2.Fail, match="does not fit"):
+            ringws2.rewrite_budgeted(src)
+    else:
+        _, info = ringws2.rewrite_budgeted(src)
+        assert info["smem"] <= ringws2.resident_limit(ringws2.kept_occupancy(src))
+    assert ringws2.kept_occupancy(_gemv()) == 8  # BN16 gemv: 9 CTAs/SM of shared memory, 8 reachable
+    g = _gemv(32)
+    occ32 = ringws2.SMEM_PER_SM // (ringws2.smem_of(g) + ringws2.SMEM_RESERVED)
+    assert 2 < occ32 < 8 and ringws2.kept_occupancy(g) == occ32   # no cap at 2 any more
+    _, info32 = ringws2.rewrite_budgeted(g)
+    assert info32["smem"] <= ringws2.resident_limit(occ32)
+
+
+def test_copy_coverage_weights_constant_loop_trips():
+    """(B5-9) An in-loop copy of a constant-trip loop counts once per iteration; a loop with run-time bounds once."""
+    text = """\
+    %c0 = arith.constant 0 : i32
+    %c8 = arith.constant 8 : i32
+    %c1 = arith.constant 1 : i32
+    %a = ttg.async_copy_global_to_local %p, %s : tensor<16x128x!tt.ptr<bf16>, #blocked> -> <16x128xbf16, #shared, #smem, mutable>
+    ttg.warp_specialize(%x)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg: i32) num_warps(1) {
+      scf.for %i = %c0 to %c8 step %c1 : i32 {
+        %b = ttg.async_copy_global_to_local %p, %s : tensor<16x128x!tt.ptr<bf16>, #blocked> -> <16x128xbf16, #shared, #smem, mutable>
+      }
+      scf.for %j = %arg to %c8 step %c1 : i32 {
+        %c = ttg.async_copy_global_to_local %p, %s : tensor<16x128x!tt.ptr<bf16>, #blocked> -> <16x128xbf16, #shared, #smem, mutable>
+      }
+      ttg.warp_return
+    } : (i32) -> ()
+"""
+    assert ringws2.copy_coverage(text) == pytest.approx(9 / 10)
+
+
+def test_suffix_policy_skips_a_low_coverage_suffix():
+    sig = dict(w1_ptr="*bf16", w2_ptr="*bf16", x_ptr="*bf16", y_ptr="*bf16", out_ptr="*bf16", state_ptr="*i32",
+               epoch_ptr="*i32", N2="i32")
+    # root A's K (4096) dwarfs root B: B's own ring would stream ~12% of the copy bytes -> the policy takes both roots
+    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=4096, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
+                       num_warps=4).asm["ttgir"]
+    starts = ringws2._ring_starts(src)
+    tb, ib = ringws2.rewrite_budgeted(src, from_top=starts[1])
+    assert ib["D"] == ib["want_D"] and ringws2.copy_coverage(tb) < ringws2.MIN_COPY_COVERAGE
+    t, info = ringws2.rewrite_budgeted(src)
+    assert info["from_top"] is None and ringws2.copy_coverage(t) >= ringws2.MIN_COPY_COVERAGE
+
+
+def test_rule_e_ring_without_lookahead_is_flagged():
+    """(B5-9) The routed TMA gemv whose kernel publishes the state its per-tile spin polls: W clones the acquire spin
+    its route load needs, the only spin before the first stage, and that spin waits for this kernel's own progress ->
+    no lookahead; without the spin W waits for nothing (it streams ahead across tiles), and without a dependent load
+    it clones nothing."""
+    _, info = ringws2.rewrite(_tma(routed=1, spin=1, pub=1), shared=True)
+    assert info["w_lookahead"] is False
+    assert ringws2.rewrite(_tma(routed=1), shared=True)[1]["w_lookahead"] is True
+    assert ringws2.rewrite(_tma(), shared=True)[1]["w_lookahead"] is True
+    with pytest.raises(ringws2.Fail, match="no lookahead"):
+        ringws2.rewrite_budgeted(_tma(routed=1, spin=1, pub=1))
+
+
+def test_rule_e_producer_runs_ahead_past_spins_on_state_published_outside_the_kernel():
+    """(R6, verify5 la.py) The same persistent gemv when no op of the kernel writes the polled state: the spin W clones
+    sits in the tile loop with the first stage, and nothing this kernel does gates it, so W runs on into later tiles by
+    the ring's depth -> lookahead, and the policy builds the ring (la.py: ~12% faster than the hoist)."""
+    src = _tma(routed=1, spin=1)
+    _, info = ringws2.rewrite(src, shared=True)
+    assert info["w_lookahead"] is True
+    t, binfo = ringws2.rewrite_budgeted(src)
+    assert binfo["from_top"] is None and binfo["D"] >= 2
+    default, prod = _split(t)
+    assert prod.count("ld.acquire.gpu") == 2 and default.count("ld.acquire.gpu") == 2
+
+
+def test_rule_e_lookahead_needs_a_shared_loop_and_read_only_polls():
+    """The exception's two conditions on stand-in nodes: a loop encloses the cloned spins and the first stage, and
+    every spin W clones inside it polls only read-only arguments."""
+    from types import SimpleNamespace as NS
+
+    seed = next(l for l in _tma(routed=1, spin=1).split("\n") if "ld.acquire.gpu" in l)
+    lines = [seed, ""]
+    loop = NS(i=9, parent=None, op="scf.for")
+    spin = NS(i=0, parent=None, regions=[], uses=["%state"])
+    stage = NS(i=1, parent=None, regions=[], uses=[])
+    pre = [[spin]]
+
+    def runs(read_only, roots=None):
+        return ringws2._runs_ahead_into_later_tasks(lines, stage, pre, pre, {0}, roots or {}, read_only)
+
+    assert runs({"%state"}) is False            # no loop at all (a one-shot task)
+    spin.parent = loop
+    assert runs({"%state"}) is False            # the stage is outside the spin's loop
+    stage.parent = loop
+    assert runs({"%state"}) is True             # one loop, the polled state is published outside the kernel
+    assert runs(set()) is False                 # the kernel writes the polled state
+    assert runs({"%state"}, {"%state": frozenset({"%state", "%flags"})}) is False   # a written root among its roots
+
+
+def test_negative_control_nowspin_drops_the_rule_e_spin_clone_from_the_weight_producer():
+    src = _tma(routed=1, spin=1)
+    t, _ = ringws2.rewrite(src, shared=True)
+    tn, _ = ringws2.rewrite(src, shared=True, neg="nowspin")
+    assert _split(t)[1].count("ld.acquire.gpu") == 2 and "ld.acquire.gpu" not in _split(tn)[1]
+    assert _split(t)[0] == _split(tn)[0]   # the consumer keeps its spin
+
+
+def test_mlir_rejected_candidate_is_a_refusal_not_an_error():
+    """(verify5 C3 / C7) A 1-warp module's ring is a warp-specialized module MLIR rejects ("num_warps ... multiple of
+    4"): smem_of raises Fail (a refusal), not RuntimeError."""
+    src = _compile_jit(kern.gemv, SIG, dict(K=2048, T=16, BN=16, BK=128, NS=4), num_warps=1).asm["ttgir"]
+    t, _ = ringws2.rewrite(src)
+    with pytest.raises(ringws2.Fail, match="MLIR rejects"):
+        ringws2.smem_of(t)
+    with pytest.raises(ringws2.Fail, match="MLIR rejects"):
+        ringws2.rewrite_budgeted(src)
+
+
+def test_mlir_rejected_suffix_does_not_hide_the_next_suffix(monkeypatch):
+    sig = dict(w1_ptr="*bf16", w2_ptr="*bf16", x_ptr="*bf16", y_ptr="*bf16", out_ptr="*bf16", state_ptr="*i32",
+               epoch_ptr="*i32", N2="i32")
+    src = _compile_jit(_two_gemv_k, sig, dict(N1=2048, K=1024, T=16, BN1=128, BK1=256, NS1=3, BN2=16, BK2=128, NS2=7),
+                       num_warps=4).asm["ttgir"]
+    starts = ringws2._ring_starts(src)
+    real = ringws2.rewrite
+
+    def broken_whole_module(text, **kw):
+        t, info = real(text, **kw)
+        if kw.get("from_top") is None:   # the whole-module ring: a module MLIR cannot parse
+            t = t.replace("ttg.warp_specialize(", "ttg.warp_specialize_bogus(", 1)
+        return t, info
+    monkeypatch.setattr(ringws2, "rewrite", broken_whole_module)
+    _, info = ringws2.rewrite_budgeted(src)
+    assert info["from_top"] == starts[1]

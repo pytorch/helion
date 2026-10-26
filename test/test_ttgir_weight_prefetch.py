@@ -1246,7 +1246,9 @@ def _norm_gemv(x: torch.Tensor, gamma: torch.Tensor, w: torch.Tensor) -> torch.T
         y[t, :] = (row * torch.rsqrt(ms + 1e-6) * gamma[None, :].to(torch.float32)).to(
             torch.bfloat16
         )
-    for n_t in hl.tile(n_dim, block_size=16):
+    # N block 64: the warp-specialized ring keeps the hoist's two CTAs per SM
+    # (at 16 the 4-warp hoist runs 9 per SM, the 8-warp ring 6: refused)
+    for n_t in hl.tile(n_dim, block_size=64):
         acc = hl.zeros([n_t, t_rows], dtype=torch.float32)
         for k_t in hl.tile(k_dim, block_size=128):
             acc = hl.dot(w[n_t, k_t], y[:, k_t].permute(1, 0), acc=acc)
@@ -1409,7 +1411,7 @@ def _late_act_gemv(
         y[t, :] = (x[t, :].to(torch.float32) * gamma[None, :].to(torch.float32)).to(
             torch.bfloat16
         )
-    for n_t in hl.tile(n_dim, block_size=16):
+    for n_t in hl.tile(n_dim, block_size=64):  # as _norm_gemv: the ring keeps 2 CTAs/SM
         acc = hl.zeros([n_t, t_rows], dtype=torch.float32)
         for k_t in hl.tile(k_dim, block_size=128):
             acc = hl.dot(w[n_t, k_t], y[:, k_t].permute(1, 0), acc=acc)
@@ -1457,13 +1459,28 @@ def _ring_parts(ttgir: str) -> tuple[str, list[str]]:
 
 
 def _compiled_ttgir(bound: object) -> list[str]:
+    return [compiled.asm["ttgir"] for compiled in _compiled(bound)]
+
+
+def _compiled(bound: object) -> list[object]:
     module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
     jit = module._helion__norm_gemv
     return [
-        compiled.asm["ttgir"]
+        compiled
         for caches in jit.device_caches.values()
         for compiled in caches[0].values()
     ]
+
+
+def _is_ring_binary(compiled: object) -> bool:
+    """The binary is the ring's, not a fallback's: Triton keeps the first
+    candidate's TTGIR in ``asm`` even when a later stage fell back, so only
+    the binary's warp count and PTX tell."""
+    md = compiled.metadata  # pyrefly: ignore[missing-attribute]
+    ptx = compiled.asm["ptx"]  # pyrefly: ignore[missing-attribute]
+    return md.num_warps > 4 and (
+        "cp.async.mbarrier.arrive" in ptx or "mbarrier.arrive.expect_tx" in ptx
+    )
 
 
 @onlyBackends(["triton"])
@@ -1506,7 +1523,13 @@ class TestTtgirWeightPrefetchCompile(TestCase):
             early = [
                 line for line in lines[:poll] if "async_copy_global_to_local" in line
             ]
-            self.assertEqual(len(early), 3 if enabled else 0)
+            if enabled:
+                # the weight's prologue copies (64x128 tiles), never the
+                # activation's (16x128): y is written in-kernel
+                self.assertGreaterEqual(len(early), 3)
+                self.assertTrue(all("tensor<64x128x" in line for line in early))
+            else:
+                self.assertEqual(early, [])
         x, gamma, w = (a.float() for a in args)
         y = (x * torch.rsqrt((x * x).mean(-1, keepdim=True) + 1e-6) * gamma).bfloat16()
         torch.testing.assert_close(
@@ -1530,8 +1553,10 @@ class TestTtgirWeightPrefetchCompile(TestCase):
             self.assertEqual("_ttgir_weight_prefetch=True" in code, prefetch_on)
             self.assertEqual("_ttgir_weight_ring=True" in code, prefetch_on and ring)
             outputs[prefetch_on, ring] = kernel(*args)
-            (ttgir,) = _compiled_ttgir(bound)
+            (compiled,) = _compiled(bound)
+            ttgir = compiled.asm["ttgir"]  # pyrefly: ignore[missing-attribute]
             self.assertEqual("ttg.warp_specialize" in ttgir, prefetch_on and ring)
+            self.assertEqual(_is_ring_binary(compiled), prefetch_on and ring)
             if not (prefetch_on and ring):
                 continue
             default, producers = _ring_parts(ttgir)
@@ -2028,7 +2053,7 @@ class TestTtgirWeightRingRace(TestCase):
 
     def _run(
         self, ring: bool, neg: str | None, launches: int
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], str]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], str, bool]:
         torch.manual_seed(0)
         x = torch.randn(16, 512, device=DEVICE, dtype=torch.bfloat16)
         gamma = (1 + 0.1 * torch.randn(512, device=DEVICE)).bfloat16()
@@ -2052,11 +2077,11 @@ class TestTtgirWeightRingRace(TestCase):
             bound.set_config(_CONFIG)
             module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
 
-            def compiled() -> dict[object, str]:
+            def compiled() -> dict[object, object]:
                 # Kernels with equal generated code share one JIT function;
                 # the hook keys its binaries apart (ring0 / ring1 / ring1[neg]).
                 return {
-                    key: c.asm["ttgir"]
+                    key: c
                     for caches in module._helion__late_act_gemv.device_caches.values()
                     for key, c in caches[0].items()
                 }
@@ -2068,17 +2093,20 @@ class TestTtgirWeightRingRace(TestCase):
                 ys.append(y.clone())
             torch.cuda.synchronize()
         # one new binary, compiled once for all the launches
-        (ttgir,) = [t for key, t in compiled().items() if key not in before]
-        return outs, ys, ttgir
+        (binary,) = [c for key, c in compiled().items() if key not in before]
+        ttgir = binary.asm["ttgir"]  # pyrefly: ignore[missing-attribute]
+        return outs, ys, ttgir, _is_ring_binary(binary)
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((10, 0))
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_activation_producer_waits_for_a_late_writer(self) -> None:
-        (reference,), (y_reference,), hoisted = self._run(False, None, 1)
+        (reference,), (y_reference,), hoisted, ring = self._run(False, None, 1)
         self.assertNotIn("ttg.warp_specialize", hoisted)
+        self.assertFalse(ring)
         self.assertFalse(reference.isnan().any())
-        outs, ys, ttgir = self._run(True, None, 10)
+        outs, ys, ttgir, ring = self._run(True, None, 10)
+        self.assertTrue(ring)  # the ring binary ran, not a fallback
         # The ring streams the weight and the activation: the activation
         # producer polls the readiness counter (its cloned spin), the weight
         # producer polls nothing.
@@ -2092,7 +2120,8 @@ class TestTtgirWeightRingRace(TestCase):
             self.assertTrue(torch.equal(out, reference))
         # Negative control: without its spin the activation producer copies
         # the poisoned rows before the late root writes them.
-        outs, _, ttgir = self._run(True, "nospin", 5)
+        outs, _, ttgir, ring = self._run(True, "nospin", 5)
+        self.assertTrue(ring)
         _, (weights, activation) = _ring_parts(ttgir)
         self.assertNotIn("ld.acquire", activation)
         self.assertIn("async_copy_mbarrier_arrive", activation)

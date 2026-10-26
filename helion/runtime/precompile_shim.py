@@ -14,6 +14,7 @@ from ..autotuner.logger import classify_triton_exception
 from ..autotuner.logger import format_triton_compile_failure
 from .triton.launcher import compile_only_launch_args
 from .triton.launcher import prefetch_alias_classes
+from .triton.launcher import ring_resident_ctas
 from .triton.launcher import ttgir_weight_prefetch_context
 
 if TYPE_CHECKING:
@@ -100,6 +101,10 @@ def make_precompiler(
         )
         ttgir_weight_prefetch = alias_classes is not None
         ring = bool(kwargs.get("_ttgir_weight_ring"))
+        # the launch's co-resident cohort: part of the pass's facts (and key)
+        resident_ctas = ring_resident_ctas(
+            args, cast("int", kwargs.get("_minimum_resident_programs", 0)), ring
+        )
         # pyrefly: ignore [bad-argument-type]
         args, kwargs = compile_only_launch_args(*args, **kwargs)
         # pyrefly: ignore [bad-argument-type]
@@ -112,7 +117,10 @@ def make_precompiler(
         ]
         bound_args, specialization, options = binder(*args, **kwargs)
         with ttgir_weight_prefetch_context(
-            ttgir_weight_prefetch, alias_classes or (), ring=ring
+            ttgir_weight_prefetch,
+            alias_classes or (),
+            ring=ring,
+            resident_ctas=resident_ctas,
         ):
             _key_stages_hook(specialization)
         # Keep this key and the packed compile inputs identical to
@@ -169,7 +177,10 @@ def make_precompiler(
             compiled_kernel = None
             try:
                 with ttgir_weight_prefetch_context(
-                    ttgir_weight_prefetch, alias_classes or (), ring=ring
+                    ttgir_weight_prefetch,
+                    alias_classes or (),
+                    ring=ring,
+                    resident_ctas=resident_ctas,
                 ):
                     kernel_cache[key] = compiled_kernel = fn.compile(
                         src, target=target, options=options.__dict__

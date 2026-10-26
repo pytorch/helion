@@ -34,6 +34,7 @@ Fail-closed: raises Fail(reason); the hook then leaves the module unchanged.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 import re
 import os
@@ -53,6 +54,17 @@ _COPY_RE = re.compile(
     rf"(?:\s+mask\s+(?P<mask>{V}))?(?:\s+other\s+(?P<other>{V}))?")
 _WHILE = re.compile(rf"^(?P<ind>\s*)(?:(?P<res>{V})(?::(?P<n>\d+))?\s*=\s*)?scf\.while\s*\((?P<args>.*?)\)\s*:\s*"
                     r"\((?P<ty>.*?)\)\s*->\s*(?P<rty>.*?)\s*\{\s*$")
+# Triton's pipelined TMA copy: descriptor[coordinates] -> slot view, completion barrier, predicate.
+_TMA_RE = re.compile(
+    rf"^\s*ttng\.async_tma_copy_global_to_local\s+(?P<desc>{V})\[(?P<coords>[^\]]*)\]\s+(?P<dst>{V}),\s*(?P<bar>{V}),"
+    rf"\s*(?P<pred>{V})\s*:\s*(?P<tys>.*)$")
+_EXPECT_RE = re.compile(rf"^\s*ttng\.barrier_expect\s+(?P<bar>{V}),\s*(?P<bytes>\d+),\s*(?P<pred>{V})\s*:")
+_MMA_OPS = frozenset({"ttng.tc_gen5_mma", "ttng.tc_gen5_mma_scaled"})
+# Views through which a slot reaches its readers unchanged (same bytes, another shape / order).
+_SLOT_VIEWS = frozenset({"ttg.memdesc_trans", "ttg.memdesc_reshape"})
+# Ops through which a local_load's registers reach an MMA operand in the same block (scale chains: reshape / trans /
+# layout conversion into a tensor-memory allocation).
+_REG_FLOW = frozenset({"tt.reshape", "tt.trans", "ttg.convert_layout", "tt.bitcast", "ttng.tmem_alloc"})
 _CLONE_OK = P._PURE | {"tt.get_program_id", "tt.get_num_programs", "arith.ceildivsi", "arith.floordivsi"}
 _BITS = {"bf16": 16, "f16": 16, "f32": 32, "i8": 8, "i32": 32, "i64": 64, "f8E4M3FN": 8, "f8E5M2": 8, "i16": 16,
          "f64": 64, "i1": 8}
@@ -238,6 +250,32 @@ def _ancestors(n):
     while p is not None:
         yield p
         p = p.parent
+
+
+def _runs_ahead_into_later_tasks(lines, first, pre, spin_groups, w_spin_ops, roots, read_only):
+    """Whether a weight producer that clones every spin in ``pre`` (the readiness spins before the region's first stage
+    ``first``) still runs ahead of the consumer: some loop encloses ``first`` and every spin of ``pre`` (its later
+    iterations are later tasks), and every spin the producer clones inside that loop polls only arguments no op of the
+    kernel writes (``read_only``: the hoist pass's write analysis closed over the launch's storage classes), so the
+    polled state was published before the launch or by another grid, never by this kernel's progress."""
+    def polls_read_only(g):
+        seeds = [x for x in _walk(g) if P._is_seed(lines[x.i])]
+        polled = set()
+        for x in seeds:
+            for u in x.uses:
+                u = u.split("#")[0]
+                polled |= roots.get(u, frozenset({u}))
+        return bool(seeds) and polled <= read_only
+
+    for loop in _ancestors(first):
+        if loop.op not in ("scf.for", "scf.while"):
+            continue
+        if not all(any(a is loop for a in _ancestors(g[0])) for g in pre):
+            continue
+        inside = [g for g in spin_groups if any(x.i in w_spin_ops for x in g)
+                  and any(a is loop for a in _ancestors(g[0]))]
+        return all(polls_read_only(g) for g in inside)
+    return False
 
 
 def _memdesc_shape(t):
@@ -565,6 +603,8 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     arrives on a CTA-local ordering mbarrier after that root and the activation producer waits on it before the reading
     root: the same-CTA program order the original read relied on is restored exactly (cross-CTA order stays with the
     cloned spins), with no reasoning about which counter or target covers which rows.
+    ``neg="nowspin"`` (TEST ONLY): the weight producer omits the spins rule E cloned for its dependent loads (it reads
+    the route table unordered and streams tiles of whatever it read).
     ``neg="nospin"`` / ``neg="noorder"`` (TEST ONLY): the activation producer omits the cloned spins / the ordering
     waits (must race).  ``unroll`` N: fully unroll every consumer loop
     with a ring stage, constant bounds, at most N iterations and no nested region (exact SSA substitution; ptxas does
@@ -583,7 +623,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     and ``iv + K*step``, and no other stage is issued between the first prologue copy and the loop.  Motivation:
     instruction-cache retention across launches (att5 NOTES E1c): a megakernel whose code outgrows what the GPU's
     instruction caches keep between launches runs its roots with cold code every launch."""
-    if neg not in (None, "early", "nospin", "noorder"):
+    if neg not in (None, "early", "nospin", "noorder", "nowspin"):
         raise Fail(f"unknown negative control {neg}")
     if neg in ("nospin", "noorder") and not act:
         raise Fail(f"negative control {neg} needs act")
@@ -684,6 +724,22 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
             if m.group("dst") in view_ring:
                 view_ring[m.group("dst")].copies.append(n)
                 copy_of[n.i] = m
+    # TMA copies (Triton's pipeliner: barrier_expect bar[s], bytes; TMA desc[coords] -> slot, bar[s]; consumer
+    # wait_barrier bar[s]) into a multibuffer view: ring stages too, issued by the weight producer with the ring's ready
+    # barrier as their completion barrier.
+    tma_of = {}
+    for n in nodes:
+        if n.op == P._TMA_COPY:
+            m = _TMA_RE.match(P._code(lines[n.i]))
+            if not m:
+                raise Fail("unrecognized TMA copy")
+            if m.group("dst") in view_ring:
+                view_ring[m.group("dst")].copies.append(n)
+                tma_of[n.i] = m
+
+    def dst_of(c):
+        return (tma_of[c.i] if c.i in tma_of else copy_of[c.i]).group("dst")
+
     sel = []
     act_names, act_roots = set(), {}
     top_index = {x.i: k for k, n in enumerate(body) for x in _walk([n])}
@@ -692,11 +748,17 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
             continue
         if from_top is not None and any(top_index[c.i] < from_top for c in r.copies):
             continue
+        if len({c.i in tma_of for c in r.copies}) != 1:
+            raise Fail(f"ring {r.name} filled by both TMA and cp.async copies")
         roots = set()
         for c in r.copies:
-            src = copy_of[c.i].group("src")
+            src = tma_of[c.i].group("desc") if c.i in tma_of else copy_of[c.i].group("src")
             roots |= f.roots.get(src, frozenset({src}))
         if not roots <= read_only:
+            if r.copies[0].i in tma_of:
+                if log is not None:
+                    log.append(f"ring {r.name}: TMA source written in-kernel, stays")
+                continue
             if not act:
                 if log is not None:
                     log.append(f"ring {r.name}: source written in-kernel, stays")
@@ -729,6 +791,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     keep = set()
     captures = []
     pcaps = []   # act mode: non-clonable scalars of the function's top level (must lie in the ring-free prefix)
+    dep_loads = {}   # rule E: line of a load the producers clone -> the kernel arguments it reads
 
     def need(v):
         v = v.split("#")[0]
@@ -753,13 +816,35 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
         if d.i in keep:
             return
         if d.op not in _CLONE_OK:
-            if act_names and d.parent is None and _scalar_type(lines[d.i]):
+            if (act_names or tma_of) and d.parent is None and _scalar_type(lines[d.i]):
                 # e.g. the per-launch epoch Helion loads at entry: captured by the warp_specialize (checked below to
                 # be defined before it), so every partition sees the very same SSA value
                 if v not in pcaps:
                     pcaps.append(v)
                 return
-            raise Fail(f"producer cone has {d.op}")
+            if d.op == "tt.load" and tma_of:
+                # RULE E (dependent addresses, e.g. the expert of a routed weight tile): a load the producer clones.
+                # Sound only if the producer reads the same bytes as the consumer: checked after the cone is known
+                # (no writer of the loaded arguments inside the warp-specialized region; the producers clone every
+                # readiness spin that precedes the load, so they perform the consumer's acquires first).
+                if "isVolatile = true" in lines[d.i] or not d.uses:
+                    raise Fail("producer cone has a volatile load")
+                roots_ = f.roots.get(d.uses[0], frozenset({d.uses[0]}))
+                if not roots_ <= set(f.params):
+                    raise Fail("producer cone loads through a non-argument pointer")
+                dep_loads[d.i] = frozenset(roots_)
+            elif _generic_op(lines[d.i]) in ("tt.reduce", "tt.scan") and tma_of:
+                # integer reductions / scans with a pure combiner: cloned verbatim (warp-count independent)
+                tys = P._code(lines[d.end]).rsplit(":", 1)[-1]
+                if re.search(r"\b(f16|bf16|f32|f64|f8E\w+)\b", tys):
+                    raise Fail("producer cone has a floating-point reduction")
+                if not d.regions:
+                    raise Fail("producer cone reduction without a combiner region")
+                for x in _walk(d.regions[0]):
+                    if x.op not in P._PURE | {"tt.reduce.return", "tt.scan.return"}:
+                        raise Fail(f"producer cone reduction combiner has {x.op}")
+            else:
+                raise Fail(f"producer cone has {d.op or P._code(lines[d.i]).strip()[:80]}")
         keep.add(d.i)
         for u in d.uses:
             need(u)
@@ -829,7 +914,35 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     def _in_pipelined_loop(c):
         return "tt.num_stages" in lines[c.parent.end] or "loop.stage" in lines[c.i]
 
+    def _pipelined_by_triton(c):
+        """The copy's loop is one Triton software-pipelined (more than one stage, or the copy carries a stage)."""
+        mm = re.search(r"tt\.num_stages = (\d+)", lines[c.parent.end])
+        return (mm is not None and int(mm.group(1)) > 1) or "loop.stage" in lines[c.i]
+
+    def const_i1(v):
+        d = by_res.get(v)
+        if d is None or d.op != "arith.constant":
+            return None
+        mm = re.search(r"arith\.constant (true|false)\b", P._code(lines[d.i]))
+        return None if mm is None else mm.group(1) == "true"
+
     for c in copies:
+        if c.i in tma_of:
+            m = tma_of[c.i]
+            need(m.group("desc"))
+            for x in re.findall(V, m.group("coords")):
+                need(x)
+            k1 = const_i1(m.group("pred"))
+            p = None if k1 is True else DEAD if k1 is False else m.group("pred")
+            if p is None and c.parent is not None and c.parent.op == "scf.for" and _pipelined_by_triton(c):
+                raise Fail("in-loop TMA copy without a pipeliner predicate")
+            preds[c.i] = p
+            resid_of[c.i] = None
+            if p is not None and p is not DEAD:
+                need(p)
+            for a in _ancestors(c):
+                mark(a)
+            continue
         m = copy_of[c.i]
         if m.group("other"):
             need(m.group("other"))
@@ -848,7 +961,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
             mark(a)
 
     def slot_of_copy(c):
-        return by_res[copy_of[c.i].group("dst")].uses[1]
+        return by_res[dst_of(c)].uses[1]
 
     pstages = {}
     for c in copies:
@@ -858,8 +971,58 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     for cs in pstages.values():
         if len({preds[c.i] for c in cs}) != 1:
             raise Fail("copies of one stage with different predicates")
-        if len({view_ring[copy_of[c.i].group('dst')].name for c in cs}) != len(cs):
+        if len({view_ring[dst_of(c)].name for c in cs}) != len(cs):
             raise Fail("two copies of one stage into one ring")
+
+    # ---------------- TMA stages: Triton's per-stage completion barriers (one barrier_expect + the stage's TMA copies
+    # + the consumer's wait_barrier per slot) are replaced by the ring's ready barrier; every use of such a barrier
+    # array must be one of those (else the barrier orders something else: refuse).
+    tma_bars = {}      # barrier array name -> Ring record of the barrier allocation
+    tma_bytes = {}     # stage key -> bytes of its TMA members (Triton's barrier_expect count, verified)
+    ring_has_tma = any(c.i in tma_of for c in copies)
+    for c in copies:
+        if c.i not in tma_of:
+            continue
+        bv = tma_of[c.i].group("bar")
+        br = view_ring.get(bv)
+        if br is None or br.tile != [1] or br.elem != "i64":
+            raise Fail("TMA copy completion barrier is not a view of a barrier array")
+        tma_bars[br.name] = br
+    bar_drop = set()   # lines dropped from the consumer: the arrays, their views, init / inval / expect / waits
+    for bname, br in tma_bars.items():
+        bar_drop.add(br.alloc.i)
+        bar_drop.update(d.i for d in br.deallocs)
+        for u in users.get(bname, []):
+            if u.op not in ("ttg.memdesc_index", "ttg.local_dealloc"):
+                raise Fail(f"TMA barrier array used by {u.op}")
+        for ix in br.views:
+            bar_drop.add(ix.i)
+            for u in users.get(ix.results[0], []):
+                if u.op in ("ttng.init_barrier", "ttng.inval_barrier", "ttng.barrier_expect", "ttng.wait_barrier"):
+                    if u.op == "ttng.wait_barrier" and " deps " in P._code(lines[u.i]):
+                        raise Fail("TMA barrier wait with dependencies")
+                    bar_drop.add(u.i)
+                elif u.op == P._TMA_COPY:
+                    if u.i not in copy_set:
+                        raise Fail("TMA barrier shared with a copy that stays")
+                else:
+                    raise Fail(f"TMA barrier view used by {u.op}")
+    for key, cs in pstages.items():
+        tm = [c for c in cs if c.i in tma_of]
+        if not tm:
+            continue
+        tb = sum(view_ring[dst_of(c)].tile_bytes for c in tm)
+        bars = {tma_of[c.i].group("bar") for c in tm}
+        if len(bars) != 1:
+            raise Fail("TMA copies of one stage complete on different barriers")
+        bv = bars.pop()
+        exps = [u for u in users.get(bv, []) if u.op == "ttng.barrier_expect"]
+        if len(exps) != 1:
+            raise Fail("TMA stage without exactly one barrier_expect")
+        em = _EXPECT_RE.match(P._code(lines[exps[0].i]))
+        if em is None or int(em.group("bytes")) != tb or em.group("pred") != tma_of[tm[0].i].group("pred"):
+            raise Fail("barrier_expect bytes / predicate differ from the stage's TMA copies")
+        tma_bytes[key] = tb
 
     # ---------------- consumer stages
     PASSIVE = ("scf.for", "scf.yield", "ttng.wait_barrier", "scf.if")
@@ -930,11 +1093,11 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
             for u in users.get(v, []):
                 if u.i in copy_set or u.op in PASSIVE:
                     continue
-                if u.op == "ttg.memdesc_trans":
+                if u.op == "ttg.memdesc_trans" or (u.op in _SLOT_VIEWS and ring_has_tma):
                     work.append(u.results[0])
-                elif u.op in ("ttg.local_load", "ttng.tc_gen5_mma"):
-                    if u.op == "ttng.tc_gen5_mma" and v not in u.uses[:2]:
-                        raise Fail("moved slot as MMA accumulator")
+                elif u.op in ("ttg.local_load", "ttng.tc_gen5_mma") or (u.op in _MMA_OPS and ring_has_tma):
+                    if u.op in _MMA_OPS and v not in u.uses[:2]:
+                        raise Fail("moved slot as MMA accumulator or scale")
                     readers.append(u)
                 else:
                     raise Fail(f"moved slot read by {u.op}")
@@ -942,10 +1105,31 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
             raise Fail("stage without readers")
         if any(rd.parent is not ixs[0].parent for rd in readers):
             raise Fail("stage readers in another block")
-        kinds = {rd.op for rd in readers}
+        readers = sorted(readers, key=lambda x: x.i)
+        kinds = {"ttng.tc_gen5_mma" if rd.op in _MMA_OPS else rd.op for rd in readers}
         if len(kinds) != 1:
-            raise Fail("stage read by local_load and MMA")
-        cinfo[key] = (sorted(ixs, key=lambda x: x.i), sorted(readers, key=lambda x: x.i), kinds.pop())
+            # Mixed stage (e.g. an NVFP4 weight tile read by a scaled MMA and its scale tile by a local_load that
+            # feeds the MMA's tensor-memory scale operand): released by tcgen05.commit after its last MMA iff no
+            # generic read of the stage is outstanding once that MMA is issued, i.e. the last reader is an MMA and
+            # every local_load's registers reach the operands of an MMA reader issued no later than it (the load has
+            # then completed before that MMA, hence before the commit).
+            mmas = [rd for rd in readers if rd.op in _MMA_OPS]
+            if not ring_has_tma or readers[-1].op not in _MMA_OPS:
+                raise Fail("stage read by local_load and MMA")
+            p0 = readers[0].parent
+            blk = p0.regions[[k for k, r in enumerate(p0.regions) if readers[0] in r][0]] if p0 else body
+            pos = {x.i: k for k, x in enumerate(blk)}
+            for ld in (rd for rd in readers if rd.op == "ttg.local_load"):
+                vals, ok_ = set(ld.results), False
+                for x in blk[pos[ld.i] + 1: pos[readers[-1].i] + 1]:
+                    if x.op in _MMA_OPS and x in mmas and set(x.uses) & vals:
+                        ok_ = True
+                        break
+                    if x.op in _REG_FLOW and set(x.uses) & vals:
+                        vals |= set(x.results)
+                if not ok_:
+                    raise Fail("stage's local_load does not feed an MMA reader before its release")
+        cinfo[key] = (sorted(ixs, key=lambda x: x.i), readers, kinds.pop() if len(kinds) == 1 else "ttng.tc_gen5_mma")
 
     # ---------------- stage-count invariant: per pipelined loop instance the producer issues exactly as many stages
     # as the consumer reads (prologue + live in-loop copies == peeled reads + one read per iteration)
@@ -961,7 +1145,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
 
     p_anchor = {key: sorted(cs, key=lambda c: c.i)[-1] for key, cs in pstages.items()}
     c_anchor = {key: v[0][0] for key, v in cinfo.items()}
-    ring_of_p = {key: {view_ring[copy_of[c.i].group("dst")].name for c in cs} for key, cs in pstages.items()}
+    ring_of_p = {key: {view_ring[dst_of(c)].name for c in cs} for key, cs in pstages.items()}
     ring_of_c = {key: {ix.uses[0] for ix in v[0]} for key, v in cinfo.items()}
 
     def contains(n, x):
@@ -1072,15 +1256,44 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
         return out
     c_ctr = counter_nodes([ixs[0] for ixs, _, _ in cinfo.values()])
 
-    # ---------------- activation rings (act): spins to clone into the activation producer + soundness rules
+    # ---------------- activation rings (act) and dependent producer cones (rule E): spins to clone into the producers
+    # + soundness rules
     spin_ops, spin_groups, split_est = set(), [], None
+    w_spin_ops = set()   # rule E: spins the weight producer clones (the activation producer clones them too)
     order_after = {}   # act: reading root (top-level line) -> the last earlier root of the region writing its activation
 
     def top_of(n):
         while n.parent is not None:
             n = n.parent
         return n
-    if act_names:
+
+    def clone_spins(anchor_lines, into):
+        """Clone every recognized spin of the region that precedes one of ``anchor_lines`` in program order or shares
+        a loop with one: the cloning producer then has performed every acquire the consumer had at each anchor."""
+        last = max(anchor_lines)
+        loops = {a.i for i in anchor_lines for a in _ancestors(by_line[i]) if a.op == "scf.for"}
+        for grp in spin_groups:
+            if grp[0].i <= split_est:
+                continue
+            if not (grp[0].i < last or any(a.op == "scf.for" and a.i in loops for a in _ancestors(grp[0]))):
+                continue
+            defs, toks = set(), set()
+            for x in grp:
+                if x.op in (P._ASM, "scf.while"):
+                    into.add(x.i)
+                keep.add(x.i)
+                for k in range(x.i, x.end + 1):
+                    code = P._code(lines[k])
+                    defs |= set(re.findall(rf"({V})(?::\d+)?\s*=(?!=)", code))
+                    if code.strip().startswith("^"):
+                        defs |= set(re.findall(rf"({V})\s*:(?!\d)", code))
+                    toks |= {t.split("#")[0] for t in re.findall(V, code)}
+            for t in sorted(toks - {d.split("#")[0] for d in defs}):
+                need(t)
+            for a in _ancestors(grp[0]):
+                mark(a)
+    by_line = {n.i: n for n in nodes}
+    if act_names or dep_loads:
         marks = set(copy_set) | {ix.i for r in sel for ix in r.views} | set(c_ctr) | \
             {rd.i for _, rds, _ in cinfo.values() for rd in rds}
         for n in body:
@@ -1130,17 +1343,28 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                 # reads, but only spins of the entry function are cloned into the activation producer
                 raise Fail(f"call to a synchronizing function ({_callee(raw)}) in the warp-specialized region")
 
-        act_copies = [c for c in copies if view_ring[copy_of[c.i].group("dst")].name in act_names]
+        # (rule E) a load the producers clone reads arguments no op of the region writes: every write to them is in the
+        # prefix (this CTA: program order before the warp_specialize; other CTAs: ordered by the spins the producers
+        # clone, exactly as the consumer's load was), so the clone and the consumer's load read the same bytes
+        for i, X in dep_loads.items():
+            if i <= split_est:
+                raise Fail("producer cone loads in the ring-free prefix")
+            for w in nodes:
+                if w.i > split_est and write_hits(w) & X:
+                    raise Fail(f"producer cone loads {sorted(X)}, written in the warp-specialized region")
+        if dep_loads:
+            clone_spins(sorted(dep_loads), w_spin_ops)
+        act_copies = [c for c in copies if view_ring[dst_of(c)].name in act_names]
         # (R3) where the activation is written: never in the root that reads it; in an EARLIER root of the region only
         # through generic-proxy stores, and then the reading root's activation copies wait for a CTA-local ordering
         # point the consumer passes after that root (same-CTA program order restored; other CTAs' writes are ordered
         # by the cloned spins exactly as the consumer's reads were).  Writes before the region happen-before both
         # partitions (warp_specialize entry); writes in a LATER root only follow reads whose copies completed before
         # the consumer passed their stages (ready mbarrier = copy completion).
-        async_funcs = _async_writing_functions(lines, funcs)
+        async_funcs = _async_writing_functions(lines, funcs) if act_names else set()
         for rname in act_names:
             X = act_roots[rname]
-            rc = [c for c in act_copies if view_ring[copy_of[c.i].group("dst")].name == rname]
+            rc = [c for c in act_copies if view_ring[dst_of(c)].name == rname]
             tops = {top_of(c).i for c in rc}
             for w in nodes:
                 if not write_hits(w) & X:
@@ -1158,28 +1382,44 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                         order_after[tr] = tw
         # (R1) clone every spin of the region that precedes an activation copy in program order (or shares a loop
         # with one): the activation producer then has performed every acquire the consumer had at each copy
-        last_act = max(c.i for c in act_copies)
-        act_loops = {a.i for c in act_copies for a in _ancestors(c) if a.op == "scf.for"}
-        for grp in spin_groups:
-            if grp[0].i <= split_est:
-                continue
-            if not (grp[0].i < last_act or any(a.op == "scf.for" and a.i in act_loops for a in _ancestors(grp[0]))):
-                continue
-            defs, toks = set(), set()
-            for x in grp:
-                if x.op in (P._ASM, "scf.while"):
-                    spin_ops.add(x.i)
-                keep.add(x.i)
-                for k in range(x.i, x.end + 1):
-                    code = P._code(lines[k])
-                    defs |= set(re.findall(rf"({V})(?::\d+)?\s*=(?!=)", code))
-                    if code.strip().startswith("^"):
-                        defs |= set(re.findall(rf"({V})\s*:(?!\d)", code))
-                    toks |= {t.split("#")[0] for t in re.findall(V, code)}
-            for t in sorted(toks - {d.split("#")[0] for d in defs}):
-                need(t)
-            for a in _ancestors(grp[0]):
-                mark(a)
+        if act_copies:
+            clone_spins([c.i for c in act_copies], spin_ops)
+        # cloning spins may pull more dependent loads into the cones (their addresses): those need the same rules
+        for i, X in dep_loads.items():
+            if i <= split_est:
+                raise Fail("producer cone loads in the ring-free prefix")
+            for w in nodes:
+                if w.i > split_est and write_hits(w) & X:
+                    raise Fail(f"producer cone loads {sorted(X)}, written in the warp-specialized region")
+        if dep_loads:
+            clone_spins(sorted(dep_loads), w_spin_ops)
+
+    # weight-producer lookahead (rule E): when W's dependent cones make it clone EVERY readiness spin the consumer passes
+    # before the region's first stage, W issues nothing ahead of the consumer there (B5-9: the MoE MK's FC1 root, whose
+    # route load needs the only spin before its tiles); the root-suffix policy does not start a ring at such a root.
+    # Exception (R6, verify5 la.py): those spins and the first stage share a loop (W runs on into the loop's later
+    # tasks while the consumer still computes this one) and every spin W clones in that loop polls state no op of the
+    # kernel writes (published before the launch or by another grid): no progress of this kernel gates W there, so W
+    # runs ahead by the ring's depth. A spin on state this kernel publishes (the MoE MK's tile-dependency counters,
+    # static and dynamic alike) waits for an in-kernel producer on the critical path - W gets no earlier than the
+    # consumer (B5-9: static FC2-on +4.5 / FC1-on +4.9 us vs the static hoist's +2.4).
+    w_lookahead = True
+    if dep_loads:
+        first_stage = min(c.i for c in copies if preds[c.i] is not DEAD)
+        pre = [g for g in spin_groups if split_est < g[0].i < first_stage]
+        w_lookahead = not pre or any(not any(x.i in w_spin_ops for x in g) for g in pre)
+        if not w_lookahead:
+            w_lookahead = _runs_ahead_into_later_tasks(lines, by_line[first_stage], pre, spin_groups, w_spin_ops,
+                                                        f.roots, read_only)
+    # spin-gated (R6-8): the consumer passes a readiness spin before the ring's first stage that the weight producer
+    # does not clone, so W streams the stages while the consumer waits (a cross-root prefetch). Such a ring may run
+    # fewer CTAs per SM than its fallback, down to 2 (ttgir_weight_prefetch._Fallback): the fallback's extra CTAs would
+    # spin as well.
+    spin_gated = False
+    if spin_groups and split_est is not None:
+        first_stage = min(c.i for c in copies if preds[c.i] is not DEAD)
+        spin_gated = any(split_est < g[0].i < first_stage and not any(x.i in w_spin_ops for x in g)
+                         for g in spin_groups)
 
     # ---------------- shared byte rings (stage 2)
     k_of = {r.name: 1 for r in sel}
@@ -1194,8 +1434,8 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     if shared:
         role = {}
         for cs in pstages.values():
-            for k, c in enumerate(sorted(cs, key=lambda c: (view_ring[copy_of[c.i].group("dst")].name in act_names, c.i))):
-                rn = view_ring[copy_of[c.i].group("dst")].name
+            for k, c in enumerate(sorted(cs, key=lambda c: (view_ring[dst_of(c)].name in act_names, c.i))):
+                rn = view_ring[dst_of(c)].name
                 if role.setdefault(rn, k) != k:
                     raise Fail("ring with two roles")
         groups = {}
@@ -1223,12 +1463,16 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
 
     # ---------------- emit consumer (default region)
     edits, before, after = {}, {}, {}
-    drop = {r.alloc.i for r in sel} | {d.i for r in sel for d in r.deallocs} | copy_set
+    drop = {r.alloc.i for r in sel} | {d.i for r in sel for d in r.deallocs} | copy_set | bar_drop
     for r in sel:
         for ix in r.views:
             if all(u.i in copy_set for u in users.get(ix.results[0], [])):
                 drop.add(ix.i)
-    moved_tokens = {c.results[0] for c in copies}
+    moved_tokens = {c.results[0] for c in copies if c.results}
+    # consumer stages with a cp.async member: generic-proxy writes, made visible to MMA reads (async proxy) by a fence
+    # after the ready wait; TMA-only stages need none (TMA writes and MMA reads are both async proxy)
+    cp_rings = {r.name for r in sel if r.copies and r.copies[0].i not in tma_of}
+    fence_of = {key: bool(ring_of_c[key] & cp_rings) for key in cinfo}
     uid = [0]
 
     def fresh(b):
@@ -1528,7 +1772,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                     edits[ix.i] = view_line(ind, ix.results[0], ix.uses[0], s)
                 wl = [f"{ind}{rb} = ttg.memdesc_index %rg_ready[{s}] : {bar_ty} -> {bar1}",
                       f"{ind}ttng.wait_barrier {rb}, {ph} : {bar1}"]
-                if kind == "ttng.tc_gen5_mma":
+                if kind == "ttng.tc_gen5_mma" and fence_of[key]:
                     wl.append(f"{ind}ttng.fence_async_shared {{bCluster = false}}")
                 before.setdefault(readers[0].i, []).extend(wl)
                 if neg == "early":
@@ -1640,9 +1884,9 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                 if len(code) != 1:
                     raise Fail("edited reader")
                 edits[u.i] = [re.sub(rf"\s+token\s+{re.escape(n.results[0])}(?![\w$.-])", "", code[0])]
-    if act_names:
-        # the region R1-R3 reasoned about IS the emitted one: the warp_specialize starts at split_est (a ring edit in
-        # the prefix would fail the "ring code before the warp_specialize" check below)
+    if act_names or dep_loads:
+        # the region R1-R3 (and rule E) reasoned about IS the emitted one: the warp_specialize starts at split_est (a
+        # ring edit in the prefix would fail the "ring code before the warp_specialize" check below)
         split_at = split_est
     elif late_ws:
         touched = set(edits) | set(before) | set(after) | copy_set | {ix.i for r in sel for ix in r.views}
@@ -1692,6 +1936,9 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
     cap_ty = ring_cap_ty + [bar_ty, ebar_ty] + mb_cap_ty + wo_cap_ty + [ptypes[c] for c in captures] + \
         [_scalar_type(lines[by_res[v].i]) for v in pcaps]
     pa = {v: f"%pa{k}" for k, v in enumerate(cap_all)}
+    # the weight producer issues a cp.async member (its noinc arrivals count in the ready barrier) or TMA only
+    w_has_cp = any(c.i not in tma_of and view_ring[dst_of(c)].name not in act_names for c in copies)
+
     def build(kind):
         """Producer partition body: kind "w" issues the weight copies of every stage, kind "a" (act mode) the
         activation copies behind the cloned spins; both wait / arrive on every stage of the global sequence."""
@@ -1723,6 +1970,8 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
         prod = [f"{pind}%pr_one = arith.constant 1 : i32", f"{pind}%pr_c0 = arith.constant 0 : i32",
                 f"{pind}%pr_D = arith.constant {D} : i32", f"{pind}%pr_G = arith.constant {group} : i32",
                 f"{pind}%pr_NB = arith.constant {NB} : i32"]
+        if ring_has_tma:
+            prod.append(f"{pind}%pr_true = arith.constant true")
         ring_ref = {}
         if shared:
             for (name, bt, bmax, rs, _align) in byte_rings:
@@ -1767,8 +2016,11 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                     prod.extend([f"{ind}{wv} = ttg.memdesc_index {pa['%rg_wo']}[{pa['%rg_woc' + str(k)]}] : {wo_ty} -> {bar1}",
                                  f"{ind}ttng.wait_barrier {wv}, %pr_c0 : {bar1}"])
                 code = P._code(lines[n.i])
-                if n.i in spin_ops:
-                    if kind != "a" or neg == "nospin":
+                if n.i in spin_ops or n.i in w_spin_ops:
+                    # rule E spins guard loads both producers clone; act spins guard the activation copies (A only)
+                    if neg == "nowspin" and kind == "w" and n.i in w_spin_ops:
+                        continue   # TEST ONLY: the weight producer loads its dependent addresses unordered
+                    if not (n.i in w_spin_ops or (kind == "a" and neg != "nospin")):
                         continue
                     base = P._indent(lines[n.i])
                     for k in range(n.i, n.end + 1):
@@ -1835,6 +2087,11 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                         prod.append(f"{ind}  scf.yield {cur} : i32")
                     prod.append(f"{ind}}}")
                     cur = res
+                elif n.regions and _generic_op(lines[n.i]) in ("tt.reduce", "tt.scan"):
+                    # rule E: an integer reduction / scan of a dependent cone, cloned verbatim (combiner included)
+                    base = P._indent(lines[n.i])
+                    for k in range(n.i, n.end + 1):
+                        prod.append(ind + " " * (P._indent(lines[k]) - base) + rn_raw(lines[k]).strip())
                 elif n.i in copy_set:
                     if preds[n.i] is DEAD or n.i in rolled_copies:
                         continue
@@ -1860,13 +2117,30 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                         bl += [f"{ind2}{gq_} = arith.divui {cur}, %pr_G : i32", f"{ind2}{eidx} = arith.remui {gq_}, %pr_NB : i32"]
                     bl += [f"{ind2}{eb} = ttg.memdesc_index {pa['%rg_empty']}[{eidx}] : {ebar_ty} -> {bar1}",
                            f"{ind2}ttng.wait_barrier {eb}, {pi} : {bar1}"]
+                    rb_line = f"{ind2}{rb} = ttg.memdesc_index {pa['%rg_ready']}[{s}] : {bar_ty} -> {bar1}"
+                    if ring_has_tma:
+                        bl.append(rb_line)   # the TMA copies complete on it
+                    if ring_has_tma and kind == "w":
+                        # one arrival per stage of the global sequence (+ the stage's TMA bytes, 0 if it has none):
+                        # Triton's own expect count, the ready barrier counts it once
+                        bl.append(f"{ind2}ttng.barrier_expect {rb}, {tma_bytes.get(key, 0)}, %pr_true : {bar1}")
                     for c in cs:
-                        m = copy_of[c.i]
-                        ring = view_ring[m.group("dst")]
+                        ring = view_ring[dst_of(c)]
                         if (ring.name in act_names) != (kind == "a"):
                             continue
                         v = pf("slot")
                         bl += view_line(ind2, v, ring.name, s, ring_ref[ring.name])
+                        if c.i in tma_of:
+                            m = tma_of[c.i]
+                            tys = m.group("tys")
+                            parts = re.match(r"^(\S+<[^>]*>),\s*(!ttg\.memdesc<[^>]*>)\s*->\s*(.*)$", tys)
+                            if parts is None:
+                                raise Fail("TMA copy type list")
+                            coords = ", ".join(rn(x.strip()) for x in m.group("coords").split(","))
+                            bl.append(f"{ind2}ttng.async_tma_copy_global_to_local {rn(m.group('desc'))}[{coords}] {v}, "
+                                      f"{rb}, %pr_true : {parts.group(1)}, {bar1} -> {parts.group(3)}")
+                            continue
+                        m = copy_of[c.i]
                         cl = P._code(lines[c.i]).strip().replace(f", {m.group('dst')}", ", %RG_SLOT", 1)
                         if m.group("mask"):
                             r_ = resid_of[c.i]
@@ -1874,8 +2148,10 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                             if not r_ and m.group("other"):
                                 cl = re.sub(r"\s+other\s+" + re.escape(m.group("other")), "", cl)
                         bl.append(ind2 + rn(cl).replace("%RG_SLOT", v))
-                    bl += [f"{ind2}{rb} = ttg.memdesc_index {pa['%rg_ready']}[{s}] : {bar_ty} -> {bar1}",
-                           f"{ind2}ttng.async_copy_mbarrier_arrive {rb} {{noIncrement}} : {bar1}"]
+                    if not ring_has_tma:
+                        bl.append(rb_line)
+                    if kind == "a" or not ring_has_tma or w_has_cp:
+                        bl.append(f"{ind2}ttng.async_copy_mbarrier_arrive {rb} {{noIncrement}} : {bar1}")
                     nxt = pf("n")
                     if p:
                         inc = pf("i")
@@ -1955,10 +2231,14 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
                     f"{ind0}%rg_woi{k} = ttg.memdesc_index %rg_wo[%rg_woc{k}] : {wo_ty} -> {bar1}",
                     f"{ind0}ttng.init_barrier %rg_woi{k}, 1 : {bar1}"]
             post.append(f"{ind0}ttng.inval_barrier %rg_woi{k} : {bar1}")
+    # ready count: every producer thread's noinc arrival (cp.async completion) + with TMA members, the weight
+    # producer's one barrier_expect arrival per stage (its TMA bytes complete the phase), replacing its noinc arrivals
+    # when it issues no cp.async at all
+    ready_count = 32 * (pwn + pwa_n) if not ring_has_tma else 1 + (32 * pwn if w_has_cp else 0) + 32 * pwa_n
     for s in range(D):
         pre += [f"{ind0}%rg_cs{s} = arith.constant {s} : i32",
                 f"{ind0}%rg_r{s} = ttg.memdesc_index %rg_ready[%rg_cs{s}] : {bar_ty} -> {bar1}",
-                f"{ind0}ttng.init_barrier %rg_r{s}, {32 * (pwn + pwa_n)} : {bar1}"]
+                f"{ind0}ttng.init_barrier %rg_r{s}, {ready_count} : {bar1}"]
         post += [f"{ind0}ttng.inval_barrier %rg_r{s} : {bar1}"]
     for s in range(NB):
         pre += [f"{ind0}%rg_e{s} = ttg.memdesc_index %rg_empty[%rg_cs{s}] : {ebar_ty} -> {bar1}",
@@ -1997,7 +2277,7 @@ def rewrite(text, shared=False, depth=None, producer_regs=None, maxnreg=None, lo
         out = out.replace('"ttg.num-warps" =', f'"ttg.maxnreg" = {maxnreg} : i32, "ttg.num-warps" =', 1)
     info = dict(rings=[r.name for r in sel], D=D, want_D=max(r.depth for r in sel), tickets=len(tickets), pstages=len(pstages), cstages=len(cinfo), shared=shared,
                 act=sorted(act_names), spins=sum(1 for g in spin_groups if any(x.i in spin_ops for x in g)), pcaps=len(pcaps),
-                order_points=len(wo_nodes), ws_start=split_at, rolled=len(roll_loops),
+                order_points=len(wo_nodes), ws_start=split_at, rolled=len(roll_loops), w_lookahead=w_lookahead, spin_gated=spin_gated,
                 ring_bytes=(sum(D * b[2] for b in byte_rings) if shared else sum(D * r.tile_bytes for r in sel)))
     return out, info
 
@@ -2129,15 +2409,20 @@ def smem_of(text: str) -> int:
     with os.fdopen(fd, "w") as f:
         f.write(text)
     try:
-        mod = ir.parse_mlir_module(path, _CTX)
-        mod.context = _CTX
-        pm = ir.pass_manager(_CTX)
-        passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-        passes.ttgpuir.add_allocate_warp_groups(pm, False)
-        passes.convert.add_scf_to_cf(pm)
-        passes.gluon.add_inliner(pm)
-        nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, 100, 88)
-        pm.run(mod, "ttgir_weight_ring_smem")
+        try:
+            mod = ir.parse_mlir_module(path, _CTX)
+            mod.context = _CTX
+            pm = ir.pass_manager(_CTX)
+            passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_allocate_warp_groups(pm, False)
+            passes.convert.add_scf_to_cf(pm)
+            passes.gluon.add_inliner(pm)
+            nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, 100, 88)
+            pm.run(mod, "ttgir_weight_ring_smem")
+        except RuntimeError as e:
+            # MLIR rejects the candidate (e.g. a warp-specialized module whose warp count is not a multiple of 4):
+            # a refusal of this candidate, so the root-suffix policy goes on with the next suffix (verify5 C3 / C7)
+            raise Fail(f"MLIR rejects the candidate ({str(e).splitlines()[0][:120] if str(e) else type(e).__name__})") from e
         check_allocation_alignment(mod.str())
         return int(mod.get_int_attr("ttg.shared"))
     finally:
@@ -2161,15 +2446,110 @@ def check_allocation_alignment(allocated: str) -> None:
 
 SMEM_LIMIT = 232448 - 1024
 
+# Shared memory of one B200 (sm_100) SM and the driver's per-CTA reservation: k co-resident CTAs fit while
+# k * (smem + SMEM_RESERVED) <= SMEM_PER_SM.
+SMEM_PER_SM = 233472
+SMEM_RESERVED = 1024
 
-# Retained instruction-cache capacity a megakernel may use (bytes of SASS), B200 (sm_100) measurement: a lone kernel
-# keeps >= 128 KB warm across launches, but inside the GLM attention chain (rmsnorm / fused_a / torch kernels share the
-# GPC's L1.5 instruction + constant cache) the knee is 103-111 KB (RING3: idle 103 KB +0, pw2 111 KB +0.64 us, u0
-# 118 KB +1.2 us, full unroll 129 KB +1.5 us; ATT5 probe icap / E1c).  The stages hook walks a ring form's smaller
-# twins (rolled producers, then rolled producers without the consumer unroll) while the binary's code exceeds it (see
-# :data:`SIZE_LADDER`): rolling costs +0.1..+0.2 us on a small kernel (V1d ring, 40 KB) and saves 0.65-0.7 us on the
-# 115 KB attention MK.
-CODE_BUDGET = 103 * 1024
+
+def resident_limit(ctas: int) -> int:
+    """Largest per-CTA shared memory that keeps ``ctas`` CTAs per SM co-resident (:data:`SMEM_LIMIT` for <= 1)."""
+    return SMEM_LIMIT if ctas <= 1 else min(SMEM_LIMIT, SMEM_PER_SM // ctas - SMEM_RESERVED)
+
+
+# Register file of one SM (32-bit registers) and the request of the ring's producer partitions when the launch's
+# co-resident cohort fixes the register budget (:func:`_resident_registers`): the producers issue copies (TMA / cp.async
+# address math, cloned spins and dependent-address cones), the consumer keeps the rest of the budget.
+REGS_PER_SM = 65536
+PRODUCER_REGS = 40
+# Spill-store bytes a resident ring binary may carry: Triton's warp-group dispatch keeps a few thread-index values of
+# the function entry live across the producers' / consumer's ``setmaxnreg``, which ptxas spills once at entry (B5-6:
+# 12-40 B on the merged MoE MK, stores before the first re-allocation).  Only rings with a register budget
+# (:func:`_resident_registers`) get it; every other ring binary that spills falls back as before.
+RESIDENT_SPILL_BYTES = 64
+
+
+def _resident_registers(text: str, ctas: int) -> str:
+    """Register budget of a warp-specialized ring kernel with ``ctas`` co-resident CTAs per SM.  The ring launches its
+    producer warps on top of the original warps (Triton pads the partitions to whole warp groups), so the per-thread
+    budget of the launch, REGS_PER_SM / (ctas * threads), is lower than the original kernel's; the kernel gets it as
+    ``ttg.maxnreg`` and the producer partitions request :data:`PRODUCER_REGS` (``setmaxnreg``), which hands the
+    remainder of the budget to the consumer warp group."""
+    m = re.search(r'"ttg\.num-warps"\s*=\s*(\d+)', text)
+    parts = [int(x) for x in re.findall(r"^\s*partition\d+\(.*\)\s+num_warps\((\d+)\)\s*\{\s*$", text, flags=re.M)]
+    if m is None or not parts:
+        raise Fail("resident ring: warp counts not found")
+    if re.search(r'"ttg\.maxnreg"', text.split("tt.func", 1)[0]):
+        raise Fail("resident ring: module already has ttg.maxnreg")
+    total = int(m.group(1)) + -(-sum(parts) // 4) * 4
+    budget = min(256, REGS_PER_SM // (ctas * total * 32)) // 8 * 8
+    if budget < PRODUCER_REGS:
+        raise Fail(f"resident ring: register budget {budget} below the producer request")
+    lines = text.split("\n")
+    ws = [k for k, l in enumerate(lines) if re.match(r"\s*ttg\.warp_specialize\(", l)]
+    if len(ws) != 1 or "attributes" in lines[ws[0]]:
+        raise Fail("resident ring: warp_specialize op not found / already annotated")
+    lines[ws[0]] += f" attributes {{requestedRegisters = array<i32: {', '.join([str(PRODUCER_REGS)] * len(parts))}>}}"
+    out = "\n".join(lines)
+    return out.replace('"ttg.num-warps" =', f'"ttg.maxnreg" = {budget} : i32, "ttg.num-warps" =', 1)
+
+
+# Occupancy: a ring keeps the module's CTAs per SM, all of them (R6-7). The ring binary is judged after ptxas on its
+# real resources against its fallback's (ttgir_weight_prefetch._Fallback: registers x threads, shared memory, threads,
+# TMEM); this shared-memory rule is the same rule on what the TTGIR tells (no registers yet): the ring's buffers may not
+# lower the module's shared-memory occupancy. Measured (build5 R6-7, B200, one tile per CTA, 4 sessions on GPUs 0-3):
+# rings at 6 of 9 CTAs/SM lose (+0.8 % at K 2048, +4.3 % at K 4096 for a BN16 GEMV) while others at 5 of 6 win, so
+# "2 CTAs/SM are enough" (the former cap of this rule at 2) does not hold; B5-8 (2 -> 1 CTA/SM: +14.9 us) is the same
+# rule's extreme.
+
+
+# CTAs per SM a spin-gated ring keeps at least (when its module had more): the consumer waits on a readiness spin
+# before the ring's first stage while the weight producer streams, so the module's CTAs above this would mostly spin
+# too (build5 R6-8, B200: Helion GEMV megakernels at 6 of 9 and 4 of 9 / 6 CTAs per SM: -2 % .. -11 % vs the hoist).
+SPIN_GATED_KEPT = 2
+
+
+def kept_occupancy(text: str) -> int:
+    """CTAs per SM a ring must keep on a module: its shared-memory occupancy as is (``SMEM_PER_SM // (smem +
+    SMEM_RESERVED)``), capped by what a warp-specialized kernel of it can reach at all (the producers add at least one
+    warp group: 2048 threads / (32 * (num_warps + 4))); beyond that cap no ring keeps the module's occupancy and the
+    post-ptxas comparison with the fallback refuses it."""
+    m = re.search(r'"ttg\.num-warps"\s*=\s*(\d+)', text)
+    nw = int(m.group(1)) if m else 4
+    occ = SMEM_PER_SM // (smem_of(text) + SMEM_RESERVED)
+    return max(1, min(occ, 2048 // (32 * (nw + 4))))
+
+
+def _with_minctasm(text: str, ctas: int) -> str:
+    """The entry function asks ptxas for ``ctas`` CTAs per SM (``nvvm.minctasm`` -> ``.minnctapersm``): the warp-
+    specialized kernel launches more warps than the original, and the launch's co-resident cohort must still fit the
+    register file (ptxas then caps the registers per thread; a binary that would spill falls back)."""
+    lines = text.split("\n")
+    for k, line in enumerate(lines):
+        if re.match(r"\s*tt\.func\s+public\s+@", line):
+            if "nvvm.minctasm" in line:
+                raise Fail("entry function already carries nvvm.minctasm")
+            new, n = re.subn(r"attributes \{", f"attributes {{nvvm.minctasm = {ctas} : i32, ", line, count=1)
+            if n != 1:
+                raise Fail("entry function without an attribute dictionary")
+            lines[k] = new
+            return "\n".join(lines)
+    raise Fail("no public entry function")
+
+
+# Code-offset knee of B200 (sm_100) instruction fetch (bytes of SASS): executed code that lies beyond the first ~64 KB of
+# a kernel's binary is fetched slowly when it is not resident, ~0.2 us per KB of executed code past the knee (ATT6 PAD:
+# MK16 with never-executed padding before its code: 63.2 KB +0.0, 66.4 KB +0.3, 69.5 KB +1.2, 78.9 KB +3.0 us; the same
+# padding after its code +0.2; ATT6 verify: the same knee on another GPU and in ncu PC sampling, 44-87 % no-instruction
+# stalls past 63 KB vs 0-2 % below).  A ring form's twins differ only in the ring's own code (producer partitions and the
+# consumer root, the kernel's suffix), so once the binary exceeds the knee every byte a bigger twin adds is code past the
+# knee, and its unrolled consumer runs each copy once per trip instead of re-running one resident loop body.  The stages
+# hook therefore walks a form's smaller twins (rolled producers, then rolled producers without the consumer unroll, see
+# :data:`SIZE_LADDER`) while the binary exceeds the knee; below it the unrolled form stays (V1d ring, 40 KB: rolling costs
+# +0.1..+0.2 us).  This replaces the former total-size budget of 103 KB (RING3 / ATT5 probes: idle 103 KB +0, pw2 111 KB
+# +0.64 us, u0 118 KB +1.2 us), a proxy for the same knee that let a 95-102 KB attention MK keep the unrolled consumer
+# twin (ATT7 S2: ring_roll 101.5 KB vs ring_roll_u0 95.0 KB of the same kernel: u0 -0.05 / -0.25 us std fi / plain).
+CODE_BUDGET = 64 * 1024
 
 # The ring options of the default path.  Every option is an automatic decision (no environment variable, no per-kernel
 # input); the measurements behind each (B200, paired, byte-exact arms; NOTES of the ring, ring2, ring3, att5 tracks):
@@ -2185,8 +2565,9 @@ CODE_BUDGET = 103 * 1024
 #   full warp count (pw 4 beats pw 1 by 0.1-1.0 us, RING2 s7s).
 # * unroll=32 - the pass fully unrolls consumer loops of at most 32 iterations with a ring stage (ptxas does not unroll
 #   a loop holding the mbarrier try-wait loop): chain3 best-vs-best -0.49 us with it (RING2 s7c), BN16 BK64 -1.21 us
-#   with 32 vs -0.52 with 16 (s9c).  On a kernel past CODE_BUDGET the unrolled code costs more than it saves (ATT5:
-#   attention MK full unroll + roll +2.08 vs no unroll + roll +1.23 us), so the last size twin drops it.
+#   with 32 vs -0.52 with 16 (s9c).  On a kernel past CODE_BUDGET (the 64 KB code-offset knee) the unrolled code costs
+#   more than it saves (ATT5: attention MK full unroll + roll +2.08 vs no unroll + roll +1.23 us), so the last size twin
+#   drops it.
 # * late_ws=True - the warp_specialize starts at the first top-level op holding a ring stage, so ring-free leading roots
 #   run before the partitions exist.  V1d weight-only ring: +0.47 / +0.35 us vs the hoist with the warp_specialize at
 #   the entry, -0.32 / -0.27 with it late (RING2 s2v); chain3: late better in 5 of 6 configs (s2c).  The two-producer
@@ -2213,27 +2594,46 @@ RING_DEFAULTS = {"act": True, "pw": "auto", "pwa": "auto", "unroll": 32, "late_w
 SIZE_LADDER = (("", {}), ("_roll", {"roll": True}), ("_roll_u0", {"roll": True, "unroll": 0}))
 
 # Profitability: a ring form is a candidate only if its producer partitions issue at least this share of the module's
-# global->shared async copy bytes (cp.async and TMA copies, one tile per copy op; :func:`copy_coverage`).  The ring
-# turns the whole persistent kernel into a warp-specialized one (8-warp CTAs whose producer warps idle outside the ring's
-# roots; a null warp_specialize alone costs +0.07..+0.4 us, RING2 s7a / RING3 d3); it pays for that only through the
-# copies it streams.  Measured: the merged GLM MoE megakernel's ring moves 2% (the shared-expert down projection; the
-# routed experts' TMA copies stay) and loses +0.4..+0.5 us/layer against the hoist (Fw_f3, integ verify job vr:
-# -1.8..-2.0 vs -2.35 us vs production; +3.6 us on its non-inlined variant); the attention megakernel's O-root ring (27%)
-# wins -0.1..-0.3 us warm and -1.2 us code-cold (ATT5 R-MAIN), the V1d q-prep ring (100%) -0.44..-0.51 us (INTEG C2).
-MIN_COPY_COVERAGE = 0.10
+# global->shared async copy bytes (cp.async and TMA copies, tile bytes x constant loop trips; :func:`copy_coverage`).
+# The ring turns the whole persistent kernel into a warp-specialized one (8-warp CTAs whose producer warps idle outside
+# the ring's roots; a null warp_specialize alone costs +0.07..+0.4 us, RING2 s7a / RING3 d3); it pays for that only
+# through the copies it streams.  Measured (trip-weighted shares): the attention megakernel's O-root ring (50%) wins
+# -0.1..-0.3 us warm and -1.2 us code-cold (ATT5 R-MAIN), the V1d q-prep ring (100%) -0.44..-0.51 us (INTEG C2); the
+# merged GLM MoE megakernel's shared-down (R3F) ring loses: its cp.async-only form (2% in the old per-op count)
+# +0.4..+0.5 us/layer (integ verify job vr), its TMA form (11-12%) +0.3 us dynamic / +1.3 us static (build5 B5-8).
+MIN_COPY_COVERAGE = 0.25
 
 _COPY_DST = re.compile(r"->\s*(?:!ttg\.memdesc)?<((?:\d+x)+)([A-Za-z0-9]+),")
 
 
+_COV_FOR = re.compile(rf"scf\.for\s+{V}\s*=\s*({V})\s+to\s+({V})\s+step\s+({V})")
+_COV_CONST = re.compile(rf"^\s*({V})\s*=\s*arith\.constant\s+(-?\d+)\s*:\s*i(?:32|64)\b")
+
+
 def copy_coverage(text: str) -> float:
-    """Share of the global->shared async copy bytes of a module (static: one tile per copy op) that the producer
-    partitions of its warp_specialize issue; 0.0 without copies."""
+    """Share of the global->shared async copy bytes of a module that the producer partitions of its warp_specialize
+    issue; 0.0 without copies.  Each copy op counts its tile bytes times the trip counts of its enclosing scf.for loops
+    with constant bounds (a pipelined K loop's in-loop copy issues one tile per iteration; loops with bounds known only
+    at run time - task loops - count once)."""
+    consts = {}
+    for line in text.splitlines():
+        m = _COV_CONST.match(line)
+        if m:
+            consts.setdefault(m.group(1), int(m.group(2)))
     total = moved = 0
     in_part = False
     ws_ind = None
+    loops = []   # (indentation of the scf.for line, trip count)
     for line in text.splitlines():
         s = line.strip()
         ind = len(line) - len(line.lstrip(" "))
+        if loops and s.startswith("}") and ind == loops[-1][0]:
+            loops.pop()
+        m = _COV_FOR.search(P._code(line))
+        if m:
+            lb, ub, st = (consts.get(m.group(k)) for k in (1, 2, 3))
+            trip = -(-(ub - lb) // st) if None not in (lb, ub, st) and st > 0 and ub > lb else 1
+            loops.append((ind, max(1, trip)))
         if "ttg.warp_specialize(" in s:
             ws_ind = ind
         elif ws_ind is not None and ind == ws_ind:
@@ -2247,6 +2647,7 @@ def copy_coverage(text: str) -> float:
         if m is None:
             continue
         b = math.prod(int(d) for d in m.group(1).rstrip("x").split("x")) * _BITS.get(m.group(2), 8) // 8
+        b *= math.prod(t for _, t in loops)
         total += b
         moved += b if in_part else 0
     return moved / total if total else 0.0
@@ -2270,6 +2671,17 @@ def ring_options() -> dict:
 options_from_env = ring_options
 
 
+def decisions_key() -> str:
+    """Digest of the automatic decisions' current values (:data:`CODE_BUDGET`, :data:`SIZE_LADDER`,
+    :data:`MIN_COPY_COVERAGE`, :data:`RING_DEFAULTS`, :data:`SMEM_LIMIT`).  The stages hook puts it in the compile key of
+    every ring compile: the binary depends on these values, and the module digest covers only the source, not a value a
+    tool or test patches at run time (ATT6 verify, mutant K15)."""
+    blob = repr((CODE_BUDGET, SIZE_LADDER, MIN_COPY_COVERAGE, sorted(RING_DEFAULTS.items()), SMEM_LIMIT, SMEM_PER_SM,
+                 SMEM_RESERVED, REGS_PER_SM, PRODUCER_REGS, RESIDENT_SPILL_BYTES, "occupancy=module",
+                 SPIN_GATED_KEPT))
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 def options_key() -> str:
     """The ring's part of the compile key beyond the module digest: empty unless the test hook is set."""
     neg = os.environ.get(_NEG_ENV)
@@ -2286,8 +2698,40 @@ def rewrite_budgeted(text: str, limit: int | None = None, shared: bool = True, *
     the suffix's copies wherever the hoist put them).  The ring's buffers are allocated where the warp_specialize starts,
     so Triton's allocator overlays them on the prefix roots' dead buffers.  If no suffix fits at full depth, the longest
     suffix that fits at all (lowered depth).  For each suffix the two-producer ring (``act``) is tried first, then the
-    weight-only ring when an activation rule refuses."""
+    weight-only ring when an activation rule refuses.  A suffix is skipped when its ring streams less than
+    :data:`MIN_COPY_COVERAGE` of the module's copy bytes, or when its first root gives the weight producer no lookahead
+    (rule E clones every readiness spin the consumer passes before that root's first stage, and W cannot run on into
+    later tasks of a loop past spins that poll only state published outside the kernel).
+
+    Occupancy: the ring never lowers the module's shared-memory occupancy (:func:`kept_occupancy`): the limit is at
+    most :func:`resident_limit` of it.  ``resident_ctas`` k > 1 (the launch's co-resident cohort per SM): the ring keeps that
+    occupancy - its shared memory
+    fits :func:`resident_limit` (k) (the depth is lowered until it does, as for the device limit) and the entry function
+    carries ``nvvm.minctasm = k``; its register budget is the cohort's (:func:`_resident_registers`)."""
     opts = {**ring_options(), **opts}
+    ctas = int(opts.pop("resident_ctas", 0) or 0)
+    if not opts.pop("_occupancy_kept", False):
+        # occupancy rule: the ring keeps the module's CTAs per SM (DESIGN 9.2; B5-8: the merged MoE MK's dynamic grid
+        # with a D4 ring at 1 CTA/SM instead of 2 lost +14.9 us; R6-7: 6 instead of 9 loses on a GEMV), except a
+        # spin-gated ring, which keeps min(module, SPIN_GATED_KEPT) (R6-8; the same rule as the post-ptxas guard)
+        occ = kept_occupancy(text)
+        kept = dict(opts, _occupancy_kept=True, resident_ctas=ctas)
+        if occ > SPIN_GATED_KEPT:
+            try:
+                t, info = rewrite_budgeted(text, min(limit or SMEM_LIMIT, resident_limit(SPIN_GATED_KEPT)), shared,
+                                           **kept)
+                if info.get("spin_gated"):
+                    return t, info
+            except Fail:
+                pass
+        if occ > 1:
+            limit = min(limit or SMEM_LIMIT, resident_limit(occ))
+        return rewrite_budgeted(text, limit, shared, **kept)
+    if ctas > 1:
+        limit = min(limit or SMEM_LIMIT, resident_limit(ctas))
+        t, info = rewrite_budgeted(text, limit, shared, **opts)
+        return _with_minctasm(_resident_registers(t, ctas), ctas), dict(info, resident_ctas=ctas)
+    opts.pop("_occupancy_kept", None)
     if "from_top" in opts:
         return _act_or_wonly(text, limit, shared, opts)
     starts = _ring_starts(text)
@@ -2311,6 +2755,14 @@ def rewrite_budgeted(text: str, limit: int | None = None, shared: bool = True, *
         except Fail as e:
             errors.append(f"from {s}: {e}")
             continue
+        if not info.get("w_lookahead", True):
+            errors.append(f"from {s}: the weight producer clones every spin before the first stage and no loop lets it "
+                          "run past them into later tasks (no lookahead)")
+            continue
+        cov = copy_coverage(t)
+        if cov < MIN_COPY_COVERAGE:
+            errors.append(f"from {s}: moves {cov:.3f} of the copy bytes (< MIN_COPY_COVERAGE)")
+            continue
         info = dict(info, from_top=(s if k else None), prefix_hoisted=bool(k and hoisted is not text))
         if info["D"] >= info["want_D"]:
             return t, info
@@ -2321,8 +2773,17 @@ def rewrite_budgeted(text: str, limit: int | None = None, shared: bool = True, *
     raise Fail("; ".join(errors) or "no ring")
 
 
+_GENERIC_OP = re.compile(r'^\s*(?:%[\w.$-]+(?::\d+)?(?:\s*,\s*%[\w.$-]+(?::\d+)?)*\s*=\s*)?"([\w.]+)"\(')
+
+
+def _generic_op(line):
+    """Name of an op printed in MLIR's generic form (``%r = "tt.reduce"(%x) ...``), else None."""
+    m = _GENERIC_OP.match(line)
+    return m.group(1) if m else None
+
+
 def _ring_starts(text):
-    """Indices of the entry function's top-level ops that hold a ttg.async_copy_global_to_local into a ring."""
+    """Indices of the entry function's top-level ops that hold a global->shared copy (cp.async or TMA)."""
     lines = P._uniquify(text).splitlines()
     funcs = P._functions(lines)
     entry = [g for g in funcs if re.search(r"tt\.func\s+public", lines[g.start])]
@@ -2330,7 +2791,7 @@ def _ring_starts(text):
         return []
     f = entry[0]
     body = _parse_block(lines, f.start + 1, f.end - 1, None)
-    return [k for k, n in enumerate(body) if any(x.op == P._COPY for x in _walk([n]))]
+    return [k for k, n in enumerate(body) if any(x.op in (P._COPY, P._TMA_COPY) for x in _walk([n]))]
 
 
 def _act_or_wonly(text, limit, shared, opts):

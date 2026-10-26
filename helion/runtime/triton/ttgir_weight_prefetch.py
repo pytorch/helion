@@ -1568,10 +1568,15 @@ def _ring_form(label: str) -> str:
 
 
 def _candidates(
-    text: str, alias_classes: tuple[tuple[str, ...], ...], ring: bool = False
+    text: str,
+    alias_classes: tuple[tuple[str, ...], ...],
+    ring: bool = False,
+    resident_ctas: int = 0,
+    facts: dict[str, dict[str, object]] | None = None,
 ) -> list[tuple[str, str | None]]:
     """The fallback chain of one compile: (label, TTGIR text, or None for the
-    module as is).
+    module as is).  ``facts``, if given, receives each ring candidate's
+    rewrite facts by label (e.g. ``spin_gated``, read by :class:`_Fallback`).
 
     With ``ring`` (the kernel's ``ttgir_weight_ring`` setting): the
     two-producer ring, the weight-only ring, the hoist, the module unchanged.
@@ -1583,7 +1588,9 @@ def _candidates(
     they change it: the trial ``ptxas`` of a ring form moves on to its next
     twin while the binary's code exceeds
     :data:`ttgir_weight_ring.CODE_BUDGET` (automatic, size-aware; no
-    per-kernel switch)."""
+    per-kernel switch).  ``resident_ctas``: CTAs per SM the launch requires
+    to be co-resident (a polling schedule's cohort, see :class:`_Facts`); a
+    ring keeps that occupancy (:func:`ttgir_weight_ring.rewrite_budgeted`)."""
     out: list[tuple[str, str | None]] = []
     if ring:
         from . import ttgir_weight_ring
@@ -1593,6 +1600,8 @@ def _candidates(
             texts: list[str] = []
             for suffix, twin in ttgir_weight_ring.SIZE_LADDER:
                 kwargs: dict[str, Any] = {"roll": False, **opts, **twin}
+                if resident_ctas > 1:
+                    kwargs["resident_ctas"] = resident_ctas
                 try:
                     ring_text, twin_info = ttgir_weight_ring.rewrite_budgeted(
                         text, alias_classes=alias_classes, **kwargs
@@ -1620,6 +1629,8 @@ def _candidates(
                     continue
                 texts.append(ring_text)
                 out.append((label + suffix, ring_text))
+                if facts is not None:
+                    facts[label + suffix] = twin_info
             return info
 
         try:
@@ -1675,7 +1686,10 @@ def transform_module(
         except Exception as e:
             log.debug("ttgir weight prefetch: re-parse failed (%r)", e)
             return mod
-    for label, candidate in _candidates(text, alias_classes, ring=True):
+    resident = facts.resident_ctas if (facts := _current_facts()) is not None else 0
+    for label, candidate in _candidates(
+        text, alias_classes, ring=True, resident_ctas=resident
+    ):
         if candidate is None:
             return mod
         try:
@@ -1709,9 +1723,10 @@ def _code_bytes(cubin: bytes) -> int:
     return sum(h[5] for h in hdrs if name(h[0]).startswith(b".text."))
 
 
-def _ptxas_trial(ptx: str, arch: int, options: object) -> tuple[int, int]:
-    """(spill-store bytes, SASS code bytes) of ``ptx`` compiled by ptxas with
-    the tool and register allocator options of Triton's ``make_cubin``."""
+def _ptxas_trial(ptx: str, arch: int, options: object) -> tuple[int, int, int | None]:
+    """(spill-store bytes, SASS code bytes, registers per thread of the entry
+    function or None) of ``ptx`` compiled by ptxas with the tool and register
+    allocator options of Triton's ``make_cubin``."""
     import subprocess
 
     from triton.backends.nvidia.compiler import get_ptxas
@@ -1734,7 +1749,53 @@ def _ptxas_trial(ptx: str, arch: int, options: object) -> tuple[int, int]:
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, check=True)
         code = _code_bytes(Path(src + ".o").read_bytes())
-    return sum(int(x) for x in re.findall(r"(\d+) bytes spill stores", r.stderr)), code
+    spills = sum(int(x) for x in re.findall(r"(\d+) bytes spill stores", r.stderr))
+    return spills, code, _entry_registers(r.stderr)
+
+
+def _entry_registers(ptxas_log: str) -> int | None:
+    """Registers per thread ptxas -v reports for the entry function(s) (the
+    largest), None if the log names none."""
+    regs, in_entry = [], False
+    for line in ptxas_log.splitlines():
+        if "Compiling entry function" in line:
+            in_entry = True
+        elif "Compiling function" in line:
+            in_entry = False
+        m = re.search(r"Used (\d+) registers", line)
+        if m and in_entry:
+            regs.append(int(m.group(1)))
+            in_entry = False
+    return max(regs) if regs else None
+
+
+def ctas_per_sm(shared: int, regs: int, warps: int, tmem_columns: int = 0) -> int:
+    """CTAs one SM (sm_100) holds of a binary: the minimum over shared memory
+    (with the driver's per-CTA reservation), the register file (registers are
+    allocated per warp in 256-register units), threads, the CTA limit and
+    tensor-memory columns."""
+    from . import ttgir_weight_ring as ring
+
+    per_warp = -(-regs * 32 // 256) * 256
+    limits = [
+        ring.SMEM_PER_SM // (shared + ring.SMEM_RESERVED),
+        ring.REGS_PER_SM // max(1, per_warp * warps),
+        2048 // (32 * warps),
+        32,
+    ]
+    if tmem_columns:
+        limits.append(512 // tmem_columns)
+    return max(0, min(limits))
+
+
+def _md_ctas_per_sm(md: dict[str, object], regs: int) -> int:
+    """:func:`ctas_per_sm` of the binary a stage's metadata describes."""
+    return ctas_per_sm(
+        int(cast("int", md.get("shared", 0) or 0)),
+        regs,
+        int(cast("int", md.get("num_warps", 4) or 4)),
+        int(cast("int", md.get("tmem_size", 0) or 0)),
+    )
 
 
 class _Fallback:
@@ -1747,6 +1808,7 @@ class _Fallback:
         options: object,
         capability: object,
         alias_classes: tuple[tuple[str, ...], ...] = (),
+        resident_ctas: int = 0,
     ) -> None:
         self.make_ttgir = stages.get("ttgir")
         self.make_llir = stages.get("llir")
@@ -1755,7 +1817,10 @@ class _Fallback:
         self.options = options
         self.capability = capability
         self.alias_classes = alias_classes
+        self.resident_ctas = resident_ctas
+        self._fallback_occ: int | None = None
         self.cands: list[tuple[str, str | None]] = []
+        self.cand_facts: dict[str, dict[str, object]] = {}
         self.k = 0
         self.original: object = None
         self.original_text = ""
@@ -1798,7 +1863,14 @@ class _Fallback:
         self.original = mod
         self.original_text = mod.str()  # pyrefly: ignore[missing-attribute]
         self.num_warps = md.get("num_warps")
-        self.cands = _candidates(self.original_text, self.alias_classes, ring=True)
+        self.cand_facts = {}
+        self.cands = _candidates(
+            self.original_text,
+            self.alias_classes,
+            ring=True,
+            resident_ctas=self.resident_ctas,
+            facts=self.cand_facts,
+        )
         self.k = 0
         if self.cands[0][1] is None:
             return mod
@@ -1820,19 +1892,97 @@ class _Fallback:
             if not self.label.startswith("ring"):
                 return out
             try:
-                spills, code = _ptxas_trial(
+                trial = _ptxas_trial(
                     cast("str", out), cast("int", self.capability), self.options
                 )
-                if spills:
+                spills, code = trial[0], trial[1]
+                if spills > self._spill_allowance():
                     raise RuntimeError(f"ring binary spills {spills} bytes")
+                regs = trial[2] if len(trial) > 2 else None
+                if regs is not None:
+                    occ = _md_ctas_per_sm(md, regs)
+                    floor = self._occupancy_floor(md, occ)
+                    if occ < floor:
+                        raise RuntimeError(
+                            f"ring binary runs {occ} CTA(s) per SM ({regs} "
+                            f"registers x {md.get('num_warps')} warps), its "
+                            f"fallback {floor}"
+                        )
                 if code > _code_budget() and self._smaller_twin_next():
                     raise RuntimeError(
-                        f"ring binary code {code} B exceeds the retained "
-                        "instruction-cache budget"
+                        f"ring binary code {code} B exceeds the code-offset "
+                        "knee (CODE_BUDGET)"
                     )
                 return out
             except Exception as e:
                 src = self.llir(self.advance(md, e), md)
+
+    def _occupancy_floor(self, md: dict[str, object], occ: int) -> int:
+        """CTAs per SM the current ring binary must keep: its fallback's
+        (:meth:`_fallback_ctas_per_sm`), except for a spin-gated ring (the
+        consumer waits on a readiness spin before the first stage while the
+        weight producer streams; ``spin_gated`` of
+        :func:`ttgir_weight_ring.rewrite`), which keeps ``min(fallback, SPIN_GATED_KEPT)``:
+        the fallback's extra CTAs would spin as well (build5 R6-8).  One CTA
+        per SM below a fallback of two or more is refused in every case."""
+        from . import ttgir_weight_ring as ring
+
+        gated = bool(self.cand_facts.get(self.label, {}).get("spin_gated"))
+        if gated and occ >= ring.SPIN_GATED_KEPT:
+            return ring.SPIN_GATED_KEPT
+        floor = self._fallback_ctas_per_sm(md, occ)
+        return min(floor, ring.SPIN_GATED_KEPT) if gated else floor
+
+    def _fallback_ctas_per_sm(self, md: dict[str, object], occ: int) -> int:
+        """CTAs per SM of the binary the chain falls back to (its first
+        non-ring candidate: the hoist or the module as is), on its real
+        resources.  A ring binary must not run fewer (verify5 V4/V7: an 8-warp
+        ring of a 4-warp, 182-register kernel ran 1 CTA/SM instead of 2, +13%).
+        The fallback's shared memory and thread count bound it from above; only
+        a ring below that bound pays for lowering the fallback to PTX once (for
+        its registers)."""
+        if self._fallback_occ is not None:
+            return self._fallback_occ
+        from . import ttgir_weight_ring as ring
+
+        label, text = next(
+            ((lab, t) for lab, t in self.cands if not lab.startswith("ring")),
+            ("unchanged", None),
+        )
+        warps = int(cast("int", self.num_warps))
+        try:
+            shared = ring.smem_of(text if text is not None else self.original_text)
+        except Exception:  # an unparsable fallback bounds nothing
+            return 0
+        bound = ctas_per_sm(shared, 0, warps)
+        if occ >= bound:
+            return bound
+        md2 = dict(md)
+        md2["num_warps"] = self.num_warps
+        mod = _reparse(self.original, text if text is not None else self.original_text)
+        llir = self.make_llir(mod, md2)  # pyrefly: ignore[not-callable]
+        ptx = self.make_ptx(llir, md2)  # pyrefly: ignore[not-callable]
+        trial = _ptxas_trial(
+            cast("str", ptx), cast("int", self.capability), self.options
+        )
+        regs = trial[2] if len(trial) > 2 else None
+        self._fallback_occ = bound if regs is None else _md_ctas_per_sm(md2, regs)
+        log.debug(
+            "ttgir weight prefetch: fallback %s runs %d CTA(s) per SM",
+            label,
+            self._fallback_occ,
+        )
+        return self._fallback_occ
+
+    def _spill_allowance(self) -> int:
+        """Spill-store bytes a ring binary may carry: none, except a ring with
+        the launch's resident register budget (its warp-group dispatch spills a
+        few entry values, :data:`ttgir_weight_ring.RESIDENT_SPILL_BYTES`)."""
+        if self.resident_ctas <= 1:
+            return 0
+        from . import ttgir_weight_ring
+
+        return ttgir_weight_ring.RESIDENT_SPILL_BYTES
 
     def _next_label(self) -> str | None:
         return self.cands[self.k + 1][0] if self.k + 1 < len(self.cands) else None
@@ -1852,10 +2002,27 @@ class _Fallback:
                 src = self.ptx(self.llir(self.advance(md, e), md), md)
 
 
+def _pass_sources() -> list[Path]:
+    """The pass and every module of its family (``ttgir_*.py`` next to it:
+    the ring and any submodule either imports), by name."""
+    return sorted(Path(__file__).parent.glob("ttgir_*.py"))
+
+
 _DIGEST: str = hashlib.sha256(
-    Path(__file__).read_bytes()
-    + (Path(__file__).parent / "ttgir_weight_ring.py").read_bytes()
+    b"".join(p.name.encode() + b"\0" + p.read_bytes() for p in _pass_sources())
 ).hexdigest()
+
+
+def _decisions_key(ring: bool) -> str:
+    """The current values of the ring's automatic decisions
+    (:func:`ttgir_weight_ring.decisions_key`) for a kernel with the ring: a
+    binary depends on them, and the source digest does not see a module
+    constant changed at run time."""
+    if not ring:
+        return ""
+    from . import ttgir_weight_ring
+
+    return f"-d{ttgir_weight_ring.decisions_key()}"
 
 
 def _ring_key(ring: bool) -> str:
@@ -1877,12 +2044,19 @@ class _Facts:
     alias_classes: tuple[tuple[str, ...], ...] = ()
     # The kernel's ``ttgir_weight_ring`` setting: try the ring first.
     ring: bool = False
+    # CTAs per SM the launch needs co-resident (a schedule whose programs poll
+    # each other launches ``_minimum_resident_programs``; 0 or 1: no
+    # requirement beyond one CTA per SM).  A ring must keep that occupancy.
+    resident_ctas: int = 0
 
     def key(self) -> str:
-        if not self.alias_classes:
-            return ""
-        digest = hashlib.sha256(repr(self.alias_classes).encode()).hexdigest()
-        return f"-aliases-{digest[:16]}"
+        out = ""
+        if self.alias_classes:
+            digest = hashlib.sha256(repr(self.alias_classes).encode()).hexdigest()
+            out = f"-aliases-{digest[:16]}"
+        if self.ring and self.resident_ctas > 1:
+            out += f"-resident{self.resident_ctas}"
+        return out
 
 
 def normalize_alias_classes(
@@ -1928,7 +2102,10 @@ class _StagesHook:
             )
             if facts is None:
                 return key, digest
-            version = f"{_DIGEST}{facts.key()}-{_ring_key(facts.ring)}"
+            version = (
+                f"{_DIGEST}{_decisions_key(facts.ring)}{facts.key()}"
+                f"-{_ring_key(facts.ring)}"
+            )
             combined = hashlib.sha256(f"{digest}:{version}".encode()).hexdigest()
             # Triton keys its on-disk cache with the first value and its
             # in-memory cache with the second: both name this version.
@@ -1955,6 +2132,7 @@ class _StagesHook:
             args[2] if len(args) > 2 else None,
             args[4] if len(args) > 4 else None,
             facts.alias_classes,
+            facts.resident_ctas,
         )
         stages["ttgir"] = fb.ttgir
         stages["llir"] = fb.llir
@@ -1970,19 +2148,27 @@ _saved: Callable[..., object] | None = None
 
 @contextlib.contextmanager
 def enabled(
-    alias_classes: Iterable[Iterable[str]] = (), ring: bool = False
+    alias_classes: Iterable[Iterable[str]] = (),
+    ring: bool = False,
+    resident_ctas: int = 0,
 ) -> Iterator[None]:
     """Run the pass on kernels this thread compiles (and keys) inside this
     context.  ``alias_classes``: kernel arguments (by name) that may share a
     storage at launch; ``ring``: try the warp-specialized weight ring first
-    (the kernel's ``ttgir_weight_ring`` setting).  Both are part of the key."""
+    (the kernel's ``ttgir_weight_ring`` setting); ``resident_ctas``: CTAs per
+    SM the launch requires co-resident (the ring keeps that occupancy).  All
+    are part of the key."""
     global _depth, _saved
     from triton import knobs
 
     if not hasattr(knobs.runtime, "add_stages_inspection_hook"):
         yield
         return
-    facts = _Facts(normalize_alias_classes(alias_classes), ring=bool(ring))
+    facts = _Facts(
+        normalize_alias_classes(alias_classes),
+        ring=bool(ring),
+        resident_ctas=int(resident_ctas),
+    )
     with _lock:
         if _depth == 0:
             _saved = knobs.runtime.add_stages_inspection_hook
