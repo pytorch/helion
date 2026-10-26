@@ -2368,7 +2368,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             setattr, mod.jsd_kernel.settings, "static_shapes", original_static_shapes
         )
         mod.jsd_kernel.settings.static_shapes = True
-        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
+        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16], num_warps=16)]
         # The default budget makes this shape a single chunk; four chunks of
         # 32 rows of fp32 [chunk, k] logits exercise the multi-chunk loop.
         original_budget = mod.LOGITS_CHUNK_BYTES
