@@ -26,6 +26,7 @@ from helion._compiler.cute.masked_packet_load_names import (
 )
 from helion._compiler.cute.packet_store_policy import _STORE_HELPERS
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 
@@ -347,6 +348,7 @@ def _constant_bytes(value: Any) -> bytes:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("carrier", ["u8", "u16", "u32", "u64"])
 def test_l2_store_preserves_every_bit_of_packed_carriers(carrier: str) -> None:
     cutlass = pytest.importorskip("cutlass")
@@ -436,6 +438,7 @@ def test_l2_store_preserves_every_bit_of_packed_carriers(carrier: str) -> None:
             )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype_name", ["Float8E4M3FN", "Float8E5M2"])
 @pytest.mark.parametrize("source_name", ["Float32", "Float16", "BFloat16"])
 @pytest.mark.parametrize("runtime", [False, True])

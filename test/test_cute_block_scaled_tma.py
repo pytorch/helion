@@ -8,6 +8,7 @@ import re
 import pytest
 
 from helion._compiler.cute.block_scaled_config import block_scaled_workspace_shape
+from helion._testing import skipUnlessCuteAvailable
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -47,6 +48,7 @@ def _inspect_padded_scale_map(
     _record_copy_ranks(atom, coordinates)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("n", [1, 128, 129, 257])
 @pytest.mark.parametrize("k", [16, 80, 272])
 @pytest.mark.parametrize("bn,bk", [(128, 64), (256, 64), (256, 128), (256, 256)])

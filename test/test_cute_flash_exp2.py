@@ -37,6 +37,7 @@ from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -347,6 +348,7 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("is_causal", (False, True))
 @pytest.mark.parametrize(
     ("output_epilogue", "expected_flash"),
@@ -394,6 +396,7 @@ def test_bfloat16_output_epilogue_flash_matcher(
         assert not resolved.epi_stg
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_relu_output_epilogue_is_bfloat16_only() -> None:
     args = tuple(
         torch.empty(
@@ -412,6 +415,7 @@ def test_relu_output_epilogue_is_bfloat16_only() -> None:
     assert not bound.config_spec.cute_flash_search_enabled
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("auxiliary", ("lse", "tensor_bias"))
 def test_relu_output_epilogue_rejects_auxiliary_attention(auxiliary: str) -> None:
     from test.test_cute_backend import cute_biased_attention
