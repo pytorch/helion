@@ -8,8 +8,12 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 from .accuracy import assert_close
+from .accuracy import poison_cached_device_memory
+from .benchmark_worker import PHASE_COMPILED
+from .benchmark_worker import PhasedJob
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
@@ -21,6 +25,8 @@ from .precompile_future import _load_compiled_fn
 from .precompile_future import _unload_compiled_fn
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..runtime.kernel import CompiledConfig
     from .precompile_future import SerializedCompiledFunction
 
@@ -41,7 +47,16 @@ def _load_compiled_fn_for_worker(
 
 
 @dataclasses.dataclass
-class BenchmarkJob:
+class BenchmarkJob(PhasedJob):
+    """Load, compile, run once and time one candidate in the worker.
+
+    The first call (the backend JIT -- for CuTe the DSL compile of the
+    generated wrapper -- plus one launch) is its own phase, reported to the
+    parent as :data:`PHASE_COMPILED` before the timing starts, so the parent
+    can hold the compile to a deadline of its own and give the timing the
+    whole benchmark window.
+    """
+
     fn_spec: SerializedCompiledFunction
     args_path: str
     warmup: int = 1
@@ -62,7 +77,7 @@ class BenchmarkJob:
     # its own regime (``final_selection_l2_flush_mode``).
     l2_flush_mode: str | None = None
 
-    def __call__(self) -> float:
+    def __call__(self, report_phase: Callable[[str], None] | None = None) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
@@ -77,8 +92,13 @@ class BenchmarkJob:
                 else:
                     args = load_private_kernel_args(self.args_path, self.args_slot)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
-                # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
+                # Compile and run once; the timers then skip their setup call.
+                benchmark_fn()
+                synchronize_device()
+                if report_phase is not None:
+                    report_phase(PHASE_COMPILED)
+                # return_mode="median" guarantees a float return.
                 result = bench(
                     benchmark_fn,
                     return_mode="median",
@@ -87,6 +107,7 @@ class BenchmarkJob:
                     fixed_repetitions=self.fixed_repetitions,
                     probe_long_kernel=self.probe_long_kernel,
                     l2_flush_mode=self.l2_flush_mode,
+                    pre_warmed=True,
                 )
                 return cast(
                     "float",
@@ -99,6 +120,14 @@ class BenchmarkJob:
 @functools.cache
 def _load_trusted_baseline_output(path: str) -> object:
     return torch.load(path, weights_only=False)
+
+
+def _cuda_device_of(args: object) -> torch.device | None:
+    """The CUDA device of the first CUDA tensor in ``args`` (None without one)."""
+    for leaf in tree_flatten(args)[0]:
+        if isinstance(leaf, torch.Tensor) and leaf.device.type == "cuda":
+            return leaf.device
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,6 +152,7 @@ class AccuracyCheckJob:
     atol: float
     rtol: float
     scale_atol: bool = False
+    fp8_accuracy: str = "bitwise"
     mutated_arg_indices: tuple[int, ...] = ()
     baseline_post_args_path: str | None = None
     check_input_accuracy: bool = True
@@ -138,6 +168,9 @@ class AccuracyCheckJob:
                         args, None, idx_to_clone=self.mutated_arg_indices
                     )
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)
+                # The worker ran the previous candidates on these arguments:
+                # a fresh output must not inherit their (correct) values.
+                poison_cached_device_memory(_cuda_device_of(args))
                 output = fn(*args)
                 synchronize_device()
             finally:
@@ -150,6 +183,7 @@ class AccuracyCheckJob:
                 atol=self.atol,
                 rtol=self.rtol,
                 scale_atol_by_expected_rms=self.scale_atol,
+                fp8_accuracy=self.fp8_accuracy,
             )
             if (
                 self.mutated_arg_indices
@@ -162,6 +196,7 @@ class AccuracyCheckJob:
                     atol=self.atol,
                     rtol=self.rtol,
                     scale_atol_by_expected_rms=self.scale_atol,
+                    fp8_accuracy=self.fp8_accuracy,
                 )
         except AssertionError as e:
             return AccuracyCheckResult(ok=False, message=str(e))

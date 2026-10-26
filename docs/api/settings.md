@@ -135,6 +135,40 @@ Least recently used entries are evicted when a write would exceed the budget. Se
    the same uniform stream but rejects these other RNG operations. The policy
    is serialized with settings and emitted reproduction decorators.
 
+.. autoattribute:: Settings.cute_graph_cse
+
+   CuTe only. When ``True`` (the default) duplicate reductions of the traced
+   device IR, and the pure chains between them, are merged before code
+   generation: a ``softmax`` and a ``log_softmax`` of one operand share their
+   ``amax``, ``exp`` and ``sum`` sweeps. Two identical pure operators on the
+   same inputs are bitwise identical, so results never change. Set
+   ``cute_graph_cse=False`` or ``HELION_CUTE_GRAPH_CSE=0`` to keep the graph as
+   traced, which bisects a structural-matcher regression against the pass. The
+   two graphs roll different reduction sweeps, so their configs differ in shape;
+   printed repros record the value in their ``@helion.kernel`` decorator and
+   replay the graph they were emitted from whatever the replay environment.
+
+.. autoattribute:: Settings.cute_exact_division
+
+   CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
+   invariant across an element loop (a softmax row sum, a kernel-wide
+   temperature) hoists the divisor's correctly rounded reciprocal and its
+   admission window out of the loop and divides with the Markstein sequence
+   (``q = RN(x*y)``, ``r = RN(x - d*q)``, ``RN(q + r*y)``), speculated over the
+   loop: when some dividend left the window the loop runs again as written,
+   with ``div.rn.f32`` itself. The result is the IEEE round-to-nearest quotient
+   bit for bit (``helion/_compiler/cute/exact_division.py`` states the
+   argument); set ``cute_exact_division=False`` or
+   ``HELION_CUTE_EXACT_DIVISION=0`` to keep one ``div.rn`` expansion per
+   element; the config knob ``cute_exact_div_form`` (``"redo"``, ``"plain"``)
+   picks the form per kernel, so the autotuner can keep the plain division
+   where a kernel sits at the register cap (the knob is exposed for every
+   kernel whose traced graph divides fp32 by a scalar or a broadcast row value;
+   a loop the redo form cannot re-execute keeps its plain division, and where
+   the pass proves no divisor loop-invariant both forms render identically).
+   ``fast_math`` is unaffected: its fp32 division is the approximate
+   ``cute.math.div``.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -248,7 +282,9 @@ Least recently used entries are evicted when a write would exceed the budget. Se
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
-   Timeout in seconds for Triton compilation during autotuning. Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
+   Timeout in seconds for one precompile subprocess during autotuning, and the benchmark worker's deadline for a
+   candidate's compile and first call (never below ``autotune_benchmark_timeout``; a candidate past it is recorded as
+   failed to compile and the search goes on). Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
 
 .. autoattribute:: Settings.autotune_precompile
 
@@ -302,6 +338,10 @@ Least recently used entries are evicted when a write would exceed the budget. Se
 .. autoattribute:: Settings.autotune_baseline_rtol
 
    Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
+.. autoattribute:: Settings.autotune_fp8_accuracy
+
+   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
 
 .. autoattribute:: Settings.autotune_search_acf
 
@@ -423,7 +463,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
-| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
+| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds for one precompile subprocess, and for a candidate's compile and first call in the benchmark worker (a candidate past it is recorded as failed to compile). |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
 | ``HELION_AUTOTUNE_LOG_DETAILS`` | ``autotune_log_details`` | Enable cost-model dataset sidecar (``.meta.jsonl``) with full configs map. |
@@ -433,6 +473,8 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
+| ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
+| ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``0`` to keep one ``div.rn.f32`` per element for fp32 divisions by a loop-invariant scalar on CuTe instead of the hoisted bit-exact Markstein sequence. Default ``1``; results are bitwise identical either way. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |

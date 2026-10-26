@@ -49,6 +49,7 @@ from helion.autotuner.effort_profile import DifferentialEvolutionConfig
 from helion.autotuner.effort_profile import PatternSearchConfig
 from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
+from helion.language import loops
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
@@ -605,12 +606,14 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("variant", ("inband", "R1"))
+    @parametrize("variant", ("inband", "R1", "R1-ws"))
     @parametrize("pipeline", ("static", "dynamic"))
     @parametrize("dtype", (torch.float32, torch.bfloat16))
     def test_pipelined_allreduce_replays(
         self, variant: str, pipeline: str, dtype: torch.dtype
     ) -> None:
+        if variant == "R1-ws" and torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest("warp specialization needs sm100")
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
@@ -620,8 +623,18 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         # Distinct small integers per element stay exact in bf16 and catch lane
         # mixups in packed words.
         lane = torch.arange(n, device=self.device, dtype=dtype) % 16
-        args = (symm, x, group.group_name, variant, world)
+        args = (symm, x, group.group_name, variant.removesuffix("-ws"), world)
         bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
+        if variant == "R1-ws":
+            config = bound.config_spec.default_config().config
+            ws = {
+                "cross_loop_pipeline": pipeline,
+                "range_warp_specializes": [None, True],
+            }
+            bound.set_config(helion.Config(**{**config, **ws}))
+            # A static warp-specialized consumer issues the producer's last release.
+            deferred = "tile_dependency_deferred_task" in bound.to_triton_code()
+            self.assertEqual(deferred, pipeline == "static")
         outs = []
 
         def launch(step: int, replay: bool = False) -> None:
@@ -1507,6 +1520,27 @@ class TestDistributedTileDependencies(TestCase):
                     self.assertIn(expected, code)
                 else:
                     self.assertNotIn(expected, code)
+            # Root 2 runs single-stream, so root 1's release stays per task.
+            self.assertNotIn("tile_dependency_deferred_task", code)
+        # A warp-specialized root 2 issues each worker's last root 1 release from
+        # its first task, or after its loop if the worker runs none of it.
+        with patch.object(loops, "_supports_warp_specialize", lambda: True):
+            inband_rule_kernel.reset()
+            bound = inband_rule_kernel.bind((symm, x, group, "R1", world))
+            config = bound.config_spec.default_config().config
+            ws = {
+                "block_sizes": [64, 64, 64],
+                "range_warp_specializes": [None, None, True],
+            }
+            code = bound.to_triton_code(helion.Config(**{**config, **ws}))
+        inband_rule_kernel.reset()
+        self.assertEqual(code.count(f"{world}, {world}, 'release')"), 3)
+        for expected in (
+            "tile_dependency_deferred_task = -1",
+            "and tile_dependency_deferred_task >= 0:",
+            "if tile_dependency_deferred_ran == 0 and",
+        ):
+            self.assertIn(expected, code)
         bound = inband_rule_kernel.bind((symm, x, group, "", world))
         self.assertEqual(
             bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")

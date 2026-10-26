@@ -3,9 +3,10 @@
 The remaining device-loop axes retain their original order. In particular, a
 gathered row axis stays serial: this transformation does not assume that its
 indices are unique. Every write, and every load from a written allocation, must
-use either the promoted tile as the exact final subscript of one contiguous
-tensor view, or a proved disjoint column residue in flattened storage. The
-implementation only writes fresh host allocations, so input
+use either the promoted tile as one exact subscript position of a contiguous
+tensor view (with every later position provably in range, see
+``_is_exact_partition``), or a proved disjoint column residue in flattened
+storage. The implementation only writes fresh host allocations, so input
 aliasing cannot invalidate that partition proof on a later bound-kernel call.
 """
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
@@ -23,6 +25,7 @@ from ...autotuner.config_spec import L2GroupingSpec
 from ...autotuner.config_spec import LoopOrderSpec
 from ...language import _tracing_ops
 from ...language import creation_ops
+from ...language import matmul_ops
 from ...language import memory_ops
 from ...language import tile_ops
 from ...language import view_ops
@@ -132,6 +135,10 @@ _PURE_CALLS = frozenset(
         _tracing_ops._mask_to,
         creation_ops.full,
         view_ops.subscript,
+        # A contraction of its operands into a fresh register value: no
+        # memory access, no state, deterministic.
+        matmul_ops.dot,
+        matmul_ops.dot_scaled,
         tile_ops.tile_index,
         tile_ops.tile_begin,
         tile_ops.tile_end,
@@ -239,6 +246,42 @@ def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
     )
 
 
+_PURE_SCALAR_BUILTINS = frozenset((float, int, bool, abs, round))
+_PURE_SCALAR_MODULE_FUNCTIONS = frozenset(
+    value
+    for name, value in vars(math).items()
+    if callable(value) and not name.startswith("_")
+)
+
+
+def _pure_scalar_call(call: ast.Call, callee: CallableType) -> bool:
+    """A numeric builtin or ``math`` function over numeric arguments.
+
+    ``sm_scale = 1.0 / math.sqrt(float(head_dim))`` computes a host scalar
+    from shape metadata; neither call can reach tensor storage. Arguments
+    must be numbers (literals, symbolic ints/floats): a tensor argument would
+    be an implicit ``.item()`` and is outside this proof.
+    """
+    from ..type_info import LiteralType
+    from ..type_info import NumericType
+
+    function = callee.value
+    if not (
+        any(function is builtin for builtin in _PURE_SCALAR_BUILTINS)
+        or any(function is candidate for candidate in _PURE_SCALAR_MODULE_FUNCTIONS)
+    ):
+        return False
+    return all(
+        isinstance(argument, ExtendedAST)
+        and (
+            isinstance(argument._type_info, NumericType)
+            or isinstance(argument._type_info, LiteralType)
+            and type(argument._type_info.value) in (int, float, bool)
+        )
+        for argument in (*call.args, *(keyword.value for keyword in call.keywords))
+    )
+
+
 def _fresh_tensors(
     host: HostFunction, *, integer_metadata_calls: bool = False
 ) -> set[torch.Tensor]:
@@ -295,6 +338,7 @@ def _fresh_tensors(
                 and (
                     any(callee.value is function for function in _READ_ONLY_HOST_CALLS)
                     or _read_only_host_dsl(call, callee)
+                    or _pure_scalar_call(call, callee)
                     or integer_metadata_calls
                     and _integer_metadata_call(call, callee)
                 )
@@ -363,30 +407,73 @@ def _is_exact_partition(
     if tensor.ndim == 1 and env.known_equal(tensor.stride(0), 1):
         if is_flat_column_partition(indices[0], block_id, env):
             return True
-    info = subscript_tile_info(env, indices[-1])
-    if (
-        info is None
-        or info.block_id != block_id
-        or not env.known_equal(info.offset, 0)
-        or info.block_size is not None
-    ):
+    # Exactly one subscript position is the promoted tile itself, covering
+    # that dimension's whole extent.  It need not be the final position:
+    # ``out[b, h, tile_m, :]`` partitions rows just as ``out[b, tile_n]``
+    # partitions columns.
+    positions = [
+        position
+        for position, index in enumerate(indices)
+        if (info := subscript_tile_info(env, index)) is not None
+        and info.block_id == block_id
+    ]
+    if len(positions) != 1:
+        return False
+    position = positions[0]
+    info = subscript_tile_info(env, indices[position])
+    assert info is not None
+    if not env.known_equal(info.offset, 0) or info.block_size is not None:
         return False
     extent = env.block_sizes[block_id].size
     if not isinstance(extent, (int, torch.SymInt)) or not env.known_equal(
-        tensor.shape[-1], extent
+        tensor.shape[position], extent
     ):
         return False
-    # Row-major contiguous layout gives each final-axis coordinate a unique
-    # residue modulo the row width, even when another index is an arbitrary
-    # gather. Reject overlapping/strided views rather than infer injectivity.
+    # Row-major contiguous layout: the flat address is ``outer * R + t * r +
+    # inner`` with ``r`` the product of the sizes after ``position``, ``R``
+    # that product times this dimension's size and ``0 <= inner < r`` whenever
+    # every index after ``position`` is in range, so ``t = (address mod R) //
+    # r`` and two different tile values never share an address, whatever the
+    # indices before ``position`` are (even a gather with out-of-range
+    # values).  The in-range requirement after ``position`` is proved by the
+    # index kind: tile indices are masked to their extent, slices cannot
+    # exceed the dimension and scalars are one coordinate for every tile
+    # value; an arbitrary gather there is declined rather than assumed in
+    # range.  Reject overlapping/strided views rather than infer injectivity.
+    # A contiguous allocation writes the stride over an unbacked size as
+    # ``Max(1, u)`` (a size-0 dim keeps a stride of one); both spellings are
+    # the same layout.
+    if not all(_in_range_index(env, index) for index in indices[position + 1 :]):
+        return False
     stride: int | torch.SymInt = 1
+    clamped_stride: int | torch.SymInt = 1
     for size, actual_stride in reversed(
         tuple(zip(tensor.shape, tensor.stride(), strict=True))
     ):
-        if not env.known_equal(actual_stride, stride):
+        if not (
+            env.known_equal(actual_stride, stride)
+            or env.known_equal(actual_stride, clamped_stride)
+        ):
             return False
         stride = stride * size
+        clamped_stride = clamped_stride * torch.sym_max(1, size)
     return True
+
+
+def _in_range_index(env: CompileEnvironment, index: object) -> bool:
+    """Whether a subscript entry provably stays inside its dimension: a tile
+    index (masked to the tile's extent), a slice, or a scalar (``hl.grid``
+    index, ``tile.begin``, constant).  A gather (tensor-valued index) is not
+    proved in range."""
+    if isinstance(index, (slice, int, torch.SymInt)):
+        return True
+    if not isinstance(index, torch.fx.Node):
+        return False
+    if index.target is tile_ops.tile_index:
+        return True
+    if subscript_tile_info(env, index) is not None:
+        return True
+    return isinstance(index.meta.get("val"), (int, torch.SymInt))
 
 
 def _partitioned_memory(

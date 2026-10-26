@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import ExitStack
 from copy import deepcopy
 import random
 import re
@@ -39,6 +40,37 @@ if TYPE_CHECKING:
 
 
 KEY = "cute_host_paired_sum"
+
+# The computed-fragment lowering's coverage groups a layer-norm backward
+# kernel also carries (the resident family is its promoted route; the
+# fragment route is a search alternative whose witnesses append after the
+# whole legacy population).  The historical-prefix tests build their "old"
+# population without these registrations, as test_cute_fragment_scan_config's
+# fixture does: a new fragment knob extends this list, never the prefix.
+_FRAGMENT_COVERAGE_REGISTRATIONS = (
+    "register_fragment_reduction_coverage",
+    "register_fragment_threads_coverage",
+    "register_fragment_padded_rows_coverage",
+    "register_fragment_unrolled_loops_coverage",
+    "register_fragment_vector_io_coverage",
+    "register_fragment_batched_loads_coverage",
+    "register_fragment_split_k_coverage",
+    "register_fragment_slab_loads_coverage",
+    "register_fragment_packet_loads_coverage",
+)
+_FRAGMENT_COVERAGE_MECHANISMS = frozenset(
+    {
+        "cute.computed_fragment_reduction",
+        "cute.computed_fragment_threads",
+        "cute.fragment_padded_rows",
+        "cute.fragment_unrolled_loops",
+        "cute.fragment_vector_io",
+        "cute.fragment_batched_loads",
+        "cute.fragment_split_k",
+        "cute.fragment_slab_loads",
+        "cute.fragment_packet_loads",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -162,14 +194,11 @@ def _initial_population_with_legacy_prefix(
     # population. Check the actual benchmark boundary, exact order and RNG.
     spec = bound.config_spec
     groups = spec.compiler_coverage_groups
-    with (
-        patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
-        ),
-        patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
-        ),
-    ):
+    with ExitStack() as stack:
+        for registration in _FRAGMENT_COVERAGE_REGISTRATIONS:
+            stack.enter_context(
+                patch("helion._compiler.autotuner_heuristics." + registration)
+            )
         old_bound = _cpu_bind(bound.kernel, args)
     _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
     search, delivered, rng = _capture_initial_population(bound, args, seed)
@@ -180,8 +209,7 @@ def _initial_population_with_legacy_prefix(
     assert all(config not in old for config in additions)
     assert all(
         any(
-            group.mechanism
-            in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+            group.mechanism in _FRAGMENT_COVERAGE_MECHANISMS
             and config.config.get(group.key, group.legacy) != group.legacy
             for group in groups
         )
@@ -245,8 +273,7 @@ def test_entire_old_seed_prefix_and_default_are_preserved(
     assert [
         group.mechanism
         for group in spec.compiler_coverage_groups
-        if group.mechanism
-        not in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+        if group.mechanism not in _FRAGMENT_COVERAGE_MECHANISMS
     ] == [
         "cute.resident_row_consumption",
         "cute.resident_terminal_product",

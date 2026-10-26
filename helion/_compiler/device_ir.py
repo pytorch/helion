@@ -3518,6 +3518,22 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
+        warp_specialize_specs = (
+            CompileEnvironment.current().config_spec.range_warp_specialize
+        )
+        if warp_specialize_specs:
+            from .loop_dependency_checker import intra_loop_raw_reread_block_ids
+
+            # A loop that stores and then re-reads the same storage cannot be
+            # warp-specialized (see intra_loop_raw_reread_block_ids); its
+            # slot stays in the config space pinned to None.
+            reread_block_ids = intra_loop_raw_reread_block_ids(
+                device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids
+            )
+            for spec in warp_specialize_specs:
+                if reread_block_ids.intersection(spec.block_ids):
+                    spec.pinned = True
+
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.dot_scaled_scales import expose_dot_scaled_scales
             from .cute.promote_output_axis import promote_partitioned_output_axis
@@ -3597,18 +3613,49 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.collective_matmul import collective_knobs_apply
+            from .cute.collective_matmul import has_k_loop_less_matmul
 
+            env = CompileEnvironment.current()
+            # Knobs no contraction can act on leave the search surface: the
+            # collective marker needs an addmm/dot site with a tiled or a
+            # short full-slice K, and the epilogue store split does not
+            # survive a matmul on the direct/serial path.
+            config_spec.cute_collective_knobs_enabled = collective_knobs_apply(
+                env, device_ir
+            )
+            if has_k_loop_less_matmul(env, device_ir):
+                config_spec.epilogue_subtile_candidate_enabled = False
+
+        env = CompileEnvironment.current()
+        if env.backend.name == "cute" and env.settings.cute_graph_cse:
+            # Duplicate pure nodes (the second amax/exp/sum of a softmax and
+            # log_softmax over one operand) would each roll into their own
+            # sweep and exchange below; merge them while every graph is still
+            # the traced one.  ``cute_graph_cse=False`` (HELION_CUTE_GRAPH_CSE=0)
+            # keeps the traced graph, to bisect a structural matcher against it.
+            from .cute.graph_cse import cse_device_ir
+
+            cse_device_ir(device_ir)
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
+            from .cute.hoist_loop_invariant_recip import has_hoistable_fp32_divisions
             from .cute.signed_bitfield import has_signed_byte_field
             from .cute.tile_packing import tile_pack_counts
 
             config_spec.cute_tile_pack_counts = tile_pack_counts(
                 CompileEnvironment.current(), device_ir
+            )
+
+            # An fp32 quotient by a scalar or a broadcast row value: the exact
+            # division hoist can apply, so its form is tunable.
+            config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
+                info.graph for info in device_ir.graphs
             )
 
             config_spec.cute_signed_bitfield_bf16_available = (
@@ -3920,6 +3967,21 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     from .cute.materialized_mma import enable_materialized_mma_search
 
                     enable_materialized_mma_search(
+                        env,
+                        device_ir,
+                        planning_results,
+                        search_candidates,
+                        mma_nodes={
+                            id(candidate): node
+                            for candidate, _lhs, _rhs, node in mma_candidates
+                        },
+                    )
+                elif env.has_barrier and len(device_ir.root_ids) > 1:
+                    # Several GEMM shapes split by ``hl.barrier()``: each phase
+                    # is its own ordered launch, so each GEMM plans per phase.
+                    from .cute.materialized_mma import enable_phase_mma_search
+
+                    enable_phase_mma_search(
                         env,
                         device_ir,
                         planning_results,

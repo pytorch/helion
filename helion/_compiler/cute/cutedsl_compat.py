@@ -211,3 +211,45 @@ def emit_producer_tail_tma_umma(
     if skip_advances:
         return f"{indent}{pipeline_expr}.producer_acquire({state_expr})"
     return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+
+@lru_cache(maxsize=1)
+def nvdisasm_path() -> str | None:
+    """The ``nvdisasm`` binary the SASS checks disassemble with: the one the
+    ``nvidia-cuda-nvdisasm`` wheel ships (a runtime dependency of the CuTe
+    DSL, which dumps SASS through it), else one on ``PATH`` or under
+    ``CUDA_HOME``; None when there is none."""
+    import os
+    import shutil
+
+    try:
+        dist = importlib.metadata.distribution("nvidia-cuda-nvdisasm")
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
+    if dist is not None and dist.files is not None:
+        for entry in dist.files:
+            if entry.name == "nvdisasm":
+                path = str(dist.locate_file(entry))
+                if os.path.isfile(path):
+                    return path
+    found = shutil.which("nvdisasm")
+    if found is not None:
+        return found
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        candidate = os.path.join(cuda_home, "bin", "nvdisasm")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def hinted_cp_async_available() -> bool:
+    """Whether the mma_dag emitter may hint its staged operand packets
+    (``cp.async.cg.shared.global.L2::cache_hint``).
+
+    The DSL's assembler has misencoded that form (``sass_check.py``), so the
+    launcher verifies every hinted kernel's SASS before it runs; without a
+    disassembler nothing can be verified and the packets stay plain (the
+    normalizer pins every ``load_eviction_policies`` slot to "").
+    """
+    return nvdisasm_path() is not None

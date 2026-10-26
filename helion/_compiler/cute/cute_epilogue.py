@@ -551,6 +551,62 @@ _BINARY_OP_NAMES: dict[object, str] = {
     torch.ops.aten.div.Tensor: "div",
 }
 
+# Elementwise comparisons over auxiliary expressions (``acc * (c[tile] > 0)``,
+# the relu-backward mask).  Both overloads trace with the scalar second; the
+# TensorSSA operators lower to the ordered ``cmpf`` predicates (``UNE`` for
+# ``ne``), which is exactly torch's NaN behaviour for every one of these.
+_COMPARE_TARGETS: dict[object, tuple[str, str]] = {
+    torch.ops.aten.gt.Tensor: ("gt", "({lhs}) > ({rhs})"),
+    torch.ops.aten.gt.Scalar: ("gt", "({lhs}) > ({rhs})"),
+    torch.ops.aten.ge.Tensor: ("ge", "({lhs}) >= ({rhs})"),
+    torch.ops.aten.ge.Scalar: ("ge", "({lhs}) >= ({rhs})"),
+    torch.ops.aten.lt.Tensor: ("lt", "({lhs}) < ({rhs})"),
+    torch.ops.aten.lt.Scalar: ("lt", "({lhs}) < ({rhs})"),
+    torch.ops.aten.le.Tensor: ("le", "({lhs}) <= ({rhs})"),
+    torch.ops.aten.le.Scalar: ("le", "({lhs}) <= ({rhs})"),
+    torch.ops.aten.eq.Tensor: ("eq", "({lhs}) == ({rhs})"),
+    torch.ops.aten.eq.Scalar: ("eq", "({lhs}) == ({rhs})"),
+    torch.ops.aten.ne.Tensor: ("ne", "({lhs}) != ({rhs})"),
+    torch.ops.aten.ne.Scalar: ("ne", "({lhs}) != ({rhs})"),
+}
+
+# torch promotes a boolean operand of floating arithmetic to the floating
+# dtype (``True -> 1.0``); a Boolean TensorSSA converts the same way (Boolean
+# is an Integer subtype, ``itofp``).  The promoted value is exact in every
+# floating dtype, so one FP32 step models the promotion to any of them.
+_BOOL_TO_FLOAT_STEP = _UnaryOp(op_name="mask", template="({inner}).to(cutlass.Float32)")
+
+
+def _promote_bool_operand(
+    expr: _TensorExpr, node: torch.fx.Node, result_dtype: torch.dtype | None
+) -> _TensorExpr | None:
+    """Return ``expr`` as the floating operand torch makes of ``node``.
+
+    A boolean operand of a floating-point result is promoted; a boolean
+    operand anywhere else (a boolean result, or no dtype) is not modelled.
+    """
+    if _node_tensor_dtype(node) != torch.bool:
+        return expr
+    if result_dtype is None or not result_dtype.is_floating_point:
+        return None
+    return _UnaryTensorExpr(step=_BOOL_TO_FLOAT_STEP, operand=expr)
+
+
+def _operand_dtype_matches(
+    expr: _TensorExpr, node: torch.fx.Node, result_dtype: torch.dtype
+) -> bool:
+    """Whether an aux operand already carries the binary op's result dtype.
+
+    A host scalar is weakly typed: torch promotes it to the tensor operand's
+    dtype like a literal.  A promoted boolean operand was just converted.
+    A rank-0 load is a tensor operand and must already carry the result dtype.
+    """
+    if _is_host_scalar_expr(expr):
+        return True
+    if _node_tensor_dtype(node) == torch.bool:
+        return True
+    return _node_tensor_dtype(node) == result_dtype
+
 
 def _extract_scalar(arg: object) -> float | None:
     """Return ``float(arg)`` if ``arg`` is a finite Python int/float;
@@ -745,7 +801,10 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
             _, unary_operand = silu
     if unary_operand is not None:
         return _is_auxiliary_tensor_expr_node(unary_operand, depth + 1)
-    if node.target not in _SCALAR_BINARY_TARGETS or len(node.args) != 2:
+    if (
+        node.target not in _SCALAR_BINARY_TARGETS
+        and node.target not in _COMPARE_TARGETS
+    ) or len(node.args) != 2:
         return False
     lhs, rhs = node.args
     lhs_is_expr = isinstance(lhs, torch.fx.Node) and _is_auxiliary_tensor_expr_node(
@@ -1219,18 +1278,20 @@ def _classify_binary(
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
         )
-        aux_expr: _TensorExpr
+        aux_expr: _TensorExpr | None
         carrier: torch.fx.Node
         forward_form: bool
         if lhs_expr is not None and rhs_expr is None:
-            aux_expr = lhs_expr
+            aux_expr = _promote_bool_operand(lhs_expr, lhs, _node_tensor_dtype(cur))
             carrier = rhs
             forward_form = False  # carrier is the right operand
         elif rhs_expr is not None and lhs_expr is None:
-            aux_expr = rhs_expr
+            aux_expr = _promote_bool_operand(rhs_expr, rhs, _node_tensor_dtype(cur))
             carrier = lhs
             forward_form = True  # carrier is the left operand
         else:
+            return None
+        if aux_expr is None:
             return None
         op_name = _BINARY_OP_NAMES[target]
         current_expr = _CurrentTensorExpr()
@@ -1394,7 +1455,10 @@ def _classify_auxiliary_tensor_expr_impl(
             step=_round_unary_step(unary_step, node), operand=operand_expr
         )
 
-    if node.target not in _SCALAR_BINARY_TARGETS or len(node.args) != 2:
+    if (
+        node.target not in _SCALAR_BINARY_TARGETS
+        and node.target not in _COMPARE_TARGETS
+    ) or len(node.args) != 2:
         return None
     lhs = node.args[0]
     rhs = node.args[1]
@@ -1420,22 +1484,21 @@ def _classify_auxiliary_tensor_expr_impl(
         if isinstance(rhs, torch.fx.Node)
         else None
     )
+    compare = _COMPARE_TARGETS.get(node.target)
+    if compare is not None:
+        return _classify_comparison(node, compare, lhs_expr=lhs_expr, rhs_expr=rhs_expr)
     if lhs_expr is not None and rhs_expr is not None:
         assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
         result_dtype = _node_tensor_dtype(node)
-        # A host scalar is weakly typed: torch promotes it to the tensor
-        # operand's dtype like a literal. A rank-0 load is a tensor operand
-        # and must already carry the result dtype.
+        if result_dtype is None:
+            return None
+        lhs_expr = _promote_bool_operand(lhs_expr, lhs, result_dtype)
+        rhs_expr = _promote_bool_operand(rhs_expr, rhs, result_dtype)
         if (
-            result_dtype is None
-            or (
-                not _is_host_scalar_expr(lhs_expr)
-                and _node_tensor_dtype(lhs) != result_dtype
-            )
-            or (
-                not _is_host_scalar_expr(rhs_expr)
-                and _node_tensor_dtype(rhs) != result_dtype
-            )
+            lhs_expr is None
+            or rhs_expr is None
+            or not _operand_dtype_matches(lhs_expr, lhs, result_dtype)
+            or not _operand_dtype_matches(rhs_expr, rhs, result_dtype)
         ):
             return None
         return _BinaryTensorExpr(
@@ -1449,12 +1512,14 @@ def _classify_auxiliary_tensor_expr_impl(
     if lhs_expr is not None:
         assert isinstance(lhs, torch.fx.Node)
         scalar = _extract_scalar(rhs)
-        lhs_dtype = _node_tensor_dtype(lhs)
+        result_dtype = _node_tensor_dtype(node)
+        lhs_expr = _promote_bool_operand(lhs_expr, lhs, result_dtype)
         if (
             scalar is None
-            or lhs_dtype is None
-            or not lhs_dtype.is_floating_point
-            or _node_tensor_dtype(node) != lhs_dtype
+            or lhs_expr is None
+            or result_dtype is None
+            or not result_dtype.is_floating_point
+            or not _operand_dtype_matches(lhs_expr, lhs, result_dtype)
         ):
             return None
         template = _scalar_binary_template(node.target, scalar, forward_form=True)
@@ -1462,19 +1527,21 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=_round_epilogue_expression(template, lhs_dtype),
+                template=_round_epilogue_expression(template, result_dtype),
             ),
             operand=lhs_expr,
         )
     if rhs_expr is not None:
         assert isinstance(rhs, torch.fx.Node)
         scalar = _extract_scalar(lhs)
-        rhs_dtype = _node_tensor_dtype(rhs)
+        result_dtype = _node_tensor_dtype(node)
+        rhs_expr = _promote_bool_operand(rhs_expr, rhs, result_dtype)
         if (
             scalar is None
-            or rhs_dtype is None
-            or not rhs_dtype.is_floating_point
-            or _node_tensor_dtype(node) != rhs_dtype
+            or rhs_expr is None
+            or result_dtype is None
+            or not result_dtype.is_floating_point
+            or not _operand_dtype_matches(rhs_expr, rhs, result_dtype)
         ):
             return None
         template = _scalar_binary_template(node.target, scalar, forward_form=False)
@@ -1482,7 +1549,88 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=_round_epilogue_expression(template, rhs_dtype),
+                template=_round_epilogue_expression(template, result_dtype),
+            ),
+            operand=rhs_expr,
+        )
+    return None
+
+
+def _classify_comparison(
+    node: torch.fx.Node,
+    compare: tuple[str, str],
+    *,
+    lhs_expr: _TensorExpr | None,
+    rhs_expr: _TensorExpr | None,
+) -> _TensorExpr | None:
+    """Classify an elementwise comparison of floating auxiliary expressions.
+
+    The result is boolean; the consumer's promotion (``_promote_bool_operand``)
+    turns it back into a floating mask.  Boolean operands of a comparison and
+    comparisons of non-floating operands are not modelled.
+
+    A Python scalar operand is compared the way torch compares it: in the
+    tensor operand's dtype.  ``fp16_tensor > 0.3`` tests against
+    ``fp16(0.3) = 0.300048828125`` (the SIMT and Triton lowerings agree), so
+    the literal is rounded to that dtype before it is rendered; the rounded
+    value is exact in any wider type the TensorSSA comparison evaluates in.
+    A scalar the dtype cannot hold (``fp16_tensor > 1e5`` rounds to ``inf``)
+    is not modelled.
+    """
+    op_name, template = compare
+    if _node_tensor_dtype(node) != torch.bool:
+        return None
+    lhs, rhs = node.args
+
+    def floating(operand: object) -> bool:
+        return (
+            isinstance(operand, torch.fx.Node)
+            and (dtype := _node_tensor_dtype(operand)) is not None
+            and dtype.is_floating_point
+        )
+
+    def rounded(scalar: float, operand: torch.fx.Node) -> float | None:
+        dtype = _node_tensor_dtype(operand)
+        assert dtype is not None
+        value = torch.tensor(scalar, dtype=dtype).item()
+        return value if math.isfinite(value) else None
+
+    if lhs_expr is not None and rhs_expr is not None:
+        if not (
+            isinstance(lhs, torch.fx.Node)
+            and isinstance(rhs, torch.fx.Node)
+            and floating(lhs)
+            and _node_tensor_dtype(lhs) == _node_tensor_dtype(rhs)
+        ):
+            return None
+        return _BinaryTensorExpr(
+            op_name=op_name, op_template=template, lhs=lhs_expr, rhs=rhs_expr
+        )
+    if lhs_expr is not None:
+        scalar = _extract_scalar(rhs)
+        if scalar is None or not floating(lhs):
+            return None
+        assert isinstance(lhs, torch.fx.Node)
+        scalar = rounded(scalar, lhs)
+        if scalar is None:
+            return None
+        return _UnaryTensorExpr(
+            step=_UnaryOp(
+                op_name=op_name, template=template.format(lhs="{inner}", rhs=scalar)
+            ),
+            operand=lhs_expr,
+        )
+    if rhs_expr is not None:
+        scalar = _extract_scalar(lhs)
+        if scalar is None or not floating(rhs):
+            return None
+        assert isinstance(rhs, torch.fx.Node)
+        scalar = rounded(scalar, rhs)
+        if scalar is None:
+            return None
+        return _UnaryTensorExpr(
+            step=_UnaryOp(
+                op_name=op_name, template=template.format(lhs=scalar, rhs="{inner}")
             ),
             operand=rhs_expr,
         )

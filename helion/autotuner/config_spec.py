@@ -76,22 +76,51 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILIES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_FAMILY_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_FAMILY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_KV_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_CHUNK_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_CHOICES
+from .._compiler.cute.cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_KEY
+from .._compiler.cute.cute_flash_bwd_row_mma import FlashBwdRowFacts
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_legalize
+from .._compiler.cute.cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from .._compiler.cute.cute_mma_dag import AXIS_LEAD
 from .._compiler.cute.cute_mma_dag import AXIS_LOOP
 from .._compiler.cute.cute_mma_dag import AXIS_ROOT
 from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_AUX_RING
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_STAGES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_DEFAULT_WARPS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_DERIVED_PASS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_CANONICAL
+from .._compiler.cute.cute_mma_dag import MMA_DAG_L2_HINTS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_LANE
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOADS_TMA
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
 from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
@@ -115,8 +144,15 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
 from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
 from .._compiler.cute.cute_mma_dag import fixup_admitted
+from .._compiler.cute.cute_mma_dag import mma_dag_aux_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_epilogue_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_lookahead_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_persistent_reason
+from .._compiler.cute.cute_mma_dag import mma_dag_ragged_ceilings
+from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
@@ -325,6 +361,14 @@ class TensorNumelConstraint(NamedTuple):
     check_fn: Callable[..., bool]
     block_indices: tuple[int, ...]
     expr_str: str
+
+
+# ``cute_exact_div_form`` choices, the default first.  ``plain`` is also the
+# fail-closed repair of an unknown value, and of the retired ``guard`` form
+# (a per-element branch; its code shape changed ptxas's contraction of the
+# surrounding fp32 chains, so it was not bit identical to ``plain``).
+CUTE_EXACT_DIV_FORMS: tuple[str, ...] = ("redo", "plain")
+_CUTE_EXACT_DIV_FORM_RETIRED: frozenset[str] = frozenset({"guard"})
 
 
 class MatmulFact(NamedTuple):
@@ -1069,6 +1113,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
         "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1096,6 +1144,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1118,6 +1167,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1127,6 +1183,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1155,6 +1212,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -1239,6 +1298,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1261,6 +1321,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1270,6 +1337,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1298,6 +1366,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -1331,6 +1401,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_ds_tmem",
         "cute_flash_bwd_exp2_emu",
         "cute_flash_bwd_table_steps",
+        "cute_flash_bwd_family",
+        "cute_flash_bwd_row_kv",
+        "cute_flash_bwd_row_q_split",
+        "cute_flash_bwd_row_q_chunk",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1365,6 +1439,12 @@ VALID_MAXNREG = AUTOTUNED_MAXNREG
 MIN_MAXNREG = 1
 MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
+# Schedule knobs of the CuTe register tile (``RegisterTileOptions``); dropped
+# from a config that forms no register tile.
+_CUTE_REGISTER_TILE_KNOBS: tuple[str, ...] = (
+    "cute_register_tile_warp_fold",
+    "cute_register_tile_store_first",
+)
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         *RADIX_CONFIG_KEYS,
@@ -1397,6 +1477,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_materialized_operand_schedule",
         "cute_fragment_scan",
         "cute_fragment_reduction",
+        "cute_fp32_dot",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
@@ -1419,6 +1500,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
+        "cute_fragment_padded_rows",
+        "cute_fragment_unrolled_loops",
+        "cute_fragment_vector_io",
+        "cute_fragment_batched_loads",
+        "cute_fragment_split_k",
+        "cute_fragment_mma_rows",
+        "cute_fragment_slab_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1428,6 +1516,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_store_policy",
+        "cute_exact_div_form",
         "cute_bf16x2_recurrence",
         "cute_register_chain",
         "cute_simt_mma",
@@ -1456,6 +1545,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_scalar_epilogue_keep_inputs",
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
+        "cute_register_tile_warp_fold",
+        "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
@@ -1625,6 +1716,10 @@ class ConfigSpec:
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
+        # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
+        # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
+        # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
+        self.cute_exact_division_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
@@ -1693,6 +1788,10 @@ class ConfigSpec:
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
+        # Cleared by the CuTe DeviceIR pass when no contraction can reach the
+        # collective marker; the ``cute_collective_*`` fragments then stay out
+        # of the search surface while normalization keeps their defaults.
+        self.cute_collective_knobs_enabled: bool = True
         self.has_pallas_inner_loops: bool = False
         # Set by the Pallas graph lowering when an inner-loop dot can consume
         # an f32 producer directly instead of its explicit bf16/f16 cast.
@@ -1750,6 +1849,17 @@ class ConfigSpec:
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
+        # How a dot operand that is a pointwise chain over loaded tiles
+        # reaches its tile (``cute_mma_dag_derived``: the exchange of a
+        # derived fragment, or a packet pass from the staged sources).
+        self.cute_mma_dag_derived: EnumFragment | None = None
+        # The tensor-memory region programs' epilogue layout
+        # (``cute_mma_dag_epilogue``: one row per thread on four warps, or
+        # the row's columns split over a warp pair on eight).
+        self.cute_mma_dag_epilogue: EnumFragment | None = None
+        # The region programs' ring-loop schedule (``cute_mma_dag_lookahead``:
+        # the one dot of the loop issued one iteration ahead of its epilogue).
+        self.cute_mma_dag_lookahead: EnumFragment | None = None
         # The tcgen05 mode's persistent launch (CTAs per SM); None where the
         # mode or its one-tile-per-CTA region programs leave it no subject.
         self.cute_mma_dag_persistent: EnumFragment | None = None
@@ -1796,6 +1906,9 @@ class ConfigSpec:
         self.cute_fragment_scan_search_enabled = False
         self.cute_fragment_reduction_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_reduction_search_enabled = False
+        self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
+        self.cute_fp32_dot_search_enabled = False
+        self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False
         self.cute_fragment_producer_cache_root_ids: frozenset[int] = frozenset()
@@ -1839,6 +1952,20 @@ class ConfigSpec:
         self.cute_fragment_register_snapshot_min_threads = 0
         self.cute_fragment_packet_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_packet_loads_search_enabled = False
+        self.cute_fragment_padded_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_padded_rows_search_enabled = False
+        self.cute_fragment_unrolled_loops_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_unrolled_loops_search_enabled = False
+        self.cute_fragment_vector_io_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_vector_io_search_enabled = False
+        self.cute_fragment_batched_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_batched_loads_search_enabled = False
+        self.cute_fragment_split_k_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_split_k_search_enabled = False
+        self.cute_fragment_mma_rows_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_mma_rows_search_enabled = False
+        self.cute_fragment_slab_loads_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_slab_loads_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
@@ -1965,6 +2092,9 @@ class ConfigSpec:
         self._cute_flash_bwd_flex: bool = False
         self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
         self._cute_flash_bwd_fast_math: bool = False
+        # The dense backward's register-MMA row family: the plan facts that
+        # legalize its knobs (None off the dense bwd surface).
+        self._cute_flash_bwd_row_facts: FlashBwdRowFacts | None = None
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # A compiler may request complete initial coverage of its normalized
@@ -2189,6 +2319,14 @@ class ConfigSpec:
     @cute_tcgen05_exact_shape_aux_kernel_detected.setter
     def cute_tcgen05_exact_shape_aux_kernel_detected(self, value: bool) -> None:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
+
+    @property
+    def cute_tcgen05_aux_loads_on_every_store(self) -> bool:
+        return self._cute_tcgen05_config.aux_loads_on_every_store
+
+    @cute_tcgen05_aux_loads_on_every_store.setter
+    def cute_tcgen05_aux_loads_on_every_store(self, value: bool) -> None:
+        self._cute_tcgen05_config.aux_loads_on_every_store = value
 
     @property
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self) -> bool:
@@ -2902,8 +3040,10 @@ class ConfigSpec:
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention forward (backend 'cute')",
+            )
 
     def enable_cute_flash_gated_search(
         self,
@@ -3048,7 +3188,15 @@ class ConfigSpec:
         renders that table, so it reads 0 (the search's caps are the 1-CTA
         kernel's, mostly far above the pair's 64-128 steps). Where the pair
         kernel is not legal the knob renders the 1-CTA kernel, whose knobs
-        all apply: the knob itself reads 0 there."""
+        all apply: the knob itself reads 0 there.
+
+        The dense surface's register-MMA row family (``cute_flash_bwd_family``
+        = "row_mma") is legalized first: its three row knobs read their
+        defaults off the family, and an illegal triple on it moves to the
+        nearest legal one or back to the tcgen05 family (see
+        ``cute_flash_bwd_row_mma.flash_bwd_row_legalize``)."""
+        if self.cute_flash_bwd_search_enabled and not self._cute_flash_bwd_flex:
+            flash_bwd_row_legalize(self._cute_flash_bwd_row_facts, config)
         if not (self.cute_flash_bwd_search_enabled and self._cute_flash_bwd_flex):
             return
         # The first-step order knob reads "auto" wherever it has no effect
@@ -3100,13 +3248,26 @@ class ConfigSpec:
         two measured register splits (the compute warpgroups spill below 152
         registers; the MMA and load warps hold their rings at 88 or 104), so
         a cold search starts from both families instead of finding the pair
-        by chance."""
-        if not (
-            self.backend_name == "cute"
-            and self.cute_flash_bwd_search_enabled
-            and self._cute_flash_bwd_flex
-            and self._cute_flash_bwd_two_cta_allowed
+        by chance.
+
+        The dense surface seeds its register-MMA row family on small grids
+        (``cute_flash_bwd_family`` = "row_mma" over the default row knobs:
+        see ``cute_flash_bwd_row_mma``) for the same reason."""
+        if not (self.backend_name == "cute" and self.cute_flash_bwd_search_enabled):
+            return []
+        row_facts = self._cute_flash_bwd_row_facts
+        if (
+            not self._cute_flash_bwd_flex
+            and row_facts is not None
+            and flash_bwd_row_search_grid(row_facts)
         ):
+            seed = self.default_config()
+            seed.config[FLASH_BWD_FAMILY_KEY] = FLASH_BWD_ROW_FAMILY
+            self.normalize(seed, _fix_invalid=True)
+            if seed.config.get(FLASH_BWD_FAMILY_KEY) == FLASH_BWD_ROW_FAMILY:
+                return [seed]
+            return []
+        if not (self._cute_flash_bwd_flex and self._cute_flash_bwd_two_cta_allowed):
             return []
         # Two register splits: the cold autotunes of the 32K / 128K causal
         # cells pick 88/168/88 (the dQ-reduce and load warps at 88, the
@@ -3291,12 +3452,16 @@ class ConfigSpec:
         targets, the promoted default) selects ``warp``.
         """
         self.cute_mma_dag_facts = facts
+        # A ragged root axis below its MMA atom (M = 8 under the 16-row atom)
+        # is computed at the atom on the warp path, and the seeds walk that
+        # tile: its search ceiling, the extent where the frontend left it,
+        # admits the atom.  The default block size stays clamped to the
+        # extent (``BlockSizeSpec._fragment``); no other block widens.
+        block_ids = self.block_sizes.valid_block_ids()
+        for block_id, atom in mma_dag_ragged_ceilings(facts).items():
+            if block_id in block_ids:
+                self.block_sizes.block_id_lookup(block_id).allow_overshoot(atom)
         modes = MMA_DAG_MODES
-        if facts.chain_vecs:
-            # No warp config runs a fragment chain over a row vector: the
-            # choice would only be repaired to ``off`` (and the random half
-            # of a search spent on the SIMT lowering).
-            modes = tuple(mode for mode in modes if mode != MMA_DAG_WARP)
         if facts.tcgen05 is not None:
             modes = (*modes, MMA_DAG_TCGEN05)
         search = modes
@@ -3307,8 +3472,15 @@ class ConfigSpec:
             # random "off" configs at 2048^3 and 49 of 56 at 512x1024x1024
             # failed to compile, every tensor-memory config compiled), so
             # the search samples the tensor-memory mode; "off" stays a legal
-            # value (the repair fallback, explicit configs).
-            search = tuple(mode for mode in modes if mode != MMA_DAG_OFF)
+            # value (the repair fallback, explicit configs).  The warp mode
+            # holds the whole axis in one CTA: it is sampled only when some
+            # tile of its seed ladder runs the program (a 2048-column
+            # fragment exceeds its register budget at every tiling, and a
+            # random warp draw would only be repaired away).
+            skipped = {MMA_DAG_OFF}
+            if not mma_dag_seed_configs(facts):
+                skipped.add(MMA_DAG_WARP)
+            search = tuple(mode for mode in modes if mode not in skipped)
         self.cute_mma_dag = EnumFragment(
             choices=modes, search_choices=search if search != modes else None
         )
@@ -3330,7 +3502,15 @@ class ConfigSpec:
         self.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
         if facts.aux_candidates:
             self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
-        if facts.tcgen05 is not None and not facts.tcgen05.regions:
+        self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
+        self.cute_mma_dag_epilogue = EnumFragment(choices=MMA_DAG_EPILOGUE_CHOICES)
+        self.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
+        if facts.tcgen05 is not None and (
+            not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
+        ):
+            # The persistent launch: the single-loop renderer's tile loop,
+            # or a region program's (``cute_mma_dag_tcgen05_regions``;
+            # ``persistent_reason`` names the programs it excludes).
             self.cute_mma_dag_persistent = EnumFragment(
                 choices=MMA_DAG_PERSISTENT_CHOICES
             )
@@ -3372,6 +3552,9 @@ class ConfigSpec:
             (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
             (MMA_DAG_LOADS_KEY, self.cute_mma_dag_loads),
             (MMA_DAG_AUX_KEY, self.cute_mma_dag_aux),
+            (MMA_DAG_DERIVED_KEY, self.cute_mma_dag_derived),
+            (MMA_DAG_EPILOGUE_KEY, self.cute_mma_dag_epilogue),
+            (MMA_DAG_LOOKAHEAD_KEY, self.cute_mma_dag_lookahead),
         ):
             if fragment is None:
                 # The aux knob has no subject here: inert, no choices.
@@ -3456,10 +3639,22 @@ class ConfigSpec:
             config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
             config[MMA_DAG_PERSISTENT_KEY] = 0
             config[MMA_DAG_CLUSTER_KEY] = 1
             config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
             return
+        # The derived route has a subject only where some dot operand is a
+        # pass chain, and its pass reads the chain's tiles from the ring:
+        # the tensor-memory mode's ``lane`` loads leave them to the lanes.
+        if not facts.pass_chains or (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and config[MMA_DAG_LOADS_KEY] != MMA_DAG_LOADS_TMA
+        ):
+            config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+        derived = cast("str", config[MMA_DAG_DERIVED_KEY])
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
         indices = {
@@ -3487,7 +3682,150 @@ class ConfigSpec:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
             config[MMA_DAG_CLUSTER_KEY] = 1
-        reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages, mode)
+        # The split epilogue has a subject only in the tensor-memory region
+        # programs without reductions, at eight warps; elsewhere the knob is
+        # inert and pinned to the row layout.
+        if (
+            config[MMA_DAG_EPILOGUE_KEY] == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_epilogue_reason(facts, warps, mode) is not None
+        ):
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+        epilogue = cast("str", config[MMA_DAG_EPILOGUE_KEY])
+        # The lookahead schedule has a subject only in the region programs
+        # whose one ring loop is a fresh dot and the derived values over it.
+        if (
+            config[MMA_DAG_LOOKAHEAD_KEY] == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_lookahead_reason(facts, stages, mode) is not None
+        ):
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+        lookahead = cast("str", config[MMA_DAG_LOOKAHEAD_KEY])
+        # The aux ring has a subject only in the warp mode with a side load
+        # varying with an innermost ring loop of the bound inputs; elsewhere
+        # the knob is inert and pinned to the register prefetch.
+        if (
+            config[MMA_DAG_AUX_KEY] == MMA_DAG_AUX_RING
+            and mma_dag_aux_reason(facts, mode) is not None
+        ):
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        aux = cast("str", config[MMA_DAG_AUX_KEY])
+        # The persistent launch has a subject only in the tensor-memory mode
+        # (every single-loop program; the region programs whose root loops
+        # have static trips, under the program-order schedule); elsewhere
+        # the knob is inert and pinned to one tile per CTA.
+        if (
+            config[MMA_DAG_PERSISTENT_KEY]
+            and mma_dag_persistent_reason(facts, mode, lookahead) is not None
+        ):
+            config[MMA_DAG_PERSISTENT_KEY] = 0
+        persistent = cast("int", config[MMA_DAG_PERSISTENT_KEY])
+        reason = mma_dag_config_reason(
+            facts,
+            sizes_by_block,
+            warps,
+            stages,
+            mode,
+            derived,
+            epilogue=epilogue,
+            lookahead=lookahead,
+            aux=aux,
+            persistent=persistent > 0,
+        )
+        if (
+            reason is not None
+            and persistent
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+                aux=aux,
+            )
+            is None
+        ):
+            # The persistent layout (a region program's root items beside
+            # the frames) overflows the shared memory the one-tile layout
+            # fits: the tile stays, the launch goes.
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_PERSISTENT_KEY}={persistent!r}: {reason}"
+                )
+            persistent = config[MMA_DAG_PERSISTENT_KEY] = 0
+            reason = None
+        if (
+            reason is not None
+            and aux == MMA_DAG_AUX_RING
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                derived,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
+            is None
+        ):
+            # The aux rings overflow the shared memory (or the per-thread
+            # cap) the register prefetch fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_AUX_KEY}={aux!r}: {reason}")
+            aux = config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            reason = None
+        if (
+            reason is not None
+            and lookahead == MMA_DAG_LOOKAHEAD_ON
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived, epilogue=epilogue
+            )
+            is None
+        ):
+            # The doubled dot slot overflows the tensor memory the program
+            # order fits: the tile stays, the schedule goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_LOOKAHEAD_KEY}={lookahead!r}: {reason}")
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
+            and epilogue == MMA_DAG_EPILOGUE_SPLIT
+            and mma_dag_config_reason(
+                facts, sizes_by_block, warps, stages, mode, derived
+            )
+            is None
+        ):
+            # The split's budget or tensor-memory layout refuses what the
+            # row layout runs: the tile stays, the layout goes (and the
+            # schedule with it).
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r}: {reason}")
+            epilogue = config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            lookahead = config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            reason = None
+        if (
+            reason is not None
+            and derived == MMA_DAG_DERIVED_PASS
+            and mma_dag_config_reason(
+                facts,
+                sizes_by_block,
+                warps,
+                stages,
+                mode,
+                epilogue=epilogue,
+                lookahead=lookahead,
+            )
+            is None
+        ):
+            # The pass route alone (its ring tiles) overflows the shared
+            # memory the exchange route fits: the tile stays, the route goes.
+            if not fix_invalid:
+                raise InvalidConfig(f"{MMA_DAG_DERIVED_KEY}={derived!r}: {reason}")
+            derived = config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+            reason = None
         if reason is not None:
             if not fix_invalid:
                 raise InvalidConfig(f"{MMA_DAG_KEY}={mode!r}: {reason}")
@@ -3506,11 +3844,22 @@ class ConfigSpec:
                 config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
                 config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
+                config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+                config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
                 config[MMA_DAG_PERSISTENT_KEY] = 0
                 config[MMA_DAG_CLUSTER_KEY] = 1
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
+            # (The repair searched under the row epilogue, in program order,
+            # with the register prefetch, and -- on a region program, whose
+            # persistent layout is larger -- one tile per CTA.)
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
+            config[MMA_DAG_LOOKAHEAD_KEY] = MMA_DAG_LOOKAHEAD_OFF
+            config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+            if facts.tcgen05 is not None and facts.tcgen05.regions:
+                config[MMA_DAG_PERSISTENT_KEY] = 0
             for block_id, index in indices.items():
                 block_sizes[index] = new_sizes[block_id]
             # The repaired split axis slice names the split count (1 when
@@ -3519,6 +3868,19 @@ class ConfigSpec:
             config[MMA_DAG_CLUSTER_KEY] = facts.cluster_of(new_sizes)
             if cast("int", config[MMA_DAG_CLUSTER_KEY]) > MMA_DAG_CLUSTER_MAX:
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_FIXUP
+            if derived == MMA_DAG_DERIVED_PASS and (
+                mma_dag_config_reason(
+                    facts,
+                    new_sizes,
+                    config[MMA_DAG_WARPS_KEY],
+                    config[MMA_DAG_STAGES_KEY],
+                    cast("str", config[MMA_DAG_KEY]),
+                    derived,
+                )
+                is not None
+            ):
+                # (The repair searched under the exchange route.)
+                config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
         if config[MMA_DAG_CLUSTER_KEY] == 1:
             # The whole axis in one CTA: the combine mode has no subject.
             config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
@@ -3542,13 +3904,23 @@ class ConfigSpec:
                 config[MMA_DAG_SPLIT_KEY] = MMA_DAG_SPLIT_CLUSTER
         # Knobs without a subject are inert: no fragment read straight as an
         # A operand (only the shared tile can feed a transposed one), no loop
-        # snapshot to stage.
-        if not facts.identity_candidates:
+        # snapshot to stage, no device loop whose ring the stage depth sizes.
+        # (The tensor-memory region programs give the exchange knob a second
+        # subject: the fp32 A operands read from tensor memory and the
+        # ``X @ X`` dots sharing one tile.)
+        tcgen05_exchange = (
+            config[MMA_DAG_KEY] == MMA_DAG_TCGEN05
+            and facts.tcgen05 is not None
+            and facts.tcgen05.tmem_operands > 0
+        )
+        if not facts.identity_candidates and not tcgen05_exchange:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
         if not facts.aux_candidates:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        if not facts.loops:
+            config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
         if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
             mma_dag_pass_warps_reason(
                 facts,
@@ -3594,13 +3966,50 @@ class ConfigSpec:
             ("cute_vector_widths", 1),
             ("cute_lane_layouts", "blocked"),
             ("cute_reduction_reloads", "auto"),
-            ("load_eviction_policies", ""),
             ("reduction_loops", None),
             ("flatten_loops", False),
         ):
             value = config.get(key)
             if isinstance(value, list):
                 config[key] = [default for _ in value]
+        # The warp mode's staged tiles carry the L2 policy of their slot
+        # (``MMA_DAG_L2_HINTS``) on their cp.async packets, one canonical
+        # value per packet form; every other slot (the side loads, every load
+        # of the tensor-memory mode) is inert.  The hinted packets exist only
+        # where the launcher can verify their assembly
+        # (``hinted_cp_async_available``): elsewhere every slot pins to "".
+        policies = config.get("load_eviction_policies")
+        if isinstance(policies, list):
+            staged = (
+                set(facts.staged_slots)
+                if config[MMA_DAG_KEY] == MMA_DAG_WARP and hinted_cp_async_available()
+                else set()
+            )
+            canonical = [
+                MMA_DAG_L2_CANONICAL.get(
+                    MMA_DAG_L2_HINTS.get(policy, "") if isinstance(policy, str) else "",
+                    "",
+                )
+                if slot in staged
+                else ""
+                for slot, policy in enumerate(policies)
+            ]
+            config["load_eviction_policies"] = canonical
+            # A hinted tile keeps its cp.async packets under either loads
+            # route (``plan_tma``): a ``lane`` config hinting every tile a
+            # tensor map could fetch renders the ``tma`` config's kernel
+            # when no fixed epilogue tile tells them apart -- one identity.
+            if (
+                config[MMA_DAG_KEY] == MMA_DAG_WARP
+                and config.get(MMA_DAG_LOADS_KEY) == MMA_DAG_LOADS_LANE
+                and facts.tma_slots
+                and not facts.fixed_derived
+                and all(
+                    slot < len(canonical) and canonical[slot]
+                    for slot in facts.tma_slots
+                )
+            ):
+                config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_TMA
         for key in ("cute_collective_mma", "cute_register_chain", "cute_simt_mma"):
             if key in config:
                 config[key] = False
@@ -3689,6 +4098,7 @@ class ConfigSpec:
         additive_bias: bool = True,
         table_step_choices: Sequence[int] = (0,),
         two_cta_table_steps: int = 0,
+        row_mma_facts: FlashBwdRowFacts | None = None,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3698,9 +4108,14 @@ class ConfigSpec:
         problem shape supports 256-row cluster KV tiles;
         ``two_cta_table_steps`` is the flex pair kernel's automatic step
         table (``cute_flash_bwd_table_steps`` caps at or above it render it;
-        see ``_normalize_cute_flash_bwd``).
+        see ``_normalize_cute_flash_bwd``). ``row_mma_facts`` (the dense
+        surface) carries the plan facts of the register-MMA row family
+        (``cute_flash_bwd_family`` = "row_mma"; see
+        ``cute_flash_bwd_row_mma``): its knobs are offered where the facts
+        admit the family and searched / seeded on small grids.
         """
         self.cute_flash_bwd_search_enabled = True
+        self._cute_flash_bwd_row_facts = row_mma_facts
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
         self._cute_flash_bwd_two_cta_table_steps = (
@@ -3725,8 +4140,10 @@ class ConfigSpec:
         self._cute_flash_bwd_table_step_choices = tuple(table_step_choices)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
-            spec.autotuner_min = target
-            spec.max_size = target
+            spec.pin_structurally(
+                target,
+                reason="the CuTe fused flash-attention backward (backend 'cute')",
+            )
 
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
@@ -4733,6 +5150,101 @@ class ConfigSpec:
             fix_invalid=fix_invalid,
         )
 
+    def _normalize_cute_fragment_padded_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_padded_rows",
+            self.cute_fragment_padded_rows_root_ids,
+            "a complete fragment root staging a tile whose rows are a multiple of 128 bytes",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_unrolled_loops(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_unrolled_loops",
+            self.cute_fragment_unrolled_loops_root_ids,
+            "a complete fragment root",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_vector_io(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_vector_io",
+            self.cute_fragment_vector_io_root_ids,
+            "a complete fragment root moving a 16-byte-packetizable host window",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_batched_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_batched_loads",
+            self.cute_fragment_batched_loads_root_ids,
+            "a complete fragment root with two or more host loads",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_split_k(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The split rides the tf32 mma phase: without it the knob is inert.
+        if config.get("cute_fragment_split_k") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_split_k=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_split_k", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_split_k",
+            self.cute_fragment_split_k_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_mma_rows(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        # The row walk is a form of the tf32 mma phase: inert without it.
+        if config.get("cute_fragment_mma_rows") and (
+            config.get("cute_fp32_dot", "simt") != "tf32_mma"
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_fragment_mma_rows=True requires cute_fp32_dot='tf32_mma'"
+                )
+            config.pop("cute_fragment_mma_rows", None)
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_mma_rows",
+            self.cute_fragment_mma_rows_root_ids,
+            "a complete fragment root with a tf32-eligible fp32 hl.dot",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_slab_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_slab_loads",
+            self.cute_fragment_slab_loads_root_ids,
+            "a complete fragment root with repeated static windows of one tensor",
+            fix_invalid=fix_invalid,
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4792,6 +5304,18 @@ class ConfigSpec:
             "a supported computed scalar reduction",
             fix_invalid=fix_invalid,
             choices=("serial", "warp", "cta", "cta_unroll"),
+        )
+
+    def _normalize_cute_fp32_dot(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fp32_dot",
+            self.cute_fp32_dot_root_ids,
+            "an fp32 hl.dot in a computed fragment under tf32 dot precision",
+            fix_invalid=fix_invalid,
+            choices=("simt", "tf32_mma"),
         )
 
     def _normalize_cute_fragment_scan(
@@ -5023,6 +5547,37 @@ class ConfigSpec:
         if not self.cute_l2_evict_last_store_policy_supported:
             config[key] = "default"
 
+    def _normalize_cute_exact_div_form(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_exact_div_form`` picks how an fp32 division by a
+        loop-invariant divisor is lowered on CuTe (both forms give the IEEE
+        quotient bit for bit): ``redo`` speculates the Markstein sequence
+        over the loop and re-runs the loop on a hard case, ``plain`` keeps
+        ``div.rn`` per element.  A recorded config carrying the retired
+        ``guard`` form is repaired to ``plain`` (fail closed: the plain
+        division is what every form must equal), as is any unknown value
+        under ``fix_invalid``.  A kernel without such a division has nothing
+        for the knob to choose; it is dropped.  The gate
+        (``has_hoistable_fp32_divisions``) is a graph-level necessary
+        condition: a kernel whose division the AST pass then proves
+        loop-carried at every loop keeps the knob, with both forms rendering
+        identically."""
+        key = "cute_exact_div_form"
+        if key not in config:
+            return
+        value = config[key]
+        if value in _CUTE_EXACT_DIV_FORM_RETIRED:
+            config[key] = value = "plain"
+        if value not in CUTE_EXACT_DIV_FORMS:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} must be one of {CUTE_EXACT_DIV_FORMS}, got {value!r}"
+                )
+            config[key] = "plain"
+        if not self.cute_exact_division_sites or self.matmul_facts:
+            config.pop(key, None)
+
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5152,6 +5707,8 @@ class ConfigSpec:
             "cute_scalar_epilogue_keep_inputs",
             "cute_scalar_epilogue_owner_fold",
             "cute_warp_fp32_redux",
+            "cute_register_tile_warp_fold",
+            "cute_register_tile_store_first",
             "cute_replicated_reduction",
             "cute_vector_packet_unroll",
         ):
@@ -5912,6 +6469,7 @@ class ConfigSpec:
             self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_reduction(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fp32_dot(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_threads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_producer_cache(
                 config, fix_invalid=_fix_invalid
@@ -5941,6 +6499,17 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_padded_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_unrolled_loops(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_vector_io(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_batched_loads(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_split_k(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_mma_rows(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_slab_loads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
@@ -5971,6 +6540,7 @@ class ConfigSpec:
             self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_store_policy(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_exact_div_form(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
@@ -6303,6 +6873,7 @@ class ConfigSpec:
         # is regenerated with ``_cute_register_tiles=False`` (the looped
         # reduction this branch chooses without the register tile), and an
         # unproved reordering rejects the config instead of miscompiling.
+        register_tile = False
         if (
             self.backend_name == "cute"
             and self.max_reduction_threads is not None
@@ -6351,22 +6922,56 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
-                        if (
+                        forms_register_tile = (
                             _cute_register_tiles
                             and self._cute_config_forms_register_tile(
                                 config, spec, available
                             )
-                        ) or self._cute_config_forms_one_vector_lane(
-                            config, spec, available
+                        )
+                        if (
+                            forms_register_tile
+                            or self._cute_config_forms_one_vector_lane(
+                                config, spec, available
+                            )
                         ):
+                            # Only the register tile honours the schedule
+                            # knobs; a one-vector lane that is not one keeps
+                            # its lane loop but drops them below.
+                            register_tile = register_tile or forms_register_tile
                             continue
                         chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
                         changed = True
+                    elif (
+                        new_loops[i] is None
+                        and _cute_register_tiles
+                        and isinstance(
+                            requested := self.num_threads.config_get(
+                                nt_list, spec.block_id, 0
+                            ),
+                            int,
+                        )
+                        and 0 < requested < spec.size_hint
+                        and self._cute_config_forms_register_tile(
+                            config, spec, available
+                        )
+                    ):
+                        # An explicit reduction thread count below the extent
+                        # within the budget (a lane loop of >= 2 rows per
+                        # thread): the register tile forms here too.
+                        register_tile = True
                 if changed:
                     config["reduction_loops"] = new_loops
+        if self.backend_name == "cute" and not register_tile:
+            # The register-tile schedule knobs mean nothing without the tile
+            # (a one-vector persistent lane over an admitted reduction block);
+            # dropping them keeps the proven schedule and a byte-identical
+            # render, also on the ``_cute_register_tiles=False`` retry.
+            for key in _CUTE_REGISTER_TILE_KNOBS:
+                if config.get(key):
+                    config[key] = False
 
         # Disable range_* configs for static ranges
         static_range_block_ids = [
@@ -7279,6 +7884,13 @@ class ConfigSpec:
                 "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
+                "cute_fragment_padded_rows",
+                "cute_fragment_unrolled_loops",
+                "cute_fragment_vector_io",
+                "cute_fragment_batched_loads",
+                "cute_fragment_split_k",
+                "cute_fragment_mma_rows",
+                "cute_fragment_slab_loads",
             ):
                 return True, False
             if key == "cute_topk_key_recovery":
@@ -7287,8 +7899,12 @@ class ConfigSpec:
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
                 return True, "serial"
+            if key == "cute_fp32_dot":
+                return True, "simt"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
+            if key == "cute_exact_div_form":
+                return True, CUTE_EXACT_DIV_FORMS[0]
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -7445,7 +8061,8 @@ class ConfigSpec:
         ):
             return
         min_sizes = [
-            max(self.block_sizes[i].min_size, 1) for i in range(len(block_sizes))
+            max(self.block_sizes[i].min_size, self.block_sizes[i].structural_pin or 1)
+            for i in range(len(block_sizes))
         ]
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
@@ -7466,6 +8083,9 @@ class ConfigSpec:
         best_val = -1
         for i, value in enumerate(block_sizes):
             if not isinstance(value, int):
+                continue
+            if self.block_sizes[i].structural_pin is not None:
+                # Normalization would restore the pinned size: no progress.
                 continue
             if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
                 best_val = value
@@ -7558,6 +8178,40 @@ class ConfigSpec:
                 fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
             if self.cute_fragment_packet_loads_search_enabled:
                 fields["cute_fragment_packet_loads"] = BooleanFragment()
+            if self.cute_fragment_padded_rows_search_enabled:
+                fields["cute_fragment_padded_rows"] = BooleanFragment()
+            if self.cute_fragment_unrolled_loops_search_enabled:
+                fields["cute_fragment_unrolled_loops"] = BooleanFragment()
+            # The tile transport knobs (one statement: this method sits at a
+            # size past which pyrefly drops its narrowing of the fields below).
+            fields.update(
+                {
+                    key: BooleanFragment()
+                    for enabled, key in (
+                        (
+                            self.cute_fragment_vector_io_search_enabled,
+                            "cute_fragment_vector_io",
+                        ),
+                        (
+                            self.cute_fragment_batched_loads_search_enabled,
+                            "cute_fragment_batched_loads",
+                        ),
+                        (
+                            self.cute_fragment_split_k_search_enabled,
+                            "cute_fragment_split_k",
+                        ),
+                        (
+                            self.cute_fragment_mma_rows_search_enabled,
+                            "cute_fragment_mma_rows",
+                        ),
+                        (
+                            self.cute_fragment_slab_loads_search_enabled,
+                            "cute_fragment_slab_loads",
+                        ),
+                    )
+                    if enabled
+                }
+            )
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_topk_network_search_enabled:
@@ -7602,7 +8256,14 @@ class ConfigSpec:
                 fields["cute_fragment_reduction"] = EnumFragment(
                     choices=("serial", "warp", "cta", "cta_unroll")
                 )
-            if self.cute_pointwise_region_block_ids:
+            if self.cute_fp32_dot_search_enabled:
+                fields["cute_fp32_dot"] = EnumFragment(choices=("simt", "tf32_mma"))
+            if self.cute_pointwise_region_block_ids and any(
+                pid_type != "flat" for pid_type in self.allowed_pid_types
+            ):
+                # The pointwise launch may go flat while the native launch
+                # stays persistent; when every launch is flat already (ordered
+                # barrier phases) the knob is inert and stays off the surface.
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
@@ -7661,6 +8322,33 @@ class ConfigSpec:
                 fields["cute_flash_bwd_exp2_f32"] = EnumFragment(
                     choices=(1, 0) if self._cute_flash_bwd_flex else (0, 1)
                 )
+                row_facts = self._cute_flash_bwd_row_facts
+                if (
+                    not self._cute_flash_bwd_flex
+                    and row_facts is not None
+                    and row_facts.admitted
+                ):
+                    # The register-MMA row programs (cute_flash_bwd_row_mma):
+                    # searched beside the tcgen05 family where its grid is
+                    # small, legal everywhere the knobs divide the shape.
+                    row_search = flash_bwd_row_search_grid(row_facts)
+                    fields[FLASH_BWD_FAMILY_KEY] = EnumFragment(
+                        choices=FLASH_BWD_FAMILIES,
+                        search_choices=(
+                            FLASH_BWD_FAMILIES
+                            if row_search
+                            else (FLASH_BWD_FA4_FAMILY,)
+                        ),
+                    )
+                    for key, choices in (
+                        (FLASH_BWD_ROW_KV_KEY, FLASH_BWD_ROW_KV_CHOICES),
+                        (FLASH_BWD_ROW_Q_SPLIT_KEY, FLASH_BWD_ROW_Q_SPLIT_CHOICES),
+                        (FLASH_BWD_ROW_Q_CHUNK_KEY, FLASH_BWD_ROW_Q_CHUNK_CHOICES),
+                    ):
+                        fields[key] = EnumFragment(
+                            choices=choices,
+                            search_choices=choices if row_search else choices[:1],
+                        )
                 if self._cute_flash_bwd_flex:
                     if self._cute_flash_bwd_has_mask:
                         # How the mask_mod predicate reaches the -inf select of
@@ -7844,6 +8532,13 @@ class ConfigSpec:
                         else ("default",)
                     )
                 )
+                if self.cute_exact_division_sites and not self.matmul_facts:
+                    # How an fp32 quotient by a loop-invariant divisor is
+                    # lowered; bitwise identical forms, see
+                    # ``_normalize_cute_exact_div_form``.
+                    fields["cute_exact_div_form"] = EnumFragment(
+                        choices=CUTE_EXACT_DIV_FORMS
+                    )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)
@@ -7908,72 +8603,73 @@ class ConfigSpec:
                     if self.cute_split_k_workspace_available:
                         fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
                         fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
-                    fields["cute_collective_mma"] = BooleanFragment()
-                    fields["cute_collective_static_layouts"] = BooleanFragment()
-                    native_collective = (
-                        self.target_device_capability is not None
-                        and self.target_device_capability[0] == 10
-                    )
-                    gathered_collective = native_collective and any(
-                        seed.config.get("cute_collective_compute") == "tma_gather"
-                        for seed in self.compiler_seed_configs
-                    )
-                    fields["cute_collective_compute"] = EnumFragment(
-                        choices=("warp", "tcgen05", "tma_gather")
-                        if native_collective
-                        else ("warp",),
-                        search_choices=("warp", "tcgen05", "tma_gather")
-                        if gathered_collective
-                        else ("warp", "tcgen05")
-                        if native_collective
-                        else ("warp",),
-                    )
-                    fields["cute_collective_native_seeded"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_seed"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_tmem_a"] = (
-                        BooleanFragment()
-                        if native_collective
-                        else EnumFragment(choices=(False,))
-                    )
-                    fields["cute_collective_stages"] = EnumFragment(
-                        choices=(1, 2, 3, 4)
-                    )
-                    fields["cute_collective_copy"] = EnumFragment(
-                        choices=("scalar", "async", "async_cached")
-                    )
-                    fields["cute_collective_recipe"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_collective_operand_packets"] = EnumFragment(
-                        choices=(False, True),
-                        search_choices=(False, True)
-                        if any(
-                            fact.lhs_dtype == torch.float32
-                            for fact in self.matmul_facts
+                    if self.cute_collective_knobs_enabled:
+                        fields["cute_collective_mma"] = BooleanFragment()
+                        fields["cute_collective_static_layouts"] = BooleanFragment()
+                        capability = self.target_device_capability
+                        native_collective = (
+                            capability is not None and capability[0] == 10
                         )
-                        else (False,),
-                    )
-                    fields["cute_collective_epilogue"] = EnumFragment(
-                        choices=("scalar", "vector", "vector_unrolled")
-                    )
-                    fields["cute_gathered_mma_n"] = EnumFragment(
-                        choices=(256, 128, 512),
-                        search_choices=(256, 128, 512)
-                        if gathered_collective
-                        else (256,),
-                    )
-                    fields["cute_gathered_mma_stages"] = EnumFragment(
-                        choices=(3, 2, 4),
-                        search_choices=(3, 2, 4) if gathered_collective else (3,),
-                    )
+                        gathered_collective = native_collective and any(
+                            seed.config.get("cute_collective_compute") == "tma_gather"
+                            for seed in self.compiler_seed_configs
+                        )
+                        fields["cute_collective_compute"] = EnumFragment(
+                            choices=("warp", "tcgen05", "tma_gather")
+                            if native_collective
+                            else ("warp",),
+                            search_choices=("warp", "tcgen05", "tma_gather")
+                            if gathered_collective
+                            else ("warp", "tcgen05")
+                            if native_collective
+                            else ("warp",),
+                        )
+                        fields["cute_collective_native_seeded"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_seed"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_tmem_a"] = (
+                            BooleanFragment()
+                            if native_collective
+                            else EnumFragment(choices=(False,))
+                        )
+                        fields["cute_collective_stages"] = EnumFragment(
+                            choices=(1, 2, 3, 4)
+                        )
+                        fields["cute_collective_copy"] = EnumFragment(
+                            choices=("scalar", "async", "async_cached")
+                        )
+                        fields["cute_collective_recipe"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_collective_operand_packets"] = EnumFragment(
+                            choices=(False, True),
+                            search_choices=(False, True)
+                            if any(
+                                fact.lhs_dtype == torch.float32
+                                for fact in self.matmul_facts
+                            )
+                            else (False,),
+                        )
+                        fields["cute_collective_epilogue"] = EnumFragment(
+                            choices=("scalar", "vector", "vector_unrolled")
+                        )
+                        fields["cute_gathered_mma_n"] = EnumFragment(
+                            choices=(256, 128, 512),
+                            search_choices=(256, 128, 512)
+                            if gathered_collective
+                            else (256,),
+                        )
+                        fields["cute_gathered_mma_stages"] = EnumFragment(
+                            choices=(3, 2, 4),
+                            search_choices=(3, 2, 4) if gathered_collective else (3,),
+                        )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
                 if self.cute_warp_aggregated_atomics_enabled:
@@ -7988,6 +8684,8 @@ class ConfigSpec:
                         "cute_scalar_epilogue_keep_inputs",
                         "cute_scalar_epilogue_owner_fold",
                         "cute_warp_fp32_redux",
+                        "cute_register_tile_warp_fold",
+                        "cute_register_tile_store_first",
                         "cute_replicated_reduction",
                         "cute_vector_packet_unroll",
                     ):
@@ -8152,20 +8850,33 @@ class ConfigSpec:
                 assert self.cute_mma_dag_exchange is not None
                 assert self.cute_mma_dag_pass_warps is not None
                 assert self.cute_mma_dag_loads is not None
+                assert self.cute_mma_dag_derived is not None
+                assert self.cute_mma_dag_epilogue is not None
+                lookahead_fragment = self.cute_mma_dag_lookahead
+                assert lookahead_fragment is not None
                 fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
                 fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
                 fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
                 fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
                 fields[MMA_DAG_LOADS_KEY] = self.cute_mma_dag_loads
-                if self.cute_mma_dag_aux is not None:
-                    fields[MMA_DAG_AUX_KEY] = self.cute_mma_dag_aux
-                if self.cute_mma_dag_persistent is not None:
-                    fields[MMA_DAG_PERSISTENT_KEY] = self.cute_mma_dag_persistent
-                if self.cute_mma_dag_cluster is not None:
-                    fields[MMA_DAG_CLUSTER_KEY] = self.cute_mma_dag_cluster
-                if self.cute_mma_dag_split is not None:
-                    fields[MMA_DAG_SPLIT_KEY] = self.cute_mma_dag_split
+                # (Locals: the type checker's attribute narrowing does not
+                # reach this far into the function.)
+                aux_fragment = self.cute_mma_dag_aux
+                if aux_fragment is not None:
+                    fields[MMA_DAG_AUX_KEY] = aux_fragment
+                fields[MMA_DAG_DERIVED_KEY] = self.cute_mma_dag_derived
+                fields[MMA_DAG_EPILOGUE_KEY] = self.cute_mma_dag_epilogue
+                fields[MMA_DAG_LOOKAHEAD_KEY] = lookahead_fragment
+                persistent_fragment = self.cute_mma_dag_persistent
+                if persistent_fragment is not None:
+                    fields[MMA_DAG_PERSISTENT_KEY] = persistent_fragment
+                cluster_fragment = self.cute_mma_dag_cluster
+                if cluster_fragment is not None:
+                    fields[MMA_DAG_CLUSTER_KEY] = cluster_fragment
+                split_fragment = self.cute_mma_dag_split
+                if split_fragment is not None:
+                    fields[MMA_DAG_SPLIT_KEY] = split_fragment
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
@@ -8700,6 +9411,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.declared_max_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # The one block size a fused lowering's envelope admits
+        # (``pin_structurally``): the search sees a single point and a
+        # provided config's other value is normalized onto it (see
+        # ``_normalize``). ``None`` where no surface pinned this block.
+        self.structural_pin: int | None = None
+        self.structural_pin_reason: str = ""
+        self._structural_pin_warned: set[int] = set()
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -8720,9 +9438,41 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
+        if not isinstance(result, int):
+            return result
+        pin = self.structural_pin
+        if pin is not None and result != pin:
+            # A decorator / saved config written for another backend (the
+            # examples pin Triton-shaped 64x64 tiles) must not silently pick
+            # the scalar lowering: the fused family is the only one the
+            # surface offers, so the value is normalized onto its envelope.
+            if result not in self._structural_pin_warned:
+                self._structural_pin_warned.add(result)
+                log.warning(
+                    "%s=%d in the provided config is normalized onto %d: "
+                    "%s pins this block size",
+                    name,
+                    result,
+                    pin,
+                    self.structural_pin_reason,
+                )
+            return pin
+        if result < self.min_size:
             result = self.min_size
         return result
+
+    def pin_structurally(self, value: int, *, reason: str) -> None:
+        """Pin this block size to the one value a fused lowering admits.
+
+        The autotuner's range collapses to ``value`` and ``_normalize`` maps
+        any other provided value onto it (with a logged warning naming the
+        key and ``reason``), so a config pinned by a decorator or loaded from
+        a cache written for another backend still reaches the fused family.
+        """
+        self.autotuner_min = value
+        self.max_size = value
+        self.structural_pin = value
+        self.structural_pin_reason = reason
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
@@ -9156,7 +9906,21 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
-    pass
+    # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
+    # a loop whose region stores and then re-reads the same storage: Triton's
+    # warp specialization splits such a body across partitions and the
+    # re-read observes stale memory.  The slot stays, so the config shape
+    # does not depend on the analysis, but its value is pinned to None.
+    pinned: bool = False
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if self.pinned:
+            return EnumFragment((None,))
+        return super()._fragment(base)
+
+    def _normalize(self, name: str, value: object) -> bool | None:
+        value = super()._normalize(name, value)
+        return None if self.pinned else value
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):

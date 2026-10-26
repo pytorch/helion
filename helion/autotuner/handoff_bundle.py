@@ -19,6 +19,7 @@ from torch.utils._pytree import tree_map
 
 from .._hardware import get_hardware_info
 from ..language.constexpr import ConstExpr
+from .accuracy import effective_fp8_accuracy
 from .accuracy import is_fp8_dtype
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
@@ -205,8 +206,9 @@ def _tolerances(
     inputs: Sequence[object],
     post_args: Sequence[object],
 ) -> tuple[float, float]:
-    # Match autotuning's strict FP8 default; unchanged input dtypes should not
-    # weaken the checks on an FP8 output.
+    # Match autotuning's FP8 rule (exact bytes under the 'bitwise' mode, one
+    # dequantized ulp plus the default tolerances under 'ulp'); unchanged
+    # input dtypes should not weaken the checks on an FP8 output.
     outputs, _ = tree_flatten(output)
     before, _ = tree_flatten(inputs)
     after, _ = tree_flatten(post_args)
@@ -220,7 +222,13 @@ def _tolerances(
             if not torch.equal(lhs, rhs):
                 dtypes.add(result.dtype)
     atol, rtol = settings.autotune_baseline_atol, settings.autotune_baseline_rtol
-    if atol is None and rtol is None and dtypes and all(map(is_fp8_dtype, dtypes)):
+    if (
+        atol is None
+        and rtol is None
+        and dtypes
+        and all(map(is_fp8_dtype, dtypes))
+        and effective_fp8_accuracy(settings) == "bitwise"
+    ):
         return 0.0, 0.0
     return atol if atol is not None else 0.01, rtol if rtol is not None else 0.01
 
@@ -397,6 +405,7 @@ def build_handoff(
                 "atol": atol,
                 "rtol": rtol,
                 "scale_atol": bound.settings.autotune_baseline_atol is None,
+                "fp8_accuracy": effective_fp8_accuracy(bound.settings),
                 "inputs": f"case_{index}/inputs.pt",
                 "reference": f"case_{index}/reference.pt",
             }

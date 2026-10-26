@@ -1994,12 +1994,22 @@ class DeviceFunction:
                     kernel_body = lower_register_row_reduction(
                         kernel_body, constexpr_values
                     )
-            elif self.config.get("cute_cluster_warp_online", False):
+            # The rolled (``reduction_loops``) form's online pair: tried after
+            # the register-row lowering, which consumes the cluster sites when
+            # it fires, so the knob is honoured whatever ``cute_register_row``
+            # says.  Under fast_math the CTA-level pair caches sweep B's
+            # exponentials for the write sweep; otherwise the exact warp pair.
+            if self.config.get("cute_cluster_warp_online", False):
                 from .cute.rolled_cluster_online_pair import (
                     fuse_rolled_cluster_online_pair,
                 )
 
-                kernel_body = fuse_rolled_cluster_online_pair(kernel_body)
+                kernel_body = fuse_rolled_cluster_online_pair(
+                    kernel_body,
+                    constexpr_values,
+                    rename_groups=rename_groups,
+                    fast_math=CompileEnvironment.current().settings.fast_math,
+                )
             if self.config.get("cute_independent_reduction", False):
                 from .cute.rolled_vector_reduction import split_rolled_vector_sums
 
@@ -2062,6 +2072,37 @@ class DeviceFunction:
                             integer_names=known,
                         )
                     ),
+                )
+            # Without fast_math, hoist the divisor-only work of an fp32
+            # ``x / d`` with a loop-invariant divisor as the Markstein
+            # sequence, speculated over the loop and redone with div.rn
+            # when a dividend left the admitted window: the IEEE quotient
+            # bit for bit (exact_division.py), at three FMA-pipe
+            # instructions and two FMNMX per element.  Last among the
+            # structural passes: the sweep matchers above (independent
+            # partial accumulators, pipelined and packed loads, the cluster
+            # pairs, the scalar epilogue) recognize the plain ``v = x / d``
+            # sweeps, so the redo render keeps the plain render's structure
+            # and summation order.  ``cute_exact_div_form="plain"`` keeps
+            # the plain division.  Not for matmul kernels, whose tcgen05
+            # scheduling passes pin exact statement sequences (as fuse_fma).
+            if (
+                CompileEnvironment.current().settings.cute_exact_division
+                and not CompileEnvironment.current().settings.fast_math
+                and self.config.cute_exact_div_form == "redo"
+                and not env.config_spec.matmul_facts
+            ):
+                from .cute.hoist_loop_invariant_recip import (
+                    hoist_exact_invariant_divisions,
+                )
+
+                kernel_body = hoist_exact_invariant_divisions(
+                    kernel_body,
+                    rename_groups,
+                    float_scalar_names=float_scalar_names,
+                    tensor_dtypes=tensor_dtypes,
+                    argument_names={arg.arg for arg in args},
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                 )
         definition = ast_rename(
             create(
@@ -2158,6 +2199,17 @@ class DeviceFunction:
             with SyntheticLocation():
                 result.append(
                     statement_from_string(f"{self.name}._helion_cute_use_pdl = True")
+                )
+        sass_checks = self.cute_state.sass_checks
+        if sass_checks:
+            # The CuTe launcher verifies the compiled kernel's SASS against
+            # these checks before its first launch
+            # (``helion.runtime.cute.sass_check``).
+            with SyntheticLocation():
+                result.append(
+                    statement_from_string(
+                        f"{self.name}._helion_cute_sass_checks = {tuple(sass_checks)!r}"
+                    )
                 )
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
         if (

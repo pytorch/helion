@@ -25,17 +25,22 @@ from test.test_cute_mma_dag import _bind
 from test.test_cute_mma_dag import _bind_bwd
 from test.test_cute_mma_dag import _bind_dk
 from test.test_cute_mma_dag import _bind_dqk
+from test.test_cute_mma_dag import _bind_dqkg
 from test.test_cute_mma_dag import _bind_dqkw
 from test.test_cute_mma_dag import _bind_dstate
 from test.test_cute_mma_dag import _bind_dv
+from test.test_cute_mma_dag import _bind_dwk
 from test.test_cute_mma_dag import _bind_fn
 from test.test_cute_mma_dag import _bind_fwd
 from test.test_cute_mma_dag import _bind_fwd_h_delta
 from test.test_cute_mma_dag import _bind_fwd_o
 from test.test_cute_mma_dag import _bind_wy
+from test.test_cute_mma_dag import _bind_wy_anchored
 from test.test_cute_mma_dag import _bind_wy_dl
 from test.test_cute_mma_dag import _gen_epi
 from test.test_cute_mma_dag import _gen_epi_stored
+from test.test_cute_mma_dag import _head_sum_inputs
+from test.test_cute_mma_dag import _head_sum_logits
 from test.test_cute_mma_dag import _kernel_body
 from test.test_cute_mma_dag import _program
 from test.test_cute_mma_dag import _root_rescaled_carry
@@ -1316,23 +1321,26 @@ def test_the_persistent_launch_loops_over_tiles_around_one_setup() -> None:
     assert "pid_0 = virtual_pid %" in tile
     # Cross-tile prefetch: the ring's phases run on from the CTA's
     # iteration count, only its first tile issues its own ring prologue, and
-    # each tile issues the next tile's slot right after its drain -- the x
-    # box, clear of the epilogue staging tile at the ring's end -- and the B
-    # box behind the epilogue's staging reads (one K step per tile here).
+    # each tile issues the next tile's whole slot right after its drain
+    # (one K step per tile here): the epilogue staging tile lives beside the
+    # ring (``tcgen05_persistent_staging``: 32 KB ring + 8 KB staging fit
+    # the capacity), so no box waits for the staging reads and nothing is
+    # left for a late issue.
     assert body.index("md_ib = cutlass.Int32(0)") < loop
     assert "md_stage = (md_ib + md_i) % 1" in tile
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 40960," in body
     first = tile.index("if md_ib == 0:")
     assert first < tile.index(f"{P}.cp_async_bulk_tensor_shared_cta_global(")
     drain = tile.index(f"{RT}.mbar_wait(md_accb, 1 - 0 - 1 & 1)")
-    staging = tile.index("md_srow = md_s0 + 24576 + ")
+    staging = tile.index("md_srow = md_s0 + 32768 + ")
     early = tile[drain:staging]
     assert "md_npid = virtual_pid + _NUM_SM * 4" in early
     assert early.count(f"{P}.mbarrier_arrive_expect_tx(md_full + (") == 1
-    assert early.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert early.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 2
     assert "* 32768 + 0), md_tma0" in early
+    assert "* 32768 + 16384), md_tma1" in early
     late = tile[tile.rindex("_helion_mma_dag.stg_v4_b32(") :]
-    assert late.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
-    assert "* 32768 + 16384), md_tma1" in late
+    assert late.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 0
     # The other barriers are re-armed per tile, the ring's are not.
     assert f"{P}.mbarrier_init(md_accb, 1)" in late
     assert f"{P}.mbarrier_init(md_full" not in tile
@@ -1570,13 +1578,12 @@ def test_renders_wy_dl_sequential_loops_and_vector_carries() -> None:
     body = _kernel_body(_source(_bind_wy_dl(), _config(64, 64, 64, warps=4, stages=2)))
     # Three rings, no staged region (A_inv's tile is hoisted by the
     # synchronous pass... through TMA: the root barrier), four vector
-    # registers.
-    # md_cb, the two rings' full barriers and the streaming loop's empty
-    # barriers (loop 1: one batch of dots over ring tiles, nothing else).
+    # registers; kk's loop (a plain K loop) streams, so its slots get their
+    # ``md_empty`` barriers beside the ``md_full`` ones.
     assert body.count("cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)") == 4
-    assert re.search(
-        r"md_empty\d = cute\.arch\.alloc_smem\(cutlass\.Int64, 2, alignment=8\)", body
-    )
+    assert body.count("= cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)") == 4
+    assert "md_empty2 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in body
+    assert "md_empty0" not in body and "md_empty1" not in body
     for slot in range(4):
         assert f"md_vv{slot} = cutlass.Float32(0.0)" in body
     first, rest = _split_loop(body, "md_i")
@@ -1742,7 +1749,7 @@ def _bind_fwd_o_anch_f32(bhn: int = 16, d: int = 128, dv: int = 128) -> BoundKer
     )
 
 
-def test_mn_major_tf32_tiles_are_b_operands_only() -> None:
+def test_mn_major_tf32_tiles_are_read_on_either_side() -> None:
     # The GLA example's ``h[bhn, tile_d, tile_dv]`` B operand is an fp32
     # source read with K along its rows: an MN-major tf32 tile, read under
     # the 32-byte-unit swizzle straight from TMA (box of 32 columns per
@@ -1763,9 +1770,9 @@ def test_mn_major_tf32_tiles_are_b_operands_only() -> None:
         f"layout={P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B"
     ) in body
     assert "a_major=0, b_major=1" in body
-    # An A operand with K along its rows stays declined (the layout is
-    # verified for B operands): the state recurrence over fp32 chunks reads
-    # ``k_i^T`` as A.
+    # An A operand with K along its rows takes the same layout (``a_major=1``;
+    # se_block dw's widened transposed half tile, bit-equal to Triton on the
+    # GPU): the state recurrence over fp32 chunks reads ``k_i^T`` as A.
     f32 = torch.float32
     bound = _bind_fn(
         _store_after, (_cpu(2, 8, 64, 64, dtype=f32), _cpu(2, 8, 64, 64, dtype=f32))
@@ -1773,9 +1780,18 @@ def test_mn_major_tf32_tiles_are_b_operands_only() -> None:
     with bound.env, bound.host_function:
         program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
         assert program is not None
-        assert regions.region_program_reason(program) == (
-            "permute: an MN-major tf32 A operand"
-        )
+        # (The region renderer admits it; this single-loop program's tf32
+        # dot stays with the warp mode, the single-loop emitter's rule.)
+        assert regions.region_program_reason(program) is None
+    from test.test_cute_mma_dag import _bind_se_block
+
+    dw = _bind_se_block("se_block_bwd_dw")
+    assert dw.config_spec.cute_mma_dag is not None
+    assert dw.config_spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    body = _kernel_body(_source(dw, _config(64, 64, 64, warps=4, stages=2)))
+    assert "a_major=1, b_major=1" in body
+    assert f"{P}.Tcgen05MMAKind.TF32" in body
+    assert body.count(f"{P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B") == 2
 
 
 def test_wy_admits_the_tf32_chain_and_seeds_it_first() -> None:
@@ -1819,7 +1835,15 @@ def test_wy_admits_the_tf32_chain_and_seeds_it_first() -> None:
 
 
 def test_renders_the_wy_chain_with_tf32_mmas() -> None:
-    body = _kernel_body(_source(_bind_wy(), _config(64, 64, 64, warps=4, stages=2)))
+    # The exchange-tile schedule (``cute_mma_dag_exchange='smem'``: every
+    # fragment operand through its own shared tile; ``auto`` reads the fp32
+    # A operands from tensor memory, pinned by the next test).
+    body = _kernel_body(
+        _source(
+            _bind_wy(),
+            _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_exchange="smem"),
+        )
+    )
     # Loop 1's two exchange phases (32 KB) under the w / u frames (two
     # 16 KB fp32 slots carrying their own raw tiles, 16 KB of staging),
     # T's root tile on top; A_inv's staging overlays the frames.
@@ -1907,6 +1931,223 @@ def test_renders_the_wy_chain_with_tf32_mmas() -> None:
     assert u_loop.count(f"{P}.Tcgen05MMAKind.TF32") == 8
 
 
+@pytest.mark.parametrize(("stages", "smem"), ((2, 49152), (1, 32768)))
+def test_wy_reads_fp32_a_operands_from_tensor_memory(stages: int, smem: int) -> None:
+    # ``cute_mma_dag_exchange='auto'`` (the default): the tensor core reads
+    # the chain's accumulate A (the squared Apow, slot 3 at column 0) and
+    # the w / u dots' A (T, slot 2 at column 64) straight from tensor
+    # memory, eight fp32 columns a K step, and the squaring dot exchanges
+    # one tile -- Apow's MN-major tile under the 32-byte-unit swizzle, read
+    # K-major through a descriptor of the same layout type (LBO the slab
+    # stride, SBO the four-row period).  Per chain step: two exchange tiles
+    # (Apow, T) of 8 packets instead of four, two tensor-memory reads
+    # instead of three; no hoisted T tile ahead of loop 2 (loop 1's frame
+    # is one 16 KB phase, the w / u rings 16 KB a slot): 48 / 32 KB at two
+    # / one stage against 64 / 48.  Same MMAs, same instruction
+    # descriptors: bit-equal to the exchange schedule (the GPU tests).
+    bound = _bind_wy()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    # Four A operands may read tensor memory (the squaring's Apow, the
+    # accumulate's squared Apow, T twice) and one dot is ``X @ X``.
+    assert facts.tcgen05.tmem_operands == 5
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=stages)))
+    assert f"alloc_smem(cutlass.Uint8, {smem}, alignment=1024)" in body
+    assert f"{P}.tcgen05_alloc(md_tslot, 128," in body
+    assert body.count(f"{P}.Tcgen05MMAKind.TF32") == 4 * 8
+    assert body.count("a_major=0, b_major=1") == 4
+    tmem_a = re.findall(
+        rf"tcgen05_mma\([^\n]*md_acc(\d), cutlass\.inttoptr\(md_tmem \+ (\d+), "
+        rf"{RT}\.TMEM_SPACE, cutlass\.Float32\), md_db\d\.advance_start_address\((\d+)\)",
+        body,
+    )
+    assert [(acc, int(col)) for acc, col, _b in tmem_a] == [
+        ("2", 8 * step) for step in range(8)
+    ] + [(acc, 64 + 8 * step) for acc in ("4", "5") for step in range(8)]
+    assert [int(b) for _a, _c, b in tmem_a] == [1024 * step for step in range(8)] * 3
+    assert (
+        "md_da2 = " not in body and "md_da3 = " not in body and "md_da4 = " not in body
+    )
+    # The squaring's A and B descriptors name the same bytes.
+    shared = (
+        f"md_s0 + 0, leading_byte_offset=8192, stride_byte_offset=512, "
+        f"layout={P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B)"
+    )
+    assert f"md_da1 = {P}.Tcgen05SmemDesc.build({shared}" in body
+    assert f"md_db1 = {P}.Tcgen05SmemDesc.build({shared}" in body
+    # kk's bf16 descriptors are the only SW128 K-major ones left.
+    assert body.count("leading_byte_offset=16, stride_byte_offset=1024") == 2
+    loop1 = body[body.index("for md_i1 in") : body.index(_after_loop(body, "md_i1"))]
+    assert loop1.count(f"{P}.tcgen05_commit(md_cb") == 2
+    assert loop1.count(f"{P}.tcgen05_ld(") == 2
+    assert loop1.count(f"{RT}.sts_v4_f32(md_s0 + 0 + md_row64") == 16
+    assert loop1.count(f"{RT}.sts_v4_f32(") == 16
+    assert "% 8 ^ md_row64 % 8) * 16" not in loop1
+    assert loop1.count("% 8 ^ md_row64 % 4 * 2) * 16") == 16
+    _first, rest = _split_loop(body, "md_i2")
+    # No exchange store (row-indexed) ahead of or inside loops 2 / 3: T is
+    # read in place.
+    assert not re.search(rf"{RT}\.sts_v4_f32\([^\n]*md_row64", rest)
+    assert rest.count(f"cutlass.inttoptr(md_tmem + 64, {RT}.TMEM_SPACE") == 2
+
+
+def test_the_exchange_knob_keeps_its_tensor_memory_subject() -> None:
+    # wy's candidates (``tmem_a_candidates``: config-free) are the four fp32
+    # A operands over plain fragments; ``shared_operand_dots`` names the
+    # squaring.  At a config the squaring's Apow is refused (its slot
+    # aliases the dot's own columns) and T's reads add the (T, u) conflict
+    # the planner's linear liveness lacked (u's result would otherwise be
+    # free to take T's columns while the MMA still reads them); the layout
+    # does not grow, so every other candidate is routed.  The knob stays
+    # searchable on such a program and pins to ``auto`` where no operand
+    # qualifies (the 16-bit state kernels).
+    bound = _bind_wy()
+    program = _match(bound)
+    names = [
+        (dot.node.name, program.frag_slots[program.resolve(operand.frag)])
+        for dot, operand in regions.tmem_a_candidates(program)
+    ]
+    assert [slot for _name, slot in names] == [1, 3, 2, 2]
+    (square,) = regions.shared_operand_dots(program)
+    assert square.loop == 1 and square.a.frag is square.b.frag
+    routed = [
+        (dot, program.frag_slots[program.resolve(dot.a.frag)])
+        for dot in program.dots[2:]
+    ]
+    assert {slot for _d, slot in routed} == {3, 2}
+    conflicts = regions.tmem_route_conflicts(program, routed)
+    assert (2, 5) in conflicts and (2, 3) in conflicts
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None
+    resolved = [64, 64, 64, 1, 64]
+    plain = regions.region_tmem_layout(facts, resolved)
+    routed_layout = regions.region_tmem_layout(
+        facts, resolved, extra_conflicts=conflicts
+    )
+    assert plain == routed_layout == ({0: 0, 1: 0, 2: 64, 3: 0, 4: 0, 5: 0}, 128)
+    spec = bound.config_spec
+    with bound.env:
+        for mode in ("smem", "auto"):
+            config = spec.normalized_config(
+                _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_exchange=mode)
+            )
+            assert config.config["cute_mma_dag_exchange"] == mode
+    state = _bind_fwd()
+    assert state.config_spec.cute_mma_dag_facts.tcgen05.tmem_operands == 0  # type: ignore[union-attr]
+    with state.env:
+        config = state.config_spec.normalized_config(
+            _config(64, 64, warps=8, stages=4, cute_mma_dag_exchange="smem")
+        )
+    assert config.config["cute_mma_dag_exchange"] == "auto"
+
+
+_TMEM_A_READ = re.compile(
+    rf"tcgen05_mma\([^\n]*cutlass\.inttoptr\(md_tmem \+ \d+, {RT}\.TMEM_SPACE"
+)
+_EXCHANGE_STORE = re.compile(rf"{RT}\.sts_v4_f32\(md_s0 \+ \d+ \+ md_row64")
+
+
+@pytest.mark.parametrize("probe", ("rewrite", "rescale"))
+def test_a_slot_a_later_dot_of_the_region_rewrites_keeps_its_exchange_tile(
+    probe: str,
+) -> None:
+    # ``o = dot(s, w); s = dot(q, k^T, acc=s)`` (plain, and ``acc=s * 0.5``):
+    # the body's two dots are independent, so they issue in one MMA batch
+    # -- and the second rewrites ``s`` (its MMA accumulates in place; the
+    # rescale's epilogue store lands ahead of the batch) while the first
+    # would still be reading it from tensor memory.  The exchange schedule
+    # read the tile ahead of the batch, so ``tmem_a_slot_rewriters`` names
+    # the writer and ``tmem_a_candidates`` refuses the operand: no
+    # tensor-memory A read, the knob has no tensor-memory subject (the
+    # warp mode's identity exchange keeps it searchable) and the ``auto``
+    # render is the ``smem`` one byte for byte.  With the update ahead of
+    # the read (``probe_update_first``) the writer is the producer, the
+    # dots take separate batches, and the state is read from tensor memory.
+    bound = _REGION_BINDERS[f"probe_batch_{probe}"]()
+    program = _match(bound)
+    read, update = [dot for dot in program.dots if dot.loop == 1]
+    slot = program.frag_slots[program.resolve(read.a.frag)]
+    assert read.a.kind == "frag" and read.a.dtype == torch.float32
+    assert update.slot == update.acc_slot == slot
+    assert regions.dot_prepares(update) == (probe == "rescale")
+    (_work, batch), *_rest = regions.region_block_steps(program, program.loops[1].steps)
+    assert batch == [read, update]
+    assert regions.tmem_a_slot_rewriters(program, read, slot) == [update]
+    assert regions.tmem_a_candidates(program) == ()
+    assert regions.shared_operand_dots(program) == ()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.regions and facts.tcgen05.tmem_operands == 0
+    assert facts.identity_candidates
+    source = _source(bound, _config(64, 64, warps=4, stages=2))
+    assert source == _source(
+        bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_exchange="smem")
+    )
+    body = _kernel_body(source)
+    assert not _TMEM_A_READ.search(body)
+    loop1 = body[body.index("for md_i1 in") : body.index(_after_loop(body, "md_i1"))]
+    # One batch (one commit) a step: the read's A tile is exchanged in the
+    # work phase ahead of it (a tensor-memory load, eight row-indexed
+    # packets of 8 fp32 columns), the rescale (``md_rs``, a tensor-memory
+    # store) behind the exchange, then the read's eight tf32 steps and the
+    # update's four bf16 steps; the second load is the ``o`` store's.
+    assert loop1.count(f"{P}.tcgen05_commit(md_cb") == 1
+    assert loop1.count(f"{P}.tcgen05_ld(") == 2
+    assert len(_EXCHANGE_STORE.findall(loop1)) == 8
+    assert loop1.count(f"{P}.Tcgen05MMAKind.TF32") == 8
+    assert loop1.count(f"{P}.Tcgen05MMAKind.F16") == 4
+    assert ("md_rs" in loop1) == (probe == "rescale")
+    if probe == "rescale":
+        _assert_in_order(
+            loop1,
+            [
+                f"{P}.tcgen05_ld(",
+                f"{RT}.sts_v4_f32(md_s0 + ",
+                "md_rs",
+                f"{P}.tcgen05_st(",
+                f"{P}.tcgen05_mma(",
+            ],
+        )
+
+    control = _REGION_BINDERS["probe_update_first"]()
+    program = _match(control)
+    update, read = [dot for dot in program.dots if dot.loop == 1]
+    slot = program.frag_slots[program.resolve(read.a.frag)]
+    assert update.slot == update.acc_slot == slot
+    assert regions.tmem_a_slot_rewriters(program, read, slot) == []
+    assert [
+        (dot, program.frag_slots[program.resolve(operand.frag)])
+        for dot, operand in regions.tmem_a_candidates(program)
+    ] == [(read, slot)]
+    blocks = regions.region_block_steps(program, program.loops[1].steps)
+    assert [dots for _work, dots in blocks][:2] == [[update], [read]]
+    facts = control.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.tmem_operands == 1
+    spec = control.config_spec
+    with control.env:
+        for mode in ("smem", "auto"):
+            config = spec.normalized_config(
+                _config(64, 64, warps=4, stages=2, cute_mma_dag_exchange=mode)
+            )
+            assert config.config["cute_mma_dag_exchange"] == mode
+    auto = _kernel_body(_source(control, _config(64, 64, warps=4, stages=2)))
+    smem = _kernel_body(
+        _source(
+            control, _config(64, 64, warps=4, stages=2, cute_mma_dag_exchange="smem")
+        )
+    )
+    assert len(_TMEM_A_READ.findall(auto)) == 8
+    assert not _TMEM_A_READ.search(smem)
+    loop1 = auto[auto.index("for md_i1 in") : auto.index(_after_loop(auto, "md_i1"))]
+    # Two batches a step (the update, then the read) and no exchange: the
+    # one tensor-memory load is the ``o`` store's.
+    assert loop1.count(f"{P}.tcgen05_commit(md_cb") == 2
+    assert loop1.count(f"{P}.tcgen05_ld(") == 1
+    assert not _EXCHANGE_STORE.search(loop1)
+    assert loop1.count(f"{P}.Tcgen05MMAKind.TF32") == 8
+
+
 # --------------------------------------------------------------------------
 # Region programs: the kda / anchored kernels
 # --------------------------------------------------------------------------
@@ -1964,6 +2205,23 @@ def _bind_fwd_o_anch(bhn: int = 16, d: int = 64, dv: int = 64) -> BoundKernel:
     )
 
 
+def _bind_wu_kda(bhn: int = 16, d: int = 64, dv: int = 64) -> BoundKernel:
+    c, f32 = 64, torch.float32
+    return _bind(
+        "chunk_bwd_wu_kda_helion",
+        (
+            _cpu(bhn, c, c, dtype=f32),
+            _cpu(bhn, c, d),
+            _cpu(bhn, c, dv),
+            _cpu(bhn, c),
+            _cpu(bhn, c, d, dtype=f32),
+            _cpu(bhn, c, c),
+            _cpu(bhn, c, d, dtype=f32),
+            _cpu(bhn, c, dv, dtype=f32),
+        ),
+    )
+
+
 _REGION_BINDERS: dict[str, Callable[[], BoundKernel]] = {
     "dk": _bind_dk,
     "dqkw": _bind_dqkw,
@@ -1988,6 +2246,9 @@ _REGION_BINDERS: dict[str, Callable[[], BoundKernel]] = {
     "probe_dotless_store": lambda: _bind_probe_dotless_store(),
     "probe_register_carry": lambda: _bind_probe_register_carry(),
     "probe_register_carry_budget": lambda: _bind_probe_register_carry_budget(),
+    "probe_batch_rewrite": lambda: _bind_probe_state_read(_probe_batch_rewrite),
+    "probe_batch_rescale": lambda: _bind_probe_state_read(_probe_batch_rescale),
+    "probe_update_first": lambda: _bind_probe_state_read(_probe_update_first),
 }
 
 
@@ -2002,7 +2263,12 @@ def _commits_while_one_is_outstanding(body: str) -> list[int]:
     """Abstract interpretation of the kernel body's commit / wait order
     (loops run 0..n times, branches are taken): the line numbers of
     ``tcgen05_commit(md_cb`` issued while a commit is still outstanding
-    -- the single barrier's parity tells one phase apart."""
+    -- the single barrier's parity tells one phase apart -- and of
+    ``mbar_wait(md_cb`` with more than one outstanding (the parity would
+    alias).  A streamed ring loop (its batches also commit to the slots'
+    ``md_empty`` barriers) commits freely: the slot barriers order its
+    passes and refills, and the ``md_empty`` wait at its exit drains every
+    batch before ``md_cb`` is waited again."""
     root: list[object] = []
     stack: list[tuple[int, list[object]]] = [(-1, root)]
     for number, line in enumerate(body.split("\n")):
@@ -2019,31 +2285,52 @@ def _commits_while_one_is_outstanding(body: str) -> list[int]:
             stack.append((indent, children))
         elif "tcgen05_commit(md_cb" in text:
             current.append(("commit", number))
+        elif "tcgen05_commit(md_empty" in text:
+            current.append(("ecommit", number))
         elif "mbar_wait(md_cb" in text:
             current.append(("wait", number))
+        elif "mbar_wait(md_empty" in text:
+            current.append(("ewait", number))
         elif text.startswith(("if ", "elif ", "else", "with ")) and text.endswith(":"):
             stack.append((indent, current))
     errors: set[int] = set()
 
-    def run(nodes: list[object], outstanding: int) -> int:
+    def streamed(nodes: list[object]) -> bool:
+        return any(
+            node[0] == "ecommit" or (node[0] == "loop" and streamed(node[2]))  # type: ignore[index]
+            for node in nodes
+        )
+
+    def run(nodes: list[object], outstanding: int, inside: bool) -> int:
+        drained = False
         for node in nodes:
             kind = node[0]  # type: ignore[index]
             if kind == "commit":
-                if outstanding:
+                if outstanding and not inside:
                     errors.add(node[1])  # type: ignore[index]
                 outstanding = min(outstanding + 1, 2)
             elif kind == "wait":
+                if outstanding >= 2:
+                    errors.add(node[1])  # type: ignore[index]
                 outstanding = 0
+            elif kind == "ewait":
+                # The exit wait of a streamed loop (after it, at its level).
+                if drained and not inside:
+                    outstanding = 0
+            elif kind == "ecommit":
+                continue
             else:
+                body_streamed = inside or streamed(node[2])  # type: ignore[index]
                 worst = state = outstanding
                 for _trip in range(4):
-                    state = run(node[2], state)  # type: ignore[index]
+                    state = run(node[2], state, body_streamed)  # type: ignore[index]
                     worst = max(worst, state)
                     state = max(state, outstanding)
                 outstanding = worst
+                drained = body_streamed
         return outstanding
 
-    run(root, 0)
+    run(root, 0, False)
     return sorted(errors)
 
 
@@ -2537,6 +2824,105 @@ def _probe_register_carry_budget(k: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 def _bind_probe_register_carry_budget(bhn: int = 4, d: int = 128) -> BoundKernel:
     return _bind_probe(_probe_register_carry_budget, ((bhn, 64, d), torch.bfloat16))
+
+
+def _probe_batch_rewrite(
+    q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, p: torch.Tensor, r: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A loop body reading the fp32 state ``s`` as an A operand and then
+    accumulating into it in place: the two dots are independent, so they
+    issue in one MMA batch (``region_block_steps``)."""
+    BHN = q.size(0)
+    C = hl.specialize(q.size(1))
+    D = q.size(2)
+    E = p.size(2)
+    out_o = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
+    out_s = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        s = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_e in hl.tile(E):
+            s = hl.dot(
+                p[tile_bhn, :, tile_e], r[tile_bhn, :, tile_e].transpose(-2, -1), acc=s
+            )
+        for tile_d in hl.tile(D):
+            o = hl.dot(s, w[tile_bhn, :, tile_d])
+            out_o[tile_bhn, :, tile_d] = o
+            s = hl.dot(
+                q[tile_bhn, :, tile_d], k[tile_bhn, :, tile_d].transpose(-2, -1), acc=s
+            )
+        out_s[tile_bhn, :, :] = s
+    return out_o, out_s
+
+
+def _probe_batch_rescale(
+    q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, p: torch.Tensor, r: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_probe_batch_rewrite`` with the state rescaled as it is
+    accumulated: the epilogue warps rewrite ``s`` ahead of the batch."""
+    BHN = q.size(0)
+    C = hl.specialize(q.size(1))
+    D = q.size(2)
+    E = p.size(2)
+    out_o = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
+    out_s = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        s = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_e in hl.tile(E):
+            s = hl.dot(
+                p[tile_bhn, :, tile_e], r[tile_bhn, :, tile_e].transpose(-2, -1), acc=s
+            )
+        for tile_d in hl.tile(D):
+            o = hl.dot(s, w[tile_bhn, :, tile_d])
+            out_o[tile_bhn, :, tile_d] = o
+            s = hl.dot(
+                q[tile_bhn, :, tile_d],
+                k[tile_bhn, :, tile_d].transpose(-2, -1),
+                acc=s * 0.5,
+            )
+        out_s[tile_bhn, :, :] = s
+    return out_o, out_s
+
+
+def _probe_update_first(
+    q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, p: torch.Tensor, r: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_probe_batch_rewrite`` with the state updated ahead of the read:
+    the reading dot depends on the update, so the two issue in separate
+    batches and the state may be read from tensor memory."""
+    BHN = q.size(0)
+    C = hl.specialize(q.size(1))
+    D = q.size(2)
+    E = p.size(2)
+    out_o = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
+    out_s = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        s = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_e in hl.tile(E):
+            s = hl.dot(
+                p[tile_bhn, :, tile_e], r[tile_bhn, :, tile_e].transpose(-2, -1), acc=s
+            )
+        for tile_d in hl.tile(D):
+            s = hl.dot(
+                q[tile_bhn, :, tile_d], k[tile_bhn, :, tile_d].transpose(-2, -1), acc=s
+            )
+            o = hl.dot(s, w[tile_bhn, :, tile_d])
+            out_o[tile_bhn, :, tile_d] = o
+        out_s[tile_bhn, :, :] = s
+    return out_o, out_s
+
+
+def _bind_probe_state_read(
+    fn: object, bhn: int = 4, d: int = 256, e: int = 128
+) -> BoundKernel:
+    bf16, f32, c = torch.bfloat16, torch.float32, 64
+    return _bind_probe(
+        fn,
+        ((bhn, c, d), bf16),
+        ((bhn, c, d), bf16),
+        ((bhn, c, d), f32),
+        ((bhn, c, e), bf16),
+        ((bhn, c, e), bf16),
+    )
 
 
 def _probe_kk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3473,13 +3859,18 @@ def _tmem_hazards(body: str, spans: dict[int, tuple[int, int]]) -> list[str]:
 
 
 def _slot_spans(
-    body: str, bound: BoundKernel, program: dag.MmaDagProgram, block_sizes: list[int]
+    body: str,
+    bound: BoundKernel,
+    program: dag.MmaDagProgram,
+    block_sizes: list[int],
+    split: bool = False,
 ) -> dict[int, tuple[int, int]]:
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None and facts.tcgen05 is not None
     resolved = _resolved_axes(program, bound, block_sizes)
-    # A register carry resident at this config holds no columns.
-    resident = tc.resident_slots(facts.tcgen05, resolved)
+    # A register carry resident at this config holds no columns (the split
+    # epilogue's budget admits more of them).
+    resident = tc.resident_slots(facts.tcgen05, resolved, split)
     return {
         slot: (
             column,
@@ -3491,12 +3882,16 @@ def _slot_spans(
 
 
 def _assert_tmem_hardware_order(
-    bound: BoundKernel, program: dag.MmaDagProgram, body: str, block_sizes: list[int]
+    bound: BoundKernel,
+    program: dag.MmaDagProgram,
+    body: str,
+    block_sizes: list[int],
+    split: bool = False,
 ) -> None:
     """``body`` (rendered under ``_instrumented_renderer``) has no
     tensor-memory hazard."""
     assert _TMEM_MARK in body, "render the body under _instrumented_renderer"
-    hazards = _tmem_hazards(body, _slot_spans(body, bound, program, block_sizes))
+    hazards = _tmem_hazards(body, _slot_spans(body, bound, program, block_sizes, split))
     assert not hazards, hazards
 
 
@@ -3608,6 +4003,91 @@ def test_region_programs_own_the_carry_slot_rule() -> None:
         program.frag_slots[program.resolve(carry.output)] != carry.slot
         for loop in program.loops
         for carry in loop.carries
+    )
+
+
+def test_a_root_converted_operand_read_by_loop_dots_rounds_once() -> None:
+    # wu_kda's ``Tinv[tile].transpose(-2, -1).to(bf16)`` is converted at the
+    # root and read by the dots of both loops through loop placeholders
+    # (``program.aliases``).  Its convert pass folds the cast into the pack
+    # like a loop-local operand's: ``fold_root`` keys the fold on the node
+    # the evaluator lowers (the alias resolved), so the fp32 tile's elements
+    # go to ``pack_bf16x2`` as they are -- one rounding -- instead of a
+    # scalar ``cutlass.BFloat16`` cast per element widened back and rounded
+    # again by the pack (the bits are the same; the XU-pipe conversions
+    # are not).
+    bound = _bind_wu_kda()
+    body = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=1)))
+    prologue = body.split("for md_i in cutlass.range(", 1)[0]
+    # The root group's convert pass: the fp32 Tinv tile read in 16-byte
+    # chunks, every element packed straight from its fp32 value.
+    assert f"{RT}.lds_v4_f32(" in prologue
+    assert "cutlass.BFloat16(md_f" not in body
+    assert re.search(
+        rf"{WARP_RT}\.pack_bf16x2\(cutlass\.Float32\(md_f(_\d+)?\), cutlass\.Float32\(md_f(_\d+)?\)\)",
+        prologue,
+    )
+    # The 16-bit leaves the chain re-types (the beta row, a scalar per
+    # row) keep their typed reads; nothing else casts to bf16 in the pass.
+    pass_text = prologue[prologue.index(f"{RT}.lds_v4_f32(") :]
+    pass_text = pass_text[: pass_text.index(f"{WARP_RT}.sts_v2_b32(")]
+    assert "cutlass.BFloat16(" not in pass_text
+
+
+def test_a_tile_whose_ring_fits_no_seed_depth_seeds_one_stage() -> None:
+    # state_du_kda at (4, 16, 2048, 128, 128): a slot stages k, w, the fp32
+    # gc tile and the fp32 dv_new / dh tiles -- two stages of the [32] tile
+    # need 235 KB -- so no seed depth (8, 4, 2) fits the [64] / [32] tiles
+    # and the ladder seeded only the two-stage [16] tile (218 us) beside the
+    # tensor-memory seeds.  Such a tile seeds at one stage, the depth that
+    # fits (150 / 127 us at [64] / [32]), with the default warps beside the
+    # budget warps where a one-stage ring overlaps nothing ([32] at four
+    # warps 127 us against 205 at eight).
+    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+
+    bound = _bind_state_du_kda(bh=64, n=32, d=128, dv=128)
+    with bound.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds is not None
+    warp = [
+        (
+            s.config["block_sizes"],
+            s.config["cute_mma_dag_warps"],
+            s.config["cute_mma_dag_stages"],
+        )
+        for s in seeds
+        if s.config["cute_mma_dag"] == "warp"
+    ]
+    # The seeded two-stage [16] tile keeps the lead (the promoted default and
+    # its route twins are unchanged); the one-stage [64] / [32] tiles join
+    # behind every seed of a ladder depth, [32] at eight and four warps.
+    assert warp[0] == ([16], 8, 2)
+    assert warp[-3:] == [([64], 8, 1), ([32], 8, 1), ([32], 4, 1)]
+    assert all(stages == 2 for sizes, _w, stages in warp[:-3])
+    # Every warp seed is a legal config (the fallback asks the admission):
+    # the one-stage seeds keep their tile, warps and depth through strict
+    # normalization.
+    with bound.env:
+        for seed in seeds:
+            if seed.config["cute_mma_dag"] != "warp":
+                continue
+            launch = bound.config_spec.normalized_config(seed).config
+            for key in ("block_sizes", "cute_mma_dag_warps", "cute_mma_dag_stages"):
+                assert launch[key] == seed.config[key], (key, seed.config)
+    # Where a seed depth fits, nothing changes: the s3 shape keeps its
+    # multi-stage warp seeds and gains no one-stage seed.
+    small = _bind_state_du_kda(bh=64, n=16, d=64, dv=64)
+    with small.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            small.env, small.host_function.device_ir
+        )
+    assert seeds is not None
+    assert all(
+        s.config["cute_mma_dag_stages"] > 1
+        for s in seeds
+        if s.config["cute_mma_dag"] == "warp"
     )
 
 
@@ -4184,8 +4664,14 @@ def test_atom_32b_exchange_writes_rotate_the_packet_order() -> None:
     # (adjacent packets differ in parity, hence in bank-group half), chosen
     # by selects over the row's values -- same bytes at the same addresses,
     # every store instruction over all eight groups.  The SW128 A tiles are
-    # conflict-free as they are and keep the plain order.
-    body = _kernel_body(_source(_bind_wy(), _config(64, 64, 64, warps=4, stages=2)))
+    # conflict-free as they are and keep the plain order.  (The exchange
+    # schedule: under ``auto`` the A tiles are not written.)
+    body = _kernel_body(
+        _source(
+            _bind_wy(),
+            _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_exchange="smem"),
+        )
+    )
     first, rest = _split_loop(body, "md_i")
     kk_loop, rest = _split_loop(rest, "md_i1")
     chain, rest = _split_loop(rest, "md_i2")
@@ -4265,16 +4751,18 @@ def test_mn_major_tf32_tiles_need_32_columns_at_config_time() -> None:
         spec.normalize(_config(1, 16, 16, warps=4, stages=2).config)
     with bound.env:
         spec.normalize(_config(1, 32, 32, warps=4, stages=2).config)
-    # block_sizes = [bhn, dv (the B tile's N), d (the K loop tile)].
+    # block_sizes = [bhn, dv (the B tile's N), d (the K loop tile)].  (At
+    # sixteen heads the grid is below 128 CTAs, so the default is the warp
+    # mode's; the first tensor-memory seed is the rule's subject.)
     default = spec.default_config().config
-    assert default["cute_mma_dag"] == "tcgen05" and default["block_sizes"][1] >= 32
-    assert "tcgen05_mma(" in _source(bound, helion.Config(**default))
+    assert default["cute_mma_dag"] != "tcgen05" or default["block_sizes"][1] >= 32
     seeds = [
         c.config
         for c in spec.compiler_seed_configs
         if c.config["cute_mma_dag"] == "tcgen05"
     ]
     assert seeds and all(c["block_sizes"][1] >= 32 for c in seeds)
+    assert "tcgen05_mma(" in _source(bound, helion.Config(**seeds[0]))
     config = _config(1, 16, 16, warps=4, stages=2).config
     with bound.env:
         spec.normalize(config, _fix_invalid=True)
@@ -4970,10 +5458,12 @@ def test_the_hardware_order_checker_catches_shared_columns() -> None:
         def collapsed(
             facts: dag.CuteMmaDagFacts,
             resolved: Sequence[int],
+            *,
             moved: int = moved,
             onto: int = onto,
+            **layout: bool,
         ) -> tuple[dict[int, int], int]:
-            columns, total = original_layout(facts, resolved)
+            columns, total = original_layout(facts, resolved, **layout)
             columns = dict(columns)
             columns[moved] = columns[onto]
             return columns, total
@@ -5319,7 +5809,13 @@ def test_root_fragment_exchanges_are_hoisted_ahead_of_the_loop() -> None:
         if operand.frag is not None
         and regions.hoisted_exchange_loop(program, dot, operand) is not None
     }
-    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    # (The exchange schedule; under ``auto`` the w / u dots read T from
+    # tensor memory inside their loops and nothing is hoisted.)
+    body = _kernel_body(
+        _source(
+            bound, _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_exchange="smem")
+        )
+    )
     columns = _tmem_columns(body)
     before, rest = _split_loop(body, "md_i2")
     read = f"md_tmem + {columns[t_slot]},"
@@ -5328,6 +5824,13 @@ def test_root_fragment_exchanges_are_hoisted_ahead_of_the_loop() -> None:
     # stores are the widen pass's (pass-indexed) alone.
     assert not re.search(rf"{RT}\.sts_v4_f32\([^\n]*md_row64", rest)
     assert f"{P}.tcgen05_alloc(md_tslot, 128," in body and max(columns.values()) == 64
+    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=2)))
+    before, rest = _split_loop(body, "md_i2")
+    between = before[before.rindex("md_cn = md_cn + 1") :]
+    # The root segment behind the chain stages A_inv (eight row-indexed
+    # packets) and writes no T tile; loops 2 / 3 read T's columns in place.
+    assert len(re.findall(rf"{RT}\.sts_v4_f32\([^\n]*md_row64", between)) == 8
+    assert rest.count(f"cutlass.inttoptr({read} {RT}.TMEM_SPACE") == 2
 
 
 def _tmem_ptr(column: int) -> str:
@@ -5543,7 +6046,13 @@ def test_exchange_tiles_of_dependent_batches_share_their_bytes() -> None:
     assert layout.offsets[1:5] == (0, 16384, 0, 16384)
     assert layout.total == 65536
     assert regions.region_layout(items, facts.loops, resolved, 1).total == 49152
-    body = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=1)))
+    # (The exchange schedule; ``auto`` leaves the A tiles out of the layout:
+    # ``test_wy_reads_fp32_a_operands_from_tensor_memory``.)
+    body = _kernel_body(
+        _source(
+            bound, _config(64, 64, 64, warps=4, stages=1, cute_mma_dag_exchange="smem")
+        )
+    )
     assert "alloc_smem(cutlass.Uint8, 49152, alignment=1024)" in body
     assert f"{P}.tcgen05_alloc(md_tslot, 128," in body
     # Both phases' straight tiles are written at offset 0 in one iteration
@@ -6050,21 +6559,20 @@ def test_full_slice_gemm_row_epilogue_is_matched() -> None:
     assert [r.orient for r in program.reduces] == ["rows", "rows"]
     assert len(program.vec_ops) == 4 and len(program.stores) == 1
     (store,) = program.stores
-    # The variance's value and the store's value read the row vectors.
-    chains = {
-        node.name: tuple(v.name for v in vecs)
-        for node, vecs in program.chain_vecs.items()
-    }
-    assert set(chains) == {program.reduces[1].value.name, store.value.name}
-    assert chains[store.value.name] == ("rsqrt", "mean")
+    # The variance's value and the store's value read the row vectors
+    # (``check_vecs``: a vector of the program beside a fragment value, read
+    # at the element's row by either emitter).
+    mean, rsqrt = program.reduces[0].node, program.vec_ops[-1].node
+    assert {mean, rsqrt} <= set(program.vec_leaves)
     facts = bound.config_spec.cute_mma_dag_facts
-    assert facts is not None and facts.chain_vecs
+    assert facts is not None
     assert facts.tcgen05 is not None and facts.tcgen05.regions
     assert facts.axes[facts.split_axis].kind == dag.AXIS_RDIM
     assert facts.axes[facts.split_axis].extent == 2048
-    # The warp mode has no lane map for a row vector read by a fragment chain.
+    # The warp mode reads the row vectors at the fragment's rows, but the
+    # 2048-column fragment exceeds its register budget.
     reason = dag.mma_dag_config_reason(facts, {0: 64, 1: 64}, 4, 4, dag.MMA_DAG_WARP)
-    assert reason is not None and "row vector" in reason
+    assert reason is not None and "registers per thread" in reason
 
 
 def test_cluster_split_knob_seeds_and_normalization() -> None:
@@ -6074,12 +6582,14 @@ def test_cluster_split_knob_seeds_and_normalization() -> None:
     assert spec.cute_mma_dag_cluster.choices == (1, 2, 4, 8, 16)
     assert spec.cute_mma_dag_split is not None
     assert spec.cute_mma_dag_split.choices == ("cluster", "fixup")
-    # The warp mode cannot run a fragment chain over a row vector: it is not
-    # a choice (a random config would only be repaired to ``off``).
+    # The warp mode is a choice (a fragment chain may read a row vector on
+    # either emitter) but no sample: the 2048-column fragment exceeds its
+    # register budget at every tiling.
     assert spec.cute_mma_dag is not None
-    assert spec.cute_mma_dag.choices == ("off", "tcgen05")
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
     # The search samples the tensor-memory mode alone: the SIMT fallback's
-    # lane-restore pass declines most tilings of the full-row epilogue.
+    # lane-restore pass declines most tilings of the full-row epilogue, and
+    # no warp tile of the seed ladder holds the 2048-column fragment.
     assert spec.cute_mma_dag.search_choices == ("tcgen05",)
     assert spec.cute_mma_dag.random() == "tcgen05"
     facts = spec.cute_mma_dag_facts
@@ -6136,8 +6646,8 @@ def test_cluster_split_knob_seeds_and_normalization() -> None:
         assert repaired["cute_mma_dag_cluster"] == 8
         with pytest.raises(InvalidConfig, match="up to 256"):
             spec.normalize(dict(_mln_config(64, 64, 2, 2).config))
-        with pytest.raises(InvalidConfig, match="must be one of"):
-            # The warp mode is no choice here (a chain reads a row vector).
+        with pytest.raises(InvalidConfig, match="needs the tcgen05 mode"):
+            # The warp mode runs one CTA per root tile: no split of the axis.
             spec.normalize({**_mln_config(64, 64, 2, 8).config, "cute_mma_dag": "warp"})
         with pytest.raises(InvalidConfig, match="portable cluster"):
             spec.normalize(dict(_mln_config(64, 64, 2, 16).config))
@@ -6182,11 +6692,18 @@ def test_cluster_split_codegen() -> None:
             "cute.arch.cluster_arrive_relaxed()",
             "cute.arch.cluster_wait()",
             "for md_i in cutlass.range(0, 32):",
-            f"{P}.tcgen05_commit(md_empty0 + md_st0,",
-            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 1) % 2, (md_rk0 + 1) // 2 + 1 & 1)",
-            "md_tma1.get_ptr(), [cutlass.Int32(md_a2), cutlass.Int32((md_i + 1) * 64)]",
+            # The streamed K loop: warp 0 alone waits for the slot's tile,
+            # issues the batch and commits it to ``md_cb`` and the slot's
+            # ``md_empty``; the refill waits for the slot's previous reader
+            # alone; the loop exit waits for the last slot, then ``md_cb``.
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
             f"{P}.tcgen05_commit(md_cb,",
+            f"{P}.tcgen05_commit(md_empty0 + md_st0,",
             "md_cn = md_cn + 1",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 1) % 2, (md_rk0 + 1) // 2 & 1)",
+            "md_tma1.get_ptr(), [cutlass.Int32(md_a2), cutlass.Int32((md_i + 1) * 64)]",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 - 1) % 2, (md_rk0 - 1) // 2 + 1 & 1)",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
             # The mean and the centered variance share one round: this
             # CTA's row sum and its second moment about its own mean (the
             # slice of 256 columns) pushed into every peer's two exchange
@@ -6216,12 +6733,17 @@ def test_cluster_split_codegen() -> None:
     assert "md_cx_1 = md_s0 + 81920 + 2048 + 2048" in body
     assert "md_clc" not in body
     assert f"{P}.mbarrier_init(md_clb + 1, 1)" in body
-    # The streaming K loop: warp 0 alone, no barrier or commit wait inside.
-    loop = body[
-        body.index("for md_i in cutlass.range(0, 32):") : body.index(
-            f"{P}.tcgen05_commit(md_cb,"
-        )
-    ]
+    # The streamed K loop (no pass, no aux tile): warp 0 alone, no CTA
+    # barrier or commit wait inside the loop body.
+    start = body.index("for md_i in cutlass.range(0, 32):")
+    indent = start - (body.rfind("\n", 0, start) + 1)
+    lines = body[start:].split("\n")
+    end = next(
+        i
+        for i, line in enumerate(lines[1:], 1)
+        if line.strip() and len(line) - len(line.lstrip()) <= indent
+    )
+    loop = "\n".join(lines[:end])
     assert "cute.arch.barrier()" not in loop and f"{RT}.mbar_wait(md_cb" not in loop
     assert loop.count(f"{P}.tcgen05_mma(") == 4
     # The launch: one cluster of eight CTAs per root tile.
@@ -6527,7 +7049,6 @@ def test_a_wide_full_slice_gemm_takes_the_cluster_split_without_reductions() -> 
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
     assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
-    assert not facts.chain_vecs
     assert spec.cute_mma_dag is not None
     assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
     assert spec.cute_mma_dag_cluster is not None
@@ -6585,3 +7106,1453 @@ def test_cute_pdl_waits_after_the_prologue_and_releases_after_the_loop() -> None
     # Without the knob: no griddepcontrol calls, no use_pdl.
     source = _source(bound, _mln_config(64, 32, 4, 8))
     assert "griddepcontrol" not in source and "use_pdl" not in source
+
+
+def test_dwk_relays_the_column_sum_into_the_fragment_rows() -> None:
+    # Tensor-memory rows are threads: ``dgc_last`` (a vector along the
+    # ``[C, bk]`` fragment's columns) is held one element per thread-row of
+    # its family, so the masked store reads it through the scratch at the
+    # register's column (``md_fv_{c}``), behind the epilogue barrier.
+    bound = _bind_dwk()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    body = _kernel_body(_source(bound, _config(1, 64, 64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    relaid = re.findall(r"(md_fv_\d+) = _helion_mma_dag\.lds_f32\(", body)
+    assert relaid and len(relaid) == len(set(relaid))
+    first = body.index("md_fv_0 = ")
+    # The owning thread-rows write their element (guarded by the vector's
+    # extent), the epilogue barrier, the reads at the columns, a barrier.
+    writes = body.rindex(f"{WARP_RT}.sts_f32(", 0, first)
+    assert writes < first
+    assert re.search(r"if .*md_row\d+ < \d+:", body[writes - 200 : writes])
+    assert re.search(r"= md_vv\d+ \* md_v_\d+|= md_v_\d+ \* md_fv_0\b", body[first:])
+
+
+def test_anchored_wy_seeds_the_tmem_carries_from_the_loaded_gram() -> None:
+    # Both Neumann carries are seeded per element of the thread's row: the
+    # gram's bf16 pairs unpacked, the chain evaluated, the row stored to
+    # tensor memory (``md_seed``) -- before any accumulator is read (the
+    # first ``tcgen05_ld`` is the Apow operand's exchange).
+    bound = _bind_wy_anchored()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    program = _match(bound)
+    assert not program.simple
+    body = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=1)))
+    assert f"{P}.tcgen05_mma(" in body
+    seed = body[: body.index(f"{P}.tcgen05_ld(")]
+    assert f"{WARP_RT}.unpack_bf16x2({WARP_RT}.ldg_b32(" in seed
+    assert re.search(r"md_seed\[\d+\] = cutlass\.Float32\(md_v_\d+\)", seed)
+    assert f"{P}.tcgen05_mma(" not in seed
+
+
+def test_a_seed_derived_at_the_root_takes_a_tmem_slot() -> None:
+    # se_block dx's ``acc += 2.0 * grad_out * s`` before the K loop: the
+    # half-typed derived value computed at the root seeds the loop's carry,
+    # so it crosses into tensor memory (a reader the block renderer must not
+    # keep in registers).
+    from test.test_cute_mma_dag import _bind_se_block
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    program = _match(bound)
+    (loop,) = program.loops
+    (carry,) = loop.carries
+    (seed,) = [d for d in program.derived if d.node is carry.init_frag]
+    assert regions.derived_crosses(program, seed)
+    assert seed.slot in regions.tmem_slots(program)
+    body = _kernel_body(_source(bound, _config(128, 64, 64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    assert "tf32" in body.lower()
+
+
+def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:
+    # The region renderer evaluates the ``where(mask, acc, -inf)`` store per
+    # element of the thread's row through the same evaluator: the ``hl.full``
+    # fill is spelled ``float('-inf')``, never the bare name.
+    from test.test_cute_mma_dag import _masked_neg_inf_inputs
+    from test.test_cute_mma_dag import _masked_neg_inf_stored
+
+    bound = _bind_fn(_masked_neg_inf_stored, _masked_neg_inf_inputs())
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    body = _kernel_body(_source(bound, _config(64, warps=4, stages=2)))
+    assert f"{P}.tcgen05_mma(" in body
+    assert "cutlass.Float32(float('-inf'))" in body
+    assert "Float32(-inf)" not in body
+    assert "Float32(inf)" not in body
+
+
+def test_a_pass_chain_operand_is_a_ring_tile_written_by_the_derived_pass() -> None:
+    # se_block dx under ``cute_mma_dag_derived='pass'`` on the region
+    # renderer: the chain's exchange item becomes a ring tile of the loop
+    # (``derived_items``), its three source tiles are aux items the layout
+    # never drops, and the render has no tensor-memory round trip of the
+    # chain (``tcgen05_st`` / ``md_dr`` arrays): the pass loads the aux
+    # chunks, writes two fp32 packets per group into the ring slot and the
+    # A descriptor reads that slot.  The exchange route is unchanged.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    from helion._compiler.cute.cute_mma_dag_tcgen05 import derived_items
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    tc = facts.tcgen05
+    (item,) = [item for item in tc.items if item.pass_ring]
+    assert item.kind == "exchange" and item.copies == 1
+    assert sum(1 for item in tc.items if item.pass_source) == 3
+    passed = derived_items(tc.items, "pass")
+    assert derived_items(tc.items, "exchange") == tc.items
+    (ring_item,) = [item for item in passed if item.pass_ring]
+    assert (ring_item.kind, ring_item.copies, ring_item.segment) == ("tile", 0, -1)
+    sizes = {0: 128, 1: 64, 2: 64}
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert all(isinstance(size, int) for size in resolved)
+    exchange_bytes = regions.region_smem_bytes(facts, resolved, 2)  # type: ignore[arg-type]
+    pass_bytes = regions.region_smem_bytes(facts, resolved, 2, derived="pass")  # type: ignore[arg-type]
+    # One more ring slot of the 128x64 fp32 A tile against the one exchange copy.
+    assert pass_bytes - exchange_bytes == 128 * 64 * 4
+    assert dag.mma_dag_config_reason(facts, sizes, 4, 2, "tcgen05", "pass") is None
+    # The loads route ``lane`` leaves the aux tiles to the lanes: the pass
+    # has no sources there, so the knob is pinned to the exchange route.
+    with bound.env:
+        lane = bound.config_spec.normalized_config(
+            _config(
+                128,
+                64,
+                64,
+                warps=4,
+                stages=2,
+                cute_mma_dag_loads="lane",
+                cute_mma_dag_derived="pass",
+            )
+        )
+        # Three stages of ring tiles overflow the shared memory under
+        # ``pass`` alone (the exchange route fits): an explicit pin is
+        # invalid, the autotuner's repair yields the route and keeps the
+        # tile.
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_derived='pass'"):
+            bound.config_spec.normalized_config(
+                _config(128, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass")
+            )
+        over = dict(
+            _config(128, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass").config
+        )
+        bound.config_spec.normalize(over, _fix_invalid=True)
+    assert lane.config["cute_mma_dag_derived"] == "exchange"
+    assert over["cute_mma_dag_derived"] == "exchange"
+    assert over["block_sizes"] == [128, 64, 64]
+    assert over["cute_mma_dag_stages"] == 3
+    exchange = _loop(
+        _kernel_body(_source(bound, _config(128, 64, 64, warps=4, stages=2)))
+    )
+    passed_body = _kernel_body(
+        _source(
+            bound,
+            _config(128, 64, 64, warps=4, stages=2, cute_mma_dag_derived="pass"),
+        )
+    )
+    loop = _loop(passed_body)
+    assert f"{P}.tcgen05_st(" in exchange and "md_dr_" in exchange
+    assert f"{P}.tcgen05_st(" not in loop and "md_dr_" not in loop
+    assert f"{P}.tcgen05_mma({P}.Tcgen05MMAKind.TF32" in loop
+    # The pass: 128x64 / 8 = 1024 groups over 128 threads, eight per thread,
+    # three source chunks each, two fp32 packets out.
+    assert (
+        loop.count(f"{WARP_RT}.lds_v4_b32(")
+        == 8 * 3 + exchange.count(f"{WARP_RT}.lds_v4_b32(") - 4 * 8
+    )
+    assert loop.count(f"{RT}.sts_v4_f32(md_s0 + 0 + md_st0 * ") >= 16
+    # A reads its ring slot; in the exchange render A was the fixed tile.
+    assert re.search(
+        r"md_da0 = .*Tcgen05SmemDesc\.build\(md_s0 \+ 0 \+ md_st0 \* ", loop
+    )
+    assert re.search(r"md_da0 = .*Tcgen05SmemDesc\.build\(md_s0 \+ \d+,", exchange)
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{RT}.sts_v4_f32(md_s0 + 0 + md_st0 * ",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+        ],
+    )
+
+
+# --------------------------------------------------------------------------
+# The split epilogue (``cute_mma_dag_epilogue='split'``)
+# --------------------------------------------------------------------------
+
+
+def _bind_head_sum(m: int = 512, h: int = 32, n: int = 4096) -> BoundKernel:
+    """The sparse-attention indexer's logits at the campaign's prefill shape
+    (M = 512, H = 32, N = 4096): a root-tile region program whose loop body
+    is one dot and a derived carry."""
+    return _bind_fn(_head_sum_logits, _head_sum_inputs(m=m, h=h, n=n))
+
+
+def _sizes_of(bound: BoundKernel, block_sizes: list[int]) -> dict[int, int]:
+    return {
+        spec.block_id: size
+        for spec, size in zip(bound.config_spec.block_sizes, block_sizes, strict=True)
+    }
+
+
+def test_the_split_epilogue_counts_the_threads_half_rows() -> None:
+    # One epilogue thread's fp32 columns of a fragment: the row (128-row
+    # tiles), half of it where the 64-row tile's lane halves split it, and
+    # half again under the split epilogue (the warp pair shares the row).
+    assert tc.tcgen05_thread_cols(128, 128) == 128
+    assert tc.tcgen05_thread_cols(64, 128) == 64
+    assert tc.tcgen05_thread_cols(64, 8) == 8
+    assert tc.tcgen05_thread_cols(128, 128, split=True) == 64
+    assert tc.tcgen05_thread_cols(64, 128, split=True) == 32
+    assert tc.tcgen05_thread_cols(64, 64, split=True) == 16
+    assert tc.tcgen05_thread_cols(64, 32, split=True) == 8
+    # (A 64 x 16 tile's warp half of eight columns stays with lanes 0-15:
+    # no lane split below one packet per lane.)
+    assert tc.tcgen05_thread_cols(64, 16, split=True) == 8
+    assert tc.tcgen05_thread_cols(128, 8, split=True) == 4
+
+
+def test_the_split_epilogue_lifts_the_row_layouts_budget() -> None:
+    # The indexer's logits: the derived carry ``acc + relu(score) * w`` holds
+    # the score's row, the carry's and its own -- three 128-column rows at
+    # 128 x 128 under the row layout (384 > 192), three half rows under the
+    # split (192).  The split has a subject at eight warps of the tcgen05
+    # mode only, and the layout's 16-byte packets need eight columns per
+    # thread.
+    bound = _bind_head_sum()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    tcf = facts.tcgen05
+    assert tcf.regions and tcf.split_epilogue
+    assert len(tcf.derived_cols) == 1 and len(tcf.derived_cols[0]) == 3
+    assert len(tcf.derived_frags) == 1 and len(tcf.derived_frags[0]) == 3
+    big = _sizes_of(bound, [128, 128])
+    reason = dag.mma_dag_config_reason(facts, big, 8, 2, "tcgen05")
+    assert reason is not None and "derived value holds 384" in reason
+    assert (
+        dag.mma_dag_config_reason(facts, big, 8, 2, "tcgen05", epilogue="split") is None
+    )
+    reason = dag.mma_dag_config_reason(facts, big, 4, 2, "tcgen05", epilogue="split")
+    assert reason is not None and "pairs warps 4-7" in reason
+    reason = dag.mma_dag_config_reason(facts, big, 8, 2, "warp", epilogue="split")
+    assert reason is not None and "needs the tcgen05 mode" in reason
+    wide = _sizes_of(bound, [64, 128])
+    reason = dag.mma_dag_config_reason(facts, wide, 4, 2, "tcgen05")
+    assert reason is not None and "derived value holds 384" in reason
+    assert (
+        dag.mma_dag_config_reason(facts, wide, 8, 2, "tcgen05", epilogue="split")
+        is None
+    )
+    assert (
+        dag.mma_dag_config_reason(facts, _sizes_of(bound, [128, 64]), 4, 2, "tcgen05")
+        is None
+    )
+    narrow = _sizes_of(bound, [128, 8])
+    assert dag.mma_dag_config_reason(facts, narrow, 8, 2, "tcgen05") is None
+    reason = dag.mma_dag_config_reason(facts, narrow, 8, 2, "tcgen05", epilogue="split")
+    assert reason is not None and "4 columns" in reason and "at least 8" in reason
+    assert dag.mma_dag_epilogue_reason(facts, 8, "tcgen05") is None
+    # A program whose reduction sums whole rows keeps the row layout.
+    facts = _bind_wy_dl().config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert not facts.tcgen05.split_epilogue
+    reason = dag.mma_dag_epilogue_reason(facts, 8, "tcgen05")
+    assert reason is not None and "whole rows" in reason
+    assert tc.tcgen05_split_seed(facts) is None
+
+
+def test_the_split_epilogue_renders_every_warp_over_half_a_row() -> None:
+    # 128 x 128 at eight warps: ``md_epi`` covers all warps, warp w + 4 reads
+    # its lanes 64 columns in (``md_cb0``), one 32x32b load of 64 columns per
+    # head, a register carry of 64 scalars, the staging tile's row written as
+    # 16 packets per thread; 128 CTAs of 256 threads.  At 64 x 128 the lane
+    # halves split the warp's 64 columns again (16x32bx2, offset 32).
+    bound = _bind_head_sum()
+    program = _match(bound)
+    config = _config(128, 128, warps=8, stages=2, cute_mma_dag_epilogue="split")
+    source = _source(bound, config)
+    body = _kernel_body(source)
+    assert "md_epi = md_warp < 8" in body
+    assert "md_cb0 = md_warp // 4 * 64" in body
+    assert f"{P}.tcgen05_alloc(md_tslot, 128," in body
+    assert (
+        f"{P}.tcgen05_ld('32x32b', cutlass.inttoptr(md_warp % 4 * 32 << 16 | "
+        "md_tmem + 0 + md_warp // 4 * 64, "
+    ) in body
+    assert "num=64)" in body
+    assert "md_rc0_0_63 = " in body and "md_rc0_0_64" not in body
+    assert "md_rc0_1_0" not in body
+    assert "(md_cb0 // 4 + 15)" in body and "(md_cb0 // 4 + 16)" not in body
+    assert "block=(256, 1, 1)" in source
+    assert re.search(r"_launcher\(_helion__head_sum_logits, \(128,\),", source)
+    assert _version_errors(bound, config) == []
+    instrumented = _instrumented_body(bound, config)
+    _assert_tmem_hardware_order(bound, program, instrumented, [128, 128], split=True)
+    config = _config(64, 128, warps=8, stages=2, cute_mma_dag_epilogue="split")
+    body = _kernel_body(_source(bound, config))
+    assert "md_cb0 = md_warp // 4 * 64 + md_lane // 16 * 32" in body
+    assert "md_rowok" not in body
+    assert (
+        f"{P}.tcgen05_ld('16x32bx2', cutlass.inttoptr(md_warp % 4 * 32 << 16 | "
+        "md_tmem + 0 + md_warp // 4 * 64, "
+    ) in body
+    assert "num=32, offset=32)" in body
+    assert "md_rc0_0_31 = " in body and "md_rc0_0_32" not in body
+    assert _version_errors(bound, config) == []
+    # The row layout is untouched: the knob spelled out renders the same
+    # bytes as left out.
+    plain = _source(bound, _config(64, 64, warps=4, stages=2))
+    assert plain == _source(
+        bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_epilogue="row")
+    )
+    assert "md_epi = md_warp < 4" in plain
+    assert "md_cb0 = md_lane // 16 * 32" in plain
+
+
+def test_the_split_epilogue_is_normalized_to_its_subject() -> None:
+    # The knob is inert (pinned to ``row``) in the warp mode and at four
+    # warps; a split config the row layout refuses keeps its tile; a tile
+    # only the row layout runs drops the split (an error unless the
+    # normalization may fix it); a tile neither layout runs is repaired
+    # under the row layout.
+    bound = _bind_head_sum()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_epilogue is not None
+    assert spec.cute_mma_dag_epilogue.choices == ("row", "split")
+
+    def normalized(config: helion.Config) -> dict[str, object]:
+        with bound.env:
+            return spec.normalized_config(config).config
+
+    def fixed(config: helion.Config) -> dict[str, object]:
+        values = dict(config.config)
+        with bound.env:
+            spec.normalize(values, _fix_invalid=True)
+        return values
+
+    split = normalized(
+        _config(128, 128, warps=8, stages=2, cute_mma_dag_epilogue="split")
+    )
+    assert split["cute_mma_dag_epilogue"] == "split"
+    assert split["block_sizes"] == [128, 128]
+    four = normalized(_config(64, 64, warps=4, stages=2, cute_mma_dag_epilogue="split"))
+    assert four["cute_mma_dag_epilogue"] == "row" and four["block_sizes"] == [64, 64]
+    warp = normalized(
+        helion.Config(
+            block_sizes=[128, 128],
+            cute_mma_dag="warp",
+            cute_mma_dag_warps=8,
+            cute_mma_dag_stages=2,
+            cute_mma_dag_epilogue="split",
+        )
+    )
+    assert warp["cute_mma_dag_epilogue"] == "row" and warp["cute_mma_dag"] == "warp"
+    narrow = _config(128, 8, warps=8, stages=2, cute_mma_dag_epilogue="split")
+    with pytest.raises(InvalidConfig, match="cute_mma_dag_epilogue='split'"):
+        normalized(narrow)
+    values = fixed(narrow)
+    assert values["cute_mma_dag_epilogue"] == "row"
+    assert values["block_sizes"] == [128, 8] and values["cute_mma_dag"] == "tcgen05"
+    values = fixed(_config(128, 128, warps=4, stages=2, cute_mma_dag_epilogue="split"))
+    assert values["cute_mma_dag_epilogue"] == "row"
+    assert values["cute_mma_dag"] == "tcgen05" and values["block_sizes"] == [128, 64]
+
+
+def test_the_split_epilogue_seeds_the_largest_root_tile() -> None:
+    # Right behind the first tensor-memory seed: the 128 x 128 tile at eight
+    # warps under the split (the one the row budget refuses), two stages (two
+    # CTAs per SM); the promoted default stays.  A program without a root
+    # tile (dk) admits the knob to the search but seeds nothing.
+    bound = _bind_head_sum()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    seed = tc.tcgen05_split_seed(facts)
+    assert seed is not None and seed[1:] == (8, 2)
+    big = _sizes_of(bound, [128, 128])
+    assert {block_id: seed[0][block_id] for block_id in big} == big
+    seeds = [c.config for c in spec.compiler_seed_configs]
+    split = [
+        c
+        for c in seeds
+        if c.get("cute_mma_dag_epilogue") == "split"
+        and c.get("cute_mma_dag_lookahead", "off") == "off"
+    ]
+    # The first tensor-memory seed's split twins (``tcgen05_split_twins``:
+    # its 64 x 64 tile with the rows doubled and with the columns doubled,
+    # at eight warps and its two stages) lead, the largest tile last.
+    assert [c["block_sizes"] for c in split] == [[128, 64], [64, 128], [128, 128]]
+    assert all(c["cute_mma_dag"] == "tcgen05" for c in split)
+    assert all(c["cute_mma_dag_warps"] == 8 for c in split)
+    assert all(c["cute_mma_dag_stages"] == 2 for c in split)
+    first = next(i for i, c in enumerate(seeds) if c["cute_mma_dag"] == "tcgen05")
+    # (Each seed's lookahead variant sits right behind it.)
+    assert seeds[first + 2] is split[0]
+    assert seeds[first + 4] is split[1]
+    assert seeds[first + 6] is split[2]
+    top = tc.tcgen05_seed_configs(facts)[0]
+    twins = tc.tcgen05_split_twins(facts, top)
+
+    def tunable(sizes: dict[int, int]) -> dict[int, int]:
+        return {block_id: sizes[block_id] for block_id in big}
+
+    assert [tunable(sizes) for sizes, _w, _s in twins] == [
+        _sizes_of(bound, [128, 64]),
+        _sizes_of(bound, [64, 128]),
+    ]
+    assert all(warps == 8 and stages == 2 for _sizes, warps, stages in twins)
+    # A 128-row tile has no row twin; an eight-warp seed none at all.
+    wide = {**top[0], **_sizes_of(bound, [128, 64])}
+    assert [
+        (tunable(sizes), warps, stages)
+        for sizes, warps, stages in tc.tcgen05_split_twins(facts, (wide, 4, 2))
+    ] == [(_sizes_of(bound, [128, 128]), 8, 2)]
+    assert tc.tcgen05_split_twins(facts, (top[0], 8, 2)) == []
+    # A program without a root tile (dk) has none.
+    dk_facts = _bind_dk().config_spec.cute_mma_dag_facts
+    assert dk_facts is not None
+    assert tc.tcgen05_split_twins(dk_facts, tc.tcgen05_seed_configs(dk_facts)[0]) == []
+    assert spec.default_config().config["cute_mma_dag_epilogue"] == "row"
+    assert spec.default_config().config["cute_mma_dag"] == "warp"
+    dk = _bind_dk().config_spec
+    facts = dk.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.split_epilogue
+    assert tc.tcgen05_split_seed(facts) is None
+    assert all(
+        c.config.get("cute_mma_dag_epilogue", "row") == "row"
+        for c in dk.compiler_seed_configs
+    )
+
+
+def test_the_streamed_split_seed_checks_the_pass_route_under_its_own_epilogue() -> None:
+    # The anchored output at the production shape (2048 chunks, D = DV = 128)
+    # is a streamed K-loop program with a pass chain (qg = q * exp2(gc)) whose
+    # 128-column epilogue value the row layout's register budget refuses at
+    # four warps (384 fp32 columns per thread) and the split epilogue admits
+    # at eight.  The streamed seed rank drops a tile whose pass route is not
+    # legal; that check used to run under the row epilogue whatever epilogue
+    # the seeds were for, so no split seed ever reached the 128-column tile
+    # and ``tcgen05_split_seed`` (the largest root tile the split admits)
+    # stopped at 64.
+    bound = _bind_fwd_o_anch(bhn=2048, d=128, dv=128)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.streamed_loops == 1 and facts.pass_chains
+    root = next(axis.block_id for axis in facts.axes if axis.kind == dag.AXIS_ROOT)
+    loop = next(axis.block_id for axis in facts.axes if axis.kind == dag.AXIS_LOOP)
+    wide = {0: 1, root: 128, loop: 128}
+    assert (
+        dag.mma_dag_config_reason(
+            facts, wide, 8, 1, "tcgen05", "pass", epilogue="split"
+        )
+        is None
+    )
+    reason = dag.mma_dag_config_reason(facts, wide, 4, 1, "tcgen05", "pass")
+    assert reason is not None and "384 fp32 columns" in reason
+    split_seeds = tc.tcgen05_seed_configs(facts, epilogue="split")
+    assert {sizes[root] for sizes, _w, _s in split_seeds} == {16, 32, 64, 128}
+    assert all(warps == 8 for _sizes, warps, _s in split_seeds)
+    seed = tc.tcgen05_split_seed(facts)
+    assert seed is not None and seed[0][root] == 128 and seed[1] == 8
+    # The row seeds keep the budget's verdict: no 128-column tile at four warps.
+    assert all(sizes[root] < 128 for sizes, _w, _s in tc.tcgen05_seed_configs(facts))
+    seeds = [c.config for c in bound.config_spec.compiler_seed_configs]
+    assert any(
+        c.get("cute_mma_dag_epilogue") == "split" and c["block_sizes"][root] == 128
+        for c in seeds
+    )
+
+
+@pytest.mark.parametrize("kernel", sorted(_REGION_BINDERS))
+def test_region_programs_render_the_split_epilogue_or_decline_it(kernel: str) -> None:
+    # Every region binder: the split either has no subject (reductions,
+    # vectors), refuses the tile (a thread below one packet), or renders the
+    # first tensor-memory seed's tile at eight warps with the hardware-order
+    # checker clean (the warp pair's halves share every slot's columns and
+    # tensor-memory round trips).
+    bound = _REGION_BINDERS[kernel]()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    first = next(
+        c.config
+        for c in spec.compiler_seed_configs
+        if c.config["cute_mma_dag"] == "tcgen05"
+    )
+    sizes = cast("list[int]", first["block_sizes"])
+    config = helion.Config(
+        **{**first, "cute_mma_dag_warps": 8, "cute_mma_dag_epilogue": "split"}
+    )
+    with bound.env:
+        values = dict(config.config)
+        spec.normalize(values, _fix_invalid=True)
+    stages = cast("int", first["cute_mma_dag_stages"])
+    reason = dag.mma_dag_config_reason(
+        facts, _sizes_of(bound, sizes), 8, stages, "tcgen05", epilogue="split"
+    )
+    if not facts.tcgen05.split_epilogue or reason is not None:
+        assert values["cute_mma_dag_epilogue"] == "row"
+        return
+    assert values["cute_mma_dag_epilogue"] == "split", values
+    assert values["block_sizes"] == sizes
+    config = helion.Config(**values)
+    body = _instrumented_body(bound, config)
+    assert "md_epi = md_warp < 8" in body
+    _assert_tmem_hardware_order(bound, _match(bound), body, sizes, split=True)
+    assert _version_errors(bound, config) == []
+
+
+# --------------------------------------------------------------------------
+# The lookahead schedule (``cute_mma_dag_lookahead='on'``)
+# --------------------------------------------------------------------------
+
+
+def test_the_lookahead_schedule_runs_the_dot_one_iteration_ahead() -> None:
+    # The indexer's loop -- one fresh dot per head, the derived carry over
+    # it -- admits the schedule: iteration i waits its own dot's commit on
+    # the barrier of its parity, refills the ring slot that dot read two
+    # tiles ahead, issues head i + 1's dot into the slot's other half behind
+    # the CTA barrier, and runs its epilogue over its half (``md_pt0``) while
+    # that dot and its commit are in flight; the first head's dot runs ahead
+    # of the loop with both ring slots filled.  The dot slot doubles in
+    # tensor memory; off renders the bytes it did.
+    bound = _bind_head_sum()
+    program = _match(bound)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    (dot,) = program.dots
+    assert regions.region_lookahead(program) == (0, dot.slot)
+    assert facts.tcgen05.lookahead_loop == 0
+    assert facts.tcgen05.lookahead_slot == dot.slot
+    sizes = _sizes_of(bound, [64, 64])
+    assert dag.mma_dag_lookahead_reason(facts, 2, "tcgen05") is None
+    reason = dag.mma_dag_lookahead_reason(facts, 1, "tcgen05")
+    assert reason is not None and "stages >= 2" in reason
+    reason = dag.mma_dag_config_reason(facts, sizes, 4, 1, "tcgen05", lookahead="on")
+    assert reason is not None and "stages >= 2" in reason
+    assert (
+        dag.mma_dag_config_reason(facts, sizes, 4, 2, "tcgen05", lookahead="on") is None
+    )
+    reason = dag.mma_dag_config_reason(facts, sizes, 8, 2, "warp", lookahead="on")
+    assert reason is not None and "needs the tcgen05 mode" in reason
+    resolved = _resolved_axes(program, bound, [64, 64])
+    assert regions.region_tmem_columns(facts, resolved) == 64
+    assert regions.region_tmem_columns(facts, resolved, lookahead=True) == 128
+    resolved = _resolved_axes(program, bound, [128, 128])
+    assert (
+        regions.region_tmem_columns(facts, resolved, split=True, lookahead=True) == 256
+    )
+    config = _config(64, 64, warps=4, stages=2, cute_mma_dag_lookahead="on")
+    body = _kernel_body(_source(bound, config))
+    assert "md_lkb = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in body
+    assert "md_lke = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)" in body
+    assert f"{P}.mbarrier_init(md_lkb + 0, 1)" in body
+    assert f"{P}.mbarrier_init(md_lkb + 1, 1)" in body
+    assert f"{P}.mbarrier_init(md_lke, 128)" in body
+    assert f"{P}.tcgen05_alloc(md_tslot, 128," in body
+    prologue, loop = body.split("for md_i in cutlass.range(0, 32):", 1)
+    assert prologue.count(f"{P}.mbarrier_arrive_expect_tx(md_full0 + ") == 2
+    assert f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 1) % 2, " in prologue
+    assert "md_lka = cutlass.inttoptr(md_tmem + 0 + md_rk0 % 2 * 64, " in prologue
+    assert f"{P}.tcgen05_commit(md_lkb + md_rk0 % 2, " in prologue
+    iteration = loop[: loop.index("md_rk0 = md_rk0 + 1")]
+    _assert_in_order(
+        iteration,
+        [
+            f"{RT}.mbar_wait(md_lkb + md_rk0 % 2, md_rk0 // 2 & 1)",
+            "if md_i + 2 < 32 - 0:",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 2) % 2, ",
+            f"{RT}.mbar_wait(md_lke, md_rk0 + 1 & 1)",
+            "if md_i + 1 < 32 - 0:",
+            f"{RT}.mbar_wait(md_full0 + (md_rk0 + 1) % 2, (md_rk0 + 1) // 2 & 1)",
+            "md_lka = cutlass.inttoptr(md_tmem + 0 + (md_rk0 + 1) % 2 * 64, ",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_lkb + (md_rk0 + 1) % 2, ",
+            (
+                f"{P}.tcgen05_ld('16x32bx2', cutlass.inttoptr(md_warp % 4 * 32 << 16 | "
+                "md_tmem + 0 + md_pt0 * 64, "
+            ),
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.BEFORE_THREAD_SYNC)",
+            f"{P}.mbarrier_arrive(md_lke)",
+        ],
+    )
+    # No CTA barrier and no commit on the batch barrier inside the loop.
+    assert "cute.arch.barrier()" not in iteration
+    assert f"{P}.tcgen05_commit(md_cb" not in iteration
+    assert iteration.count(f"{P}.tcgen05_mma(") == 8
+    plain = _source(bound, _config(64, 64, warps=4, stages=2))
+    assert plain == _source(
+        bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_lookahead="off")
+    )
+    assert "md_lkb" not in plain
+
+
+def test_the_lookahead_schedule_is_normalized_to_its_subject() -> None:
+    # No subject: one ring slot, the warp mode, a program whose loop holds
+    # more than the one dot and its derived values (wy_dL's reductions,
+    # probe_register_carry's two loops); the knob stays with the split.
+    bound = _bind_head_sum()
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_lookahead is not None
+    assert spec.cute_mma_dag_lookahead.choices == ("off", "on")
+
+    def normalized(config: helion.Config) -> dict[str, object]:
+        with bound.env:
+            return spec.normalized_config(config).config
+
+    on = normalized(_config(64, 64, warps=4, stages=2, cute_mma_dag_lookahead="on"))
+    assert on["cute_mma_dag_lookahead"] == "on"
+    one = normalized(_config(64, 64, warps=4, stages=1, cute_mma_dag_lookahead="on"))
+    assert one["cute_mma_dag_lookahead"] == "off" and one["cute_mma_dag_stages"] == 1
+    both = normalized(
+        _config(
+            128,
+            128,
+            warps=8,
+            stages=2,
+            cute_mma_dag_epilogue="split",
+            cute_mma_dag_lookahead="on",
+        )
+    )
+    assert both["cute_mma_dag_lookahead"] == "on"
+    assert both["cute_mma_dag_epilogue"] == "split"
+    assert both["block_sizes"] == [128, 128]
+    warp = normalized(
+        helion.Config(
+            block_sizes=[64, 64],
+            cute_mma_dag="warp",
+            cute_mma_dag_warps=8,
+            cute_mma_dag_stages=2,
+            cute_mma_dag_lookahead="on",
+        )
+    )
+    assert warp["cute_mma_dag_lookahead"] == "off"
+    for binder in (_bind_wy_dl, _bind_probe_register_carry):
+        other = binder()
+        facts = other.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.tcgen05 is not None
+        assert facts.tcgen05.lookahead_loop < 0
+        assert regions.region_lookahead(_match(other)) is None
+        first = next(
+            c.config
+            for c in other.config_spec.compiler_seed_configs
+            if c.config["cute_mma_dag"] == "tcgen05"
+        )
+        values = {**first, "cute_mma_dag_lookahead": "on"}
+        with other.env:
+            other.config_spec.normalize(values, _fix_invalid=True)
+        assert values["cute_mma_dag_lookahead"] == "off"
+        assert all(
+            c.config.get("cute_mma_dag_lookahead", "off") == "off"
+            for c in other.config_spec.compiler_seed_configs
+        )
+
+
+def test_the_autotune_viability_screen_sees_the_configs_own_layout() -> None:
+    # The backend's pre-screen (``autotune_config_is_viable``: the budget
+    # check ``normalize`` would repair or refuse) judges a config under its
+    # own epilogue layout, schedule and derived route: the split's
+    # 128-column tiles, which the row layout's budget refuses, are viable
+    # under the split -- every compiler seed passes -- while the row layout
+    # at 128 x 128 does not (screened under the row layout, the split seeds
+    # never reached a benchmark).
+    bound = _bind_head_sum()
+    spec = bound.config_spec
+    backend = spec.backend
+    with bound.env:
+        for seed in spec.compiler_seed_configs:
+            normalized = spec.normalized_config(seed)
+            assert backend.autotune_config_is_viable(spec, normalized), seed
+        wide = [
+            c
+            for c in spec.compiler_seed_configs
+            if c.config["block_sizes"] in ([64, 128], [128, 128])
+            and c.config["cute_mma_dag"] == "tcgen05"
+        ]
+        assert len(wide) == 4
+        assert all(c.config["cute_mma_dag_epilogue"] == "split" for c in wide)
+        row = helion.Config(
+            **{
+                **wide[-1].config,
+                "cute_mma_dag_epilogue": "row",
+                "cute_mma_dag_lookahead": "off",
+            }
+        )
+        assert not backend.autotune_config_is_viable(spec, row)
+        reason = dag.mma_dag_config_reason(
+            spec.cute_mma_dag_facts,
+            _sizes_of(bound, [128, 128]),
+            8,
+            2,
+            "tcgen05",
+        )
+        assert reason is not None
+
+
+def test_a_bf16_rounded_dot_read_widens_in_one_fma_pipe_conversion() -> None:
+    # ``.to(float32)`` of a bf16 ``torch.matmul`` result (the fp32 product
+    # read rounded) renders as ``round_bf16_f32`` -- ``cvt.rn.bf16x2.f32``
+    # of the register with itself and a mask, the same bits as the DSL's
+    # ``Float32(BFloat16(x))`` casts, off the conversion unit -- on both
+    # tensor-memory layouts and the warp mode.
+    bound = _bind_head_sum()
+    for config in (
+        _config(64, 64, warps=4, stages=2),
+        _config(128, 64, warps=8, stages=3, cute_mma_dag_epilogue="split"),
+        helion.Config(
+            block_sizes=[64, 64],
+            cute_mma_dag="warp",
+            cute_mma_dag_warps=4,
+            cute_mma_dag_stages=2,
+        ),
+    ):
+        body = _kernel_body(_source(bound, config))
+        assert f"{RT.replace('_tc', '')}.round_bf16_f32(" in body
+        assert "cutlass.BFloat16(" not in body
+        epilogue = body[body.index("round_bf16_f32(") :]
+        assert "cutlass.Float32(md_v)" not in epilogue[: epilogue.index("\n")]
+
+
+def test_the_lookahead_schedule_seeds_behind_its_subjects() -> None:
+    # The first tensor-memory seed and the split seeds again with the
+    # schedule on, each right behind its subject, at the subject's ring
+    # depth where two CTAs share an SM and three slots where the tile runs
+    # one CTA per SM (``tcgen05_lookahead_stages``: the 128 x 128 split's
+    # 128 CTAs on 148 SMs); the default stays.
+    bound = _bind_head_sum()
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    seeds = [c.config for c in spec.compiler_seed_configs]
+    first = next(i for i, c in enumerate(seeds) if c["cute_mma_dag"] == "tcgen05")
+    top, ahead = seeds[first : first + 2]
+    assert top["block_sizes"] == [64, 64]
+    assert top.get("cute_mma_dag_lookahead", "off") == "off"
+    assert ahead["cute_mma_dag_lookahead"] == "on"
+    assert {k: v for k, v in ahead.items() if k != "cute_mma_dag_lookahead"} == top
+    for split, split_ahead in zip(
+        seeds[first + 2 : first + 8 : 2], seeds[first + 3 : first + 8 : 2], strict=True
+    ):
+        assert split["cute_mma_dag_epilogue"] == "split"
+        assert split.get("cute_mma_dag_lookahead", "off") == "off"
+        assert split_ahead["cute_mma_dag_epilogue"] == "split"
+        assert split_ahead["cute_mma_dag_lookahead"] == "on"
+        assert split_ahead["block_sizes"] == split["block_sizes"]
+        assert split_ahead["cute_mma_dag_warps"] == 8
+        one_per_sm = split["block_sizes"] == [128, 128]
+        assert split_ahead["cute_mma_dag_stages"] == (3 if one_per_sm else 2)
+    assert sum(c.get("cute_mma_dag_lookahead") == "on" for c in seeds) == 4
+    assert spec.default_config().config["cute_mma_dag_lookahead"] == "off"
+    # The depth rule itself: two slots at two CTAs per SM, three at one
+    # (the grid of 128 CTAs below the SM count), the deeper seed kept.
+    small = _sizes_of(bound, [64, 64])
+    assert tc.tcgen05_lookahead_stages(facts, small, 4, 2, False) == 2
+    assert tc.tcgen05_lookahead_stages(facts, small, 4, 1, False) == 2
+    assert tc.tcgen05_lookahead_stages(facts, small, 4, 4, False) == 4
+    big = _sizes_of(bound, [128, 128])
+    assert tc.tcgen05_lookahead_stages(facts, big, 8, 2, True) == 3
+    assert tc.tcgen05_lookahead_stages(facts, big, 8, 4, True) == 4
+
+
+def test_a_k_loop_over_ring_tiles_streams_behind_slot_barriers() -> None:
+    # se_block dx under ``pass``: the K loop's body is one batch over ring
+    # tiles (the chain's A tile, w's convert tile) accumulating into the
+    # TMEM carry, so it streams -- every slot gets an ``md_empty`` barrier
+    # (initialized, then arrived once: the first round is free), the
+    # iteration waits for the slot's previous reader and its TMA ahead of
+    # the passes, never for the previous batch on ``md_cb``; the batch
+    # commits to ``md_cb`` and the slot; the refill follows the batch and
+    # the issuing thread alone waits for the slot it lands in; the loop
+    # exit waits on the last slot (``md_cb`` would alias with several
+    # commits outstanding) before anything waits on ``md_cb`` again.  The
+    # exchange route keeps a fragment operand in the loop: the chain
+    # schedule, no slot barriers.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    assert facts.tcgen05.streamed_loops == 1
+    program = _match(bound)
+    assert regions.streamed_loop_candidates(program) == frozenset({0})
+    streamed = _kernel_body(
+        _source(
+            bound, _config(64, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass")
+        )
+    )
+    assert "md_empty0 = cute.arch.alloc_smem(cutlass.Int64, 3, alignment=8)" in streamed
+    for stage in range(3):
+        assert f"{P}.mbarrier_init(md_empty0 + {stage}, 1)" in streamed
+        assert f"{P}.mbarrier_arrive(md_empty0 + {stage})" in streamed
+    prologue, loop = streamed.split("for md_i in cutlass.range(", 1)
+    body, after = loop.split("md_rk0 = md_rk0 + 1", 1)
+    # The prologue's issues wait for their slots (free: the init arrive).
+    assert prologue.count(f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 1) % 3") == 1
+    assert f"{RT}.mbar_wait(md_cb" not in body
+    _assert_in_order(
+        body,
+        [
+            f"{RT}.mbar_wait(md_empty0 + md_rk0 % 3, md_rk0 // 3 & 1)",
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{RT}.sts_v4_f32(",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_cb",
+            f"{P}.tcgen05_commit(md_empty0 + md_st0",
+            "if md_warp == 0:",
+            f"{P}.elect_sync():",
+            "if md_i + 2 < 2 - 0:",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 2) % 3, (md_rk0 + 2) // 3 & 1)",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 2) % 3",
+        ],
+    )
+    assert body.count(f"{P}.tcgen05_commit(md_cb") == 1
+    _assert_in_order(
+        after,
+        [
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 - 1) % 3, (md_rk0 - 1) // 3 + 1 & 1)",
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.AFTER_THREAD_SYNC)",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+        ],
+    )
+    assert _commits_while_one_is_outstanding(streamed) == []
+    exchange = _kernel_body(_source(bound, _config(64, 64, 64, warps=4, stages=3)))
+    assert "md_empty" not in exchange
+    assert f"{RT}.mbar_wait(md_cb" in _loop(exchange)
+
+
+def test_root_derived_tiles_are_staged_with_the_root_group() -> None:
+    # se_block dx's carry seed ``2 * g * s`` reads two tiles at the root
+    # fragment coordinates: aux tiles of the root frame (``root_aux_load``),
+    # issued once per CTA on ``md_sfr`` with the root group and read as
+    # 16-byte chunks after one wait -- no per-lane global loads anywhere.
+    # Its value is computed once in the prologue segment into its TMEM slot,
+    # so both tiles overlay the loop frames (segment 0, no bytes of their
+    # own); the ``lane`` loads route keeps the per-lane loads.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    program = _match(bound)
+    roots = [
+        (derived, access)
+        for derived, access in regions.aux_tile_loads(program)
+        if derived.loop < 0
+    ]
+    assert [access.name for _derived, access in roots] == ["grad_out", "s"]
+    items = [
+        item
+        for item, _payload in regions.region_items(program)
+        if item.kind == regions.ITEM_AUX and item.frame < 0
+    ]
+    assert [(item.copies, item.segment) for item in items] == [(1, 0), (1, 0)]
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    sizes = {0: 64, 1: 64, 2: 64}
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert all(isinstance(size, int) for size in resolved)
+    body = _kernel_body(
+        _source(
+            bound, _config(64, 64, 64, warps=4, stages=2, cute_mma_dag_derived="pass")
+        )
+    )
+    assert "ldg_b32(" not in body and "ldg_v2_f32(" not in body
+    assert "md_sfr = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=8)" in body
+    prologue = body[: body.index("for md_i in cutlass.range(")]
+    assert prologue.count(f"{P}.mbarrier_arrive_expect_tx(md_sfr, 16384)") == 1
+    assert prologue.count(", md_sfr)") == 2
+    _assert_in_order(
+        prologue,
+        [
+            f"{P}.mbarrier_arrive_expect_tx(md_sfr, 16384)",
+            "cute.arch.barrier()",
+            "if md_epi:",
+            f"{RT}.mbar_wait(md_sfr, 0)",
+            "_helion_mma_dag.lds_v4_b32(",
+            f"{P}.tcgen05_st(",
+            # The reads complete before the ring prologue lands on the frames.
+            "cute.arch.barrier()",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + md_rk0 % 2",
+        ],
+    )
+    lane = _kernel_body(
+        _source(
+            bound,
+            _config(
+                64,
+                64,
+                64,
+                warps=4,
+                stages=2,
+                cute_mma_dag_loads="lane",
+            ),
+        )
+    )
+    assert "md_sfr" not in lane
+    assert "ldg_b32(" in lane[: lane.index("for md_i in cutlass.range(")]
+
+
+def test_a_root_tile_read_again_after_a_loop_lives_across_it() -> None:
+    # kda's state_dwk: ``k_scaled`` (computed once into its TMEM slot ahead
+    # of the loop) reads ``kf`` and ``gcf``; the epilogue's ``mul_3`` reads
+    # ``gcf`` again after the loop.  The aux tile of ``kf`` overlays the loop
+    # frames (segment 0); ``gcf``'s is shared by a reader behind the loop,
+    # so it takes bytes of its own (a segment-0 overlay was clobbered by the
+    # ring: the kernel's dk output went wrong).
+    bound = _bind_dwk()
+    program = _match(bound)
+    items = {
+        access.name: item
+        for (item, payload) in regions.region_items(program)
+        if item.kind == regions.ITEM_AUX and item.frame < 0
+        for access in [cast("tuple[dag.Derived, dag.Access]", payload)[1]]
+    }
+    assert sorted(items) == ["gcf", "kf"]
+    assert (items["kf"].copies, items["kf"].segment) == (1, 0)
+    assert (items["gcf"].copies, items["gcf"].segment) == (1, -1)
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    sizes = dict.fromkeys(range(len(facts.axes)), 64)
+    sizes[0] = 1
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert all(isinstance(size, int) for size in resolved)
+    layout = regions.region_layout(
+        regions.derived_items(facts.tcgen05.items, "exchange"),
+        facts.loops,
+        resolved,  # type: ignore[arg-type]
+        2,
+    )
+    aux_offsets = [
+        offset
+        for item, offset in zip(facts.tcgen05.items, layout.offsets, strict=True)
+        if item.kind == regions.ITEM_AUX and item.frame < 0
+    ]
+    frames = max(layout.ring_base.values()) + 2 * max(layout.ring_bytes.values())
+    # One inside the frames' extent, one beyond it.
+    assert sorted(offset < frames for offset in aux_offsets) == [False, True]
+
+
+def test_lane_loads_and_the_lookahead_schedule_never_share_a_subject() -> None:
+    # ``cute_mma_dag_loads='lane'`` has a subject only where derived values
+    # read tiles that may ride a loop ring (``aux_items``), and
+    # ``region_lookahead`` refuses a ring-riding derived load, so the
+    # schedule's subject (``lookahead_loop``) and the route's never meet in
+    # one program; the planner has no refusal for the pair, and normalization
+    # none either.  This pins that as an admission invariant over every
+    # region binder: should either admission widen, the failure lands here,
+    # and the pair wants a normalization refusal rather than a render-time
+    # InvalidConfig.
+    binders: dict[str, Callable[[], BoundKernel]] = {
+        **_REGION_BINDERS,
+        "head_sum": _bind_head_sum,
+    }
+    subjects: dict[str, tuple[bool, bool]] = {}
+    lane_survives = ahead_survives = False
+    for name, binder in sorted(binders.items()):
+        bound = binder()
+        spec = bound.config_spec
+        facts = spec.cute_mma_dag_facts
+        if (
+            spec.cute_mma_dag is None
+            or "tcgen05" not in spec.cute_mma_dag.choices
+            or facts is None
+            or facts.tcgen05 is None
+        ):
+            continue
+        aux = facts.tcgen05.aux_items > 0
+        ahead = facts.tcgen05.lookahead_loop >= 0
+        assert not (aux and ahead), name
+        subjects[name] = (aux, ahead)
+        seeds = [
+            c.config
+            for c in spec.compiler_seed_configs
+            if c.config["cute_mma_dag"] == "tcgen05"
+        ]
+        for seed in (spec.default_config().config, *seeds[:1]):
+            values = {
+                **seed,
+                "cute_mma_dag_loads": "lane",
+                "cute_mma_dag_lookahead": "on",
+            }
+            with bound.env:
+                spec.normalize(values, _fix_invalid=True)
+            lane = values["cute_mma_dag_loads"] == "lane"
+            on = values["cute_mma_dag_lookahead"] == "on"
+            assert not (lane and on), (name, values)
+            # (A default config in the warp mode: its loads knob has the warp
+            # mode's own subjects, the TMA ring and the fixed epilogue tiles.)
+            subject = (
+                aux
+                if values["cute_mma_dag"] == "tcgen05"
+                else facts.tma_ring or facts.fixed_derived
+            )
+            assert not lane or subject, (name, values)
+            assert not on or ahead, (name, values)
+            lane_survives |= lane
+            ahead_survives |= on
+    # Both knobs have subjects among the binders, and both survive
+    # normalization somewhere: the pin is not vacuous on either side.
+    assert any(aux for aux, _ in subjects.values())
+    assert any(ahead for _, ahead in subjects.values())
+    assert lane_survives and ahead_survives
+
+
+def test_a_tf32_tile_read_k_major_and_mn_major_takes_the_32_byte_unit_swizzle() -> None:
+    # full_gla's training backward without the gate gradient
+    # (``chunk_bwd_dqkg_scalar_helion(diag_anchored=True, compute_dg=False)``):
+    # the epilogue's dA (fp32, masked) is the K-major A of the dq dot and,
+    # transposed, the MN-major A of the dk dot -- one exchange tile
+    # (``tile_key``).  The first reader's layout alone put the tile under the
+    # 16-byte-unit swizzle, which the dk dot's MN-major descriptor read as
+    # zeros: dk lost its intra-chunk term (relative error 0.997 at every
+    # tcgen05 config, the promoted default included, in the examples14
+    # campaign at 9534981b9).  The shared 32-bit tile takes the 32-byte-unit
+    # swizzle when any reader is MN-major (``tile_mn_major``): the exchange
+    # writes it (the rotated packets), both descriptors read it with the
+    # slab as the leading offset, and the K-major reader steps 32 bytes per
+    # K step within a slab as the ``X @ X`` sharing already did.
+    bound = _bind_dqkg(diag=True, compute_dg=False)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert "tcgen05" in spec.cute_mma_dag.choices
+    program = _program(bound)
+    fp32_dots = [dot for dot in program.dots if dot.a.dtype == torch.float32]
+    assert len(fp32_dots) == 2
+    dq_dot, dk_dot = fp32_dots
+    assert not dq_dot.a.trans and dk_dot.a.trans
+    # One tile key (the keys hold fake tensors: compare by identity hash).
+    keys = {regions.tile_key(program, dq_dot.a), regions.tile_key(program, dk_dot.a)}
+    assert len(keys) == 1
+    assert regions.operand_geometry(program, dq_dot.a)[2]
+    assert not regions.operand_geometry(program, dk_dot.a)[2]
+    assert regions.tile_mn_major(program, dq_dot.a)
+    assert regions.tile_mn_major(program, dk_dot.a)
+    # The loaded bf16 operands of the DV loop are read K-major only.
+    assert not any(
+        regions.tile_mn_major(program, operand)
+        for dot in program.dots
+        for operand in (dot.a, dot.b)
+        if operand.dtype == torch.bfloat16
+    )
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    # The fp32 exchanges: dA (shared, MN-major by the dk dot alone) and the
+    # two scaled B operands (MN-major B tiles).
+    assert [(x.elem_bytes, x.mn_major) for x in facts.tcgen05.exchanges] == [
+        (4, True)
+    ] * 3
+    body = _kernel_body(_source(bound, _config(1, 32, 64, warps=4, stages=3)))
+    descs = {
+        line.split(" = ")[0].strip(): line
+        for line in body.splitlines()
+        if f"{P}.Tcgen05SmemDesc.build(" in line
+    }
+    # The dq dot's A (K-major, md_idesc3) and the dk dot's A (MN-major,
+    # md_idesc4) name the same bytes under the 32-byte-unit swizzle.
+    assert "a_major=0, b_major=1" in body.split("md_idesc3 = ", 1)[1].split("\n")[0]
+    assert "a_major=1, b_major=1" in body.split("md_idesc4 = ", 1)[1].split("\n")[0]
+    (base,) = {
+        descs[name].split("build(")[1].split(",")[0] for name in ("md_da3", "md_da4")
+    }
+    for name in ("md_da3", "md_da4"):
+        assert (
+            f"leading_byte_offset=8192, stride_byte_offset=512, "
+            f"layout={P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B)" in descs[name]
+        ), descs[name]
+    # The dA exchange is written once, under the 32-byte-unit swizzle (the
+    # packet rotation over the row's parity), never the 16-byte-unit one.
+    writes = [
+        line
+        for line in body.splitlines()
+        if f"{RT}.sts_v4_f32({base} + md_row64" in line
+    ]
+    assert len(writes) == 8
+    assert all("% 8 ^ md_row64 % 4 * 2) * 16" in line for line in writes)
+    assert all("md_rot" in line for line in writes)
+    assert not any("^ md_row64 % 8) * 16" in line for line in writes)
+    # The K-major reader steps 32 bytes per K step within a slab (four
+    # steps), then the slab.
+    k_steps = re.findall(r"md_da3\.advance_start_address\((\d+)\)", body)
+    assert [int(step) for step in k_steps] == [0, 32, 64, 96, 8192, 8224, 8256, 8288]
+    mn_steps = re.findall(r"md_da4\.advance_start_address\((\d+)\)", body)
+    assert [int(step) for step in mn_steps] == [1024 * step for step in range(8)]
+
+
+def _persistent_config(
+    *block_sizes: int, warps: int, stages: int, ctas: int, **extra: object
+) -> helion.Config:
+    return _config(
+        *block_sizes,
+        warps=warps,
+        stages=stages,
+        cute_mma_dag_persistent=ctas,
+        pid_type="persistent_interleaved",
+        num_sm_multiplier=ctas,
+        **extra,
+    )
+
+
+def test_a_region_program_runs_as_a_persistent_launch_with_a_cross_tile_prefetch() -> (
+    None
+):
+    # cute_mma_dag_persistent on a tensor-memory region program (dqkg at
+    # (8, 8, 1024, 64, 64), chunk 64: one ring loop of one trip over the
+    # do / v / h / dh tiles, the q / k root tiles, two root batches): the
+    # barriers, the tensor memory, the instruction descriptors and the
+    # counters are set up once ahead of the generic persistent_interleaved
+    # tile loop; inside it the CTA's first tile issues its own root group
+    # and ring prologue (``md_tn == 0``), every later tile's were issued by
+    # its predecessor: the ring prologue at the loop's exit (every batch of
+    # the loop waited), the root group right after the batch that last
+    # reads q / k is waited (ahead of the decay pass and the stores), at the
+    # next tile's coordinates; the root barrier's parity alternates with the
+    # tile count; no barrier is re-armed (every phase runs on a counter);
+    # the dealloc follows the loop once.  The root items (the dA exchange
+    # tile, the dq / dk staging) live beside the frames: 65536 + 24576 B.
+    bound = _bind_dqkg(diag=False, compute_dg=False, bhn=1024, d=64, dv=64)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    assert facts.tcgen05.persistent_reason is None
+    assert spec.cute_mma_dag_persistent is not None
+    flat = _config(1, 64, 64, warps=4, stages=1)
+    config = _persistent_config(1, 64, 64, warps=4, stages=1, ctas=2)
+    with bound.env:
+        normalized = spec.normalized_config(config).config
+    assert normalized["cute_mma_dag_persistent"] == 2
+    assert normalized["pid_type"] == "persistent_interleaved"
+    assert normalized["num_sm_multiplier"] == 2
+    body = _kernel_body(bound.to_code(helion.Config(**normalized)))
+    loop = body.index("for virtual_pid in range(")
+    setup = body[:loop]
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 90112," in setup
+    for name in (
+        "tcgen05_alloc(",
+        "mbarrier_init(md_sfr, 1)",
+        "mbarrier_init(md_full0 + 0, 1)",
+    ):
+        assert setup.count(f"{P}.{name}") == 1 and f"{P}.{name}" not in body[loop:]
+    assert "md_idesc0 = " in setup and "md_cn = cutlass.Int32(0)" in setup
+    assert "md_rk0 = cutlass.Int32(0)" in setup and "md_tn = cutlass.Int32(0)" in setup
+    tile = body[loop : body.index(f"{P}.tcgen05_dealloc(")]
+    assert body.count(f"{P}.tcgen05_dealloc(") == 1
+    assert "md_npid = virtual_pid + _NUM_SM * 2" in tile
+    # The first tile's own issues, both behind ``md_tn == 0``: the tensor
+    # maps ahead of the loop; the ring prologue and, behind it, the root
+    # group (``root_group_deferral``: nothing ahead of the loop or in it
+    # reads q / k, so the loop's batch is not queued behind them).
+    guards = [m.start() for m in re.finditer(r"if md_tn == 0:", tile)]
+    assert len(guards) == 2
+    loop_top = tile.index("for md_i in cutlass.range(0, 1):")
+    first_root = tile.index(", md_sfr)")
+    first_ring = tile.index(", md_full0 + md_rk0 % 1)")
+    assert guards[0] < guards[1] < first_ring < first_root < loop_top
+    assert ", md_sfr)" not in tile[guards[0] : guards[1]]
+    # The next tile's ring prologue at the loop's exit, at the next tile's
+    # coordinates, ahead of the epilogue's wait on the root group.
+    sfr_wait = tile.index(f"{RT}.mbar_wait(md_sfr, md_tn & 1)")
+    exit_issue = tile.index("if md_npid < total_pids:")
+    assert loop_top < exit_issue < sfr_wait
+    ring_next = tile[exit_issue:sfr_wait]
+    assert ring_next.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 4
+    assert "(virtual_pid + _NUM_SM * 2)" in ring_next
+    assert f"{P}.mbarrier_arrive_expect_tx(md_full0 + md_rk0 % 1, 40960)" in ring_next
+    # The next tile's root group behind the second batch's wait (its last
+    # reader), ahead of the stage-out.
+    second_batch = tile.index("md_cn = md_cn + 1", tile.index("md_cn = md_cn + 1") + 1)
+    root_next = tile.index(
+        f"{P}.mbarrier_arrive_expect_tx(md_sfr, 16384)", second_batch
+    )
+    staging = tile.index("md_srow = md_s0 + ")
+    assert second_batch < root_next < staging
+    assert (
+        "(virtual_pid + _NUM_SM * 2)"
+        in tile[root_next : tile.index("\n", root_next + 200)]
+    )
+    # The staging tiles and the exchange tile live past the TMA frames.
+    staging_offsets = [
+        int(m) for m in re.findall(r"md_srow\w* = md_s0 \+ (\d+) \+", tile)
+    ]
+    assert staging_offsets and min(staging_offsets) >= 65536
+    assert tile.count("md_tn = md_tn + 1") == 1
+    assert f"{P}.mbarrier_init(" not in tile
+    # The previous tile's TMA stores finish reading their staging tiles
+    # ahead of this tile's stage-in, not at the tile's end.
+    stage_in_wait = tile.index(
+        f"{P}.cp_async_bulk_wait_group(0, read=True)", second_batch
+    )
+    assert stage_in_wait < staging
+    tail = tile[tile.rindex(f"{P}.cp_async_bulk_tensor_global_shared_cta(") :]
+    assert "cp_async_bulk_wait_group(0, read=True)" not in tail
+    # The knob off: the one-tile render, unchanged (no tile loop, no tile
+    # count, the root items overlaying the frames).
+    with bound.env:
+        plain = spec.normalized_config(flat).config
+    assert plain["cute_mma_dag_persistent"] == 0
+    assert plain.get("pid_type", "flat") == "flat" and "num_sm_multiplier" not in plain
+    plain_body = _kernel_body(bound.to_code(helion.Config(**plain)))
+    assert "virtual_pid" not in plain_body and "md_tn" not in plain_body
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 65536," in plain_body
+    # Seeds: the top tensor-memory seed's persistent twins (at its stage
+    # depth, at one stage, and at one stage over the doubled loop tile).
+    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+
+    with bound.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds is not None
+    twins = [
+        (s.config["block_sizes"], s.config["cute_mma_dag_stages"])
+        for s in seeds
+        if s.config.get("cute_mma_dag_persistent")
+    ]
+    assert twins == [([1, 64, 32], 2), ([1, 64, 32], 1), ([1, 64, 64], 1)]
+    with bound.env:
+        for seed in seeds:
+            if seed.config.get("cute_mma_dag_persistent"):
+                launch = spec.normalized_config(seed).config
+                assert launch["cute_mma_dag_persistent"] == 2
+                assert launch["pid_type"] == "persistent_interleaved"
+                assert launch["num_sm_multiplier"] == 2
+
+
+def test_the_region_persistent_launch_fails_closed() -> None:
+    # The persistent layout keeps the root items beside the frames: where
+    # that overflows the shared memory the one-tile layout fits, the tile
+    # stays and the launch goes (strict normalization names the knob); the
+    # lookahead schedule and the persistent launch are exclusive (the
+    # launch goes); the warp mode has no persistent launch.
+    bound = _bind_dqkg(diag=False, compute_dg=False, bhn=1024, d=64, dv=64)
+    spec = bound.config_spec
+    squeezed = _persistent_config(1, 64, 64, warps=4, stages=4, ctas=1)
+    with bound.env:
+        assert (
+            spec.normalized_config(_config(1, 64, 64, warps=4, stages=4)).config[
+                "cute_mma_dag_stages"
+            ]
+            == 4
+        )
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_persistent=1: "):
+            spec.normalize(dict(squeezed.config))
+        fixed = dict(squeezed.config)
+        spec.normalize(fixed, _fix_invalid=True)
+    assert fixed["cute_mma_dag_persistent"] == 0
+    assert fixed["cute_mma_dag_stages"] == 4 and fixed["pid_type"] == "flat"
+    warp = dict(
+        helion.Config(
+            block_sizes=[1, 64, 64],
+            cute_mma_dag="warp",
+            cute_mma_dag_warps=4,
+            cute_mma_dag_stages=2,
+            cute_mma_dag_persistent=2,
+            pid_type="persistent_interleaved",
+            num_sm_multiplier=2,
+        ).config
+    )
+    with bound.env:
+        with pytest.raises(InvalidConfig, match="cute_mma_dag_persistent"):
+            spec.normalize(dict(warp))
+        spec.normalize(warp, _fix_invalid=True)
+    assert warp["cute_mma_dag"] == "warp" and warp["cute_mma_dag_persistent"] == 0
+    assert warp["pid_type"] == "flat"
+    # A lookahead program: the knob pins to one tile per CTA under the
+    # schedule and stays otherwise.
+    probe = _bind_probe_kk()
+    pspec = probe.config_spec
+    pfacts = pspec.cute_mma_dag_facts
+    assert pfacts is not None and pfacts.tcgen05 is not None
+    if pfacts.tcgen05.lookahead_loop >= 0 and pspec.cute_mma_dag_persistent is not None:
+        with probe.env:
+            ahead = pspec.normalized_config(
+                _persistent_config(
+                    64, 64, warps=4, stages=2, ctas=2, cute_mma_dag_lookahead="on"
+                )
+            ).config
+        if ahead["cute_mma_dag_lookahead"] == "on":
+            assert ahead["cute_mma_dag_persistent"] == 0
+
+
+def test_the_persistent_layout_keeps_the_top_level_loops_frames_apart() -> None:
+    # The one-tile layout lets sibling frames share one extent (a loop's
+    # frame is dead while another top-level loop runs).  The persistent
+    # launch issues a root ring loop's next-tile prologue at the loop's
+    # exit -- while the tile's later top-level loops run and ahead of the
+    # next tile's earlier ones -- so its layout lays the top-level frames
+    # out one after another.  dqkw at [64, 64, 64], two stages: loop 0's
+    # ring (two 16 KB slots) and loop 1's frame (its nested ring, two 40 KB
+    # slots, then its staged tiles) share bytes 0.. in the one-tile layout;
+    # the persistent layout starts loop 1's frame at 32768.
+    bound = _bind_dqkw(False, bhn=2048, d=128, dv=128)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.tcgen05.regions
+    assert facts.tcgen05.persistent_reason is None
+    assert [loop.parent for loop in facts.loops] == [-1, -1, 1]
+    # Axes of dqkw: loop block ids 1, 3, 4, the lead 0, the rdim 2.
+    resolved = [64, 64, 64, 1, 64]
+    items = facts.tcgen05.items
+    flat = regions.region_layout(items, facts.loops, resolved, 2)
+    assert flat.ring_base == {0: 0, 2: 0} and flat.total == 147456
+    # (The barriers: two slots of two rings, three staged regions, the
+    # commit barrier, the TMEM slot: 80 B.)
+    assert regions.region_smem_bytes(facts, resolved, 2) == 147456 + 80
+    apart = regions.region_layout(items, facts.loops, resolved, 2, persistent=True)
+    assert apart.ring_base == {0: 0, 2: 32768} and apart.total == 180224
+    assert apart.ring_bytes == flat.ring_bytes == {0: 16384, 2: 40960}
+    assert regions.region_smem_bytes(facts, resolved, 2, persistent=True) == 180224 + 80
+    # Every item of loop 1's frame moves by loop 0's extent (a ring item's
+    # offset is within its slot); the root items stay beside the frames.
+    frames = {1} | {index for index, loop in enumerate(facts.loops) if loop.parent == 1}
+    assert frames == {1, 2}
+    for index, item in enumerate(items):
+        if item.frame in frames and item.copies:
+            assert apart.offsets[index] == flat.offsets[index] + 32768, (index, item)
+    assert all(
+        apart.offsets[index] >= 180224 - 32768
+        for index, item in enumerate(items)
+        if item.frame < 0
+    )
+    # The render: loop 0's next-tile prologue (at its exit, guarded by the
+    # next program id) lands in loop 0's slots; loop 1's nested ring and
+    # staged tiles live past them.
+    config = _persistent_config(64, 64, 64, warps=4, stages=2, ctas=1)
+    with bound.env:
+        normalized = spec.normalized_config(config).config
+    assert normalized["cute_mma_dag_persistent"] == 1
+    body = _kernel_body(bound.to_code(helion.Config(**normalized)))
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 180224," in body
+    tile = body[body.index("for virtual_pid in range(") :]
+    exit_issue = tile.index("if md_npid < total_pids:")
+    loop1 = tile.index("for md_i1 in cutlass.range(0, 2):")
+    assert exit_issue < loop1
+    ahead = tile[exit_issue:loop1]
+    assert ahead.count("md_smem + (0 + md_rk0 % 2 * 16384 + ") == 2
+    assert "(virtual_pid + _NUM_SM)" in ahead
+    rest = tile[loop1:]
+    assert "md_smem + (32768 + md_rk2 % 2 * 40960 + " in rest
+    assert "md_smem + (0 + md_rk2" not in rest
+    # Three top-level ring loops (wy_dL): one frame after another.
+    wy = _bind_wy_dl(True, torch.bfloat16, torch.bfloat16, bhn=2048, d=128, dv=128)
+    wy_facts = wy.config_spec.cute_mma_dag_facts
+    assert wy_facts is not None and wy_facts.tcgen05 is not None
+    assert [loop.parent for loop in wy_facts.loops] == [-1, -1, -1]
+    wy_items = wy_facts.tcgen05.items
+    assert regions.region_layout(wy_items, wy_facts.loops, resolved, 2).ring_base == {
+        0: 0,
+        1: 0,
+        2: 0,
+    }
+    assert regions.region_layout(
+        wy_items, wy_facts.loops, resolved, 2, persistent=True
+    ).ring_base == {0: 0, 1: 49152, 2: 147456}
+    # Where the frames apart overflow the capacity the one-tile layout
+    # fits, the tile stays and the launch goes (dqkw at three stages:
+    # 237672 B against 232448).
+    assert regions.region_smem_bytes(facts, resolved, 3) == 188520
+    assert regions.region_smem_bytes(facts, resolved, 3, persistent=True) == 237672
+    with bound.env:
+        assert (
+            spec.normalized_config(_config(64, 64, 64, warps=4, stages=3)).config[
+                "cute_mma_dag_stages"
+            ]
+            == 3
+        )
+        with pytest.raises(
+            InvalidConfig,
+            match="cute_mma_dag_persistent=1: 3 tcgen05 stages need 237672 B",
+        ):
+            spec.normalize(
+                dict(_persistent_config(64, 64, 64, warps=4, stages=3, ctas=1).config)
+            )
+        fixed = dict(_persistent_config(64, 64, 64, warps=4, stages=3, ctas=1).config)
+        spec.normalize(fixed, _fix_invalid=True)
+    assert fixed["cute_mma_dag_persistent"] == 0 and fixed["cute_mma_dag_stages"] == 3
+    # The knob off: the one-tile render keeps the shared frames.
+    with bound.env:
+        plain = spec.normalized_config(_config(64, 64, 64, warps=4, stages=2)).config
+    plain_body = _kernel_body(bound.to_code(helion.Config(**plain)))
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 147456," in plain_body
+    assert "md_smem + (0 + md_rk2 % 2 * 40960 + " in plain_body
+    # Seeds: the persistent twins follow the layout's occupancy
+    # (``tcgen05_persistent_ctas`` over the frames apart).
+    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+
+    with bound.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds is not None
+    twins = [
+        (
+            s.config["block_sizes"],
+            s.config["cute_mma_dag_stages"],
+            s.config["cute_mma_dag_persistent"],
+        )
+        for s in seeds
+        if s.config.get("cute_mma_dag_persistent")
+    ]
+    assert twins == [([128, 64, 32], 2, 1), ([128, 64, 32], 1, 1)]
+
+
+def test_the_single_loop_persistent_launch_prefetches_the_epilogue_tiles() -> None:
+    # dv at (8, 8, 1024, 64, 64): a single-loop program with an epilogue
+    # operand tile (``do``, on ``md_efull``).  The cross-tile prefetch now
+    # admits it: the next tile's epilogue tile goes out behind the tile's
+    # barrier re-init, and the epilogue staging tile lives beside the ring
+    # (``tcgen05_persistent_staging``: 40960 + 16384 + 8192 B fit), so the
+    # whole next slot -- q, k and the dh box the staging used to hold back
+    # -- goes out right after the drain.
+    bound = _bind_dv("scalar", bhn=1024, d=64, dv=64)
+    spec = bound.config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and not facts.tcgen05.regions
+    config = _persistent_config(1, 64, 64, warps=4, stages=1, ctas=3)
+    with bound.env:
+        normalized = spec.normalized_config(config).config
+    assert normalized["cute_mma_dag_persistent"] == 3
+    body = _kernel_body(bound.to_code(helion.Config(**normalized)))
+    assert "md_smem = cute.arch.alloc_smem(cutlass.Uint8, 65536," in body
+    loop = body.index("for virtual_pid in range(")
+    tile = body[loop : body.index(f"{P}.tcgen05_dealloc(")]
+    first = tile.index("if md_ib == 0:")
+    first_block = tile[first : tile.index("for md_i in cutlass.range(")]
+    assert f"{P}.mbarrier_arrive_expect_tx(md_efull, 8192)" in first_block
+    drain = tile.index(f"{RT}.mbar_wait(md_accb, 1 - 0 - 1 & 1)")
+    efull_wait = tile.index(f"{RT}.mbar_wait(md_efull, 0)")
+    early = tile[drain:efull_wait]
+    assert early.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 3
+    assert "(virtual_pid + _NUM_SM * 3)" in early
+    staging_row = re.search(r"md_srow\w* = md_s0 \+ (\d+) \+", tile)
+    assert staging_row is not None
+    staging = staging_row.start()
+    assert int(staging_row.group(1)) >= 57344
+    reinit = tile.index(f"{P}.mbarrier_init(md_efull, 1)")
+    assert staging < reinit
+    late = tile[reinit:]
+    assert late.count(f"{P}.mbarrier_arrive_expect_tx(md_efull, 8192)") == 1
+    assert late.count(f"{P}.cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert "md_tma3" in late[late.index("md_efull, 8192") :]
+    assert "(virtual_pid + _NUM_SM * 3)" in late
+    # Seeds: the top seed's persistent twin at three CTAs per SM (the
+    # beside-the-ring layout's occupancy).
+    from helion._compiler.autotuner_heuristics.cute_mma_dag import CuteMmaDagHeuristic
+
+    with bound.env:
+        seeds = CuteMmaDagHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+    assert seeds is not None
+    assert [
+        s.config["cute_mma_dag_persistent"]
+        for s in seeds
+        if s.config.get("cute_mma_dag_persistent")
+    ] == [3]

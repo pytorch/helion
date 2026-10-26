@@ -106,7 +106,32 @@ def _job(directory: Path, repetitions: int = 3) -> _EvaluateCase:
         case["scale_atol"],
         repetitions,
         case.get("alias_signature"),
+        fp8_accuracy=case.get("fp8_accuracy", "bitwise"),
     )
+
+
+# ``x + 1`` cast to fp8 with every other pair of elements moved one fp8 ulp up
+# and down (balanced, as reordering noise is), against the exact reference.
+_FP8_ONE_ULP_FLIP_SOURCE = """
+import torch
+
+
+def kernel(x):
+    exact = (x + 1).to(torch.float8_e4m3fn)
+    values = exact.float()
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    _, exponent = torch.frexp(values.abs().clamp_min(finfo.smallest_normal))
+    ulp = torch.ldexp(torch.full_like(values, finfo.eps), exponent - 1)
+    index = torch.arange(values.numel())
+    direction = torch.where(index % 2 == 0, 1.0, -1.0)
+    return torch.where(index % 4 < 2, values + direction * ulp, values).to(
+        torch.float8_e4m3fn
+    )
+"""
+
+
+def _fp8_reference(x: torch.Tensor) -> torch.Tensor:
+    return (x + 1).to(torch.float8_e4m3fn)
 
 
 def test_worker_snapshot_survives_source_edits(tmp_path: Path) -> None:
@@ -158,6 +183,28 @@ def test_undeclared_mutation_fails_despite_correct_output(tmp_path: Path) -> Non
     outcome = _job(tmp_path)()
     assert outcome.status == "accuracy_error"
     assert outcome.samples == ()
+
+
+@pytest.mark.parametrize("fp8_accuracy", [None, "bitwise", "ulp"])
+def test_fp8_one_ulp_flips_follow_the_recorded_mode(
+    tmp_path: Path, fp8_accuracy: str | None
+) -> None:
+    """A case records the autotuner's fp8 comparison mode: 'ulp' admits the
+    balanced one-bucket flips the autotuner accepts, 'bitwise' (and a bundle
+    written before the mode was recorded) requires identical bytes."""
+    manifest = _bundle(tmp_path, _FP8_ONE_ULP_FLIP_SOURCE, reference=_fp8_reference)
+    if fp8_accuracy is not None:
+        manifest["cases"][0]["fp8_accuracy"] = fp8_accuracy
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    outcome = _job(tmp_path)()
+    if fp8_accuracy == "ulp":
+        assert outcome.status == "ok", outcome.error
+        assert len(outcome.samples) == 3
+        result = evaluate_handoff(tmp_path, repetitions=1, timeout=60)
+        assert result.ok, result.cases
+    else:
+        assert outcome.status == "accuracy_error"
+        assert outcome.samples == ()
 
 
 def test_small_undeclared_mutation_ignores_output_tolerances(tmp_path: Path) -> None:

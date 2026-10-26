@@ -70,6 +70,7 @@ from .._compiler.cute.aux_tensor import (
     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
 )
 from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
+from .._compiler.cute.aux_tensor import host_function_tcgen05_aux_loads_on_every_store
 from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
@@ -2814,6 +2815,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.host_function
                     )
                 )
+                # ``pre_acc_wait`` renders only where every store chain has
+                # per-subtile auxiliary loads (or the shared fanout epilogue
+                # merges the chains); the strict normalizer and the seeds
+                # read this proof so a two-output kernel whose first output
+                # is aux-free never samples the placement into a codegen
+                # refusal.
+                self.env.config_spec.cute_tcgen05_aux_loads_on_every_store = (
+                    host_function_tcgen05_aux_loads_on_every_store(self.host_function)
+                )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)
                 )
@@ -2958,6 +2968,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if settings.backend == "cute":
             # Structural settings determine the config's axis schema at binding.
             # Record opt-outs too, independent of the replay process's environment.
+            # The graph CSE pass belongs here as well: the merged and the traced
+            # device IR roll different reduction sweeps, so their configs carry a
+            # different number of ``load_eviction_policies`` slots; a repro
+            # printed under HELION_CUTE_GRAPH_CSE=0 must replay the traced graph.
             parts.extend(
                 [
                     "backend='cute'",
@@ -2966,6 +2980,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     f"cute_segmented_matmul_tiling={settings.cute_segmented_matmul_tiling}",
                     f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
                     f"cute_materialize_transformed_operands={settings.cute_materialize_transformed_operands}",
+                    f"cute_graph_cse={settings.cute_graph_cse}",
                 ]
             )
         if settings.backend == "cute" or settings.cute_rng_stream != "word0":
