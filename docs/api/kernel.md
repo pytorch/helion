@@ -168,6 +168,22 @@ each native launch. Dynamic
 launch layouts and plans that require additional descriptor preparation are not
 yet supported.
 
+A CuTe export also changes the entry point's signature and scalars:
+
+- Callable arguments (such as score or mask modifiers) are compiled into the
+  kernel, so the exported entry point omits them. Export refuses a kernel
+  whose host code uses one, for example to read a value the callable's
+  closure captures.
+- Bool and float arguments stay runtime arguments. By default, export fails
+  with `GuardOnDataDependentSymNode` when the host code branches on one or a
+  launch needs one as a compile-time constant. With
+  `HELION_CUTE_EXPORT_HARDCODE_SCALARS=1`, export instead hard-codes those
+  arguments as constants; a call with another value raises `ValueError`. The
+  hard-coded values are those the `BoundKernel` was created with (a hand-off
+  uses each case's values). Bool and float arguments do not key bound kernels
+  by value, so `kernel.bind(args)` can return a `BoundKernel` created by an
+  earlier call with other values.
+
 ## Caching and Specialization
 
 Kernels are automatically cached based on:

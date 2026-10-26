@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import sys
 import threading
+import types
 import typing
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -21,6 +22,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
+from .output_header import library_import_value
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -29,7 +31,6 @@ from .variable_origin import Origin
 
 if TYPE_CHECKING:
     import inspect
-    import types
 
     from .device_ir import DeviceIR
     from .source_location import SourceLocation
@@ -258,7 +259,18 @@ class HostFunction:
 
     def import_from_module(
         self, module_scope: dict[str, object], name: str
-    ) -> AttributeOrigin:
+    ) -> AttributeOrigin | GlobalOrigin:
+        # A library module referenced from a traced callable (a score/mask mod)
+        # resolves like a kernel-body global, not through the source module,
+        # when it is the module the backend's generated code imports under
+        # that name.
+        imports = CompileEnvironment.current().backend.library_imports
+        if (
+            name in imports
+            and isinstance(value := module_scope.get(name), types.ModuleType)
+            and value is library_import_value(name, imports)
+        ):
+            return GlobalOrigin(name=name, function=self)
         # pyrefly: ignore [missing-attribute]
         if module_scope is self.fn.__globals__:
             return self.global_scope_origin(name)

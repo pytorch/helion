@@ -11,13 +11,19 @@ from typing import NamedTuple
 
 import pytest
 import torch
+from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
+from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import noop_mask
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
 import helion.language as hl
 
-attention_output = import_example("attention").attention_output
+attention = import_example("attention")
+attention_output = attention.attention_output
+attention_backward = attention.attention_backward
+flex_example = import_example("flex_attention")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -92,6 +98,63 @@ def test_pointwise(tmp_path: Path, layout: str) -> None:
     if layout == "contiguous":
         with pytest.raises(ValueError, match="tensor layout"):
             exported._pointwise(torch.randn(129, device=DEVICE)[1:], 2.0)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _host_offset(x: torch.Tensor, scale: float, shift: float) -> torch.Tensor:
+    assert scale > 0
+    offset = shift + 1.0
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] * scale + offset
+    return out
+
+
+def test_only_host_branched_floats_are_hard_coded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """By default a host branch on a float (``scale``) fails export with
+    GuardOnDataDependentSymNode, as before; with
+    ``HELION_CUTE_EXPORT_HARDCODE_SCALARS=1`` the export hard-codes it and
+    keeps the float the host code only computes with (``shift``) a runtime
+    argument."""
+    x = torch.randn(128, device=DEVICE)
+    bound = _host_offset.bind((x, 2.0, 2.0))
+    monkeypatch.delenv("HELION_CUTE_EXPORT_HARDCODE_SCALARS", raising=False)
+    with pytest.raises(GuardOnDataDependentSymNode):
+        bound.to_code(
+            bound.config_spec.default_config(),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+    monkeypatch.setenv("HELION_CUTE_EXPORT_HARDCODE_SCALARS", "1")
+    path = tmp_path / "native_host_offset.py"
+    path.write_text(
+        bound.to_code(
+            bound.config_spec.default_config(),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+    )
+    exported = _load(path)
+    torch.testing.assert_close(exported._host_offset(x, 2.0, 2.0), x * 2.0 + 3.0)
+    torch.testing.assert_close(exported._host_offset(x, 2.0, 3.0), x * 2.0 + 4.0)
+    with pytest.raises(ValueError, match="constant"):
+        exported._host_offset(x, 3.0, 2.0)
+    # The repro caller passes the hard-coded value instead of a placeholder.
+    repro_path = tmp_path / "native_host_offset_repro.py"
+    repro_path.write_text(
+        bound.to_code(
+            bound.config_spec.default_config(),
+            emit_repro_caller=True,
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+    )
+    call = next(
+        node
+        for node in ast.parse(repro_path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "call"
+    )
+    assert "    scale = 2.0" in ast.unparse(call).splitlines()
+    _load(repro_path).call()
 
 
 @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
@@ -410,5 +473,130 @@ def test_flash_attention(tmp_path: Path, family: str, head_dim: int) -> None:
         actual = native_attention.attention_output(*args)
         expected = torch.nn.functional.scaled_dot_product_attention(*args)
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+    """,
+    )
+
+
+@pytest.mark.slow
+def test_flash_attention_backward(tmp_path: Path) -> None:
+    """The fused flash backward's ``helion_flash_bwd`` plan only selects its
+    launch path, so it exports like the forward."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("flash attention requires Blackwell")
+    kernel = helion.kernel(
+        attention_backward.fn,
+        backend="cute",
+        autotune_effort="none",
+        autotune_accuracy_check=False,
+        static_shapes=True,
+    )
+    torch.manual_seed(0)
+    shape = (1, 2, 256, 64)
+    q, k, v, o, do = (
+        torch.randn(shape, device=DEVICE, dtype=torch.bfloat16) for _ in range(5)
+    )
+    sm_scale = 1.0 / math.sqrt(shape[-1])
+    # The example takes K pre-scaled to log2 units and the matching log2 LSE.
+    scores = q.float() @ k.float().transpose(-1, -2) * sm_scale
+    lse = torch.logsumexp(scores, -1) / math.log(2)
+    delta = torch.randn(shape[:-1], device=DEVICE)
+    args = (q, k * (sm_scale / math.log(2)), v, o, lse, do, delta, sm_scale)
+    bound = kernel.bind(args)
+    config = bound.config_spec.default_config()
+    expected = bound.compile_config(config)(*args)
+    code = bound.to_code(
+        config,
+        options=helion.OutputCodeOptions(allow_helion_deps=False),
+    )
+    assert "'kind': 'helion_flash_bwd'" in code
+    (tmp_path / "native_attention_bwd.py").write_text(code)
+    torch.save((args, expected), tmp_path / "case.pt")
+    _run_without_helion(
+        tmp_path,
+        """
+        import native_attention_bwd
+        args, expected = torch.load("case.pt")
+        actual = native_attention_bwd.attention_backward(*args)
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, atol=2e-2, rtol=2e-2)
+    """,
+    )
+
+
+@pytest.mark.slow
+def test_flex_attention_backward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FlexAttention backward exports on the fused backward with its
+    score/mask mods compiled in (the entry point omits them), the
+    ``enable_gqa`` its host code branches on hard-coded
+    (``HELION_CUTE_EXPORT_HARDCODE_SCALARS=1``) and ``scale`` a runtime
+    scalar, and runs without Helion."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("flash attention requires Blackwell")
+    monkeypatch.setenv("HELION_CUTE_EXPORT_HARDCODE_SCALARS", "1")
+    kernel = helion.kernel(
+        flex_example.helion_flex_attention_backward_kernel.fn,
+        backend="cute",
+        autotune_effort="none",
+        static_shapes=True,
+        fast_math=True,
+    )
+    torch.manual_seed(0)
+    shape = (1, 2, 256, 64)
+    q, k, v, out, grad_out = (
+        torch.randn(shape, device=DEVICE, dtype=torch.bfloat16) for _ in range(5)
+    )
+    scale = 1.0 / math.sqrt(shape[-1])
+    lse = torch.logsumexp(q.float() @ k.float().transpose(-1, -2) * scale, -1)
+    block_mask = create_block_mask(
+        noop_mask, None, None, shape[2], shape[2], device=str(DEVICE), BLOCK_SIZE=128
+    )
+    args = flex_example.flex_attention_backward_args(
+        q, k, v, grad_out, lse, out, None, None, block_mask, scale, False
+    )
+    # The row terms of ``_flex_attention_bwd_preprocess`` (a Helion kernel of
+    # its own, which would autotune here).
+    lse2 = lse * 1.44269504
+    delta = (out.float() * grad_out.float()).sum(-1)
+    args = (*args[:4], lse2, delta, *args[6:])
+    bound = kernel.bind(args)
+    config = bound.config_spec.default_config()
+    compiled = bound.compile_config(config)
+    rescaled = (*args[:-2], scale * 0.5, args[-1])
+    expected = (compiled(*args), compiled(*rescaled))
+    code = bound.to_code(
+        config,
+        options=helion.OutputCodeOptions(allow_helion_deps=False),
+    )
+    assert "'kind': 'helion_flash_bwd'" in code
+    entry = next(
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "helion_flex_attention_backward_kernel"
+    )
+    names = [arg.arg for arg in entry.args.args]
+    assert not {"score_mod", "score_mod_bwd", "block_mask_mask_mod"} & set(names)
+    validate = entry.body[0]
+    assert isinstance(validate, ast.Expr) and isinstance(validate.value, ast.Call)
+    specs = dict(zip(names, ast.literal_eval(validate.value.args[1]), strict=True))
+    assert specs["enable_gqa"] == ("constant", False)
+    assert specs["scale"] == ("scalar", "float")
+    (tmp_path / "native_flex_bwd.py").write_text(code)
+    entry_args = tuple(
+        bound.env.backend.standalone_entry_args(bound, case)
+        for case in (args, rescaled)
+    )
+    torch.save((entry_args, expected), tmp_path / "cases.pt")
+    _run_without_helion(
+        tmp_path,
+        """
+        import native_flex_bwd
+        cases, expected = torch.load("cases.pt")
+        for args, references in zip(cases, expected, strict=True):
+            actual = native_flex_bwd.helion_flex_attention_backward_kernel(*args)
+            for value, reference in zip(actual, references, strict=True):
+                torch.testing.assert_close(value, reference, atol=2e-2, rtol=2e-2)
     """,
     )

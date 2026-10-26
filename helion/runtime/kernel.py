@@ -3013,6 +3013,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             for name, value in zip(self.kernel.signature.parameters, args, strict=False)
             if isinstance(value, torch.Tensor)
         }
+        # Bool and float arguments trace as unbacked symbols that carry no
+        # value (an int keeps its value as the symbol's hint) and key a bound
+        # kernel by type, so this one serves every value. A standalone export
+        # that opts into it makes the ones its host code branches on concrete,
+        # with the values of the call being exported or else these
+        # construction-time values, and hard-codes them as constants of the
+        # exported kernel.
+        self._runtime_scalar_args_by_name: dict[str, bool | float] = {
+            name: value
+            for name, value in zip(self.kernel.signature.parameters, args, strict=False)
+            if type(value) is bool or type(value) is float
+        }
         self._first_compile_lock = threading.RLock()
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None
