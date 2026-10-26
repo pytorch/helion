@@ -196,6 +196,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("_helion_tensor_descriptor(", dict_unaligned_code)
         self.assertEqual(len(static_dict_copy._bound_kernels), 2)
 
+    @skipIfXPU("XPU doesn't have CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")
     def test_unfixed_cuda_descriptor_extent_cache_caps_at_tma_limit(self):
