@@ -47,6 +47,42 @@ _MAX_LX_BUFFERS = 2
 _BENCH_WARMUP = 1
 _BENCH_REPS = 3
 
+#: Launches submitted per timed sample, before one synchronize drains them.
+#:
+#: A Spyre launch is **asynchronous**: ``spyre_stream.cpp:261`` wraps
+#: ``launchOperationCompute``, so timing a call measures the enqueue and the
+#: loop overlaps submit(N+1) with compute(N). Timing one call at a time
+#: therefore measures the *queue*, not the kernel -- it reports ~26-30 us for
+#: matmuls from 0.07 to 4.3 GFLOP, a 64x work range, which at the top end would
+#: be 158 TFLOP/s. It also **inverts** the ranking the autotuner needs: on a
+#: 512x512 matmul it rates the 1-core config at 18 us and the 16-core config at
+#: 23-60 us, when draining shows 181 us against 62 us.
+#:
+#: Batching before the synchronize amortizes the one-off sync cost while still
+#: emptying the queue, so a per-launch figure stays meaningful. 8 is enough to
+#: separate every config of that matmul with disjoint IQRs while keeping a
+#: sweep affordable: it costs 8 launches per sample, not 8x the wall time,
+#: because the submissions pipeline.
+_BENCH_BATCH = 8
+
+
+def _drained(fn: object, batch: int = _BENCH_BATCH) -> float:
+    """Microseconds for one launch of ``fn``, with the device queue drained.
+
+    Submits ``batch`` launches, synchronizes once, and divides. The
+    synchronize is what makes this a measurement of the device rather than of
+    the submission path.
+    """
+    import time
+
+    import torch
+
+    start = time.perf_counter()
+    for _ in range(batch):
+        fn()
+    torch.accelerator.synchronize()
+    return (time.perf_counter() - start) * 1e3 / batch
+
 
 def _sencores() -> int:
     """Cores available to one kernel (``SENCORES``, default 32)."""
@@ -144,7 +180,8 @@ class SpyreBackend(Backend):
         return False
 
     def get_interleaved_bench(self) -> object:
-        """Wall-clock interleaved timing; the default needs Triton.
+        """Interleaved timing with the device queue drained; the default needs
+        Triton.
 
         ``autotuner/benchmarking.py:383`` imports ``triton.runtime`` for its
         cache-clearing and device-interface handles, which do not exist here.
@@ -153,7 +190,9 @@ class SpyreBackend(Backend):
 
         Interleaving exists to cancel slow drift between candidates, so the
         sweeps are round-robin over the candidate functions rather than
-        candidate-at-a-time.
+        candidate-at-a-time. Each candidate's turn is a *drained* batch (see
+        ``_BENCH_BATCH``): without the synchronize this timed the submission
+        queue and ranked candidates backwards.
         """
 
         def spyre_interleaved_bench(
@@ -164,8 +203,6 @@ class SpyreBackend(Backend):
             max_total_ms: object = None,
             **kwargs: object,
         ) -> list[float]:
-            import time
-
             fns = list(fns)
             for fn in fns:
                 fn()
@@ -174,21 +211,22 @@ class SpyreBackend(Backend):
             sweeps = max(1, min(int(repeat), _BENCH_REPS))
             for _ in range(sweeps):
                 for i, fn in enumerate(fns):
-                    start = time.perf_counter()
-                    fn()
-                    totals[i] += (time.perf_counter() - start) * 1e3
+                    totals[i] += _drained(fn)
             return [t / sweeps for t in totals]
 
         return spyre_interleaved_bench
 
     def get_do_bench(self) -> object:
-        """Wall-clock timing: the default ``do_bench`` is CUDA-shaped.
+        """Wall-clock timing with the device queue drained.
 
         ``autotuner/benchmarking.py`` times with CUDA events and streams
-        (`:105-114`), which do not exist for the ``spyre`` device. Spyre
-        launches are synchronous from the host's point of view -- ``runner.run``
-        returns once the jobplan completes -- so a monotonic clock around the
-        call is the honest measurement here, with no device-side timer to read.
+        (`:105-114`), which do not exist for the ``spyre`` device, and there is
+        no device-side timer to read instead.
+
+        A Spyre launch is asynchronous, so the naive form of this -- a clock
+        around one call -- measures submission and is flat in the problem size.
+        Each sample is a drained batch instead; see ``_BENCH_BATCH`` for the
+        measurements that forced it.
         """
 
         def spyre_do_bench(
@@ -202,16 +240,11 @@ class SpyreBackend(Backend):
             **kwargs: object,
         ) -> float | tuple[float, ...]:
             import statistics
-            import time
 
             for _ in range(_BENCH_WARMUP):
-                fn()
+                _drained(fn)
 
-            samples: list[float] = []
-            for _ in range(_BENCH_REPS):
-                start = time.perf_counter()
-                fn()
-                samples.append((time.perf_counter() - start) * 1e3)
+            samples: list[float] = [_drained(fn) for _ in range(_BENCH_REPS)]
 
             if return_mode == "all":
                 return tuple(samples)
