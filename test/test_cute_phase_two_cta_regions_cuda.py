@@ -2,18 +2,21 @@
 
 ``tcgen05_region_pid_types`` runs chosen GEMM phases of an ordered
 ``hl.barrier()`` chain (the two-GEMM ``squeeze_and_excitation_net`` backward
-chains of ``test._cute_se_bwd_chains``) as the static persistent CtaGroup.TWO
-pipeline while the chain and its pointwise phase stay flat; the exact-shape
-auxiliary epilogues (the relu-backward mask, ``grad_out * d + acc``) ride
-along.  Each render is checked against the fp32 torch reference and must
-match the flat chain's numerics bitwise (same tiles, same K order, same
-epilogue arithmetic).
+chains of ``test._cute_se_bwd_chains``, and the one-GEMM ``bwd_dc`` chain of
+the example itself) as the static persistent CtaGroup.TWO pipeline while the
+chain and its pointwise phase stay flat; the exact-shape auxiliary epilogues
+(the relu-backward mask, ``grad_out * d + acc``) ride along, and a launch
+left flat keeps the one-CTA pipeline at the AB depth its tile fits.  Each
+render is checked against the fp32 torch reference and must match the flat
+chain's numerics bitwise (same tiles, same K order, same epilogue
+arithmetic).
 """
 
 from __future__ import annotations
 
 from typing import cast
 
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_bwd_dc
 import pytest
 import torch
 
@@ -198,6 +201,160 @@ def test_bwd_da_two_cta_region_launches(pdl: bool) -> None:
     torch.cuda.synchronize()
     assert _rel_l2(flat_out, grad_a_ref) < 2e-3
     torch.testing.assert_close(two_cta_out, flat_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("pdl", [False, True], ids=["serial", "pdl"])
+def test_bwd_dc_one_gemm_chain_region_launches(pdl: bool) -> None:
+    """One GEMM phase beside a pointwise phase is planned per phase: grad_c
+    runs as a CtaGroup.TWO persistent launch while grad_cb renders 16-byte
+    packets, and the flat launch's ring reaches the depth its tile fits."""
+    _requires_sm100()
+    t = _inputs()
+    args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
+    grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
+        1.0 - t["d"].float()
+    )
+    grad_c_ref = (grad_cb.to(torch.float16).float() @ t["b"].float().T) * (t["c"] > 0)
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_bwd_dc.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    state = bound.config_spec._cute_tcgen05_config
+    # grad_cb: 512x512 pointwise phase; grad_c: 512x256x512 (relu mask).
+    assert state.materialized_matmul_shapes == ((512, 256, 512),)
+    assert state.region_pid_type_choices()
+    tiles = [128, 128, 64]
+    flat = _chain_config(bound, None, tiles=tiles, region_ab_stages=[], pdl=pdl)
+    assert flat.config["tcgen05_ab_stages"] == 2
+    # The one-CTA fit of a 128x128x64 fp16 tile beside a 4-stage output
+    # ring: 6 AB stages (the flat chain used to validate 3 at most).
+    deep_flat = _chain_config(
+        bound,
+        None,
+        tiles=tiles,
+        region_ab_stages=[],
+        pdl=pdl,
+        tcgen05_ab_stages=6,
+        tcgen05_c_stages=4,
+    )
+    assert deep_flat.config["tcgen05_ab_stages"] == 6
+    with pytest.raises(helion.exc.InvalidConfig, match="maximum AB stages: 6"):
+        _chain_config(
+            bound,
+            None,
+            tiles=tiles,
+            region_ab_stages=[],
+            pdl=pdl,
+            tcgen05_ab_stages=7,
+            tcgen05_c_stages=4,
+        )
+    pointwise = {
+        "num_threads": [1, 64, 0, 0, 0],
+        "cute_vector_widths": [1, 8, 1, 1, 1],
+    }
+    two_cta = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=tiles,
+        region_ab_stages=[4],
+        pdl=pdl,
+        tcgen05_aux_load_placement="pre_acc_wait",
+        **pointwise,
+    )
+    blocks = list(two_cta.block_sizes)
+    blocks[:2] = [1, 512]
+    # The chain's launches raster under the shared L2 swizzle (two N tiles
+    # of 128 at N=256 admit a swizzle of 2).
+    two_cta = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=tiles,
+        region_ab_stages=[4],
+        pdl=pdl,
+        tcgen05_aux_load_placement="pre_acc_wait",
+        tcgen05_l2_swizzle_size=2,
+        block_sizes=blocks,
+        **pointwise,
+    )
+    assert two_cta.config["tcgen05_region_pid_types"] == ["persistent_blocked"]
+    assert two_cta.config["cute_vector_widths"] == [1, 8, 1, 1, 1]
+    assert two_cta.config["tcgen05_l2_swizzle_size"] == 2
+    assert two_cta.block_sizes[:2] == [1, 512]
+    source = bound.to_code(two_cta)
+    assert "CtaGroup.TWO" in source
+    assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in source
+    # The kernel returns (grad_cb, grad_c).
+    flat_out = bound.compile_config(flat, allow_print=False)(*args)
+    deep_out = bound.compile_config(deep_flat, allow_print=False)(*args)
+    two_cta_out = bound.compile_config(two_cta, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    assert _rel_l2(flat_out[1], grad_c_ref) < 2e-3
+    torch.testing.assert_close(deep_out, flat_out, atol=0, rtol=0)
+    torch.testing.assert_close(two_cta_out, flat_out, atol=0, rtol=0)
+
+
+def test_bwd_dx_flat_ring_bound_at_bk128() -> None:
+    """At bm=128/bk=128 a flat launch's 16-bit ring stops at the standalone
+    surface's admission (4 stages of 128x32x128, a 160 KiB ring), as the
+    kernel's knob and as an ``inherit`` launch's region entry; the admitted
+    depth is bitwise equal to the shallow ring.  The deeper rings the bare
+    one-CTA capacity would hold (ab5, 200 KiB) changed grad_x's rounding in
+    about 0.1 % of its elements and are refused."""
+    _requires_sm100()
+    t = _inputs((1024, 512, 256))
+    args = (t["grad_out"], t["x"], t["a"], t["b"], t["c"], t["d"])
+    grad_x_ref, _grad_a_ref = _reference(t)
+    kernel = helion.kernel(
+        se_bwd_dx_chain,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    # grad_c 128x128x64 (one K tile of 64 fits 6), grad_x 128x32x128.
+    tiles = [128, 128, 64, 128, 32, 128]
+    flat = _chain_config(bound, None, tiles=tiles, region_ab_stages=[], pdl=False)
+    deep_flat = _chain_config(
+        bound, None, tiles=tiles, region_ab_stages=[], pdl=False, tcgen05_ab_stages=4
+    )
+    assert deep_flat.config["tcgen05_ab_stages"] == 4
+    with pytest.raises(helion.exc.InvalidConfig, match="maximum AB stages: 4"):
+        _chain_config(
+            bound,
+            None,
+            tiles=tiles,
+            region_ab_stages=[],
+            pdl=False,
+            tcgen05_ab_stages=5,
+        )
+    mixed = _chain_config(
+        bound,
+        ["persistent_blocked", "inherit"],
+        tiles=tiles,
+        region_ab_stages=[4, 4],
+        pdl=False,
+        tcgen05_aux_load_placement="pre_acc_wait",
+    )
+    assert mixed.config["tcgen05_region_ab_stages"] == [4, 4]
+    with pytest.raises(helion.exc.InvalidConfig, match="per-region SMEM"):
+        _chain_config(
+            bound,
+            ["persistent_blocked", "inherit"],
+            tiles=tiles,
+            region_ab_stages=[4, 5],
+            pdl=False,
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+    flat_out = bound.compile_config(flat, allow_print=False)(*args)
+    deep_out = bound.compile_config(deep_flat, allow_print=False)(*args)
+    mixed_out = bound.compile_config(mixed, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    assert _rel_l2(flat_out, grad_x_ref) < 2e-3
+    torch.testing.assert_close(deep_out, flat_out, atol=0, rtol=0)
+    torch.testing.assert_close(mixed_out, flat_out, atol=0, rtol=0)
 
 
 def test_chain_seeds_compile_and_match() -> None:

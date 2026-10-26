@@ -101,7 +101,9 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
+    from ..language.matmul_ops import CuteTcgen05SearchPlan
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
+    from .cute.cute_mma import _CuteMmaNode
     from .cute.layout import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
@@ -131,6 +133,31 @@ def _finalize_cute_tcgen05_search_planning(
     return (
         all(result.guards_complete for result in planning_results)
         and len(analysis_keys) == 1
+    )
+
+
+def _enable_cute_phase_mma_search(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
+    search_candidates: Sequence[
+        tuple[_CuteMmaNode, torch.Tensor, CuteTcgen05SearchPlan]
+    ],
+    mma_candidates: Sequence[
+        tuple[_CuteMmaNode, torch.Tensor, torch.Tensor, torch.fx.Node]
+    ],
+) -> bool:
+    """Plan an ordered ``hl.barrier()`` chain per phase; False where it declines."""
+    from .cute.materialized_mma import enable_phase_mma_search
+
+    return enable_phase_mma_search(
+        env,
+        device_ir,
+        planning_results,
+        search_candidates,
+        mma_nodes={
+            id(candidate): node for candidate, _lhs, _rhs, node in mma_candidates
+        },
     )
 
 
@@ -3890,11 +3917,30 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 # set on a later binding. Publish all source-backed guards only
                 # after every candidate has observed the same compile state.
                 env = CompileEnvironment.current()
-                if _finalize_cute_tcgen05_search_planning(
+                single_analysis = _finalize_cute_tcgen05_search_planning(
                     env,
                     planning_results,
                     analysis_keys,
+                )
+                if env.cute_fission_plan is None and (
+                    env.has_barrier
+                    and len(device_ir.root_ids) > 1
+                    and _enable_cute_phase_mma_search(
+                        env,
+                        device_ir,
+                        planning_results,
+                        search_candidates,
+                        mma_candidates,
+                    )
                 ):
+                    # An ordered ``hl.barrier()`` chain plans per phase
+                    # whenever its phases prove out, with one GEMM phase as
+                    # with several: each GEMM launch owns its tile triple,
+                    # budget and per-launch pid type, and the plain phases
+                    # their layout knobs.  A chain the per-phase planner
+                    # declines takes the standalone surface below.
+                    pass
+                elif single_analysis:
                     candidate, lhs, search_plan = search_candidates[0]
                     config_spec._cute_tcgen05_config.fission_bundle = (
                         env.cute_fission_plan is not None
@@ -3980,21 +4026,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for candidate, _lhs, _rhs, node in mma_candidates
                         },
                     )
-                elif env.has_barrier and len(device_ir.root_ids) > 1:
-                    # Several GEMM shapes split by ``hl.barrier()``: each phase
-                    # is its own ordered launch, so each GEMM plans per phase.
-                    from .cute.materialized_mma import enable_phase_mma_search
-
-                    enable_phase_mma_search(
-                        env,
-                        device_ir,
-                        planning_results,
-                        search_candidates,
-                        mma_nodes={
-                            id(candidate): node
-                            for candidate, _lhs, _rhs, node in mma_candidates
-                        },
-                    )
         if (
             len(device_ir.root_ids) > 1
             and CompileEnvironment.current().cute_fission_plan is None
@@ -4031,6 +4062,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             "persistent pid types yet (single-root launch grid)",
                         )
                 config_spec.allowed_pid_types = non_persistent_pid_types
+            if (
+                config_spec.cute_tcgen05_search_enabled
+                and CompileEnvironment.current().has_barrier
+            ):
+                # The flat chain launches every ``hl.barrier()`` phase on its
+                # own; a phase without a matmul keeps the SIMT layout knobs
+                # a fission plan's pointwise region has (``enable_phase_
+                # mma_search`` publishes them itself for multi-GEMM chains).
+                from .cute.materialized_mma import register_plain_barrier_phases
+
+                register_plain_barrier_phases(CompileEnvironment.current(), device_ir)
 
         # Build structural and liveness observations once, after reduction rolling has
         # finalized the graph set. Specialized fact passes consume this shared analysis.
