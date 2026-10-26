@@ -324,9 +324,12 @@ class _FakeBoundKernel:
             f"num_stages={config.num_stages}{self.launch_kwargs_source}"
         )
         source = "def demo(x, *, _launcher=_default_launcher):\n"
-        source += "    before_launch(x)\n" + "".join(
-            f"    _launcher({name}, {self.grid(config)}, x, {launch})\n"
-            for name in self.kernel_names
+        source += (
+            "    before_launch(x)\n    if not x.numel():\n        return x\n"
+            + "".join(
+                f"    _launcher({name}, {self.grid(config)}, x, {launch})\n"
+                for name in self.kernel_names
+            )
         )
         source += "    after_launch(x)\n    return x\n"
         path = self.tmp_path / f"fake_host_{len(self.compiled)}.py"
@@ -395,7 +398,7 @@ class TestFitOnFirstLaunch:
         bound_kernel.select(Config(block_sizes=[64], num_stages=8))(torch.zeros(4))
         assert _stages(bound_kernel.attempts) == [8, 4, 3]
         assert bound_kernel._config is not None
-        assert bound_kernel._config.num_stages == 3
+        assert bound_kernel._config == Config(block_sizes=[64], num_stages=3)
 
     @pytest.mark.parametrize(
         ("num_stages", "range_num_stages", "expected"),
@@ -806,6 +809,89 @@ class TestFitOnFirstLaunch:
         assert [
             (name, config.num_stages) for name, config in bound_kernel.launched
         ] == [("_helion_demo", 5), ("_helion_demo_1", 5)]
+
+    def test_empty_call_keeps_first_launch_fitting_armed(self, tmp_path: Path) -> None:
+        bound_kernel = _FakeBoundKernel(tmp_path, 300_000, _buffers)
+        run = bound_kernel.select(Config(block_sizes=[64], num_stages=8))
+        run(torch.zeros(0))
+        assert bound_kernel._run is run
+        assert bound_kernel.attempts == []
+        run(torch.zeros(4))
+        assert _stages(bound_kernel.launched) == [5]
+        assert bound_kernel._config == Config(block_sizes=[64], num_stages=5)
+
+    def test_empty_call_does_not_publish_a_pending_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        bound_kernel = _FakeBoundKernel(
+            tmp_path, 300_000, lambda config: 150_000 + _buffers(config)
+        )
+        run = bound_kernel.select(Config(block_sizes=[64], num_stages=8))
+        started, finish = threading.Event(), threading.Event()
+
+        def pause_candidate(config: Config) -> None:
+            if config.num_stages == 4:
+                started.set()
+                assert finish.wait(10)
+
+        bound_kernel.launch_error = pause_candidate
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(run, torch.zeros(4))
+            try:
+                assert started.wait(10)
+                run(torch.zeros(0))
+                assert bound_kernel._run is run
+            finally:
+                finish.set()
+            first.result(timeout=10)
+        assert _stages(bound_kernel.launched) == [3]
+        assert bound_kernel._config == Config(block_sizes=[64], num_stages=3)
+
+    def test_interrupted_caller_does_not_publish_another_calls_reset_state(
+        self, tmp_path: Path
+    ) -> None:
+        bound_kernel = _FakeBoundKernel(
+            tmp_path, 3500, lambda config: config.num_stages * 1000
+        )
+        run = bound_kernel.select(Config(block_sizes=[64], num_stages=8))
+        started, finish = threading.Event(), threading.Event()
+        first_thread: int | None = None
+        interrupted = False
+        before, after = Mock(), Mock()
+        bound_kernel.before_launch, bound_kernel.after_launch = before, after
+
+        def pause_or_interrupt(config: Config) -> None:
+            nonlocal interrupted
+            if config.num_stages != 3:
+                return
+            if threading.get_ident() == first_thread:
+                started.set()
+                assert finish.wait(10)
+            elif not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        def first_call() -> None:
+            nonlocal first_thread
+            first_thread = threading.get_ident()
+            run(torch.zeros(4))
+
+        bound_kernel.launch_error = pause_or_interrupt
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(first_call)
+            try:
+                assert started.wait(10)
+                with pytest.raises(KeyboardInterrupt):
+                    run(torch.zeros(4))
+            finally:
+                finish.set()
+            first.result(timeout=10)
+        assert bound_kernel._run is run
+        bound_kernel._run(torch.zeros(4))
+        assert _stages(bound_kernel.launched) == [3, 3]
+        assert bound_kernel._config == Config(block_sizes=[64], num_stages=3)
+        assert bound_kernel.default_launches == []
+        assert (before.call_count, after.call_count) == (3, 2)
 
     def test_concurrent_first_calls_fit_once(self, tmp_path: Path) -> None:
         bound_kernel = _FakeBoundKernel(tmp_path, 300_000, _buffers)

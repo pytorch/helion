@@ -117,8 +117,8 @@ class _FirstLaunchFit:
     its pipelining but not its results.  (The host code can differ when code
     generation guarded on input sizes after it generated the running code.)  If
     no smaller config loads, the original error is raised.  After the first
-    call returns, the bound kernel runs the original or the fitted config
-    directly.
+    call that validates the current config returns, the bound kernel runs
+    that config directly. Calls that launch nothing leave fitting armed.
     """
 
     def __init__(
@@ -149,9 +149,18 @@ class _FirstLaunchFit:
     def __call__(self, *args: object) -> object:
         if torch.compiler.is_compiling():
             return self.compiled(*args)
-        result = self.compiled(*args, _launcher=self.launch)
+        # Publish only a launch this call observed. An empty call or another
+        # caller resetting the shared candidate has not verified current.
+        launched: list[tuple[Config, Callable[..., object], bool]] = []
+        result = self.compiled(
+            *args, _launcher=functools.partial(self.launch, launched)
+        )
         with self.lock:
-            if self.bound_kernel._run is self:
+            if (
+                self.bound_kernel._run is self
+                and launched
+                and launched[-1] is self.current
+            ):
                 config, compiled, _ = self.current
                 if compiled is self.compiled:
                     self.bound_kernel._run = compiled
@@ -161,6 +170,7 @@ class _FirstLaunchFit:
 
     def launch(
         self,
+        launched: list[tuple[Config, Callable[..., object], bool]],
         triton_kernel: Any,  # noqa: ANN401
         grid: tuple[int, ...],
         *args: object,
@@ -176,7 +186,7 @@ class _FirstLaunchFit:
             # Another caller may still be loading this candidate. Establish
             # this call's original error before joining its fit.
             tried = (self.config, self.compiled, True)
-        launch = (triton_kernel, grid, args, num_warps, num_stages, kwargs)
+        launch = (launched, triton_kernel, grid, args, num_warps, num_stages, kwargs)
         try:
             return self.launch_as(tried, *launch)
         except OutOfResources as error:
@@ -228,6 +238,7 @@ class _FirstLaunchFit:
     def launch_as(
         self,
         fitted: tuple[Config, Callable[..., object], bool],
+        launched: list[tuple[Config, Callable[..., object], bool]],
         triton_kernel: Any,  # noqa: ANN401
         grid: tuple[int, ...],
         args: tuple[object, ...],
@@ -244,7 +255,7 @@ class _FirstLaunchFit:
                 triton_kernel = compiled.__globals__[triton_kernel.__name__]
                 num_warps = self.backend.effective_num_warps(config)
             num_stages = config.num_stages
-        return default_launcher(
+        result = default_launcher(
             triton_kernel,
             grid,
             *args,
@@ -252,6 +263,9 @@ class _FirstLaunchFit:
             num_stages=num_stages,
             **kwargs,  # pyrefly: ignore [bad-argument-type]
         )
+        # Only the last successful invocation is needed, even for a host loop.
+        launched[:] = [fitted]
+        return result
 
     def smaller(
         self, config: Config, error: OutOfResources
