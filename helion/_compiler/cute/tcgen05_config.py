@@ -241,6 +241,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from .tcgen05_constants import TCGEN05_TWO_CTA_PAIR_BLOCK_NS
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
@@ -1350,7 +1351,7 @@ class CuteTcgen05Config:
             or view is None
             or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
             or config.get("tcgen05_cluster_m", 1) != 2
-            or config.get("tcgen05_cluster_n", 1) != 1
+            or config.get("tcgen05_cluster_n", 1) not in (1, 2)
             or config.get("pid_type")
             not in (
                 "persistent_blocked",
@@ -1385,6 +1386,13 @@ class CuteTcgen05Config:
             or c_stages not in (2, 4)
             or acc_stages not in (1, 2)
         ):
+            return None
+        if config.get(
+            "tcgen05_cluster_n", 1
+        ) == 2 and not self._pair_cluster_n2_is_valid(bm, bn):
+            # The 2x2 multicast cluster (A across the N pair) is the pair's
+            # render with the cluster lines changed, admitted on the 4-CTA
+            # envelope only; the per-CTA SMEM reservation below is the same.
             return None
         if facts.output_column_major:
             bounds = self._matmul_search_bounds()
@@ -1844,6 +1852,23 @@ class CuteTcgen05Config:
         limit = self._paired_pipeline_stage_limit(config)
         if limit is not None and limit > 0:
             return
+        if config.get("tcgen05_cluster_n", 1) == 2:
+            pair_limit = self._paired_pipeline_stage_limit(
+                {**config, "tcgen05_cluster_n": 1}
+            )
+            if pair_limit is not None and pair_limit > 0:
+                # The CTA pair is admitted; only the 2x2 multicast cluster's
+                # envelope refuses (``_pair_cluster_n2_is_valid``).  The
+                # search keeps the sampled pair and drops the cluster rather
+                # than leaving the family.
+                if fix_invalid:
+                    config["tcgen05_cluster_n"] = 1
+                    return
+                raise InvalidConfig(
+                    "tcgen05_cta_group='two' runs tcgen05_cluster_n=2 (the 2x2 "
+                    "multicast cluster) only on the two-CTA 256-row pair tile "
+                    "with an even N tile count of an unbatched GEMM"
+                )
         if fix_invalid:
             config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
             return
@@ -2146,34 +2171,58 @@ class CuteTcgen05Config:
                                 if aux_mode == TCGEN05_AUX_LOAD_MODE_EPI_TMA
                                 else (min(2, maximum), maximum)
                             )
+                            # nvjet's 2x2 clusters stage the same pair tiles
+                            # 64 deep in K (``128x256_64x6_2x2_2cta``): the
+                            # deepest bk=64 SIMT ring gets a 2x2 twin where
+                            # the pair tile is inside the 4-CTA envelope
+                            # (256 rows, whole N-tile pairs, full static
+                            # tiles).  The twin's render is the pair's with
+                            # the cluster lines changed, so the ring depth
+                            # carries over.
+                            cluster_ns = (1,)
+                            if (
+                                bk == 64
+                                and aux_mode == TCGEN05_AUX_LOAD_MODE_SIMT
+                                and all(
+                                    extent % value == 0
+                                    for extent, value in zip(
+                                        (m, n, k), values, strict=True
+                                    )
+                                )
+                                and self._pair_cluster_n2_is_valid(bm, bn)
+                            ):
+                                cluster_ns = (1, 2)
                             for stages in dict.fromkeys(depths):
                                 if stages <= 0:
                                     continue
-                                seed = Config(
-                                    block_sizes=block_sizes,
-                                    pid_type=pid,
-                                    tcgen05_cta_group="two",
-                                    tcgen05_cluster_m=2,
-                                    tcgen05_cluster_n=1,
-                                    tcgen05_ab_stages=stages,
-                                    tcgen05_c_stages=2,
-                                    tcgen05_acc_stages=acc_stages,
-                                    tcgen05_persistence_model="static_persistent",
-                                    tcgen05_strategy="role_local_monolithic",
-                                    tcgen05_layout_strategy="default",
-                                    tcgen05_tvm_ffi_launch=False,
-                                    tcgen05_flat_role_coordinates=False,
-                                    **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
-                                )
-                                if facts.has_auxiliary_loads:
-                                    seed.config[
-                                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
-                                    ] = placement
-                                if aux_mode != TCGEN05_AUX_LOAD_MODE_SIMT:
-                                    seed.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = (
-                                        aux_mode
+                                for cluster_n in cluster_ns:
+                                    if cluster_n == 2 and stages != maximum:
+                                        continue
+                                    seed = Config(
+                                        block_sizes=block_sizes,
+                                        pid_type=pid,
+                                        tcgen05_cta_group="two",
+                                        tcgen05_cluster_m=2,
+                                        tcgen05_cluster_n=cluster_n,
+                                        tcgen05_ab_stages=stages,
+                                        tcgen05_c_stages=2,
+                                        tcgen05_acc_stages=acc_stages,
+                                        tcgen05_persistence_model="static_persistent",
+                                        tcgen05_strategy="role_local_monolithic",
+                                        tcgen05_layout_strategy="default",
+                                        tcgen05_tvm_ffi_launch=False,
+                                        tcgen05_flat_role_coordinates=False,
+                                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
                                     )
-                                seeds.append(seed)
+                                    if facts.has_auxiliary_loads:
+                                        seed.config[
+                                            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+                                        ] = placement
+                                    if aux_mode != TCGEN05_AUX_LOAD_MODE_SIMT:
+                                        seed.config[
+                                            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+                                        ] = aux_mode
+                                    seeds.append(seed)
         return seeds
 
     def _small_grid_seed_configs(self) -> list[Config]:
@@ -2593,6 +2642,69 @@ class CuteTcgen05Config:
             and n % bn == 0
             and (n // bn) % 2 == 0
         )
+
+    def _pair_cluster_n2_is_valid(self, bm: object, bn: object) -> bool:
+        """The paired pipeline's 2x2 (4-CTA) multicast cluster envelope.
+
+        ``tcgen05_cluster_n=2`` multicasts each A half across the two CTA
+        pairs of a cluster that share an M tile and walk adjacent N tiles
+        (B stays split inside each pair), so it needs the 256-row
+        CtaGroup.TWO pair tile -- the 128-row pair tile of
+        ``tcgen05_cta_group='two'`` runs a 64-row CTA tile the 4-CTA
+        envelope was never validated on -- whole N-tile pairs of a single
+        GEMM (the persistent scheduler walks whole clusters; an odd count
+        would pad one with a tile that does not exist, which the render
+        refuses) and no batch axis.  The render is the ``"auto"`` pair's
+        with the cluster lines changed (cluster layout, arrive count,
+        V-leader predicate, scheduler cluster shape, launch grid), so no
+        new SMEM or barrier model is involved.
+        """
+        return bm == TCGEN05_TWO_CTA_BLOCK_M and self._one_wave_cluster_n2_is_valid(bn)
+
+    def _cluster_n2_n_tile_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_cluster_n=2`` cannot pair this GEMM's N tiles.
+
+        Every 2x2 cluster family walks whole clusters of two N tiles
+        (``cute_mma`` refuses an odd ``cdiv(N, block_n)`` at render, after
+        the search has spent a compile on the sample).  Judged on the static
+        N extent of the single matmul the config tiles; families that own
+        their own geometry (grouped worklists, the dense aligned-N plan,
+        materialized chains, dynamic shapes) are not judged here.
+        """
+        if (
+            config.get("tcgen05_cluster_n", 1) != 2
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None
+            or config.get(TILE_N_KEY, 0) != 0
+        ):
+            return None
+        extents = self.matmul_compile_time_static_extents
+        view = self._matmul_config_view(config)
+        if extents is None or view is None:
+            return None
+        n = extents[1]
+        blocks, _m_index, n_index, _k_index = view
+        bn = blocks[n_index]
+        if not isinstance(n, int) or type(bn) is not int or bn <= 0:
+            return None
+        tiles = -(-n // bn)
+        if tiles % 2 == 0:
+            return None
+        return (
+            f"tcgen05_cluster_n=2 pairs N tiles, but cdiv({n}, {bn}) = {tiles} "
+            "tiles is odd; use tcgen05_cluster_n=1 or a block_n with an even "
+            "N tile count"
+        )
+
+    def _validate_cluster_n_pairs_n_tiles(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        reason = self._cluster_n2_n_tile_refusal(config)
+        if reason is None:
+            return
+        if fix_invalid:
+            config["tcgen05_cluster_n"] = 1
+            return
+        raise InvalidConfig(reason)
 
     def _batched_multi_tile_seed_configs(self) -> list[Config]:
         """Persistent two-CTA seeds for batched GEMMs with several tiles per pair.
@@ -4060,9 +4172,9 @@ class CuteTcgen05Config:
             return
         if self._fanout_pair_search_config_supported(config):
             # A sampled CTA pair carrying the proved shared fanout keeps the
-            # fanout's own validated pair geometry (the 256x128 16-bit tile,
-            # two C stages, role-local monolithic SIMT aux loads; see
-            # ``epilogue_fanout_config_supported``). The projections below
+            # pair geometry its budgets admit (a 16-bit pair N tile, two C
+            # stages, role-local monolithic SIMT aux loads; see
+            # ``_pair_fanout_refusal``). The projections below
             # -- the canonical 256x256 tile and the aux-TMA producer regime --
             # are calibrated for the single-output residual family and would
             # drop the fanout, so a two-output kernel's pair recipe was never
@@ -4085,7 +4197,14 @@ class CuteTcgen05Config:
                 block_sizes[n_index] = 128
             if block_sizes[k_index] not in (64, 128, 256):
                 block_sizes[k_index] = 64
-            config["tcgen05_cluster_n"] = 1
+            # A sampled 2x2 multicast cluster stays where the projected pair
+            # tile is inside its envelope (``_pair_cluster_n2_is_valid``).
+            if config.get(
+                "tcgen05_cluster_n", 1
+            ) == 2 and not self._pair_cluster_n2_is_valid(
+                block_sizes[m_index], block_sizes[n_index]
+            ):
+                config["tcgen05_cluster_n"] = 1
             config["pid_type"] = "persistent_blocked"
             config.pop("epilogue_subtile", None)
             return
@@ -4613,36 +4732,136 @@ class CuteTcgen05Config:
         )
 
     def epilogue_fanout_config_supported(self, config: dict[str, object]) -> bool:
+        return self.epilogue_fanout_refusal(config) is None
+
+    def epilogue_fanout_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_epilogue_fanout='shared'`` is refused; None if admitted.
+
+        One CTA takes any whole tile of the fanout's outputs. The CTA pair
+        (``tcgen05_cluster_m=2``) is admitted by budget rather than at one
+        fixed geometry (``_pair_fanout_refusal``): it must store 16-bit
+        outputs of the 256-row pair tile (the codegen store protocol's fact)
+        at one of the backend's pair N tiles and leave room for one AB stage
+        next to both outputs' C rings in the static arena; the ring depth
+        itself is judged by ``_normalize_multi_output_rings``.
+        """
         if not self.epilogue_fanout_plans or not fanout_schedule_supported(config):
-            return False
+            return "the fanout needs the standard role-local TMA epilogue schedule"
         blocks = config.get("block_sizes")
         if not isinstance(blocks, list):
-            return False
+            return "the fanout needs the kernel's block sizes"
         for plan in self.epilogue_fanout_plans:
             for block_id, extent in zip(plan.block_ids, plan.shape, strict=True):
                 index = self._config_block_index(block_id)
                 if index is None or index >= len(blocks):
-                    return False
+                    return "the fanout needs a block size per output axis"
                 block = blocks[index]
                 if type(block) is not int or block <= 0 or extent % block:
-                    return False
+                    return (
+                        f"the fanout stores whole tiles: {block!r} does not "
+                        f"divide the output extent {extent}"
+                    )
             if config.get("tcgen05_cluster_m", 1) == 2:
-                index = self._config_block_index(plan.block_ids[0])
-                assert index is not None
-                n_index = self._config_block_index(plan.block_ids[1])
-                assert n_index is not None
-                if (
-                    blocks[index] != 256
-                    or blocks[n_index] != 128
-                    or plan.output_dtype.itemsize != 2
-                ):
-                    return False
+                reason = self._pair_fanout_refusal(config, plan, blocks)
+                if reason is not None:
+                    return reason
             if (
                 config.get("tcgen05_aux_load_placement") == "pre_acc_wait"
                 and not plan.pre_wait_aux_safe
             ):
-                return False
-        return True
+                return (
+                    "pre_acc_wait needs the pair's auxiliary reads proved safe "
+                    "ahead of the accumulator wait"
+                )
+        return None
+
+    def _pair_fanout_refusal(
+        self,
+        config: dict[str, object],
+        plan: PairedFanoutPlan,
+        blocks: list[object],
+    ) -> str | None:
+        """Budget admission of the shared fanout on a tcgen05 CTA pair.
+
+        The pair's epilogue stores two 16-bit outputs of each CTA's 128-row
+        half of the ``TCGEN05_TWO_CTA_BLOCK_M``-row pair tile through the
+        standard role-local TMA protocol at whatever N tile the pair MMA
+        runs (``TCGEN05_TWO_CTA_PAIR_BLOCK_NS``), so the geometry is admitted
+        when its budgets hold rather than at one validated shape: the M tile
+        must be the 256-row pair tile (the fact the codegen gate
+        ``epilogue_fanout.store_protocol_supported`` demands of a two-CTA
+        store; a 128-row tile under ``tcgen05_cluster_m=2`` -- the clustered
+        one-CTA family, or the pair MMA under ``tcgen05_cta_group='two'`` /
+        the fp8 small grid -- has no such epilogue), and one AB stage must
+        fit next to both outputs' C rings and the fixed allocations in the
+        per-CTA SMEM arena (``default_layout_smem_fits``, which charges one
+        ring per output).  The accumulator stages of a clustered fanout are
+        pinned to two by ``fanout_schedule_supported`` and ``bn <= 256`` by
+        the pair N tiles, so the 512 TMEM columns always hold them.  Fails
+        closed without a recorded SMEM budget.
+        """
+        m_index = self._config_block_index(plan.block_ids[0])
+        n_index = self._config_block_index(plan.block_ids[1])
+        assert m_index is not None and n_index is not None
+        bm = blocks[m_index]
+        bn = blocks[n_index]
+        assert type(bm) is int and type(bn) is int
+        if bm != TCGEN05_TWO_CTA_BLOCK_M:
+            return (
+                "a clustered fanout's role-local TMA-store epilogue stores each "
+                f"CTA's {TCGEN05_TWO_CTA_BLOCK_M // 2}-row half of the "
+                f"{TCGEN05_TWO_CTA_BLOCK_M}-row tcgen05 pair tile; a {bm}-row "
+                f"tile under tcgen05_cluster_m=2 (the clustered one-CTA family, "
+                f"or the pair MMA under {TCGEN05_CTA_GROUP_CONFIG_KEY}='two') "
+                "has no such epilogue"
+            )
+        if plan.output_dtype.itemsize != 2:
+            return "the CTA-pair fanout stores 16-bit outputs"
+        if bn not in TCGEN05_TWO_CTA_PAIR_BLOCK_NS:
+            return (
+                f"the CTA pair runs its MMA at N tiles "
+                f"{sorted(TCGEN05_TWO_CTA_PAIR_BLOCK_NS)}, not {bn}"
+            )
+        if config.get("tcgen05_cluster_n", 1) == 2 and (plan.shape[1] // bn) % 2:
+            # The N-pair multicast walks whole clusters of two N tiles; the
+            # persistent scheduler would pad an odd count with a tile that does
+            # not exist (``cute_mma`` refuses the render).
+            return (
+                f"the 2x2 cluster pairs N tiles, but {plan.shape[1]} // {bn} = "
+                f"{plan.shape[1] // bn} tiles is odd"
+            )
+        if self.materialized_matmul_block_ids:
+            # A fission plan or barrier chain budgets each GEMM launch from
+            # its typed pair proof (``_materialized_paired_stage_limits``).
+            return None
+        view = self._matmul_config_view(config)
+        if view is None:
+            return "the CTA-pair fanout needs the matmul's K block"
+        block_sizes, _m, _n, k_index = view
+        bk = block_sizes[k_index]
+        if type(bk) is not int or bk <= 0:
+            return "the CTA-pair fanout needs a positive K block"
+        c_stages = config.get("tcgen05_c_stages", 2)
+        assert type(c_stages) is int
+        facts = self.rowvec_aux_facts
+        outputs = facts.output_count if facts is not None else 1
+        if not self.default_layout_smem_fits(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=2,
+            ab_stages=1,
+            c_stages=c_stages,
+            stage_rows=self._store_lowering_stages_rows(config),
+            epi_warps=self._config_epi_warps(config),
+            acc_stages=self._config_acc_stages(config),
+        ):
+            return (
+                f"a {bm}x{bn}x{bk} CTA-pair tile leaves no room for one AB "
+                f"stage next to the {outputs} outputs' {c_stages}-stage C rings "
+                "in the per-CTA SMEM arena"
+            )
+        return None
 
     def _normalize_epilogue_fanout(
         self,
@@ -4764,10 +4983,18 @@ class CuteTcgen05Config:
             ) is True and not self.aux_fragment_hoist_admissible(config):
                 config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
         else:
+            reason = (
+                self.epilogue_fanout_refusal(config)
+                if type(value) is str
+                and value == "shared"
+                and self.epilogue_fanout_plans
+                and validate_schedule
+                else None
+            )
             raise InvalidConfig(
                 f"{FANOUT_CONFIG_KEY}={value!r} requires a proved equal-layout "
                 "fresh-output fanout and a static-full standard "
-                "role-local TMA epilogue"
+                "role-local TMA epilogue" + (f": {reason}" if reason else "")
             )
 
     def _normalize_batch_raster(
@@ -5372,6 +5599,10 @@ class CuteTcgen05Config:
         self._normalize_grouped_balanced_workers(config, fix_invalid=fix_invalid)
         self._normalize_grouped_prefix_adaptive_n(config, fix_invalid=fix_invalid)
         self._normalize_grouped_panel_adaptation(config, fix_invalid=fix_invalid)
+        # A 2x2 cluster on an odd N tile count is repaired to the pair before
+        # the fanout is judged, so the sample keeps its fanout and its pair
+        # (judged again on the final tile in ``normalize_strategy``).
+        self._validate_cluster_n_pairs_n_tiles(config, fix_invalid=fix_invalid)
         self._normalize_epilogue_fanout(config, fix_invalid=fix_invalid)
         self._normalize_warp_register_reallocation(config, fix_invalid=fix_invalid)
         full_a_key = TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
@@ -5769,7 +6000,8 @@ class CuteTcgen05Config:
         measured plain and row-vector kernels. The C subtile follows the
         matmul plan (``cute_mma``): (128, 32) for a 16-bit output whose
         row-vector rows are all promoted and staged, or for a plain 16-bit
-        store on the 256-wide two-CTA tile, otherwise CuTe's with-source rule
+        store (one output, no auxiliary operand) on the 256-wide two-CTA
+        tile, otherwise CuTe's with-source rule
         at the output width, which the role-local epilogue applies whether
         or not a source-C tensor exists ((128, 64) on a 256-wide 16-bit
         tile, (128, 32) on narrower ones). ``None`` without a
@@ -5808,9 +6040,11 @@ class CuteTcgen05Config:
             output_itemsize = facts.output_itemsize
             # The matmul plan's (128, 32) subtile: promoted 16-bit rows that
             # are staged, or a plain 16-bit store on the 256-wide two-CTA
-            # tile (``tcgen05_plain_narrow_subtile``; the plan also asks for
-            # a single static-full-tile store, which every plain kernel the
-            # gates see has).
+            # tile (``tcgen05_plain_narrow_subtile``: one output store and no
+            # auxiliary operand -- a two-output or aux epilogue keeps CuTe's
+            # with-source (128, 64) subtile there, 64 KiB of C rings for two
+            # outputs; the plan also asks for a single static-full-tile
+            # store, which every plain kernel the gates see has).
             narrow_subtile = (
                 facts.output_itemsize == 2
                 and (
@@ -5821,6 +6055,8 @@ class CuteTcgen05Config:
                     )
                     or (
                         not facts.rows
+                        and facts.output_count == 1
+                        and not self.aux_kernel_detected
                         and constraints.dtype_bytes == 2
                         and cluster_m == 2
                         and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
@@ -7001,6 +7237,11 @@ class CuteTcgen05Config:
             # producer-warp projection.
             return
         if not self._is_validated_cluster_m2_full_tile_search_candidate(config):
+            return
+        if self._fanout_pair_search_config_supported(config):
+            # A CTA pair carrying the proved shared fanout is its own regime
+            # (role-local monolithic SIMT aux loads, two C stages); the search
+            # measures it as sampled, as ``_fix_cluster_m2_search_config`` does.
             return
         # ab=2 is the aux-TMA producer's validated stage depth for this family
         # (the aux SMEM ring forces ab<=2 under the 232 KB B200 cap; the
@@ -9594,6 +9835,11 @@ class CuteTcgen05Config:
         self._normalize_grouped_row_union(
             config, fix_invalid=fix_invalid, validate_schedule=True
         )
+        # Every 2x2 cluster family walks whole pairs of N tiles; judged here
+        # on the final tile (the search projections above may have moved
+        # block_n), ahead of the fanout so a repaired cluster keeps its
+        # fanout.
+        self._validate_cluster_n_pairs_n_tiles(config, fix_invalid=fix_invalid)
         self._normalize_epilogue_fanout(
             config, fix_invalid=fix_invalid, validate_schedule=True
         )
@@ -9601,6 +9847,20 @@ class CuteTcgen05Config:
         # the search's fix pass shallowed its samples above, so this refuses
         # only an explicit config whose rings provably overflow the arena.
         self._normalize_multi_output_rings(config, fix_invalid=fix_invalid)
+        if (
+            fix_invalid
+            and config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True
+            and not self.aux_fragment_hoist_admissible(config)
+        ):
+            # ``normalize_pre_pid_type`` judged the hoist on the sampled tile
+            # and recipe; the search's geometry projections (the canonical
+            # 256x256 pair of ``_fix_cluster_m2_search_config``, the aux-TMA
+            # full-tile regime) ran after it, so the hoist's fragment budget,
+            # placement and load mode are re-judged on the final config for
+            # every kernel: the repaired config has to be a fixed point of
+            # strict normalization (the autotuner compiled such neighbours of
+            # the 256x128 hoist witness and lost them to the strict refusal).
+            config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
 
     def flat_fields(
         self,

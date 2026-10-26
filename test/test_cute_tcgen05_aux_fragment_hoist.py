@@ -24,6 +24,9 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
+from helion._compiler.autotuner_heuristics.cute_epilogue_fanout import (
+    _synthesized_pair_fanout_carriers,
+)
 from helion._compiler.autotuner_heuristics.cute_l2_row_swizzle import row_swizzle_size
 from helion._compiler.autotuner_heuristics.cute_launch_bounds import MIN_BLOCKS_KEY
 from helion._compiler.compile_environment import CompileEnvironment
@@ -38,6 +41,8 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_PAIR_BLOCK_NS
 from helion._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
 from helion._compiler.cute.tcgen05_constants import (
     tcgen05_aux_fragment_bytes_per_thread,
@@ -104,6 +109,18 @@ def pair_no_aux(x: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.T
         s[tile_m, tile_n] = sigmoid_result
         out[tile_m, tile_n] = (2.0 * sigmoid_result).to(x.dtype)
     return out, s
+
+
+def plain_single(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """One output, no auxiliary operand: the plain narrow-subtile epilogue."""
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(n):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
 
 
 @pytest.fixture(autouse=True)
@@ -644,6 +661,258 @@ def test_pair_fanout_sample_keeps_its_geometry_in_the_search() -> None:
     assert plain["tcgen05_cluster_m"] == 2
     assert plain["block_sizes"][:2] == [256, 256]
     assert plain.get(FANOUT_CONFIG_KEY, "off") == "off"
+
+
+def _pair(bn: int, bk: int, ab: int, *parts: dict[str, Any]) -> dict[str, Any]:
+    return base_config(
+        SHARED,
+        PRE,
+        {HOIST: False},
+        *parts,
+        block_sizes=[256, bn, bk],
+        tcgen05_cluster_m=2,
+        tcgen05_ab_stages=ab,
+        tcgen05_c_stages=2,
+    )
+
+
+def test_pair_fanout_is_admitted_by_budget_at_every_pair_geometry() -> None:
+    # The fanout's CTA pair is admitted by its TMEM / SMEM / C-ring budget at
+    # every pair N tile the backend runs (256, 128, 64), not at one fixed
+    # geometry: a strictly valid sample is a fixed point of the search's
+    # repairing pass with its tile, rings and recipe intact.
+    bound = bind(gated_pair)
+    state = state_of(bound)
+    for bn, bk, ab in (
+        (256, 64, 4),
+        (256, 64, 5),
+        (256, 128, 2),
+        (128, 64, 8),
+        (64, 64, 9),
+    ):
+        sample = _pair(bn, bk, ab)
+        assert state.epilogue_fanout_refusal(sample) is None
+        strict = normalized(bound, sample)
+        repaired = normalized(bound, sample, fix_invalid=True)
+        for config in (strict, repaired):
+            assert config["block_sizes"] == [256, bn, bk]
+            assert config["tcgen05_cluster_m"] == 2
+            assert config["tcgen05_ab_stages"] == ab
+            assert config["tcgen05_c_stages"] == 2
+            assert config[FANOUT_CONFIG_KEY] == "shared"
+            assert config[PLACEMENT] == "pre_acc_wait"
+            assert config.get("tcgen05_aux_load_mode", "simt") == "simt"
+            assert config.get("tcgen05_strategy", "role_local_monolithic") == (
+                "role_local_monolithic"
+            )
+        assert normalized(bound, repaired) == repaired
+    # The ring depth is the budget's: two (128, 64) fp16 C rings of the
+    # 256-wide pair tile take 64 KiB, so a 32 KiB-per-stage bk=64 AB ring
+    # holds five stages and a 64 KiB bk=128 ring two; the refusal names the
+    # overflow and the search shallows the sample to the deepest fit.
+    for bk, ab, deepest in ((64, 6, 5), (128, 3, 2)):
+        with pytest.raises(InvalidConfig, match="overflows the per-CTA SMEM budget"):
+            normalized(bound, _pair(256, bk, ab))
+        repaired = normalized(bound, _pair(256, bk, ab), fix_invalid=True)
+        assert repaired["tcgen05_ab_stages"] == deepest
+        assert repaired["block_sizes"] == [256, 256, bk]
+        assert repaired[FANOUT_CONFIG_KEY] == "shared"
+    # The hoist keeps its own budget: a 128x256 fp16 fragment is 512 bytes
+    # per epilogue thread, so the 256-wide pair takes pre_acc_wait without it.
+    hoisted = _pair(256, 64, 4, ON)
+    with pytest.raises(InvalidConfig, match="aux_fragment_hoist=True requires"):
+        normalized(bound, hoisted)
+    repaired = normalized(bound, hoisted, fix_invalid=True)
+    assert repaired[HOIST] is False
+    assert repaired[FANOUT_CONFIG_KEY] == "shared"
+    assert repaired[PLACEMENT] == "pre_acc_wait"
+    assert repaired["block_sizes"] == [256, 256, 64]
+    # Refusals name their budget, through the public refusal: the pair's
+    # role-local TMA-store epilogue stores each CTA's 128-row half of the
+    # 256-row pair tile (the fact the codegen store protocol demands), so a
+    # 128-row tile under cluster_m=2 -- the clustered one-CTA family, or the
+    # pair MMA under tcgen05_cta_group='two' -- is refused with that fact
+    # rather than reaching the codegen gate; an N tile the pair MMA does not
+    # run is refused before SMEM.
+    half = (
+        f"{TCGEN05_TWO_CTA_BLOCK_M // 2}-row half of the {TCGEN05_TWO_CTA_BLOCK_M}-row"
+    )
+    for family in ({}, {"tcgen05_cta_group": "two"}):
+        clustered = _pair(128, 64, 4) | {"block_sizes": [128, 128, 64]} | family
+        reason = state.epilogue_fanout_refusal(clustered)
+        assert reason is not None and half in reason
+    with pytest.raises(InvalidConfig, match=half):
+        normalized(bound, _pair(128, 64, 4) | {"block_sizes": [128, 128, 64]})
+    assert state.epilogue_fanout_refusal(_pair(32, 64, 4)) == (
+        f"the CTA pair runs its MMA at N tiles "
+        f"{sorted(TCGEN05_TWO_CTA_PAIR_BLOCK_NS)}, not 32"
+    )
+    # Every pair tile of the fanout renders through the one store protocol.
+    assert "_BLOCK_SIZE_1 = 256" in render(bound, _pair(256, 64, 5))
+    # A search neighbour of the 256x128 hoist witness whose pid type the
+    # fanout refuses is projected onto the canonical 256x256 pair after the
+    # hoist was judged at bn=128; the admitted fanout keeps the recipe and
+    # the hoist is re-judged on the final tile (the autotuner compiled such
+    # samples and lost them to the strict refusal).
+    for pid_type in ("persistent_blocked", "flat"):
+        neighbour = _pair(128, 128, 4, ON) | {"pid_type": pid_type}
+        repaired = normalized(bound, neighbour, fix_invalid=True)
+        assert repaired["block_sizes"] == [256, 256, 128]
+        assert repaired[FANOUT_CONFIG_KEY] == "shared"
+        assert repaired[PLACEMENT] == "pre_acc_wait"
+        assert repaired[HOIST] is False
+        assert normalized(bound, repaired) == repaired
+
+
+def test_search_repair_rejudges_the_hoist_after_the_geometry_projections() -> None:
+    # The re-judge is not the fanout's: a single-output kernel's neighbour of
+    # the 256x128 pair hoist witness is projected onto the canonical 256x256
+    # pair in the aux-TMA regime (scheduler warps, tcgen05_aux_load_mode=tma)
+    # after the hoist was judged at bn=128 on the SIMT recipe, so without the
+    # re-judge the repaired config kept tcgen05_aux_fragment_hoist=True on a
+    # 512 B/thread fragment with a TMA aux load, which strict normalization
+    # refuses (verified on the unpatched tree: the strict pass raised the
+    # hoist's own InvalidConfig on the repaired config).
+    bound = bind(residual_single)
+    for pid_type in ("persistent_blocked", "flat"):
+        neighbour = _pair(128, 128, 4, ON) | {"pid_type": pid_type}
+        neighbour.pop(FANOUT_CONFIG_KEY)
+        repaired = normalized(bound, neighbour, fix_invalid=True)
+        assert repaired["block_sizes"] == [256, 256, 128]
+        assert repaired["tcgen05_cluster_m"] == 2
+        assert repaired.get(FANOUT_CONFIG_KEY, "off") == "off"
+        assert repaired["tcgen05_aux_load_mode"] == "tma"
+        assert repaired[HOIST] is False
+        assert normalized(bound, repaired) == repaired
+
+
+def test_smem_model_keeps_the_with_source_subtile_for_two_outputs() -> None:
+    # The plain (128, 32) subtile of the 256-wide pair tile belongs to a
+    # single-output epilogue without auxiliary operands; two outputs (or an
+    # aux operand) keep CuTe's with-source (128, 64) subtile, so each fp16 C
+    # ring is 32 KiB and the pair's arena holds 32 KiB less AB ring. The old
+    # model admitted 256x256x64 ab=6 with two outputs; NVVM rejected it.
+    bound = bind(gated_pair)
+    state = state_of(bound)
+    kwargs: dict[str, Any] = {
+        "bm": 256,
+        "bn": 256,
+        "bk": 64,
+        "cluster_m": 2,
+        "ab_stages": 1,
+        "c_stages": 2,
+        "stage_rows": False,
+    }
+    two_outputs = state.default_layout_smem_bytes(**kwargs)
+    facts = state.rowvec_aux_facts
+    assert facts is not None and facts.output_count == 2
+    state.rowvec_aux_facts = Tcgen05RowvecAuxFacts(
+        output_itemsize=2, rows=(), output_count=1
+    )
+    one_output_with_aux = state.default_layout_smem_bytes(**kwargs)
+    state.aux_kernel_detected = False
+    plain = state.default_layout_smem_bytes(**kwargs)
+    state.aux_kernel_detected = True
+    state.rowvec_aux_facts = facts
+    assert two_outputs is not None and one_output_with_aux is not None
+    assert plain is not None
+    # Two (128, 64) rings of two stages: 64 KiB; one: 32 KiB; plain: 16 KiB.
+    assert two_outputs - one_output_with_aux == 2 * 128 * 64 * 2
+    assert one_output_with_aux - plain == 2 * 128 * 64 * 2 - 2 * 128 * 32 * 2
+    fits = [
+        ab
+        for ab in range(1, 9)
+        if state.default_layout_smem_fits(**(kwargs | {"ab_stages": ab}))
+    ]
+    assert fits == [1, 2, 3, 4, 5]
+
+
+def test_codegen_and_the_arena_model_agree_on_the_pair_subtile() -> None:
+    # Codegen takes the plain (128, 32) subtile on the 256-wide 16-bit pair
+    # tile for one output store without auxiliary descriptors
+    # (``tcgen05_plain_narrow_subtile``); the arena model's predicate keeps
+    # both conditions (``output_count == 1`` and no auxiliary operand), so
+    # it prices a 16 KiB C ring for the plain kernel, a 32 KiB with-source
+    # ring for one output with an aux operand and two of them for two
+    # outputs: at 256x256x64 six 32 KiB AB stages fit beside one ring of
+    # either size and five beside two -- the depths that render.
+    narrow = "(cute.make_layout(128), cute.make_layout(32))"
+    kwargs: dict[str, Any] = {
+        "bm": 256,
+        "bn": 256,
+        "bk": 64,
+        "cluster_m": 2,
+        "c_stages": 2,
+        "stage_rows": False,
+    }
+    priced: dict[str, int] = {}
+    for fn, deepest, drop in (
+        (plain_single, 6, (FANOUT_CONFIG_KEY, PLACEMENT, HOIST)),
+        (residual_single, 6, (FANOUT_CONFIG_KEY,)),
+        (gated_pair, 5, ()),
+    ):
+        bound = bind(fn)
+        state = state_of(bound)
+        fits = [
+            ab
+            for ab in range(1, 9)
+            if state.default_layout_smem_fits(**kwargs, ab_stages=ab)
+        ]
+        assert fits == list(range(1, deepest + 1)), fn.__name__
+        size = state.default_layout_smem_bytes(**kwargs, ab_stages=1)
+        assert size is not None
+        priced[fn.__name__] = size
+        config = _pair(256, 64, deepest)
+        for key in drop:
+            config.pop(key)
+        strict = normalized(bound, config)
+        assert strict["tcgen05_ab_stages"] == deepest, fn.__name__
+        code = render(bound, config)
+        assert (narrow in code) is (fn is plain_single), fn.__name__
+        assert ("compute_epilogue_tile_shape(" in code) is not (fn is plain_single), (
+            fn.__name__
+        )
+        # One stage deeper overflows: the multi-output ring judge names the
+        # rings, the single-output kernels' arena check the budget.
+        with pytest.raises(InvalidConfig, match="SMEM budget"):
+            normalized(bound, config | {"tcgen05_ab_stages": deepest + 1})
+    # The same AB ring and fixed allocations: the C rings alone differ.
+    assert priced["residual_single"] - priced["plain_single"] == 2 * 128 * 32 * 2
+    assert priced["gated_pair"] - priced["residual_single"] == 2 * 128 * 64 * 2
+
+
+def test_pair_carriers_enumerate_the_budgeted_geometries() -> None:
+    # One carrier per pair geometry that walks whole output tiles, the
+    # widest N tile first and per K tile, each at the deepest AB ring the two
+    # C rings leave; the hoist group still takes one pair geometry (the first
+    # the hoist admits: the 256-wide fragment is over its budget) beside the
+    # fanout group's one-CTA carrier.
+    bound = bind(gated_pair)
+    carriers = _synthesized_pair_fanout_carriers(bound.config_spec, state_of(bound))
+    assert [
+        (tuple(c.block_sizes), c.config["tcgen05_ab_stages"]) for c in carriers
+    ] == [
+        ((256, 256, 128), 2),
+        ((256, 256, 64), 5),
+        ((256, 128, 128), 4),
+        ((256, 128, 64), 8),
+        ((256, 64, 128), 4),
+        ((256, 64, 64), 9),
+    ]
+    for carrier in carriers:
+        config = dict(carrier.config)
+        assert config["tcgen05_cluster_m"] == 2
+        assert config["tcgen05_c_stages"] == 2
+        assert FANOUT_CONFIG_KEY not in config
+        shared = normalized(bound, config | SHARED)
+        assert shared[FANOUT_CONFIG_KEY] == "shared"
+        assert shared["block_sizes"] == carrier.block_sizes
+    hoist = _group(bound, HOIST)
+    assert hoist is not None
+    geometries = [
+        (tuple(c["block_sizes"]), c["tcgen05_cluster_m"]) for c in _carriers(hoist)
+    ]
+    assert geometries == [((256, 128, 128), 2)] * 2 + [((128, 128, 64), 1)] * 2
 
 
 def test_pair_carrier_needs_whole_pair_tiles() -> None:

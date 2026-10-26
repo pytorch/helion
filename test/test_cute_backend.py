@@ -13281,6 +13281,9 @@ class TestCuteBackend(TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         # One N tile: no whole N-tile pair for the cluster_n=2 A multicast.
+        # Every 2x2 family refuses an odd N tile count at the config layer,
+        # ahead of the render's batched refusal, with the reason; the search
+        # repairs the cluster to the CTA pair instead of spending a compile.
         args = (
             torch.randn(2, 256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 128, 256, device=DEVICE, dtype=HALF_DTYPE),
@@ -13288,10 +13291,15 @@ class TestCuteBackend(TestCase):
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             bound = cute_batched_baddbmm_tcgen05.bind(args)
             with self.assertRaisesRegex(
-                helion.exc.BackendUnsupported,
-                "supports tcgen05_cluster_n=2 only for whole N-tile pairs",
+                helion.exc.InvalidConfig,
+                r"tcgen05_cluster_n=2 pairs N tiles, but cdiv\(256, 256\) = 1 "
+                r"tiles is odd",
             ):
                 bound.to_triton_code(_batched_tcgen05_two_cta_config(cluster_n=2))
+            repaired = dict(_batched_tcgen05_two_cta_config(cluster_n=2).config)
+            bound.config_spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+            self.assertEqual(repaired["tcgen05_cluster_m"], 2)
             # Two N tiles: the cluster pairs them along the scheduler's dim 1
             # (N moves ahead of M for batched grids) and reads the tile
             # coordinates back in (batch, m, n) PID order.
@@ -13300,6 +13308,18 @@ class TestCuteBackend(TestCase):
                 torch.randn(2, 128, 512, device=DEVICE, dtype=HALF_DTYPE),
             )
             bound = cute_batched_baddbmm_tcgen05.bind(args)
+            # The render's own refusal still guards what the config layer
+            # does not judge: an L2 grouping pairs the cluster lanes on the
+            # (batch, m) grid dims of a batched grid, so the A multicast
+            # refuses it cleanly instead of decoding tiles that do not exist.
+            grouped = _batched_tcgen05_two_cta_config(cluster_n=2)
+            grouped.config["l2_groupings"] = [2]
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported,
+                "supports tcgen05_cluster_n=2 only for whole N-tile pairs without "
+                "an L2 swizzle or L2 grouping",
+            ):
+                bound.to_triton_code(grouped)
             code = bound.to_triton_code(_batched_tcgen05_two_cta_config(cluster_n=2))
             self.assertIn(
                 "PersistentTileSchedulerParams((2 * 2, "
@@ -14391,7 +14411,9 @@ class TestCuteBackend(TestCase):
         loop (2x1 256x256x64 ab6 fp16 at 4096x1024x4096: 29.4 -> 28.1 us).
         Narrower tiles already take (128, 32) from CuTe's default rule, and
         one-CTA tiles, fp8 operands, unstaged aux rows, two-store fanout and
-        bk=128's K loop keep what they had.
+        bk=128's K loop keep what they had. The SMEM model prices the subtile
+        the same way: two stores keep the with-source (128, 64) subtile and
+        its 64 KiB of C rings, so ab=6 is refused there before codegen.
         """
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.float16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
@@ -14473,8 +14495,18 @@ class TestCuteBackend(TestCase):
             )
             self.assertNotIn(narrow, code)
             self.assertNotIn("unroll=1", code)
-            code = render(cute_matmul_mma_two_outputs, (x, y))
+            # Two stores: codegen keeps the with-source (128, 64) subtile
+            # (``tcgen05_plain_narrow_subtile`` wants one output store and no
+            # aux descriptors), and the arena model charges two such C rings
+            # (64 KiB), so the plain kernel's ab=6 overflows at 256x256x64
+            # (NVVM rejected the compiled kernel) and ab=5 is the deepest fit.
+            with self.assertRaisesRegex(
+                InvalidConfig, "2 output stores keep one C ring each"
+            ):
+                render(cute_matmul_mma_two_outputs, (x, y))
+            code = render(cute_matmul_mma_two_outputs, (x, y), tcgen05_ab_stages=5)
             self.assertNotIn(narrow, code)
+            self.assertIn("compute_epilogue_tile_shape(", code)
             self.assertNotIn("unroll=1", code)
             self.assertEqual(code.count("for tile_offset_2 in range("), 2)
 

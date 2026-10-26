@@ -115,24 +115,40 @@ def test_sm103_keeps_even_n_cluster_schedule() -> None:
 
 
 @pytest.mark.parametrize(
-    "override",
+    "override,error,match",
     (
-        {
-            "tcgen05_strategy": "role_local_with_scheduler",
-            "tcgen05_warp_spec_scheduler_warps": 1,
-        },
-        {"tcgen05_l2_swizzle_size": 4},
-        {"l2_groupings": [2]},
-        {"block_sizes": [256, 128, 128]},  # Seven N tiles: padded peer.
+        (
+            {
+                "tcgen05_strategy": "role_local_with_scheduler",
+                "tcgen05_warp_spec_scheduler_warps": 1,
+            },
+            helion.exc.BackendUnsupported,
+            "N-edge cluster_n=2",
+        ),
+        (
+            {"tcgen05_l2_swizzle_size": 4},
+            helion.exc.BackendUnsupported,
+            "N-edge cluster_n=2",
+        ),
+        ({"l2_groupings": [2]}, helion.exc.BackendUnsupported, "N-edge cluster_n=2"),
+        # Seven N tiles: the padded peer is refused by the config layer
+        # (every 2x2 family pairs N tiles) before the render could.
+        (
+            {"block_sizes": [256, 128, 128]},
+            helion.exc.InvalidConfig,
+            r"cdiv\(832, 128\) = 7 tiles is odd",
+        ),
     ),
 )
-def test_unsafe_explicit_schedule_is_rejected(override: dict[str, object]) -> None:
+def test_unsafe_explicit_schedule_is_rejected(
+    override: dict[str, object], error: type[Exception], match: str
+) -> None:
     bound = vector_scaled_mm._bind_isolated(_args())
     config = _config(**override)
     assert not bound.config_spec._cute_tcgen05_config.n_edge_cluster_schedule_config_supported(
         config.config
     )
-    with pytest.raises(helion.exc.BackendUnsupported, match="N-edge cluster_n=2"):
+    with pytest.raises(error, match=match):
         bound.to_code(config)
 
 

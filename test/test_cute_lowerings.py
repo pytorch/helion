@@ -11232,6 +11232,8 @@ class TestCuteLowerings(unittest.TestCase):
         - The V-leader gate emits ``% cutlass.Int32(2) == cutlass.Int32(0)``
           for AB consumer-release / MMA issue (instead of the cluster_n=1
           ``== cutlass.Int32(0)`` form).
+        - The persistent grid is capped in whole co-resident 4-CTA
+          clusters (``_MAX_ACTIVE_CLUSTERS``), not the pair's SM slots.
         - The plan persists ``cluster_n=2``.
 
         This is a *codegen* test only — the runtime correctness test is
@@ -11315,17 +11317,25 @@ class TestCuteLowerings(unittest.TestCase):
         # anchor on the launcher signature so a regression of the
         # cluster_n axis in ``codegen_grid`` fails loudly.
         self.assertRegex(code, r"_launcher\([^,]+,\s*\(2,\s*2,\s*")
-        # Launch-grid persistent-capacity divisor is ``_NUM_SM // 2``
-        # (cluster_m), NOT ``_NUM_SM // 4`` (cluster_size = cluster_m
-        # * cluster_n). The latter caps cluster_n=2 at one wave of
-        # 37 cluster slots × 4 CTAs and starves the GPU of wave-overlap
-        # parallelism; the cluster_m divisor matches the cluster_n=1
-        # baseline so each cluster slot still consumes one SM. Anchor
-        # on the ``max(1, _NUM_SM // 2)`` envelope (the launcher emits
-        # ``min(total_clusters, max(1, _NUM_SM // cluster_m))`` for
-        # this seed) so a regression of either branch (``// 4``
-        # re-introduced or ``// 2`` lost) fails this assertion.
-        self.assertIn("max(1, _NUM_SM // 2)", code)
+        # The 2x2 cluster is larger than the CtaGroup.TWO pair, so the
+        # persistent grid is capped in whole co-resident clusters: the
+        # device's four-CTA cluster count (33 on a B200, below
+        # ``_NUM_SM // 4`` because a cluster lives inside one GPC), not the
+        # pair's ``max(1, _NUM_SM // 2)`` slots, which launched a second
+        # hardware wave of 2x2 clusters that re-ran the prologue.  The
+        # cluster count is cdiv(2 * M tiles, 2) * cdiv(N tiles, 2).
+        self.assertIn(
+            "_MAX_ACTIVE_CLUSTERS = helion.runtime.get_max_active_clusters("
+            "x.device, 4)",
+            code,
+        )
+        self.assertIn(
+            "(2, 2, min(((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
+            " // 2 * (((1024 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
+            " * 1, _MAX_ACTIVE_CLUSTERS))",
+            code,
+        )
+        self.assertNotIn("_NUM_SM // 2", code)
         self.assertNotIn("_NUM_SM // 4", code)
         # cluster_n=2 plumbing is exercised end-to-end by the codegen
         # markers above (no plan-field round-trip is asserted here —
@@ -11906,6 +11916,10 @@ class TestCuteLowerings(unittest.TestCase):
         cluster hands its second CTA an out-of-range tile_n marked valid —
         an unmasked out-of-bounds store on the full-tile TMA path (this was
         silently reachable through ``l2_groupings=[1]`` before the gate).
+        Every 2x2 family now fails closed at the config layer, ahead of the
+        render's own ``divisible by cluster_n`` guard, so the search never
+        spends a compile on the sample: strict normalization names the
+        reason and the search repair drops the cluster and keeps the pair.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -11946,9 +11960,21 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             with self.assertRaisesRegex(
-                exc.BackendUnsupported, "divisible by cluster_n"
+                exc.InvalidConfig,
+                r"tcgen05_cluster_n=2 pairs N tiles, but cdiv\(768, 256\) = 3 "
+                r"tiles is odd",
             ):
                 bound.to_triton_code(cfg)
+            # The search repair keeps the tile and the CTA pair and drops the
+            # cluster; the repaired config renders the 2x1 pair.
+            repaired = dict(cfg.config)
+            bound.env.config_spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+            self.assertEqual(repaired["tcgen05_cluster_m"], 2)
+            self.assertEqual(repaired["block_sizes"], [256, 256, 128])
+            code = bound.to_triton_code(helion.Config(**repaired))
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertNotIn("(2, 2, 1)", code)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,

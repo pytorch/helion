@@ -22,6 +22,7 @@ from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
+from helion._compiler.autotuner_heuristics.cute_epilogue_fanout import _fits_one_wave
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
@@ -34,6 +35,9 @@ from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.epilogue_fanout import render_chain
 from helion._compiler.cute.epilogue_fanout import render_shared_suffix
 from helion._compiler.cute.epilogue_fanout import schedule_supported
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
 from helion._testing import skipUnlessBackends
@@ -339,11 +343,12 @@ def bind(
     dtype: torch.dtype = torch.float16,
     rows: int = 256,
     columns: int = 128,
+    k: int = 64,
     **settings: Any,
 ) -> BoundKernel[Any]:
     args = (
-        torch.empty((rows, 64), dtype=dtype),
-        torch.empty((64, columns), dtype=dtype),
+        torch.empty((rows, k), dtype=dtype),
+        torch.empty((k, columns), dtype=dtype),
         torch.empty((rows, columns), dtype=dtype),
     )
     kernel = helion.kernel(
@@ -740,6 +745,177 @@ def test_registered_witnesses_are_independent_and_cache_visible() -> None:
             assert effective.config.get(FANOUT_CONFIG_KEY, "off") == witness.value
             assert gen.unflatten(flat) == effective
             assert gen.strict_config_pair(effective) == (flat, effective)
+
+
+def _fanout_witnesses(
+    bound: BoundKernel[Any],
+) -> list[tuple[object, tuple[int, ...], int]]:
+    (group,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == FANOUT_CONFIG_KEY
+    ]
+    return [
+        (w.value, tuple(w.carrier.block_sizes), w.carrier.config["tcgen05_c_stages"])
+        for w in group.witnesses
+    ]
+
+
+def _hoist_geometries(bound: BoundKernel[Any]) -> list[tuple[int, ...]]:
+    groups = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    if not groups:
+        return []
+    seen: list[tuple[int, ...]] = []
+    for witness in groups[0].witnesses:
+        blocks = tuple(witness.carrier.block_sizes)
+        if blocks not in seen:
+            seen.append(blocks)
+    return seen
+
+
+@skipUnlessBackends(["cute"])
+def test_one_wave_geometry_fills_a_free_fanout_witness_slot() -> None:
+    # 1024x512 has 32 standard tiles, so the small-grid seeds spread the
+    # output over 64x64 (128 tiles: one wave on 148 SMs) and 128x{16,32,64}.
+    # The largest tile's C-ring twins witness the fanout. With K = 64 both
+    # twins fit SMEM and take the whole four-witness budget: the C ring
+    # pipelines the epilogue sub-tile stores inside one tile, so the deep
+    # twin is never displaced, even on a one-wave grid.
+    assert _fanout_witnesses(bind(rows=1024, columns=512)) == [
+        ("off", (128, 64, 64), 4),
+        ("shared", (128, 64, 64), 4),
+        ("off", (128, 64, 64), 2),
+        ("shared", (128, 64, 64), 2),
+    ]
+    # With K = 512 the seeds take a 128-deep K tile and the deep twin
+    # overflows SMEM: the free slot goes to the finest one-wave tile, 64x64
+    # (128x32 also walks 128 tiles; the squarer tile reads fewer operand
+    # rows). The second geometry's ``off`` control is the seed itself.
+    bound = bind(rows=1024, columns=512, k=512)
+    assert _fanout_witnesses(bound) == [
+        ("off", (128, 64, 128), 2),
+        ("shared", (128, 64, 128), 2),
+        ("off", (64, 64, 128), 2),
+        ("shared", (64, 64, 128), 2),
+    ]
+    (group,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == FANOUT_CONFIG_KEY
+    ]
+    with bound.env:
+        seeds = []
+        for seed in bound.config_spec.compiler_seed_configs:
+            candidate = helion.Config.from_dict(deepcopy(seed.config))
+            try:
+                bound.config_spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            seeds.append(candidate)
+    assert group.witnesses[2].carrier in seeds
+    # The hoist (and the swizzle riding it) witness both geometries, so the
+    # complete small-grid recipe -- fanout, pre-wait aux, hoist -- is seeded.
+    assert _hoist_geometries(bound) == [(128, 64, 128), (64, 64, 128)]
+    # 2048x256: 64x64 and 128x32 both walk 128 tiles; the squarer tile wins.
+    assert _fanout_witnesses(bind(rows=2048, columns=256, k=512))[2:] == [
+        ("off", (64, 64, 128), 2),
+        ("shared", (64, 64, 128), 2),
+    ]
+    # 4096x512 walks 256 tiles of 128x64 (two waves) and every smaller seed
+    # tile needs more: the free slot stays empty rather than taking a
+    # multi-wave tile.
+    assert _fanout_witnesses(bind(rows=4096, columns=512, k=512)) == [
+        ("off", (128, 64, 128), 2),
+        ("shared", (128, 64, 128), 2),
+    ]
+    # A geometry no ordinary seed carries (4096x4096: the machine-filling
+    # pairs only) keeps the synthesized 128x128 twins and nothing else.
+    assert _fanout_witnesses(bind(rows=4096, columns=4096)) == [
+        ("off", (128, 128, 64), 4),
+        ("shared", (128, 128, 64), 4),
+        ("off", (128, 128, 64), 2),
+        ("shared", (128, 128, 64), 2),
+    ]
+
+
+@skipUnlessBackends(["cute"])
+def test_an_admitted_pair_seed_leaves_the_fanout_group_one_cta() -> None:
+    # 4096x4096 at K = 64 is seeded with the machine-filling 256x256x64 CTA
+    # pairs alone, and the pair fanout admits that seed by budget (three AB
+    # stages beside two (128, 64) C rings; its four-stage twin overflows).
+    # The seed-derived carriers are one-CTA tiles, so the pair does not take
+    # the fanout group with its shallow twin alone: the group keeps the
+    # synthesized 128x128 twins, and the hoist group keeps its one-CTA slot
+    # beside the pair carrier it builds itself (256x128: the 256-wide
+    # fragment is over the hoist's budget).
+    bound = bind(rows=4096, columns=4096)
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    with bound.env:
+        seeds = []
+        for seed in spec.compiler_seed_configs:
+            candidate = helion.Config.from_dict(deepcopy(seed.config))
+            try:
+                spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            seeds.append(candidate)
+    assert seeds and all(
+        tuple(seed.block_sizes) == (256, 256, 64)
+        and seed.config["tcgen05_cluster_m"] == 2
+        for seed in seeds
+    )
+    admitted = [
+        seed
+        for seed in seeds
+        if schedule_supported(seed.config)
+        and state.epilogue_fanout_refusal(
+            dict(seed.config) | {FANOUT_CONFIG_KEY: "shared"}
+        )
+        is None
+    ]
+    assert admitted
+    assert _fanout_witnesses(bound) == [
+        ("off", (128, 128, 64), 4),
+        ("shared", (128, 128, 64), 4),
+        ("off", (128, 128, 64), 2),
+        ("shared", (128, 128, 64), 2),
+    ]
+    assert _hoist_geometries(bound) == [(256, 128, 64), (128, 128, 64)]
+
+
+@skipUnlessBackends(["cute"])
+def test_one_wave_counts_the_cluster_footprint() -> None:
+    # 2048x2048 in 256x128 pair tiles is 128 tiles -- within the 148 SMs as
+    # tiles, but each pair occupies two SMs. The hoist group's synthesized
+    # pair carrier is the admitted ``tcgen05_cluster_m=2`` fanout geometry.
+    bound = bind(rows=2048, columns=2048, k=512)
+    state = bound.config_spec._cute_tcgen05_config
+    (hoist,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    pair = hoist.witnesses[0].carrier
+    assert tuple(pair.block_sizes) == (256, 128, 128)
+    assert pair.config["tcgen05_cluster_m"] == 2
+    assert not _fits_one_wave(state, pair)
+    single = helion.Config.from_dict(deepcopy(pair.config) | {"tcgen05_cluster_m": 1})
+    assert _fits_one_wave(state, single)
+    # Half the rows: 64 pairs on 128 SMs fit one wave.
+    bound = bind(rows=1024, columns=2048, k=512)
+    (hoist,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    pair = hoist.witnesses[0].carrier
+    assert pair.config["tcgen05_cluster_m"] == 2
+    assert _fits_one_wave(bound.config_spec._cute_tcgen05_config, pair)
 
 
 def _rendered_plan(

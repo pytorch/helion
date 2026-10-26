@@ -11359,15 +11359,56 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
         self.assertIsNotNone(facts)
         assert facts is not None
+        # The paired seeds are CTA pairs (cluster_n=1); the deepest bk=64
+        # SIMT ring of every 256-row pair tile with whole N-tile pairs also
+        # carries a 2x2 multicast-cluster twin (cluster_n=2) that differs
+        # from its pair in nothing else.  fp16 4096^3 pairs every N tile
+        # width, so each of the three 256-row bk=64 tiles has one twin.
+        paired_by_tile: dict[tuple[int, ...], list[helion.Config]] = {}
+        for config in paired_configs:
+            paired_by_tile.setdefault(tuple(config.block_sizes), []).append(config)
+        self.assertEqual(
+            sorted(
+                tuple(config.block_sizes)
+                for config in paired_configs
+                if config["tcgen05_cluster_n"] == 2
+            ),
+            [
+                (TCGEN05_TWO_CTA_BLOCK_M, 64, 64),
+                (TCGEN05_TWO_CTA_BLOCK_M, 128, 64),
+                (TCGEN05_TWO_CTA_BLOCK_M, 256, 64),
+            ],
+        )
         for config in paired_configs:
             with self.subTest(paired_config=config):
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config["tcgen05_cluster_n"], 1)
+                self.assertIn(config["tcgen05_cluster_n"], (1, 2))
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["tcgen05_c_stages"], 2)
                 self.assertEqual(config["tcgen05_acc_stages"], 2)
                 self.assertFalse(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY])
                 bm, bn, bk = config.block_sizes
+                siblings = paired_by_tile[(bm, bn, bk)]
+                deepest = max(
+                    cast("int", sibling["tcgen05_ab_stages"]) for sibling in siblings
+                )
+                if config["tcgen05_cluster_n"] == 2:
+                    # The twin sits on the 256-row pair tile at bk=64, at
+                    # the tile's deepest ring, beside exactly one pair seed
+                    # it matches in every other knob.
+                    self.assertEqual(bm, TCGEN05_TWO_CTA_BLOCK_M)
+                    self.assertEqual(bk, 64)
+                    self.assertEqual(config["tcgen05_ab_stages"], deepest)
+                    pairs = [
+                        sibling
+                        for sibling in siblings
+                        if sibling["tcgen05_cluster_n"] == 1
+                        and sibling["tcgen05_ab_stages"] == deepest
+                    ]
+                    self.assertEqual(len(pairs), 1)
+                    self.assertEqual(
+                        {**config.config, "tcgen05_cluster_n": 1}, pairs[0].config
+                    )
                 self.assertLessEqual(
                     pipeline_smem_bytes(
                         facts,

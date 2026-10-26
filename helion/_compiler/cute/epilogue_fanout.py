@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ... import exc
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -466,7 +467,6 @@ def schedule_supported(config: dict[str, object]) -> bool:
         "pid_type": "persistent_interleaved",
         "tcgen05_strategy": "role_local_monolithic",
         "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_cluster_n": 1,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_warp_spec_mma_warps": 1,
         "tcgen05_warp_spec_ab_load_warps": 1,
@@ -490,6 +490,12 @@ def schedule_supported(config: dict[str, object]) -> bool:
         and config.get("tcgen05_aux_load_mode", "simt") in ("simt", "epi_tma")
         and type(config.get("tcgen05_cluster_m", 1)) is int
         and config.get("tcgen05_cluster_m", 1) in (1, 2)
+        # The CTA pair may run in the 2x2 cluster (A multicast across the N
+        # pair): the epilogue stores each CTA's half of the pair tile either
+        # way, and ``_pair_fanout_refusal`` requires an even N tile count.
+        and type(config.get("tcgen05_cluster_n", 1)) is int
+        and config.get("tcgen05_cluster_n", 1)
+        in ((1, 2) if config.get("tcgen05_cluster_m", 1) == 2 else (1,))
         and config.get("tcgen05_cta_group", "auto")
         in (
             ("auto", "two")
@@ -528,10 +534,13 @@ def store_protocol_supported(value: CuteTcgen05StoreValue) -> bool:
         and not value.tma_store_full_tiles_only
         and not value.partial_output_tma_store
         and not value.pure_matmul_role_lifecycle
+        # A CTA pair stores its 128-row half of the 256-row pair tile (the
+        # same fact ``CuteTcgen05Config._pair_fanout_refusal`` requires of
+        # the config, which admits the pair's N tile and ring depth from the
+        # SMEM budget).
         and (
             not value.lifecycle_context.is_two_cta
-            or value.bm == 256
-            and value.bn == 128
+            or value.bm == TCGEN05_TWO_CTA_BLOCK_M
             and value.c_stage_count == 2
         )
         and value.orientation is Tcgen05Orientation.MN

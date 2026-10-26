@@ -1957,21 +1957,24 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _tcgen05_max_persistent_work_clusters_expr(self) -> str:
         """Return the launch-grid persistent work-cluster capacity.
 
-        Capacity is in cluster slots; divide by ``cluster_m`` (V-pair
-        size) so each cluster slot consumes one SM regardless of
-        ``cluster_n``. Independent of ``cluster_n`` so cluster_n=2
-        does not collapse the launch to one wave.  Batched cluster_n=2
-        grids (whose 4-CTA clusters outnumber the SMs: 16 x 512x768x1024
-        launches 64 clusters) are capped in whole clusters instead, so
-        the persistent CTAs recycle their pipelines across tiles rather
-        than leaving a second hardware wave to re-run the prologue; the
-        whole-cluster cap is the device's co-resident cluster count
-        (``_MAX_ACTIVE_CLUSTERS``), which for clusters larger than the
-        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.
+        Capacity is in cluster slots.  The CtaGroup.TWO pair divides the
+        grid by ``cluster_m`` (exact: one pair per two SMs).  Every larger
+        cluster -- the 2x2 multicast cluster, batched or plain, and the
+        row-union cluster-4 grids -- is capped in whole clusters at the
+        device's co-resident cluster count (``_MAX_ACTIVE_CLUSTERS``, below
+        ``_NUM_SM // cluster_size`` because a cluster lives inside one GPC),
+        so the persistent CTAs recycle their pipelines across tiles rather
+        than leaving a second hardware wave to re-run the prologue.
         """
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
-        if self._tcgen05_batched_cluster_n2():
+        if self._tcgen05_batched_cluster_n2() or cluster_m * cluster_n > 2:
+            # Every cluster larger than the CtaGroup.TWO pair is capped in
+            # whole co-resident clusters, batched or not: ``grid // cluster_m``
+            # launched 64 four-CTA clusters of a plain 2x2 grid against the 33
+            # a B200 co-schedules, a second hardware wave that re-runs the
+            # prologue (fp16 4096x1024x1024 on the 256x128 pair tile: 14.43 us
+            # vs 11.90 capped; 4096x4096x1024 at 256x256: 33.9 vs 27.3).
             return self._tcgen05_whole_cluster_capacity_expr()
         if cluster_m * cluster_n == 1:
             plan = self._tcgen05_plan()
