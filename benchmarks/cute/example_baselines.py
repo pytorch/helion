@@ -14,6 +14,7 @@ import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+import weakref
 
 if TYPE_CHECKING:
     import torch
@@ -122,6 +123,10 @@ def live_example_kernels() -> dict[str, Any]:
     # the first in whatever order the collector lists them.
     found: dict[str, Any] = {}
     for obj in gc.get_objects():
+        # isinstance() on a dead weakref.proxy (anywhere in the process)
+        # dereferences it for the __class__ lookup and raises ReferenceError.
+        if isinstance(obj, weakref.ProxyTypes):
+            continue
         if isinstance(obj, helion.Kernel) and obj.fn.__module__.startswith("examples."):
             base = f"{obj.fn.__module__}.{obj.fn.__name__}"
             key = base
