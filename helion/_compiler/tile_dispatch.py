@@ -7,6 +7,7 @@ import torch
 
 from .. import exc
 from .._compat import shape_env_size_hint
+from .._utils import next_power_of_2
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
@@ -77,7 +78,6 @@ class TileStrategyDispatch:
         super().__init__()
         self._device_function = fn
         self.strategies: list[TileStrategy] = []
-        self._has_rolled_reductions = False
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
         self._constexpr_live_graph_ids: frozenset[int] | None = None
@@ -193,7 +193,6 @@ class TileStrategyDispatch:
 
     def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
         self.strategies.append(strategy)
-        self._has_rolled_reductions |= isinstance(strategy, LoopedReductionStrategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
@@ -387,23 +386,29 @@ class TileStrategyDispatch:
         else:
             return self.strategies[0].fn.literal_expr(shape)
 
-        if (
-            self._has_rolled_reductions
-            and CompileEnvironment.current().codegen_name == "triton"
-            and not isinstance(expr, sympy.Symbol)
-        ):
+        env = CompileEnvironment.current()
+        if env.codegen_name == "triton" and not isinstance(expr, sympy.Symbol):
             block_symbols, _ = find_block_size_symbols(expr)
-            if any(
-                isinstance(
-                    self.block_id_to_strategy.get_any(block_id), LoopedReductionStrategy
-                )
-                for block_id in block_symbols.values()
-            ):
-                # Derived rolled-axis shapes have no supported host definition here.
-                raise exc.BackendUnsupported(
-                    "triton",
-                    "derived tensor shapes involving a rolled reduction axis",
-                )
+            for block_id in block_symbols.values():
+                info = env.block_sizes[block_id]
+                if not info.reduction:
+                    continue
+                numel = env.specialize_expr(info.numel)
+                # A derived shape scales the physical extent, and nothing masks
+                # the lanes it adds past a padded or rolled axis's logical size.
+                if (
+                    isinstance(
+                        self.block_id_to_strategy.get_any(block_id),
+                        LoopedReductionStrategy,
+                    )
+                    or not isinstance(numel, (int, sympy.Integer))
+                    or int(numel) != next_power_of_2(int(numel))
+                ):
+                    raise exc.BackendUnsupported(
+                        "triton",
+                        "derived tensor shapes involving a padded or rolled "
+                        "reduction axis",
+                    )
 
         # Try to map block symbols to their variable names
         mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)

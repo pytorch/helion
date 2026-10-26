@@ -375,7 +375,8 @@ class TestReductions(RefEagerTestBase, TestCase):
             near_one = near_one.transpose(1, 2).contiguous().transpose(1, 2)
         for x, op, expected in (
             (ones, "sum", ones.sum(dim=(1, 2))),
-            (near_one, "sum_fp16", near_one.sum(dim=(1, 2), dtype=torch.float16)),
+            # dtype= casts each element first; eager on some devices does not.
+            (near_one, "sum_fp16", near_one.half().float().sum(dim=(1, 2))),
         ):
             with self.subTest(op=op, transpose=transpose):
                 _, output = code_and_output(
@@ -442,19 +443,23 @@ class TestReductions(RefEagerTestBase, TestCase):
                 out[row] = value.sum(1) + extra.sum(1)
             return out
 
-        full = torch.ones(5, 64, device=DEVICE)
-        bound = derived_shape.bind((full,))
-        loops = len(bound.config_spec.reduction_loops)
-        actual = bound.compile_config(
-            helion.Config(block_sizes=[2], reduction_loops=[None] * loops)
-        )(full)
-        torch.testing.assert_close(actual, full.sum(1) + 128)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "derived tensor shapes.*rolled reduction"
-        ):
-            bound.compile_config(
-                helion.Config(block_sizes=[2], reduction_loops=[8] * loops)
-            )(full)
+        # A derived shape is exact only on an unrolled, statically unpadded axis.
+        unsupported = "derived tensor shapes.*padded or rolled reduction"
+        for width in (64, 33):
+            full = torch.ones(5, width, device=DEVICE)
+            bound = derived_shape.bind((full,))
+            loops = len(bound.config_spec.reduction_loops)
+            persistent = helion.Config(block_sizes=[2], reduction_loops=[None] * loops)
+            if static_shapes and width == 64:
+                actual = bound.compile_config(persistent)(full)
+                torch.testing.assert_close(actual, full.sum(1) + 2 * width)
+            else:
+                with self.assertRaisesRegex(helion.exc.BackendUnsupported, unsupported):
+                    bound.compile_config(persistent)(full)
+            with self.assertRaisesRegex(helion.exc.BackendUnsupported, unsupported):
+                bound.compile_config(
+                    helion.Config(block_sizes=[2], reduction_loops=[8] * loops)
+                )(full)
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
