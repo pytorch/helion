@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .cute_mma_dag import MmaDagPlan
+    from .cute_register_subblocks import RegisterSubblockPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
@@ -994,6 +995,12 @@ class CuteDeviceFunctionState:
         # its tile; the dedicated codegen emits the whole device body and
         # the launch runs ``32 * warps`` threads per CTA.
         self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_register_subblocks`` (``cute_register_subblocks=
+        # "on"``, cute_register_subblocks.py): the flattened static
+        # sub-block program of the root and its knobs; the dedicated
+        # codegen renders the whole device body as one register program
+        # per warp and the launch runs ``32 * warps`` threads per CTA.
+        self.register_subblocks_plan: RegisterSubblockPlan | None = None
         # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
         # the matched serial MMA state recurrence and its tile / warp /
         # stage selection; the dedicated codegen owns the matched root and

@@ -13282,13 +13282,16 @@ class TestCuteBackend(TestCase):
 
         # One N tile: no whole N-tile pair for the cluster_n=2 A multicast.
         # Every 2x2 family refuses an odd N tile count at the config layer,
-        # ahead of the render's batched refusal, with the reason; the search
-        # repairs the cluster to the CTA pair instead of spending a compile.
+        # ahead of the render's batched refusal, with the reason, so the
+        # search never spends a compile on the sample.
         args = (
             torch.randn(2, 256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 128, 256, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        with (
+            patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch("helion.runtime.get_num_sm", return_value=148),
+        ):
             bound = cute_batched_baddbmm_tcgen05.bind(args)
             with self.assertRaisesRegex(
                 helion.exc.InvalidConfig,
@@ -13296,10 +13299,25 @@ class TestCuteBackend(TestCase):
                 r"tiles is odd",
             ):
                 bound.to_triton_code(_batched_tcgen05_two_cta_config(cluster_n=2))
+            # The search repair drops the cluster (cluster_n -> 1).  Whether
+            # the CTA pair survives is the quarter-wave gate's call
+            # (``matmul_ops``: the 256x256 two-CTA grid must fill a quarter
+            # of the SMs): two batched tiles against the 37 clusters of 148
+            # SMs admit no cluster_m=2 search at all, so the sample lands on
+            # one CTA with the 128-row tile.  (A CPU bind sees no SMs and
+            # skips the gate, keeping the pair.)  The repaired config is a
+            # strict fixed point and renders without a cluster.
+            self.assertIsNone(bound.config_spec._tcgen05_cluster_m2_search_constraints)
             repaired = dict(_batched_tcgen05_two_cta_config(cluster_n=2).config)
             bound.config_spec.normalize(repaired, _fix_invalid=True)
             self.assertEqual(repaired["tcgen05_cluster_n"], 1)
-            self.assertEqual(repaired["tcgen05_cluster_m"], 2)
+            self.assertEqual(repaired["tcgen05_cluster_m"], 1)
+            self.assertEqual(repaired["block_sizes"], [1, 128, 256, 64])
+            strict = dict(repaired)
+            bound.config_spec.normalize(strict)
+            self.assertEqual(strict, repaired)
+            code = bound.to_triton_code(helion.Config(**repaired))
+            self.assertNotIn("_helion_cute_cluster_shape", code)
             # Two N tiles: the cluster pairs them along the scheduler's dim 1
             # (N moves ahead of M for batched grids) and reads the tile
             # coordinates back in (batch, m, n) PID order.

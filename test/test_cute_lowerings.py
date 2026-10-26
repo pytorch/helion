@@ -11919,7 +11919,10 @@ class TestCuteLowerings(unittest.TestCase):
         Every 2x2 family now fails closed at the config layer, ahead of the
         render's own ``divisible by cluster_n`` guard, so the search never
         spends a compile on the sample: strict normalization names the
-        reason and the search repair drops the cluster and keeps the pair.
+        reason and the search repair drops the cluster (cluster_n -> 1).
+        Whether the CTA pair survives the repair is the quarter-wave gate's
+        call (``matmul_ops``: the 256x256 two-CTA grid must fill a quarter
+        of the SMs), pinned here on both sides of the gate at 148 SMs.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -11941,11 +11944,6 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        # N=768 at bn=256 gives 3 N tiles: cluster_n=2 pads a partial cluster.
-        args = (
-            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16),
-        )
         cfg = _make_tcgen05_persistent_config(
             block_sizes=[256, 256, 128],
             l2_groupings=[1],
@@ -11956,23 +11954,51 @@ class TestCuteLowerings(unittest.TestCase):
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaisesRegex(
-                exc.InvalidConfig,
-                r"tcgen05_cluster_n=2 pairs N tiles, but cdiv\(768, 256\) = 3 "
-                r"tiles is odd",
+
+        def repair(m: int, n: int, n_tiles: int) -> tuple[dict[str, object], str]:
+            # K=128 and M a multiple of 256: an odd N tile count at bn=256.
+            args = (
+                torch.randn(m, 128, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16),
+            )
+            with (
+                patch_cute_mma_support(),
+                patch("helion.runtime.get_num_sm", return_value=148),
             ):
-                bound.to_triton_code(cfg)
-            # The search repair keeps the tile and the CTA pair and drops the
-            # cluster; the repaired config renders the 2x1 pair.
-            repaired = dict(cfg.config)
-            bound.env.config_spec.normalize(repaired, _fix_invalid=True)
-            self.assertEqual(repaired["tcgen05_cluster_n"], 1)
-            self.assertEqual(repaired["tcgen05_cluster_m"], 2)
-            self.assertEqual(repaired["block_sizes"], [256, 256, 128])
-            code = bound.to_triton_code(helion.Config(**repaired))
+                bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    rf"tcgen05_cluster_n=2 pairs N tiles, but cdiv\({n}, 256\) = "
+                    rf"{n_tiles} tiles is odd",
+                ):
+                    bound.to_triton_code(cfg)
+                repaired = dict(cfg.config)
+                bound.env.config_spec.normalize(repaired, _fix_invalid=True)
+                # The repair reaches a strict fixed point.
+                strict = dict(repaired)
+                bound.env.config_spec.normalize(strict)
+                self.assertEqual(strict, repaired)
+                return repaired, bound.to_triton_code(helion.Config(**repaired))
+
+        # N=768 at bn=256 gives 3 N tiles over 4 M tiles: 12 pair tiles sit
+        # under the 37 co-resident clusters of 148 SMs, so only the one-wave
+        # 256x{128,64} tiles are admitted on two CTAs; the 256x256 sample
+        # drops the cluster and lands on one CTA with the 128-row tile.  (A
+        # CPU bind sees no SMs and skips the gate, keeping the pair.)
+        repaired, code = repair(1024, 768, 3)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 1)
+        self.assertEqual(repaired["block_sizes"], [128, 256, 128])
+        self.assertNotIn("_helion_cute_cluster_shape", code)
+        self.assertIn("cute.make_layout((1, 1, 1))", code)
+        # N=1280 gives 5 N tiles over 8 M tiles: 40 pair tiles clear the
+        # gate, so the repair keeps the tile and the CTA pair and drops the
+        # cluster; the repaired config renders the 2x1 pair.
+        repaired, code = repair(2048, 1280, 5)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 2)
+        self.assertEqual(repaired["block_sizes"], [256, 256, 128])
         self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
         self.assertNotIn("(2, 2, 1)", code)
 

@@ -1784,6 +1784,10 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
+        if config_spec is not None and config_spec.cute_register_subblocks is not None:
+            # The register sub-block family is admitted: keep the random
+            # half of the population mostly in-family.
+            priors["cute_register_subblocks"] = weighted_choice({"on": 3.0, "off": 1.0})
         if config_spec is not None and config_spec.cute_mma_dag is not None:
             # The warp-MMA recurrence owner is admitted: keep the random half
             # of the population mostly in-family (tensor-memory mode first
@@ -2018,6 +2022,13 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        from .cute_register_subblocks import plan_register_subblocks
+
+        device_function.cute_state.register_subblocks_plan = plan_register_subblocks(
+            graphs, config
+        )
+        if device_function.cute_state.register_subblocks_plan is not None:
+            return
         plan_block_scaled(graphs)
         if DeviceFunction.current().cute_state.block_scaled_plan is not None:
             return
@@ -2208,6 +2219,12 @@ class CuteBackend(Backend):
             or key == "cute_tiles_per_block"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
+            or key == "cute_register_subblocks"
+            or key == "cute_register_subblocks_warps"
+            or key == "cute_register_subblocks_prefetch"
+            or key == "cute_register_subblocks_mask"
+            or key == "cute_register_subblocks_colside"
+            or key == "cute_register_subblocks_roll"
             or key
             in (
                 "cute_topk_lanes_per_row",

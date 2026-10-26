@@ -151,6 +151,30 @@ from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_persistent_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_ragged_ceilings
 from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
+from .._compiler.cute.cute_register_subblocks import (
+    COLSIDE_CHOICES as RSB_COLSIDE_CHOICES,
+)
+from .._compiler.cute.cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
+from .._compiler.cute.cute_register_subblocks import COLSIDE_RMW as RSB_COLSIDE_RMW
+from .._compiler.cute.cute_register_subblocks import KEY as RSB_KEY
+from .._compiler.cute.cute_register_subblocks import KEYS as RSB_KEYS
+from .._compiler.cute.cute_register_subblocks import MASK_CHOICES as RSB_MASK_CHOICES
+from .._compiler.cute.cute_register_subblocks import MASK_KEY as RSB_MASK_KEY
+from .._compiler.cute.cute_register_subblocks import MASK_SELECT as RSB_MASK_SELECT
+from .._compiler.cute.cute_register_subblocks import MODE_OFF as RSB_MODE_OFF
+from .._compiler.cute.cute_register_subblocks import MODES as RSB_MODES
+from .._compiler.cute.cute_register_subblocks import (
+    PREFETCH_CHOICES as RSB_PREFETCH_CHOICES,
+)
+from .._compiler.cute.cute_register_subblocks import PREFETCH_KEY as RSB_PREFETCH_KEY
+from .._compiler.cute.cute_register_subblocks import ROLL_CHOICES as RSB_ROLL_CHOICES
+from .._compiler.cute.cute_register_subblocks import ROLL_KEY as RSB_ROLL_KEY
+from .._compiler.cute.cute_register_subblocks import ROLL_UNROLLED as RSB_ROLL_UNROLLED
+from .._compiler.cute.cute_register_subblocks import WARP_CHOICES as RSB_WARP_CHOICES
+from .._compiler.cute.cute_register_subblocks import WARPS_KEY as RSB_WARPS_KEY
+from .._compiler.cute.cute_register_subblocks import RegisterSubblockFacts
+from .._compiler.cute.cute_register_subblocks import register_subblocks_config_reason
+from .._compiler.cute.cute_register_subblocks import register_subblocks_repair
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
@@ -1124,6 +1148,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         *MMA_DAG_KEYS,
+        *RSB_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1259,6 +1284,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         *MMA_DAG_KEYS,
+        *RSB_KEYS,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
@@ -1870,6 +1896,17 @@ class ConfigSpec:
         # distributed shared memory, or the fixup grid's global workspace.
         self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
+        # Enabled only when the register sub-block family
+        # (``cute_register_subblocks``, cute_register_subblocks.py) admits
+        # the root: the family switch and its knobs; the facts carry the
+        # register estimates ``normalize`` validates a knob choice against.
+        self.cute_register_subblocks: EnumFragment | None = None
+        self.cute_register_subblocks_warps: EnumFragment | None = None
+        self.cute_register_subblocks_prefetch: EnumFragment | None = None
+        self.cute_register_subblocks_mask: EnumFragment | None = None
+        self.cute_register_subblocks_colside: EnumFragment | None = None
+        self.cute_register_subblocks_roll: EnumFragment | None = None
+        self.cute_register_subblocks_facts: RegisterSubblockFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
@@ -3463,6 +3500,37 @@ class ConfigSpec:
             choices=tuple(group_choices)
         )
 
+    def enable_cute_register_subblocks_search(
+        self, facts: RegisterSubblockFacts
+    ) -> None:
+        """Expose the register sub-block family and its knobs.
+
+        ``off`` leads the mode domain so a config that leaves the knob out
+        keeps the ordinary lowering; the seed heuristic (and, on validated
+        targets, the promoted default) selects ``on``.  A knob without a
+        subject (no prefetchable second item, no static mask, no window
+        written twice) stays off the surface and is pinned by ``normalize``.
+        """
+        self.cute_register_subblocks_facts = facts
+        self.cute_register_subblocks = EnumFragment(choices=RSB_MODES)
+        self.cute_register_subblocks_warps = EnumFragment(choices=RSB_WARP_CHOICES)
+        self.cute_register_subblocks_prefetch = (
+            EnumFragment(choices=RSB_PREFETCH_CHOICES)
+            if facts.prefetch_subject
+            else None
+        )
+        self.cute_register_subblocks_mask = (
+            EnumFragment(choices=RSB_MASK_CHOICES) if facts.has_static_mask else None
+        )
+        self.cute_register_subblocks_colside = (
+            EnumFragment(choices=RSB_COLSIDE_CHOICES)
+            if facts.multi_write_windows
+            else None
+        )
+        self.cute_register_subblocks_roll = (
+            EnumFragment(choices=RSB_ROLL_CHOICES) if facts.roll_subject else None
+        )
+
     def enable_cute_mma_dag_search(self, facts: CuteMmaDagFacts) -> None:
         """Expose the warp-MMA recurrence mode, warp count and stage depth.
 
@@ -3551,6 +3619,130 @@ class ConfigSpec:
             self.cute_mma_dag_split = (
                 EnumFragment(choices=MMA_DAG_SPLIT_CHOICES) if admitted else None
             )
+
+    def _normalize_cute_register_subblocks(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Validate the register sub-block knobs against the facts (tile,
+        warps, register estimate) and pin the knobs the replaced body
+        ignores to one identity."""
+        facts = self.cute_register_subblocks_facts
+        assert facts is not None
+        mode = config.setdefault(RSB_KEY, RSB_MODE_OFF)
+        if mode not in RSB_MODES or type(mode) is not str:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{RSB_KEY} must be one of {RSB_MODES!r}, got {mode!r}"
+                )
+            config[RSB_KEY] = mode = RSB_MODE_OFF
+        defaults: dict[str, object] = {
+            RSB_WARPS_KEY: RSB_WARP_CHOICES[0],
+            RSB_PREFETCH_KEY: RSB_PREFETCH_CHOICES[0],
+            RSB_MASK_KEY: RSB_MASK_SELECT,
+            RSB_COLSIDE_KEY: RSB_COLSIDE_RMW,
+            RSB_ROLL_KEY: RSB_ROLL_UNROLLED,
+        }
+        fragments = {
+            RSB_WARPS_KEY: self.cute_register_subblocks_warps,
+            RSB_PREFETCH_KEY: self.cute_register_subblocks_prefetch,
+            RSB_MASK_KEY: self.cute_register_subblocks_mask,
+            RSB_COLSIDE_KEY: self.cute_register_subblocks_colside,
+            RSB_ROLL_KEY: self.cute_register_subblocks_roll,
+        }
+        if mode == RSB_MODE_OFF:
+            config.update(defaults)
+            return
+        for key, fragment in fragments.items():
+            value = config.setdefault(key, defaults[key])
+            allowed = (defaults[key],) if fragment is None else fragment.choices
+            if value not in allowed or type(value) is not type(defaults[key]):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be one of {allowed!r}, got {value!r}"
+                    )
+                config[key] = defaults[key]
+        block_sizes = config.get("block_sizes")
+        tile_index = None
+        bk: object = None
+        if facts.tile_block_id is not None:
+            tile_index = self.block_sizes.block_id_to_index(facts.tile_block_id)
+            assert isinstance(block_sizes, list)
+            bk = block_sizes[tile_index]
+        reason = register_subblocks_config_reason(
+            facts,
+            bk=bk,
+            warps=config[RSB_WARPS_KEY],
+            prefetch=config[RSB_PREFETCH_KEY],
+            mask=config[RSB_MASK_KEY],
+            colside=config[RSB_COLSIDE_KEY],
+            roll=config[RSB_ROLL_KEY],
+        )
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(f"{RSB_KEY}={mode!r}: {reason}")
+            repaired = register_subblocks_repair(
+                facts,
+                bk=bk,
+                warps=config[RSB_WARPS_KEY],
+                prefetch=config[RSB_PREFETCH_KEY],
+                mask=config[RSB_MASK_KEY],
+                colside=config[RSB_COLSIDE_KEY],
+                roll=config[RSB_ROLL_KEY],
+            )
+            if repaired is None:
+                config[RSB_KEY] = RSB_MODE_OFF
+                config.update(defaults)
+                return
+            for key in defaults:
+                config[key] = repaired[key]
+            if tile_index is not None:
+                assert isinstance(block_sizes, list)
+                block_sizes[tile_index] = repaired["bk"]
+        # The replaced body reads no fragment-route knob: pin them so the
+        # search does not sample inert variations of one kernel.
+        for key in (
+            "cute_fp32_dot",
+            "cute_fragment_padded_rows",
+            "cute_fragment_unrolled_loops",
+            "cute_fragment_vector_io",
+            "cute_fragment_batched_loads",
+            "cute_fragment_split_k",
+            "cute_fragment_slab_loads",
+            "cute_fragment_threads",
+            "cute_fragment_mma_rows",
+            "cute_fragment_register_loads",
+            "cute_fragment_producer_cache",
+            "cute_fragment_warp_scan",
+            "cute_fragment_scan",
+            "cute_fragment_reduction",
+            "cute_fragment_pure_producer_regions",
+            "cute_fragment_warp_results",
+            "cute_fragment_warp_producer_regions",
+            "cute_fragment_published_scalars",
+            "cute_fragment_register_producers",
+            "cute_fragment_register_snapshots",
+            "cute_fragment_private_scalar_loops",
+            "cute_fragment_packet_loads",
+            "cute_fragment_bounded_gather",
+        ):
+            config.pop(key, None)
+        for key, identity in (
+            ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
+            ("cute_reduction_reloads", "auto"),
+            ("load_eviction_policies", ""),
+        ):
+            value = config.get(key)
+            if isinstance(value, list):
+                config[key] = [identity] * len(value)
+        orders = config.get("loop_orders")
+        if isinstance(orders, list):
+            config["loop_orders"] = [
+                list(range(len(order))) if isinstance(order, list) else order
+                for order in orders
+            ]
+        if "cute_store_policy" in config:
+            config["cute_store_policy"] = "default"
 
     def _normalize_cute_mma_dag(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -6438,6 +6630,20 @@ class ConfigSpec:
                         "chunk-recurrence kernels"
                     )
 
+        for rsb_key in RSB_KEYS:
+            if (
+                rsb_key in config
+                and self.cute_register_subblocks is None
+                and self.supports_config_key(rsb_key)
+            ):
+                if _fix_invalid:
+                    config.pop(rsb_key)
+                else:
+                    raise InvalidConfig(
+                        f"{rsb_key} is available only for roots the register "
+                        "sub-block family admits"
+                    )
+
         for dag_key in MMA_DAG_KEYS:
             if (
                 dag_key in config
@@ -7327,6 +7533,8 @@ class ConfigSpec:
                     )
         if self.cute_mma_dag is not None:
             self._normalize_cute_mma_dag(config, fix_invalid=_fix_invalid)
+        if self.cute_register_subblocks is not None:
+            self._normalize_cute_register_subblocks(config, fix_invalid=_fix_invalid)
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
             prepare_schedule = config.setdefault(
@@ -8947,6 +9155,20 @@ class ConfigSpec:
                 split_fragment = self.cute_mma_dag_split
                 if split_fragment is not None:
                     fields[MMA_DAG_SPLIT_KEY] = split_fragment
+            rsb_fragment = self.cute_register_subblocks
+            if rsb_fragment is not None:
+                fields[RSB_KEY] = rsb_fragment
+                fields.update(
+                    (rsb_key, rsb_knob)
+                    for rsb_key, rsb_knob in (
+                        (RSB_WARPS_KEY, self.cute_register_subblocks_warps),
+                        (RSB_PREFETCH_KEY, self.cute_register_subblocks_prefetch),
+                        (RSB_MASK_KEY, self.cute_register_subblocks_mask),
+                        (RSB_COLSIDE_KEY, self.cute_register_subblocks_colside),
+                        (RSB_ROLL_KEY, self.cute_register_subblocks_roll),
+                    )
+                    if rsb_knob is not None
+                )
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule

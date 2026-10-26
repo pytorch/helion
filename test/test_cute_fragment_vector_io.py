@@ -39,6 +39,7 @@ SPLIT = "cute_fragment_split_k"
 SLAB = "cute_fragment_slab_loads"
 DOT = "cute_fp32_dot"
 PAD = "cute_fragment_padded_rows"
+RSB = "cute_register_subblocks"
 MMA = "_helion_fragment_mma.mma_tf32("
 SYNC = "cute.arch.sync_threads()"
 PACKET = "num_bits_per_copy=128"
@@ -858,7 +859,11 @@ def test_engine_varlen_gram_plans_three_slabs(_cpu_only: None) -> None:
     groups = {id(group): group for group in plan.values()}
     assert len(groups) == 3 and len(plan) == 22
     assert sorted(len(g.members) for g in groups.values()) == [4, 7, 11]
-    code = bound.to_code(_config(bound, **{SLAB: True, VEC: True}))
+    # The gram's flattened dots exceed ``SEED_MACS``, so the register
+    # sub-block family is this program's autotune-off default on sm100; the
+    # fragment route's slab loads this test pins are reached with it off.
+    assert bound.config_spec.default_config().config[RSB] == "on"
+    code = bound.to_code(_config(bound, **{SLAB: True, VEC: True, RSB: "off"}))
     assert code.count(".load()") == 4
     assert code.count("fragment_slab_scalar") >= 2
 

@@ -90,6 +90,11 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/_warp_mma_runtime.py",
         "_compiler/cute/_flash_row_mma_runtime.py",
     ),
+    "helion_register_subblocks": (
+        "_compiler/cute/_warp_mma_runtime.py",
+        "_compiler/cute/_mma_dag_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",
