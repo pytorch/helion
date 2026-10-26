@@ -25,6 +25,7 @@ from ..backend import log
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from collections.abc import Hashable
 
     from torch._inductor.ops_handler import OpsHandler
 
@@ -664,7 +665,41 @@ class TritonBackend(Backend):
                 graph = HostFunction.current().device_ir.tile_dependency_graph
                 assert graph is not None
                 out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
+            # The schedule orders accesses through arguments that share a
+            # storage only if the compiler saw them share it; the launcher
+            # refuses any other sharing.
+            alias_groups = self._tensor_storage_alias_groups(sorted_args or [])
+            if alias_groups:
+                out.append(f"_tensor_storage_aliases={alias_groups!r}")
+        elif HostFunction.current().device_ir.tile_dependency_graph is not None:
+            # Fused roots (plain or barrier phases) are placed by the same
+            # dependency graph: refuse sharing the compiler did not see.
+            out.append("_check_storage_aliasing=True")
+            alias_groups = self._tensor_storage_alias_groups(sorted_args or [])
+            if alias_groups:
+                out.append(f"_tensor_storage_aliases={alias_groups!r}")
         env = CompileEnvironment.current()
+        if (
+            env.settings.ttgir_weight_prefetch
+            and device_fn.triton_persistent_state_specs
+            and not any(spec[3] for spec in device_fn.triton_persistent_state_specs)
+            and not device_fn.triton_remote_copy_signal_slots
+            and not device_fn.triton_remote_barrier_signal_slots
+            and not device_fn.triton_remote_copy_scratch_specs
+        ):
+            # Only tasks of this launch produce what its readiness waits wait
+            # for, so tensors it never writes can be read before the waits.
+            # Arguments that share a storage (``_tensor_storage_aliases``: a
+            # tensor and its TMA descriptor, views of one buffer) are written
+            # together; the launcher runs the pass only on launches whose
+            # sharing stays within those classes.
+            out.append("_ttgir_weight_prefetch=True")
+            if env.settings.ttgir_weight_ring:
+                # The pass tries its warp-specialized weight ring first.  The
+                # decision travels with the launch (and so into the compile
+                # key): a process that also runs kernels with the setting off
+                # compiles each kernel the way its own settings ask.
+                out.append("_ttgir_weight_ring=True")
         if env.pdl_entry or env.pdl_exit:
             out.append("launch_pdl=True")
         if device_fn.triton_minimum_resident_programs is not None:
@@ -674,6 +709,30 @@ class TritonBackend(Backend):
             )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
+
+    @staticmethod
+    def _tensor_storage_alias_groups(
+        sorted_args: list[Argument],
+    ) -> tuple[tuple[int, ...], ...]:
+        """Positions of the launcher's tensor and tensor-descriptor arguments
+        that share one storage at compile time, per shared storage (a tensor
+        and its descriptor view one fake storage, and inputs that share a
+        storage share one fake storage)."""
+        from ..device_function import TensorArg
+        from ..input_storage_aliasing import input_storage_classes
+
+        tensors = [
+            (index, argument.fake_value)
+            for index, argument in enumerate(sorted_args)
+            if isinstance(argument, TensorArg)
+        ]
+        positions: dict[Hashable, list[int]] = {}
+        for (index, _), key in zip(
+            tensors, input_storage_classes([t for _, t in tensors]), strict=True
+        ):
+            if key is not None:
+                positions.setdefault(key, []).append(index)
+        return tuple(tuple(group) for group in positions.values() if len(group) > 1)
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:

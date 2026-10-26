@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import ast
+import collections
+import contextlib
 import dataclasses
+from functools import partial
+import itertools
+import re
 from types import SimpleNamespace
 from typing import Any
+from typing import Callable
+from typing import Literal
 from typing import cast
 from unittest import mock
 
 import pytest
+import sympy
 import torch
+import triton
+import triton.language as tl
 
 import helion
 from helion._compat import supports_host_tensor_descriptor
@@ -25,14 +35,17 @@ from helion._compiler.cross_loop_codegen import (
 from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
 from helion._compiler.cross_loop_codegen import _insert_before_first_use
+from helion._compiler.cross_loop_codegen import _insert_producer_waits
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.program_id import PIDInfo
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import DenseTaskOrder
 from helion._compiler.tile_dependency import Incidence
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -664,6 +677,332 @@ def coalesced_single_producer_fanout(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def fanout_and_keyed_join(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A small root every consumer task reads whole (a routing table) and a keyed
+    # root with several tasks per key (FC1 units per expert slot): the consumer
+    # (FC2) must keep its keyed wait on the keyed root.
+    n = x.size(0)
+    rows, width = y.shape
+    quarters = 4
+    small = torch.empty_like(x)
+    keyed = torch.empty_like(y)
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=1):
+        small[tile] = x[tile] + 1
+    for tile_q, tile_r in hl.tile([quarters, rows], block_size=[1, 1]):
+        cols = tile_q.begin * (width // quarters) + hl.arange(width // quarters)
+        keyed[tile_r, cols] = y[tile_r, cols] * 2 + torch.sum(small[:], dim=0)
+    for tile_r in hl.tile(rows, block_size=1):
+        out[tile_r, :] = keyed[tile_r, :] + torch.sum(small[:], dim=0)
+    return out
+
+
+def _short_then_long_sinks_impl(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # A feeds two sinks written short-task first: B's tasks load 9 floats, C's a
+    # 512-float row (+ all of A).  Nothing waits on B or C.
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    c = torch.empty_like(y)
+    for tile in hl.tile(x.size(0), block_size=1):
+        a[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0), block_size=1):
+        b[tile] = x[tile] + torch.sum(a[:], dim=0)
+    for tile in hl.tile(y.size(0), block_size=1):
+        c[tile, :] = y[tile, :] * 2 + torch.sum(a[:], dim=0)
+    return b, c
+
+
+short_then_long_sinks = helion.kernel(
+    _short_then_long_sinks_impl, static_shapes=True, autotune_effort="none"
+)
+short_then_long_sinks_source_order = helion.kernel(
+    _short_then_long_sinks_impl,
+    static_shapes=True,
+    autotune_effort="none",
+    cross_loop_sink_lpt_order=False,
+)
+
+_GLOBALTIMER_SPIN = (
+    "{ .reg .u64 t0, t1; .reg .pred p; mov.u64 t0, %globaltimer; "
+    "SPIN: mov.u64 t1, %globaltimer; sub.u64 t1, t1, t0; "
+    "setp.lt.u64 p, t1, $1; @p bra SPIN; mov.u32 $0, 0; }"
+)
+# The same spin in every warp but the first: warp 0 runs ahead to its stores
+# (and to a publication right behind them) while warps 1.. still spin.
+_WARP_SKEWED_SPIN = (
+    "{ .reg .u64 t0, t1; .reg .pred p, w; .reg .u32 tid; mov.u32 tid, %tid.x; "
+    "setp.lt.u32 w, tid, 32; @w bra SKEW_DONE; mov.u64 t0, %globaltimer; "
+    "SKEW: mov.u64 t1, %globaltimer; sub.u64 t1, t1, t0; "
+    "setp.lt.u64 p, t1, $1; @p bra SKEW; SKEW_DONE: mov.u32 $0, 0; }"
+)
+
+
+def _warp_skewed_publisher_impl(
+    x: torch.Tensor, y: torch.Tensor, delay: torch.Tensor
+) -> torch.Tensor:
+    # P: one element per thread (128-element tiles, 4 warps), stored with no
+    # layout conversion (no CTA barrier of Triton's own) right after the
+    # skewed spin.  C reads all of y, so it waits for P's root barrier, whose
+    # release thread 0 issues: only a CTA barrier in front of that release
+    # orders the stores of warps 1-3 before it.
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0), block_size=128):
+        spun = hl.inline_asm_elementwise(
+            _WARP_SKEWED_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        y[tile] = x[tile] + 1 + spun.to(torch.float32)
+    for tile in hl.tile(x.size(0), block_size=128):
+        out[tile] = y[tile] + torch.sum(y[:], dim=0) * 0.0
+    return out
+
+
+@triton.jit
+def _tma_store_rows(y_ptr, row0, value):
+    descriptor = tl.make_tensor_descriptor(
+        y_ptr,
+        shape=[65, 128],  # pyrefly: ignore[bad-argument-type]
+        strides=[128, 1],  # pyrefly: ignore[bad-argument-type]
+        block_shape=[32, 128],  # pyrefly: ignore[bad-argument-type]
+    )
+    descriptor.store([row0, 0], value)  # pyrefly: ignore[bad-argument-type]
+
+
+def _callee_tma_store_impl(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # P writes rows of y only through a TMA store inside a user Triton
+    # function (an async-proxy write the root body does not spell) and the pad
+    # row generically; C reads all of y.
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0), block_size=32):
+        value = x[tile, :] + 1.0
+        hl.triton_kernel(_tma_store_rows, args=(y, tile.begin, value), output_like=None)
+        y[x.size(0), :] = hl.zeros([x.size(1)], dtype=torch.float32) + 7.0
+    for tile in hl.tile(x.size(0), block_size=32):
+        out[tile, :] = (
+            y[tile, :]
+            + torch.sum(y[0 : x.size(0), :], dim=0)[None, :] * 0.0
+            + y[x.size(0), :][None, :] * 0.0
+        )
+    return out
+
+
+def _grouped_source_impl(
+    w: torch.Tensor, x: torch.Tensor, parts: torch.Tensor, delay: torch.Tensor
+) -> torch.Tensor:
+    # S (64 tasks, a 64 KiB fp32 tile + the 8-byte delay scalar each, no
+    # producer) writes one partial per task after spinning `delay` ns; C reads
+    # every partial.  Its first wave puts 64 x 65544 B (just over 4 MiB) in
+    # flight, so under a 1 MiB + 4 KiB source budget S claims 4 consecutive
+    # tasks per ticket.
+    out = torch.empty_like(x)
+    for tile in hl.tile(w.size(0), block_size=1):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        parts[tile] = torch.sum(torch.sum(w[tile, :, :], dim=-1), dim=-1) + spun.to(
+            torch.float32
+        )
+    for tile in hl.tile(x.size(0), block_size=1):
+        out[tile] = x[tile] + torch.sum(parts[:], dim=0)
+    return out
+
+
+grouped_source = helion.kernel(
+    _grouped_source_impl,
+    static_shapes=True,
+    autotune_effort="none",
+    cross_loop_source_inflight_budget=(1 << 20) + (1 << 12),
+    cross_loop_source_max_group=4,
+)
+capped_source = helion.kernel(
+    _grouped_source_impl,
+    static_shapes=True,
+    autotune_effort="none",
+    cross_loop_source_inflight_budget=(1 << 20) + (1 << 12),
+)
+ungrouped_source = helion.kernel(
+    _grouped_source_impl,
+    static_shapes=True,
+    autotune_effort="none",
+    cross_loop_source_inflight_budget=0,
+)
+
+
+def _transitive_chain_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    small: torch.Tensor,
+    delay: torch.Tensor,
+    middle_reads_small: hl.constexpr,
+    small_first: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
+    # S writes `small` late (spins `delay` ns first); M reads all of it (when
+    # middle_reads_small) and publishes keyed rows; C reads its row of M and all
+    # of `small`.  C's keyed wait on M certifies S transitively.  small_first:
+    # C reads `small` before M's rows (certifying S through the M wait would
+    # move a sunk wait up).
+    n = x.size(0)
+    rows, width = y.shape
+    quarters = 4
+    keyed = torch.empty_like(y)
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=1):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        small[tile] = x[tile] + 1 + spun.to(torch.float32)
+    for tile_q, tile_r in hl.tile([quarters, rows], block_size=[1, 1]):
+        cols = tile_q.begin * (width // quarters) + hl.arange(width // quarters)
+        if middle_reads_small:
+            keyed[tile_r, cols] = y[tile_r, cols] * 2 + torch.sum(small[:], dim=0)
+        else:
+            keyed[tile_r, cols] = y[tile_r, cols] * 2
+    # Two C tasks per M key: each first reads data no root writes, then M's row
+    # half and all of `small` (certified only through M), in either order.
+    for tile_h, tile_c in hl.tile([2, rows], block_size=[1, 1]):
+        half = tile_h.begin * (width // 2) + hl.arange(width // 2)
+        base = y[tile_c, half] * 0
+        if small_first:
+            small_sum = torch.sum(small[:], dim=0)
+            kept = keyed[tile_c, half]
+        else:
+            kept = keyed[tile_c, half]
+            small_sum = torch.sum(small[:], dim=0)
+        out[tile_c, half] = base + small_sum + kept
+    return out
+
+
+def _war_after_producer_read_impl(
+    x: torch.Tensor,
+    x_store: torch.Tensor,
+    y: torch.Tensor,
+    delay: torch.Tensor,
+) -> torch.Tensor:
+    # P reads x late (a spin feeds the load address) and writes y = x + 1.  C
+    # first overwrites its tile of x through `x_store` (x itself, or a view of
+    # its storage: a write-after-read on P's input), then reads all of y (C's
+    # root barrier on P).  Sequential semantics: y = x0 + 1 everywhere and x
+    # ends -1; a C store that wins the race against a late P read corrupts y.
+    n = x.size(0)
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=64):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        y[tile] = x[tile.index + spun] + 1.0
+    for tile_c in hl.tile(n, block_size=64):
+        x_store[tile_c] = hl.zeros([tile_c], dtype=torch.float32) - 1.0
+        out[tile_c] = hl.zeros([tile_c], dtype=torch.float32) + torch.sum(y[:], dim=0)
+    return out
+
+
+def _dot_branch_transitive_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    small: torch.Tensor,
+    flags: torch.Tensor,
+    delay: torch.Tensor,
+    keyed: torch.Tensor,
+    w: torch.Tensor,
+) -> torch.Tensor:
+    # S writes `small` late.  M (a dot root: kernel scope on sm100) reads all
+    # of `small` only under a runtime branch and publishes keyed rows; C reads
+    # its rows of M and all of `small`.  A transitive cover of S through M's
+    # keyed counter is unsound when M's barrier wait on S lands in the branch
+    # (static first-use sinking) and the branch is not taken.
+    n = x.size(0)
+    rows, width = y.shape
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=1):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        small[tile] = x[tile] + 1 + spun.to(torch.float32)
+    for tile_r in hl.tile(rows, block_size=16):
+        on = torch.sum(flags[:])
+        base = torch.matmul(y[tile_r, :], w[:, :])
+        if on > 0:
+            keyed[tile_r, :] = base + torch.sum(small[:], dim=0)
+        else:
+            keyed[tile_r, :] = base
+    for tile_h, tile_c in hl.tile([2, rows], block_size=[1, 16]):
+        half = tile_h.begin * (width // 2) + hl.arange(width // 2)
+        kept = keyed[tile_c, half]
+        small_sum = torch.sum(small[:], dim=0)
+        out[tile_c, half] = small_sum + kept
+    return out
+
+
+def _guarded_transitive_chain_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    small: torch.Tensor,
+    flags: torch.Tensor,
+    delay: torch.Tensor,
+    mid: torch.Tensor,
+    w: torch.Tensor,
+) -> torch.Tensor:
+    # 32 x 512.  S late -> K per row (keyed counter to M) -> M guarded by a
+    # runtime live-row count -> C (16x16 dot tiles) reads M's rows and all of
+    # `small`.  Guard-skipped M tasks of a static pipeline publish their
+    # arrivals without running K's wait, so a cover of S through M's counter
+    # is unsound there.
+    n = x.size(0)
+    rows, width = y.shape
+    kk = torch.empty_like(y)
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=1):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=False,
+            pack=1,
+        )
+        small[tile] = x[tile] + 1 + spun.to(torch.float32)
+    for tile_k in hl.tile(rows, block_size=1):
+        kk[tile_k, :] = y[tile_k, :] + torch.sum(small[:], dim=0)
+    for tile_c, tile_r in hl.tile([width, rows], block_size=[128, 1]):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile_r.begin < live:
+            mid[tile_r, tile_c] = kk[tile_r, tile_c] * 2
+    for tile_o, tile_n in hl.tile([rows, width], block_size=[16, 16]):
+        prod = torch.matmul(mid[tile_o, :], w[:, tile_n])
+        out[tile_o, tile_n] = prod + torch.sum(small[:], dim=0)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def direct_nested_continuation(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
     tmp = torch.empty_like(x)
@@ -916,6 +1255,114 @@ def split_independent_merge(
     static_shapes=True,
     autotune_effort="none",
 )
+def partial_row_tile_absorb(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    heads, rows, width = x.size()
+    _, used_rows, cols = w.size()
+    q = torch.empty_like(x)
+    out = torch.empty([heads, cols, width], dtype=x.dtype, device=x.device)
+    for head_tile, row_tile in hl.tile([heads, rows], block_size=[1, None]):
+        q[head_tile.begin, row_tile, :] = x[head_tile.begin, row_tile, :] * 2
+    # Each consumer task reads only the leading ``used_rows`` of its head.
+    for head_tile, col_tile in hl.tile([heads, cols], block_size=[1, 64]):
+        acc = hl.zeros([col_tile, width], dtype=torch.float32)
+        for used_tile in hl.tile(used_rows, block_size=32):
+            acc = hl.dot(
+                w[head_tile.begin, used_tile, col_tile].permute(1, 0),
+                q[head_tile.begin, used_tile, :],
+                acc=acc,
+            )
+        out[head_tile.begin, col_tile, :] = acc.to(out.dtype)
+    return out
+
+
+def _domain_points(domain: CoordinateDomain) -> list[dict[int, int]]:
+    counts = domain.axis_counts
+    return [
+        dict(zip(domain.axis_order, values, strict=True))
+        for values in itertools.product(
+            *(range(counts[axis]) for axis in domain.axis_order)
+        )
+    ]
+
+
+def _related_points(
+    relation: CoordinateRelation, point: dict[int, int]
+) -> set[tuple[int, ...]]:
+    """Enumerate one source point's targets, clipped to the target domain."""
+    substitutions = {
+        coordinate_axis_symbol(axis): sympy.Integer(value)
+        for axis, value in point.items()
+    }
+
+    def value(expression: object) -> int:
+        return int(sympy.sympify(expression).xreplace(substitutions))
+
+    counts = relation.target_domain.axis_counts
+    related: set[tuple[int, ...]] = set()
+    for piece in relation.pieces:
+        if all(
+            value(begin) <= point[axis] < value(end)
+            and (point[axis] - value(begin)) % step == 0
+            for axis, begin, end, step in piece.source_bounds_items
+        ):
+            related.update(
+                itertools.product(
+                    *(
+                        [
+                            target
+                            for target in range(value(begin), value(end), step)
+                            if 0 <= target < counts[axis]
+                        ]
+                        for axis, begin, end, step in piece.target_ranges
+                    )
+                )
+            )
+    return related
+
+
+def _readiness_arrival_mismatches(
+    plan: cross_loop_scheduler.StaticPipelinePlan,
+) -> tuple[list[str], int]:
+    """Compare every producer arm's publications with its exact-wait count.
+
+    Also returns the number of arms in which some producer items publish
+    nothing.
+    """
+    mismatches: list[str] = []
+    partial_arms = 0
+    for counter in plan.readiness_counters:
+        key_domain = counter.readiness_key_domain
+        for producer in counter.producers:
+            incidence = producer.incidence
+            assert incidence.keys_by_item is not None
+            assert incidence.count_by_key is not None
+            arrivals: collections.Counter[tuple[int, ...]] = collections.Counter()
+            items = _domain_points(incidence.items_by_key.target_domain)
+            silent = 0
+            for item in items:
+                keys = _related_points(incidence.keys_by_item, item)
+                if len(keys) > 1:
+                    mismatches.append(f"item {item} publishes to {sorted(keys)}")
+                silent += not keys
+                arrivals.update(keys)
+            partial_arms += silent > 0
+            for key in _domain_points(key_domain):
+                key_index = tuple(key[axis] for axis in key_domain.axis_order)
+                ((expected,),) = _related_points(incidence.count_by_key, key)
+                fiber = len(_related_points(incidence.items_by_key, key))
+                if not arrivals[key_index] == expected == fiber:
+                    mismatches.append(
+                        f"root {producer.producer_root} key {key_index}: "
+                        f"{arrivals[key_index]} arrivals, waits for {expected}, "
+                        f"fiber has {fiber} items"
+                    )
+    return mismatches, partial_arms
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -934,7 +1381,467 @@ def specialized_quotient_chain(
     return out
 
 
+_GLOBALTIMER_SPIN_20US = """
+t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
+t1 = t0
+while t1 - t0 < 20000:
+    t1 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
+0
+"""
+
+
+def late_producer_chain(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    flag: torch.Tensor,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Two producers (q written 20 us late) feed a Blackwell dot root that
+    reads ``a`` first and ``q`` only where ``flag`` is set; the last root reads
+    ``q`` through the dot root's publication alone (no barrier of its own)."""
+    tokens, k = x.size()
+    n = w.size(0)
+    mid = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        q[t, :] = x[t, :] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, va.permute(1, 0), out_dtype=torch.float32)
+        if flag[0] > 0:
+            vq = hl.load(q, [rows, hl.arange(k)], extra_mask=live[:, None])
+            acc = hl.dot(wt, vq.permute(1, 0), acc=acc)
+        mid[n_t, :] = acc
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vq = hl.load(q, [rows, n_t.begin + hl.arange(16)], extra_mask=live[:, None])
+        out[n_t, :] = mid[(n - 16 - n_t.begin) + hl.arange(16), :] + vq.permute(
+            1, 0
+        ).to(torch.float32)
+    return out
+
+
+def late_producer_branches(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    flag: torch.Tensor,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Like :func:`late_producer_chain`, but both branches of the dot root
+    read ``q`` (adding or subtracting its product)."""
+    tokens, k = x.size()
+    n = w.size(0)
+    mid = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        q[t, :] = x[t, :] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, va.permute(1, 0), out_dtype=torch.float32)
+        if flag[0] > 0:
+            vq = hl.load(q, [rows, hl.arange(k)], extra_mask=live[:, None])
+            acc = hl.dot(wt, vq.permute(1, 0), acc=acc)
+        else:
+            vq = hl.load(q, [rows, hl.arange(k)], extra_mask=live[:, None])
+            acc = acc - hl.dot(wt, vq.permute(1, 0), out_dtype=torch.float32)
+        mid[n_t, :] = acc
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vq = hl.load(q, [rows, n_t.begin + hl.arange(16)], extra_mask=live[:, None])
+        out[n_t, :] = mid[(n - 16 - n_t.begin) + hl.arange(16), :] + vq.permute(
+            1, 0
+        ).to(torch.float32)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def column_half_producers(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    tokens, k = x.size()
+    n = w.size(0)
+    half = k // 2
+    c = torch.empty_like(x)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        c[t, :half] = x[t, :half] + 1
+    for t in hl.tile(tokens, block_size=1):
+        c[t, half:] = x[t, half:] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vc = hl.load(c, [rows, hl.arange(k)], extra_mask=live[:, None])
+        out[n_t, :] = hl.dot(w[n_t, :], vc.permute(1, 0), out_dtype=torch.float32)
+    return out
+
+
+def late_pair_producers(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """Two independent producers (``b`` written 20 us late) feed a root whose
+    outlined task body first reads both: one combined poll."""
+    tokens, k = x.size()
+    out = torch.empty([k, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        b[t, :] = x[t, :] * 2
+    for n_t in hl.tile(k, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        va = hl.load(a, [rows, n_t.begin + hl.arange(16)], extra_mask=live[:, None])
+        vb = hl.load(b, [rows, n_t.begin + hl.arange(16)], extra_mask=live[:, None])
+        out[n_t, :] = (va.to(torch.float32) + vb.to(torch.float32)).permute(1, 0)
+    return out
+
+
+def transitive_pre_chain(
+    x: torch.Tensor, w: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """``a`` (written 20 us late) reaches the dot root only through the root
+    that reads all of it: the dot root's edge from its writer is pruned, and
+    it reads ``a`` before ``b``."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        b[t, :] = x[t, :] + torch.sum(a[:, :], dim=0)
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, va.permute(1, 0), out_dtype=torch.float32)
+        vb = hl.load(b, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, vb.permute(1, 0), acc=acc)
+        out[n_t, :] = acc
+    return out
+
+
+def transitive_split_chain(
+    x: torch.Tensor, w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """Like :func:`transitive_pre_chain`, plus a fast producer of ``c`` that
+    the dot root reads first: it reads ``c``, then ``a``, then ``b``."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        b[t, :] = x[t, :] + torch.sum(a[:, :], dim=0)
+    for t in hl.tile(tokens, block_size=1):
+        c[t, :] = x[t, :] * 3
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vc = hl.load(c, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, vc.permute(1, 0), out_dtype=torch.float32)
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, va.permute(1, 0), acc=acc)
+        vb = hl.load(b, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, vb.permute(1, 0), acc=acc)
+        out[n_t, :] = acc
+    return out
+
+
+def war_pre_chain(
+    x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, a: torch.Tensor
+) -> torch.Tensor:
+    """The dot root overwrites ``s``, which its producer (20 us late) reads,
+    before it reads that producer's output."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = s[t, :] + 1
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        wt = w[n_t, :]
+        hl.store(
+            s,
+            [rows, n_t.begin + hl.arange(16)],
+            hl.full([16, 16], 100.0, dtype=s.dtype),
+            extra_mask=live[:, None],
+        )
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        out[n_t, :] = hl.dot(wt, va.permute(1, 0), out_dtype=torch.float32)
+    return out
+
+
+def war_split_chain(
+    x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """Like :func:`war_pre_chain`, but the dot root first reads ``b`` of a
+    fast producer: it reads ``b``, overwrites ``s``, then reads ``a``."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = s[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        b[t, :] = x[t, :] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vb = hl.load(b, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, vb.permute(1, 0), out_dtype=torch.float32)
+        hl.store(
+            s,
+            [rows, n_t.begin + hl.arange(16)],
+            hl.full([16, 16], 100.0, dtype=s.dtype),
+            extra_mask=live[:, None],
+        )
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, va.permute(1, 0), acc=acc)
+        out[n_t, :] = acc
+    return out
+
+
+def branch_then_later_chain(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    flag: torch.Tensor,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """The dot root reads ``q`` (written 20 us late) inside a branch and
+    again after it."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        q[t, :] = x[t, :] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        va = hl.load(a, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, va.permute(1, 0), out_dtype=torch.float32)
+        if flag[0] > 0:
+            vq = hl.load(q, [rows, hl.arange(k)], extra_mask=live[:, None])
+            acc = hl.dot(wt, vq.permute(1, 0), acc=acc)
+        vq2 = hl.load(q, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, vq2.permute(1, 0), acc=acc)
+        out[n_t, :] = acc
+    return out
+
+
+def alias_view_chain(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    a: torch.Tensor,
+    a_v: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """The dot root reads ``b``, then the output of the producer of ``a``
+    (20 us late) through ``a_v``, which the caller may pass as a view of
+    ``a``."""
+    tokens, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, 16], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        b[t, :] = x[t, :] * 2
+    for n_t in hl.tile(n, block_size=16):
+        rows = hl.arange(16)
+        live = rows < tokens
+        vb = hl.load(b, [rows, hl.arange(k)], extra_mask=live[:, None])
+        wt = w[n_t, :]
+        acc = hl.dot(wt, vb.permute(1, 0), out_dtype=torch.float32)
+        va = hl.load(a_v, [rows, hl.arange(k)], extra_mask=live[:, None])
+        acc = hl.dot(wt, va.permute(1, 0), acc=acc)
+        out[n_t, :] = acc
+    return out
+
+
+def offset_alias_chain(
+    x: torch.Tensor, a: torch.Tensor, big: torch.Tensor
+) -> torch.Tensor:
+    """Writes ``a`` (20 us late); the next root reads rows ``tokens`` and up of
+    ``big``, of which the caller may pass ``a`` as the tail."""
+    tokens, k = x.size()
+    out = torch.empty([tokens, k], dtype=torch.float32, device=x.device)
+    for t in hl.tile(tokens, block_size=1):
+        hl.inline_triton(_GLOBALTIMER_SPIN_20US, args={}, output_like=None)
+        a[t, :] = x[t, :] + 1
+    for t in hl.tile(tokens, block_size=1):
+        out[t, :] = big[t.index + tokens, :].to(torch.float32)
+    return out
+
+
+def _padded_rows(t: torch.Tensor) -> torch.Tensor:
+    rows = torch.zeros(16, t.size(1), device=t.device, dtype=torch.float32)
+    rows[: t.size(0)] = t.float()
+    return rows
+
+
+def _bad_launches(
+    launch: Callable[[], torch.Tensor],
+    poison: Callable[[], None],
+    good: Callable[[torch.Tensor], bool],
+    launches: int = 20,
+) -> int:
+    """Launches whose result shows an access that ran before its producer
+    finished (``poison`` resets the producers' memory before each)."""
+    bad = 0
+    for _ in range(launches):
+        poison()
+        out = launch()
+        torch.cuda.synchronize()
+        bad += not (not torch.isnan(out).any() and good(out))
+    return bad
+
+
+def _without_names(
+    dropped: str,
+) -> Callable[..., tuple[int, ...]]:
+    """``_insert_producer_waits`` that ignores ``dropped`` as a use of any
+    producer's memory (a negative control)."""
+    original = cross_loop_codegen._insert_producer_waits
+
+    def insert(
+        statements: list[ast.stmt],
+        names: tuple[frozenset[str] | None, ...],
+        make_wait: Any,
+    ) -> tuple[int, ...]:
+        return original(
+            statements,
+            tuple(None if n is None else (n - {dropped}) or None for n in names),
+            make_wait,
+        )
+
+    return insert
+
+
+_SINGLE_TRIP_DOT_CONFIG: dict[str, Any] = {
+    "block_sizes": [],
+    "cross_loop_pipeline": "static",
+    "pid_type": "persistent_blocked",
+    "num_warps": 4,
+    "num_stages": 1,
+    "num_sm_multiplier": 1,
+    "indexing": "pointer",
+}
+
+
+def _initial_polls(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(line, indent, counter) of every root-barrier poll outside its spin."""
+    pattern = re.compile(
+        r"^(\s*)tile_dependency_root_barrier_wait(?:_\d+)? = tl\.inline_asm_elementwise"
+        r"\(asm='ld\.(?:acquire|relaxed)\.gpu\.global\.u32 \$0, \[\$1\];', "
+        r"constraints='=r,l', "
+        r"args=\[([^\]]+)\]"
+    )
+    polls = []
+    spin: int | None = None
+    for index, line in enumerate(lines):
+        indent = len(line) - len(line.lstrip())
+        if spin is not None and indent > spin:
+            continue
+        spin = indent if line.lstrip().startswith("while ") else None
+        match = pattern.match(line)
+        if match:
+            polls.append((index, indent, match.group(2)))
+    return polls
+
+
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_async_proxy_write_detector_counts_unknown_callees(self) -> None:
+        # Lean publication drops a root's bulk drain only when nothing in its
+        # body may write through the async proxy; a callee that is neither a
+        # Triton builtin nor a known Helion helper may issue TMA stores.
+        writes = cross_loop_codegen._body_writes_async_proxy
+
+        def body(*lines: str) -> list[ast.stmt]:
+            return [statement for line in lines for statement in ast.parse(line).body]
+
+        lean = (
+            "tl.store(y + offsets, v)",
+            "tl.atomic_add(counter, 1, sem='release', scope='gpu')",
+            "v = tl.load(x + offsets).to(tl.float32)",
+            "w = x_desc.load([0, 0]).reshape([32, 4]).sum(1)",
+            "e = libdevice.exp(v) + tl_math.abs(v)",
+            "m = helion_triton_helpers.max_propagate_nan(v, 0)",
+            "q = triton_helpers.div_floor_integer(a, 4)",
+            "tl.extra.cuda.gdc_wait()",
+            "n = min(a, b) + len(s)",
+            (
+                "t = tl.inline_asm_elementwise(asm='ld.acquire.gpu.global.u32 $0, "
+                "[$1];', constraints='=r,l', args=[c], dtype=tl.uint32, "
+                "is_pure=False, pack=1)"
+            ),
+        )
+        for line in lean:
+            with self.subTest(line=line):
+                self.assertFalse(writes(body(line)))
+        async_writes = (
+            "y_desc.store([0, 0], v)",
+            "y_desc.atomic_add([0, 0], v)",
+            "y_desc.scatter(v, rows, 0)",
+            "tl.store_tensor_descriptor(y_desc, [0, 0], v)",
+            (
+                "t = tl.inline_asm_elementwise(asm='cp.reduce.async.bulk.global"
+                ".shared::cta.add.f32 [$1], [$2], 4;', constraints='=r,l,r', "
+                "args=[a, b], dtype=tl.int32, is_pure=False, pack=1)"
+            ),
+            (
+                "t = tl.inline_asm_elementwise(asm=template, constraints='=r', "
+                "args=[], dtype=tl.int32, is_pure=False, pack=1)"
+            ),
+            # Callees that may store through TMA themselves.
+            "user_triton_function(y, row, v)",
+            "_source_module.helper(y, v)",
+            "v.frobnicate()",
+        )
+        for line in async_writes:
+            with self.subTest(line=line):
+                self.assertTrue(writes(body(line)))
+        # A compiler-outlined helper is judged by its own body.
+        helpers = {
+            "pure_helper": tuple(body("tl.store(y + offsets, v)")),
+            "tma_helper": tuple(body("y_desc.store([0, 0], v)")),
+            "nested_helper": tuple(body("tma_helper(y_desc, v)")),
+            "recursive_helper": tuple(body("recursive_helper(v)")),
+        }
+        self.assertFalse(writes(body("pure_helper(y, v)"), helpers))
+        self.assertTrue(writes(body("tma_helper(y_desc, v)"), helpers))
+        self.assertTrue(writes(body("nested_helper(y_desc, v)"), helpers))
+        self.assertFalse(writes(body("recursive_helper(v)"), helpers))
+        self.assertTrue(writes(body("pure_helper(y, v)")))
+
     def test_guard_hoisting_preserves_dtype_checks(self) -> None:
         indexing = "pid_0 = virtual_pid\noffset_0 = pid_0\n"
         invariant = (
@@ -1203,6 +2110,183 @@ class TestCrossLoopCodegenHelpers(TestCase):
             "wait()\na = z_desc.load([0])\nb = tl.load(z)",
         )
         self.assertEqual(place("a = tl.load(x)\n"), "unused")
+
+    def test_each_producer_waits_before_its_own_first_use(self) -> None:
+        def place(source: str, *names: frozenset[str] | None) -> str:
+            body = ast.parse(source).body
+            self.top = _insert_producer_waits(
+                body,
+                names,
+                lambda producers: (
+                    ast.parse(f"wait({', '.join(map(str, producers))})").body
+                ),
+            )
+            return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+        a, q, kv = frozenset({"a"}), frozenset({"q", "q_desc"}), frozenset({"kv"})
+        # The read of another producer's rows runs before q's wait.
+        self.assertEqual(
+            place(
+                "i = t + 1\nx = tl.load(a + i)\nj = i * 2\ny = tl.load(q + j)\n", a, q
+            ),
+            "i = t + 1\nwait(0)\nx = tl.load(a + i)\nj = i * 2\nwait(1)\n"
+            "y = tl.load(q + j)",
+        )
+        self.assertEqual(self.top, (0, 1))
+        # Outputs first used together, or with only latency-free work between
+        # the uses, share one poll.
+        for source in (
+            "x = tl.load(a + q_desc.load([0]))\n",
+            "x = a + 1\ni = tl.where(c, t, 0).to(tl.int32)\ny = tl.load(q + i)\n",
+        ):
+            with self.subTest(source=source):
+                text = place(source, a, q)
+                self.assertEqual(text.count("wait("), 1)
+                self.assertIn("wait(0, 1)", text)
+                self.assertEqual(self.top, (0, 1))
+        # A producer used in both branches waits in each, before that branch's
+        # first use (after the branch's own reads): every path passes a wait.
+        self.assertEqual(
+            place(
+                "r = tl.load(kv + t)\n"
+                "if c:\n    s = t + 1\n    y = tl.load(q + s)\n"
+                "else:\n    n = tl.load(kv + s)\n    z = tl.load(q + n)\n",
+                kv,
+                q,
+                q,
+            ),
+            "wait(0)\nr = tl.load(kv + t)\n"
+            "if c:\n    s = t + 1\n    wait(1, 2)\n    y = tl.load(q + s)\n"
+            "else:\n    n = tl.load(kv + s)\n    wait(1, 2)\n    z = tl.load(q + n)",
+        )
+        self.assertEqual(self.top, (0, 1, 2))
+        # One using branch: the other branch skips the wait.
+        self.assertEqual(
+            place("x = tl.load(a + t)\nif c:\n    y = tl.load(q + x)\nz = x\n", a, q),
+            "wait(0)\nx = tl.load(a + t)\nif c:\n    wait(1)\n    y = tl.load(q + x)\n"
+            "z = x",
+        )
+        self.assertEqual(self.top, (0,))
+        # A use in a branch and another after the `if`: the wait stays before
+        # the `if`, so the read after it is covered on the path that skips
+        # the branch.
+        self.assertEqual(
+            place(
+                "x = tl.load(a + t)\nif c:\n    y = tl.load(q + x)\n"
+                "z = tl.load(q + t)\n",
+                a,
+                q,
+            ),
+            "wait(0)\nx = tl.load(a + t)\nwait(1)\nif c:\n    y = tl.load(q + x)\n"
+            "z = tl.load(q + t)",
+        )
+        self.assertEqual(self.top, (0, 1))
+        # A wait right before the `if` absorbs a branch wait that follows only
+        # latency-free work; a load in between keeps them apart.
+        self.assertEqual(
+            place("i = t + 1\nif tl.load(a + i) > 0:\n    y = tl.load(q + i)\n", a, q),
+            "i = t + 1\nwait(0, 1)\nif tl.load(a + i) > 0:\n    y = tl.load(q + i)",
+        )
+        self.assertEqual(self.top, (0, 1))
+        self.assertEqual(
+            place(
+                "if tl.load(a + t) > 0:\n    j = tl.load(r + t)\n    y = tl.load(q + j)\n",
+                a,
+                q,
+            ),
+            "wait(0)\nif tl.load(a + t) > 0:\n    j = tl.load(r + t)\n    wait(1)\n"
+            "    y = tl.load(q + j)",
+        )
+        self.assertEqual(self.top, (0,))
+        # Unknown outputs and unused producers wait at the top; loops are not
+        # entered.
+        self.assertEqual(
+            place("for i in tl.range(0, 4):\n    y = tl.load(q + i)\n", None, a, q),
+            "wait(0, 1, 2)\nfor i in tl.range(0, 4):\n    y = tl.load(q + i)",
+        )
+        self.assertEqual(self.top, (0, 1, 2))
+        self.assertEqual(
+            place("x = tl.load(r + t)\ny = tl.load(q + x)\n", None, q),
+            "wait(0)\nx = tl.load(r + t)\nwait(1)\ny = tl.load(q + x)",
+        )
+        self.assertEqual(self.top, (0, 1))
+
+    def test_multi_counter_poll_uses_an_acquire_fence_from_sm90(self) -> None:
+        names = itertools.count()
+        device_function = SimpleNamespace(
+            new_var=lambda prefix, dce=False: f"{prefix}_{next(names)}",
+            async_load_fence=list,
+        )
+        # fence.acquire.gpu assembles for sm_80 too, as an illegal instruction:
+        # older targets poll with acquire loads.
+        for capability, relaxed in (
+            ((8, 0), False),
+            ((8, 9), False),
+            ((9, 0), True),
+            ((10, 0), True),
+            (None, False),
+        ):
+            with (
+                self.subTest(capability=capability),
+                mock.patch.object(
+                    CompileEnvironment,
+                    "current",
+                    return_value=SimpleNamespace(ptx_capability=capability),
+                ),
+            ):
+                text = "\n".join(
+                    ast.unparse(statement)
+                    for statement in cross_loop_codegen._wait_for_dependencies(
+                        device_function=cast("DeviceFunction", device_function),
+                        dependencies=(("c0", "t0"), ("c1", "t1")),
+                        prefix="w",
+                    )
+                )
+                self.assertEqual(text.count("ld.relaxed.gpu"), 4 if relaxed else 0)
+                self.assertEqual(text.count("ld.acquire.gpu"), 0 if relaxed else 4)
+                self.assertEqual("fence.acquire.gpu" in text, relaxed)
+
+    def test_launcher_refuses_storage_sharing_the_compiler_did_not_see(
+        self,
+    ) -> None:
+        from helion.runtime.triton import launcher
+
+        x = torch.zeros(8, 4)
+        y = torch.zeros(8, 4)
+        args = (
+            x,
+            3,
+            x[2:],
+            y,
+            SimpleNamespace(base=x),  # a host tensor descriptor of x
+            torch.empty(0),
+            torch.empty(0),
+        )
+        self.assertEqual(launcher._shared_storages(args), ((0, 2, 4),))
+        self.assertFalse(launcher._distinct_storages(args))
+        self.assertTrue(launcher._distinct_storages((x, y, torch.empty(0))))
+        kernel = SimpleNamespace(arg_names=["x", "n", "x_tail", "y", "x_desc"])
+        launcher._check_compiled_storage_sharing(kernel, ((0, 2, 4),), ((0, 2, 4),))
+        for compiled in ((), ((0, 4),), ((0, 2), (4, 5))):
+            with (
+                self.subTest(compiled=compiled),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Cross-loop launch aliasing: arguments 'x', 'x_tail', 'x_desc'",
+                ),
+            ):
+                launcher._check_compiled_storage_sharing(kernel, ((0, 2, 4),), compiled)
+        # The in-process launcher checks before it touches launch state.
+        with self.assertRaises(helion.exc.CrossLoopAliasedLaunch):
+            helion.runtime.default_launcher(
+                kernel,
+                (1,),
+                x,
+                x[1:],
+                num_warps=4,
+                num_stages=1,
+                _persistent_state_specs=((x, 1, torch.int32, False),),
+            )
 
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
@@ -1684,6 +2768,150 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     )
 
     @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_wait_precedes_every_read_it_certifies(self) -> None:
+        # W writes w (20 us late, into NaN-poisoned storage); Q reads all of w;
+        # A first computes from its own input, then reads all of q and all of
+        # w.  A (publishing nothing) waits once -- on a counter both W and Q
+        # arrive on, or on Q's root barrier that implies W's (W -> Q -> A) --
+        # sunk past its own work but in front of its first read of q or w.
+        def chain_join(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            w: torch.Tensor,
+            q: torch.Tensor,
+            delay: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for w_tile in hl.tile(x.size(0), block_size=1):
+                spun = hl.inline_asm_elementwise(
+                    _GLOBALTIMER_SPIN,
+                    "=r,l",
+                    [delay[0]],
+                    dtype=torch.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                w[w_tile] = x[w_tile] + spun.to(torch.float32)
+            for q_tile in hl.tile(q.size(0), block_size=1):
+                q[q_tile] = torch.sum(w[:], dim=0) + q_tile.begin
+            for a_tile in hl.tile(y.size(0), block_size=1):
+                own = y[a_tile] * 2
+                out[a_tile] = own + torch.sum(w[:], dim=0) + torch.sum(q[:], dim=0)
+            return out
+
+        x = torch.randn(16, device=DEVICE)
+        y = torch.randn(8, device=DEVICE)
+        w = torch.empty_like(x)
+        q = torch.empty(4, device=DEVICE)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        kernel = helion.kernel(chain_join, static_shapes=True, autotune_effort="none")
+        for launch in range(3):
+            w.fill_(float("nan"))
+            q.fill_(float("nan"))
+            code, out = code_and_output(
+                kernel,
+                (x + launch, y, w, q, delay),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            torch.cuda.synchronize()
+            total = (x + launch).sum()
+            expected = (
+                y * 2 + total + (total * 4 + torch.arange(4, device=DEVICE).sum())
+            )
+            torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_2"))
+        kinds = [
+            kind
+            for kind in (
+                "tile_dependency_readiness_wait",
+                "tile_dependency_root_barrier_wait",
+            )
+            if kind in root
+        ]
+        self.assertEqual(len(kinds), 1, root)
+        wait = root.index(kinds[0])
+        self.assertLess(root.index("tl.load(y"), wait)
+        self.assertLess(wait, root.index("tl.load(w"))
+        self.assertLess(wait, root.index("tl.load(q"))
+        # One poll: W's dependency is carried by the same wait as Q's.
+        self.assertEqual(root.count(f"{kinds[0]}_sync"), 1)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_readiness_wait_in_a_root_barrier_publisher(self) -> None:
+        # The gated consumer also feeds a join whose every task reads all of
+        # `out` (a root barrier).  Barrier consumers order other roots by
+        # barrier edges only, so the consumer keeps its sunk wait (after the
+        # keep load, in the branch that reads tmp) although it publishes.  The
+        # producer writes 20 us late into a NaN-poisoned tmp, so a missing or
+        # skipped wait on a kept row shows up.
+        def gated_join(
+            x: torch.Tensor, keep: torch.Tensor, tmp: torch.Tensor, delay: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            total = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for producer_m in hl.tile(x.size(0), block_size=1):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    spun = hl.inline_asm_elementwise(
+                        _GLOBALTIMER_SPIN,
+                        "=r,l",
+                        [delay[0]],
+                        dtype=torch.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+                    tmp[producer_m, producer_n] = (
+                        x[producer_m, producer_n] + 1 + spun.to(torch.float32)
+                    )
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[1, 32]):
+                if keep[consumer_m.begin] > 0:
+                    out[consumer_m, consumer_n] = tmp[consumer_m, consumer_n] * 2
+            for join_m in hl.tile(x.size(0), block_size=1):
+                total[join_m] = (
+                    torch.sum(torch.sum(out[:, :], dim=-1), dim=0) + 0 * join_m.begin
+                )
+            return total
+
+        x = torch.randn(8, 128, device=DEVICE)
+        keep = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0], device=DEVICE, dtype=torch.int32)
+        tmp = torch.empty_like(x)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        expected = torch.where(keep[:, None] > 0, (x + 1) * 2, 0).sum().expand(8)
+        kernel = helion.kernel(gated_join, static_shapes=True, autotune_effort="none")
+        for launch in range(3):
+            tmp.fill_(float("nan"))
+            code, total = code_and_output(
+                kernel,
+                (x + launch, keep, tmp, delay),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                total,
+                torch.where(keep[:, None] > 0, (x + launch + 1) * 2, 0).sum().expand(8),
+                rtol=1e-5,
+                atol=1e-3,
+            )
+        del expected
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        branch = root.index("if v_")
+        self.assertLess(root.index("tl.load(keep"), branch)
+        self.assertLess(branch, root.index("tile_dependency_readiness_wait"))
+        self.assertLess(
+            root.rindex("tile_dependency_readiness_wait"), root.index("tl.load(tmp")
+        )
+        # The consumer publishes the join's root barrier and the join waits on it.
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertGreaterEqual(code.count("sem='release'"), 2)
+
+    @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_sunk_readiness_wait_precedes_device_descriptor_reads(self) -> None:
@@ -1816,11 +3044,70 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertNotIn("tile_dependency_readiness_wait", ast.unparse(root))
 
     @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_single_trip_source_publisher_wrapper_inlines(self) -> None:
+        def chain_impl(x: torch.Tensor) -> torch.Tensor:
+            first = torch.empty_like(x)
+            second = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for producer_m, producer_n in hl.tile(x.size(), block_size=[1, 32]):
+                first[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for middle_m, middle_n in hl.tile(x.size(), block_size=[1, 32]):
+                second[middle_m, middle_n] = first[middle_m, middle_n] * 2
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[1, 32]):
+                out[consumer_m, consumer_n] = second[consumer_m, consumer_n] + 3
+            return out
+
+        def wrapper_decorator(code: str, root: int) -> str:
+            wrapper = _generated_function(
+                code, f"tile_dependency_root_{root}_scheduled_task"
+            )
+            self.assertIn("sem='release'", ast.unparse(wrapper))
+            return ast.unparse(wrapper.decorator_list[0])
+
+        # The first two roots publish readiness counters (no continuation:
+        # fan-in 1 would run the next root inside its producer).  With 8 x 4
+        # tasks they run in one wave: the source root's wrapper inlines unless
+        # the setting is off; the middle root waits on the first, so it keeps
+        # the call boundary.  With 2048 x 4 tasks they loop: both stay noinline.
+        noinline = "triton.jit(noinline=True)"
+        for rows, inline, expected in (
+            (8, True, ("triton.jit", noinline)),
+            (8, False, (noinline, noinline)),
+            (2048, True, (noinline, noinline)),
+        ):
+            x = torch.randn(rows, 128, device=DEVICE)
+            chain = helion.kernel(
+                chain_impl,
+                static_shapes=True,
+                autotune_effort="none",
+                cross_loop_inline_single_trip_publishers=inline,
+            )
+            with mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ):
+                code, out = code_and_output(
+                    chain,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+            torch.testing.assert_close(out, (x + 1) * 2 + 3)
+            self.assertEqual(
+                (wrapper_decorator(code, 0), wrapper_decorator(code, 1)),
+                expected,
+                (rows, inline),
+            )
+
+    @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_middle_root_tma_store_drains_every_release(self) -> None:
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def three_stage(x: torch.Tensor) -> torch.Tensor:
+        def three_stage_impl(x: torch.Tensor) -> torch.Tensor:
             a = torch.empty_like(x)
             b = torch.empty_like(x)
             out = torch.empty_like(x)
@@ -1833,53 +3120,96 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             return out
 
         x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
-        # Continuations with fan-in 1 publish without atomics; keep every edge
-        # on the release path this test inspects.
-        with mock.patch.object(
-            cross_loop_scheduler,
-            "choose_final_arrival_continuations",
-            return_value=(),
-        ):
-            code, out = code_and_output(
-                three_stage,
-                (x,),
-                pid_type="persistent_blocked",
-                cross_loop_pipeline="dynamic",
-                num_sm_multiplier=1,
-                num_warps=4,
-                # Only the store of b is a TMA store; every load uses pointers.
-                indexing=[
-                    "pointer",
-                    "pointer",
-                    "pointer",
-                    "tensor_descriptor",
-                    "pointer",
-                    "pointer",
-                ],
-            )
 
-        torch.testing.assert_close(out, (x + 1) * 2 + 3)
-        self.assertIn(".store(", code)
-        lines = code.splitlines()
-        releases = [
-            i
-            for i, line in enumerate(lines)
-            if "sem='release'" in line or "sem='acq_rel'" in line
-        ]
-        self.assertTrue(releases)
-        # Walking back from each release must reach a drain before any store.
-        for i in releases:
-            for line in reversed(lines[:i]):
-                if "cp.async.bulk.wait_group 0;" in line:
-                    break
-                self.assertFalse(
-                    ".store(" in line or line.lstrip().startswith("def "),
-                    msg=f"release without a TMA drain: {lines[i].strip()}",
+        def release_drains(lean_publication: bool) -> dict[str, bool]:
+            three_stage = helion.kernel(
+                three_stage_impl,
+                static_shapes=True,
+                autotune_effort="none",
+                cross_loop_lean_publication=lean_publication,
+            )
+            # Continuations with fan-in 1 publish without atomics; keep every
+            # edge on the release path this test inspects.
+            with mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ):
+                code, out = code_and_output(
+                    three_stage,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    # Only the store of b is a TMA store; every load uses pointers.
+                    indexing=[
+                        "pointer",
+                        "pointer",
+                        "pointer",
+                        "tensor_descriptor",
+                        "pointer",
+                        "pointer",
+                    ],
                 )
+            torch.testing.assert_close(out, (x + 1) * 2 + 3)
+            self.assertIn(".store(", code)
+            lines = code.splitlines()
+            releases = [
+                i
+                for i, line in enumerate(lines)
+                if "sem='release'" in line or "sem='acq_rel'" in line
+            ]
+            self.assertTrue(releases)
+            # Walking back from a release must reach a drain before any store;
+            # a release that reaches its function's start publishes undrained.
+            drained: dict[str, bool] = {}
+            for i in releases:
+                function = next(
+                    line.split("(")[0].split()[-1]
+                    for line in reversed(lines[:i])
+                    if line.lstrip().startswith("def ")
+                )
+                has_drain = False
+                for line in reversed(lines[:i]):
+                    if "cp.async.bulk.wait_group 0;" in line:
+                        has_drain = True
+                        break
+                    self.assertNotIn(
+                        ".store(",
+                        line,
+                        msg=f"store between drain and release: {lines[i].strip()}",
+                    )
+                    if line.lstrip().startswith("def "):
+                        has_drain = False
+                        break
+                drained[function] = drained.get(function, True) and has_drain
+            return drained
+
+        # Only the root with the TMA store drains before publishing; the root
+        # that stores through pointers publishes without the drain.
+        drained = release_drains(lean_publication=True)
+        self.assertEqual(
+            drained,
+            {
+                "tile_dependency_root_0_scheduled_task": False,
+                "tile_dependency_root_1_scheduled_task": True,
+            },
+        )
+        # Without lean publication every release drains.
+        drained = release_drains(lean_publication=False)
+        self.assertEqual(
+            set(drained),
+            {
+                "tile_dependency_root_0_scheduled_task",
+                "tile_dependency_root_1_scheduled_task",
+            },
+        )
+        self.assertTrue(all(drained.values()), drained)
 
         # Without a TMA access there is nothing to drain or fence.
         code, out = code_and_output(
-            three_stage,
+            helion.kernel(three_stage_impl, static_shapes=True, autotune_effort="none"),
             (x,),
             pid_type="persistent_blocked",
             cross_loop_pipeline="dynamic",
@@ -1889,6 +3219,88 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(out, (x + 1) * 2 + 3)
         self.assertNotIn("fence.proxy.async", code)
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_lean_publication_drains_after_a_callee_tma_store(self) -> None:
+        # P's rows of y land only through a TMA store inside a user Triton
+        # function: its publication must complete that bulk store first even
+        # with lean publication, since its body does not spell the store.
+        x = torch.randn(64, 128, device=DEVICE)
+        y = torch.empty(65, 128, device=DEVICE)
+        pipelines: tuple[Literal["dynamic", "static"], ...] = ("dynamic", "static")
+        for pipeline, lean in itertools.product(pipelines, (True, False)):
+            with self.subTest(pipeline=pipeline, lean=lean):
+                config = helion.Config(
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    # x through TMA, so the kernel uses the async proxy.
+                    indexing=["tensor_descriptor", *["pointer"] * 5],
+                )
+                kernel = helion.kernel(
+                    _callee_tma_store_impl,
+                    config=config,
+                    static_shapes=True,
+                    cross_loop_lean_publication=lean,
+                )
+                code = kernel.bind((x, y)).to_triton_code(config)
+                self.assertIn("_tma_store_rows(", code)
+                self.assertIn("cp.async.bulk.wait_group 0;", code)
+                for _ in range(4):
+                    y.fill_(float("nan"))
+                    out = kernel(x, y)
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(out, x + 1.0))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_lean_publication_keeps_the_cta_barrier_before_its_release(self) -> None:
+        # Lean publication drops only the bulk drain: thread 0's release must
+        # still follow a CTA barrier, or it publishes while warps 1-3 have not
+        # stored yet (here they spin 20 us first) and C reads NaN.
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.empty_like(x)
+        delay = torch.tensor([20_000], device=DEVICE, dtype=torch.int64)
+        for pipeline in ("dynamic", "static"):
+            with self.subTest(pipeline=pipeline):
+                config = helion.Config(
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                )
+                kernel = helion.kernel(
+                    _warp_skewed_publisher_impl, config=config, static_shapes=True
+                )
+                # Runtime first: without the barrier the race shows on every
+                # launch (C reads warps 1-3's NaN).
+                bad = 0
+                for _ in range(20):
+                    y.fill_(float("nan"))
+                    out = kernel(x, y, delay)
+                    torch.cuda.synchronize()
+                    bad += not torch.equal(out, x + 1.0)
+                self.assertEqual(bad, 0)
+                # Lean: nothing to drain.  Walking back from each release
+                # meets the CTA barrier before any store.
+                code = kernel.bind((x, y, delay)).to_triton_code(config)
+                self.assertNotIn("cp.async.bulk.wait_group", code)
+                lines = code.splitlines()
+                releases = [
+                    i
+                    for i, line in enumerate(lines)
+                    if "sem='release'" in line or "sem='acq_rel'" in line
+                ]
+                self.assertTrue(releases)
+                for i in releases:
+                    for line in reversed(lines[:i]):
+                        if "tl.debug_barrier()" in line:
+                            break
+                        self.assertNotIn("tl.store(", line, lines[i])
+                        self.assertFalse(line.lstrip().startswith("def "), lines[i])
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2773,11 +4185,22 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn(f"% {workers} - 0 + 6, {workers + 5}, {workers})", code)
         end = workers + 10
         self.assertIn(f"% {workers} - 0 + {workers + 5}, {end}, {workers})", code)
-        # An edge-free root before a synchronized one keeps its own wave.
+        # An edge-free root before a synchronized one keeps its own wave, and
+        # each root's lanes start on the worker after the previous root's
+        # last task (packed placement): z on workers 6-10, the merge on 11-12.
         code, (out, other) = code_and_output(split_independent_merge, (x, z), **config)
         torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
         torch.testing.assert_close(other, z - 1)
-        self.assertIn(f"tl.program_id(0) - 0 + {workers}, {workers + 5},", code)
+        self.assertIn(
+            f"(tl.program_id(0) + {workers - 6}) % {workers} - 0 + {workers}, "
+            f"{workers + 5},",
+            code,
+        )
+        self.assertIn(
+            f"(tl.program_id(0) + {workers - 11}) % {workers} - 0 + "
+            f"{2 * workers}, {2 * workers + 2},",
+            code,
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2874,6 +4297,451 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertIn("tl.cast(4, tl.uint32)", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fanout_producer_keeps_keyed_readiness_of_other_producer(self) -> None:
+        # Regression: merging the fan-out producer (every consumer key reads all of
+        # it) into the keyed producer's readiness event made the event unlowerable,
+        # so the consumer fell back to whole-root barriers on BOTH producers.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(32 * 64, device=DEVICE, dtype=torch.float32).reshape(32, 64)
+        for pipeline in ("static", "dynamic"):
+            for launch in range(2):
+                code, out = code_and_output(
+                    fanout_and_keyed_join,
+                    (x + launch, y + launch),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                small_sum = (x + launch + 1).sum()
+                torch.testing.assert_close(out, (y + launch) * 2 + 2 * small_sum)
+            # The consumer stays keyed on M: a keyed wait, or (once M's keyed
+            # wait certifies S transitively and no S -> C barrier remains) a
+            # final-arrival continuation of M's key.
+            self.assertTrue(
+                "tile_dependency_readiness_wait" in code
+                or "tile_dependency_continuation_previous" in code,
+                pipeline,
+            )
+            barrier_targets = {
+                line.split("args=[", 1)[1].split("]", 1)[0]
+                for line in code.splitlines()
+                if "tile_dependency_root_barrier_wait" in line and "ld.acquire" in line
+            }
+            # Only the fan-out producer keeps a root barrier.
+            self.assertEqual(len(barrier_targets), 1, barrier_targets)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_tickets_claim_long_task_sinks_first(self) -> None:
+        # Sink LPT order (default on): C's long tasks are claimed before B's
+        # short ones; with the setting off the stream keeps source order.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(16 * 512, device=DEVICE, dtype=torch.float32).reshape(16, 512)
+        expected_bounds = {
+            short_then_long_sinks: [(0, 8), (8, 24), (24, 32)],
+            short_then_long_sinks_source_order: [(0, 8), (8, 16), (16, 32)],
+        }
+        for kernel, bounds_expected in expected_bounds.items():
+            for launch in range(3):
+                code, (b, c) = code_and_output(
+                    kernel,
+                    (x + launch, y + launch),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                a_sum = (x + launch + 1).sum()
+                torch.testing.assert_close(b, x + launch + a_sum)
+                torch.testing.assert_close(c, (y + launch) * 2 + a_sum)
+            ranges = [
+                line.split("if ", 1)[1]
+                for line in code.splitlines()
+                if "tile_dependency_dispatch_ticket_1 >= " in line
+                and " and tile_dependency_dispatch_ticket_1 < " in line
+            ]
+            bounds = [
+                tuple(int(part.split()[-1].rstrip(":")) for part in item.split(" and "))
+                for item in ranges
+            ]
+            # A has 8 tasks, B 8, C 16: the 16-ticket packet is C's.
+            self.assertEqual(bounds, bounds_expected, ranges)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_source_root_claims_grouped_tasks_under_inflight_budget(self) -> None:
+        # S's 64 tasks are claimed 4 per ticket (16 packets) and run in order;
+        # each ticket publishes its 4 tasks at once, so C waits for all 64.  S
+        # writes 20 us late into NaN-poisoned partials: a short count would read
+        # NaN.  With the default group cap (2) the same budget claims 2 per
+        # ticket (32 packets).
+        w = torch.randn(64, 128, 128, device=DEVICE, dtype=torch.float32)
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        parts = torch.empty(64, device=DEVICE, dtype=torch.float32)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        expected_packets = {grouped_source: 16, capped_source: 32, ungrouped_source: 64}
+        for kernel, packets in expected_packets.items():
+            for launch in range(4):
+                parts.fill_(float("nan"))
+                code, out = code_and_output(
+                    kernel,
+                    (w + launch, x, parts, delay),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                )
+                torch.cuda.synchronize()
+                reference = (w + launch).sum(dim=(1, 2))
+                torch.testing.assert_close(parts, reference, rtol=1e-4, atol=1e-2)
+                torch.testing.assert_close(out, x + parts.sum(), rtol=1e-5, atol=1e-3)
+            ranges = [
+                line.split("if ", 1)[1]
+                for line in code.splitlines()
+                if "tile_dependency_dispatch_ticket_1 >= " in line
+                and " and tile_dependency_dispatch_ticket_1 < " in line
+            ]
+            bounds = [
+                tuple(int(part.split()[-1].rstrip(":")) for part in item.split(" and "))
+                for item in ranges
+            ]
+            self.assertEqual(bounds[0], (0, packets), ranges)
+            self.assertEqual("tile_dependency_group_task" in code, packets != 64)
+            if packets != 64:
+                # A plain group loop and one publication of all of a ticket's
+                # tasks.
+                group = 64 // packets
+                self.assertIn(f"in tl.range(0, {group}, 1):", code)
+                self.assertNotIn(f"tl.range(0, {group}, 1, num_stages=1)", code)
+                self.assertIn(f", {group}, sem='release', scope='gpu')", code)
+            # C's root barrier waits for all 64 S tasks either way.
+            self.assertIn("tl.cast(64, tl.uint32)", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_transitive_keyed_wait_replaces_root_barrier(self) -> None:
+        # C waits only on M's keyed readiness: M waited on all of S, so S keeps a
+        # root barrier for M alone; C's wait precedes its read of S; S writes
+        # 20 us late into a NaN-poisoned buffer, so a missing wait shows up.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(32 * 64, device=DEVICE, dtype=torch.float32).reshape(32, 64)
+        small = torch.empty_like(x)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        no_continuations = mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            lambda *args, **kwargs: (),
+        )
+        for pipeline, continuations in itertools.product(
+            ("static", "dynamic"), (True, False)
+        ):
+            kernel = helion.kernel(
+                _transitive_chain_impl, static_shapes=True, autotune_effort="none"
+            )
+            for launch in range(3):
+                small.fill_(float("nan"))
+                with contextlib.nullcontext() if continuations else no_continuations:
+                    code, out = code_and_output(
+                        kernel,
+                        (x + launch, y + launch, small, delay, True),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                small_sum = (x + launch + 1).sum()
+                torch.testing.assert_close(out, (y + launch) * 2 + 2 * small_sum)
+            spins = [
+                line
+                for line in code.splitlines()
+                if line.lstrip().startswith("while tile_dependency_root_barrier_wait")
+            ]
+            consumer = ast.unparse(_generated_function(code, "tile_dependency_root_2"))
+            if pipeline == "static":
+                # Transitive covers are formed for dynamic pipelines only: C
+                # keeps its own S barrier (see
+                # test_static_pipelines_form_no_transitive_covers).
+                self.assertEqual(len(spins), 2, (pipeline, spins))
+                continue
+            self.assertEqual(len(spins), 1, (pipeline, spins))
+            self.assertNotIn("tile_dependency_root_barrier_wait", consumer)
+            if not continuations:
+                # The task's wait on M is emitted before C's first read of S,
+                # wherever the task places it (task entry, or sunk to first use
+                # in a dynamic root, after the read of y).
+                scheduled = ast.unparse(
+                    _generated_function(code, "tile_dependency_root_2_scheduled_task")
+                )
+                self.assertIn("tile_dependency_readiness_wait", scheduled + consumer)
+                if "tile_dependency_readiness_wait" in consumer:
+                    self.assertLess(
+                        consumer.index("tile_dependency_readiness_wait"),
+                        consumer.index("tl.load(small"),
+                        pipeline,
+                    )
+                    self.assertLess(
+                        consumer.index("tl.load(y"),
+                        consumer.index("tile_dependency_readiness_wait"),
+                        pipeline,
+                    )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_transitive_cover_keeps_direct_wait_when_it_would_move(self) -> None:
+        # C reads all of S before M's rows.  A dynamic C sinks its wait on M to
+        # its first use of M's data; certifying S through that wait would move
+        # it above the S read (serializing the work in between), so C keeps its
+        # direct S wait there.  Static waits sit at task entry: the cover stays.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(32 * 64, device=DEVICE, dtype=torch.float32).reshape(32, 64)
+        small = torch.empty_like(x)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        no_continuations = mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            lambda *args, **kwargs: (),
+        )
+        for pipeline in ("static", "dynamic"):
+            kernel = helion.kernel(
+                _transitive_chain_impl, static_shapes=True, autotune_effort="none"
+            )
+            for launch in range(2):
+                small.fill_(float("nan"))
+                with no_continuations:
+                    code, out = code_and_output(
+                        kernel,
+                        (x + launch, y + launch, small, delay, True, True),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                small_sum = (x + launch + 1).sum()
+                torch.testing.assert_close(out, (y + launch) * 2 + 2 * small_sum)
+            spins = [
+                line
+                for line in code.splitlines()
+                if line.lstrip().startswith("while tile_dependency_root_barrier_wait")
+            ]
+            consumer = ast.unparse(_generated_function(code, "tile_dependency_root_2"))
+            # Dynamic: S keeps a barrier for C (emitted at C's dispatch branch)
+            # and C's sunk wait on M stays after its read of S.  Static: no
+            # transitive cover is formed at all, so C keeps its S barrier too.
+            self.assertEqual(len(spins), 2, spins)
+            if pipeline == "dynamic":
+                self.assertLess(
+                    consumer.index("tl.load(small"),
+                    consumer.index("tile_dependency_readiness_wait"),
+                )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_transitive_wait_race_negative_control(self) -> None:
+        # M does not read S, so C needs its own S synchronization.  The sound
+        # scheduler keeps it (correct output); an unsound cover that skips the
+        # causal proof drops it and C reads the poisoned buffer: the race test
+        # must detect that.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(32 * 64, device=DEVICE, dtype=torch.float32).reshape(32, 64)
+        small = torch.empty_like(x)
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        expected = y * 2 + (x + 1).sum()
+
+        def unsound(
+            readiness_graph, obligations_by_root_pair, counters, charge, *_args
+        ):
+            covered = cross_loop_scheduler._covered_obligations(counters)
+            return tuple(
+                dataclasses.replace(
+                    plan,
+                    consumers=tuple(
+                        dataclasses.replace(
+                            consumer,
+                            covered_obligations=consumer.covered_obligations.union(
+                                *(
+                                    obligations - covered
+                                    for (
+                                        _p,
+                                        root,
+                                    ), obligations in obligations_by_root_pair
+                                    if root == consumer.consumer_root
+                                )
+                            ),
+                        )
+                        for consumer in plan.consumers
+                    ),
+                )
+                for plan in counters
+            )
+
+        for pipeline in ("static", "dynamic"):
+            small.fill_(float("nan"))
+            sound = helion.kernel(
+                _transitive_chain_impl, static_shapes=True, autotune_effort="none"
+            )
+            _code, out = code_and_output(
+                sound,
+                (x, y, small, delay, False),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline=pipeline,
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            torch.testing.assert_close(out, expected)
+            broken = helion.kernel(
+                _transitive_chain_impl, static_shapes=True, autotune_effort="none"
+            )
+            with mock.patch.object(
+                cross_loop_scheduler, "_transitively_covered_counters", unsound
+            ):
+                small.fill_(float("nan"))
+                code, out = code_and_output(
+                    broken,
+                    (x, y, small, delay, False),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+            if pipeline == "static":
+                # Static pipelines form no transitive covers, so even the
+                # unsound cover function is never consulted.
+                torch.testing.assert_close(out, expected)
+                continue
+            consumer = ast.unparse(_generated_function(code, "tile_dependency_root_2"))
+            self.assertNotIn("tile_dependency_root_barrier_wait", consumer)
+            self.assertTrue(torch.isnan(out).any(), pipeline)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_barrier_wait_precedes_write_after_read_store(self) -> None:
+        # A dynamic root that publishes nothing sinks its root-barrier wait to
+        # the first use of what the wait orders.  That includes a store into a
+        # tensor its producer READS (write-after-read), also through a view of
+        # the tensor's storage passed as another argument.  P reads x 20 us
+        # late; C's store of -1 must not reach x before P's read.
+        n = 1024
+        x0 = (torch.arange(n, device=DEVICE, dtype=torch.float32) % 13) + 0.5
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        expected = torch.full((n,), float((x0 + 1).sum()), device=DEVICE)
+        for alias in (False, True):
+            kernel = helion.kernel(
+                _war_after_producer_read_impl,
+                static_shapes=True,
+                autotune_effort="none",
+            )
+            x = x0.clone()
+            y = torch.empty(n, device=DEVICE)
+            for _launch in range(6):
+                x.copy_(x0)
+                y.fill_(float("nan"))
+                code, out = code_and_output(
+                    kernel,
+                    (x, x.view(n) if alias else x, y, delay),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(out, expected), alias)
+                self.assertTrue(bool((x == -1).all()), alias)
+            consumer = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+            store = consumer.index("tl.store(x_store")
+            self.assertIn(
+                "tile_dependency_root_barrier_wait", consumer[:store], msg=str(alias)
+            )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_pipelines_form_no_transitive_covers(self) -> None:
+        # Two shapes where a transitive cover of S through M's counter was
+        # unsound in static pipelines (S writes `small` 20 us late into
+        # NaN-poisoned memory): M's barrier wait on S sunk into a branch of a
+        # kernel-scope root that publishes keyed rows (flags = 0 skips it), and
+        # guard-skipped M tasks publishing their arrivals without K's wait
+        # (live < rows).  Static pipelines now keep C's own S wait; dynamic
+        # ones (publishers wait at task entry) stay exact with covers.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        s_sum = (x + 1).sum()
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        for pipeline in ("static", "dynamic"):
+            rows, width = 32, 64
+            y = (
+                (torch.arange(rows * width, device=DEVICE) % 97)
+                .float()
+                .reshape(rows, width)
+            )
+            w = torch.eye(width, device=DEVICE, dtype=torch.float32)
+            small = torch.empty(8, device=DEVICE)
+            keyed = torch.zeros(rows, width, device=DEVICE)
+            flags = torch.zeros(4, device=DEVICE, dtype=torch.int32)
+            kernel = helion.kernel(
+                _dot_branch_transitive_impl, static_shapes=True, autotune_effort="none"
+            )
+            for on in (0, 1, 0):
+                small.fill_(float("nan"))
+                keyed.zero_()
+                flags.fill_(on)
+                _code, out = code_and_output(
+                    kernel,
+                    (x, y, small, flags, delay, keyed, w),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                torch.cuda.synchronize()
+                self.assertFalse(bool(torch.isnan(out).any()), (pipeline, on))
+                self.assertTrue(
+                    torch.allclose(
+                        out,
+                        y @ w + (s_sum if on else 0.0) + s_sum,
+                        rtol=1e-6,
+                        atol=1e-3,
+                    ),
+                    (pipeline, on),
+                )
+            rows, width = 32, 512
+            y = (
+                (torch.arange(rows * width, device=DEVICE) % 97)
+                .float()
+                .reshape(rows, width)
+            )
+            w = torch.eye(width, device=DEVICE, dtype=torch.float32)
+            mid = torch.zeros(rows, width, device=DEVICE)
+            kernel = helion.kernel(
+                _guarded_transitive_chain_impl,
+                static_shapes=True,
+                autotune_effort="none",
+            )
+            for live in (0, 7, 32):
+                flags = (torch.arange(rows, device=DEVICE) < live).to(torch.int32)
+                small.fill_(float("nan"))
+                mid.fill_(3.0)
+                _code, out = code_and_output(
+                    kernel,
+                    (x, y, small, flags, delay, mid, w),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                torch.cuda.synchronize()
+                ref_mid = torch.full((rows, width), 3.0, device=DEVICE)
+                ref_mid[:live] = 2 * (y[:live] + s_sum)
+                self.assertFalse(bool(torch.isnan(out).any()), (pipeline, live))
+                self.assertTrue(
+                    torch.allclose(out, ref_mid + s_sum, rtol=1e-6, atol=1e-3),
+                    (pipeline, live),
+                )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -3061,6 +4929,641 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertUsesExactReadiness(code)
         self.assertIn("tl.cast(4, tl.uint32)", code)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_root_waits_for_each_producer_at_its_first_use(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        a = torch.empty_like(x)
+        q = torch.empty_like(x)
+        flags = {
+            v: torch.full([1], v, device=DEVICE, dtype=torch.int32) for v in (0, 1)
+        }
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+
+        def build() -> helion.Kernel:
+            return helion.kernel(late_producer_chain, config=config, static_shapes=True)
+
+        lines = build().bind((x, w, flags[1], a, q)).to_triton_code(config).splitlines()
+        polls = _initial_polls(lines)
+        va = next(
+            i for i, s in enumerate(lines) if s.lstrip().startswith("va = tl.load(a ")
+        )
+        vq = next(
+            i
+            for i, s in enumerate(lines)
+            if i > va and s.lstrip().startswith("vq = tl.load(q ")
+        )
+        publish = next(
+            i for i, s in enumerate(lines) if i > vq and "sem='release'" in s
+        )
+        a_poll = max(p for p in polls if p[0] < va)
+        q_poll = max(p for p in polls if p[0] < vq)
+        # The dot root waits for `a` before its first read of it, on every
+        # path, and for `q` only inside the branch that reads it (after that
+        # read of `a`), each producer on its own counter.
+        self.assertNotEqual(a_poll[2], q_poll[2])
+        self.assertGreater(q_poll[0], va)
+        self.assertGreater(q_poll[1], a_poll[1])
+        # Tasks that skip the branch never waited for `q`, and the last root
+        # trusts this root's publication: it re-polls `q`, not `a`.
+        self.assertEqual([p[2] for p in polls if vq < p[0] < publish], [q_poll[2]])
+
+        def reference(flag: int) -> torch.Tensor:
+            rows = [torch.zeros(16, 64, device=DEVICE) for _ in range(2)]
+            rows[0][:6] = (x.float() + 1).bfloat16().float()
+            rows[1][:6] = (x.float() * 2).bfloat16().float()
+            mid = w.float() @ rows[0].T + flag * (w.float() @ rows[1].T)
+            return mid.view(4, 16, 16).flip(0).reshape(64, 16) + rows[1].T
+
+        def mismatches(kernel: helion.Kernel, flag: int) -> int:
+            # Poisoned producer outputs: a read before its producer finished
+            # turns the result into NaN.
+            outs = []
+            for _ in range(20):
+                a.fill_(float("nan"))
+                q.fill_(float("nan"))
+                outs.append(kernel(x, w, flags[flag], a, q))
+            torch.cuda.synchronize()
+            if not torch.isnan(outs[0]).any():
+                torch.testing.assert_close(
+                    outs[0], reference(flag), rtol=2e-2, atol=2e-2
+                )
+            return sum(
+                not torch.equal(out, outs[0]) or bool(torch.isnan(out).any())
+                for out in outs
+            )
+
+        kernel = build()
+        for flag in (1, 0):
+            with self.subTest(flag=flag):
+                self.assertEqual(mismatches(kernel, flag), 0)
+
+        # Negative controls (must race): claiming that every producer was
+        # waited for on every path drops the publication's re-poll; dropping
+        # q's branch wait lets the branch read q early.
+        original = cross_loop_codegen._insert_producer_waits
+
+        def certify_all(
+            statements: list[ast.stmt],
+            names: tuple[frozenset[str] | None, ...],
+            make_wait: Any,
+        ) -> tuple[int, ...]:
+            original(statements, names, make_wait)
+            return tuple(range(len(names)))
+
+        def skip_q(
+            statements: list[ast.stmt],
+            names: tuple[frozenset[str] | None, ...],
+            make_wait: Any,
+        ) -> tuple[int, ...]:
+            def without_q(producers: tuple[int, ...]) -> list[ast.stmt]:
+                kept = tuple(p for p in producers if "q" not in (names[p] or ()))
+                return make_wait(kept) if kept else []
+
+            original(statements, names, without_q)
+            return tuple(range(len(names)))
+
+        for mutation, flag in ((certify_all, 0), (skip_q, 1)):
+            with (
+                self.subTest(mutation=mutation.__name__),
+                mock.patch.object(
+                    cross_loop_codegen, "_insert_producer_waits", mutation
+                ),
+            ):
+                self.assertGreater(mismatches(build(), flag), 0)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_waits_in_both_branches_certify_the_publication(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        a = torch.empty_like(x)
+        q = torch.empty_like(x)
+        flags = {
+            v: torch.full([1], v, device=DEVICE, dtype=torch.int32) for v in (0, 1)
+        }
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+
+        def build() -> helion.Kernel:
+            return helion.kernel(
+                late_producer_branches, config=config, static_shapes=True
+            )
+
+        lines = build().bind((x, w, flags[1], a, q)).to_triton_code(config).splitlines()
+        polls = _initial_polls(lines)
+        va = next(
+            i for i, s in enumerate(lines) if s.lstrip().startswith("va = tl.load(a ")
+        )
+        vqs = [
+            i
+            for i, s in enumerate(lines)
+            if i > va and s.lstrip().startswith("vq = tl.load(q ")
+        ][:2]
+        publish = next(
+            i for i, s in enumerate(lines) if i > vqs[1] and "sem='release'" in s
+        )
+        a_poll = max(p for p in polls if p[0] < va)
+        q_polls = [max(p for p in polls if p[0] < vq) for vq in vqs]
+        # Each branch waits for `q` right before its own read, after the read
+        # of `a`; every path passes one of them, so the publication certifies
+        # `q` without a re-poll.
+        self.assertEqual(len({p[2] for p in q_polls}), 1)
+        self.assertNotEqual(a_poll[2], q_polls[0][2])
+        self.assertGreater(q_polls[0][0], va)
+        self.assertGreater(q_polls[1][0], vqs[0])
+        self.assertTrue(all(p[1] > a_poll[1] for p in q_polls))
+        self.assertEqual([p for p in polls if vqs[1] < p[0] < publish], [])
+
+        def reference(flag: int) -> torch.Tensor:
+            rows = [torch.zeros(16, 64, device=DEVICE) for _ in range(2)]
+            rows[0][:6] = (x.float() + 1).bfloat16().float()
+            rows[1][:6] = (x.float() * 2).bfloat16().float()
+            sign = 1 if flag else -1
+            mid = w.float() @ rows[0].T + sign * (w.float() @ rows[1].T)
+            return mid.view(4, 16, 16).flip(0).reshape(64, 16) + rows[1].T
+
+        def mismatches(kernel: helion.Kernel, flag: int) -> int:
+            outs = []
+            for _ in range(20):
+                a.fill_(float("nan"))
+                q.fill_(float("nan"))
+                outs.append(kernel(x, w, flags[flag], a, q))
+            torch.cuda.synchronize()
+            if not torch.isnan(outs[0]).any():
+                torch.testing.assert_close(
+                    outs[0], reference(flag), rtol=2e-2, atol=2e-2
+                )
+            return sum(
+                not torch.equal(out, outs[0]) or bool(torch.isnan(out).any())
+                for out in outs
+            )
+
+        kernel = build()
+        for flag in (1, 0):
+            with self.subTest(flag=flag):
+                self.assertEqual(mismatches(kernel, flag), 0)
+
+        # Negative control (must race): without the else branch's wait the
+        # certification is wrong, and both the branch and the last root read
+        # `q` early.
+        original = cross_loop_codegen._insert_producer_waits
+
+        def skip_else_q(
+            statements: list[ast.stmt],
+            names: tuple[frozenset[str] | None, ...],
+            make_wait: Any,
+        ) -> tuple[int, ...]:
+            q_waits = itertools.count()
+
+            def without_second_q(producers: tuple[int, ...]) -> list[ast.stmt]:
+                is_q = [p for p in producers if "q" in (names[p] or ())]
+                if is_q and next(q_waits) == 1:
+                    kept = tuple(p for p in producers if p not in is_q)
+                    return make_wait(kept) if kept else []
+                return make_wait(producers)
+
+            return original(statements, names, without_second_q)
+
+        with mock.patch.object(
+            cross_loop_codegen, "_insert_producer_waits", skip_else_q
+        ):
+            self.assertGreater(mismatches(build(), 0), 0)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_producers_of_one_tensor_share_one_poll(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        code, out = code_and_output(
+            column_half_producers, (x, w), **_SINGLE_TRIP_DOT_CONFIG
+        )
+        lines = code.splitlines()
+        vc = next(
+            i for i, s in enumerate(lines) if s.lstrip().startswith("vc = tl.load(c ")
+        )
+        polls = [p for p in _initial_polls(lines) if p[0] < vc]
+        # Both producers write `c`: their counters are polled in one spin
+        # right before the first read, with relaxed loads that all issue at
+        # once and one acquire fence after the spin.
+        self.assertEqual(len({p[2] for p in polls[-2:]}), 2)
+        self.assertEqual(polls[-1][0], polls[-2][0] + 1)
+        self.assertTrue(lines[polls[-1][0] + 1].lstrip().startswith("while ("))
+        self.assertTrue(all("ld.relaxed.gpu" in lines[p[0]] for p in polls[-2:]))
+        self.assertIn("asm='fence.acquire.gpu; bar.warp.sync", lines[polls[-1][0] + 4])
+        rows = torch.zeros(16, 64, device=DEVICE)
+        rows[:6, :32] = (x[:, :32].float() + 1).bfloat16().float()
+        rows[:6, 32:] = (x[:, 32:].float() * 2).bfloat16().float()
+        torch.testing.assert_close(out, w.float() @ rows.T, rtol=2e-2, atol=2e-2)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_combined_relaxed_poll_waits_for_every_producer(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        a = torch.empty_like(x)
+        b = torch.empty_like(x)
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+
+        def build() -> helion.Kernel:
+            return helion.kernel(late_pair_producers, config=config, static_shapes=True)
+
+        lines = build().bind((x, a, b)).to_triton_code(config).splitlines()
+        call = next(
+            i
+            for i, s in enumerate(lines)
+            if s.lstrip().startswith("tile_dependency_root_2(")
+        )
+        polls = [p for p in _initial_polls(lines) if p[0] < call]
+        # The consumer's first statement reads both producers' outputs: one
+        # spin over both counters, relaxed loads and one acquire fence.
+        self.assertEqual(polls[-1][0], polls[-2][0] + 1)
+        self.assertNotEqual(polls[-1][2], polls[-2][2])
+        self.assertTrue(all("ld.relaxed.gpu" in lines[p[0]] for p in polls[-2:]))
+        self.assertIn("asm='fence.acquire.gpu; bar.warp.sync", lines[polls[-1][0] + 4])
+
+        expected = torch.zeros(16, 64, device=DEVICE)
+        expected[:6] = (x.float() + 1).bfloat16().float() + (
+            x.float() * 2
+        ).bfloat16().float()
+        reference = expected.T
+
+        def mismatches(kernel: helion.Kernel) -> int:
+            # Poisoned producer outputs: a read before its producer finished
+            # turns the result into NaN.
+            outs = []
+            for _ in range(20):
+                a.fill_(float("nan"))
+                b.fill_(float("nan"))
+                outs.append(kernel(x, a, b))
+            torch.cuda.synchronize()
+            if not torch.isnan(outs[0]).any():
+                torch.testing.assert_close(outs[0], reference)
+            return sum(
+                not torch.equal(out, outs[0]) or bool(torch.isnan(out).any())
+                for out in outs
+            )
+
+        self.assertEqual(mismatches(build()), 0)
+
+        # Negative control (must race): the spin polls only the first counter,
+        # not the late producer's.
+        original = cross_loop_codegen._wait_for_dependencies
+
+        def first_counter_only(
+            *,
+            device_function: DeviceFunction,
+            dependencies: tuple[tuple[str, str], ...],
+            prefix: str,
+        ) -> list[ast.stmt]:
+            return original(
+                device_function=device_function,
+                dependencies=dependencies[:1],
+                prefix=prefix,
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen, "_wait_for_dependencies", first_counter_only
+        ):
+            self.assertGreater(mismatches(build()), 0)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_wait_covers_producers_its_producer_certifies(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        a, b, c = (torch.empty_like(x) for _ in range(3))
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+        cases = {
+            "transitive_pre": (transitive_pre_chain, (x, w, a, b)),
+            "transitive_split": (transitive_split_chain, (x, w, a, b, c)),
+        }
+
+        def good(name: str, out: torch.Tensor) -> bool:
+            expected = w.float() @ _padded_rows(a).T + w.float() @ _padded_rows(b).T
+            if name == "transitive_split":
+                expected = expected + w.float() @ _padded_rows(c).T
+            return torch.allclose(out, expected, rtol=2e-2, atol=2e-2)
+
+        def poison() -> None:
+            for t in (a, b, c):
+                t.fill_(float("nan"))
+
+        for name, (fn, args) in cases.items():
+            with self.subTest(name=name):
+                kernel = helion.kernel(fn, config=config, static_shapes=True)
+                lines = kernel.bind(args).to_triton_code(config).splitlines()
+                va = next(
+                    i
+                    for i, line in enumerate(lines)
+                    if line.lstrip().startswith("va = tl.load(a ")
+                )
+                consumer = max(
+                    i
+                    for i, line in enumerate(lines[:va])
+                    if "for virtual_pid in" in line
+                )
+                # The pruned producer of `a` is certified only by the producer
+                # that reads all of `a`: that producer's wait precedes the read.
+                self.assertTrue(
+                    any(consumer < p[0] < va for p in _initial_polls(lines))
+                )
+                self.assertEqual(
+                    _bad_launches(partial(kernel, *args), poison, partial(good, name)),
+                    0,
+                )
+                # Negative control (must race): the wait ignores the memory of
+                # the producer behind it (the producer's own writes only).
+                with mock.patch.object(
+                    cross_loop_codegen, "_insert_producer_waits", _without_names("a")
+                ):
+                    mutant = helion.kernel(fn, config=config, static_shapes=True)
+                    self.assertGreater(
+                        _bad_launches(
+                            partial(mutant, *args), poison, partial(good, name)
+                        ),
+                        0,
+                    )
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_wait_precedes_overwriting_what_a_producer_reads(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        s0 = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        s, a, b = s0.clone(), torch.empty_like(x), torch.empty_like(x)
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+        cases = {
+            "war_pre": (war_pre_chain, (x, w, s, a)),
+            "war_split": (war_split_chain, (x, w, s, a, b)),
+        }
+        a_expected = (s0.float() + 1).bfloat16()
+
+        def good(name: str, out: torch.Tensor) -> bool:
+            # The producer read the original `s`, not the consumer's 100s.
+            expected = w.float() @ _padded_rows(a).T
+            if name == "war_split":
+                expected = expected + w.float() @ _padded_rows(b).T
+            return torch.equal(a, a_expected) and torch.allclose(
+                out, expected, rtol=2e-2, atol=2e-2
+            )
+
+        def poison() -> None:
+            s.copy_(s0)
+            a.fill_(float("nan"))
+            b.fill_(float("nan"))
+
+        for name, (fn, args) in cases.items():
+            with self.subTest(name=name):
+                kernel = helion.kernel(fn, config=config, static_shapes=True)
+                lines = kernel.bind(args).to_triton_code(config).splitlines()
+                store = next(
+                    i
+                    for i, line in enumerate(lines)
+                    if line.lstrip().startswith("tl.store(s ")
+                )
+                consumer = max(
+                    i
+                    for i, line in enumerate(lines[:store])
+                    if "for virtual_pid in" in line
+                )
+                polls = [p for p in _initial_polls(lines) if consumer < p[0] < store]
+                self.assertEqual(len({p[2] for p in polls}), 1 + (name == "war_split"))
+                self.assertEqual(
+                    _bad_launches(partial(kernel, *args), poison, partial(good, name)),
+                    0,
+                )
+                # Negative control (must race): the wait ignores what the
+                # producer reads.
+                with mock.patch.object(
+                    cross_loop_codegen, "_insert_producer_waits", _without_names("s")
+                ):
+                    mutant = helion.kernel(fn, config=config, static_shapes=True)
+                    self.assertGreater(
+                        _bad_launches(
+                            partial(mutant, *args), poison, partial(good, name)
+                        ),
+                        0,
+                    )
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_branch_wait_does_not_cover_a_read_after_the_branch(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        a = torch.empty_like(x)
+        q = torch.empty_like(x)
+        flags = {
+            v: torch.full([1], v, device=DEVICE, dtype=torch.int32) for v in (0, 1)
+        }
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+        kernel = helion.kernel(
+            branch_then_later_chain, config=config, static_shapes=True
+        )
+        lines = kernel.bind((x, w, flags[1], a, q)).to_triton_code(config).splitlines()
+        va = next(
+            i for i, s in enumerate(lines) if s.lstrip().startswith("va = tl.load(a ")
+        )
+        branch = next(
+            i for i, s in enumerate(lines) if i > va and s.lstrip().startswith("if ")
+        )
+        polls = _initial_polls(lines)
+        a_poll = max(p for p in polls if p[0] < va)
+        q_poll = max(p for p in polls if p[0] < branch)
+        # q is read after the `if` too: its wait precedes the `if`, at the
+        # task's top level, not only inside the branch.
+        self.assertNotEqual(a_poll[2], q_poll[2])
+        self.assertGreater(q_poll[0], va)
+        self.assertEqual(q_poll[1], a_poll[1])
+        self.assertFalse(any(p[0] > branch for p in polls))
+
+        def good(flag: int, out: torch.Tensor) -> bool:
+            expected = w.float() @ _padded_rows(a).T + (flag + 1) * (
+                w.float() @ _padded_rows(q).T
+            )
+            return torch.allclose(out, expected, rtol=2e-2, atol=2e-2)
+
+        def poison() -> None:
+            a.fill_(float("nan"))
+            q.fill_(float("nan"))
+
+        for flag in (0, 1):
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    _bad_launches(
+                        partial(kernel, x, w, flags[flag], a, q),
+                        poison,
+                        partial(good, flag),
+                    ),
+                    0,
+                )
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="only sm100 keeps dot roots inline in the task loop"
+    )
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_view_of_a_written_input_waits_for_its_writer(self) -> None:
+        from helion.runtime.triton import launcher
+
+        torch.manual_seed(0)
+        x = torch.randn(6, 64, device=DEVICE, dtype=torch.bfloat16)
+        w = (0.1 * torch.randn(64, 64, device=DEVICE)).bfloat16()
+        a, a2, b = (torch.empty_like(x) for _ in range(3))
+        config = helion.Config(**_SINGLE_TRIP_DOT_CONFIG)
+        kernel = helion.kernel(alias_view_chain, config=config, static_shapes=True)
+        distinct = (x, w, a, a2, b)
+        aliased = (x, w, a, a.view(6, 64), b)
+
+        # Inputs sharing a storage are one allocation in the dependency graph:
+        # the writer of `a` precedes the reader of `a_v`.
+        def edges(args: tuple[torch.Tensor, ...]) -> set[tuple[int, int]]:
+            host_function = kernel.bind(args).host_function
+            assert host_function is not None
+            graph = host_function.device_ir.tile_dependency_graph
+            assert graph is not None
+            return {(edge.producer_root, edge.consumer_root) for edge in graph.edges}
+
+        self.assertNotIn((0, 2), edges(distinct))
+        self.assertIn((0, 2), edges(aliased))
+        self.assertIsNot(kernel.bind(aliased), kernel.bind(distinct))
+        lines = kernel.bind(aliased).to_triton_code(config).splitlines()
+        va = next(
+            i for i, s in enumerate(lines) if s.lstrip().startswith("va = tl.load(a_v ")
+        )
+        consumer = max(
+            i for i, line in enumerate(lines[:va]) if "for virtual_pid in" in line
+        )
+        polls = [p for p in _initial_polls(lines) if consumer < p[0] < va]
+        self.assertEqual(len({p[2] for p in polls}), 2)
+        self.assertIn("_tensor_storage_aliases=((", "\n".join(lines))
+
+        def good(out: torch.Tensor) -> bool:
+            expected = w.float() @ _padded_rows(a).T + w.float() @ _padded_rows(b).T
+            return torch.allclose(out, expected, rtol=2e-2, atol=2e-2)
+
+        def poison() -> None:
+            a.fill_(float("nan"))
+            b.fill_(float("nan"))
+
+        # The kernel's cache key includes the storage aliasing of its inputs:
+        # after a call with distinct buffers, the aliasing call compiles for it.
+        a2.copy_(x)
+        torch.testing.assert_close(
+            kernel(*distinct),
+            w.float() @ _padded_rows(a2).T + w.float() @ _padded_rows(b).T,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        self.assertEqual(_bad_launches(partial(kernel, *aliased), poison, good), 0)
+        # So does calling the binding compiled for distinct buffers.
+        bound = kernel.bind(distinct)
+        self.assertEqual(_bad_launches(partial(bound, *aliased), poison, good), 0)
+        # Its compiled code alone (as exported, no compiler behind it): the
+        # launcher refuses the aliasing launch.
+        run = bound._run
+        assert run is not None
+        self.assertRaises(helion.exc.CrossLoopAliasedLaunch, run, *aliased)
+        # Negative control (must race): without that check the code's
+        # schedule does not order the read of `a_v` after the writer of `a`.
+        with mock.patch.object(
+            launcher, "_check_compiled_storage_sharing", lambda *args: None
+        ):
+            self.assertGreater(_bad_launches(partial(run, *aliased), poison, good), 0)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_inputs_sharing_storage_overlap_at_any_offset(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(8, 64, device=DEVICE, dtype=torch.bfloat16)
+        buf = torch.empty(16, 64, device=DEVICE, dtype=torch.bfloat16)
+        aliased = (x, buf[8:], buf)
+        distinct = (x, torch.empty_like(x), torch.empty_like(buf))
+
+        def edges(
+            args: tuple[torch.Tensor, ...], static_shapes: bool = True
+        ) -> set[tuple[int, int]]:
+            kernel = helion.kernel(
+                offset_alias_chain, static_shapes=static_shapes, autotune_effort="none"
+            )
+            host_function = kernel.bind(args).host_function
+            assert host_function is not None
+            graph = host_function.device_ir.tile_dependency_graph
+            assert graph is not None
+            return {(edge.producer_root, edge.consumer_root) for edge in graph.edges}
+
+        # The second root reads where the first writes only through the
+        # offset of `a` in `buf`, which the cache key does not record (the
+        # fakes of inputs sharing a storage all start at offset 0, where these
+        # rows are disjoint): their accesses overlap whatever the offsets.
+        self.assertEqual(edges(distinct), set())
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                self.assertEqual(edges(aliased, static_shapes), {(0, 1)})
+        # Negative control: trusting the offset-0 layouts loses the edge.
+        original = CompileEnvironment._aliased_input_fake
+
+        def trusted_layouts(
+            env: CompileEnvironment, tensor: torch.Tensor
+        ) -> torch.Tensor | None:
+            fake = original(env, tensor)
+            env.aliased_input_storages.clear()
+            return fake
+
+        with mock.patch.object(
+            CompileEnvironment, "_aliased_input_fake", trusted_layouts
+        ):
+            self.assertEqual(edges(aliased), set())
+
+        config = helion.Config(
+            block_sizes=[],
+            cross_loop_pipeline="static",
+            pid_type="persistent_blocked",
+            num_warps=4,
+            num_stages=1,
+            num_sm_multiplier=1,
+            indexing="pointer",
+        )
+        kernel = helion.kernel(offset_alias_chain, config=config, static_shapes=True)
+        expected = (x.float() + 1).bfloat16().float()
+
+        def poison() -> None:
+            buf.fill_(float("nan"))
+
+        self.assertEqual(
+            _bad_launches(
+                partial(kernel, *aliased), poison, partial(torch.equal, expected)
+            ),
+            0,
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -3394,3 +5897,46 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertUsesExactReadiness(code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_partially_read_producer_tiles_publish_counted_arrivals(self) -> None:
+        # Consumers read 2 of each head's 3 producer row tiles.  Exact-equality
+        # waits hang unless only the counted producer tasks publish.
+        torch.manual_seed(0)
+        x = torch.randn([2, 96, 16], device=DEVICE, dtype=torch.float16)
+        w = torch.randn([2, 64, 128], device=DEVICE, dtype=torch.float16)
+        expected = torch.einsum("hdc,hdt->hct", w.float(), x[:, :64].float() * 2).half()
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+        plans: list[cross_loop_scheduler.StaticPipelinePlan] = []
+
+        def record(**kwargs: Any) -> cross_loop_scheduler.StaticPipelinePlan:
+            plan = original_build(**kwargs)
+            plans.append(plan)
+            return plan
+
+        for pipeline in ("dynamic", "static"):
+            with self.subTest(pipeline=pipeline):
+                config = {
+                    "block_sizes": [32],
+                    "pid_type": "persistent_blocked",
+                    "cross_loop_pipeline": pipeline,
+                    "num_warps": 4,
+                }
+                plans.clear()
+                with mock.patch.object(
+                    cross_loop_codegen, "build_static_pipeline_plan", side_effect=record
+                ):
+                    partial_row_tile_absorb.bind((x, w)).to_triton_code(
+                        helion.Config(**config)
+                    )
+                (plan,) = plans
+                # Check before launching: an inconsistent counter deadlocks.
+                mismatches, partial_arms = _readiness_arrival_mismatches(plan)
+                self.assertEqual(mismatches, [])
+                self.assertGreater(partial_arms, 0)
+                self.assertNotIn((0, 1), plan.root_barrier_edges)
+
+                code, out = code_and_output(partial_row_tile_absorb, (x, w), **config)
+                torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+                self.assertNotIn("tile_dependency_root_barrier", code)

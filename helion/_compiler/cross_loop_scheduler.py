@@ -24,11 +24,24 @@ from .tile_dependency import nested_logical_axes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     import sympy
 
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
+    ]
+    # (consumer root, its counter's producer roots, obligations the wait
+    # already covers, obligations a transitive cover would add) -> whether the
+    # consumer's wait point stays put (see _transitively_covered_counters).
+    TransitiveWaitMotionCheck = Callable[
+        [
+            int,
+            frozenset[int],
+            frozenset[DependencyObligation],
+            frozenset[DependencyObligation],
+        ],
+        bool,
     ]
 
 ObligationsByRootPair = tuple[
@@ -226,6 +239,39 @@ class ReadinessGraph:
             raise ValueError("event IDs must be dense and source ordered")
 
 
+def _publications_contradict_count(incidence: Incidence) -> bool:
+    """Return whether a uniform exact-wait target provably misses arrivals.
+
+    Each item publishes once to its single-valued key and a consumer waits
+    for exactly ``count`` arrivals per key and epoch, so a publication that
+    provably covers every item must account for ``count`` times the number
+    of keys.  Anything else never matches an exact-equality wait.
+    """
+    keys_by_item, count_by_key = incidence.keys_by_item, incidence.count_by_key
+    assert keys_by_item is not None and count_by_key is not None
+    bounds = count_by_key.value_bounds()
+    if bounds is None or bounds[0] != bounds[1]:
+        return False
+    try:
+        item_count = incidence.items_by_key.target_domain.size
+        key_count = incidence.items_by_key.source_domain.size
+    except ValueError:
+        return False
+    return (
+        item_count != bounds[0] * key_count
+        and count_by_key.has_total_source()
+        and keys_by_item.has_total_source()
+    )
+
+
+def _count_may_be_negative(incidence: Incidence) -> bool:
+    """A per-key arrival count must be a count: an expression that may go
+    negative (an unclipped block tail) cannot be an exact-wait target."""
+    assert incidence.count_by_key is not None
+    bounds = incidence.count_by_key.value_bounds()
+    return bounds is None or bounds[0] < 0
+
+
 def _supports_readiness_counter_lowering(
     readiness_producer: ReadinessProducer,
 ) -> bool:
@@ -233,6 +279,8 @@ def _supports_readiness_counter_lowering(
         readiness_producer.incidence.keys_by_item is not None
         and readiness_producer.incidence.count_by_key is not None
         and readiness_producer.incidence.keys_by_item.is_single_valued()
+        and not _count_may_be_negative(readiness_producer.incidence)
+        and not _publications_contradict_count(readiness_producer.incidence)
     )
 
 
@@ -996,10 +1044,18 @@ class StaticPipelinePlan:
     trailing_roots: frozenset[int] = frozenset()
     # Per-key cross-rank counters for the peer dependencies no edge carries.
     peer_counters: tuple[ReadinessCounterPlan, ...] = ()
+    # Dynamic dispatch: the order of the resident roots' packets in the ticket
+    # stream (empty: source order). Every producer precedes its consumers.
+    dispatch_order: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "dynamic"):
             raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
+        if self.dispatch_order and (
+            self.dispatch_mode != "dynamic"
+            or sorted(self.dispatch_order) != sorted(self.resident_roots)
+        ):
+            raise ValueError("dispatch order must permute the dynamic resident roots")
         if self.worker_count <= 0:
             raise ValueError("worker_count must be positive")
         if len(self.execution_orders) != len(self.body_orders):
@@ -2162,11 +2218,33 @@ def _build_readiness_events(
             producer_incidence = incidence.coarsen(partition)
             if producer_incidence is None:
                 break
-            event_producers.append(
-                ReadinessProducer(producer_root, producer_incidence, producer_site_id)
+            readiness_producer = ReadinessProducer(
+                producer_root, producer_incidence, producer_site_id
             )
+            if (
+                len(merged_relations) > 1
+                and not _supports_readiness_counter_lowering(readiness_producer)
+                and (
+                    producer_incidence.keys_by_item is None
+                    or KeyPartition.from_fixed_width_publication(
+                        producer_incidence.keys_by_item
+                    )
+                    is None
+                )
+            ):
+                # A fan-out arm (one producer task publishes to keys no fixed-width
+                # quotient groups, e.g. every consumer key reads all of a small
+                # root) cannot lower as a counter and would make the whole merged
+                # event unlowerable, so the other arms' keyed obligations would fall
+                # back to whole-root barriers.  Leave its obligations unrepresented:
+                # the fallback below gives exactly this (producer, consumer) pair a
+                # root barrier.
+                continue
+            event_producers.append(readiness_producer)
             covered_obligations.update(relation_points)
         else:
+            if not event_producers:
+                continue
             _record_readiness_event(
                 pending_events,
                 readiness_key_domain=readiness_key_domain,
@@ -2740,11 +2818,197 @@ def _supports_emitted_counter_plan_lowering(
     )
 
 
+def _transitively_covered_counters(
+    readiness_graph: ReadinessGraph,
+    obligations_by_root_pair: ObligationsByRootPair,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    charge: Callable[[int], bool],
+    motion_free: TransitiveWaitMotionCheck | None = None,
+) -> tuple[ReadinessCounterPlan, ...]:
+    """Let a consumer's counter wait certify what its producers waited on.
+
+    A consumer task C that waits on readiness key ``k`` runs after every producer
+    task that publishes ``k``; each of those tasks published only after its own
+    waits, so it ran after every task it causally depends on. An obligation
+    ``P0 -> C`` that no counter covers is therefore met by C's wait on ``k`` when,
+    for every C task, the P0 tasks it reads are among the P0 tasks that the
+    producers of its key are causally after (all relations exact or
+    conservative, every wait in the chain unconditional for the tasks it
+    certifies). The obligation joins that consumer's covered set, so the
+    lowering places the consumer's wait before every access it names (a sunk
+    wait moves up to the first read of the P0 data) and no root barrier
+    ``P0 -> C`` is emitted; P0 no longer publishes one either if nothing else
+    waits on it.  ``motion_free`` (from the lowering) may refuse a cover whose
+    certified data the consumer uses before its own wait point: moving that
+    wait up would cost more than the direct wait it saves.
+    """
+    covered = _covered_obligations(readiness_counters)
+    pending = {
+        pair: obligations - covered
+        for pair, obligations in obligations_by_root_pair
+        if obligations - covered
+    }
+    if not pending or not readiness_counters:
+        return readiness_counters
+    candidates = {
+        consumer.consumer_root
+        for plan in readiness_counters
+        for index, consumer in enumerate(plan.consumers)
+        if index != plan.continuation_consumer_index
+        and consumer.consumer_site_id is None
+    }
+    pending = {pair: value for pair, value in pending.items() if pair[1] in candidates}
+    if not pending:
+        return readiness_counters
+    causal = dict(_root_causal_prerequisite_relations(readiness_graph, charge))
+    root_domains = readiness_graph.root_domains
+
+    def compose(left: Incidence, right: Incidence) -> Incidence | None:
+        if not charge(
+            1 + len(left.items_by_key.pieces) * len(right.items_by_key.pieces)
+        ):
+            return None
+        return left.then(right)
+
+    def union(items: list[Incidence]) -> Incidence | None:
+        if len(items) == 1:
+            return items[0]
+        if not charge(1 + sum(len(item.items_by_key.pieces) for item in items)):
+            return None
+        return Incidence.union_all(tuple(items))
+
+    # What each consumer task reads of each pending producer, from the events
+    # that carry the pending obligations.
+    needed: dict[tuple[int, int], list[Incidence]] = {}
+    attributed: dict[tuple[int, int], set[DependencyObligation]] = {}
+    unsupported: set[tuple[int, int]] = set()
+    for event in readiness_graph.events:
+        for consumer in event.consumers:
+            for producer in event.producers:
+                pair = (producer.producer_root, consumer.consumer_root)
+                obligations = pending.get(pair, frozenset()) & (
+                    consumer.covered_obligations
+                )
+                if not obligations or pair in unsupported:
+                    continue
+                consumer_items = consumer.incidence.project_items(
+                    root_domains[consumer.consumer_root]
+                )
+                consumer_keys = (
+                    None if consumer_items is None else consumer_items.reversed()
+                )
+                producer_tasks = producer.incidence.project_items(
+                    root_domains[producer.producer_root]
+                )
+                relation = (
+                    None
+                    if producer.producer_site_id is not None
+                    or consumer_keys is None
+                    or producer_tasks is None
+                    else compose(consumer_keys, producer_tasks)
+                )
+                if relation is None:
+                    unsupported.add(pair)
+                    continue
+                needed.setdefault(pair, []).append(relation)
+                attributed.setdefault(pair, set()).update(obligations)
+
+    extra: dict[tuple[int, int], set[DependencyObligation]] = {}
+    for pair, obligations in sorted(pending.items()):
+        source_root, consumer_root = pair
+        if pair in unsupported or attributed.get(pair) != obligations:
+            continue
+        required = union(needed[pair])
+        if required is None:
+            continue
+        for plan_index, plan in enumerate(readiness_counters):
+            found = False
+            for index, consumer in enumerate(plan.consumers):
+                if (
+                    consumer.consumer_root != consumer_root
+                    or consumer.consumer_site_id is not None
+                    or index == plan.continuation_consumer_index
+                    # A partial key map guards the wait: tasks without a key skip it.
+                    or not consumer.keys_by_consumer.is_total_function()
+                ):
+                    continue
+                consumer_items = consumer.incidence.project_items(
+                    root_domains[consumer_root]
+                )
+                consumer_keys = (
+                    None if consumer_items is None else consumer_items.reversed()
+                )
+                if consumer_keys is None:
+                    continue
+                certified: list[Incidence] = []
+                for producer in plan.producers:
+                    if producer.producer_site_id is not None:
+                        continue
+                    producer_tasks = producer.incidence.project_items(
+                        root_domains[producer.producer_root]
+                    )
+                    direct = (
+                        None
+                        if producer_tasks is None
+                        else compose(consumer_keys, producer_tasks)
+                    )
+                    if direct is None:
+                        continue
+                    if producer.producer_root == source_root:
+                        certified.append(direct)
+                        continue
+                    ancestry = causal.get((producer.producer_root, source_root))
+                    chained = None if ancestry is None else compose(direct, ancestry)
+                    if chained is not None:
+                        certified.append(chained)
+                proved = None if not certified else union(certified)
+                if (
+                    proved is not None
+                    and proved.items_by_key.covers(required.items_by_key)
+                    and (
+                        motion_free is None
+                        or motion_free(
+                            consumer_root,
+                            frozenset(p.producer_root for p in plan.producers),
+                            consumer.covered_obligations
+                            | frozenset(extra.get((plan_index, index), ())),
+                            frozenset(obligations),
+                        )
+                    )
+                ):
+                    extra.setdefault((plan_index, index), set()).update(obligations)
+                    found = True
+                    break
+            if found:
+                break
+    if not extra:
+        return readiness_counters
+    return tuple(
+        dataclasses.replace(
+            plan,
+            consumers=tuple(
+                dataclasses.replace(
+                    consumer,
+                    covered_obligations=consumer.covered_obligations
+                    | frozenset(extra[plan_index, index]),
+                )
+                if (plan_index, index) in extra
+                else consumer
+                for index, consumer in enumerate(plan.consumers)
+            ),
+        )
+        for plan_index, plan in enumerate(readiness_counters)
+    )
+
+
 def _finalize_emitted_synchronization(
     *,
     readiness_graph: ReadinessGraph,
     obligations_by_root_pair: ObligationsByRootPair,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
+    charge: Callable[[int], bool] | None = None,
+    transitive_waits: bool = True,
+    transitive_wait_is_motion_free: TransitiveWaitMotionCheck | None = None,
 ) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
     """Select fallback barriers and remove counter consumers they subsume."""
     readiness_counters = tuple(
@@ -2752,12 +3016,39 @@ def _finalize_emitted_synchronization(
         for plan in readiness_counters
         if _supports_emitted_counter_plan_lowering(plan, readiness_graph.root_domains)
     )
+    if transitive_waits:
+        readiness_counters = _transitively_covered_counters(
+            readiness_graph,
+            obligations_by_root_pair,
+            readiness_counters,
+            charge or _new_relation_work_budget(),
+            transitive_wait_is_motion_free,
+        )
+    pair_by_obligation = {
+        obligation: pair
+        for pair, obligations in obligations_by_root_pair
+        for obligation in obligations
+    }
     covered_obligations = _covered_obligations(readiness_counters)
     root_barrier_edges = _select_root_barrier_edges(
         obligations_by_root_pair=obligations_by_root_pair,
         covered_obligations=covered_obligations,
     )
     root_order_edges = _root_barrier_reachability(root_barrier_edges)
+
+    def certifies_unordered_root(
+        plan: ReadinessCounterPlan, consumer: ReadinessConsumer
+    ) -> bool:
+        # A wait that also certifies another root's data transitively stays
+        # unless barriers order that root too.
+        plan_roots = {producer.producer_root for producer in plan.producers}
+        return any(
+            pair not in root_order_edges
+            for obligation in consumer.covered_obligations
+            if (pair := pair_by_obligation.get(obligation)) is not None
+            and pair[0] not in plan_roots
+        )
+
     retained: list[ReadinessCounterPlan] = []
     for plan in readiness_counters:
         kept = tuple(
@@ -2768,6 +3059,7 @@ def _finalize_emitted_synchronization(
                 (producer.producer_root, consumer.consumer_root) in root_order_edges
                 for producer in plan.producers
             )
+            or certifies_unordered_root(plan, consumer)
         )
         if not kept:
             continue
@@ -2925,6 +3217,199 @@ def _try_finalize_pipeline_proposal(
     return baseline if prepared == ownership_base else finalize(prepared) or baseline
 
 
+def _prerequisite_root_pairs(
+    plan: StaticPipelinePlan,
+    obligations_by_root_pair: ObligationsByRootPair,
+) -> frozenset[tuple[int, int]]:
+    """Producer -> consumer root pairs of every dependency and emitted wait."""
+    pairs = {pair for pair, _obligations in obligations_by_root_pair}
+    pairs |= set(plan.root_barrier_edges) | set(plan.peer_edges)
+    for counter in (*plan.readiness_counters, *plan.peer_counters):
+        for consumer in counter.consumers:
+            pairs.update(
+                (producer.producer_root, consumer.consumer_root)
+                for producer in counter.producers
+            )
+    return frozenset(
+        (producer, consumer) for producer, consumer in pairs if producer != consumer
+    )
+
+
+def _whole_producer_waits(plan: StaticPipelinePlan) -> frozenset[tuple[int, int]]:
+    """Producer -> consumer pairs whose every emitted wait is for all of the
+    producer: a root barrier, or a one-key counter every producer task
+    arrives on.  A keyed (multi-key) or peer counter lets the consumer start
+    on part of the producer, so its pairs are excluded."""
+    complete = set(plan.root_barrier_edges)
+    partial: set[tuple[int, int]] = set()
+    for counter in (*plan.readiness_counters, *plan.peer_counters):
+        one_key = (
+            counter not in plan.peer_counters and counter.readiness_key_domain.size == 1
+        )
+        for producer in counter.producers:
+            count = producer.incidence.count_by_key
+            size = producer.incidence.items_by_key.target_domain.size
+            whole = (
+                one_key
+                and producer.producer_site_id is None
+                and count is not None
+                and count.value_bounds() == (size, size)
+            )
+            for consumer in counter.consumers:
+                pair = (producer.producer_root, consumer.consumer_root)
+                (complete if whole else partial).add(pair)
+    return frozenset(complete - partial)
+
+
+def sink_lpt_dispatch_order(
+    plan: StaticPipelinePlan,
+    obligations_by_root_pair: ObligationsByRootPair,
+    root_task_costs: Sequence[int | None],
+) -> tuple[int, ...]:
+    """Claim the kernel's makespan-only tail longest task first.
+
+    Dynamic tickets are claimed in packet order.  A sink root -- one no other
+    root waits on or reads from -- gates nothing inside the kernel, so for the
+    sinks at the end of the ticket stream only the makespan counts.  The same
+    holds for a root whose every consumer is such a tail root that waits for
+    all of it (a root barrier or a one-key counter: a join such as an
+    in-kernel finalize), as long
+    as the root itself waits on some producer (a root with no producer is
+    claimable from the first ticket, and its place among the sources is the
+    author's first-wave priority).  The maximal run of these roots at the end
+    of the current order is list-scheduled longest path first: each root's rank
+    is its task cost plus the largest rank among its consumers in the run (for
+    sinks: the task cost, i.e. longest-processing-time-first), and the run is
+    re-emitted in topological order, highest rank first among the roots whose
+    producers in the run are placed.  Claiming the long tasks first lets the
+    short ones fill the slots that free up last; claimed first, short tasks
+    take the slots the long ones need and those start late.  Producers keep
+    preceding their consumers, so the stream stays progress safe.  A task's
+    cost is the bytes its loads move (``root_task_costs``; decode-size
+    megakernel tasks are memory bound); if any cost in the run is unknown the
+    order is left alone.  Ties keep the current order.
+    """
+    base = tuple(plan.dispatch_order or plan.resident_roots)
+    consumers_of: dict[int, set[int]] = {}
+    producers_of: dict[int, set[int]] = {}
+    for producer, consumer in _prerequisite_root_pairs(plan, obligations_by_root_pair):
+        consumers_of.setdefault(producer, set()).add(consumer)
+        producers_of.setdefault(consumer, set()).add(producer)
+    whole_waits = _whole_producer_waits(plan)
+    run: list[int] = []
+    for root in reversed(base):
+        if root in plan.continuation_roots:
+            break
+        consumers = consumers_of.get(root, set())
+        if consumers and not (
+            producers_of.get(root)
+            and all(
+                consumer in run and (root, consumer) in whole_waits
+                for consumer in consumers
+            )
+        ):
+            break
+        run.append(root)
+    run.reverse()
+    if len(run) < 2:
+        return ()
+    position = {root: index for index, root in enumerate(run)}
+    rank: dict[int, int] = {}
+    for root in reversed(run):  # consumers follow their producers in the run
+        cost = root_task_costs[root] if root < len(root_task_costs) else None
+        if cost is None or cost < 0:
+            return ()
+        rank[root] = cost + max(
+            (rank[c] for c in consumers_of.get(root, ()) if c in position), default=0
+        )
+    placed: list[int] = []
+    remaining = list(run)
+    while remaining:
+        ready = [
+            root
+            for root in remaining
+            if all(
+                producer in placed or producer not in position
+                for producer in producers_of.get(root, ())
+            )
+        ]
+        best = min(ready, key=lambda root: (-rank[root], position[root]))
+        placed.append(best)
+        remaining.remove(best)
+    order = base[: len(base) - len(run)] + tuple(placed)
+    return () if order == tuple(plan.resident_roots) else order
+
+
+# Largest number of consecutive tasks one ticket of a grouped source root
+# claims (source_root_task_groups).
+SOURCE_ROOT_MAX_GROUP = 2
+
+
+def source_root_task_groups(
+    plan: StaticPipelinePlan,
+    obligations_by_root_pair: ObligationsByRootPair,
+    root_task_costs: Sequence[int | None],
+    inflight_budget: int,
+    max_group: int = SOURCE_ROOT_MAX_GROUP,
+) -> dict[int, int]:
+    """Consecutive tasks per ticket for the dynamic stream's bandwidth sources.
+
+    A source root -- it waits on no root -- is claimable from the first ticket,
+    so with one task per ticket its first wave puts ``min(tasks, workers)``
+    tasks' loads in flight at once.  Bytes in flight beyond the memory
+    system's bandwidth-delay product buy no bandwidth: they only queue the
+    round trips of the latency-critical roots behind them and take first-wave
+    slots from the roots claimed after them, which then start (and finish)
+    together.  Such a root claims ``g`` consecutive tasks per ticket, run one
+    after another by the claiming program, with ``g`` the smallest factor that
+    brings its first wave's bytes in flight (a task's load bytes stand for its
+    in-flight bytes) under ``inflight_budget``, capped at ``max_group``.
+
+    The cap is the cost side of the trade.  The group loop is not pipelined
+    (Triton 3.8 drains each task's ring before the next task starts), so a
+    ticket runs its tasks back to back, each paying its first-load latency:
+    the root's span grows to about ``g`` task latencies while its consumers'
+    slots (claimed in ticket order, then spinning on the root's barrier) wait
+    for it.  The gain is bounded by the over-subscription the group removes,
+    the loss grows linearly in ``g``.  Measured on the GLM-5 MoE megakernel
+    (shared gate_up, 192 x 72 KB tasks): g=2 is the optimum, g=3 / 4 / 7 cost
+    +2.7 / +3.3..3.7 / +4.3..4.8 us per layer.  The default cap of 2 bounds
+    the span growth to one task latency, so the over-subscription relief
+    cannot turn into a serialization cliff whatever the budget says.
+
+    A grouped task finishes later than it would on a slot of its own, so only
+    a root whose consumers each wait for all of it (``_whole_producer_waits``)
+    is grouped: for those only the root's last task counts, never the order
+    of the others.  Every task still runs once, so counts and dependencies
+    are unchanged.  Returns ``{root: g}`` for the grouped roots only.
+    """
+    if plan.dispatch_mode != "dynamic" or inflight_budget <= 0:
+        return {}
+    pairs = _prerequisite_root_pairs(plan, obligations_by_root_pair)
+    consumers = {consumer for _producer, consumer in pairs}
+    whole_waits = _whole_producer_waits(plan)
+    partially_consumed = {
+        producer
+        for producer, consumer in pairs
+        if (producer, consumer) not in whole_waits
+    }
+    groups: dict[int, int] = {}
+    for root in plan.resident_roots:
+        if root in consumers or root in partially_consumed:
+            continue
+        cost = root_task_costs[root] if root < len(root_task_costs) else None
+        if cost is None or cost <= 0:
+            continue
+        tasks = plan.execution_orders[root].task_count
+        inflight = min(tasks, plan.worker_count) * cost
+        if inflight <= inflight_budget:
+            continue
+        group = min(-(-inflight // inflight_budget), tasks, max(max_group, 1))
+        if group > 1:
+            groups[root] = group
+    return groups
+
+
 def build_static_pipeline_plan(
     *,
     dependency_graph: TileDependencyGraph,
@@ -2935,6 +3420,10 @@ def build_static_pipeline_plan(
     continuation_ineligible_roots: frozenset[int] = frozenset(),
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     cross_loop_dispatch_mode: CrossLoopDispatchMode = "static",
+    transitive_waits: bool = True,
+    transitive_wait_is_motion_free: TransitiveWaitMotionCheck | None = None,
+    sink_lpt_order: bool = False,
+    root_task_costs: Sequence[int | None] = (),
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
     if cross_loop_dispatch_mode not in ("static", "dynamic"):
@@ -3059,6 +3548,9 @@ def build_static_pipeline_plan(
             readiness_graph=readiness_graph,
             obligations_by_root_pair=obligations_by_root_pair,
             readiness_counters=counters,
+            charge=charge,
+            transitive_waits=transitive_waits,
+            transitive_wait_is_motion_free=transitive_wait_is_motion_free,
         )
         return counters, barriers, try_plan(counters, barriers, dispatch_mode)
 
@@ -3183,7 +3675,7 @@ def build_static_pipeline_plan(
                 "the requested dynamic cross-loop pipeline does not admit a "
                 "progress-safe cross-loop schedule"
             )
-    return dataclasses.replace(
+    finalized = dataclasses.replace(
         proposal,
         peer_edges=peer_edges,
         # Parity and credit already keep in-band roots from reusing live buffers.
@@ -3196,6 +3688,13 @@ def build_static_pipeline_plan(
         ),
         peer_counters=peer_counters,
     )
+    if sink_lpt_order and root_task_costs and finalized.dispatch_mode == "dynamic":
+        order = sink_lpt_dispatch_order(
+            finalized, (*obligations_by_root_pair, *peer_pairs), root_task_costs
+        )
+        if order:
+            finalized = dataclasses.replace(finalized, dispatch_order=order)
+    return finalized
 
 
 def _unordered_reuse_roots(

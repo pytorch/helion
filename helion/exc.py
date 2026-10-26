@@ -114,6 +114,13 @@ class CrossLoopSchedulingError(BaseError):
     message = "Cross-loop scheduling cannot safely lower dependency {0}."
 
 
+class CrossLoopAliasedLaunch(BaseError):
+    """A cross-loop kernel launched with tensor arguments sharing storage in
+    a way its compiled schedule does not know about."""
+
+    message = "{0}"
+
+
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
 

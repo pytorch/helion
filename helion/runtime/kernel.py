@@ -2557,6 +2557,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
         )
+        self._env.record_input_storage_aliases(
+            [tensor for _path, tensor in _walk_input_tensors(args)]
+        )
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]

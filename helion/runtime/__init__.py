@@ -82,6 +82,10 @@ def default_launcher(
     _persistent_state_process_group_name: str | None = None,
     _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
+    _ttgir_weight_prefetch: bool = False,
+    _ttgir_weight_ring: bool = False,
+    _tensor_storage_aliases: tuple[tuple[int, ...], ...] = (),
+    _check_storage_aliasing: bool = False,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -108,6 +112,10 @@ def default_launcher(
             _persistent_state_process_group_name=_persistent_state_process_group_name,
             _persistent_state_rank_digest=_persistent_state_rank_digest,
             _minimum_resident_programs=_minimum_resident_programs,
+            _ttgir_weight_prefetch=_ttgir_weight_prefetch,
+            _ttgir_weight_ring=_ttgir_weight_ring,
+            _tensor_storage_aliases=_tensor_storage_aliases,
+            _check_storage_aliasing=_check_storage_aliasing,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,
@@ -118,6 +126,8 @@ def default_launcher(
             raise exc.ShapeMismatch("kernel operands", message) from error
         if message.startswith("Cross-loop scheduling requires "):
             raise exc.InvalidConfig(message) from error
+        if message.startswith("Cross-loop launch aliasing: "):
+            raise exc.CrossLoopAliasedLaunch(message) from error
         raise
 
 

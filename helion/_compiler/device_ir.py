@@ -3960,6 +3960,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     else 1
                 ),
             )
+            if env.unrepresented_input_aliasing:
+                raise exc.CrossLoopSchedulingError(
+                    "because tensor inputs share a storage that their fake tensors "
+                    "could not share"
+                )
+            if env.backend_name == "triton":
+                from .input_storage_aliasing import register_input_storage_partition
+
+                # In-kernel orderings follow the storage partition this
+                # binding saw: key on it, so another aliasing recompiles.
+                register_input_storage_partition(env)
             cross_rank = device_ir.tile_dependency_graph.crosses_ranks()
             _install_dependency_phases(
                 device_ir,

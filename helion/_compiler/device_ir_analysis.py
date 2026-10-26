@@ -1799,9 +1799,12 @@ class DeviceIRAnalysis:
                     symbolic_layout = tuple(
                         symbolic_layout_value(value) for value in raw_layout
                     )
+                    # Inputs sharing a storage keep their own layouts at
+                    # offset 0: where they lie relative to each other is
+                    # unknown, so their accesses overlap anything there.
                     layout_is_symbolically_exact = not any(
                         _has_unbacked(expression) for expression in symbolic_layout
-                    )
+                    ) and (fake.untyped_storage() not in env.aliased_input_storages)
                     rank = fake.ndim
                     tensor_shape = symbolic_layout[:rank]
                     tensor_strides = symbolic_layout[rank : 2 * rank]

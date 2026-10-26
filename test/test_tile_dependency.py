@@ -30,6 +30,7 @@ from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _interval_hull
+from helion._compiler.tile_dependency import _linearize_fibers
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
@@ -2582,6 +2583,76 @@ class TestTileDependency(TestCase):
             (frozenset(), frozenset(), frozenset(), frozenset((0,))),
         )
         self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
+
+    def test_point_composition_keeps_intermediate_domain_clip(self) -> None:
+        # Producer row tile ``r`` of head ``h`` feeds fine key ``(h, r)``, but
+        # the fine keys stop at ``r < 2``: row tile 2 is read by no consumer.
+        producers = CoordinateDomain((0, 1), ((0, 2), (1, 3)), identity=0)
+        fine_keys = CoordinateDomain((2, 3), ((2, 2), (3, 2)), kind="event", identity=7)
+        heads = CoordinateDomain((4, 5), ((4, 1), (5, 2)), kind="event", identity=7)
+        head, row = coordinate_axis_symbol(0), coordinate_axis_symbol(1)
+        publication = CoordinateRelation.point_map(
+            producers, fine_keys, ((((0, 0, 2, 1), (1, 0, 3, 1)), (head, row)),)
+        )
+        partition = KeyPartition.contiguous_segments(fine_keys, heads, 3, ((0, 2),))
+        assert partition is not None
+        unread = (frozenset({0}), frozenset({1})) * 2 + (frozenset(),) * 2
+
+        composed = publication.then(partition.coarse_key_by_fine_key)
+        assert composed is not None
+        self.assertEqual(_materialize(composed), unread)
+
+        fine = Incidence.from_fibers(
+            CoordinateRelation.point_map(
+                fine_keys,
+                producers,
+                (
+                    (
+                        ((2, 0, 2, 1), (3, 0, 2, 1)),
+                        (coordinate_axis_symbol(2), coordinate_axis_symbol(3)),
+                    ),
+                ),
+            ),
+            keys_by_item=publication,
+        )
+        coarse = fine.coarsen(partition)
+        assert coarse is not None
+        assert coarse.keys_by_item is not None
+        assert coarse.count_by_key is not None
+        self.assertEqual(_materialize(coarse.keys_by_item), unread)
+        self.assertEqual(
+            _materialize(coarse.items_by_key),
+            (frozenset({0, 2}), frozenset({1, 3})),
+        )
+        self.assertEqual(coarse.count_by_key.value_bounds(), (2, 2))
+
+    def test_linearized_fibers_do_not_alias_clipped_items(self) -> None:
+        keys = CoordinateDomain.scalar(3, kind="event", identity=0)
+        items = CoordinateDomain((1, 2), ((1, 4), (2, 3)), identity=1)
+        key = coordinate_axis_symbol(0)
+        order = DenseTaskOrder.from_pid(items, items.axis_order)
+        assert order is not None
+
+        def fibers(row_end: int) -> CoordinateRelation:
+            return CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 3, 1),), ((1, 0, row_end, 1), (2, key, key + 1, 1))
+                    ),
+                ),
+            )
+
+        # Rows 4 and 5 are outside the item domain; their affine ordinals
+        # would name the next key's items.
+        self.assertIsNone(_linearize_fibers(fibers(6), order.ordinal_by_task))
+        linear = _linearize_fibers(fibers(4), order.ordinal_by_task)
+        assert linear is not None
+        self.assertEqual(
+            _materialize(linear),
+            tuple(frozenset(range(4 * k, 4 * k + 4)) for k in range(3)),
+        )
 
     def test_source_axes_ignore_known_domain_parameters(self) -> None:
         extent = sympy.Symbol("extent", integer=True, positive=True)

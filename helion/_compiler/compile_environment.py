@@ -161,6 +161,34 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
 HELION_STATIC_DIMS_ATTR = "_helion_static_dims"
 
 
+@dataclasses.dataclass
+class _InputStorageAliasClass:
+    """Input tensors whose storages overlap (one storage, or separately
+    constructed storages over one buffer), faked on one fake storage."""
+
+    # The byte range the members' real storages cover, or None for fakes.
+    extent: tuple[int, int] | None
+    # The fake storage's size when every member's layout is concrete; else
+    # the storage gets an unbacked size, so that nothing bounds the layouts.
+    nbytes: int | None
+    # Whether members view more than one storage (the fake converter of
+    # dynamic shapes shares fakes of one storage only).
+    several_storages: bool
+    storage: torch.UntypedStorage | None = None
+
+
+def _concrete_span_nbytes(tensor: torch.Tensor) -> int | None:
+    """Bytes a tensor's layout spans from its first element, or None when its
+    sizes or strides are symbolic."""
+    sizes, strides = tensor.size(), tensor.stride()
+    if not all(type(value) is int for value in (*sizes, *strides)):
+        return None
+    if any(size == 0 for size in sizes):
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(sizes, strides, strict=True))
+    return (last + 1) * tensor.element_size()
+
+
 def _static_dims_symbolic_context(
     tensor: torch.Tensor,
 ) -> StatelessSymbolicContext | None:
@@ -485,6 +513,17 @@ class CompileEnvironment:
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self._ambiguous_tensor_input_source_ids: set[int] = set()
+        # Inputs that share a storage share one fake storage (see
+        # ``record_input_storage_aliases``); these are the fake storages so
+        # shared, whose inputs' layouts relative to each other are unknown.
+        self.aliased_input_storages: set[torch.UntypedStorage] = set()
+        self._input_storage_alias_classes: dict[
+            typing.Hashable, _InputStorageAliasClass
+        ] = {}
+        # Set when inputs share a storage that their fakes could not share;
+        # multi-root bindings then refuse to compile rather than miss the
+        # dependencies.
+        self.unrepresented_input_aliasing = False
         # Positive provenance for host allocations whose layout is fixed by the
         # generated wrapper.  Track storage rather than tensor identity so a
         # deterministic view of such an allocation retains the proof, while a
@@ -1903,10 +1942,147 @@ class CompileEnvironment:
         self._foreign_symint_cache[cache_key] = result
         return result
 
+    def record_input_storage_aliases(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> None:
+        """Note which input tensors share a storage, before they are faked.
+
+        Tensors share one when their storages overlap
+        (:func:`input_storage_classes`).  Their fake tensors then share one
+        fake storage, so the analyses that identify memory by storage (the
+        cross-loop dependency graph, written argument sets) see one
+        allocation.  Each fake keeps its own size and stride at storage
+        offset 0: the inputs' runtime offsets relative to each other are not
+        part of the cache key, so nothing may rely on them
+        (``aliased_input_storages``).
+        """
+        from .input_storage_aliasing import input_storage_classes
+        from .input_storage_aliasing import input_storage_extent
+
+        members: dict[typing.Hashable, list[torch.Tensor]] = {}
+        for tensor, key in zip(tensors, input_storage_classes(tensors), strict=True):
+            if key is not None:
+                members.setdefault(key, []).append(tensor)
+        for key, aliases in members.items():
+            if len(aliases) < 2:
+                continue
+            # Fakes keep the inputs' concrete layouts with static shapes (or
+            # concrete outer-trace fakes) only; dynamic shapes make them
+            # symbolic, and a concrete storage size would bound them.
+            spans = [
+                _concrete_span_nbytes(alias)
+                if self.settings.static_shapes or isinstance(alias, FakeTensor)
+                else None
+                for alias in aliases
+            ]
+            starts: list[int] = []
+            ends: list[int] = []
+            for alias in aliases:
+                extent = input_storage_extent(alias)
+                if extent is not None and isinstance(extent[0], int):
+                    starts.append(extent[0])
+                    ends.append(typing.cast("int", extent[1]))
+            self._input_storage_alias_classes[key] = _InputStorageAliasClass(
+                extent=(min(starts), max(ends)) if starts else None,
+                nbytes=(
+                    max(typing.cast("list[int]", spans))
+                    if all(span is not None for span in spans)
+                    else None
+                ),
+                several_storages=len(
+                    {alias.untyped_storage()._cdata for alias in aliases}
+                )
+                > 1,
+            )
+
+    def _input_storage_alias_class(
+        self, tensor: torch.Tensor
+    ) -> _InputStorageAliasClass | None:
+        """The storage class ``tensor`` shares with other inputs, or None."""
+        from .input_storage_aliasing import input_storage_extent
+
+        if not self._input_storage_alias_classes:
+            return None
+        extent = input_storage_extent(tensor)
+        if extent is None:
+            return None
+        start, end = extent
+        if isinstance(start, str):
+            return self._input_storage_alias_classes.get(extent)
+        found = [
+            alias
+            for alias in self._input_storage_alias_classes.values()
+            if alias.extent is not None
+            and start < alias.extent[1]
+            and alias.extent[0] < typing.cast("int", end)
+        ]
+        if len(found) > 1:
+            # Overlaps storages that were faked apart (not an input itself).
+            self.unrepresented_input_aliasing = True
+        return found[0] if len(found) == 1 else None
+
+    def _input_alias_storage(
+        self, alias: _InputStorageAliasClass, device: torch.device
+    ) -> torch.UntypedStorage:
+        storage = alias.storage
+        if storage is None:
+            if alias.nbytes is not None:
+                nbytes: int | torch.SymInt = alias.nbytes
+            else:
+                # Unbacked: no layout is checked against a guessed size.
+                with self.shape_env.ignore_fresh_unbacked_symbols():
+                    nbytes = self.shape_env.create_unbacked_symint()
+            storage = torch.empty(
+                nbytes, dtype=torch.uint8, device=device
+            ).untyped_storage()
+            alias.storage = storage
+            self.aliased_input_storages.add(storage)
+        return storage
+
+    def _aliased_input_fake(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """A fake of ``tensor`` on the fake storage it shares with other
+        inputs, or None when it shares no storage with another input or its
+        layout is symbolic (see :meth:`_alias_input_fake`)."""
+        alias = self._input_storage_alias_class(tensor)
+        if alias is None or alias.nbytes is None:
+            return None
+        storage = self._input_alias_storage(alias, tensor.device)
+        try:
+            return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+                storage, 0, tensor.size(), tensor.stride()
+            )
+        except RuntimeError:  # spans more than the inputs it was sized for
+            self.unrepresented_input_aliasing = True
+            return None
+
+    def _alias_input_fake(
+        self, alias: _InputStorageAliasClass, fake: torch.Tensor
+    ) -> torch.Tensor:
+        """``fake`` (with its symbolic layout) moved onto the fake storage of
+        its storage class, or unchanged (and the binding refused for
+        multi-root kernels) if that fails."""
+        try:
+            storage = self._input_alias_storage(alias, fake.device)
+            return torch.empty(0, dtype=fake.dtype, device=fake.device).set_(
+                storage, 0, fake.size(), fake.stride()
+            )
+        except Exception:  # fail closed below
+            self.unrepresented_input_aliasing = True
+            return fake
+
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if isinstance(tensor, FakeTensor):
+        alias = self._input_storage_alias_class(tensor)
+        aliased = (
+            self._aliased_input_fake(tensor)
+            if alias is not None
+            and (self.settings.static_shapes or isinstance(tensor, FakeTensor))
+            else None
+        )
+        if aliased is not None:
+            result = aliased
+        elif isinstance(tensor, FakeTensor):
             # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
             # Create fresh symbols in our own ShapeEnv to avoid leaking
             # foreign symbols whose var_to_range entries are missing,
@@ -1947,6 +2123,16 @@ class CompileEnvironment:
                 source=source,
                 symbolic_context=_static_dims_symbolic_context(tensor),
             )
+            # The converter maps the views of one storage onto one fake
+            # storage itself, at their runtime offsets, which are not keyed;
+            # views of several storages over one buffer get one below.
+            if alias is not None and not alias.several_storages:
+                self.aliased_input_storages.add(result.untyped_storage())
+                alias = None
+        if alias is not None and aliased is None:
+            # A symbolic layout (an outer trace's fake, or a dynamic-shape
+            # input whose class spans several storages).
+            result = self._alias_input_fake(alias, result)
         result = self.backend.normalize_input_fake_tensor(result)
         previous_source = self.input_sources.get(result)
         if previous_source is not None and previous_source != source:

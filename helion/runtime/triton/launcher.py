@@ -20,11 +20,18 @@ CPU/TPU cases of :func:`get_num_sm`) lives in thin wrappers in
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
+import ctypes
+import functools
 import math
+from typing import TYPE_CHECKING
 import weakref
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 try:
     import triton
@@ -173,11 +180,28 @@ def default_launcher(
     _persistent_state_process_group_name: str | None = None,
     _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
+    _ttgir_weight_prefetch: bool = False,
+    _ttgir_weight_ring: bool = False,
+    _tensor_storage_aliases: tuple[tuple[int, ...], ...] = (),
+    _check_storage_aliasing: bool = False,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
+    # The schedule of a multi-root kernel (cross-loop state, or the phases of
+    # fused roots) orders accesses through tensors that share a storage only
+    # if it was compiled for that sharing.  A helion.Kernel call recompiles
+    # for each sharing pattern; code run without the compiler (exported, AOT,
+    # ``bound._run``) is checked here.
+    checked = bool(_persistent_state_specs) or _check_storage_aliasing
+    shared_storages = (
+        _shared_storages(args) if checked or _ttgir_weight_prefetch else ()
+    )
+    if checked and shared_storages:
+        _check_compiled_storage_sharing(
+            triton_kernel, shared_storages, _tensor_storage_aliases
+        )
     if _remote_copy_signal_slots_per_program:
         if _remote_copy_signal_dst is None or _remote_copy_process_group_name is None:
             raise RuntimeError(
@@ -263,24 +287,153 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    if _minimum_resident_programs:
-        # ``triton_kernel`` is a JITFunction.  Resource information belongs to
-        # its exact compiled specialization, so compile (but do not launch)
-        # that specialization before asking CUDA for its occupancy.
-        compiled_kernel = triton_kernel.run(  # type: ignore[union-attr]
-            *args,
-            **{**run_kwargs, "warmup": True},
+    # The pass is part of the kernel's cache key, so it covers every compile
+    # and lookup of this kernel, including the occupancy probe.  It tells
+    # written from read-only tensors by argument, writing together arguments
+    # the compiler saw share a storage (e.g. a tensor and its TMA descriptor);
+    # a launch whose arguments share storage otherwise runs without it.
+    alias_classes = (
+        prefetch_alias_classes(
+            triton_kernel, args, _tensor_storage_aliases, shared_storages
         )
-        _validate_resident_program_capacity(
-            compiled_kernel,
-            args,
-            num_warps=num_warps,
-            required_programs=_minimum_resident_programs,
-        )
-    return triton_kernel.run(  # type: ignore[union-attr]
-        *args,
-        **run_kwargs,
+        if _ttgir_weight_prefetch
+        else None
     )
+    with ttgir_weight_prefetch_context(
+        alias_classes is not None, alias_classes or (), ring=_ttgir_weight_ring
+    ):
+        if _minimum_resident_programs:
+            # ``triton_kernel`` is a JITFunction.  Resource information belongs to
+            # its exact compiled specialization, so compile (but do not launch)
+            # that specialization before asking CUDA for its occupancy.
+            compiled_kernel = triton_kernel.run(  # type: ignore[union-attr]
+                *args,
+                **{**run_kwargs, "warmup": True},
+            )
+            _validate_resident_program_capacity(
+                compiled_kernel,
+                args,
+                num_warps=num_warps,
+                required_programs=_minimum_resident_programs,
+            )
+        return triton_kernel.run(  # type: ignore[union-attr]
+            *args,
+            **run_kwargs,
+        )
+
+
+def _shared_storages(args: tuple[object, ...]) -> tuple[tuple[int, ...], ...]:
+    """Positions of the tensor (and tensor descriptor) arguments on each
+    storage that more than one of them views.  Storages whose
+    ``[data_ptr, data_ptr + nbytes)`` ranges overlap (separately constructed
+    over one buffer, e.g. by ``from_dlpack``) count as one."""
+    spans: list[tuple[int, int, int]] = []
+    for index, arg in enumerate(args):
+        tensor = getattr(arg, "base", arg)  # TensorDescriptor -> its tensor
+        if isinstance(tensor, torch.Tensor):
+            storage = tensor.untyped_storage()
+            start = storage.data_ptr()
+            nbytes = storage.nbytes()
+            if start and nbytes:  # empty tensors share the null pointer
+                spans.append((start, start + nbytes, index))
+    if len(spans) < 2:
+        return ()
+    spans.sort()
+    groups: list[tuple[int, ...]] = []
+    members: list[int] = []
+    reach = 0
+    for start, end, index in spans:
+        if start >= reach:  # disjoint from every earlier storage
+            if len(members) > 1:
+                groups.append(tuple(sorted(members)))
+            members = []
+        members.append(index)
+        reach = max(reach, end)
+    if len(members) > 1:
+        groups.append(tuple(sorted(members)))
+    return tuple(sorted(groups))
+
+
+def _distinct_storages(args: tuple[object, ...]) -> bool:
+    return not _shared_storages(args)
+
+
+def prefetch_alias_classes(
+    triton_kernel: object,
+    args: tuple[object, ...],
+    compiled: tuple[tuple[int, ...], ...],
+    shared: tuple[tuple[int, ...], ...] | None = None,
+) -> tuple[tuple[str, ...], ...] | None:
+    """The storage classes the TTGIR pass compiles for (argument names of the
+    positions that share a storage at compile time, ``compiled``), or None if
+    the launch's sharing (``shared``, by default that of ``args``) is not
+    within them: then the pass must not run.  Arguments the compiler saw
+    share a storage need not share it at launch; the pass then only writes
+    more than it must."""
+    if shared is None:
+        shared = _shared_storages(args)
+    group_of = {
+        index: group for group, members in enumerate(compiled) for index in members
+    }
+    for positions in shared:
+        groups = {group_of.get(index) for index in positions}
+        if len(groups) != 1 or None in groups:
+            return None
+    if not compiled:
+        return ()
+    names = getattr(triton_kernel, "arg_names", None)
+    if not isinstance(names, (list, tuple)) or any(
+        index >= len(names) for members in compiled for index in members
+    ):
+        return None
+    return tuple(tuple(str(names[index]) for index in members) for members in compiled)
+
+
+def _check_compiled_storage_sharing(
+    triton_kernel: object,
+    shared: tuple[tuple[int, ...], ...],
+    compiled: tuple[tuple[int, ...], ...],
+) -> None:
+    """Refuse a launch whose arguments share a storage the compiler did not
+    see them share (``compiled``: positions sharing one at compile time)."""
+    group_of = {
+        index: group for group, members in enumerate(compiled) for index in members
+    }
+    for positions in shared:
+        if len({group_of.get(index, -1 - index) for index in positions}) == 1:
+            continue
+        names = getattr(triton_kernel, "arg_names", None)
+        described = ", ".join(
+            repr(names[index]) if names and index < len(names) else str(index)
+            for index in positions
+        )
+        raise RuntimeError(
+            f"Cross-loop launch aliasing: arguments {described} share one "
+            "storage, but the kernel was compiled for tensors that do not share "
+            "it, and its cross-loop schedule orders accesses only between "
+            "tensors the compiler saw share storage.  Call the helion.Kernel "
+            "(its cache key includes the storage aliasing of tensor inputs), or "
+            "bind it with arguments that alias like these."
+        )
+
+
+def ttgir_weight_prefetch_context(
+    enable: bool,
+    alias_classes: tuple[tuple[str, ...], ...] = (),
+    ring: bool = False,
+) -> contextlib.AbstractContextManager[None]:
+    """Compile kernels with the TTGIR weight prefetch pass inside the context;
+    ``alias_classes``: argument names that may share a storage; ``ring``: the
+    pass tries its warp-specialized weight ring first (the kernel's
+    ``ttgir_weight_ring`` setting, emitted as ``_ttgir_weight_ring``)."""
+    if enable:
+        try:
+            from .ttgir_weight_prefetch import enabled
+        except ImportError:  # a standalone export runs without the pass
+            pass
+        else:
+            return enabled(alias_classes, ring=ring)
+    return contextlib.nullcontext()
 
 
 def compile_only_launch_args(
@@ -425,8 +578,82 @@ def _get_persistent_state(
     key = (like.device, dtype, stream.cuda_stream, namespace, slot)
     state = cache.get(key)
     if state is None or state.numel() < required_numel:
-        state = torch.zeros(required_numel, dtype=dtype, device=like.device)
+        state = _new_zeroed_state(required_numel, dtype, like.device)
         cache[key] = state
+    return state
+
+
+_CU_STREAM_CAPTURE_MODE_RELAXED = 2
+
+
+@functools.cache
+def _cuda_driver() -> object | None:
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+        lib.cuThreadExchangeStreamCaptureMode.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        lib.cuThreadExchangeStreamCaptureMode.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        return None
+    return lib
+
+
+@contextlib.contextmanager
+def _relaxed_stream_capture_mode(lib: object) -> Iterator[None]:
+    """Allow this thread "potentially unsafe" CUDA calls (an allocation or a
+    host wait on a stream that is not capturing) during a capture, as
+    PyTorch's caching allocator does for its own allocations
+    (``CUDAStreamCaptureModeGuard``)."""
+    mode = ctypes.c_int(_CU_STREAM_CAPTURE_MODE_RELAXED)
+    if lib.cuThreadExchangeStreamCaptureMode(ctypes.byref(mode)) != 0:  # type: ignore[attr-defined]
+        raise RuntimeError("cuThreadExchangeStreamCaptureMode failed")
+    try:
+        yield
+    finally:
+        lib.cuThreadExchangeStreamCaptureMode(ctypes.byref(mode))  # type: ignore[attr-defined]
+
+
+def _is_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream (the stream the state is keyed by
+    and the launch runs on) is capturing; not the current device's."""
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+_STATE_INIT_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+# Retained state allocated during a capture, kept alive for the life of the
+# process: graphs that captured its launches address it, but (unlike the
+# graph's private pool) nothing else ties its memory to those graphs, and the
+# launcher's cache entry may go (a kernel object freed or regenerated).
+_CAPTURED_STATES: list[torch.Tensor] = []
+
+
+def _new_zeroed_state(
+    numel: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Zeroed retained state, allocated and zeroed outside any ongoing capture.
+
+    Retained state only has to be zero before its first launch: launches read
+    their epoch from it and leave epochs and counters consistent for the next
+    launch. Requested while the current stream is capturing, ``torch.zeros``
+    would instead record the allocation (from the graph's private pool) and
+    its fill kernel into the graph, so every replay would re-zero the state:
+    one more kernel per replay, in front of the kernel's first launch, which
+    also cuts that launch's programmatic (PDL) edge to its predecessor. So the
+    state is allocated on a side stream that is not capturing (the regular
+    pool), zeroed there, and the host waits for the zeroes, which are then in
+    place before the graph is first launched.
+    """
+    lib = _cuda_driver() if device.type == "cuda" else None
+    if lib is None or not _is_capturing(device):
+        return torch.zeros(numel, dtype=dtype, device=device)
+    with _relaxed_stream_capture_mode(lib), torch.cuda.device(device):
+        side = _STATE_INIT_STREAMS.get(device)
+        if side is None:
+            side = _STATE_INIT_STREAMS[device] = torch.cuda.Stream(device)
+        with torch.cuda.stream(side):
+            state = torch.zeros(numel, dtype=dtype, device=device)
+        side.synchronize()
+    _CAPTURED_STATES.append(state)
     return state
 
 
@@ -521,6 +748,52 @@ def _new_symmetric_state(
     return state, ptrs, handle
 
 
+_TMEM_COLUMNS_PER_SM = 512
+
+
+def _tcgen05_blocks_per_sm(
+    cuda_driver: object,
+    function: object,
+    device: torch.device,
+    num_warps: int,
+    shared: int,
+    tmem_columns: int,
+) -> int:
+    """Resident blocks per SM from registers, shared memory, threads and TMEM."""
+    attr = cuda_driver.CUfunction_attribute  # type: ignore[attr-defined]
+    dev_attr = cuda_driver.CUdevice_attribute  # type: ignore[attr-defined]
+    fn = cuda_driver.CUfunction(int(function))  # type: ignore[attr-defined]
+    regs = cuda_driver.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_NUM_REGS, fn)[1]  # type: ignore[attr-defined]
+    static_smem = cuda_driver.cuFuncGetAttribute(  # type: ignore[attr-defined]
+        attr.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn
+    )[1]
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    cu_device = cuda_driver.cuDeviceGet(index)[1]  # type: ignore[attr-defined]
+
+    def device_attr(name: str) -> int:
+        return int(
+            cuda_driver.cuDeviceGetAttribute(getattr(dev_attr, name), cu_device)[1]  # type: ignore[attr-defined]
+        )
+
+    threads = num_warps * 32
+    # Registers are allocated per warp in units of 256.
+    regs_per_warp = -(-max(int(regs), 1) * 32 // 256) * 256
+    by_regs = device_attr("CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR") // (
+        regs_per_warp * num_warps
+    )
+    reserved = device_attr("CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK")
+    smem_per_block = int(shared) + int(static_smem) + reserved
+    by_smem = device_attr(
+        "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"
+    ) // max(smem_per_block, 1)
+    by_threads = (
+        device_attr("CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR") // threads
+    )
+    by_blocks = device_attr("CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR")
+    by_tmem = _TMEM_COLUMNS_PER_SM // int(tmem_columns)
+    return max(1, min(by_regs, by_smem, by_threads, by_blocks, by_tmem))
+
+
 def _validate_resident_program_capacity(
     compiled_kernel: object,
     args: tuple[object, ...],
@@ -549,6 +822,9 @@ def _validate_resident_program_capacity(
         raise RuntimeError("unable to query cross-loop kernel occupancy")
 
     device = tensor.device
+    # A warp-specialized kernel launches its partitions' warps too: Triton
+    # records the total in the compiled metadata.
+    num_warps = max(num_warps, int(getattr(metadata, "num_warps", 0) or 0))
     cache = vars(compiled_kernel).setdefault(
         "_helion_resident_program_capacity_cache", {}
     )
@@ -567,6 +843,18 @@ def _validate_resident_program_capacity(
         if error != cuda_driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(
                 f"CUDA occupancy query failed for cross-loop kernel: {error}"
+            )
+        tmem_columns = getattr(metadata, "tmem_size", 0) or 0
+        if tmem_columns > 0:
+            # The occupancy API reports one block per SM for any kernel ptxas
+            # tags as using tcgen05 (EIATTR_TCGEN05_1CTA_USED), however small;
+            # the hardware co-schedules such CTAs while registers, shared
+            # memory, threads and TMEM columns allow.
+            blocks_per_sm = max(
+                int(blocks_per_sm),
+                _tcgen05_blocks_per_sm(
+                    cuda_driver, function, device, num_warps, shared, tmem_columns
+                ),
             )
         properties = torch.cuda.get_device_properties(device)
         capacity = int(blocks_per_sm) * int(properties.multi_processor_count)

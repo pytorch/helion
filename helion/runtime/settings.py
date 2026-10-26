@@ -427,6 +427,46 @@ class _Settings:
     distributed: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
     )
+    ttgir_weight_prefetch: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TTGIR_WEIGHT_PREFETCH", True
+        )
+    )
+    ttgir_weight_ring: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TTGIR_WEIGHT_RING", True
+        )
+    )
+    cross_loop_transitive_waits: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CROSS_LOOP_TRANSITIVE_WAITS", True
+        )
+    )
+    cross_loop_sink_lpt_order: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CROSS_LOOP_SINK_LPT_ORDER", True
+        )
+    )
+    cross_loop_source_inflight_budget: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_CROSS_LOOP_SOURCE_INFLIGHT_BUDGET", 8 << 20
+        )
+    )
+    cross_loop_source_max_group: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_CROSS_LOOP_SOURCE_MAX_GROUP", 2
+        )
+    )
+    cross_loop_lean_publication: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CROSS_LOOP_LEAN_PUBLICATION", True
+        )
+    )
+    cross_loop_inline_single_trip_publishers: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CROSS_LOOP_INLINE_SINGLE_TRIP_PUBLISHERS", True
+        )
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -724,6 +764,67 @@ class Settings(_Settings):
             "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
             "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
             "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
+        ),
+        "ttgir_weight_prefetch": (
+            "If True, cross-loop Triton kernels with single-device state issue the "
+            "pipelined prologue copies of tensors they never write before readiness "
+            "waits instead of after them (helion.runtime.triton.ttgir_weight_prefetch). "
+            "Set HELION_TTGIR_WEIGHT_PREFETCH=0 to disable."
+        ),
+        "ttgir_weight_ring": (
+            "If True (and ttgir_weight_prefetch is on), the TTGIR pass first builds a "
+            "warp-specialized shared-memory ring for those kernels "
+            "(helion.runtime.triton.ttgir_weight_ring): producer warps stream the pipelined "
+            "copies of weights, and of activations behind clones of the readiness waits, "
+            "across task and root boundaries, and the compute warps wait per stage on "
+            "mbarriers.  A module the ring does not apply to, or whose ring fails to lower or "
+            "spills, gets the weight-only ring, then the prefetch hoist, then no change.  "
+            "Set HELION_TTGIR_WEIGHT_RING=0 to disable."
+        ),
+        "cross_loop_transitive_waits": (
+            "If True, a cross-loop root does not wait on a producer root whose data its "
+            "counter wait on another producer already certifies (that producer waited on "
+            "it before publishing); the counter wait moves before the first read of the "
+            "certified data. Set HELION_CROSS_LOOP_TRANSITIVE_WAITS=0 to disable."
+        ),
+        "cross_loop_source_inflight_budget": (
+            "Bytes (default 8 MiB, about the HBM bandwidth-delay product of a B200) a dynamic "
+            "cross-loop pipeline lets one source root (a root that waits on nothing) put in "
+            "flight in its first wave. A source root above it claims several consecutive tasks "
+            "per ticket, run in order, so its burst neither queues the latency-critical roots' "
+            "round trips nor takes the first-wave slots of the roots behind it. 0 disables. "
+            "Set with HELION_CROSS_LOOP_SOURCE_INFLIGHT_BUDGET."
+        ),
+        "cross_loop_source_max_group": (
+            "Largest number of consecutive tasks (default 2) one ticket of a source root grouped "
+            "under cross_loop_source_inflight_budget claims. The group loop is not pipelined, so a "
+            "ticket's tasks run back to back and the root's span grows by one task latency per "
+            "extra task: on the GLM-5 MoE megakernel g=2 is the optimum and g=3..7 cost "
+            "+2.7..+4.8 us. Set with HELION_CROSS_LOOP_SOURCE_MAX_GROUP."
+        ),
+        "cross_loop_lean_publication": (
+            "If True (default), a cross-loop root whose body issues no async-proxy global write "
+            "(TMA store or reduction, bulk-async asm) publishes without the bulk-group drain and "
+            "producer-side proxy fence before its release; consumers keep their proxy fence after "
+            "the acquire. Set HELION_CROSS_LOOP_LEAN_PUBLICATION=0 for the old form."
+        ),
+        "cross_loop_inline_single_trip_publishers": (
+            "If True (default), the scheduled-task wrapper of a cross-loop source root (it waits "
+            "on nothing in the kernel) whose tasks all fit in one wave is inlined even when it "
+            "publishes readiness counters, so its code sits at its dispatch site next to the "
+            "kernel entry instead of in an out-of-line callee after the kernel body, where a "
+            "task that starts at once fetches it cold. Waiting roots and wrappers with nested "
+            "work or peer publication stay noinline. "
+            "Set HELION_CROSS_LOOP_INLINE_SINGLE_TRIP_PUBLISHERS=0 for the old form."
+        ),
+        "cross_loop_sink_lpt_order": (
+            "If True (default), a dynamic cross-loop pipeline claims the run of sink roots at "
+            "the end of its ticket stream (roots nothing in the kernel waits on) longest task "
+            "first, by the bytes one task loads: the short tasks then fill the slots that free "
+            "up last instead of holding the slots the long tasks need. Only that trailing run "
+            "moves, so producers still precede their consumers. On the GLM-5 MoE megakernels "
+            "(FC2 before the shared-expert down projection) it is worth ~0.3-1.0 us. Set "
+            "HELION_CROSS_LOOP_SINK_LPT_ORDER=0 to keep source order."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

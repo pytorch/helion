@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -11,6 +13,8 @@ from .._compat import get_triton_version
 from ..autotuner.logger import classify_triton_exception
 from ..autotuner.logger import format_triton_compile_failure
 from .triton.launcher import compile_only_launch_args
+from .triton.launcher import prefetch_alias_classes
+from .triton.launcher import ttgir_weight_prefetch_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,6 +53,25 @@ def _device_probe_values(values: Sequence[object]) -> list[object]:
     ]
 
 
+@functools.cache
+def _run_keys_stages_hook() -> bool:
+    from triton.runtime.jit import JITFunction
+
+    try:
+        return "custom_pipeline" in inspect.getsource(JITFunction.run)
+    except (OSError, TypeError):
+        return False
+
+
+def _key_stages_hook(specialization: list[object]) -> None:
+    """Add the installed stages hook to the key as ``JITFunction.run()`` does."""
+    from triton import knobs
+
+    hook = getattr(knobs.runtime, "add_stages_inspection_hook", None)
+    if hook is not None and _run_keys_stages_hook():
+        specialization.append(f'("custom_pipeline", {hook()[1]})')
+
+
 def make_precompiler(
     fn: JITFunction[object],
     config: Config,
@@ -62,6 +85,21 @@ def make_precompiler(
         parts so we can wrap it in a subprocess to handle configs that hang in
         Triton compile and never return.
         """
+        # The pass runs (and keys) as ``default_launcher`` would run it here.
+        alias_classes = (
+            prefetch_alias_classes(
+                fn,
+                args,
+                cast(
+                    "tuple[tuple[int, ...], ...]",
+                    kwargs.get("_tensor_storage_aliases", ()),
+                ),
+            )
+            if kwargs.get("_ttgir_weight_prefetch")
+            else None
+        )
+        ttgir_weight_prefetch = alias_classes is not None
+        ring = bool(kwargs.get("_ttgir_weight_ring"))
         # pyrefly: ignore [bad-argument-type]
         args, kwargs = compile_only_launch_args(*args, **kwargs)
         # pyrefly: ignore [bad-argument-type]
@@ -73,6 +111,10 @@ def make_precompiler(
             device
         ]
         bound_args, specialization, options = binder(*args, **kwargs)
+        with ttgir_weight_prefetch_context(
+            ttgir_weight_prefetch, alias_classes or (), ring=ring
+        ):
+            _key_stages_hook(specialization)
         # Keep this key and the packed compile inputs identical to
         # JITFunction.run(). Triton 3.7 changed both; using the old hand-rolled
         # forms makes the benchmark worker compile every candidate a second time.
@@ -126,9 +168,12 @@ def make_precompiler(
 
             compiled_kernel = None
             try:
-                kernel_cache[key] = compiled_kernel = fn.compile(
-                    src, target=target, options=options.__dict__
-                )
+                with ttgir_weight_prefetch_context(
+                    ttgir_weight_prefetch, alias_classes or (), ring=ring
+                ):
+                    kernel_cache[key] = compiled_kernel = fn.compile(
+                        src, target=target, options=options.__dict__
+                    )
                 _set_helion_compilation_success(compiled_kernel, True)
                 if not in_child_process:
                     compiled_kernel._init_handles()

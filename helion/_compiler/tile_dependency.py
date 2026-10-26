@@ -3844,6 +3844,16 @@ def _linearize_fibers(
     coefficients, offset = affine
     pieces = []
     for piece in incidence.pieces:
+        # Fibers are clipped to the item domain; the affine ordinal of an
+        # out-of-domain coordinate aliases a different in-domain item.
+        if not _target_ranges_are_valid(
+            piece.target_ranges,
+            source_domain=incidence.source_domain,
+            source_bounds=piece.source_bounds_items,
+            target_domain=incidence.target_domain,
+            clipped=False,
+        ):
+            return None
         start = sympy.Integer(offset)
         ranked = []
         for axis, begin, stop, axis_step in piece.target_ranges:
@@ -4082,8 +4092,12 @@ def _compose_point_relations(
             for axis, begin, end, step in following_piece.source_bounds_items:
                 if step != 1:
                     return None
-                if begin == 0 and end == following.source_domain.axis_counts[axis]:
-                    continue
+                # A full intermediate bound is not vacuous: a first-relation
+                # target outside the intermediate domain relates to nothing
+                # (relations clip targets to their domain).  Skipping it would
+                # widen the composed support, e.g. make producer tasks whose
+                # output no consumer reads publish to a readiness key whose
+                # count excludes them.  Restrict it like any other bound.
                 source_expression = _simplify_logical_expression(
                     first_targets[axis],
                     domain=first.source_domain,
@@ -4096,11 +4110,17 @@ def _compose_point_relations(
                 )
                 if expression_bounds is not None:
                     minimum, maximum = expression_bounds
-                    if minimum >= begin and maximum < end:  # pyrefly: ignore[unsupported-operation]
+                    inside = (minimum - begin, end - 1 - maximum)  # pyrefly: ignore[unsupported-operation]
+                    outside = (begin - 1 - maximum, minimum - end)  # pyrefly: ignore[unsupported-operation]
+                    if all(_is_provably_nonnegative(v, None) for v in inside):
                         continue
-                    if maximum < begin or minimum >= end:  # pyrefly: ignore[unsupported-operation]
+                    if any(_is_provably_nonnegative(v, None) for v in outside):
                         valid = False
                         break
+                if not all(isinstance(v, sympy.Integer) for v in (begin, end)):
+                    # A symbolic bound that is not provably vacuous has no
+                    # exact box preimage here.
+                    return None
                 preimage = _point_expression_preimage(
                     source_expression,
                     lower=begin,
@@ -4116,6 +4136,11 @@ def _compose_point_relations(
                     continue
                 source_axis, preimage_begin, preimage_end, preimage_step = preimage
                 source_begin, source_end, source_step = bounds[source_axis]
+                if not all(
+                    isinstance(sympy.sympify(v), sympy.Integer)
+                    for v in (source_begin, source_end, preimage_begin, preimage_end)
+                ):
+                    return None
                 restricted_end = min(source_end, preimage_end)
                 lower = max(source_begin, preimage_begin)
                 period = math.lcm(source_step, preimage_step)

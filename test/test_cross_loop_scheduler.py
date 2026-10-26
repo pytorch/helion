@@ -848,6 +848,130 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(count_by_key.value_bounds(), (2, 3))
         _plan(roots, 4, counters=(counter,))
 
+    def test_counter_lowering_rejects_uncounted_publications(self) -> None:
+        # Two heads of three row tiles; each head's consumers read two tiles.
+        producers = _domain((0, 2), (1, 3), identity=0)
+        heads = _domain((2, 2), kind="event", identity=0)
+        head, key = coordinate_axis_symbol(0), coordinate_axis_symbol(2)
+        fibers = CoordinateRelation(
+            heads,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    ((2, 0, 2, 1),), ((0, key, key + 1, 1), (1, 0, 2, 1))
+                ),
+            ),
+        )
+        count = CoordinateRelation.point_map(
+            heads,
+            CoordinateDomain.scalar(3, axis=3, kind="value"),
+            ((((2, 0, 2, 1),), (sympy.Integer(2),)),),
+        )
+
+        def producer(published_rows: int) -> ReadinessProducer:
+            publication = CoordinateRelation.point_map(
+                producers,
+                heads,
+                ((((0, 0, 2, 1), (1, 0, published_rows, 1)), (head,)),),
+            )
+            return ReadinessProducer(
+                0,
+                Incidence._from_constructed(
+                    fibers, keys_by_item=publication, count_by_key=count
+                ),
+            )
+
+        # Three arrivals per head never equal an exact wait for two.
+        self.assertFalse(
+            cross_loop_scheduler._supports_readiness_counter_lowering(producer(3))
+        )
+        self.assertTrue(
+            cross_loop_scheduler._supports_readiness_counter_lowering(producer(2))
+        )
+        # A count that may go negative (an unclipped block tail) is no target.
+        negative = CoordinateRelation.point_map(
+            heads,
+            CoordinateDomain.scalar(3, axis=3, kind="value"),
+            ((((2, 0, 2, 1),), (key - 1,)),),
+        )
+        self.assertFalse(
+            cross_loop_scheduler._supports_readiness_counter_lowering(
+                ReadinessProducer(
+                    0,
+                    Incidence._from_constructed(
+                        fibers,
+                        keys_by_item=producer(2).incidence.keys_by_item,
+                        count_by_key=negative,
+                    ),
+                )
+            )
+        )
+
+    def test_nested_entry_counter_publishes_only_read_producer_tiles(self) -> None:
+        # Producer (head, row tile) for 2 heads x 3 row tiles; each consumer
+        # task's nested loop reads row tiles 0 and 1 of its head.  The fine
+        # publication item -> (head, tile) is clipped to the two read tiles.
+        roots = (
+            _domain((0, 2), (1, 3), identity=0),
+            _domain((2, 2), (3, 2), identity=1),
+        )
+        site = _domain((2, 2), (3, 2), (4, 2), identity=5)
+        keys = _domain((0, 2), (1, 2), kind="event", identity=0)
+        full_keys = ((0, 0, 2, 1), (1, 0, 2, 1))
+        axis = coordinate_axis_symbol
+        producer = Incidence._from_constructed(
+            CoordinateRelation.point_map(
+                keys, roots[0], ((full_keys, (axis(0), axis(1))),)
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                roots[0], keys, ((((0, 0, 2, 1), (1, 0, 3, 1)), (axis(0), axis(1))),)
+            ),
+            count_by_key=CoordinateRelation.point_map(
+                keys,
+                CoordinateDomain.scalar(2, axis=5, kind="value"),
+                ((full_keys, (sympy.Integer(1),)),),
+            ),
+        )
+        consumer = Incidence._from_constructed(
+            CoordinateRelation(
+                keys,
+                site,
+                (
+                    _CoordinateRelationPiece(
+                        full_keys,
+                        (
+                            (2, axis(0), axis(0) + 1, 1),
+                            (3, 0, 2, 1),
+                            (4, axis(1), axis(1) + 1, 1),
+                        ),
+                    ),
+                ),
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                site,
+                keys,
+                ((((2, 0, 2, 1), (3, 0, 2, 1), (4, 0, 2, 1)), (axis(2), axis(4))),),
+            ),
+        )
+        event = ReadinessEvent(
+            (ReadinessProducer(0, producer),),
+            (ReadinessConsumer(1, consumer, 0, frozenset(), 5),),
+        )
+        entry = _segmented_nested_loop_counter(
+            ReadinessGraph(roots, (event,)),
+            event,
+            event.consumers[0],
+            None,
+            cross_loop_scheduler._new_relation_work_budget(),
+        )
+
+        assert entry is not None
+        self.assertEqual(entry.uniform_arrival_count(), 2)
+        publication = entry.producers[0].incidence.keys_by_item
+        assert publication is not None
+        # Producer index head + 2 * tile publishes to its head; tile 2 is silent.
+        self.assertEqual(_relation_pairs(publication), ((0, 0), (1, 1), (2, 0), (3, 1)))
+
     def test_paired_incidence_composition_preserves_widening_chain(self) -> None:
         first = _domain((0, 1), (1, 4), kind="event", identity=0)
         middle = _domain((2, 4), (3, 4), identity=1)
@@ -1550,6 +1674,416 @@ class TestCrossLoopScheduler(TestCase):
             charge=cross_loop_scheduler._new_relation_work_budget(),
         )
         self.assertEqual(counter.uniform_arrival_count(), 2)
+
+    def _transitive_chain_plan(
+        self,
+        mode: cross_loop_scheduler.CrossLoopDispatchMode,
+        *,
+        middle_reads_source: bool = True,
+        consumer_axis_geometry: tuple[int, int] = (8, 16),
+    ) -> tuple[StaticPipelinePlan, TileDependencyGraph]:
+        """Source S (8 tasks) -> middle M (reads all of S, keyed output) ->
+        consumer C (reads M's tile r and all of S)."""
+
+        def full_load(root: int, allocation_id: int) -> TileAccess:
+            return dataclasses.replace(
+                _access(
+                    root=root, kind="load", block_id=0, allocation_id=allocation_id
+                ),
+                subscript_affine_block_ids=(None,),
+                subscript_is_full_slice=(True,),
+            )
+
+        accesses = [_access(root=0, kind="store", block_id=10)]
+        if middle_reads_source:
+            accesses.append(full_load(1, 0))
+        accesses += [
+            _access(root=1, allocation_id=1, kind="store", block_id=20),
+            _access(root=2, allocation_id=1, kind="load", block_id=30),
+            full_load(2, 0),
+        ]
+        graph = _dependency_graph([[10], [20], [30]], *accesses)
+        roots, sites = instantiate_coordinate_domains(
+            graph,
+            axis_geometry={10: (8, 16), 20: (8, 16), 30: consumer_axis_geometry},
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=32,
+            cross_loop_dispatch_mode=mode,
+        )
+        return plan, graph
+
+    def test_keyed_wait_certifies_what_its_producer_waited_on(self) -> None:
+        # C's keyed wait on M covers C's read of S: every M task waited on all of
+        # S before publishing, so no S -> C barrier is needed (S publishes one
+        # only for M).
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan, graph = self._transitive_chain_plan(mode)
+                self.assertNotIn((0, 2), plan.root_barrier_edges)
+                pairs = dict(graph.obligations_by_root_pair())
+                carriers = [
+                    consumer
+                    for counter in plan.readiness_counters
+                    for consumer in counter.consumers
+                    if consumer.consumer_root == 2
+                    and {p.producer_root for p in counter.producers} == {1}
+                ]
+                self.assertEqual(len(carriers), 1)
+                # The keyed consumer now also names C's read of S, so the
+                # lowering places its wait before that read.
+                self.assertLessEqual(pairs[(0, 2)], carriers[0].covered_obligations)
+
+    def test_transitive_cover_needs_the_middle_root_to_wait(self) -> None:
+        # Negative control: M does not read S, so M's publication certifies
+        # nothing about S and C keeps its own S -> C synchronization.
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan, graph = self._transitive_chain_plan(
+                    mode, middle_reads_source=False
+                )
+                pairs = dict(graph.obligations_by_root_pair())
+                carried = frozenset(
+                    obligation
+                    for counter in plan.readiness_counters
+                    for consumer in counter.consumers
+                    if consumer.consumer_root == 2
+                    and 0 not in {p.producer_root for p in counter.producers}
+                    for obligation in consumer.covered_obligations
+                )
+                self.assertFalse(pairs[(0, 2)] & carried)
+                self.assertIn((0, 2), plan.root_barrier_edges)
+
+    def test_transitive_cover_rejects_consumers_without_a_key(self) -> None:
+        # Negative control: C's tasks 8.. lie past M's output, so they have no
+        # key and skip the (guarded) keyed wait, yet still read all of S: the
+        # certified relation does not cover them and they keep the S -> C
+        # barrier.
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan, _graph = self._transitive_chain_plan(
+                    mode, consumer_axis_geometry=(16, 16)
+                )
+                self.assertIn((0, 2), plan.root_barrier_edges)
+
+    def test_dispatch_order_must_permute_the_dynamic_resident_roots(self) -> None:
+        # Two independent chains A -> B and C -> D: without a reordering
+        # feature the ticket stream keeps source order (empty dispatch order),
+        # and a dispatch order must be a permutation of a dynamic plan's
+        # resident roots.
+        def full_load(root: int, allocation_id: int) -> TileAccess:
+            return dataclasses.replace(
+                _access(
+                    root=root, kind="load", block_id=0, allocation_id=allocation_id
+                ),
+                subscript_affine_block_ids=(None,),
+                subscript_is_full_slice=(True,),
+            )
+
+        graph = _dependency_graph(
+            [[10], [20], [30], [40]],
+            _access(root=0, kind="store", block_id=10),
+            full_load(1, 0),
+            _access(root=2, allocation_id=1, kind="store", block_id=30),
+            full_load(3, 1),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph,
+            axis_geometry={10: (8, 16), 20: (8, 16), 30: (32, 4), 40: (32, 4)},
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        orders = tuple(_dense(root) for root in root_domains)
+        dynamic = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=orders,
+            site_domains=sites,
+            worker_count=8,
+            cross_loop_dispatch_mode="dynamic",
+        )
+        self.assertEqual(dynamic.dispatch_order, ())
+        static = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=orders,
+            site_domains=sites,
+            worker_count=8,
+        )
+        self.assertEqual(static.dispatch_order, ())
+        dataclasses.replace(dynamic, dispatch_order=(2, 0, 3, 1))
+        with self.assertRaisesRegex(ValueError, "permute"):
+            dataclasses.replace(static, dispatch_order=(1, 0, 2, 3))
+        with self.assertRaisesRegex(ValueError, "permute"):
+            dataclasses.replace(dynamic, dispatch_order=(1, 0, 2))
+
+    def test_sink_lpt_order_claims_long_task_sinks_first(self) -> None:
+        # A (8 tasks) feeds two sinks that each read all of it: B (cheap tasks)
+        # then C (expensive tasks) in source order, and an unrelated chain
+        # D -> E written after them.  Only the trailing run of sinks moves, and
+        # only when every cost in it is known.
+        def full_load(root: int, allocation_id: int) -> TileAccess:
+            return dataclasses.replace(
+                _access(
+                    root=root, kind="load", block_id=0, allocation_id=allocation_id
+                ),
+                subscript_affine_block_ids=(None,),
+                subscript_is_full_slice=(True,),
+            )
+
+        graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(root=0, kind="store", block_id=10),
+            full_load(1, 0),
+            full_load(2, 0),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (8, 16), 20: (8, 16), 30: (8, 16)}
+        )
+        orders = tuple(_dense(root) for root in roots if root is not None)
+
+        def plan(
+            costs: tuple[int | None, ...], mode: str = "dynamic", lpt: bool = True
+        ) -> StaticPipelinePlan:
+            return build_static_pipeline_plan(
+                dependency_graph=graph,
+                root_task_orders=orders,
+                site_domains=sites,
+                worker_count=8,
+                cross_loop_dispatch_mode=cast("Any", mode),
+                sink_lpt_order=lpt,
+                root_task_costs=costs,
+            )
+
+        self.assertEqual(plan((64, 4096, 65536)).dispatch_order, (0, 2, 1))
+        # Already longest first, ties, an unknown cost, the setting off, and a
+        # static pipeline: source order.
+        self.assertEqual(plan((64, 65536, 4096)).dispatch_order, ())
+        self.assertEqual(plan((64, 4096, 4096)).dispatch_order, ())
+        self.assertEqual(plan((64, None, 65536)).dispatch_order, ())
+        self.assertEqual(plan((64, 4096, 65536), lpt=False).dispatch_order, ())
+        self.assertEqual(plan((64, 4096, 65536), mode="static").dispatch_order, ())
+        # The producer is never part of the moved run, whatever its cost.
+        self.assertEqual(plan((1 << 30, 4096, 65536)).dispatch_order, (0, 2, 1))
+
+        # A sink followed by a producer -> consumer pair: the trailing run is
+        # just the last consumer, so nothing moves (B keeps its slot ahead of D).
+        chained = _dependency_graph(
+            [[10], [20], [30], [40]],
+            _access(root=0, kind="store", block_id=10),
+            full_load(1, 0),
+            _access(root=2, allocation_id=1, kind="store", block_id=30),
+            full_load(3, 1),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            chained,
+            axis_geometry={10: (8, 16), 20: (8, 16), 30: (8, 16), 40: (8, 16)},
+        )
+        chained_plan = build_static_pipeline_plan(
+            dependency_graph=chained,
+            root_task_orders=tuple(_dense(root) for root in roots if root is not None),
+            site_domains=sites,
+            worker_count=8,
+            cross_loop_dispatch_mode="dynamic",
+            sink_lpt_order=True,
+            root_task_costs=(64, 65536, 64, 4096),
+        )
+        self.assertEqual(chained_plan.dispatch_order, ())
+        # Every producer precedes its consumers in a reordered stream.
+        reordered = plan((64, 4096, 65536))
+        position = {root: index for index, root in enumerate(reordered.dispatch_order)}
+        for (producer, consumer), _obligations in graph.obligations_by_root_pair():
+            self.assertLess(position[producer], position[consumer])
+
+    def test_lpt_tail_reorders_the_producers_of_a_join(self) -> None:
+        # A (8 tasks) feeds B (cheap) and C (expensive), which both feed a join
+        # J that reads all of them (an in-kernel finalize).  B and C now have a
+        # consumer, but J waits for every task of both (root barriers), so
+        # only the makespan of B and C counts: C goes first, J stays last.
+        def full_load(root: int, allocation_id: int) -> TileAccess:
+            return dataclasses.replace(
+                _access(
+                    root=root, kind="load", block_id=0, allocation_id=allocation_id
+                ),
+                subscript_affine_block_ids=(None,),
+                subscript_is_full_slice=(True,),
+            )
+
+        geometry = {10: (8, 16), 20: (8, 16), 30: (8, 16), 40: (8, 16)}
+
+        def plan(
+            join_b: TileAccess, costs: tuple[int | None, ...], sources: bool = False
+        ) -> StaticPipelinePlan:
+            accesses = [
+                _access(root=0, kind="store", block_id=10),
+                *(() if sources else (full_load(1, 0), full_load(2, 0))),
+                _access(root=1, allocation_id=1, kind="store", block_id=20),
+                _access(root=2, allocation_id=2, kind="store", block_id=30),
+                join_b,
+                full_load(3, 2),
+            ]
+            graph = _dependency_graph([[10], [20], [30], [40]], *accesses)
+            roots, sites = instantiate_coordinate_domains(graph, axis_geometry=geometry)
+            built = build_static_pipeline_plan(
+                dependency_graph=graph,
+                root_task_orders=tuple(
+                    _dense(root) for root in roots if root is not None
+                ),
+                site_domains=sites,
+                worker_count=8,
+                cross_loop_dispatch_mode="dynamic",
+                sink_lpt_order=True,
+                root_task_costs=costs,
+            )
+            order = built.dispatch_order or built.resident_roots
+            position = {root: index for index, root in enumerate(order)}
+            for (producer, consumer), _obligations in graph.obligations_by_root_pair():
+                self.assertLess(position[producer], position[consumer])
+            return built
+
+        costs = (64, 4096, 65536, 1024)
+        self.assertEqual(plan(full_load(3, 1), costs).dispatch_order, (0, 2, 1, 3))
+        # The longest path counts, not the root's own task: a cheap B whose
+        # join is expensive still trails C only by rank.
+        self.assertEqual(
+            plan(full_load(3, 1), (64, 4096, 65536, 1 << 20)).dispatch_order,
+            (0, 2, 1, 3),
+        )
+        self.assertEqual(
+            plan(full_load(3, 1), (64, 65536, 4096, 1024)).dispatch_order, ()
+        )
+        # J reads B tile by tile (a keyed readiness counter): B's finish order
+        # gates J's tasks, so B is no makespan-only root and nothing moves.
+        keyed = _access(root=3, allocation_id=1, kind="load", block_id=40)
+        self.assertEqual(plan(keyed, costs).dispatch_order, ())
+        # B and C without producers are sources: their order is the author's
+        # first-wave priority, so only the join is in the tail run.
+        self.assertEqual(plan(full_load(3, 1), costs, sources=True).dispatch_order, ())
+
+        # Longest path, not own task: A feeds B (cheap) and C (a mid-size
+        # sink); D (expensive tasks) reads all of B.  B heads the path B -> D,
+        # so the stream is A B D C (by task cost alone it would be A C B D).
+        chain = _dependency_graph(
+            [[10], [20], [30], [40]],
+            _access(root=0, kind="store", block_id=10),
+            full_load(1, 0),
+            full_load(2, 0),
+            _access(root=1, allocation_id=1, kind="store", block_id=20),
+            full_load(3, 1),
+        )
+        roots, sites = instantiate_coordinate_domains(chain, axis_geometry=geometry)
+        chain_plan = build_static_pipeline_plan(
+            dependency_graph=chain,
+            root_task_orders=tuple(_dense(root) for root in roots if root is not None),
+            site_domains=sites,
+            worker_count=8,
+            cross_loop_dispatch_mode="dynamic",
+            sink_lpt_order=True,
+            root_task_costs=(64, 4096, 65536, 1 << 20),
+        )
+        self.assertEqual(chain_plan.dispatch_order, (0, 1, 3, 2))
+
+    def test_source_root_task_groups_bound_first_wave_bytes(self) -> None:
+        # S (192 tasks, no producer) feeds C (32 tasks, reads all of S); R (6
+        # tasks) is a small source.  With 296 workers S's first wave puts
+        # 192 * cost bytes in flight; above the budget it claims ceil(bytes /
+        # budget) consecutive tasks per ticket.  Consumers are never grouped.
+        def full_load(root: int, allocation_id: int) -> TileAccess:
+            return dataclasses.replace(
+                _access(
+                    root=root, kind="load", block_id=0, allocation_id=allocation_id
+                ),
+                subscript_affine_block_ids=(None,),
+                subscript_is_full_slice=(True,),
+            )
+
+        graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(root=0, kind="store", block_id=10),
+            full_load(1, 0),
+            _access(root=2, allocation_id=1, kind="store", block_id=30),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (192, 16), 20: (32, 16), 30: (6, 16)}
+        )
+        orders = tuple(_dense(root) for root in roots if root is not None)
+
+        def groups(
+            costs: tuple[int | None, ...],
+            budget: int,
+            mode: str = "dynamic",
+            max_group: int | None = None,
+        ) -> dict[int, int]:
+            plan = build_static_pipeline_plan(
+                dependency_graph=graph,
+                root_task_orders=orders,
+                site_domains=sites,
+                worker_count=296,
+                cross_loop_dispatch_mode=cast("Any", mode),
+            )
+            extra = {} if max_group is None else {"max_group": max_group}
+            return cross_loop_scheduler.source_root_task_groups(
+                plan, graph.obligations_by_root_pair(), costs, budget, **extra
+            )
+
+        kib = 1024
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 8 << 20), {0: 2})
+        self.assertEqual(
+            groups((72 * kib, 1 << 30, 2 * kib), 4 << 20, max_group=8), {0: 4}
+        )
+        # The default cap: however far over the budget, a ticket claims at
+        # most SOURCE_ROOT_MAX_GROUP (2) tasks (g=3..7 serialization cliffs).
+        self.assertEqual(cross_loop_scheduler.SOURCE_ROOT_MAX_GROUP, 2)
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 4 << 20), {0: 2})
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 2 << 20), {0: 2})
+        self.assertEqual(groups((1 << 40, 1 << 30, 1 << 40), 8 << 20), {0: 2, 2: 2})
+        # A cap of 1 (or less) disables grouping.
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 4 << 20, max_group=1), {})
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 4 << 20, max_group=0), {})
+        # Under the budget, an unknown cost, the budget off, a static pipeline.
+        self.assertEqual(groups((40 * kib, 1 << 30, 2 * kib), 8 << 20), {})
+        self.assertEqual(groups((None, 1 << 30, 2 * kib), 8 << 20), {})
+        self.assertEqual(groups((72 * kib, 1 << 30, 2 * kib), 0), {})
+        self.assertEqual(
+            groups((72 * kib, 1 << 30, 2 * kib), 8 << 20, mode="static"), {}
+        )
+        # A group never exceeds the root's task count.
+        self.assertEqual(
+            groups((1 << 40, 1 << 30, 1 << 40), 8 << 20, max_group=1 << 20),
+            {0: 192, 2: 6},
+        )
+
+        # A source whose consumer starts on part of it (here C reads S tile by
+        # tile: a keyed counter) is never grouped -- a grouped task finishes
+        # later than on its own slot, and C's tasks would wait for it.
+        keyed = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="load", block_id=20),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            keyed, axis_geometry={10: (192, 16), 20: (192, 16)}
+        )
+        keyed_plan = build_static_pipeline_plan(
+            dependency_graph=keyed,
+            root_task_orders=tuple(_dense(root) for root in roots if root is not None),
+            site_domains=sites,
+            worker_count=296,
+            cross_loop_dispatch_mode="dynamic",
+        )
+        self.assertTrue(keyed_plan.readiness_counters)
+        self.assertEqual(
+            cross_loop_scheduler.source_root_task_groups(
+                keyed_plan,
+                keyed.obligations_by_root_pair(),
+                (72 * kib, 1 << 30),
+                8 << 20,
+            ),
+            {},
+        )
 
     def test_root_barrier_selection_is_forward_and_transitively_minimal(self) -> None:
         obligations = (
