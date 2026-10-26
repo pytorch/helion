@@ -2549,6 +2549,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             for name, value in zip(self.kernel.signature.parameters, args, strict=False)
             if isinstance(value, torch.Tensor)
         }
+        # Bool arguments trace as unbacked symbols; standalone export captures
+        # host launches with these construction-time (or default) values.
+        self._runtime_bool_args_by_name = {}
+        for index, (name, parameter) in enumerate(
+            self.kernel.signature.parameters.items()
+        ):
+            value = args[index] if index < len(args) else parameter.default
+            if type(value) is bool:
+                self._runtime_bool_args_by_name[name] = value
         self._first_compile_lock = threading.RLock()
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None

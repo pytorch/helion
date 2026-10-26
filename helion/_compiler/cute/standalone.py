@@ -9,6 +9,7 @@ from graphlib import TopologicalSorter
 import importlib
 import importlib.util
 import inspect
+from itertools import starmap
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -509,6 +510,9 @@ def _capture_launches(
             plan.get("kind")
             not in (
                 "helion_flash",
+                # The fused flash backward's plan only selects its launch
+                # path; the exported launcher needs no host preparation.
+                "helion_flash_bwd",
                 "helion_small_biased_attention",
                 # Launch-time argument metadata: the exported launcher runs
                 # the alias check from the launch table (no host preparation).
@@ -564,13 +568,57 @@ def _capture_launches(
             alias,
         )
 
+    # Unbacked bool symbols cannot drive host control flow during capture;
+    # capture with the bound values (the export is specialized to them).
+    capture_args = starmap(
+        bound._runtime_bool_args_by_name.get,
+        zip(bound.kernel.signature.parameters, bound.fake_args, strict=True),
+    )
     with bound.env:
-        entrypoint(*bound.fake_args, _launcher=capture)
+        entrypoint(*capture_args, _launcher=capture)
     if not launch_specs:
         raise NotImplementedError(
             "No CuTe launches were captured for standalone export"
         )
     return wrappers, launch_specs
+
+
+def _is_compiled_callable(arg: object) -> bool:
+    """Callable arguments (score/mask mods) only shape tracing; their effect is
+    compiled into the kernel, so standalone entry points omit them."""
+    return callable(arg) and not isinstance(arg, (torch.Tensor, type))
+
+
+def _drop_parameters(function: ast.FunctionDef, names: set[str]) -> None:
+    """Remove ``names`` from a function signature, keeping defaults aligned."""
+    arguments = function.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    defaults = [None] * (len(positional) - len(arguments.defaults)) + list(
+        arguments.defaults
+    )
+    kept = [
+        (arg, default)
+        for arg, default in zip(positional, defaults, strict=True)
+        if arg.arg not in names
+    ]
+    posonly = sum(arg.arg not in names for arg in arguments.posonlyargs)
+    arguments.posonlyargs = [arg for arg, _ in kept[:posonly]]
+    arguments.args = [arg for arg, _ in kept[posonly:]]
+    trailing = [default for _, default in kept]
+    while trailing and trailing[0] is None:
+        trailing.pop(0)
+    if any(default is None for default in trailing):
+        raise NotImplementedError("Cannot drop a callable argument between defaults")
+    arguments.defaults = [default for default in trailing if default is not None]
+    kwonly = [
+        (arg, default)
+        for arg, default in zip(
+            arguments.kwonlyargs, arguments.kw_defaults, strict=True
+        )
+        if arg.arg not in names
+    ]
+    arguments.kwonlyargs = [arg for arg, _ in kwonly]
+    arguments.kw_defaults = [default for _, default in kwonly]
 
 
 def build_standalone_code(
@@ -624,16 +672,36 @@ def build_standalone_code(
         if isinstance(statement, ast.FunctionDef)
         and statement.name == bound.kernel.name
     )
+    names = list(bound.kernel.signature.parameters)
+    # Callable arguments are compiled into the kernel: the entry point omits them.
+    kept = [
+        (name, arg)
+        for name, arg in zip(names, bound.fake_args, strict=True)
+        if not _is_compiled_callable(arg)
+    ]
+    dropped = set(names) - {name for name, _ in kept}
+    if any(
+        isinstance(node, ast.Name) and node.id in dropped
+        for statement in host.body
+        for node in ast.walk(statement)
+    ):
+        raise NotImplementedError(
+            "Standalone CuTe export cannot omit a callable used by host code"
+        )
+    _drop_parameters(host, dropped)
+    bools = bound._runtime_bool_args_by_name
     argument_specs = tuple(
-        _argument_schema(
+        ("constant", bools[name])
+        if name in bools
+        else _argument_schema(
             arg, pointer_residues, specialized_vars=bound.env.specialized_vars
         )
-        for arg in bound.fake_args
+        for name, arg in kept
     )
-    names = list(bound.kernel.signature.parameters)
     host.body[:0] = [
         *ast.parse(
-            f"_standalone_validate_args(({', '.join(names)},), {_schema_repr(argument_specs)})"
+            f"_standalone_validate_args(({', '.join(name for name, _ in kept)},), "
+            f"{_schema_repr(argument_specs)})"
         ).body,
         *guards,
     ]

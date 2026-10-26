@@ -32,6 +32,7 @@ from helion.autotuner.handoff_inputs import _save_inputs
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -375,6 +376,62 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
                 reference_fn=lambda x, scale: torch.zeros_like(x),
                 repetitions=1,
             )
+
+
+def _leaky(x: torch.Tensor) -> torch.Tensor:
+    return torch.where(x > 0, x, x * 0.5)
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skipIfRefEager("Native handoff requires compilation")
+def test_cute_handoff_with_callable_and_bool_arguments(tmp_path: Path) -> None:
+    """Callables (score/mask mods) are compiled into the kernel, so the exported
+    entry point omits them; a bool driving host code is exported as a constant."""
+    pytest.importorskip("cutlass.cute")
+
+    @helion.kernel(
+        backend="cute",
+        static_shapes=True,
+        autotune_precompile=None,
+        autotune_benchmark_subprocess=False,
+    )
+    def mapped_add(
+        x: torch.Tensor,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        y: torch.Tensor,
+        check: bool = False,
+    ) -> torch.Tensor:
+        if check:
+            assert x.size(0) == y.size(0)
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size()):
+            out[tile] = fn(x[tile]) + y[tile]
+        return out
+
+    x = torch.randn(256, device=DEVICE)
+    y = torch.randn(256, device=DEVICE)
+    args = (x, _leaky, y, True)
+    search = FiniteSearch(
+        mapped_add.bind(args),
+        args,
+        [helion.Config(block_sizes=[64]), helion.Config(block_sizes=[128])],
+    )
+    point = find_handoff(search, HandoffPolicy())
+    torch.testing.assert_close(point.fn(*args), torch.where(x > 0, x, x * 0.5) + y)
+    bundle = build_handoff(search, point, tmp_path / "bundle", repetitions=1)
+    assert bundle.manifest["baseline_evaluation"]["ok"]
+    assert len(bundle.manifest["cases"][0]["input_metadata"]) == 3
+    source = bundle.sources["case_0/kernel.py"]
+    entry = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "mapped_add"
+    )
+    assert [arg.arg for arg in entry.args.args] == ["x", "y", "check"]
+    assert "_source_module" not in source
+    result = bundle.run_agent(lambda workspace: dict(workspace.sources), repetitions=1)
+    assert result.ok, result
 
 
 @pytest.mark.timeout(300)
