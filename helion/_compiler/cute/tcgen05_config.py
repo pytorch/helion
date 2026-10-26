@@ -111,6 +111,7 @@ from .strategies import Tcgen05PersistenceModel
 from .strategies import Tcgen05Strategy
 from .strategies import derive_persistence_model_from_pid_type
 from .strategies import layout_overrides_from_config
+from .strategies import tcgen05_epilogue_subtile_m
 from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import validate_tcgen05_strategy_invariants
 from .strategies import warp_spec_from_config
@@ -153,12 +154,16 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_PREFETCH_MAX_SUBTILES
+from .tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
+from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_BEFORE_STORE
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
@@ -173,6 +178,11 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_WARPS_PER_GROUP
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
@@ -262,12 +272,15 @@ from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
+from .tcgen05_constants import tcgen05_aux_prefetch_bytes_per_thread
 from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_aux_subtile_fragment_bytes_per_thread
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from .tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_constants import tcgen05_round_up_smem_bytes
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
@@ -492,6 +505,9 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
+    TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY,
+    TCGEN05_EPI_SUBTILE_N_CONFIG_KEY,
+    TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
@@ -5278,6 +5294,8 @@ class CuteTcgen05Config:
             stage_rows=self._store_lowering_stages_rows(config),
             epi_warps=self._config_epi_warps(config),
             acc_stages=self._config_acc_stages(config),
+            epi_subtile_n=self._config_epi_subtile_n(config),
+            epi_warp_groups=self._config_epi_warp_groups(config),
         ):
             return (
                 f"a {bm}x{bn}x{bk} CTA-pair tile leaves no room for one AB "
@@ -6455,6 +6473,8 @@ class CuteTcgen05Config:
         acc_stages: int = 2,
         aux_load_mode: str = TCGEN05_AUX_LOAD_MODE_SIMT,
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+        epi_subtile_n: int | None = None,
+        epi_warp_groups: int = 1,
     ) -> int | None:
         """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
 
@@ -6479,7 +6499,11 @@ class CuteTcgen05Config:
         chain is judged conservatively rather than refused. A staged aux load
         mode (``TCGEN05_AUX_LOAD_MODES_STAGED``) adds one ``aux_stages``-deep
         ring of the with-source epilogue subtile per exact-shape auxiliary
-        operand (``facts.exact_aux_count``).
+        operand (``facts.exact_aux_count``). ``epi_subtile_n`` pins the C
+        subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
+        the explicit-tile path) and ``epi_warp_groups`` multiplies the C
+        stages (each epilogue warp group owns ``c_stages`` stages of the
+        ring, ``tcgen05_epi_warp_groups``).
         """
         constraints = self.ab_stages_three_search_constraints
         facts = self.rowvec_aux_facts
@@ -6489,7 +6513,7 @@ class CuteTcgen05Config:
             return None
         if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages <= 0:
             return None
-        if acc_stages <= 0 or epi_warps <= 0:
+        if acc_stages <= 0 or epi_warps <= 0 or epi_warp_groups <= 0:
             return None
         ab_bytes = tcgen05_ab_smem_bytes_per_cta(
             bm=bm,
@@ -6501,46 +6525,9 @@ class CuteTcgen05Config:
         )
         if facts is None:
             output_itemsize = 4
-            narrow_subtile = False
             stage_bytes = 0
         else:
             output_itemsize = facts.output_itemsize
-            # The matmul plan's (128, 32) subtile: promoted 16-bit rows that
-            # are staged, or a plain 16-bit store on the 256-wide two-CTA
-            # tile (``tcgen05_plain_narrow_subtile``: one output store and no
-            # auxiliary operand -- a two-output or aux epilogue keeps CuTe's
-            # with-source (128, 64) subtile there, 64 KiB of C rings for two
-            # outputs; the plan also asks for a single static-full-tile
-            # store, which every plain kernel the gates see has).
-            narrow_subtile = (
-                facts.output_itemsize == 2
-                and (
-                    (
-                        stage_rows
-                        and bool(facts.rows)
-                        and all(row.promoted for row in facts.rows)
-                    )
-                    or (
-                        not facts.rows
-                        and facts.output_count == 1
-                        and not self.aux_kernel_detected
-                        and constraints.dtype_bytes == 2
-                        and cluster_m == 2
-                        and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
-                        # An exact-shape auxiliary operand keeps the plan's
-                        # with-source subtile (``cute_mma``:
-                        # ``tcgen05_plain_narrow_subtile`` needs an aux-free
-                        # epilogue).
-                        and facts.exact_aux_count == 0
-                    )
-                )
-                and tcgen05_explicit_epilogue_tile_supported(
-                    is_two_cta=cluster_m == 2,
-                    bm=bm,
-                    bn=bn,
-                    tile_shape=(128, 32, 32),
-                )
-            )
             stage_bytes = (
                 tcgen05_rowvec_stage_smem_bytes(
                     rows=facts.rows, bn=bn, epi_warps=epi_warps
@@ -6555,17 +6542,18 @@ class CuteTcgen05Config:
                 stage_bytes, TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
             )
         out_bits = output_itemsize * 8
-        if narrow_subtile:
-            epi_tile_m, epi_tile_n = 128, 32
-        else:
-            epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
-                bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
-            )
+        epi_tile_m, epi_tile_n = self.epilogue_subtile(
+            bm=bm,
+            bn=bn,
+            cluster_m=cluster_m,
+            stage_rows=stage_rows,
+            epi_subtile_n=epi_subtile_n,
+        )
         c_bytes = tcgen05_c_smem_bytes_per_cta(
             epi_tile_m=epi_tile_m,
             epi_tile_n=epi_tile_n,
             dtype_bytes=output_itemsize,
-            c_stages=c_stages,
+            c_stages=c_stages * epi_warp_groups,
         )
         # One C ring per output store: two fresh outputs of one accumulator
         # (``se_block_fwd``'s ``s`` and ``out``) allocate two rings, with or
@@ -6615,6 +6603,8 @@ class CuteTcgen05Config:
         acc_stages: int = 2,
         aux_load_mode: str = TCGEN05_AUX_LOAD_MODE_SIMT,
         aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+        epi_subtile_n: int | None = None,
+        epi_warp_groups: int = 1,
     ) -> bool:
         """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
 
@@ -6637,6 +6627,8 @@ class CuteTcgen05Config:
             acc_stages=acc_stages,
             aux_load_mode=aux_load_mode,
             aux_stages=aux_stages,
+            epi_subtile_n=epi_subtile_n,
+            epi_warp_groups=epi_warp_groups,
         )
         if arena_bytes is None:
             return False
@@ -7161,9 +7153,35 @@ class CuteTcgen05Config:
         if cluster_m == 2 and not is_two_cta:
             return False
         rows = bm // 2 if is_two_cta else bm
+        if rows <= 0:
+            return False
+        groups = self._config_epi_warp_groups(config)
+        if groups > 1:
+            # Each epilogue warp group hoists the fragments of its own
+            # subtiles through the auxiliary ring, ``ceil(count / G)`` of
+            # them (the long groups of a ragged split; the store lowering's
+            # ring budget prices the same count), not the average share.
+            count = self.epilogue_subtile_count(config)
+            if count is None:
+                return False
+            epi_tile_m, epi_tile_n = self.epilogue_subtile(
+                bm=bm,
+                bn=bn,
+                cluster_m=cluster_m,
+                stage_rows=self._store_lowering_stages_rows(config),
+                epi_subtile_n=self._config_epi_subtile_n(config),
+            )
+            return (
+                tcgen05_aux_prefetch_bytes_per_thread(
+                    epi_tile_m=epi_tile_m,
+                    epi_tile_n=epi_tile_n,
+                    itemsize=facts.output_itemsize,
+                    depth=-(-count // groups) - 1,
+                )
+                <= TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
+            )
         return (
-            rows > 0
-            and tcgen05_aux_fragment_bytes_per_thread(
+            tcgen05_aux_fragment_bytes_per_thread(
                 bm=rows,
                 bn=bn,
                 itemsize=facts.output_itemsize,
@@ -7211,6 +7229,498 @@ class CuteTcgen05Config:
             bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
             and self.matmul_input_dtype == torch.float8_e4m3fn
         )
+
+    def epilogue_subtile(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        cluster_m: int,
+        stage_rows: bool,
+        epi_subtile_n: int | None = None,
+    ) -> tuple[int, int]:
+        """The C subtile ``(m, n)`` the role-local TMA-store epilogue renders.
+
+        The matmul plan's choice (``cute_mma``): a configured subtile
+        (``tcgen05_epi_subtile_n``, the explicit-tile path: ``(per-CTA M,
+        n)``) wins; then the plan's (128, 32) for promoted 16-bit rows that
+        are staged, or for a plain 16-bit store on the 256-wide two-CTA tile
+        (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
+        operand -- a two-output or aux epilogue keeps CuTe's with-source
+        (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
+        also asks for a single static-full-tile store, which every plain
+        kernel the gates see has); otherwise CuTe's with-source rule at the
+        output width, sized for a 32-bit output without store facts.
+        """
+        constraints = self.ab_stages_three_search_constraints
+        facts = self.rowvec_aux_facts
+        if epi_subtile_n is not None:
+            return (
+                tcgen05_epilogue_subtile_m(bm=bm, is_two_cta=cluster_m == 2),
+                epi_subtile_n,
+            )
+        out_bits = 32 if facts is None else facts.output_itemsize * 8
+        narrow_subtile = (
+            facts is not None
+            and constraints is not None
+            and facts.output_itemsize == 2
+            and (
+                (
+                    stage_rows
+                    and bool(facts.rows)
+                    and all(row.promoted for row in facts.rows)
+                )
+                or (
+                    not facts.rows
+                    and facts.output_count == 1
+                    and not self.aux_kernel_detected
+                    and constraints.dtype_bytes == 2
+                    and cluster_m == 2
+                    and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+                    # An exact-shape auxiliary operand keeps the plan's
+                    # with-source subtile (``cute_mma``:
+                    # ``tcgen05_plain_narrow_subtile`` needs an aux-free
+                    # epilogue).
+                    and facts.exact_aux_count == 0
+                )
+            )
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=cluster_m == 2,
+                bm=bm,
+                bn=bn,
+                tile_shape=(128, 32, 32),
+            )
+        )
+        if narrow_subtile:
+            return 128, 32
+        return tcgen05_default_epilogue_tile_size(
+            bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
+        )
+
+    @staticmethod
+    def _config_epi_warp_groups(config: dict[str, object]) -> int:
+        """Epilogue warp groups of ``config`` (``tcgen05_epi_warp_groups``)."""
+        groups = config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1)
+        if type(groups) is int and groups > 0:
+            return groups
+        return 1
+
+    @staticmethod
+    def _config_epi_subtile_n(config: dict[str, object]) -> int | None:
+        """Configured epilogue subtile width (``tcgen05_epi_subtile_n``)."""
+        value = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+        if type(value) is int and value > 0:
+            return value
+        return None
+
+    def epilogue_group_search_enabled(self) -> bool:
+        """Whether the epilogue subtile and warp-group knobs are searched.
+
+        Both act on a heavy epilogue -- several output stores or an
+        exact-shape auxiliary read -- whose per-subtile chain a one-tile
+        per-CTA grid leaves exposed; a plain store's search keeps its
+        surface (an explicit config is validated everywhere).
+        """
+        facts = self.rowvec_aux_facts
+        return self.search_enabled and (
+            self.exact_shape_aux_kernel_detected
+            or (facts is not None and facts.output_count >= 2)
+        )
+
+    def _standard_tma_epilogue_schedule_refusal(
+        self, config: dict[str, object]
+    ) -> str | None:
+        """Why ``config`` is not the standard role-local TMA-store epilogue.
+
+        The epilogue subtile knob, the epilogue warp groups and the auxiliary
+        prefetch ring render on the one schedule the store lowering's default
+        subtile loop owns: the monolithic role-local strategy with four
+        epilogue warps, the default layout without overrides, the normal
+        TMA store, register (SIMT) auxiliary reads, static full tiles of a
+        rank-2 row-major output and -- clustered -- the 256-row CtaGroup.TWO
+        pair. Every other family (grouped, materialized chains, store or
+        C-input warps, the diagnostic layouts) keeps its own epilogue.
+        """
+        expected: dict[str, object] = {
+            TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: Tcgen05LayoutStrategy.DEFAULT.value,
+            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY: "normal",
+            TCGEN05_C_STORE_MODE_CONFIG_KEY: TCGEN05_C_STORE_MODE_NORMAL,
+            "tcgen05_num_epi_warps": TCGEN05_EPI_WARPS_PER_GROUP,
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 0,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 0,
+            TCGEN05_WARP_SPEC_STORE_WARPS_KEY: 0,
+        }
+        for key, default in expected.items():
+            value = config.get(key, default)
+            if type(value) is not type(default) or value != default:
+                return f"requires {key}={default!r}"
+        if (
+            config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT)
+            != TCGEN05_AUX_LOAD_MODE_SIMT
+        ):
+            return "requires the register (simt) auxiliary load mode"
+        if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None:
+            return "is not available for grouped matmuls"
+        if config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY):
+            return "requires the launch-axis role coordinates"
+        if config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY):
+            return "is not available with the diagnostic invalid output"
+        if any(config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS):
+            return "requires no explicit layout overrides"
+        if (
+            config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ):
+            return "is not validated with CLC persistence"
+        if self.materialized_matmul_block_ids:
+            return "is not available on a materialized fission chain"
+        if self.matmul_has_leading_passthrough:
+            return "requires a rank-2 matmul"
+        facts = self.pipeline_smem_facts
+        if facts is not None and facts.output_column_major:
+            return "requires a row-major output"
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        if type(cluster_m) is not int or cluster_m not in (1, 2):
+            return "requires tcgen05_cluster_m in (1, 2)"
+        view = self._matmul_config_view(config)
+        if view is None:
+            return "requires the tcgen05 matmul block view"
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
+            return "requires integer tcgen05 block sizes"
+        bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
+        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk):
+            return "requires static full output tiles"
+        if cluster_m == 2 and not (
+            self._config_is_two_cta_mma(config, bm=bm, cluster_m=2)
+            and bm == TCGEN05_TWO_CTA_BLOCK_M
+        ):
+            return (
+                f"requires the {TCGEN05_TWO_CTA_BLOCK_M}-row CtaGroup.TWO pair "
+                "tile when tcgen05_cluster_m=2"
+            )
+        return None
+
+    def epi_subtile_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_epi_subtile_n`` is refused for ``config``; None if admitted.
+
+        The configured subtile is ``(per-CTA M, n)`` with ``n`` as the TMA
+        store box width (``tcgen05_explicit_epilogue_tile_supported``), on
+        16-bit outputs of the standard role-local TMA-store epilogue.
+        """
+        value = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+        if value is None:
+            return None
+        if type(value) is not int or value not in TCGEN05_EPI_SUBTILE_N_CHOICES:
+            return f"must be one of {TCGEN05_EPI_SUBTILE_N_CHOICES!r}"
+        reason = self._standard_tma_epilogue_schedule_refusal(config)
+        if reason is not None:
+            return f"the configured epilogue subtile {reason}"
+        facts = self.rowvec_aux_facts
+        if facts is None or facts.output_itemsize != 2:
+            return "the configured epilogue subtile needs 16-bit outputs"
+        view = self._matmul_config_view(config)
+        assert view is not None
+        blocks, mi, ni, _ki = view
+        bm = cast("int", blocks[mi])
+        bn = cast("int", blocks[ni])
+        is_two_cta = config.get("tcgen05_cluster_m", 1) == 2
+        epi_tile_m = tcgen05_epilogue_subtile_m(bm=bm, is_two_cta=is_two_cta)
+        if not tcgen05_explicit_epilogue_tile_supported(
+            is_two_cta=is_two_cta,
+            bm=bm,
+            bn=bn,
+            tile_shape=(epi_tile_m, value, value),
+        ):
+            return (
+                f"a ({epi_tile_m}, {value}) epilogue subtile does not partition "
+                f"the {bm}x{bn} tile into whole TMA store boxes"
+            )
+        return None
+
+    def epilogue_subtile_count(self, config: dict[str, object]) -> int | None:
+        """Epilogue subtiles of one CTA tile (the subtile loop's trip count).
+
+        ``None`` where the per-CTA rows do not partition into the plan's
+        subtile (the bm=128 CtaGroup.TWO family's permuted per-CTA tile, or a
+        config without a block view).
+        """
+        view = self._matmul_config_view(config)
+        if view is None:
+            return None
+        blocks, mi, ni, _ki = view
+        bm, bn = blocks[mi], blocks[ni]
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        if not (
+            type(bm) is int
+            and type(bn) is int
+            and type(cluster_m) is int
+            and bm > 0
+            and bn > 0
+            and cluster_m in (1, 2)
+        ):
+            return None
+        epi_tile_m, epi_tile_n = self.epilogue_subtile(
+            bm=bm,
+            bn=bn,
+            cluster_m=cluster_m,
+            stage_rows=self._store_lowering_stages_rows(config),
+            epi_subtile_n=self._config_epi_subtile_n(config),
+        )
+        rows = (
+            bm // 2
+            if self._config_is_two_cta_mma(config, bm=bm, cluster_m=cluster_m)
+            else bm
+        )
+        if rows % epi_tile_m or bn % epi_tile_n:
+            return None
+        return (rows // epi_tile_m) * (bn // epi_tile_n)
+
+    def epi_warp_groups_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_epi_warp_groups`` is refused for ``config``; None if admitted.
+
+        Mirrors the store lowering's gate (``memory_ops``, which fails closed
+        on the same facts): the standard role-local TMA-store epilogue with
+        the pre-loop or before-store C acquire, the accumulator wait inside
+        the subtile loop (the groups move it ahead of their own loop), no
+        staged row-vector operands (the row stages are sized per warp), the
+        shared fanout on a kernel with several output stores (each group
+        must walk both outputs' subtiles together) and a known subtile count.
+        """
+        groups = config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1)
+        if type(groups) is int and groups == 1:
+            return None
+        if type(groups) is not int or groups not in TCGEN05_EPI_WARP_GROUP_CHOICES:
+            return f"must be one of {TCGEN05_EPI_WARP_GROUP_CHOICES!r}"
+        reason = self._standard_tma_epilogue_schedule_refusal(config)
+        if reason is not None:
+            return f"epilogue warp groups {reason}"
+        if config.get(
+            TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+        ) not in (
+            TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
+            TCGEN05_C_ACQUIRE_PLACEMENT_BEFORE_STORE,
+        ):
+            return (
+                "epilogue warp groups require the pre_loop or before_store C "
+                "acquire placement"
+            )
+        if (
+            config.get(
+                TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+                TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
+            )
+            != TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+        ):
+            return (
+                "epilogue warp groups wait for the accumulator ahead of their own "
+                f"subtile loop; they require {TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP!r}"
+            )
+        facts = self.rowvec_aux_facts
+        if (
+            facts is not None
+            and facts.rows
+            and config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        ):
+            return (
+                "epilogue warp groups do not stage row-vector operands "
+                f"({TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r} with a row-vector "
+                "auxiliary)"
+            )
+        if (
+            facts is not None
+            and facts.output_count >= 2
+            and config.get(FANOUT_CONFIG_KEY, "off") != "shared"
+        ):
+            return (
+                "epilogue warp groups on a kernel with several output stores need "
+                f"the shared fanout epilogue ({FANOUT_CONFIG_KEY}='shared')"
+            )
+        if self.epilogue_subtile_count(config) is None:
+            return "epilogue warp groups need a known epilogue subtile count"
+        view = self._matmul_config_view(config)
+        assert view is not None
+        blocks, _mi, ni, _ki = view
+        bn = cast("int", blocks[ni])
+        if bn < tcgen05_role_launch_n_width(groups):
+            # The role launch's N width (a power of two covering the ``4G +
+            # 2`` warps) has to divide the N tile.
+            return (
+                f"{groups} epilogue warp groups launch "
+                f"{tcgen05_role_launch_n_width(groups)} warp rows, more than the "
+                f"{bn}-wide N tile has columns"
+            )
+        return None
+
+    def aux_prefetch_depth_limit(self, config: dict[str, object]) -> int | None:
+        """Deepest auxiliary prefetch ring the register budget admits.
+
+        ``(d + 1)`` subtile fragments of the config's epilogue subtile per
+        thread within ``TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD``,
+        at most one less than the subtiles each epilogue warp group walks
+        (a ring that reaches the group's last subtile is the whole-fragment
+        hoist) and the knob's ceiling. ``None`` without store facts or a
+        known subtile count.
+        """
+        facts = self.rowvec_aux_facts
+        count = self.epilogue_subtile_count(config)
+        view = self._matmul_config_view(config)
+        if facts is None or count is None or view is None:
+            return None
+        blocks, mi, ni, _ki = view
+        bm, bn = cast("int", blocks[mi]), cast("int", blocks[ni])
+        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+        epi_tile_m, epi_tile_n = self.epilogue_subtile(
+            bm=bm,
+            bn=bn,
+            cluster_m=cluster_m,
+            stage_rows=self._store_lowering_stages_rows(config),
+            epi_subtile_n=self._config_epi_subtile_n(config),
+        )
+        per_subtile = tcgen05_aux_subtile_fragment_bytes_per_thread(
+            epi_tile_m=epi_tile_m,
+            epi_tile_n=epi_tile_n,
+            itemsize=facts.output_itemsize,
+        )
+        groups = self._config_epi_warp_groups(config)
+        local_count = -(-count // groups)
+        return max(
+            0,
+            min(
+                TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD // per_subtile - 1,
+                local_count - 1,
+                TCGEN05_AUX_PREFETCH_MAX_SUBTILES,
+            ),
+        )
+
+    def aux_prefetch_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``tcgen05_aux_prefetch_subtiles`` is refused; None if admitted.
+
+        The ring needs the exact-shape auxiliary operand and the
+        ``pre_acc_wait`` placement the hoist needs, the standard role-local
+        TMA-store epilogue, no whole-fragment hoist (which supersedes it),
+        and a depth within ``aux_prefetch_depth_limit``.
+        """
+        depth = config.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY, 0)
+        if type(depth) is int and depth == 0:
+            return None
+        if (
+            type(depth) is not int
+            or depth < 0
+            or depth > TCGEN05_AUX_PREFETCH_MAX_SUBTILES
+        ):
+            return f"must be an integer in [0, {TCGEN05_AUX_PREFETCH_MAX_SUBTILES}]"
+        if not self.exact_shape_aux_kernel_detected:
+            return (
+                "the auxiliary prefetch ring needs an exact-shape rank-2 "
+                "auxiliary operand of the output's dtype in the epilogue chain"
+            )
+        if (
+            config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        ):
+            return (
+                "the auxiliary prefetch ring needs "
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}"
+            )
+        reason = self._standard_tma_epilogue_schedule_refusal(config)
+        if reason is not None:
+            return f"the auxiliary prefetch ring {reason}"
+        if config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True:
+            return (
+                "the auxiliary prefetch ring is superseded by the whole-fragment "
+                f"hoist ({TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True)"
+            )
+        limit = self.aux_prefetch_depth_limit(config)
+        if limit is None:
+            return "the auxiliary prefetch ring needs a known epilogue subtile"
+        if depth > limit:
+            return (
+                f"a {depth}-deep auxiliary prefetch ring holds more than "
+                f"{TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD} bytes per "
+                f"epilogue thread at this subtile, or reaches the group's last "
+                f"subtile (deepest fitting depth {limit})"
+            )
+        return None
+
+    def _normalize_epilogue_groups(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Judge the epilogue subtile, warp groups and auxiliary prefetch ring.
+
+        In order of dependence: the subtile (the groups' subtile count and
+        the ring's budget read it), the groups (one C stage per group is
+        legal only with two or more), the hoist at the final group count
+        (its budget is the per-group share), then the ring (superseded by an
+        admitted hoist, clamped to the deepest fitting depth in search).
+        Explicit configs are refused with the reason.
+        """
+        if not self.search_enabled:
+            return
+        reason = self.epi_subtile_refusal(config)
+        if reason is not None:
+            if fix_invalid:
+                config[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = None
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_EPI_SUBTILE_N_CONFIG_KEY}="
+                    f"{config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)!r}: {reason}"
+                )
+        reason = self.epi_warp_groups_refusal(config)
+        if reason is not None:
+            if fix_invalid:
+                config[TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY] = 1
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY}="
+                    f"{config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY)!r}: {reason}"
+                )
+        groups = self._config_epi_warp_groups(config)
+        if config.get("tcgen05_c_stages", 2) == 1 and groups == 1:
+            if fix_invalid:
+                config["tcgen05_c_stages"] = 2
+            else:
+                raise InvalidConfig(
+                    "tcgen05_c_stages=1 needs two or more epilogue warp groups "
+                    f"({TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY} >= 2): each group owns "
+                    "one stage of the C ring"
+                )
+        if config.get(
+            TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+        ) is True and not self.aux_fragment_hoist_admissible(config):
+            if fix_invalid:
+                config[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY}=True holds more than "
+                    f"{TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD} bytes of "
+                    "auxiliary tile per epilogue thread at this group count"
+                )
+        reason = self.aux_prefetch_refusal(config)
+        if reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY}="
+                    f"{config.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY)!r}: "
+                    f"{reason}"
+                )
+            # A ring the budget alone refuses keeps its deepest fitting depth;
+            # one the schedule refuses collapses to the per-subtile read.
+            probe = dict(config)
+            probe[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = 1
+            limit = self.aux_prefetch_depth_limit(config)
+            config[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = (
+                limit
+                if limit is not None
+                and (limit == 0 or self.aux_prefetch_refusal(probe) is None)
+                else 0
+            )
 
     def _fix_multi_output_ring_search_config(self, config: dict[str, object]) -> None:
         """Shallow a multi-output sample's rings to the whole static arena."""
@@ -7280,6 +7790,8 @@ class CuteTcgen05Config:
                 acc_stages=acc_stages,
                 aux_load_mode=self._config_aux_load_mode(config),
                 aux_stages=self._config_aux_stages(config),
+                epi_subtile_n=self._config_epi_subtile_n(config),
+                epi_warp_groups=self._config_epi_warp_groups(config),
             )
 
         if fits(cast("int", ab_stages), cast("int", c_stages)):
@@ -7296,6 +7808,16 @@ class CuteTcgen05Config:
                     config["tcgen05_ab_stages"] = ab
                     config["tcgen05_c_stages"] = c
                     return
+        # The epilogue warp groups' rings (``G x c_stages`` stages per output)
+        # fit at no AB depth: one stage per group, then one group.
+        if self._config_epi_warp_groups(config) > 1:
+            for groups, c in ((self._config_epi_warp_groups(config), 1), (1, 2)):
+                config[TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY] = groups
+                for ab in range(cast("int", ab_stages), 0, -1):
+                    if fits(ab, c):
+                        config["tcgen05_ab_stages"] = ab
+                        config["tcgen05_c_stages"] = c
+                        return
 
     def _fix_rowvec_stage_search_config(self, config: dict[str, object]) -> None:
         """Demote a sampled ``pre_acc_wait`` whose row stages overflow SMEM.
@@ -8704,7 +9226,11 @@ class CuteTcgen05Config:
             "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
             "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
-            "tcgen05_c_stages": EnumFragment((2, 3, 4), search_choices=(2, 4)),
+            # One stage per epilogue warp group is enough with two or more
+            # groups (``_normalize_epilogue_groups``: a lone group keeps the
+            # two-stage ring); the search samples the historical depths and
+            # the first choice stays the default (``EnumFragment.default``).
+            "tcgen05_c_stages": EnumFragment((2, 3, 4, 1), search_choices=(2, 4)),
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
@@ -8919,6 +9445,23 @@ class CuteTcgen05Config:
         # the strict normalizer's (``aux_fragment_hoist_admissible``).
         if self.exact_shape_aux_kernel_detected:
             fragments[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = BooleanFragment()
+            # The register prefetch ring of the same fragment, by subtile
+            # distance (``aux_prefetch_refusal``: budget per depth).
+            fragments[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = IntegerFragment(
+                0, TCGEN05_AUX_PREFETCH_MAX_SUBTILES, 0
+            )
+        if not for_search or self.epilogue_group_search_enabled():
+            # The epilogue subtile width and the epilogue warp groups of the
+            # role-local TMA-store epilogue: searched on kernels whose
+            # epilogue is heavy (two outputs or an exact-shape auxiliary
+            # read), validated everywhere. Plain enum fields: the coverage
+            # group ``cute.epi_warp_groups`` owns the groups coordinate.
+            fragments[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = EnumFragment(
+                TCGEN05_EPI_SUBTILE_N_CHOICES
+            )
+            fragments[TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY] = EnumFragment(
+                TCGEN05_EPI_WARP_GROUP_CHOICES
+            )
         if not for_search:
             fragments["tcgen05_grouped_worklist_orientation"] = EnumFragment(
                 ("nm", "mn")
@@ -9194,6 +9737,8 @@ class CuteTcgen05Config:
                 acc_stages=self._config_acc_stages(config),
                 aux_load_mode=TCGEN05_AUX_LOAD_MODE_EPI_TMA,
                 aux_stages=self._config_aux_stages(config),
+                epi_subtile_n=self._config_epi_subtile_n(config),
+                epi_warp_groups=self._config_epi_warp_groups(config),
             ):
                 return stages
         return 0
@@ -9797,8 +10342,9 @@ class CuteTcgen05Config:
                     f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}, the SIMT aux "
                     "load mode, the normal TMA store and a tile fragment of at "
                     f"most {TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD} "
-                    "bytes per epilogue thread"
+                    "bytes per epilogue thread (per epilogue warp group)"
                 )
+        self._normalize_epilogue_groups(config, fix_invalid=fix_invalid)
         if (
             aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
             and config.get(
@@ -10255,6 +10801,11 @@ class CuteTcgen05Config:
         # demote it where the stage does not fit (the seeds' gate, applied to
         # the projection).
         self._fix_rowvec_stage_search_config(config)
+        # The epilogue subtile, warp groups and auxiliary prefetch ring are
+        # re-judged on the projected geometry ahead of the ring pricing they
+        # feed (a (128, 32) subtile halves each ring; a second group doubles
+        # the stages).
+        self._normalize_epilogue_groups(config, fix_invalid=True)
         # A kernel with several output stores keeps one C ring per output;
         # judge the final rings against the whole arena and shallow them
         # where the extra rings overflow.
@@ -10440,6 +10991,11 @@ class CuteTcgen05Config:
         self._normalize_epilogue_fanout(
             config, fix_invalid=fix_invalid, validate_schedule=True
         )
+        # The epilogue warp groups of a two-output kernel ride on the shared
+        # fanout; re-judged after the fanout's own admission and ahead of the
+        # ring pricing (a dropped second group halves the C rings, a lone
+        # group's one-stage ring deepens to two).
+        self._normalize_epilogue_groups(config, fix_invalid=fix_invalid)
         # A kernel with several output stores keeps one C ring per output;
         # the search's fix pass shallowed its samples above, so this refuses
         # only an explicit config whose rings provably overflow the arena.

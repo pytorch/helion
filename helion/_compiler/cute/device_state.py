@@ -307,12 +307,23 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     bn: int = 0
     bk: int = 0
     thr_mma: str = ""
+    # Epilogue warps per warp group (the four TMEM datapath warps the CUTLASS
+    # partition helpers address through ``epi_tidx``).
     epi_warp_count: int = 0
+    # Epilogue warp groups (``tcgen05_epi_warp_groups``): ``epi_group`` /
+    # ``epi_leader`` are the per-warp group index and leader-warp predicate
+    # the role prefix defines when there are several groups ("" otherwise).
+    epi_warp_groups: int = 1
+    epi_group: str = ""
+    epi_leader: str = ""
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
     warp_idx: str = ""
     epi_tile: str = ""
+    # Stages of each output's TMA-store C ring: ``c_stages_per_group`` per
+    # epilogue warp group, ``c_stage_count`` in total.
     c_stage_count: int = 0
+    c_stages_per_group: int = 0
     epilog_sync_barrier_id: int = 0
     tmem_load_atom: str = ""
     epilogue_rest_mode: str = ""
@@ -361,6 +372,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
         )
         if self.explicit_d_store_box_n is not None:
             assert self.explicit_epi_tile_n == self.explicit_d_store_box_n
+        if self.c_stages_per_group == 0:
+            object.__setattr__(self, "c_stages_per_group", self.c_stage_count)
+        assert self.epi_warp_groups >= 1
+        assert self.c_stage_count == self.c_stages_per_group * self.epi_warp_groups
+        assert (
+            (self.epi_warp_groups > 1) == bool(self.epi_group) == bool(self.epi_leader)
+        )
 
     @property
     def has_explicit_epilogue_tile(self) -> bool:
@@ -881,6 +899,12 @@ class CuteDeviceFunctionState:
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
+        # ``min_blocks_per_mp`` the tcgen05 role launch requires (the
+        # epilogue warp groups' 10+-warp block runs without a ``setmaxnreg``
+        # split and needs ptxas to cap the per-thread allocation at
+        # ``65536 / threads``); emitted as ``_helion_cute_min_blocks_per_mp``
+        # by the device function.
+        self.tcgen05_min_blocks_per_mp: int | None = None
         self.suppress_root_lane_loops = False
         # Active block-id remapping for matmul operand re-materialization.
         # Maps a source block_id (e.g. the rhs operand's loop-invariant

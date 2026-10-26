@@ -524,11 +524,14 @@ def schedule_supported(config: dict[str, object]) -> bool:
         in ("pre_loop", "before_store")
         and config.get("tcgen05_aux_load_placement", "post_acc_wait")
         in ("post_acc_wait", "pre_acc_wait")
-        and config.get("tcgen05_c_stages", 2) in (2, 4)
+        # One C stage per epilogue warp group is legal with two or more groups
+        # (``CuteTcgen05Config._normalize_epilogue_groups``); the pair's rings
+        # are priced per group by ``_pair_fanout_refusal``.
+        and config.get("tcgen05_c_stages", 2) in (1, 2, 4)
         and (
             config.get("tcgen05_cluster_m", 1) == 1
             or (
-                config.get("tcgen05_c_stages", 2) == 2
+                config.get("tcgen05_c_stages", 2) in (1, 2)
                 and config.get("tcgen05_acc_stages", 2) == 2
             )
         )
@@ -555,19 +558,31 @@ def store_protocol_supported(value: CuteTcgen05StoreValue) -> bool:
         # A CTA pair stores its 128-row half of the 256-row pair tile (the
         # same fact ``CuteTcgen05Config._pair_fanout_refusal`` requires of
         # the config, which admits the pair's N tile and ring depth from the
-        # SMEM budget).
+        # SMEM budget); the ring depth is judged per epilogue warp group.
         and (
             not value.lifecycle_context.is_two_cta
             or value.bm == TCGEN05_TWO_CTA_BLOCK_M
-            and value.c_stage_count == 2
+            and value.c_stages_per_group in (1, 2)
         )
         and value.orientation is Tcgen05Orientation.MN
         and not value.output_column_major
         and not value.segment_store_m_offset
-        and not value.has_explicit_epilogue_tile
+        # The configured epilogue subtile (``tcgen05_epi_subtile_n``) and the
+        # plan's own narrow subtiles ride the explicit-tile path with the
+        # per-CTA M; the layout-override surface is pinned out by
+        # ``schedule_supported``.
+        and (
+            not value.has_explicit_epilogue_tile
+            or value.explicit_epi_tile_m
+            == (
+                TCGEN05_TWO_CTA_BLOCK_M // 2
+                if value.lifecycle_context.is_two_cta
+                else min(value.bm, 128)
+            )
+        )
         and bool(value.role_local_tile_counter)
         and value.epi_warp_count == 4
-        and value.c_stage_count in (2, 4)
+        and value.c_stages_per_group in (1, 2, 4)
     )
 
 
@@ -719,6 +734,19 @@ class FanoutStore:
     commit: str
     advance: str
     late_acquire: str = ""
+    # The epilogue warp groups' ring offset (``group * c_stages + ``), the
+    # per-store lines ahead of the subtile loop (the auxiliary prefetch ring's
+    # buffers and first reads), the first store's pre-loop accumulator wait,
+    # the loop header (with the group-local subtile index and ragged guard),
+    # the body's extra indent under that guard and the final store's
+    # post-loop accumulator release. All empty / the plain header without
+    # groups or a ring.
+    buffer_prefix: str = ""
+    pre_loop: str = ""
+    pre_loop_wait: str = ""
+    loop_header: str = ""
+    body_indent: str = ""
+    post_loop: str = ""
 
 
 def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
@@ -730,13 +758,17 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
         or second.plan.stores != plan.stores
         or first.c_stages != second.c_stages
         or first.iteration.release
-        or not second.iteration.release
+        or first.post_loop
+        or not (second.iteration.release or second.post_loop)
         or first.advance
         or not second.advance
         or first.iteration.pre_wait_aux != second.iteration.pre_wait_aux
         or bool(first.late_acquire) != bool(second.late_acquire)
         or first.iteration.pre_wait_aux
         and not plan.pre_wait_aux_safe
+        or first.body_indent != second.body_indent
+        or bool(first.buffer_prefix) != bool(second.buffer_prefix)
+        or second.pre_loop_wait
     ):
         raise exc.BackendUnsupported("cute", "incomplete shared epilogue lifetime")
     left, right = first.iteration, second.iteration
@@ -767,8 +799,8 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
         + right.register_store
         + first.late_acquire
         + f"        {first.barrier}.arrive_and_wait()\n"
-        + f"        {first.buffer} = ({first.buffer_expr}) % cutlass.Int32({first.c_stages})\n"
-        + f"        {second.buffer} = ({second.buffer_expr}) % cutlass.Int32({second.c_stages})\n"
+        + f"        {first.buffer} = {first.buffer_prefix}({first.buffer_expr}) % cutlass.Int32({first.c_stages})\n"
+        + f"        {second.buffer} = {second.buffer_prefix}({second.buffer_expr}) % cutlass.Int32({second.c_stages})\n"
         + first.r2s
         + second.r2s
         + "        cute.arch.fence_view_async_shared()\n"
@@ -780,8 +812,15 @@ def combine_stores(first: FanoutStore, second: FanoutStore) -> None:
     # Both TMA strings include their shared warp-0 predicate only in `first.tma`.
     loop = (
         f"assert cutlass.const_expr({first.subtile_count} == {second.subtile_count})\n"
-        f"for _tcgen05_subtile in cutlass.range({first.subtile_count}, unroll_full=True):\n"
-        + textwrap.indent(textwrap.dedent(body), "    ")
+        + first.pre_loop
+        + second.pre_loop
+        + first.pre_loop_wait
+        + (
+            first.loop_header
+            or f"for _tcgen05_subtile in cutlass.range({first.subtile_count}, unroll_full=True):\n"
+        )
+        + textwrap.indent(textwrap.dedent(body), "    " + first.body_indent)
+        + second.post_loop
         + second.advance
     )
     source = "\n".join((*first.setup, *second.setup_without_acquire, loop))

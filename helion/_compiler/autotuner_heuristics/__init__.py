@@ -65,6 +65,7 @@ from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_dot_row_reduction import CuteDotRowReductionHeuristic
 from .cute_epilogue_fanout import register_aux_fragment_hoist_coverage
+from .cute_epilogue_fanout import register_epi_warp_groups_coverage
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_fp32_dot import CuteFp32DotHeuristic
 from .cute_fp32_dot import register_fp32_dot_coverage
@@ -577,6 +578,7 @@ def register_compiler_coverage_groups(
     register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
     register_aux_fragment_hoist_coverage(env, device_ir)
+    register_epi_warp_groups_coverage(env, device_ir)
     register_l2_row_swizzle_coverage(env, device_ir)
     register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)

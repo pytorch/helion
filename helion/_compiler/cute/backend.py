@@ -606,6 +606,7 @@ def _specialized_mma_root_threads_support_impl(
     root_n_threads: int,
     root_m_threads_explicit: bool,
     root_n_threads_explicit: bool,
+    epi_warp_groups: int = 1,
 ) -> bool:
     from .cute_mma import _mma_active_n_threads
     from .cute_mma import _tcgen05_root_m_threads
@@ -627,7 +628,9 @@ def _specialized_mma_root_threads_support_impl(
         else:
             m_threads_supported = physical_m_threads <= root_m_threads <= bm
         if root_n_threads_explicit:
-            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(bn)
+            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(
+                bn, epi_warp_groups=epi_warp_groups
+            )
         else:
             n_threads_supported = (
                 _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
@@ -708,6 +711,8 @@ def _detect_grouped_rank3_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
+    from .cute_mma import _tcgen05_epi_warp_groups
+
     if not _specialized_mma_root_threads_support_impl(
         "tcgen05",
         bm=bm,
@@ -716,6 +721,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
         root_n_threads=root_n_threads,
         root_m_threads_explicit=root_m_threads_explicit,
         root_n_threads_explicit=root_n_threads_explicit,
+        epi_warp_groups=_tcgen05_epi_warp_groups(config),
     ):
         return False
 
@@ -749,6 +755,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -895,6 +902,7 @@ def _detect_specialized_mma_loop(
             root_n_threads=root_n_threads,
             root_m_threads_explicit=root_m_threads_explicit,
             root_n_threads_explicit=root_n_threads_explicit,
+            epi_warp_groups=_tcgen05_epi_warp_groups(config),
         ):
             if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
@@ -4692,6 +4700,7 @@ class CuteBackend(Backend):
                     specialized_mma_plan is not None
                     and specialized_mma_plan.impl == "tcgen05"
                 ):
+                    from .cute_mma import _tcgen05_epi_warp_groups
                     from .cute_mma import _tcgen05_root_m_threads
                     from .cute_mma import _tcgen05_root_n_threads
 
@@ -4716,7 +4725,10 @@ class CuteBackend(Backend):
                         else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        _tcgen05_root_n_threads(int(n_block_size))
+                        _tcgen05_root_n_threads(
+                            int(n_block_size),
+                            epi_warp_groups=_tcgen05_epi_warp_groups(config),
+                        )
                         if original_num_threads_config[n_axis] == 0
                         and isinstance(n_block_size, int)
                         else num_threads_config[n_axis]
