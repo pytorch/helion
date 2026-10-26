@@ -4031,6 +4031,80 @@ class TestPallas(TestCase):
             f"dot_general output diverged from pallas_call by {max_abs_diff}",
         )
 
+    def test_pallas_matmul_dot_general_lowering_needs_a_pure_matmul_body(
+        self,
+    ) -> None:
+        """The no-tiling ``lax.dot_general`` shortcut replaces the whole
+        kernel, so it only fires on exactly ``out = x @ y``: a transposed
+        operand (``x.T @ g``) or an epilogue (``relu``) keeps the
+        ``pl.pallas_call`` path and the result stays correct; an argument
+        order that differs from the operand order still takes the shortcut
+        with the operands oriented by the matmul, not by position.
+        """
+        from unittest.mock import patch
+
+        from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as pallas_launcher
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _transposed_lhs(x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([n, n], device=x.device, dtype=x.dtype)
+            for tile_n1, tile_n2 in hl.tile([n, n]):
+                acc = hl.zeros([tile_n1, tile_n2], dtype=torch.float32)
+                for tile_m in hl.tile(m):
+                    acc = torch.addmm(acc, x[tile_m, tile_n1].T, g[tile_m, tile_n2])
+                out[tile_n1, tile_n2] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _relu_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _operands_swapped(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        no_tiling_cfg = Config(block_sizes=[128, 128, 128])
+        cases = [
+            (_transposed_lhs, (x, y), x.float().T @ y.float(), 0),
+            (_relu_epilogue, (x, y), torch.relu(x.float() @ y.float()), 0),
+            (_operands_swapped, (y, x), x.float() @ y.float(), 1),
+        ]
+        for kernel, args, expected, builds in cases:
+            with (
+                self.subTest(kernel=kernel.name),
+                patch.object(
+                    pallas_launcher,
+                    "_build_matmul_dot_general_jit_fn",
+                    wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
+                ) as build_spy,
+            ):
+                result = kernel.bind(args).compile_config(no_tiling_cfg)(*args)
+                self.assertEqual(build_spy.call_count, builds)
+                torch.testing.assert_close(
+                    result.float(), expected, atol=5e-2, rtol=5e-2
+                )
+
     def test_pallas_matmul_dot_general_lowering_pins_default_precision(self) -> None:
         """The no-tiling dot-general shortcut must not inherit JAX global precision."""
         from unittest.mock import patch

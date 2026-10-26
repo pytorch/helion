@@ -1249,9 +1249,12 @@ class PallasBackend(Backend):
 
         Eligible when: 2 input tensors + 1 output-only tensor; all 2D with
         matching M/K/N contiguous layout (BMM not covered yet); the device IR
-        has one ``aten.mm``/``addmm`` family op; and the picked block sizes
-        cover every dim (single launch, no inner K tile).  Returns the spec
-        dict consumed by ``_build_matmul_dot_general_jit_fn``, else ``None``.
+        is exactly ``out = x @ y`` (see ``_pure_matmul_operands``: the two
+        inputs loaded as they are, one ``mm``/``addmm`` over a zero
+        accumulator, the result cast and stored, nothing else); and the
+        picked block sizes cover every dim (single launch, no inner K tile).
+        Returns the spec dict consumed by ``_build_matmul_dot_general_jit_fn``,
+        else ``None``.
         """
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
@@ -1286,19 +1289,8 @@ class PallasBackend(Backend):
         lhs_t = lhs_arg.fake_value
         rhs_t = rhs_arg.fake_value
         out_t = out_arg.fake_value
-        # 2D matmul, matching contraction dim, statically-known shapes.
+        # 2D matmul with statically-known shapes.
         if lhs_t.ndim != 2 or rhs_t.ndim != 2 or out_t.ndim != 2:
-            return None
-        try:
-            m = int(lhs_t.shape[0])
-            k_lhs = int(lhs_t.shape[1])
-            k_rhs = int(rhs_t.shape[0])
-            n = int(rhs_t.shape[1])
-            out_m = int(out_t.shape[0])
-            out_n = int(out_t.shape[1])
-        except (TypeError, ValueError):
-            return None
-        if k_lhs != k_rhs or out_m != m or out_n != n:
             return None
 
         # The device IR must contain an aten.mm/addmm/bmm family op
@@ -1315,15 +1307,29 @@ class PallasBackend(Backend):
         if not matmul_present:
             return None
 
-        # Orient to lhs=(M, K), rhs=(K, N); the user may have written
-        # ``f(y, x) -> x @ y``. For all-equal dims either ordering is the same.
-        if lhs_t.shape == (m, k_lhs) and rhs_t.shape == (k_lhs, n):
-            lhs_arg_pos, rhs_arg_pos = input_positions
-            lhs_resolved, rhs_resolved = lhs_t, rhs_t
-        elif lhs_t.shape == (k_lhs, n) and rhs_t.shape == (m, k_lhs):
-            rhs_arg_pos, lhs_arg_pos = input_positions
-            lhs_resolved, rhs_resolved = rhs_t, lhs_t
-        else:
+        # The body must be exactly ``out = x @ y``; the matmul's own operands
+        # say which input is lhs=(M, K) and which is rhs=(K, N) (the user may
+        # have written ``f(y, x) -> x @ y``).  A transposed or otherwise
+        # transformed operand, an epilogue, or any other work in the body
+        # keeps the ``pl.pallas_call`` path.
+        operands = self._pure_matmul_operands(
+            device_ir,
+            input_names={sorted_args[p].host_str(): p for p in input_positions},
+            out_name=out_arg.host_str(),
+        )
+        if operands is None:
+            return None
+        lhs_arg_pos, rhs_arg_pos = operands
+        lhs_resolved = cast("TensorArg", sorted_args[lhs_arg_pos]).fake_value
+        rhs_resolved = cast("TensorArg", sorted_args[rhs_arg_pos]).fake_value
+        # lhs=(M, K), rhs=(K, N), out=(M, N) with a matching contraction dim.
+        try:
+            m, k_lhs = (int(d) for d in lhs_resolved.shape)
+            k_rhs, n = (int(d) for d in rhs_resolved.shape)
+            out_m, out_n = (int(d) for d in out_t.shape)
+        except (TypeError, ValueError):
+            return None
+        if k_lhs != k_rhs or out_m != m or out_n != n:
             return None
 
         # Every block size must be >= max(M, N, K): a smaller block means a
@@ -1368,6 +1374,223 @@ class PallasBackend(Backend):
             "out_dtype": self.dtype_str(out_t.dtype),
             "f32_accumulator": bool(f32_acc),
         }
+
+    @staticmethod
+    def _pure_matmul_operands(
+        device_ir: object,
+        *,
+        input_names: dict[str, int],
+        out_name: str,
+    ) -> tuple[int, int] | None:
+        """The (lhs, rhs) argument positions when the device IR is exactly
+        ``out = x @ y``, else ``None``.
+
+        Exactly: one root graph plus at most one plain ``for`` loop (the K
+        tile); one ``aten.mm`` / ``aten.addmm`` whose matrix operands are the
+        two inputs loaded as they are (no ``.T``, cast or arithmetic between
+        the load and the matmul); an ``addmm`` accumulator that is a zero
+        ``hl.zeros`` / ``hl.full`` carried through the loop; one store to
+        the output whose value is the matmul result, optionally cast; and no
+        other operation (an epilogue such as ``relu`` keeps the
+        ``pl.pallas_call`` path).  The launcher's ``lax.dot_general(x, y)``
+        replaces the whole kernel, so anything the body does beyond the
+        contraction would be dropped.
+        """
+        import operator
+
+        from ...language._decorators import is_api_func
+        from ..device_ir import ForLoopGraphInfo
+        from ..device_ir import ReductionLoopGraphInfo
+        from ..device_ir import RootGraphInfo
+
+        graphs = getattr(device_ir, "graphs", None)
+        if not isinstance(graphs, list):
+            return None
+        roots = [g for g in graphs if isinstance(g, RootGraphInfo)]
+        loops = [g for g in graphs if isinstance(g, ForLoopGraphInfo)]
+        if len(roots) != 1 or len(loops) > 1 or len(roots) + len(loops) != len(graphs):
+            return None
+        if any(isinstance(g, ReductionLoopGraphInfo) for g in loops):
+            return None
+        graph_by_id = {g.graph_id: g for g in graphs}
+
+        pass_through_api = {"_get_symnode", "_host_tensor", "_phi", "_new_var"}
+        matmul_targets = {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}
+        loads: list[torch.fx.Node] = []
+        stores: list[torch.fx.Node] = []
+        matmuls: list[torch.fx.Node] = []
+        for_loops: list[torch.fx.Node] = []
+        zero_fills: set[torch.fx.Node] = set()
+
+        def api_name(node: torch.fx.Node) -> str | None:
+            if node.op == "call_function" and is_api_func(node.target):
+                return getattr(node.target, "__name__", None)
+            return None
+
+        for graph_info in graphs:
+            for node in graph_info.graph.nodes:
+                if node.op in ("placeholder", "output"):
+                    continue
+                if node.op != "call_function":
+                    return None
+                name = api_name(node)
+                if name in pass_through_api:
+                    continue
+                if name == "load":
+                    loads.append(node)
+                elif name == "store":
+                    stores.append(node)
+                elif name in ("full", "zeros"):
+                    value = node.args[1] if name == "full" else 0
+                    if isinstance(value, (int, float)) and value == 0:
+                        zero_fills.add(node)
+                    else:
+                        return None
+                elif name == "_for_loop":
+                    for_loops.append(node)
+                elif node.target in matmul_targets:
+                    matmuls.append(node)
+                elif node.target in (
+                    torch.ops.aten.sym_size.int,
+                    torch.ops.prims.convert_element_type.default,
+                    operator.getitem,
+                ):
+                    continue
+                else:
+                    return None
+        if len(matmuls) != 1 or len(loads) != 2 or len(stores) != 1:
+            return None
+        if len(for_loops) != len(loops):
+            return None
+
+        def host_tensor_name(node: object) -> str | None:
+            if isinstance(node, torch.fx.Node) and api_name(node) == "_host_tensor":
+                debug_name = node.args[0]
+                return debug_name if isinstance(debug_name, str) else None
+            return None
+
+        def plain_load_of(node: object) -> str | None:
+            """The loaded host tensor's name when ``node`` is a plain,
+            unmasked ``hl.load`` indexed by tiles and full slices."""
+            if not (isinstance(node, torch.fx.Node) and api_name(node) == "load"):
+                return None
+            if any(arg is not None for arg in node.args[2:]) or node.kwargs:
+                return None
+            indices = node.args[1]
+            if not isinstance(indices, (list, tuple)):
+                return None
+            for index in indices:
+                if isinstance(index, slice):
+                    if index != slice(None, None, None):
+                        return None
+                elif not (
+                    isinstance(index, torch.fx.Node)
+                    and (
+                        api_name(index) == "_get_symnode"
+                        or index.target is torch.ops.aten.sym_size.int
+                    )
+                ):
+                    return None
+            return host_tensor_name(node.args[0])
+
+        def loop_input(node: torch.fx.Node) -> object:
+            """The root-graph value a loop placeholder is bound to."""
+            graph_info = next(
+                (g for g in loops if node.graph is g.graph),
+                None,
+            )
+            if graph_info is None:
+                return None
+            for_loop = next(
+                (n for n in for_loops if n.args[0] == graph_info.graph_id), None
+            )
+            if for_loop is None or not isinstance(for_loop.args[3], (list, tuple)):
+                return None
+            placeholders = [n for n in graph_info.graph.nodes if n.op == "placeholder"]
+            if node not in placeholders:
+                return None
+            index = placeholders.index(node)
+            inputs = for_loop.args[3]
+            return inputs[index] if index < len(inputs) else None
+
+        def is_zero_accumulator(node: object) -> bool:
+            seen = 0
+            while isinstance(node, torch.fx.Node) and seen < 8:
+                seen += 1
+                if node in zero_fills:
+                    return True
+                name = api_name(node)
+                if name == "_new_var":
+                    node = node.args[0]
+                elif node.op == "placeholder":
+                    node = loop_input(node)
+                else:
+                    return False
+            return False
+
+        (matmul,) = matmuls
+        if matmul.target is torch.ops.aten.addmm.default:
+            if len(matmul.args) != 3 or any(
+                matmul.kwargs.get(key, 1) != 1 for key in ("alpha", "beta")
+            ):
+                return None
+            acc, lhs, rhs = matmul.args
+            if not is_zero_accumulator(acc):
+                return None
+        else:
+            if len(matmul.args) != 2 or matmul.kwargs:
+                return None
+            lhs, rhs = matmul.args
+        lhs_name = plain_load_of(lhs)
+        rhs_name = plain_load_of(rhs)
+        if (
+            lhs_name is None
+            or rhs_name is None
+            or lhs_name == rhs_name
+            or lhs_name not in input_names
+            or rhs_name not in input_names
+        ):
+            return None
+
+        # The store writes the matmul result (through the loop's carried
+        # value and an optional cast) to the output, and nothing else.
+        (store,) = stores
+        if host_tensor_name(store.args[0]) != out_name or len(store.args) < 3:
+            return None
+        if any(arg is not None for arg in store.args[3:]) or store.kwargs:
+            return None
+        value: object = store.args[2]
+        seen = 0
+        while isinstance(value, torch.fx.Node) and value is not matmul and seen < 16:
+            seen += 1
+            name = api_name(value)
+            if value.target is torch.ops.prims.convert_element_type.default:
+                value = value.args[0]
+            elif name == "_phi":
+                value = value.args[1]
+            elif name == "_new_var":
+                value = value.args[0]
+            elif value.target is operator.getitem:
+                for_loop, index = value.args
+                if not (
+                    isinstance(for_loop, torch.fx.Node)
+                    and api_name(for_loop) == "_for_loop"
+                    and isinstance(index, int)
+                ):
+                    return None
+                graph_info = graph_by_id.get(for_loop.args[0])  # type: ignore[arg-type]
+                if graph_info is None:
+                    return None
+                output = next(n for n in graph_info.graph.nodes if n.op == "output")
+                outputs = output.args[0]
+                if not isinstance(outputs, (list, tuple)) or index >= len(outputs):
+                    return None
+                value = outputs[index]
+            else:
+                return None
+        if value is not matmul:
+            return None
+        return input_names[lhs_name], input_names[rhs_name]
 
     def build_launcher_args(
         self,

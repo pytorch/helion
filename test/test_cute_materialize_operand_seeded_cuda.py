@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from examples.se_block import se_block_bwd_dw
-from examples.se_block import se_block_bwd_dx
 import pytest
 import torch
+
+from test._se_block_derived_operand_kernels import se_block_bwd_dw
+from test._se_block_derived_operand_kernels import se_block_bwd_dx
 
 import helion
 from helion._testing import DEVICE
