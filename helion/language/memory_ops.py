@@ -3442,10 +3442,16 @@ def _codegen_cute_store_tcgen05_tile(
             and aux_pipeline_plan_obj.use_tma_load
         )
     )
+    # ``tcgen05_aux_load_mode="epi_tma"``: the same per-subtile SMEM rings,
+    # filled by the epilogue warps themselves (``_epi_tma_aux_tile_lines`` /
+    # ``_epi_tma_aux_refill_source`` below) instead of a producer warp.
+    aux_epilogue_issued = (
+        aux_pipeline_plan_obj is not None and aux_pipeline_plan_obj.epilogue_issued
+    )
     use_aux_smem_source = (
         aux_step_records
         and aux_matmul_plan is not None
-        and aux_producer_warp_present
+        and (aux_producer_warp_present or aux_epilogue_issued)
         and bool(aux_matmul_plan.c_input_aux_tensor_descriptors)
         and aux_pipeline_plan_obj is not None
         and aux_has_staged_steps
@@ -3478,6 +3484,132 @@ def _codegen_cute_store_tcgen05_tile(
         aux_consumer_state_name = ""
         aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
+    # Epilogue-issued aux TMA (``epi_tma``): per-ring names of the tile's TMA
+    # partitions, allocated once so the per-tile setup and the per-subtile
+    # refill agree, and the prefetch depth (the ring depth).
+    epi_tma_rings: list[tuple[str, str, str, str, str, str]] = []
+    epi_tma_barrier_var = ""
+    if use_aux_smem_source and aux_epilogue_issued:
+        assert aux_pipeline_plan_obj is not None
+        assert aux_pipeline_plan_obj.use_tma_load
+        assert tcgen05_value.use_tma_store_epilogue, (
+            "epi_tma aux staging renders only on the TMA-store epilogue"
+        )
+        epi_tma_barrier_var = df.new_var("tcgen05_aux_tma_barrier")
+        for ring_idx, ring in enumerate(aux_pipeline_plan_obj.rings):
+            assert ring.tma_atom is not None and ring.tma_tensor is not None
+            epi_tma_rings.append(
+                (
+                    ring.tma_atom,
+                    ring.tma_tensor,
+                    ring.smem,
+                    df.new_var(f"tcgen05_aux_gmem_tile_{ring_idx}"),
+                    df.new_var(f"tcgen05_aux_tma_smem_part_{ring_idx}"),
+                    df.new_var(f"tcgen05_aux_tma_gmem_part_{ring_idx}"),
+                )
+            )
+
+    def _epi_tma_aux_issue_lines(indent: str, subtile_expr: str) -> list[str]:
+        """Warp 0 acquires one ring stage, issues every ring's bulk load of
+        ``subtile_expr`` into it and advances the producer state. Runs under
+        an outer ``if warp_idx == 0`` the caller emits."""
+        assert aux_pipeline_plan_obj is not None
+        producer_state = aux_pipeline_plan_obj.producer_state
+        lines = [
+            f"{indent}{aux_pipeline_name}.producer_acquire({producer_state})\n",
+            (
+                f"{indent}{epi_tma_barrier_var} = "
+                f"{aux_pipeline_name}.producer_get_barrier({producer_state})\n"
+            ),
+        ]
+        for tma_atom, _tma_tensor, _smem, _gtile, smem_part, gmem_part in epi_tma_rings:
+            lines.append(
+                f"{indent}cute.copy({tma_atom}, "
+                f"{gmem_part}[None, {subtile_expr}], "
+                f"{smem_part}[None, {producer_state}.index], "
+                f"tma_bar_ptr={epi_tma_barrier_var})\n"
+            )
+        lines.append(emit_pipeline_advance(producer_state, indent=indent) + "\n")
+        return lines
+
+    def _epi_tma_aux_tile_lines() -> list[str]:
+        """Per-output-tile setup of the epilogue-issued aux rings.
+
+        Partitions each staged operand's per-CTA ``(bm_per_cta, bn)`` tile
+        into ``epi_tile`` subtiles against its TMA atom and SMEM ring (the
+        same flat subtile axis the consumer indexes), then warp 0 issues the
+        first ``stage_count`` subtiles' loads. Emitted before the
+        accumulator wait, so the loads land under the tile's MMA; the
+        remaining subtiles are refilled one subtile ahead of their read by
+        ``_epi_tma_aux_refill_source``. A CTA pair's epilogue owns the
+        per-CTA half of the pair tile's rows (``peer_m`` of the cluster).
+        """
+        if not epi_tma_rings:
+            return []
+        assert aux_pipeline_plan_obj is not None
+        assert aux_matmul_plan is not None
+        cluster_m = aux_matmul_plan.cluster_m
+        if tcgen05_lifecycle.is_two_cta:
+            bm_per_cta = tcgen05_aux_bm // cluster_m
+            peer_m = (
+                "(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+                f"% cutlass.Int32({cluster_m}))"
+            )
+            aux_tile_m = f"({tile_coord_m}) * cutlass.Int32({cluster_m}) + {peer_m}"
+        else:
+            bm_per_cta = tcgen05_aux_bm
+            aux_tile_m = tile_coord_m
+        epi_tile_var = aux_pipeline_plan_obj.epi_tile_var
+        lines: list[str] = []
+        for tma_atom, tma_tensor, smem, gtile, smem_part, gmem_part in epi_tma_rings:
+            gsub = f"{gtile}_subtiles"
+            lines.extend(
+                [
+                    (
+                        f"{gtile} = cute.local_tile({tma_tensor}, "
+                        f"({bm_per_cta}, {tcgen05_aux_bn}), "
+                        f"({aux_tile_m}, {tile_coord_n}))"
+                    ),
+                    f"{gsub} = cute.flat_divide({gtile}, {epi_tile_var})",
+                    f"{gsub} = cute.group_modes({gsub}, 2, cute.rank({gsub}))",
+                    (
+                        f"{smem_part}, {gmem_part} = cute.nvgpu.cpasync.tma_partition("
+                        f"{tma_atom}, 0, cute.make_layout(1), "
+                        f"cute.group_modes({smem}, 0, cute.rank({smem}) - 1), "
+                        f"cute.group_modes({gsub}, 0, cute.rank({gsub}) - 1))"
+                    ),
+                ]
+            )
+        stage_count = aux_pipeline_plan_obj.stage_count
+        issue = "".join(
+            _epi_tma_aux_issue_lines("        ", "cutlass.Int32(_tcgen05_aux_prefetch)")
+        )
+        lines.append(
+            f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"    for _tcgen05_aux_prefetch in cutlass.range("
+            f"min({stage_count}, {subtile_count}), unroll_full=True):\n"
+            f"{issue}"
+        )
+        return lines
+
+    def _epi_tma_aux_refill_source(indent: str) -> str:
+        """Refill the stage the subtile just released with the subtile
+        ``stage_count`` ahead (nothing past the tile's last subtile)."""
+        if not epi_tma_rings:
+            return ""
+        assert aux_pipeline_plan_obj is not None
+        stage_count = aux_pipeline_plan_obj.stage_count
+        issue = "".join(
+            _epi_tma_aux_issue_lines(
+                indent + "        ",
+                f"cutlass.Int32(_tcgen05_subtile + {stage_count})",
+            )
+        )
+        return (
+            f"{indent}if _tcgen05_subtile + {stage_count} < {subtile_count}:\n"
+            f"{indent}    if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
+            f"{issue}"
+        )
 
     # Row-vector aux (``bias[n]`` / rowwise ``scale_b[n]``) reads stay
     # per-subtile (the generic ``ttr_aux_subtile.load()`` path below, placed
@@ -4301,6 +4433,8 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
+            if aux_epilogue_issued:
+                lines.append(_epi_tma_aux_refill_source(prelude_indent))
         # Broadcast auxiliaries are partitioned against the same accumulator
         # carrier, so their fragments share an index domain, coordinates, and
         # validity predicate. Load all of them in one scalar edge loop instead
@@ -7099,6 +7233,9 @@ def _codegen_cute_store_tcgen05_tile(
             ),
             f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
             f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
+            # Epilogue-issued aux TMA: partition the tile's staged operands and
+            # prefetch the first ring stages ahead of the accumulator wait.
+            *_epi_tma_aux_tile_lines(),
             *tma_store_pre_loop_acc_wait,
         ]
 

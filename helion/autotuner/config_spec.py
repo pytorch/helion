@@ -2369,6 +2369,14 @@ class ConfigSpec:
     def cute_tcgen05_matmul_operands_tma_provable(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_operands_tma_provable = value
 
+    @property
+    def cute_tcgen05_exact_aux_tma_provable(self) -> bool:
+        return self._cute_tcgen05_config.exact_aux_tma_provable
+
+    @cute_tcgen05_exact_aux_tma_provable.setter
+    def cute_tcgen05_exact_aux_tma_provable(self, value: bool) -> None:
+        self._cute_tcgen05_config.exact_aux_tma_provable = value
+
     def _cute_flash_autotune_fragments(
         self,
         topology_override: str | None = None,
