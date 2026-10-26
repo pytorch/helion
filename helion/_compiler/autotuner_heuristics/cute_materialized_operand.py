@@ -209,15 +209,16 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
             pid_type != "flat" for pid_type in spec.allowed_pid_types
         ):
             # A flat producer grid launches one CTA per tile; the persistent
-            # grid above serializes tiles once there are more of them than SMs.
-            # (When every launch is flat already the knob is inert and off the
-            # surface.)
-            configs.extend(
-                [
-                    Config.from_dict(
-                        config.config | {"cute_pointwise_pid_type": "flat"}
-                    )
-                    for config in configs
-                ]
-            )
+            # grid above serializes tiles once there are more of them than SMs
+            # (a 128-thread CTA per SM cannot cover DRAM latency, and the
+            # dependent GEMM's wait stretches with it), so the flat twins go
+            # first: the search population keeps the first seeds in list order,
+            # and a persistent twin that fits is one knob away from its flat
+            # twin either way. (When every launch is flat already the knob is
+            # inert and off the surface.)
+            flat = [
+                Config.from_dict(config.config | {"cute_pointwise_pid_type": "flat"})
+                for config in configs
+            ]
+            configs = [*flat, *configs]
         return dedupe_configs(configs)

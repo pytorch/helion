@@ -387,11 +387,16 @@ TCGEN05_REGION_PID_TYPE_CHOICES: tuple[str, ...] = (
     "persistent_interleaved",
 )
 # The recipe a persistent GEMM launch of a chain runs under, projected onto
-# its launch config by ``materialized_fission_codegen._stage_config`` (the
-# standalone paired pipeline's fixed coordinates, ``_paired_pipeline_parameters``).
+# its launch config by ``CuteTcgen05Config.region_launch_config`` (the
+# standalone paired pipeline's fixed coordinates, ``_paired_pipeline_parameters``;
+# ``materialized_fission_codegen._stage_config`` renders exactly that config).
 # The chain's whole-kernel config keeps the flat recipe of its ``inherit``
 # launches (a scheduler warp, a one-slot accumulator ring, direct stores ...),
-# which these launches do not see.
+# which these launches do not see.  The auxiliary load mode is not projected:
+# the chain's whole-kernel config carries the launch's register (``simt``) or
+# epilogue-issued (``epi_tma``) aux reads, judged per launch by the
+# normalizer, and a launch without an exact-shape auxiliary operand takes
+# the register reads whatever the kernel's knob says.
 TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION: tuple[tuple[str, object], ...] = (
     ("tcgen05_persistence_model", "static_persistent"),
     ("tcgen05_strategy", "role_local_monolithic"),
@@ -405,7 +410,6 @@ TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION: tuple[tuple[str, object], ...] = (
     ("tcgen05_num_epi_warps", 4),
     ("tcgen05_acc_stages", 2),
     ("tcgen05_c_store_mode", "normal"),
-    ("tcgen05_aux_load_mode", "simt"),
     ("tcgen05_acc_wait_placement", "subtile_loop"),
     ("tcgen05_epilogue_layout", "normal"),
     ("tcgen05_tvm_ffi_launch", False),
