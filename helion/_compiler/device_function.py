@@ -1324,6 +1324,18 @@ class DeviceFunction:
                 dependent_launch = [
                     statement_from_string("cute.arch.griddepcontrol_wait()")
                 ]
+        if self._cute_early_release_applies():
+            # Release the programmatic dependents at entry (``cute_early_release``),
+            # after this kernel's own wait when it is a dependent itself: a
+            # release ahead of the wait would let them start while this
+            # kernel's predecessors still write.  Their wait still covers this
+            # kernel's completion; only their launch and prologue move earlier.
+            with SyntheticLocation():
+                dependent_launch.append(
+                    statement_from_string(
+                        "cute.arch.griddepcontrol_launch_dependents()"
+                    )
+                )
         env = CompileEnvironment.current()
         if (
             self.triton_persistent_state_specs
@@ -2390,6 +2402,40 @@ class DeviceFunction:
                     property_hint,
                 )
         return result
+
+    def _cute_early_release_applies(self) -> bool:
+        """Whether ``cute_early_release`` adds an entry release to this kernel.
+
+        Only plain SIMT kernels without a release of their own take it: a
+        kernel with a native wrapper plan (the tcgen05, register-MMA, flash
+        and recurrence families place their own waits and releases, or
+        launch with ``use_pdl``), a body that already waits on or releases
+        its dependents, and the materialized-fission producer (which gets
+        its entry release from ``generate_stage``; ``_stage_config`` keeps
+        this knob and ``cute_pdl`` away from it) generate exactly the
+        knob-off code.  ``griddepcontrol`` needs sm_90.  The release is
+        appended after ``cute_pdl``'s wait when that applies, never ahead
+        of it.
+        """
+        env = CompileEnvironment.current()
+        if (
+            env.backend.name != "cute"
+            or self.config.config.get("cute_early_release") is not True
+        ):
+            return False
+        capability = env.config_spec.target_device_capability
+        if capability is None or capability < (9, 0):
+            return False
+        if self.cute_state.cute_pdl_entry_wait or self.codegen.cute_wrapper_plans:
+            return False
+        return not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in ("griddepcontrol_wait", "griddepcontrol_launch_dependents")
+            for stmt in [*self.preamble, *self.body]
+            for node in ast.walk(stmt)
+        )
 
     def _cute_pdl_applies(self) -> bool:
         """Whether ``cute_pdl`` shapes this kernel.

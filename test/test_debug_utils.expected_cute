@@ -54,7 +54,7 @@ import helion.language as hl
 import torch
 from torch._dynamo.testing import rand_strided
 
-@helion.kernel(config=helion.Config(block_sizes=[32], cute_pdl=False, cute_store_policy='default'), static_shapes=True, backend='cute', cute_region_fission=False, cute_full_slice_matmul_tiling=False, cute_segmented_matmul_tiling=False, cute_flatten_nested_reductions=False, cute_materialize_transformed_operands=False, cute_graph_cse=True, cute_rng_stream='auto')
+@helion.kernel(config=helion.Config(block_sizes=[32], cute_early_release=False, cute_pdl=False, cute_store_policy='default'), static_shapes=True, backend='cute', cute_region_fission=False, cute_full_slice_matmul_tiling=False, cute_segmented_matmul_tiling=False, cute_flatten_nested_reductions=False, cute_materialize_transformed_operands=False, cute_graph_cse=True, cute_rng_stream='auto')
 def kernel_with_compile_error(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     n = x.shape[0]

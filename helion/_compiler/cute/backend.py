@@ -2187,6 +2187,7 @@ class CuteBackend(Backend):
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_early_release"
             or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key

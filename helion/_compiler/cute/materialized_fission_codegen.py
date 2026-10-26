@@ -154,8 +154,12 @@ def _stage_config(
     # producer) has to stay an ordinary launch.  Launched as a programmatic
     # dependent itself it would start, and release the consumer, while the
     # kernels ahead of it still run, and the consumer's TMA role loads the
-    # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it.
-    drop_pdl = releases_dependents_at_entry and config.get("cute_pdl") is True
+    # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it,
+    # and neither does ``cute_early_release``: the stage gets its one release
+    # from ``generate_stage``.
+    drop_pdl = releases_dependents_at_entry and (
+        config.get("cute_pdl") is True or config.get("cute_early_release") is True
+    )
     region_pid_types = config.get(TCGEN05_REGION_PID_TYPES_CONFIG_KEY)
     # The exact-shape auxiliary mechanisms are projected per GEMM launch of a
     # materialized chain (``region_launch_config``: inert on a launch without
@@ -187,7 +191,8 @@ def _stage_config(
         return config
     result = copy.deepcopy(config)
     if drop_pdl:
-        result.config.pop("cute_pdl")
+        result.config.pop("cute_pdl", None)
+        result.config.pop("cute_early_release", None)
     if region_pid_types is not None:
         # An ordered barrier chain: normalization admitted the knob only with
         # the complete two-CTA region schedule.  A persistent GEMM launch runs

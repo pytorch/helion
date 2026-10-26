@@ -77,6 +77,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_early_release: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
@@ -170,6 +171,23 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_early_release: Release this kernel's programmatic dependents
+                (``griddepcontrol.launch_dependents``) at the top of the body,
+                directly after its own wait when ``cute_pdl`` applies (never
+                ahead of it), so a successor launched with ``cute_pdl`` runs
+                its launch and prologue under this kernel's execution instead
+                of its tail; the successor's wait still covers this kernel's
+                completion. Off by default: the per-kernel autotuner times
+                the kernel alone, where a release without dependents is a
+                no-op, and in a chain the sign depends on the dependent
+                (measured -1.1 us on a 2048-CTA producer ahead of a tcgen05
+                GEMM, +1..2 timer ticks on an 8192-CTA pointwise kernel
+                ahead of another SIMT kernel), so it is a pinnable choice
+                searched on sm_90+ rather than a default. Only CuTe SIMT
+                kernels on sm_90+ without a release of their own emit it
+                (native pipeline plans, bodies with their own
+                ``griddepcontrol`` calls and the materialized-fission
+                producer generate exactly the knob-off code).
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
@@ -270,6 +288,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_early_release": cute_early_release,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,

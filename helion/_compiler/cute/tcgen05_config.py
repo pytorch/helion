@@ -4534,7 +4534,13 @@ class CuteTcgen05Config:
         return seeds
 
     def _pdl_searched(self) -> bool:
-        """Whether ``cute_pdl`` is on this kernel's tcgen05 search surface."""
+        """Whether this kernel's tcgen05 surface launches as a dependent by default.
+
+        sm_90+ targets with the knob (``griddepcontrol`` exists there): the
+        fragment defaults to True and the search keeps it there
+        (``optional_fragments``).  Fission bundles are excluded: their stages
+        carry the materialized-operand protocol.
+        """
         capability = self.config_spec.target_device_capability
         return (
             self.config_spec.supports_config_key("cute_pdl")
@@ -9311,11 +9317,28 @@ class CuteTcgen05Config:
             # tcgen05 search surface owns the knob here: every other CuTe
             # kernel keeps the generic ``cute_pdl`` boolean of its own
             # branch (``ConfigSpec._flat_fields``), untouched.
+            #
+            # On sm_90+ the knob defaults to True and the search does not
+            # flip it.  A tcgen05 kernel releases its dependents only after
+            # its MMA warp's last MMA, when every CTA of the grid is resident,
+            # and waits late (the TMA-load warp ahead of its first load, the
+            # epilogue warps ahead of their first global read), so the knob
+            # costs nothing in isolation and gains the dependent's prologue
+            # and operand prefetch (measured 0.8-0.9 us per tcgen05 edge of
+            # the squeeze_and_excitation_net backward chain, 47.07 -> 45.02 us
+            # on its one-call graph).  The autotuner cannot rank it: its
+            # per-call-flushed regime times ``[L2 flush memset; kernel]``
+            # graphs, where a memset predecessor gives the kernel a full
+            # dependency whatever its launch attribute says, so the two values
+            # read alike and the final pick was a coin flip (campaign winners
+            # carried True 5x, False 7x).  A knob the search cannot see and
+            # whose chain effect is one-signed is a default, not a sample.
+            # Both values stay valid: a pinned ``cute_pdl=False`` (older
+            # records) still generates the knob-off code.
+            pdl_searched = self._pdl_searched()
             fragments["cute_pdl"] = EnumFragment(
-                (False, True),
-                search_choices=(False, True)
-                if not for_search or self._pdl_searched()
-                else (False,),
+                (True, False) if pdl_searched else (False, True),
+                search_choices=(True,) if pdl_searched else (False,),
             )
         if not for_search or self.warp_mma_admitted:
             # Validation accepts both spellings (normalization refuses the

@@ -52,6 +52,7 @@ _COLUMN = {
     "cute_lane_unroll": 8,
 }
 _WAIT = "cute.arch.griddepcontrol_wait()"
+_RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 _ATTRIBUTE = "._helion_cute_use_pdl = True"
 _PRODUCER_GRID = 128
 _BLOCK = 1024
@@ -294,3 +295,82 @@ class TestCutePdl(TestCase):
         self.assertGreater(stale_runs(middle_is_dependent=True, release_first=True), 0)
         # A dependent launch that waits before it releases is safe.
         self.assertEqual(stale_runs(middle_is_dependent=True, release_first=False), 0)
+
+
+@onlyBackends(["cute"])
+class TestCuteEarlyRelease(TestCase):
+    def test_a_producer_that_releases_at_entry_ahead_of_dependent_gemms(
+        self,
+    ) -> None:
+        # ``cute_early_release`` on the se_block backward's shared-operand
+        # producer, followed by the two GEMMs launched as programmatic
+        # dependents (``cute_pdl``): their waits still cover the producer's
+        # completion, so the gradients match the knob-off chain bit for bit,
+        # in the stream and inside a CUDA graph (where the launch attributes
+        # become programmatic edges).
+        if torch.cuda.get_device_capability() < (9, 0):
+            self.skipTest("griddepcontrol needs sm_90")
+        from examples.se_block import se_block_bwd_dw
+        from examples.se_block import se_block_bwd_dx
+        from examples.se_block import se_block_bwd_grad_to_w
+
+        m, n = 1024, 512
+        generator = torch.Generator(device=DEVICE).manual_seed(7)
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16, generator=generator)
+        w = torch.randn(n, n, device=DEVICE, dtype=torch.float16, generator=generator)
+        grad_out = torch.randn(
+            m, n, device=DEVICE, dtype=torch.float16, generator=generator
+        )
+        s = torch.sigmoid(x @ w)
+
+        def pinned(kernel: helion.Kernel, args: tuple, **knobs: object) -> tuple:
+            bound = helion.kernel(
+                kernel.fn, backend="cute", static_shapes=True, autotune_effort="none"
+            )._bind_isolated(args)
+            spec = bound.config_spec
+            config = spec.normalized_config(
+                helion.Config.from_dict(spec.default_config().config | knobs)
+            )
+            return bound.compile_config(config), bound.to_code(config)
+
+        g = torch.empty_like(x)
+        producer_off, off_code = pinned(se_block_bwd_grad_to_w, (grad_out, x, s))
+        producer_on, on_code = pinned(
+            se_block_bwd_grad_to_w, (grad_out, x, s), cute_early_release=True
+        )
+        self.assertNotIn(_RELEASE, off_code)
+        self.assertEqual(on_code.count(_RELEASE), 1)
+        self.assertNotIn(_WAIT, on_code)
+        dx, dx_code = pinned(se_block_bwd_dx, (grad_out, g, w, s), cute_pdl=True)
+        dw, dw_code = pinned(se_block_bwd_dw, (x, g), cute_pdl=True)
+        # Both GEMMs launch as dependents and wait before they read ``g``.
+        for code in (dx_code, dw_code):
+            self.assertTrue(_WAIT in code or "'use_pdl': True" in code, code[:400])
+
+        def chain(producer: Callable[..., torch.Tensor]) -> tuple[torch.Tensor, ...]:
+            g = producer(grad_out, x, s)
+            return g, dx(grad_out, g, w, s), dw(x, g)
+
+        expected = chain(producer_off)
+        torch.cuda.synchronize()
+        reference_g = (
+            2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())
+        ).to(torch.float16)
+        self.assertTrue(torch.equal(expected[0], reference_g))
+        torch.testing.assert_close(
+            expected[1],
+            (2.0 * grad_out.float() * s.float() + reference_g.float() @ w.float().T).to(
+                torch.float16
+            ),
+            rtol=1e-2,
+            atol=1e-1,
+        )
+        for _ in range(20):
+            actual = chain(producer_on)
+            torch.cuda.synchronize()
+            for lhs, rhs in zip(actual, expected, strict=True):
+                self.assertTrue(torch.equal(lhs, rhs))
+        replay = _make_cudagraph_replay(lambda: chain(producer_on))
+        for _ in range(10):
+            for lhs, rhs in zip(replay(), expected, strict=True):
+                self.assertTrue(torch.equal(lhs, rhs))

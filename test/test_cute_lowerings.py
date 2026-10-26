@@ -10776,6 +10776,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # generic ``cute_pdl`` (default True on sm_90+) would add an entry wait.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -10846,6 +10849,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # generic ``cute_pdl`` (default True on sm_90+) would add an entry wait.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)

@@ -1088,6 +1088,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_simt_mma",
         "cute_simt_mma_layout",
         "cute_pdl",
+        "cute_early_release",
         "cute_min_blocks_per_mp",
         "cute_tiles_per_block",
         "epilogue_subtile",
@@ -1244,6 +1245,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_early_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1399,6 +1401,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_early_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1578,6 +1581,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_early_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -6028,6 +6032,17 @@ class ConfigSpec:
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
 
+    def _normalize_cute_early_release(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_early_release`` is a boolean (release the dependents at entry)."""
+        if "cute_early_release" not in config:
+            return
+        if type(config["cute_early_release"]) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig("cute_early_release must be a boolean")
+            config.pop("cute_early_release")
+
     def _normalize_cute_tiles_per_block(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -6836,6 +6851,7 @@ class ConfigSpec:
             )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_early_release(config, fix_invalid=_fix_invalid)
             self._normalize_cute_tiles_per_block(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
@@ -9011,6 +9027,17 @@ class ConfigSpec:
                         and self.target_device_capability >= (9, 0)
                     )
                     fields["cute_pdl"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if pdl_searched else (False,),
+                    )
+                    # The SIMT kernels of this branch place no release of
+                    # their own; ``cute_early_release`` releases the
+                    # dependents at entry (after the wait above when both
+                    # apply).  Its effect exists only in a chain, which the
+                    # per-kernel search cannot time, and its sign depends on
+                    # the dependent, so it stays off by default and is a
+                    # searchable choice where ``griddepcontrol`` exists.
+                    fields["cute_early_release"] = EnumFragment(
                         (False, True),
                         search_choices=(False, True) if pdl_searched else (False,),
                     )

@@ -11,6 +11,7 @@ MMA warp has issued its last MMA.
 from __future__ import annotations
 
 import ast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -80,14 +81,36 @@ def _persistent_config(**overrides: object) -> helion.Config:
     return helion.Config(**values)
 
 
-def test_knob_is_searched_on_sm100_matmul_kernels() -> None:
+def test_knob_defaults_on_and_stays_on_for_sm90_plus_matmul_kernels() -> None:
+    # The autotuner's per-call-flushed regime cannot rank the knob (a memset
+    # predecessor gives every kernel a full dependency), and a tcgen05 kernel
+    # only gains from it in a chain: the fragment defaults to True, the
+    # search keeps it there, and both values stay valid for pinned configs.
     bound = _bind_gemm((1024, 1024, 1024), torch.float16)
     with bound.env:
         spec = bound.config_spec
         fields = spec.flat_config(lambda x: x.default()).config
-        assert fields["cute_pdl"] is False
+        assert fields["cute_pdl"] is True
         fragment = spec._cute_tcgen05_config.flat_fields()["cute_pdl"]
-    assert tuple(fragment.choices) == (False, True)  # pyrefly: ignore[missing-attribute]
+        assert spec.default_config().config["cute_pdl"] is True
+        pinned_off = spec.normalized_config(_flat_config(cute_pdl=False))
+    assert tuple(fragment.choices) == (True, False)  # pyrefly: ignore[missing-attribute]
+    assert fragment.search_choices == (True,)  # pyrefly: ignore[missing-attribute]
+    assert pinned_off.config["cute_pdl"] is False
+
+
+def test_pre_hopper_targets_keep_the_knob_off() -> None:
+    # ``griddepcontrol`` needs sm_90: below it the default stays False and
+    # the search offers only the off value.
+    bound = _bind_gemm((1024, 1024, 1024), torch.float16)
+    with bound.env, patch.object(bound.config_spec, "target_device_capability", (8, 0)):
+        spec = bound.config_spec
+        state = spec._cute_tcgen05_config
+        assert not state._pdl_searched()
+        fragment = state.flat_fields()["cute_pdl"]
+        assert tuple(fragment.choices) == (False, True)  # pyrefly: ignore[missing-attribute]
+        assert fragment.search_choices == (False,)  # pyrefly: ignore[missing-attribute]
+        assert spec.default_config().config["cute_pdl"] is False
 
 
 def test_seeds_are_not_doubled_and_normalization_carries_the_knob() -> None:
@@ -102,7 +125,7 @@ def test_seeds_are_not_doubled_and_normalization_carries_the_knob() -> None:
         normalized = spec.normalized_config(
             _persistent_config(loop_orders=[[0, 1]], l2_groupings=[1])
         )
-        assert normalized.config["cute_pdl"] is False
+        assert normalized.config["cute_pdl"] is True
         generation = spec.create_config_generation()
         roundtrip = generation.unflatten(generation.flatten(normalized))
     # (``cute_min_blocks_per_mp`` is the launch-bounds heuristic's field; this
@@ -113,7 +136,7 @@ def test_seeds_are_not_doubled_and_normalization_carries_the_knob() -> None:
 
 def test_flat_kernel_waits_before_the_first_load_and_releases_after_the_mma() -> None:
     bound = _bind_gemm((256, 256, 256), torch.float16)
-    plain = _source(bound, _flat_config())
+    plain = _source(bound, _flat_config(cute_pdl=False))
     assert "griddepcontrol" not in plain
     assert "'use_pdl': True" not in plain
     source = _source(bound, _flat_config(cute_pdl=True))
@@ -162,7 +185,7 @@ def test_persistent_kernel_waits_in_the_tma_and_epilogue_roles() -> None:
     _assert_no_entry_wait(body)
     # The release follows the MMA role's tile loop, in the teardown.
     assert body.index(RELEASE) > body.index("tcgen05_role_local_2_tile_sched")
-    plain = _kernel_body(_source(bound, _persistent_config()))
+    plain = _kernel_body(_source(bound, _persistent_config(cute_pdl=False)))
     assert "griddepcontrol" not in plain
 
 
@@ -198,6 +221,7 @@ def test_two_cta_kernels_add_the_launch_attribute_and_the_epilogue_wait() -> Non
         tcgen05_ab_stages=4,
         tcgen05_cta_group="two",
         tcgen05_cluster_m=2,
+        cute_pdl=False,
     )
     with bound.env:
         normalized = bound.config_spec.normalized_config(config)
