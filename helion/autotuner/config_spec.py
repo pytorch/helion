@@ -1999,6 +1999,12 @@ class ConfigSpec:
         # flash detector fires (see ``lower_to_device_ir``). The shape needed to
         # build the fragments (head_dim / num_kv) is captured at the same time.
         self.cute_flash_search_enabled: bool = False
+        # Knobs whose value picks a distinct kernel body (a pipeline family).
+        # The full-effort final selection keeps the best shortlisted config
+        # of every such family in contention for its steady windows
+        # (``FinalSelectionConfig.family_finalists``); a surface that offers
+        # several bodies names its family knobs when it is enabled.
+        self.final_selection_family_keys: tuple[str, ...] = ()
         # Gated (softmax-free) attention surface: pins the 128x128 tile shape
         # and exposes only the K/V TMA ring depth. See ``cute_flash_gated``.
         self.cute_flash_gated_search_enabled: bool = False
@@ -3004,6 +3010,11 @@ class ConfigSpec:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        # The pipeline family picks the flash body (the alternating-warpgroup
+        # single tile vs the two-tile pair, the 2-CTA cluster, ...; the Q
+        # tiles per CTA follow from it); the bodies' energy per call differs,
+        # so the sustained clock of the final selection's windows does too.
+        self.final_selection_family_keys = (FLASH_PIPELINE_FAMILY_KEY,)
         self._cute_flash_device_sm_count = device_sm_count
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
@@ -4142,6 +4153,9 @@ class ConfigSpec:
         admit the family and searched / seeded on small grids.
         """
         self.cute_flash_bwd_search_enabled = True
+        # The backward family (the tcgen05 pair vs the register-MMA rows)
+        # picks the body the same way the forward's pipeline family does.
+        self.final_selection_family_keys = (FLASH_BWD_FAMILY_KEY,)
         self._cute_flash_bwd_row_facts = row_mma_facts
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
