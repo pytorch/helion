@@ -122,6 +122,16 @@ def _known_view(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _asserted_view(x: torch.Tensor) -> torch.Tensor:
+    assert x.size(1) == 4
+    flat = x.view(-1)
+    out = torch.empty_like(flat)
+    for row in hl.tile(flat.numel()):
+        out[row] = flat[row]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _absolute_storage_view(x: torch.Tensor) -> torch.Tensor:
     flat = torch.as_strided(x, (x.numel(),), (1,), storage_offset=0)
     out = torch.empty_like(flat)
@@ -140,7 +150,26 @@ def _mutated_view(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@pytest.mark.parametrize("kernel", [_known_view, _absolute_storage_view, _mutated_view])
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _assert_mutated_view(x: torch.Tensor) -> torch.Tensor:
+    flat = x.view(-1)
+    assert x.add_(1).size(1) == 4
+    out = torch.empty_like(flat)
+    for row in hl.tile(flat.numel()):
+        out[row] = flat[row]
+    return out
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        _known_view,
+        _asserted_view,
+        _absolute_storage_view,
+        _mutated_view,
+        _assert_mutated_view,
+    ],
+)
 @skipUnlessBackends(["cute"])
 def test_host_view_origin_and_effects_are_checked(kernel: Kernel[torch.Tensor]) -> None:
     bound = _cpu_bind(kernel, (torch.empty((3, 4)),))
@@ -162,4 +191,4 @@ def test_host_view_origin_and_effects_are_checked(kernel: Kernel[torch.Tensor]) 
         ),
     ):
         facts = input_view_copy_facts(bound.env, source)
-    assert (facts is not None) == (kernel is _known_view)
+    assert (facts is not None) == (kernel in (_known_view, _asserted_view))

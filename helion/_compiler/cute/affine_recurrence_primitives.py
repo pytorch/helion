@@ -179,6 +179,23 @@ def pack_bf16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def prefetch_global_l2(ptr, *, loc=None, ip=None) -> None:
+    """``prefetch.global.L2`` of the line holding the global ``ptr``."""
+
+    llvm.inline_asm(
+        None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def store_u32x4_if_valid(
     ptr,
     value0,
@@ -342,6 +359,7 @@ __all__ = [
     "mma_m16n8k16_bf16",
     "movmatrix_b16",
     "pack_bf16x2",
+    "prefetch_global_l2",
     "stmatrix_x2",
     "stmatrix_x2_trans",
     "store_u32x4_if_valid",

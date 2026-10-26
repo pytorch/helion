@@ -167,7 +167,11 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
-    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
+    _persistent_state_specs: tuple[
+        tuple[torch.Tensor, int, torch.dtype, bool], ...
+    ] = (),
+    _persistent_state_process_group_name: str | None = None,
+    _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -218,18 +222,36 @@ def default_launcher(
             ptx_options,
             launch_cooperative_grid,
             tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
-            tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
+            tuple(spec[1:] for spec in _persistent_state_specs),
+            # Symmetric state exchanges the namespace, so ranks compare digests.
+            _persistent_state_rank_digest,
         )
-        for slot, (state_like, numel, dtype) in enumerate(_persistent_state_specs):
-            state = _get_persistent_state(
-                triton_kernel,
-                state_like,
-                persistent_state_namespace,
-                slot,
-                numel,
-                dtype,
-            )
-            args = (*args, state)
+        for slot, (state_like, numel, dtype, symmetric) in enumerate(
+            _persistent_state_specs
+        ):
+            if _persistent_state_process_group_name is None:
+                state_args = (
+                    _get_persistent_state(
+                        triton_kernel,
+                        state_like,
+                        persistent_state_namespace,
+                        slot,
+                        numel,
+                        dtype,
+                    ),
+                )
+            else:
+                state_args = _get_process_group_state(
+                    triton_kernel,
+                    state_like,
+                    persistent_state_namespace,
+                    slot,
+                    numel,
+                    dtype,
+                    symmetric=symmetric,
+                    process_group_name=_persistent_state_process_group_name,
+                )
+            args = (*args, *state_args)
     # For both CUDA and MTIA, use the same kernel execution.
     run_kwargs: dict = {
         "grid": grid,
@@ -259,6 +281,36 @@ def default_launcher(
         *args,
         **run_kwargs,
     )
+
+
+def compile_only_launch_args(
+    *args: object,
+    _remote_copy_signal_slots_per_program: int = 0,
+    _remote_barrier_signal_slots_per_program: int = 0,
+    _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
+    _persistent_state_specs: tuple[
+        tuple[torch.Tensor, int, torch.dtype, bool], ...
+    ] = (),
+    **kwargs: object,
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """Return ``triton_kernel.run`` arguments for compiling without launching.
+
+    The arguments ``default_launcher`` appends become empty tensors of the same
+    dtypes, which is all compilation reads, and launcher-only options drop.
+    """
+    dtypes = [torch.int64] * (
+        bool(_remote_copy_signal_slots_per_program)
+        + bool(_remote_barrier_signal_slots_per_program)
+    )
+    dtypes += [like.dtype for like, _ in _remote_copy_scratch_specs]
+    for _, _, dtype, symmetric in _persistent_state_specs:
+        dtypes += [dtype, torch.int64] if symmetric else [dtype]
+    kwargs = {name: value for name, value in kwargs.items() if not name.startswith("_")}
+    if not dtypes:
+        return args, kwargs
+    device = next(arg.device for arg in args if isinstance(arg, torch.Tensor))
+    placeholders = [torch.empty(0, dtype=dtype, device=device) for dtype in dtypes]
+    return (*args, *placeholders), kwargs
 
 
 def _get_remote_copy_signal(
@@ -376,6 +428,97 @@ def _get_persistent_state(
         state = torch.zeros(required_numel, dtype=dtype, device=like.device)
         cache[key] = state
     return state
+
+
+def _get_process_group_state(
+    triton_kernel: object,
+    like: torch.Tensor,
+    namespace: tuple[object, ...],
+    slot: int,
+    required_numel: int,
+    dtype: torch.dtype,
+    *,
+    symmetric: bool,
+    process_group_name: str,
+) -> tuple[object, ...]:
+    """Return the kernel arguments of retained state shared by every stream.
+
+    One epoch then covers the dispatch ticket and peer counters, so launches of
+    one kernel must not overlap across streams. A symmetric state is followed by
+    its per-rank base pointer table.
+    """
+    if like.device.type != "cuda":
+        raise RuntimeError("persistent Triton state requires a CUDA tensor")
+    cache = vars(triton_kernel).setdefault("_helion_persistent_state_cache", {})
+    # The numel is part of the namespace, so a cached entry always fits.
+    key = (like.device, dtype, process_group_name, namespace, slot)
+    entry = cache.get(key)
+    if entry is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Helion allocates distributed launch state on first use; run the "
+                "kernel once before CUDA graph capture"
+            )
+        if symmetric:
+            entry = _new_symmetric_state(
+                like.device,
+                (
+                    triton_kernel.__name__,  # type: ignore[attr-defined]
+                    namespace,
+                    slot,
+                    required_numel,
+                    str(dtype),
+                ),
+                required_numel,
+                dtype,
+                process_group_name,
+            )
+        else:
+            entry = (torch.zeros(required_numel, dtype=dtype, device=like.device),)
+        cache[key] = entry
+    return entry[:2]
+
+
+def _new_symmetric_state(
+    device: torch.device,
+    fingerprint: tuple[object, ...],
+    numel: int,
+    dtype: torch.dtype,
+    process_group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, object]:
+    """Allocate zeroed symmetric state once every rank agrees on the launch.
+
+    Returns the state, its per-rank base pointer table followed by this rank,
+    and the owning handle.
+    """
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+    from torch.distributed.distributed_c10d import _resolve_process_group
+
+    group = _resolve_process_group(
+        process_group_name  # pyrefly: ignore[bad-argument-type]
+    )
+    with torch.cuda.device(device):
+        fingerprint = (*fingerprint, torch.cuda.get_device_capability(device))
+        fingerprints: list[object] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(fingerprints, fingerprint, group=group)
+        if any(other != fingerprint for other in fingerprints):
+            raise RuntimeError(
+                "Helion distributed kernels require the same launch on every "
+                f"rank; got {fingerprints!r}"
+            )
+        state = symm_mem.empty(numel, dtype=dtype, device=device)
+        state.zero_()
+        # Zero before rendezvous, since peers may publish right after it.
+        torch.cuda.current_stream(device).synchronize()
+        handle = symm_mem.rendezvous(
+            state,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+    ptrs = torch.tensor(
+        [*handle.buffer_ptrs, handle.rank], dtype=torch.int64, device=device
+    )
+    return state, ptrs, handle
 
 
 def _validate_resident_program_capacity(

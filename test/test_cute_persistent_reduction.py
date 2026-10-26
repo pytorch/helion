@@ -286,6 +286,26 @@ def _alias_sensitive_persistent_sweeps(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _alias_sensitive_persistent_sweeps_views(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    # The device code reads host-side views; they alias exactly when the
+    # storages of the original arguments do.
+    rows, width = x.shape
+    x = x.view(rows, width)
+    y = y.view(rows, width)
+    out = torch.empty([rows], dtype=torch.float32, device=x.device)
+    for tile_rows in hl.tile(rows):
+        cols = hl.arange(width)
+        first = x[tile_rows, cols].float().sum(-1)
+        y[tile_rows, cols] = first[:, None]
+        second = (x[tile_rows, cols].float() + first[:, None]).sum(-1)
+        out[tile_rows] = first + second
+    return out
+
+
 @onlyBackends(["cute"])
 def test_seed_uses_block_ids_with_permuted_specs() -> None:
     args = (
@@ -564,7 +584,8 @@ def test_composed_async_full_row_seed_survives_flatten() -> None:
     # The early grid-size check cannot look up the two fixed-size grid axes,
     # so xyz starts conservatively disabled for this otherwise-safe 3-D grid.
     assert "xyz" not in spec.allowed_pid_types
-    seeds = compiler_seed_configs(bound.env, host_function.device_ir)
+    with bound.env:
+        seeds = compiler_seed_configs(bound.env, host_function.device_ir)
     spec.compiler_seed_configs = seeds
     composed = [
         seed
@@ -1345,15 +1366,22 @@ def test_normal_persistent_store_requires_runtime_alignment() -> None:
     )
 
 
+@pytest.mark.parametrize("host_views", (False, True))
 @pytest.mark.parametrize("storage_relation", ("distinct", "overlap", "same"))
 @onlyBackends(["cute"])
 def test_external_tensor_runtime_alias_proof_is_cache_safe(
     monkeypatch: Any,
     storage_relation: str,
+    host_views: bool,
 ) -> None:
     from helion._compiler.device_function import DeviceFunction
 
-    _alias_sensitive_persistent_sweeps.reset()
+    kernel = (
+        _alias_sensitive_persistent_sweeps_views
+        if host_views
+        else _alias_sensitive_persistent_sweeps
+    )
+    kernel.reset()
     if storage_relation == "overlap":
         storage = torch.randn(16 * 128 + 1, dtype=torch.float32)
         x = torch.as_strided(storage, (16, 128), (128, 1))
@@ -1370,7 +1398,7 @@ def test_external_tensor_runtime_alias_proof_is_cache_safe(
         return result
 
     monkeypatch.setattr(DeviceFunction, "proven_disjoint_tensor_pairs", capture)
-    bound = _alias_sensitive_persistent_sweeps.bind((x, y))
+    bound = kernel.bind((x, y))
     host_function = bound.host_function
     assert host_function is not None
     seed = CutePersistentSubwarpRowsHeuristic.get_seed_config(
@@ -2329,6 +2357,51 @@ dependent = outer_lane + fallback
     assert inner < fallback < dependent
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _guarded_constant_row_sum(
+    state_indices: torch.Tensor, a: torch.Tensor
+) -> torch.Tensor:
+    batch = state_indices.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty([batch], dtype=a.dtype, device=a.device)
+    for tile_batch in hl.tile(batch, block_size=1):
+        state_index = state_indices[tile_batch.id]
+        if state_index < 0:
+            out[tile_batch] = hl.full([tile_batch, width], 1.0, dtype=a.dtype).sum(-1)
+        else:
+            out[tile_batch] = a[tile_batch, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _guarded_broadcast_row_sum(
+    state_indices: torch.Tensor, a: torch.Tensor
+) -> torch.Tensor:
+    batch = state_indices.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty([batch], dtype=a.dtype, device=a.device)
+    for tile_batch in hl.tile(batch, block_size=1):
+        state_index = state_indices[tile_batch.id]
+        if state_index < 0:
+            first = a[tile_batch, 0]
+            row = first[:, None] + hl.zeros([tile_batch, width], dtype=a.dtype)
+            out[tile_batch] = row.sum(-1)
+        else:
+            out[tile_batch] = a[tile_batch, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _constant_row_sum_plus_rows(a: torch.Tensor) -> torch.Tensor:
+    m = a.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty_like(a)
+    for tile_m in hl.tile(m):
+        constant = hl.full([tile_m, width], 2.0, dtype=a.dtype)
+        out[tile_m, :] = a[tile_m, :] + constant.sum(-1, keepdim=True)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCutePersistentReduction(TestCase):
     def test_persistent_subwarp_vector_topology(self) -> None:
@@ -2409,3 +2482,42 @@ class TestCutePersistentReduction(TestCase):
         )
         self.assertIn("_cute_store_u16_vec", code)
         self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+    def test_lane_invariant_reduction_counts_every_lane(self) -> None:
+        # With fewer threads than the row, each thread's lane loop adds its
+        # lanes' elements.  A row whose values ignore the lane (a constant,
+        # a broadcast scalar) left an accumulation that reads no lane
+        # coordinate, and the dead-lane-loop splice ran it for one lane:
+        # 32 instead of 128 per row.
+        state_indices = torch.tensor([1, -1, -3], dtype=torch.int64, device=DEVICE)
+        a = torch.randn(3, 128, device=DEVICE)
+        negative = (state_indices < 0)[:, None]
+        for kernel, args, expected in [
+            (
+                _guarded_constant_row_sum,
+                (state_indices, a),
+                torch.where(negative, 128.0, a.sum(-1, keepdim=True))[:, 0],
+            ),
+            (
+                _guarded_broadcast_row_sum,
+                (state_indices, a),
+                torch.where(negative, 128 * a[:, :1], a.sum(-1, keepdim=True))[:, 0],
+            ),
+            (_constant_row_sum_plus_rows, (a,), a + 256.0),
+        ]:
+            bound = kernel.bind(args)
+            env = bound.env
+            reduction_block = next(
+                block_id
+                for block_id, block in enumerate(env.block_sizes)
+                if block.reduction
+            )
+            config = bound.config_spec.default_config().config
+            config["num_threads"] = [
+                32 if block_id == reduction_block else 0
+                for block_id in env.config_spec.num_threads.valid_block_ids()
+            ]
+            out = bound.compile_config(helion.Config(**config))(*args)
+            torch.testing.assert_close(
+                out, expected, rtol=1e-4, atol=1e-4, msg=kernel.name
+            )

@@ -578,5 +578,24 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
         self.assertNotIn("fixed_rank1_codegen_abi_version", code)
 
 
+@pytest.mark.parametrize(
+    "key,value", [("cute_fragment_threads", 32), ("cute_fragment_reduction", "warp")]
+)
+def test_planned_root_rejects_competing_fragment_schedule(key, value):
+    def config(*args, **kwargs):
+        result = original(*args, **kwargs)
+        result.config[key] = value
+        return result
+
+    original = _config
+    with (
+        patch(
+            "test.test_cute_fixed_token_rank1_recurrence._config", side_effect=config
+        ),
+        pytest.raises(helion.exc.InvalidConfig, match="planned root cannot share"),
+    ):
+        TestCuteFixedTokenRank1Recurrence()._code()
+
+
 if __name__ == "__main__":
     unittest.main()

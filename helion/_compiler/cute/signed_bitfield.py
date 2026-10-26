@@ -384,6 +384,30 @@ def _no_alias_effects(state: CodegenState, graph: torch.fx.Graph) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class PackedStoreValue:
+    """A vector flush operand converted from a whole signed byte packet.
+
+    The store site inside the constexpr V-loop then computes nothing per
+    lane.  It binds the packet ``carrier`` under the flush operand's name, so
+    the site depends on the lane loop that loaded the packet and the flush
+    depends on the site: ``lane_loop_distribution`` orders the other
+    statements against the flush through that site.
+    """
+
+    carrier: str
+    bit_offset: int
+    bit_width: int
+    lanes: int
+
+    def flush_operand(self, packet: str) -> str:
+        """The converted lanes of the packet bound to ``packet`` at the flush."""
+        return (
+            f"_cute_signed_bitfield_to_bf16_packed({packet}, "
+            f"{self.bit_offset}, {self.bit_width}, {self.lanes})"
+        )
+
+
 def packed_store_value(
     state: CodegenState,
     strategy: object,
@@ -393,7 +417,7 @@ def packed_store_value(
     index_exprs: list[str],
     mask: str | None,
     site: SignedByteSite | None = None,
-) -> str | None:
+) -> PackedStoreValue | None:
     """Use the packet only at the original vector flush, with identical lanes."""
     node = state.fx_node
     if site is None:
@@ -448,7 +472,4 @@ def packed_store_value(
         or not _no_alias_effects(state, node.graph)
     ):
         return None
-    return (
-        f"_cute_signed_bitfield_to_bf16_packed({packet.carrier}, "
-        f"{field.bit_offset}, {field.bit_width}, {width})"
-    )
+    return PackedStoreValue(packet.carrier, field.bit_offset, field.bit_width, width)

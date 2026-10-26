@@ -146,7 +146,7 @@ def _device_at_path(values: Sequence[object], path: _DevicePath) -> torch.device
 
 
 def _current_device_index(device_type: str) -> int:
-    device_module = getattr(torch, device_type, None)
+    device_module = None if device_type == "tpu" else getattr(torch, device_type, None)
     is_available = getattr(device_module, "is_available", None)
     available = None if not callable(is_available) else is_available()
     current_device = getattr(device_module, "current_device", None)

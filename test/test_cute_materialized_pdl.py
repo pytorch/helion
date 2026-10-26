@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from hashlib import sha256
+import textwrap
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -16,11 +17,18 @@ from test.test_cute_materialize_operand import _bind
 from test.test_cute_materialize_operand import _computed_rhs
 from test.test_cute_materialize_operand import _cpu_b200 as _cpu_b200
 from test.test_cute_materialize_operand import _direct_rhs
+from test.test_cute_materialize_operand import _int16_args
+from test.test_cute_materialize_operand import _int16_bare_cast_rhs
+from test.test_cute_materialize_operand import _producer_seed
 from test.test_cute_materialize_operand import _stage_sources
 
 import helion
 from helion._compiler.autotuner_heuristics.cute_materialized_operand import (
     CuteMaterializedOperandHeuristic,
+)
+from helion._compiler.cute import cute_mma
+from helion._compiler.cute.materialized_fission_codegen import (
+    _tma_role_waits_before_dependent_loads,
 )
 from helion._compiler.cute.materialized_pdl import prove_materialized_operand_pdl
 from helion._compiler.cute.tcgen05_constants import (
@@ -82,12 +90,21 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     release = producer.body.pop(0)
     assert ast.unparse(release) == "cute.arch.griddepcontrol_launch_dependents()"
     assert ast.dump(producer) == ast.dump(_device(before[0]))
+    # The paired consumer always waits ahead of its whole TMA role (the wait
+    # is inert without a programmatic dependency), so only the launch flag
+    # changes; the one-CTA family splits its loads around the wait instead
+    # (see test_cute_materialize_operand.py).
     assert ast.dump(_device(after[1])) == ast.dump(_device(before[1]))
     assert "cute.arch.griddepcontrol_wait()" in after[1]
     assert after[1].index("cute.arch.griddepcontrol_wait()") < after[1].index(
         "cute.copy(tma_atom_"
     )
-    assert "sync_threads()" in after[1]
+    # The plain clustered consumer publishes its pipeline init through the
+    # cluster-wide ``pipeline_init_wait`` and the TMEM allocation through
+    # ``wait_for_alloc``; the CTA-wide ``sync_threads`` stays only on the grouped
+    # and row-union kernels, whose prologues publish SMEM tables through it.
+    assert "sync_threads()" not in after[1]
+    assert "pipeline_init_wait(" in after[1]
     assert after[1].count("wait_for_alloc()") == 1
     assert after[1].replace(", 'use_pdl': True", "") == before[1]
     # Full caller/allocation/ABI inverse, including the embedded source hashes.
@@ -98,6 +115,58 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
             sha256(new.encode()).hexdigest(), sha256(old.encode()).hexdigest()
         )
     assert ast.dump(ast.parse(restored)) == ast.dump(ast.parse(baseline))
+
+
+@pytest.mark.parametrize(
+    "kernel,packed", [(matmul_bf16_int4, True), (_computed_rhs, False)]
+)
+def test_cute_pdl_never_reaches_the_stage_that_releases_dependents_at_entry(
+    kernel: Kernel[Any], packed: bool
+) -> None:
+    bound = _bind(kernel, _args(packed=packed))
+    serial = _serial(bound)
+    # With the protocol on, the producer stage releases its dependents at
+    # entry and the consumer's TMA role loads the ordinary operand ahead of
+    # its own wait, relying on the producer being an ordinary launch that
+    # started after everything ahead of it.  ``cute_pdl`` must not turn the
+    # producer into a programmatic dependent launch (its wait would land
+    # behind the release), and the consumer's plan already launches with one:
+    # the knob is inert on the whole bundle.
+    protocol = bound.to_code(helion.Config.from_dict(serial.config | {KEY: True}))
+    assert (
+        bound.to_code(
+            helion.Config.from_dict(serial.config | {KEY: True, "cute_pdl": True})
+        )
+        == protocol
+    )
+    producer, consumer = _stage_sources(protocol)
+    assert (
+        ast.unparse(_device(producer).body[0])
+        == "cute.arch.griddepcontrol_launch_dependents()"
+    )
+    assert WAIT not in producer and "_helion_cute_use_pdl" not in producer
+    assert "'use_pdl': True" in consumer and "_helion_cute_use_pdl" not in consumer
+    # Without the protocol the producer is an ordinary pointwise stage and
+    # takes the knob like any kernel: the wait ahead of its first access plus
+    # the launch attribute, nothing else.  The consumer keeps its role-local
+    # wait and stays inert.
+    off = _stage_sources(bound.to_code(serial))
+    on = _stage_sources(
+        bound.to_code(helion.Config.from_dict(serial.config | {"cute_pdl": True}))
+    )
+    device = _device(on[0])
+    attribute = f"{device.name}._helion_cute_use_pdl = True"
+    assert ast.unparse(device.body[0]) == WAIT
+    assert on[0].count(WAIT) == 1 and on[0].count(attribute) == 1
+    assert [
+        line
+        for line in on[0].splitlines()
+        if WAIT not in line and attribute not in line
+    ] == off[0].splitlines()
+    assert on[1] == off[1]
+    # The bundle's search space comes from the tcgen05 branch, which never
+    # offers the knob; only an explicit config reaches the producer with it.
+    assert "cute_pdl" not in bound.config_spec._flat_fields()
 
 
 def test_coverage_is_additive_serial_default_and_acc1_is_capacity_derived() -> None:
@@ -117,10 +186,19 @@ def test_coverage_is_additive_serial_default_and_acc1_is_capacity_derived() -> N
     assert carrier.block_sizes[2:] == [128, 64, 128]
     assert carrier.config["tcgen05_ab_stages"] == 8
     assert KEY not in spec.default_config().config
-    assert all(KEY not in seed.config for seed in spec.compiler_seed_configs)
+    # The coverage carriers stay serial and enumerate both values.
+    assert all(KEY not in w.carrier.config for w in group.witnesses)
     with bound.env:
         expanded = CuteMaterializedOperandHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
+        )
+        # Producer-layout seeds request the dependent launch on every schedule
+        # that supports it.
+        assert expanded
+        assert all(
+            c.config.get(KEY) is True
+            for c in expanded
+            if state.materialized_operand_pdl_supported(c.config)
         )
         roots = state.materialized_operand_pdl_roots
         try:
@@ -130,7 +208,14 @@ def test_coverage_is_additive_serial_default_and_acc1_is_capacity_derived() -> N
             )
         finally:
             state.materialized_operand_pdl_roots = roots
-        assert expanded[: len(original)] == original
+        # The proof only adds the dependent-launch request to the existing
+        # prefix and appends the capacity-priced ACC1 variants after it.
+        assert [
+            helion.Config.from_dict(
+                {key: value for key, value in c.config.items() if key != KEY}
+            )
+            for c in expanded[: len(original)]
+        ] == original
         assert all(
             c.config["tcgen05_acc_stages"] == 1 for c in expanded[len(original) :]
         )
@@ -256,10 +341,11 @@ def test_actual_retraced_scratch_edge_is_required() -> None:
     ) as observed:
         bound = _bind(matmul_bf16_int4, _args(packed=True))
     env, ir, candidate = observed.call_args.args
-    producer, consumer = (
-        env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
-    )
+    roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+    assert roots is not None
+    producer, consumer = roots.producer, roots.consumer
     assert producer != consumer
+    assert roots.dependent_side == "rhs"
     stores = [
         node
         for node in ir.graphs[producer].graph.nodes
@@ -272,6 +358,7 @@ def test_actual_retraced_scratch_edge_is_required() -> None:
         assert prove_materialized_operand_pdl(env, ir, candidate) == (
             producer,
             consumer,
+            "rhs",
         )
         try:
             # A different input-backed tensor cannot stand in for the fresh RHS.
@@ -328,3 +415,160 @@ def test_full_search_declares_coverage_without_automatic_heuristics(
         disable_autotuner_heuristics=disabled,
     )._bind_isolated(_args(packed=True))
     assert [w.value for w in _group(bound).witnesses] == [False, True, False, True]
+
+
+_TMA_ROLE = "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+_MMA_ROLE = "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
+_LOAD_A = "cute.copy(tma_atom_a, tma_gA[None, 0], tma_sA[None, 0], tma_bar_ptr=bar)"
+_LOAD_B = "cute.copy(tma_atom_b, tma_gB[None, 0], tma_sB[None, 0], tma_bar_ptr=bar)"
+WAIT = "cute.arch.griddepcontrol_wait()"
+
+
+def _consumer(body: str) -> ast.FunctionDef:
+    return _device("def _helion_consumer():\n" + textwrap.indent(body, "    "))
+
+
+@pytest.mark.parametrize(
+    "body,guarded",
+    [
+        pytest.param(
+            f"if {_TMA_ROLE}:\n"
+            f"    if gate:\n        {_LOAD_A}\n"
+            f"    {WAIT}\n"
+            f"    if gate:\n        {_LOAD_B}\n",
+            True,
+            id="one_shot_split",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n"
+            f"    while tile.is_valid_tile:\n"
+            f"        if gate:\n            {_LOAD_A}\n"
+            f"        {WAIT}\n"
+            f"        if gate:\n            {_LOAD_B}\n"
+            f"        for k in range(4):\n            {_LOAD_A}\n            {_LOAD_B}\n",
+            True,
+            id="persistent_split",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    {WAIT}\n    if gate:\n        {_LOAD_A}\n        {_LOAD_B}\n",
+            True,
+            id="prelude_wait",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    if gate:\n        {_LOAD_B}\n    {WAIT}\n",
+            False,
+            id="load_before_wait",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    if gate:\n        {WAIT}\n    {_LOAD_B}\n",
+            False,
+            id="conditional_wait",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    while tile.is_valid_tile:\n        {WAIT}\n    {_LOAD_B}\n",
+            False,
+            id="wait_inside_loop_load_after",
+        ),
+        pytest.param(
+            f"if {_MMA_ROLE}:\n    {WAIT}\nif {_TMA_ROLE}:\n    {_LOAD_B}\n",
+            False,
+            id="wait_in_another_role",
+        ),
+        pytest.param(
+            f"if tcgen05_tma_warp and gate:\n    {WAIT}\n    {_LOAD_B}\n",
+            False,
+            id="loads_outside_a_role_block",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    {WAIT}\n    {_LOAD_B}\nif {_TMA_ROLE}:\n    {_LOAD_B}\n",
+            False,
+            id="loads_in_two_blocks",
+        ),
+        pytest.param(
+            f"if {_TMA_ROLE}:\n    {WAIT}\n    {_LOAD_A}\n",
+            False,
+            id="no_dependent_load",
+        ),
+    ],
+)
+def test_tma_role_wait_must_dominate_the_dependent_loads(
+    body: str, guarded: bool
+) -> None:
+    assert _tma_role_waits_before_dependent_loads(_consumer(body), "tma_atom_b") is (
+        guarded
+    )
+
+
+def test_dependent_side_selects_the_atom() -> None:
+    split = _consumer(
+        f"if {_TMA_ROLE}:\n"
+        f"    if gate:\n        {_LOAD_A}\n"
+        f"    {WAIT}\n"
+        f"    if gate:\n        {_LOAD_B}\n"
+    )
+    # The same split guards B (an rhs scratch) but not A (an lhs scratch).
+    assert _tma_role_waits_before_dependent_loads(split, "tma_atom_b")
+    assert not _tma_role_waits_before_dependent_loads(split, "tma_atom_a")
+
+
+def test_codegen_rejects_a_wait_after_the_materialized_operand_loads() -> None:
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        config = _producer_seed(bound, tcgen05_cta_group="auto")
+    build = cute_mma._build_split_initial_prefetch
+
+    def wait_last(*args: object, **kwargs: object) -> list[ast.stmt]:
+        statements = build(*args, **kwargs)  # pyrefly: ignore [bad-argument-type]
+        waits = [stmt for stmt in statements if ast.unparse(stmt) == WAIT]
+        assert len(waits) == 1
+        return [stmt for stmt in statements if stmt is not waits[0]] + waits
+
+    with (
+        patch.object(cute_mma, "_build_split_initial_prefetch", side_effect=wait_last),
+        pytest.raises(InvalidConfig, match="first load of the materialized operand"),
+    ):
+        bound.to_code(config)
+
+
+def test_one_cta_pdl_waits_inside_the_persistent_tile_loop() -> None:
+    # Three SMs for sixteen 128x16 tiles (the 64-row small-grid seeds are only
+    # offered within one wave, which three SMs cannot give): the TMA role loops
+    # over tiles and the split prefetch, wait included, sits inside that loop.
+    with (
+        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=3),
+        patch("helion.runtime.get_num_sm", return_value=3),
+    ):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+        with bound.env:
+            config = _producer_seed(bound, tcgen05_cta_group="auto")
+        assert config.block_sizes[2:] == [128, 16, 128]
+        producer, consumer = _stage_sources(bound.to_code(config))
+    assert "cute.arch.griddepcontrol_launch_dependents()" in producer
+    assert ".is_valid_tile:" in consumer
+    assert consumer.count(WAIT) == 1
+    loop = consumer.index(".is_valid_tile:")
+    assert loop < consumer.index("cute.copy(tma_atom_a") < consumer.index(WAIT)
+    assert consumer.index(WAIT) < consumer.index("cute.copy(tma_atom_b")
+    assert _tma_role_waits_before_dependent_loads(_device(consumer), "tma_atom_b")
+
+
+def test_plain_initial_prefetch_keeps_each_stage_gate_by_its_block() -> None:
+    # Without the split, the stage-1 gate is assigned after the stage-0
+    # prefetch block, as before the split existed; the split assigns every
+    # gate first because its first block reads them all.
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        split = _producer_seed(bound, tcgen05_cta_group="auto")
+        plain = bound._normalized_config_copy(
+            helion.Config.from_dict(split.config | {KEY: False})
+        )
+    stage0 = "if tcgen05_tma_initial_full_tile:"
+    gate1 = "tcgen05_tma_initial_next_full_tile = "
+    _producer, consumer = _stage_sources(bound.to_code(plain))
+    assert WAIT not in consumer
+    assert consumer.index(stage0) < consumer.index(gate1)
+    _producer, consumer = _stage_sources(bound.to_code(split))
+    assert consumer.index(gate1) < consumer.index("tcgen05_pdl_producer_state = ")
+    assert consumer.index(gate1) < consumer.index(stage0)

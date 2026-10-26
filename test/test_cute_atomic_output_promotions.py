@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     [
         ("out = torch.zeros((2, 3))", True),
         ("out = torch.empty_like(x)", True),
+        ("out = x.new_zeros((2, 3))", True),
+        ("out = x.new_full((2, 3), 0.0)", True),
+        ("out = x.new_zeros((2, 3), **kwargs)", False),
         ("out = torch.zeros((2, 3), out=x)", False),
         ("out = torch.zeros((2, 3), **kwargs)", False),
         ("out = x.view(2, 3)", False),

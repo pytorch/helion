@@ -292,6 +292,26 @@ def _cache_identity_value(value: object) -> object:
     return value
 
 
+def _template_union_cache_identity(
+    tuning: FlashTuningPolicy, *, is_causal: bool
+) -> tuple[object, ...]:
+    templates = tuning.causal_policies if is_causal else tuning.dense_policies
+    identities: list[object] = []
+    for template in templates:
+        # Historical sequence keys do not select or rank search templates.
+        # Keep them only in the separate exact codegen-policy identity below.
+        identity = tuple(
+            (field.name, _cache_identity_value(getattr(template, field.name)))
+            for field in dataclasses.fields(template)
+            if field.name != "num_kv"
+        )
+        if identity not in identities:
+            identities.append(identity)
+    # Optional fields mix None and numeric values, so sort their serialized
+    # representation instead of comparing heterogeneous field values directly.
+    return tuple(sorted(identities, key=repr))
+
+
 def flash_target_policy_cache_identity(
     capability: tuple[int, int] | None,
     *,
@@ -324,5 +344,6 @@ def flash_target_policy_cache_identity(
             workload,
             tuning.tmem_row_reduce_min_kv,
             shape_policy,
+            _template_union_cache_identity(tuning, is_causal=is_causal),
         )
     )

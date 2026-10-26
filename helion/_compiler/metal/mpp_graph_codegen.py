@@ -22,6 +22,11 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 
+#: Largest M/N accumulator-tile extent observed to produce correct MPP results.
+#: K is unaffected, verified up to 512.
+_MAX_MPP_TILE_EXTENT = 128
+
+
 @dataclasses.dataclass(frozen=True)
 class _MPPOperandLayout:
     """How one MPP matmul operand occupies device memory.
@@ -323,6 +328,18 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             codegen.add_statement(_mpp_threadgroup_barrier_stmt())
         return []
 
+    @staticmethod
+    def _check_mpp_tile_extents(tile_m: int, tile_n: int) -> None:
+        """Reject accumulator tiles for which MPP silently miscomputes."""
+        for extent in (tile_m, tile_n):
+            if extent > _MAX_MPP_TILE_EXTENT:
+                raise exc.BackendUnsupported(
+                    "metal",
+                    f"MPP matmul tile extent {extent} (max "
+                    f"{_MAX_MPP_TILE_EXTENT}); mpp::tensor_ops::matmul2d "
+                    "returns silently wrong results for tiles this large",
+                )
+
     def _check_mpp_operand_layout(
         self,
         tile_n: int,
@@ -426,6 +443,7 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         assert self.rhs_layout is not None
         lhs_storage_row_width = int(env.size_hint(self.lhs_layout.storage_row_width))
         rhs_storage_row_width = int(env.size_hint(self.rhs_layout.storage_row_width))
+        self._check_mpp_tile_extents(m_axis.block_size, n_axis.block_size)
         self._check_mpp_operand_layout(
             n_axis.block_size,
             bk,

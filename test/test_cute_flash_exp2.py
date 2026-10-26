@@ -4,10 +4,12 @@ import ast
 import dataclasses
 import importlib
 import inspect
+import json
 import math
 import os
 from typing import TYPE_CHECKING
 from typing import cast
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +18,10 @@ import torch
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.attention_plan import DOCUMENT_MASK_KIND
+from helion._compiler.cute.attention_plan import PREFIX_LM_MASK_KIND
+from helion._compiler.cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
+from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import AttentionScorePlan
@@ -53,6 +59,15 @@ _DEG1_PACKET = "deg1_16x8"
 _DEG1_SHORT_PACKET = "deg1_8x2_corr10"
 _CAUSAL_HD128_RESIDENT_PACKET = (
     "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+)
+_CAUSAL_HD128_RESIDENT_16X4_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_deg2_16x4_early_acquire"
+)
+_CAUSAL_HD128_RESIDENT_16X2_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_deg2_16x2_early_acquire"
+)
+_CAUSAL_HD128_RESIDENT_XU_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_xu_early_acquire"
 )
 
 
@@ -192,6 +207,16 @@ def _pointwise_attention_output(
     return out.view(q_in.size())
 
 
+# The polynomial exp2 packets are approximations and reachable only under the
+# ``fast_math`` setting; these variants of the kernels above opt in.
+_causal_attention_output_fast_math = helion.kernel(
+    _causal_attention_output.fn, backend="cute", static_shapes=True, fast_math=True
+)
+_dense_attention_output_fast_math = helion.kernel(
+    _dense_attention_output.fn, backend="cute", static_shapes=True, fast_math=True
+)
+
+
 def _manual_config(
     packet: str = _DEG2_PACKET, **overrides: object
 ) -> dict[str, object]:
@@ -215,6 +240,7 @@ def _causal_hd128_resident_seed(num_kv: int) -> helion.Config:
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY)
         == _CAUSAL_HD128_RESIDENT_PACKET
@@ -233,6 +259,7 @@ def _emit_causal_hd128_resident(
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -260,10 +287,11 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
             cute_flash.FLASH_S_STAGE_KEY: 1,
         }
-    elif route == "ws_two_warpgroup":
+    elif route.startswith("ws_two_warpgroup"):
         config_values = {
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
             cute_flash.FLASH_S_STAGE_KEY: 2,
+            cute_flash.FLASH_EPI_STG_KEY: not route.endswith("_direct"),
         }
     else:
         use_2cta = "2cta" in route
@@ -303,7 +331,7 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
                 cast("DeviceFunction", None),
                 **common,
             )
-        elif route == "ws_two_warpgroup":
+        elif route.startswith("ws_two_warpgroup"):
             body = cute_flash.emit_flash_ws_device_body(
                 cast("DeviceFunction", None),
                 **common,
@@ -325,9 +353,10 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
     (
         ("identity", True),
         ("relu", True),
-        ("relu_to_fp16", False),
-        ("relu_after_bf16", False),
-        ("abs", False),
+        # Row-local programs (casts, abs) lower through the fused row epilogue.
+        ("relu_to_fp16", True),
+        ("relu_after_bf16", True),
+        ("abs", True),
     ),
 )
 def test_bfloat16_output_epilogue_flash_matcher(
@@ -429,7 +458,11 @@ def test_relu_output_epilogue_rejects_auxiliary_attention(auxiliary: str) -> Non
     ("route", "staged_helper"),
     (
         ("ws_legacy", None),
-        ("ws_two_warpgroup", None),
+        # The two-warpgroup ws_overlap body stages O through smem by default
+        # (coalesced drain); ``cute_flash_epi_stg=False`` keeps the direct
+        # per-thread store.
+        ("ws_two_warpgroup", "fa4_correction_epilogue_to_smem_scoped"),
+        ("ws_two_warpgroup_direct", None),
         ("fa4_direct", None),
         ("fa4_tma", "fa4_correction_epilogue_to_smem_scoped"),
         ("fa4_stg", "fa4_correction_epilogue_to_smem_scoped"),
@@ -551,6 +584,88 @@ def _hybrid_runtime_config() -> dict[str, object]:
     }
 
 
+def _policy_template_seed(
+    num_kv: int,
+    *,
+    is_causal: bool,
+    capability: tuple[int, int],
+    fast_math: bool = False,
+) -> helion.Config:
+    """Select the policy being tested from the complete compiler template union.
+
+    Source and native correctness tests cover each existing lowering/resource
+    template explicitly. Public seed order no longer selects a historical
+    sequence-length winner.
+    """
+    seeds = cute_flash.flash_attention_seed_configs(
+        64,
+        num_kv,
+        dtype=torch.float16,
+        is_causal=is_causal,
+        standard_dense_output=not is_causal,
+        standard_causal_output=is_causal,
+        target_device_capability=capability,
+        fast_math=fast_math,
+    )
+    tuning = cute_flash.get_flash_target_policy(capability).tuning
+    if is_causal:
+        causal_policy = tuning.causal_policy(num_kv)
+        expected = (
+            cute_flash._flash_causal_tuning_overrides(causal_policy)
+            if causal_policy is not None
+            else None
+        )
+    else:
+        dense_policy = tuning.dense_policy(num_kv)
+        expected = (
+            cute_flash._flash_dense_tuning_overrides(dense_policy)
+            if dense_policy is not None
+            else None
+        )
+    if expected is None:
+        # Keep generic-lowering fixtures independent of target seed ordering.
+        return helion.Config.from_dict(
+            {
+                "block_sizes": [1, 128, 128],
+                **cute_flash._flash_seed_values(
+                    64,
+                    num_kv,
+                    num_bh=None,
+                    tensor_4d_heads=None,
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                    has_kv_tile_pruning=False,
+                    requires_ws_overlap=False,
+                    small_biased_candidate=False,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                    supports_tensor_4d_tma=True,
+                ),
+            }
+        )
+    if not fast_math:
+        # Without fast_math a table written against a polynomial packet is
+        # seeded on the exact default packet, and the knobs that packet
+        # implied (its cadence offsets, the masked cadence) take the
+        # resolver's values: match the table's structure modulo those keys.
+        expected = {
+            key: value
+            for key, value in expected.items()
+            if key
+            not in (
+                cute_flash.FLASH_EXP2_PACKET_KEY,
+                cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY,
+                cute_flash.FLASH_E2E_OFFSET_KEY,
+                cute_flash.FLASH_E2E_OFFSET0_KEY,
+            )
+        }
+    return next(
+        seed
+        for seed in seeds
+        if all(seed.config.get(key) == value for key, value in expected.items())
+    )
+
+
 def _emit_causal_resident_native_source(
     *,
     capability: tuple[int, int] = (10, 3),
@@ -565,18 +680,17 @@ def _emit_causal_resident_native_source(
     if seed_capability is None:
         seed_capability = capability
     with patch.dict(os.environ, {}, clear=True):
-        seed = cute_flash.flash_attention_seed_config(
-            64,
-            num_kv,
-            dtype=torch.float16,
-            is_causal=True,
-            standard_causal_output=True,
-            target_device_capability=seed_capability,
+        # The causal target seeds are written against the degree-2 packet,
+        # which only the fast_math surface offers.
+        seed = _policy_template_seed(
+            num_kv, is_causal=True, capability=seed_capability, fast_math=True
         )
         assert seed is not None
         manual_overrides = dict(seed.config)
         if config_overrides is not None:
             manual_overrides.update(config_overrides)
+        # The resolver sees the render's target (as the bind path's does):
+        # the dead-tile skip is pinned off on the resident-native route.
         config = cute_flash.resolve_flash_config(
             64,
             num_kv,
@@ -584,6 +698,11 @@ def _emit_causal_resident_native_source(
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            target_device_capability=capability,
+            tmem_rowmax_compatible=cute_flash.flash_tmem_rowmax_score_plan_supported(
+                score_plan
+            ),
+            fast_math=True,
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -665,13 +784,10 @@ def _emit_dense_resident_value_graph_source(
                 config_overrides=config_overrides,
             )
     with patch.dict(os.environ, {}, clear=True):
-        seed = cute_flash.flash_attention_seed_config(
-            64,
-            num_kv,
-            dtype=torch.float16,
-            is_causal=False,
-            standard_dense_output=True,
-            target_device_capability=seed_capability,
+        # The dense sm_103 table is written against the degree-1 packets,
+        # which only the fast_math surface offers.
+        seed = _policy_template_seed(
+            num_kv, is_causal=False, capability=seed_capability, fast_math=True
         )
         assert seed is not None
         manual_overrides = dict(seed.config)
@@ -684,6 +800,11 @@ def _emit_dense_resident_value_graph_source(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            target_device_capability=capability,
+            tmem_rowmax_compatible=cute_flash.flash_tmem_rowmax_score_plan_supported(
+                score_plan
+            ),
+            fast_math=True,
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -746,7 +867,9 @@ def test_online_softmax_codegen_preserves_target_alpha_schedules() -> None:
         "flash_s_full_phase ^= 1",
         "flash_scale_t[flash_s_corr_prod_index, 0, flash_local_tidx] = flash_alpha",
         "flash_minus_max_scale =",
-        "fa4_disc_exp_convert_store_pipe_causal",
+        # The masked segment stores the masked scores back in PASS1 and runs
+        # the plain PASS2 helper (``cute_flash_causal_mask_storeback``).
+        "fa4_disc_exp_convert_store_pipe(",
         "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum",
     )
     _assert_source_markers_in_order(b200_masked, b200_markers)
@@ -812,6 +935,7 @@ def test_registered_causal_shape_selects_requested_resident_lowering() -> None:
         dtype=torch.float16,
         is_causal=True,
         standard_causal_output=True,
+        fast_math=True,
     )
     with patch(
         "helion._compiler.cute.cute_flash.get_flash_target_policy",
@@ -824,6 +948,7 @@ def test_registered_causal_shape_selects_requested_resident_lowering() -> None:
             is_causal=True,
             standard_causal_output=True,
             target_device_capability=(10, 3),
+            fast_math=True,
         )
         source = _emit_causal_resident_native_source(num_kv=768)
 
@@ -888,6 +1013,22 @@ def test_degree2_packet_codegen_route_is_exact_and_manual_only() -> None:
         False,
         True,
     )
+    # The resident cadence siblings: the degree-2 route follows the residue
+    # pairs, so the hardware-only cadence (residue zero) reports no route.
+    for packet, e2e_res, emu_batch, degree2 in (
+        (_CAUSAL_HD128_RESIDENT_PACKET, 6, 3, True),
+        (_CAUSAL_HD128_RESIDENT_16X4_PACKET, 4, 2, True),
+        (_CAUSAL_HD128_RESIDENT_16X2_PACKET, 2, 1, True),
+        (_CAUSAL_HD128_RESIDENT_XU_PACKET, 0, 1, False),
+    ):
+        assert cute_flash._flash_disc_exp2_codegen_params(packet, 8, 2) == (
+            16,
+            e2e_res,
+            8,
+            emu_batch,
+            degree2,
+            False,
+        )
     current_packets = {
         "1x1": (1, 1),
         "4x1": (4, 1),
@@ -906,6 +1047,66 @@ def test_degree2_packet_codegen_route_is_exact_and_manual_only() -> None:
         )
 
 
+def test_hardware_resident_cadence_routes_every_pair_to_the_xu_pipe() -> None:
+    """At residue zero ``_disc_chunk_exp`` never reaches a polynomial route, so
+    the dropped ``degree2`` flag of the hardware-only sibling changes nothing."""
+    packet_route = cute_flash._flash_disc_exp2_codegen_params(
+        _CAUSAL_HD128_RESIDENT_XU_PACKET, 8, 2
+    )
+    assert (packet_route.e2e_freq, packet_route.e2e_res) == (16, 0)
+    assert not packet_route.degree2
+
+    def fma(values, scales, offsets):
+        return (
+            values[0] * scales[0] + offsets[0],
+            values[1] * scales[1] + offsets[1],
+        )
+
+    def polynomial(*_args):
+        raise AssertionError("a polynomial exp2 route executed at residue zero")
+
+    exp2_inputs: list[float] = []
+
+    def hardware_exp2(value):
+        exp2_inputs.append(value)
+        return value
+
+    for degree2 in (False, True):
+        for e2e_offset in range(16):
+            fragment = [float(index) for index in range(32)]
+            exp2_inputs.clear()
+            with (
+                patch.object(_flash_runtime.cute, "size", side_effect=len),
+                patch.object(
+                    _flash_runtime.cute.arch, "fma_packed_f32x2", side_effect=fma
+                ),
+                patch.object(
+                    _flash_runtime.cute.arch, "exp2", side_effect=hardware_exp2
+                ),
+                patch.object(_flash_runtime, "ex2_emulation_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg1_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg2_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_batch", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg1_batch", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg2_batch", polynomial),
+                patch.object(_flash_runtime, "exp2_approx_f16x2_to_f32", polynomial),
+            ):
+                _flash_runtime._disc_chunk_exp(
+                    fragment,
+                    1.0,
+                    0.0,
+                    packet_route.e2e_freq,
+                    packet_route.e2e_res,
+                    e2e_offset,
+                    False,
+                    pair_batch=packet_route.pair_batch,
+                    emu_batch=packet_route.emu_batch,
+                    degree2=degree2,
+                )
+            assert exp2_inputs == [float(index) for index in range(32)]
+            assert fragment == exp2_inputs
+
+
 def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
@@ -915,6 +1116,7 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -979,6 +1181,175 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             and ast.unparse(node.test) == "flash_acc_log >= -8.0"
             for node in ast.walk(loop)
         )
+
+
+@pytest.mark.parametrize(
+    ("packet", "head_dim", "dtype", "is_causal", "depth", "required_helper"),
+    (
+        (_DEG2_PACKET, 128, torch.bfloat16, False, 1, "fa4_disc_exp_convert_store"),
+        (
+            _DEG2_PACKET,
+            128,
+            torch.bfloat16,
+            False,
+            2,
+            "fa4_disc_exp_convert_store_pipe",
+        ),
+        (
+            _DEG2_PACKET,
+            64,
+            torch.float16,
+            True,
+            1,
+            "fa4_disc_exp_convert_store_pipe_causal",
+        ),
+        (
+            _DEG2_PACKET,
+            64,
+            torch.float16,
+            True,
+            4,
+            "fa4_disc_exp_convert_store_pipe_causal",
+        ),
+        (_HYBRID_PACKET, 64, torch.float16, True, 1, "fa4_disc_exp_convert_store_pipe"),
+        (
+            _HYBRID_PACKET,
+            64,
+            torch.bfloat16,
+            True,
+            2,
+            "fa4_disc_exp_convert_store_pipe",
+        ),
+        (
+            _CAUSAL_HD128_RESIDENT_PACKET,
+            128,
+            torch.bfloat16,
+            True,
+            1,
+            "fa4_disc_exp_convert_store_resident3_013_prefetch2",
+        ),
+    ),
+)
+@pytest.mark.parametrize("storeback", (False, True))
+def test_disc_degree_calls_match_runtime_signatures(
+    packet: str,
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    depth: int,
+    required_helper: str,
+    storeback: bool,
+) -> None:
+    # With ``cute_flash_causal_mask_storeback`` PASS1 stores the masked scores
+    # back and the masked PASS2 runs the plain helper; the knob is inert off
+    # the plain causal fa4 disc body.
+    if storeback and required_helper == "fa4_disc_exp_convert_store_pipe_causal":
+        required_helper = "fa4_disc_exp_convert_store_pipe"
+    with patch.dict(os.environ, {}, clear=True):
+        config = cute_flash.resolve_flash_config(
+            head_dim,
+            512,
+            _manual_config(
+                packet,
+                **{
+                    cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"
+                    if is_causal
+                    else "fa4_2cta",
+                    cute_flash.FLASH_DISC_PIPE_KEY: depth,
+                    cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "standard",
+                    cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback,
+                },
+            ),
+            dtype=dtype,
+            is_causal=is_causal,
+            standard_dense_output=not is_causal,
+            standard_causal_output=is_causal,
+            # The polynomial packets are offered under fast_math only.
+            fast_math=True,
+        )
+    assert config.exp2_packet == packet
+    body = cute_flash.emit_flash_fa4_device_body(
+        cast("DeviceFunction", None),
+        head_dim=head_dim,
+        num_kv=512,
+        sequence_extent=65_536,
+        num_bh=1,
+        total_tiles=256,
+        cfg=config,
+        has_lse=False,
+        io_dtype="cutlass.BFloat16" if dtype is torch.bfloat16 else "cutlass.Float16",
+        score_plan=causal_score_plan(head_dim)
+        if is_causal
+        else dense_score_plan(head_dim),
+    )
+    calls = [
+        node
+        for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("fa4_disc_exp_convert_store")
+    ]
+    assert required_helper in {call.func.attr for call in calls}
+    degree_keywords = set()
+    for call in calls:
+        keywords = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        degree_keywords.update(key for key in keywords if key.startswith("degree"))
+        inspect.signature(getattr(_flash_runtime, call.func.attr)).bind(
+            *([None] * len(call.args)), **keywords
+        )
+    assert "degree2" in degree_keywords
+    assert ("degree1" in degree_keywords) == (packet == _HYBRID_PACKET)
+
+
+@pytest.mark.parametrize("degree2", (None, False, True))
+def test_serial_disc_forwards_degree2_to_chunk_math(degree2: bool | None) -> None:
+    controls = {} if degree2 is None else {"degree2": degree2}
+    first_arrival, final_arrival = object(), object()
+    with (
+        patch.object(_flash_runtime.cutlass, "Float32", side_effect=float),
+        patch.object(_flash_runtime.cutlass, "const_expr", side_effect=lambda x: x),
+        patch.object(_flash_runtime.cute, "make_rmem_tensor"),
+        patch.object(_flash_runtime.cute, "copy"),
+        patch.object(_flash_runtime.cute.arch, "fence_view_async_tmem_store"),
+        patch.object(_flash_runtime, "_disc_chunk_exp") as chunk_exp,
+        patch.object(_flash_runtime, "_disc_chunk_convert_store"),
+        patch.object(_flash_runtime, "_disc_chunk_rowsum", return_value=1.0),
+        patch.object(_flash_runtime, "mbarrier_arrive") as arrive,
+    ):
+        total = _flash_runtime.fa4_disc_exp_convert_store(
+            None,
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+            MagicMock(),
+            1.0,
+            0.0,
+            16,
+            6,
+            0,
+            first_arrival,
+            final_arrival,
+            3,
+            4,
+            pair_batch=8,
+            emu_batch=3,
+            **controls,
+        )
+    assert total == 4.0
+    assert [call.args[6] for call in chunk_exp.call_args_list] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    for call in chunk_exp.call_args_list:
+        assert call.args[7:9] == (8, 3)
+        assert call.kwargs == {"degree2": bool(degree2)}
+    assert [call.args[0] for call in arrive.call_args_list] == [
+        first_arrival,
+        final_arrival,
+    ]
 
 
 def test_sm103_packed_f16x2_rewrite_follows_the_schedule_not_the_seed() -> None:
@@ -1679,6 +2050,39 @@ def test_causal_resident_native_gate_preserves_fallbacks() -> None:
         assert "resident_softmax_value_graph" in neighbour_source, neighbour
 
 
+def test_causal_resident_native_renders_with_the_q_staged_output() -> None:
+    # The GB300 causal resident body verifies its schedule (single-slot stat
+    # pipeline, release mapping, equal-iteration proof) before the generic
+    # one-CTA branch, so FA4's Q-staged output composes with it instead of
+    # failing the verifier ("causal cross-slot stat releases require proof of
+    # equal query-slot K/V iteration counts" from the proof-less generic spec).
+    staged = {
+        cute_flash.FLASH_EPI_TMA_KEY: True,
+        cute_flash.FLASH_O_OVER_Q_KEY: True,
+    }
+    q_alias = (
+        "sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, _flash_osl.inner), "
+        "_flash_osl.outer)"
+    )
+    # num_kv 512 seeds the stateful lowering, 1024 the resident value graph.
+    for num_kv, marker in (
+        (512, "ResidentSoftmaxState.create"),
+        (1024, "resident_softmax_value_graph"),
+    ):
+        source = _emit_causal_resident_native_source(
+            num_kv=num_kv, config_overrides=staged
+        )
+        assert marker in source
+        assert q_alias in source
+        assert "storage.sO" not in source
+        separate = _emit_causal_resident_native_source(
+            num_kv=num_kv, config_overrides={cute_flash.FLASH_EPI_TMA_KEY: True}
+        )
+        assert marker in separate
+        assert q_alias not in separate
+        assert "storage.sO" in separate
+
+
 @onlyBackends(["cute"])
 def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     capability = torch.cuda.get_device_capability()
@@ -1698,16 +2102,12 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     q = torch.randn(shape, dtype=torch.float16, device=DEVICE)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=capability,
+    seed = _policy_template_seed(
+        512, is_causal=True, capability=capability, fast_math=True
     )
     assert seed is not None
     config = helion.Config(**seed.config)
-    bound = _causal_attention_output.bind((q, k, v))
+    bound = _causal_attention_output_fast_math.bind((q, k, v))
     code = bound.to_triton_code(config)
     compiled = bound.compile_config(config)
 
@@ -1758,17 +2158,12 @@ def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     q = torch.randn(shape, dtype=torch.float16, device=DEVICE)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    seed = cute_flash.flash_attention_seed_config(
-        64,
-        num_kv,
-        dtype=torch.float16,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=capability,
+    seed = _policy_template_seed(
+        num_kv, is_causal=True, capability=capability, fast_math=True
     )
     assert seed is not None
     config = helion.Config(**seed.config)
-    bound = _causal_attention_output.bind((q, k, v))
+    bound = _causal_attention_output_fast_math.bind((q, k, v))
     code = bound.to_triton_code(config)
     compiled = bound.compile_config(config)
 
@@ -1796,6 +2191,7 @@ def test_causal_target_seed_match_ignores_conflicting_environment() -> None:
             is_causal=True,
             standard_causal_output=True,
             target_device_capability=(10, 3),
+            fast_math=True,
         )
     assert causal_seed is not None
     with patch.dict(
@@ -1807,6 +2203,7 @@ def test_causal_target_seed_match_ignores_conflicting_environment() -> None:
             causal_seed.config,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         policy = get_flash_target_policy((10, 3)).tuning.causal_policy(512)
         assert causal_cfg.wait_hint == 0
@@ -1828,6 +2225,7 @@ def test_bfloat16_hd128_degree2_packet_emits_dense_pass2_arguments() -> None:
             2048,
             dtype=torch.bfloat16,
             standard_dense_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
     )
@@ -1838,6 +2236,7 @@ def test_bfloat16_hd128_degree2_packet_emits_dense_pass2_arguments() -> None:
             seed.config,
             dtype=torch.bfloat16,
             standard_dense_output=True,
+            fast_math=True,
         )
     assert config.pipeline_family == "fa4_2cta"
     assert config.use_2cta_instrs
@@ -1889,11 +2288,17 @@ def test_causal_hd128_resident_packet_has_structural_search_envelope() -> None:
             is_causal=True,
             standard_causal_output=True,
             pipeline_family_override="fa4",
+            fast_math=True,
         )
         packet = fragments[cute_flash.FLASH_EXP2_PACKET_KEY]
         assert isinstance(packet, EnumFragment)
-        assert packet.choices == ("1x1", _CAUSAL_HD128_RESIDENT_PACKET)
-        assert packet.search_choices == ("1x1", _CAUSAL_HD128_RESIDENT_PACKET)
+        resident_packets = (
+            "1x1",
+            *cute_flash._FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES,
+        )
+        assert packet.choices == resident_packets
+        assert packet.search_choices == resident_packets
+        assert resident_packets[1] == _CAUSAL_HD128_RESIDENT_PACKET
 
     for num_kv in (1, 513, 2049):
         fragments = cute_flash.flash_autotune_fragments(
@@ -1920,6 +2325,7 @@ def test_causal_hd128_resident_packet_has_structural_search_envelope() -> None:
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         ordinary_config = cute_flash.resolve_flash_config(
             128,
@@ -1928,6 +2334,7 @@ def test_causal_hd128_resident_packet_has_structural_search_envelope() -> None:
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
     assert transferred_config.exp2_packet == _CAUSAL_HD128_RESIDENT_PACKET
     assert ordinary_config.exp2_packet == "1x1"
@@ -1970,6 +2377,7 @@ def test_causal_hd128_resident_seed_roundtrips_and_is_in_population() -> None:
             block_size_targets={0: 1, 1: 128, 2: 128},
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         spec.compiler_seed_configs = list(
             cute_flash.flash_attention_seed_configs(
@@ -1978,6 +2386,7 @@ def test_causal_hd128_resident_seed_roundtrips_and_is_in_population() -> None:
                 dtype=torch.bfloat16,
                 is_causal=True,
                 standard_causal_output=True,
+                fast_math=True,
             )
         )
         config_gen = ConfigGeneration(spec)
@@ -2098,7 +2507,7 @@ def test_causal_hd128_resident_seed_matches_sdpa() -> None:
         for _ in range(3)
     )
     config = _causal_hd128_resident_seed(512).config
-    bound = _causal_attention_output.bind((q, k, v))
+    bound = _causal_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
     code = bound.to_triton_code(active_config)
@@ -2118,16 +2527,88 @@ def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     assert normalized_rmse.item() < 0.003
 
 
-def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
+_HYBRID_PASS2_HELPERS = frozenset(
+    {
+        "fa4_disc_exp_convert_store_pipe",
+        "fa4_disc_exp_convert_store_pipe_causal",
+    }
+)
+_CAUSAL_SPLIT_SEGMENT_LOOP_VARS = {
+    "flash_kv_mask_iter": "masked",
+    "flash_kv_unmask_iter": "unmasked",
+}
+
+
+def _disc_pass2_calls_by_segment(
+    module: ast.Module, helpers: frozenset[str]
+) -> dict[str, list[ast.Call]]:
+    """PASS2 helper calls of the split causal body keyed by their segment.
+
+    The masked diagonal prefix (``for flash_kv_mask_iter``) and the unmasked
+    suffix (``for flash_kv_unmask_iter``) are told apart by the enclosing
+    loop, not by the helper's name: with ``cute_flash_causal_mask_storeback``
+    PASS1 stores the masked scores back and the masked segment runs the plain
+    helper too, at its own (masked) cadence.
+    """
+    calls: dict[str, list[ast.Call]] = {"masked": [], "unmasked": []}
+    for loop in ast.walk(module):
+        if not isinstance(loop, ast.For) or not isinstance(loop.target, ast.Name):
+            continue
+        segment = _CAUSAL_SPLIT_SEGMENT_LOOP_VARS.get(loop.target.id)
+        if segment is None:
+            continue
+        calls[segment].extend(
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in helpers
+        )
+    return calls
+
+
+def _assert_hybrid_pass2_routes(module: ast.Module) -> None:
+    """Masked segment: degree-2 emulation; unmasked segment: degree 1.
+
+    Holds for both values of ``cute_flash_causal_mask_storeback`` (the knob
+    changes which helper the masked segment calls, not its polynomial).
+    """
+    segments = _disc_pass2_calls_by_segment(module, _HYBRID_PASS2_HELPERS)
+    assert {segment: len(calls) for segment, calls in segments.items()} == {
+        "masked": 2,
+        "unmasked": 2,
+    }
+    for segment, calls in segments.items():
+        polynomial = {"degree2": True} if segment == "masked" else {"degree1": True}
+        for call in calls:
+            assert ast.literal_eval(call.args[8]) == 16
+            assert ast.literal_eval(call.args[9]) == 8
+            keywords = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}, (
+                segment,
+                call.func.attr,  # pyrefly: ignore[missing-attribute]
+            )
+
+
+@pytest.mark.parametrize("storeback", (False, True))
+def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2(storeback: bool) -> None:
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
             64,
             512,
-            _manual_config(_HYBRID_PACKET),
+            _manual_config(
+                _HYBRID_PACKET,
+                **{cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback},
+            ),
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
+    assert config.causal_mask_storeback is storeback
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
         head_dim=64,
@@ -2140,35 +2621,14 @@ def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
         io_dtype="cutlass.Float16",
         score_plan=causal_score_plan(64),
     )
-    module = ast.Module(body=body, type_ignores=[])
-    pass2_calls = [
-        node
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_disc_exp_convert_store_pipe",
-            "fa4_disc_exp_convert_store_pipe_causal",
-        }
-    ]
-    assert len(pass2_calls) == 4
-    for call in pass2_calls:
-        assert ast.literal_eval(call.args[8]) == 16
-        assert ast.literal_eval(call.args[9]) == 8
-        keywords = {
-            keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords
-        }
-        polynomial = (
-            {"degree2": True}
-            if call.func.attr.endswith("_causal")
-            else {"degree1": True}
-        )
-        assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}
+    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
 
 
+@pytest.mark.parametrize("storeback", (False, True))
 @pytest.mark.parametrize("num_kv", (1024, 4096, 5120, 6144, 7168, 8192))
-def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
+def test_bfloat16_hybrid_packet_uses_audited_causal_routes(
+    num_kv: int, storeback: bool
+) -> None:
     config = next(
         seed.config
         for seed in cute_flash.flash_attention_seed_configs(
@@ -2177,6 +2637,7 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _HYBRID_PACKET
     )
@@ -2184,11 +2645,13 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
         resolved = cute_flash.resolve_flash_config(
             64,
             num_kv,
-            config,
+            {**config, cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback},
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
+    assert resolved.causal_mask_storeback is storeback
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
         head_dim=64,
@@ -2201,29 +2664,7 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
         io_dtype="cutlass.BFloat16",
         score_plan=causal_score_plan(64),
     )
-    module = ast.Module(body=body, type_ignores=[])
-    pass2_calls = [
-        node
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_disc_exp_convert_store_pipe",
-            "fa4_disc_exp_convert_store_pipe_causal",
-        }
-    ]
-    assert len(pass2_calls) == 4
-    for call in pass2_calls:
-        keywords = {
-            keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords
-        }
-        polynomial = (
-            {"degree2": True}
-            if call.func.attr.endswith("_causal")
-            else {"degree1": True}
-        )
-        assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}
+    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
 
 
 @pytest.mark.parametrize(
@@ -2266,6 +2707,7 @@ def test_polynomial_packet_uses_whole_row_dense_pass2(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            fast_math=True,
         )
     assert config.exp2_packet == packet
     assert config.e2e_schedule == f"{freq}/{res}"
@@ -2326,6 +2768,7 @@ def test_short_degree1_packet_reverses_steady_correction_order(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            fast_math=True,
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -2390,6 +2833,7 @@ def _emit_dense_single_stat_source(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            fast_math=True,
         )
         body = cute_flash.emit_flash_fa4_device_body(
             cast("DeviceFunction", None),
@@ -2615,6 +3059,7 @@ def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
             260,
             dtype=torch.float16,
             standard_dense_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
     )
@@ -2623,7 +3068,7 @@ def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
         cute_flash.FLASH_STAT_TRANSPORT_KEY: "single_final",
     }
 
-    bound = _dense_attention_output.bind((q, k, v))
+    bound = _dense_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
     code = bound.to_triton_code(active_config)
@@ -2653,6 +3098,7 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
             256,
             dtype=torch.bfloat16,
             standard_dense_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
     )
@@ -2661,7 +3107,7 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
         torch.randn(1, 1, 32_768, 128, dtype=torch.bfloat16, device=DEVICE)
         for _ in range(3)
     )
-    bound = _dense_attention_output.bind(first_args)
+    bound = _dense_attention_output_fast_math.bind(first_args)
     active_config = helion.Config(**config)
     bound.set_config(active_config)
     code = bound.to_triton_code(active_config)
@@ -2780,6 +3226,8 @@ def _run_specialized_flash_family_correctness(
     num_kv: int,
 ) -> None:
     sequence_extent = num_kv * 128
+    # The polynomial packets exist on the fast_math surface only.
+    fast_math = packet in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
     configs = cute_flash.flash_attention_seed_configs(
         head_dim,
         num_kv,
@@ -2787,6 +3235,7 @@ def _run_specialized_flash_family_correctness(
         is_causal=is_causal,
         standard_dense_output=not is_causal,
         standard_causal_output=is_causal,
+        fast_math=fast_math,
     )
     config = next(
         (
@@ -2805,6 +3254,7 @@ def _run_specialized_flash_family_correctness(
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            fast_math=fast_math,
             pipeline_family_override=family,
         )
         config = {
@@ -2826,7 +3276,14 @@ def _run_specialized_flash_family_correctness(
         )
         for _ in range(3)
     )
-    kernel = _causal_attention_output if is_causal else _dense_attention_output
+    if fast_math:
+        kernel = (
+            _causal_attention_output_fast_math
+            if is_causal
+            else _dense_attention_output_fast_math
+        )
+    else:
+        kernel = _causal_attention_output if is_causal else _dense_attention_output
     bound = kernel.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
@@ -2838,6 +3295,7 @@ def _run_specialized_flash_family_correctness(
         is_causal=is_causal,
         standard_dense_output=not is_causal,
         standard_causal_output=is_causal,
+        fast_math=fast_math,
     )
     code = bound.to_triton_code(active_config)
     outputs = [bound(q, k, v) for _ in range(3)]
@@ -2902,6 +3360,7 @@ def test_specialized_flash_family_rejects_adjacent_unaligned_length(
         is_causal=is_causal,
         standard_dense_output=not is_causal,
         standard_causal_output=is_causal,
+        fast_math=True,
     )
     packet_fragment = fragments[cute_flash.FLASH_EXP2_PACKET_KEY]
     family_fragment = fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
@@ -2922,6 +3381,7 @@ def test_specialized_flash_family_rejects_adjacent_unaligned_length(
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            fast_math=True,
         )
     assert (resolved.pipeline_family, resolved.exp2_packet) != (family, packet)
 
@@ -3069,7 +3529,7 @@ def test_persistent_legacy_degree1_final_only_is_accurate_across_work() -> None:
         "cute_flash_rescale_chunk_cols": 8,
     }
 
-    bound = _dense_attention_output.bind((q, k, v))
+    bound = _dense_attention_output_fast_math.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
     code = bound.to_triton_code(active_config)
@@ -3209,7 +3669,7 @@ def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
     k[:, :, 128, :] = -4.0
 
     code, out = code_and_output(
-        _causal_attention_output,
+        _causal_attention_output_fast_math,
         (q, k, v),
         **_hybrid_runtime_config(),
     )
@@ -3243,11 +3703,13 @@ def test_bfloat16_hybrid_packet_matches_sdpa_beyond_registered_length() -> None:
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _HYBRID_PACKET
     )
-    code, out = code_and_output(_causal_attention_output, (q, k, v), **config)
-    repeated = code_and_output(_causal_attention_output, (q, k, v), **config)[1]
+    kernel = _causal_attention_output_fast_math
+    code, out = code_and_output(kernel, (q, k, v), **config)
+    repeated = code_and_output(kernel, (q, k, v), **config)[1]
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     assert "degree1=True" in code
@@ -3265,6 +3727,7 @@ def test_degree2_packet_normalizes_by_effective_schedule() -> None:
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
     assert resolved.exp2_packet == _DEG2_PACKET
     assert resolved.e2e_schedule == "16/6"
@@ -3300,6 +3763,7 @@ def test_bfloat16_hd128_causal_keeps_16x6_without_degree2() -> None:
         dtype=torch.bfloat16,
         is_causal=True,
         pipeline_family_override="fa4",
+        fast_math=True,
     )
     schedule_fragment = fragments[cute_flash.FLASH_E2E_SCHEDULE_KEY]
     packet_fragment = fragments[cute_flash.FLASH_EXP2_PACKET_KEY]
@@ -3333,6 +3797,7 @@ def test_degree1_packet_requires_standard_dense_output(
             overrides,
             dtype=torch.float16,
             is_causal=False,
+            fast_math=True,
         )
         standard = cute_flash.resolve_flash_config(
             64,
@@ -3341,6 +3806,7 @@ def test_degree1_packet_requires_standard_dense_output(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            fast_math=True,
         )
         causal = cute_flash.resolve_flash_config(
             64,
@@ -3348,6 +3814,7 @@ def test_degree1_packet_requires_standard_dense_output(
             overrides,
             dtype=torch.float16,
             is_causal=True,
+            fast_math=True,
         )
 
     assert nonstandard.exp2_packet == "8x2"
@@ -3367,6 +3834,7 @@ def test_hybrid_packet_normalizes_by_effective_schedule() -> None:
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
     assert resolved.exp2_packet == _HYBRID_PACKET
     assert resolved.e2e_schedule == "16/8"
@@ -3395,6 +3863,7 @@ def test_degree2_packet_canonicalizes_cadence_but_preserves_phase_offsets() -> N
                     dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
             )
 
@@ -3405,7 +3874,7 @@ def test_degree2_packet_canonicalizes_cadence_but_preserves_phase_offsets() -> N
 
 @pytest.mark.parametrize(
     "eligibility_fact",
-    ("has_kv_tile_pruning", "requires_ws_overlap", "small_biased_candidate"),
+    ("requires_ws_overlap", "small_biased_candidate"),
 )
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_hybrid_packet_does_not_survive_ineligible_attention_fact(
@@ -3419,9 +3888,42 @@ def test_hybrid_packet_does_not_survive_ineligible_attention_fact(
             dtype=dtype,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
             **{eligibility_fact: True},
         )
     assert resolved.exp2_packet == "1x1"
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_hybrid_packet_survives_kv_tile_pruning_with_standard_output(
+    dtype: torch.dtype,
+) -> None:
+    # The KV-tile-pruned masks with a proven three-segment loop run the
+    # packet on their unmasked interior (``standard_causal_output`` names
+    # them); without that output fact (the document-id mask, an LSE store)
+    # the packet canonicalizes away.
+    with patch.dict(os.environ, {}, clear=True):
+        pruned = cute_flash.resolve_flash_config(
+            64,
+            512,
+            _manual_config(_HYBRID_PACKET),
+            dtype=dtype,
+            has_kv_tile_pruning=True,
+            standard_causal_output=True,
+            fast_math=True,
+        )
+        plain = cute_flash.resolve_flash_config(
+            64,
+            512,
+            _manual_config(_HYBRID_PACKET),
+            dtype=dtype,
+            has_kv_tile_pruning=True,
+            fast_math=True,
+        )
+    assert pruned.exp2_packet == _HYBRID_PACKET
+    assert pruned.causal_loop_split
+    assert pruned.causal_kv_order == "descending"
+    assert plain.exp2_packet == "1x1"
 
 
 @pytest.mark.parametrize(
@@ -3501,6 +4003,7 @@ def test_degree2_packet_incompatible_schedule_normalizes(
             _manual_config(**overrides),
             dtype=dtype,
             is_causal=is_causal,
+            fast_math=True,
         )
     assert resolved.exp2_packet == "1x1"
 
@@ -3550,6 +4053,7 @@ def test_manual_packet_config_spec_is_fixed_not_searched(
             block_size_targets={0: 1, 1: 128, 2: 128},
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
 
         fragment = spec._flat_fields()[cute_flash.FLASH_EXP2_PACKET_KEY]
@@ -3581,10 +4085,914 @@ def test_dense_degree1_environment_builds_canonical_fragments() -> None:
             64,
             2048,
             standard_dense_output=True,
+            fast_math=True,
         )
-        nonstandard = cute_flash.flash_autotune_fragments(64, 2048)
+        nonstandard = cute_flash.flash_autotune_fragments(64, 2048, fast_math=True)
+        # Without the fast_math setting the environment's polynomial packet
+        # is not a legal value: the surface keeps its exact default and its
+        # searched packets (the gate covers the env override too).
+        gated = cute_flash.flash_autotune_fragments(
+            64,
+            2048,
+            standard_dense_output=True,
+        )
 
     assert fragments[cute_flash.FLASH_EXP2_PACKET_KEY].search_choices == (_DEG1_PACKET,)
     assert fragments[cute_flash.FLASH_E2E_SCHEDULE_KEY].choices == ("16/8",)
     assert fragments[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY].choices == ("inherit",)
     assert nonstandard[cute_flash.FLASH_EXP2_PACKET_KEY].choices[0] == "8x2"
+    gated_packet = gated[cute_flash.FLASH_EXP2_PACKET_KEY]
+    assert isinstance(gated_packet, EnumFragment)
+    assert gated_packet.default() == "8x2"
+    assert _DEG1_PACKET not in gated_packet.choices
+    assert len(gated_packet.search_choices or gated_packet.choices) > 1
+    assert gated[cute_flash.FLASH_E2E_SCHEDULE_KEY].choices != ("16/8",)
+
+
+# ---------------------------------------------------------------------------
+# The fast_math gate: the polynomial exp2 packets (an approximation of the
+# hardware ex2.approx) reach every flash surface only when the kernel opted
+# into the ``fast_math`` setting.
+# ---------------------------------------------------------------------------
+
+_RESIDENT_POLYNOMIAL_PACKETS = (
+    _CAUSAL_HD128_RESIDENT_PACKET,
+    _CAUSAL_HD128_RESIDENT_16X4_PACKET,
+    _CAUSAL_HD128_RESIDENT_16X2_PACKET,
+)
+_SLIDING_WINDOW_PLAN = {
+    "has_kv_tile_pruning": True,
+    "standard_causal_output": True,
+    "has_score_modifiers": True,
+    "score_modifier_kinds": (SLIDING_WINDOW_MASK_KIND,),
+    "plain_row_body": False,
+}
+# Every body that offers a polynomial packet: (surface options, the family
+# the packets own, the gated packets, the exact packets the surface keeps).
+_GATED_SURFACES = (
+    pytest.param(
+        {"head_dim": 64, "num_kv": 256, "dtype": torch.float16},
+        {"standard_dense_output": True},
+        "fa4_2cta",
+        (_DEG2_PACKET, _DEG1_PACKET, _DEG1_SHORT_PACKET),
+        (),
+        id="fp16-d64-dense",
+    ),
+    pytest.param(
+        {"head_dim": 64, "num_kv": 512, "dtype": torch.float16},
+        {"is_causal": True, "standard_causal_output": True},
+        "fa4",
+        (_DEG2_PACKET, _HYBRID_PACKET),
+        (),
+        id="fp16-d64-causal",
+    ),
+    pytest.param(
+        {"head_dim": 64, "num_kv": 512, "dtype": torch.bfloat16},
+        {"is_causal": True, "standard_causal_output": True},
+        "fa4",
+        (_HYBRID_PACKET,),
+        (),
+        id="bf16-d64-causal",
+    ),
+    pytest.param(
+        {"head_dim": 64, "num_kv": 64, "dtype": torch.bfloat16},
+        _SLIDING_WINDOW_PLAN,
+        "fa4",
+        (_HYBRID_PACKET,),
+        (),
+        id="bf16-d64-pruned-split",
+    ),
+    pytest.param(
+        {"head_dim": 64, "num_kv": 64, "dtype": torch.float16},
+        {**_SLIDING_WINDOW_PLAN, "score_modifier_kinds": (PREFIX_LM_MASK_KIND,)},
+        "fa4",
+        (_HYBRID_PACKET,),
+        (),
+        id="fp16-d64-pruned-split",
+    ),
+    pytest.param(
+        {"head_dim": 128, "num_kv": 16, "num_bh": 32, "dtype": torch.bfloat16},
+        {"standard_dense_output": True},
+        "fa4_2cta",
+        (_DEG2_PACKET,),
+        (),
+        id="bf16-d128-dense",
+    ),
+    pytest.param(
+        {"head_dim": 128, "num_kv": 32, "dtype": torch.bfloat16},
+        {"is_causal": True, "standard_causal_output": True},
+        "fa4",
+        _RESIDENT_POLYNOMIAL_PACKETS,
+        (_CAUSAL_HD128_RESIDENT_XU_PACKET,),
+        id="bf16-d128-causal",
+    ),
+    pytest.param(
+        {"head_dim": 192, "head_dim_v": 128, "num_kv": 32, "dtype": torch.bfloat16},
+        {"is_causal": True, "standard_causal_output": True},
+        "fa4",
+        _RESIDENT_POLYNOMIAL_PACKETS,
+        (_CAUSAL_HD128_RESIDENT_XU_PACKET,),
+        id="pair-192-128-causal",
+    ),
+)
+
+
+def _active(fragment: object) -> tuple[object, ...]:
+    assert isinstance(fragment, EnumFragment)
+    choices = fragment.choices
+    search = fragment.search_choices
+    return tuple(choices) if search is None else tuple(search)
+
+
+def test_gated_packet_set_is_every_polynomial_packet() -> None:
+    """The gate covers exactly the compound packets whose cadence runs the
+    polynomial on some pairs: every compound packet but the hardware-only
+    resident sibling, whose PASS2 routes no pair to the polynomial."""
+    gated = cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+    assert gated == frozenset(cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS) - {
+        _CAUSAL_HD128_RESIDENT_XU_PACKET
+    }
+    assert gated == {
+        _DEG2_PACKET,
+        _HYBRID_PACKET,
+        _DEG1_PACKET,
+        _DEG1_SHORT_PACKET,
+        *_RESIDENT_POLYNOMIAL_PACKETS,
+    }
+    for packet in cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS:
+        params = cute_flash._flash_disc_exp2_codegen_params(packet, 8, 2)
+        runs_polynomial = params.degree2 or params.degree1_unmasked
+        assert runs_polynomial is (
+            packet in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+        ), packet
+    for plain in cute_flash._FLASH_EXP2_PACKET_PARAMS:
+        assert plain not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+        assert cute_flash._flash_exp2_packet_admitted(plain, False)
+    assert not cute_flash._flash_exp2_packet_admitted(_DEG2_PACKET, False)
+    assert cute_flash._flash_exp2_packet_admitted(_DEG2_PACKET, True)
+
+
+@pytest.mark.parametrize(("shape", "plan", "family", "gated", "kept"), _GATED_SURFACES)
+def test_polynomial_packets_reach_every_surface_under_fast_math_only(
+    shape: dict[str, object],
+    plan: dict[str, object],
+    family: str,
+    gated: tuple[str, ...],
+    kept: tuple[str, ...],
+) -> None:
+    """Fragments (choices and search choices), seeds, the compound overrides,
+    the resolver and ``flash_config_from_config`` agree on every body: the
+    polynomial packets are offered, seeded and effective under ``fast_math``
+    and absent otherwise, when a request for one resolves to the surface's
+    exact default packet. The hardware-only resident sibling stays."""
+    shape = dict(shape)
+    head_dim = cast("int", shape.pop("head_dim"))
+    num_kv = cast("int", shape.pop("num_kv"))
+    options = {**shape, **plan}
+    override_options = {
+        key: value
+        for key, value in options.items()
+        if key
+        in (
+            "dtype",
+            "is_causal",
+            "has_kv_tile_pruning",
+            "standard_dense_output",
+            "standard_causal_output",
+            "head_dim_v",
+        )
+    }
+    override_options.setdefault("is_causal", False)
+    for fast_math in (False, True):
+        fragments = cute_flash.flash_autotune_fragments(
+            head_dim, num_kv, fast_math=fast_math, **options
+        )
+        packet_fragment = fragments[cute_flash.FLASH_EXP2_PACKET_KEY]
+        assert isinstance(packet_fragment, EnumFragment)
+        default_packet = packet_fragment.default()
+        assert default_packet not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+        for packet in gated:
+            assert (packet in packet_fragment.choices) is fast_math, packet
+            assert (packet in _active(packet_fragment)) is fast_math, packet
+        for packet in kept:
+            assert packet in packet_fragment.choices
+            assert packet in _active(packet_fragment)
+        seeds = cute_flash.flash_attention_seed_configs(
+            head_dim, num_kv, fast_math=fast_math, **options
+        )
+        seeded = {seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) for seed in seeds}
+        for packet in gated:
+            assert (packet in seeded) is fast_math, packet
+        for packet in kept:
+            assert packet in seeded
+        for packet in gated:
+            overrides = cute_flash._flash_compound_exp2_packet_overrides(
+                head_dim,
+                num_kv,
+                {cute_flash.FLASH_EXP2_PACKET_KEY: packet},
+                fast_math=fast_math,
+                **override_options,
+            )
+            assert bool(overrides) is fast_math, packet
+            if fast_math:
+                assert overrides[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == family
+            request = {
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+                cute_flash.FLASH_EXP2_PACKET_KEY: packet,
+            }
+            with patch.dict(os.environ, {}, clear=True):
+                resolved = cute_flash.resolve_flash_config(
+                    head_dim, num_kv, request, fast_math=fast_math, **options
+                )
+                reconstructed = cute_flash.flash_config_from_config(
+                    request,
+                    head_dim,
+                    num_kv,
+                    fast_math=fast_math,
+                    **{
+                        key: value
+                        for key, value in options.items()
+                        if key != "head_dim_v"
+                    },
+                )
+            assert resolved.pipeline_family == family
+            if fast_math:
+                assert resolved.exp2_packet == packet
+            else:
+                # The same request without the packet: the exact default of
+                # the requested family (``8x2`` on the dense hd64 2CTA body).
+                with patch.dict(os.environ, {}, clear=True):
+                    plain = cute_flash.resolve_flash_config(
+                        head_dim,
+                        num_kv,
+                        {cute_flash.FLASH_PIPELINE_FAMILY_KEY: family},
+                        **options,
+                    )
+                assert resolved.exp2_packet == plain.exp2_packet
+                assert (
+                    resolved.exp2_packet not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+                )
+                assert resolved.e2e_schedule == plain.e2e_schedule
+            if "head_dim_v" not in options:
+                assert reconstructed.exp2_packet == resolved.exp2_packet
+
+
+@pytest.mark.parametrize("fast_math", (False, True), ids=("default", "fast_math"))
+def test_environment_packet_override_follows_the_gate(fast_math: bool) -> None:
+    """``HELION_CUTE_FLASH_EXP2_PACKET`` cannot bypass the gate: without the
+    setting a polynomial packet from the environment resolves to the exact
+    default and the fragment surface is not pinned to it."""
+    with patch.dict(
+        os.environ, {"HELION_CUTE_FLASH_EXP2_PACKET": _DEG2_PACKET}, clear=True
+    ):
+        resolved = cute_flash.resolve_flash_config(
+            64,
+            512,
+            None,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+            fast_math=fast_math,
+        )
+        fragment = cute_flash.flash_autotune_fragments(
+            64,
+            512,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+            fast_math=fast_math,
+        )[cute_flash.FLASH_EXP2_PACKET_KEY]
+    assert isinstance(fragment, EnumFragment)
+    if fast_math:
+        assert resolved.exp2_packet == _DEG2_PACKET
+        assert fragment.choices == (_DEG2_PACKET,)
+    else:
+        assert resolved.exp2_packet == "1x1"
+        assert fragment.default() == "1x1"
+        assert _DEG2_PACKET not in fragment.choices
+        assert len(fragment.choices) > 1
+
+
+def _seed_values(seeds: tuple[helion.Config, ...], **match: object) -> list[dict]:
+    return [
+        seed.config
+        for seed in seeds
+        if all(seed.config.get(key) == value for key, value in match.items())
+    ]
+
+
+def test_withheld_packet_seeds_keep_their_structure_on_exact_packets() -> None:
+    """Without ``fast_math`` no seed is dropped for its packet alone: each
+    polynomial packet's seed keeps the structure the compound overrides pin
+    (parent family, the degree-3 cadence of the same period, discounted
+    PASS2, descending loop split) on the surface's default packet, the
+    resident cadences take the hardware-only sibling, and the measured
+    causal hd64 hybrid body and the pruned hybrid source variant keep their
+    knobs. The duplicates the resident fold creates are the only count drop."""
+    dense = {"dtype": torch.float16, "standard_dense_output": True}
+    dense_seeds = {
+        fast_math: cute_flash.flash_attention_seed_configs(
+            64, 256, fast_math=fast_math, **dense
+        )
+        for fast_math in (False, True)
+    }
+    # 33 on this surface: the hillclimb's 29 plus main's explicit
+    # standard/resident lowering seeds.
+    assert len(dense_seeds[False]) == len(dense_seeds[True]) == 33
+    for cadence in ("16/6", "16/8", "8/2"):
+        matches = _seed_values(
+            dense_seeds[False],
+            **{
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+                cute_flash.FLASH_E2E_SCHEDULE_KEY: cadence,
+                cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+                cute_flash.FLASH_SOFTMAX_DISC_KEY: False,
+            },
+        )
+        assert len(matches) >= 1, cadence
+    assert not any(
+        seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY)
+        in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+        for seed in dense_seeds[False]
+    )
+
+    causal = {"dtype": torch.float16, "is_causal": True, "standard_causal_output": True}
+    causal_seeds = {
+        fast_math: cute_flash.flash_attention_seed_configs(
+            64, 512, fast_math=fast_math, **causal
+        )
+        for fast_math in (False, True)
+    }
+    assert len(causal_seeds[False]) == len(causal_seeds[True]) == 14
+    split = {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+        cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+    }
+    # The degree-2 packet-loop seed's structure (16/6 on both segments) ...
+    assert _seed_values(
+        causal_seeds[False],
+        **{
+            **split,
+            cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/6",
+            cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+        },
+    )
+    # ... the hybrid packet-loop seed's (16/8) and the measured s4096 hybrid
+    # body with its register split, rescale and load-order knobs.
+    hybrid_bodies = _seed_values(
+        causal_seeds[False],
+        **{
+            **split,
+            cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/8",
+            cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
+            cute_flash.FLASH_DISC_PIPE_KEY: 2,
+        },
+    )
+    assert len(hybrid_bodies) == 2
+    measured = [
+        body
+        for body in hybrid_bodies
+        if body.get(cute_flash.FLASH_SOFTMAX_REGS_KEY) == 200
+        and body.get(cute_flash.FLASH_CORR_REGS_KEY) == 64
+        and body.get(cute_flash.FLASH_RESCALE_CHUNK_COLS_KEY) == 8
+        and body.get(cute_flash.FLASH_RESCALE_THRESHOLD_KEY) == 8.0
+        and body.get(cute_flash.FLASH_FIRST_LOAD_ORDER_KEY) == 2
+        and body.get(cute_flash.FLASH_EPI_TMA_KEY) is True
+        and body.get(cute_flash.FLASH_CAUSAL_SKIP_DEAD_TILE_KEY) is False
+    ]
+    assert len(measured) == 1
+    # Both substitutes carry the whole structure the packet pins, the derived
+    # query-slot count included.
+    assert all(
+        body.get(cute_flash.FLASH_Q_TILE_COUNT_KEY) == 2
+        and body.get(cute_flash.FLASH_P_STORE_REP_KEY) == 16
+        and body.get(cute_flash.FLASH_S_LOAD_REP_KEY) == 32
+        for body in hybrid_bodies
+    )
+    # The three campaign bodies (4x1, 8x2 and the hybrid structure) are still
+    # seeded, as are the fa4 pair bodies and the descending loop split.
+    assert _seed_values(
+        causal_seeds[False],
+        **{
+            cute_flash.FLASH_EXP2_PACKET_KEY: "4x1",
+            cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+        },
+    )
+    assert _seed_values(
+        causal_seeds[False],
+        **{cute_flash.FLASH_EXP2_PACKET_KEY: "8x2", cute_flash.FLASH_KV_STAGE_KEY: 7},
+    )
+    for seed in causal_seeds[False]:
+        with patch.dict(os.environ, {}, clear=True):
+            resolved = cute_flash.resolve_flash_config(
+                64,
+                512,
+                {k: v for k, v in seed.config.items() if k != "block_sizes"},
+                **causal,
+            )
+        assert resolved.exp2_packet not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+
+    pruned_seeds = {
+        fast_math: cute_flash.flash_attention_seed_configs(
+            64, 64, dtype=torch.bfloat16, fast_math=fast_math, **_SLIDING_WINDOW_PLAN
+        )
+        for fast_math in (False, True)
+    }
+    assert len(pruned_seeds[False]) == len(pruned_seeds[True]) == 10
+    variant = _seed_values(
+        pruned_seeds[False],
+        **{
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+            cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/8",
+            cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
+            cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            cute_flash.FLASH_FIRST_LOAD_ORDER_KEY: 3,
+            cute_flash.FLASH_MMA_INTERLEAVE_KEY: True,
+            cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+            cute_flash.FLASH_DISC_PIPE_KEY: 2,
+            cute_flash.FLASH_Q_TILE_COUNT_KEY: 2,
+        },
+    )
+    assert len(variant) == 1
+
+    resident = {
+        "dtype": torch.bfloat16,
+        "is_causal": True,
+        "standard_causal_output": True,
+    }
+    hd128_seeds = {
+        fast_math: cute_flash.flash_attention_seed_configs(
+            128, 32, fast_math=fast_math, **resident
+        )
+        for fast_math in (False, True)
+    }
+    # The three polynomial cadences fold onto the hardware-only sibling.
+    assert len(hd128_seeds[True]) - len(hd128_seeds[False]) == 3
+    assert (
+        len(
+            _seed_values(
+                hd128_seeds[False],
+                **{cute_flash.FLASH_EXP2_PACKET_KEY: _CAUSAL_HD128_RESIDENT_XU_PACKET},
+            )
+        )
+        == 1
+    )
+    pair_seeds = {
+        fast_math: cute_flash.flash_attention_seed_configs(
+            192, 32, head_dim_v=128, fast_math=fast_math, **resident
+        )
+        for fast_math in (False, True)
+    }
+    assert len(pair_seeds[True]) - len(pair_seeds[False]) == 5
+    staged = _seed_values(
+        pair_seeds[False],
+        **{
+            cute_flash.FLASH_EXP2_PACKET_KEY: _CAUSAL_HD128_RESIDENT_XU_PACKET,
+            cute_flash.FLASH_UNEVEN_KV_RING_KEY: True,
+            cute_flash.FLASH_O_OVER_Q_KEY: True,
+        },
+    )
+    # The 16/6 structures on the hd128 winner registers and the defaults, the
+    # sparse structure on FA4's 192/72 split and at the hint, each now on the
+    # hardware-only sibling with its dead phase offsets dropped.
+    assert sorted(
+        (
+            body.get(cute_flash.FLASH_SOFTMAX_REGS_KEY),
+            body.get(cute_flash.FLASH_RESCALE_THRESHOLD_KEY),
+            body.get(cute_flash.FLASH_WAIT_HINT_KEY),
+            body.get(cute_flash.FLASH_CAUSAL_LPT_L2_SHIFT_KEY),
+        )
+        for body in staged
+    ) == sorted(
+        [
+            (160, 32.0, 0, 0),
+            (160, 8.0, 0, 0),
+            (192, 8.0, 0, 1),
+            (200, 8.0, 10_000_000, 0),
+        ]
+    )
+    for body in staged:
+        assert body.get(cute_flash.FLASH_E2E_OFFSET_KEY, 0) == 0
+        assert body.get(cute_flash.FLASH_E2E_OFFSET0_KEY, 0) == 0
+
+
+def _seeds_modulo(seeds: tuple[helion.Config, ...], *dropped: str) -> list[str]:
+    return sorted(
+        json.dumps(
+            {key: value for key, value in seed.config.items() if key not in dropped},
+            sort_keys=True,
+            default=str,
+        )
+        for seed in seeds
+    )
+
+
+# Bodies whose fast_math surface offers a polynomial packet (every seed the
+# gate withholds has a substitute) ...
+_PACKET_SUBSTITUTED_BODIES = (
+    pytest.param(
+        64,
+        256,
+        {"dtype": torch.float16, "standard_dense_output": True},
+        id="fp16-d64-dense",
+    ),
+    pytest.param(
+        64,
+        512,
+        {"dtype": torch.float16, "is_causal": True, "standard_causal_output": True},
+        id="fp16-d64-causal",
+    ),
+    pytest.param(
+        64,
+        512,
+        {"dtype": torch.bfloat16, "is_causal": True, "standard_causal_output": True},
+        id="bf16-d64-causal",
+    ),
+    pytest.param(
+        64, 64, {"dtype": torch.bfloat16, **_SLIDING_WINDOW_PLAN}, id="bf16-d64-pruned"
+    ),
+    pytest.param(
+        64,
+        64,
+        {
+            "dtype": torch.float16,
+            **_SLIDING_WINDOW_PLAN,
+            "score_modifier_kinds": (PREFIX_LM_MASK_KIND,),
+        },
+        id="fp16-d64-prefix",
+    ),
+    pytest.param(
+        128,
+        16,
+        {"dtype": torch.bfloat16, "num_bh": 32, "standard_dense_output": True},
+        id="bf16-d128-dense",
+    ),
+)
+# ... and bodies it offers none to: the pruned hd128 kinds, the document-id
+# mask (no static interior), the row lower bound without the standard causal
+# output and the small-biased sliding window.
+_NEVER_POLYNOMIAL_BODIES = (
+    pytest.param(
+        128,
+        64,
+        {"dtype": torch.bfloat16, **_SLIDING_WINDOW_PLAN},
+        id="bf16-d128-pruned",
+    ),
+    pytest.param(
+        128,
+        64,
+        {
+            "dtype": torch.float16,
+            **_SLIDING_WINDOW_PLAN,
+            "score_modifier_kinds": (PREFIX_LM_MASK_KIND,),
+        },
+        id="fp16-d128-prefix",
+    ),
+    pytest.param(
+        64,
+        64,
+        {
+            "dtype": torch.bfloat16,
+            **_SLIDING_WINDOW_PLAN,
+            "standard_causal_output": False,
+            "score_modifier_kinds": (DOCUMENT_MASK_KIND,),
+        },
+        id="bf16-d64-document",
+    ),
+    pytest.param(
+        64,
+        128,
+        {
+            "dtype": torch.bfloat16,
+            **_SLIDING_WINDOW_PLAN,
+            "standard_causal_output": False,
+            "score_modifier_kinds": (ROW_KV_BEGIN_MASK_KIND,),
+        },
+        id="bf16-d64-row-kv-begin",
+    ),
+    pytest.param(
+        128,
+        128,
+        {
+            "dtype": torch.bfloat16,
+            **_SLIDING_WINDOW_PLAN,
+            "score_modifier_kinds": (ROW_KV_BEGIN_MASK_KIND,),
+        },
+        id="bf16-d128-row-kv-begin",
+    ),
+    pytest.param(
+        64,
+        64,
+        {
+            "dtype": torch.bfloat16,
+            **_SLIDING_WINDOW_PLAN,
+            "small_biased_candidate": True,
+        },
+        id="bf16-d64-small-biased",
+    ),
+)
+
+
+@pytest.mark.parametrize(("head_dim", "num_kv", "options"), _PACKET_SUBSTITUTED_BODIES)
+def test_default_seeds_are_the_fast_math_seeds_modulo_the_packet(
+    head_dim: int, num_kv: int, options: dict[str, object]
+) -> None:
+    """Without ``fast_math`` the seeds of a body that offers polynomial packets
+    differ from the fast_math seeds in the packet value alone: the packet
+    loop's seeds, the measured hybrid body and the pruned hybrid variant all
+    carry the structure their packet pins on the exact substitute, and no
+    seed is added or dropped."""
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = {
+            fast_math: cute_flash.flash_attention_seed_configs(
+                head_dim, num_kv, fast_math=fast_math, **{"num_bh": 64, **options}
+            )
+            for fast_math in (False, True)
+        }
+    packet_key = cute_flash.FLASH_EXP2_PACKET_KEY
+    assert len(seeds[False]) == len(seeds[True])
+    assert _seeds_modulo(seeds[False], packet_key) == _seeds_modulo(
+        seeds[True], packet_key
+    )
+    packets = {
+        fast_math: {seed.config[packet_key] for seed in seeds[fast_math]}
+        for fast_math in (False, True)
+    }
+    withheld = packets[True] - packets[False]
+    assert withheld and withheld <= cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+    assert not packets[False] & cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+
+
+@pytest.mark.parametrize(("head_dim", "num_kv", "options"), _NEVER_POLYNOMIAL_BODIES)
+def test_bodies_without_polynomial_packets_seed_alike_with_and_without_fast_math(
+    head_dim: int, num_kv: int, options: dict[str, object]
+) -> None:
+    """A body the fast_math surface offers no polynomial packet to seeds the
+    same list with and without the setting: the substitutes stand in for
+    withheld packets only, so the pruned hybrid variant is not seeded where
+    the hybrid packet was never eligible (hd128, the document-id mask)."""
+    packet_key = cute_flash.FLASH_EXP2_PACKET_KEY
+    with patch.dict(os.environ, {}, clear=True):
+        for fast_math in (True, False):
+            fragment = cute_flash.flash_autotune_fragments(
+                head_dim, num_kv, fast_math=fast_math, **{"num_bh": 64, **options}
+            )[packet_key]
+            assert not set(_active(fragment)) & cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+        seeds = {
+            fast_math: cute_flash.flash_attention_seed_configs(
+                head_dim, num_kv, fast_math=fast_math, **{"num_bh": 64, **options}
+            )
+            for fast_math in (False, True)
+        }
+    assert [seed.config for seed in seeds[False]] == [
+        seed.config for seed in seeds[True]
+    ]
+
+
+@pytest.mark.parametrize("is_causal", (True, False), ids=("causal", "dense"))
+def test_sm103_target_seeds_fall_back_to_exact_packets_without_fast_math(
+    is_causal: bool,
+) -> None:
+    """The sm_103 tables are written against polynomial packets (the causal
+    template against the degree-2 packet, the dense rows against the short
+    degree-1 one). Without ``fast_math`` the target seed keeps the table's
+    structure on the exact default packet and the policy widening at the end
+    of ``flash_autotune_fragments`` never re-admits the polynomial packet; with
+    it the tables are seeded as written."""
+    num_kv = 512 if is_causal else 256
+    options = {
+        "dtype": torch.float16,
+        "is_causal": is_causal,
+        "standard_dense_output": not is_causal,
+        "standard_causal_output": is_causal,
+        "target_device_capability": (10, 3),
+    }
+    table_packet = _DEG2_PACKET if is_causal else _DEG1_SHORT_PACKET
+    target_seeds: dict[bool, helion.Config] = {}
+    for fast_math in (False, True):
+        fragment = cute_flash.flash_autotune_fragments(
+            64, num_kv, fast_math=fast_math, **options
+        )[cute_flash.FLASH_EXP2_PACKET_KEY]
+        assert isinstance(fragment, EnumFragment)
+        assert (table_packet in fragment.choices) is fast_math
+        # The compiler seeds the complete template union of the target; select
+        # the row of this length (``_policy_template_seed``).
+        seed = _policy_template_seed(
+            num_kv, is_causal=is_causal, capability=(10, 3), fast_math=fast_math
+        )
+        assert seed is not None
+        target_seeds[fast_math] = seed
+        if fast_math:
+            assert seed.config[cute_flash.FLASH_EXP2_PACKET_KEY] == table_packet
+            continue
+        seeds = cute_flash.flash_attention_seed_configs(
+            64, num_kv, fast_math=fast_math, **options
+        )
+        assert seed in seeds
+        assert not any(
+            candidate.config.get(cute_flash.FLASH_EXP2_PACKET_KEY)
+            in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+            for candidate in seeds
+        )
+        if is_causal:
+            # The template's structure: fa4, the 16/6 cadence, the three-deep
+            # PASS2, the descending split, the TMA store and the row's ring.
+            assert seed.config[cute_flash.FLASH_EXP2_PACKET_KEY] == "1x1"
+            assert seed.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+            assert seed.config[cute_flash.FLASH_E2E_SCHEDULE_KEY] == "16/6"
+            assert seed.config[cute_flash.FLASH_DISC_PIPE_KEY] == 3
+            assert seed.config[cute_flash.FLASH_KV_STAGE_KEY] == 8
+            assert seed.config[cute_flash.FLASH_EPI_TMA_KEY] is True
+            assert seed.config[cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY] is True
+            assert seed.config[cute_flash.FLASH_CAUSAL_KV_ORDER_KEY] == "descending"
+            assert seed.config[cute_flash.FLASH_SOFTMAX_REGS_KEY] == 200
+            # The knobs the degree-2 packet implied follow the exact packet:
+            # the resident-native route pinned the staggered walk off for the
+            # polynomial packet, so the substitute takes the surface's default
+            # (on, the ring is deep enough), and the masked 16/6 cadence, equal
+            # to the main one, normalizes to ``inherit``.
+            assert seed.config[cute_flash.FLASH_CAUSAL_STAGGER_KEY] is True
+            assert seed.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == "inherit"
+        else:
+            # The dense row's structure on the pinned-2CTA surface's default
+            # packet: the 8/2 cadence, the single-slot handoff, the 160-wide
+            # KV tile and the whole-row sum.
+            assert seed.config[cute_flash.FLASH_EXP2_PACKET_KEY] == "8x2"
+            assert seed.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
+            assert seed.config[cute_flash.FLASH_E2E_SCHEDULE_KEY] == "8/2"
+            assert seed.config[cute_flash.FLASH_STAT_TRANSPORT_KEY] == "single"
+            assert seed.config[cute_flash.FLASH_KV_TILE_N_KEY] == 160
+            assert seed.config[cute_flash.FLASH_SP_ROW_SUM_KEY] == "whole"
+            assert seed.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is False
+        # The seed equals its normalized form on the target.
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 3),
+            device=torch.device("cpu"),
+            num_sm=148,
+        )
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=num_kv,
+            dtype=torch.float16,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            is_causal=is_causal,
+            standard_dense_output=not is_causal,
+            standard_causal_output=is_causal,
+        )
+        normalized = helion.Config(**seed.config)
+        spec.normalize(normalized)
+        assert all(
+            normalized.config[key] == value for key, value in seed.config.items()
+        )
+    # The substitute is the table with the packet swapped and nothing else
+    # but the knobs that packet implied.
+    differing = {
+        key
+        for key in set(target_seeds[True].config) | set(target_seeds[False].config)
+        if target_seeds[True].config.get(key) != target_seeds[False].config.get(key)
+    }
+    assert differing == (
+        {
+            cute_flash.FLASH_EXP2_PACKET_KEY,
+            cute_flash.FLASH_CAUSAL_STAGGER_KEY,
+            cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY,
+        }
+        if is_causal
+        else {cute_flash.FLASH_EXP2_PACKET_KEY}
+    )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "is_causal", "packet", "family"),
+    (
+        (64, torch.float16, False, _DEG2_PACKET, "fa4_2cta"),
+        (64, torch.float16, False, _DEG1_SHORT_PACKET, "fa4_2cta"),
+        (64, torch.float16, True, _HYBRID_PACKET, "fa4"),
+        (128, torch.bfloat16, True, _CAUSAL_HD128_RESIDENT_PACKET, "fa4"),
+    ),
+    ids=("deg2", "deg1-corr10", "hybrid", "resident"),
+)
+def test_pinned_polynomial_config_needs_the_fast_math_spec(
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    packet: str,
+    family: str,
+) -> None:
+    """A saved config carrying a polynomial packet is rejected by the config
+    spec of a kernel without ``fast_math`` (``InvalidConfig``) and accepted,
+    with the packet's cadence pinned, by the spec of one with it."""
+    config = helion.Config(
+        block_sizes=[1, 128, 128],
+        **{
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: family,
+            cute_flash.FLASH_EXP2_PACKET_KEY: packet,
+        },
+    )
+    specs = {}
+    for fast_math in (False, True):
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 0),
+            device=torch.device("cpu"),
+            num_sm=148,
+        )
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=head_dim,
+            num_kv=512,
+            dtype=dtype,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            is_causal=is_causal,
+            standard_dense_output=not is_causal,
+            standard_causal_output=is_causal,
+            fast_math=fast_math,
+        )
+        assert spec._cute_flash_fast_math is fast_math
+        specs[fast_math] = spec
+    # The spec's resolver withholds the packet on its own, ahead of the
+    # fragment-choice check normalization applies.
+    pinned = {
+        key: value for key, value in config.config.items() if key != "block_sizes"
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        resolved = {
+            fast_math: specs[fast_math]._resolve_cute_flash_config(pinned)
+            for fast_math in (False, True)
+        }
+    assert resolved[True].exp2_packet == packet
+    assert resolved[False].exp2_packet not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+    with pytest.raises(helion.exc.InvalidConfig, match=packet):
+        specs[False].normalize(helion.Config(**config.config))
+    normalized = helion.Config(**config.config)
+    specs[True].normalize(normalized)
+    assert normalized.config[cute_flash.FLASH_EXP2_PACKET_KEY] == packet
+    assert normalized.config[
+        cute_flash.FLASH_E2E_SCHEDULE_KEY
+    ] == cute_flash._flash_manual_exp2_packet_schedule_name(packet)
+    assert normalized.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == family
+
+
+@onlyBackends(["cute"])
+def test_polynomial_packets_on_the_kernels_require_fast_math() -> None:
+    """End to end through the device IR: the bound kernel's surface records
+    the setting (``ConfigSpec._cute_flash_fast_math``); without it a pinned
+    polynomial config is invalid, with it the polynomial pass is emitted and
+    stays within the output's tolerance."""
+    torch.manual_seed(110)
+    q, k, v = (
+        torch.randn(1, 1, 32_768, 64, dtype=torch.float16, device=DEVICE)
+        for _ in range(3)
+    )
+    dense_config = next(
+        seed.config
+        for seed in cute_flash.flash_attention_seed_configs(
+            64,
+            256,
+            dtype=torch.float16,
+            standard_dense_output=True,
+            fast_math=True,
+        )
+        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
+    )
+    bound = _dense_attention_output.bind((q, k, v))
+    assert not bound.config_spec._cute_flash_fast_math
+    with pytest.raises(helion.exc.InvalidConfig, match=_DEG2_PACKET):
+        bound.set_config(helion.Config(**dense_config))
+    fast = _dense_attention_output_fast_math.bind((q, k, v))
+    assert fast.config_spec._cute_flash_fast_math
+    active = helion.Config(**dense_config)
+    fast.set_config(active)
+    assert "degree2=True" in fast.to_triton_code(active)
+    out = fast(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
+
+    hybrid_config = _hybrid_runtime_config()
+    causal = _causal_attention_output.bind((q, k, v))
+    with pytest.raises(helion.exc.InvalidConfig, match=_HYBRID_PACKET):
+        causal.set_config(helion.Config(**hybrid_config))
+    fast_causal = _causal_attention_output_fast_math.bind((q, k, v))
+    active = helion.Config(**hybrid_config)
+    fast_causal.set_config(active)
+    code = fast_causal.to_triton_code(active)
+    assert "degree1=True" in code
+    assert "degree2=True" in code
+    out = fast_causal(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)

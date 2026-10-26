@@ -14,7 +14,6 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -33,6 +32,23 @@ def kernel_tuple_addition(
         for a_tensor in a_shared_tuple:
             acc += a_tensor[tile_n]
         out[tile_n] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_list_stores_then_second_root(
+    x: torch.Tensor, ys: list[torch.Tensor], zs: list[torch.Tensor]
+) -> torch.Tensor:
+    """List loops in one root leave their loop variables bound for the next root."""
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(x.size(0)):
+        v = x[tile_n] * 2
+        for peer_y in ys:
+            peer_y[tile_n] = v
+        for peer_z in zs:
+            peer_z[tile_n] = v + 1
+    for tile_n in hl.tile(x.size(0)):
+        out[tile_n] = x[tile_n]
     return out
 
 
@@ -565,6 +581,23 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         # Test correctness - should just copy the tensor
         torch.testing.assert_close(result, tensor)
 
+    @onlyBackends(["triton"])
+    def test_single_element_list_stores_before_second_root(self):
+        """One-element lists' leaked loop variables are not host arguments."""
+        x = torch.randn(16, device=DEVICE)
+        for count in (1, 3):
+            ys = [torch.zeros_like(x) for _ in range(count)]
+            zs = [torch.zeros_like(x) for _ in range(count)]
+            code, result = code_and_output(
+                kernel_list_stores_then_second_root, (x, ys, zs)
+            )
+            if not self._in_ref_eager_mode:
+                self.assertNotIn("peer_", code.split("_launcher(")[-1])
+            torch.testing.assert_close(result, x)
+            for y, z in zip(ys, zs, strict=True):
+                torch.testing.assert_close(y, 2 * x)
+                torch.testing.assert_close(z, 2 * x + 1)
+
     def test_constants_iteration(self):
         """Test iteration over tuple of constants."""
         size = (24,)
@@ -934,6 +967,11 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @skipIfMTIA(
         "Triton-MTIA: register-cache layernorm (G=8) needs >14 circular buffers; see T280008478"
     )
+    # MI350X CI intermittently returns wrong values for a few rows of this
+    # two-pass layernorm (up to ~900 elements off by up to 0.26) while
+    # every CUDA job passes; test_examples.py::test_softmax_bwd has the
+    # full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
@@ -963,6 +1001,11 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @skipIfMTIA(
         "Triton-MTIA: no-cache layernorm (G=8, 2*G loads) exceeds the 14 circular-buffer limit; see T280008478"
     )
+    # MI350X CI intermittently returns wrong values for a few rows of this
+    # two-pass layernorm (up to ~900 elements off by up to 0.26) while
+    # every CUDA job passes; test_examples.py::test_softmax_bwd has the
+    # full description.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_list_no_cache_layernorm(self):
         """Test two-pass layernorm without register cache (re-gathers in pass 2)."""
         M, D, G = 1024 * 1024, 32, 8
@@ -994,9 +1037,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @unittest.skipIf(
         "PYTEST_XDIST_WORKER" in os.environ,
         "Benchmark timing unreliable under pytest-xdist",
-    )
-    @skipIfCute(
-        "register caching does not beat re-gather on cute: runtime dominated by two-stage shared reductions"
     )
     @skipIfMTIA(
         "Triton-MTIA: both layernorm kernels exceed the 14 circular-buffer limit; see T280008478"

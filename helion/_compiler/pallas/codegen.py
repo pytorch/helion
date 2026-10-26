@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
@@ -658,21 +659,32 @@ def index_parts(
             out_pos += 1
             continue
 
-        # Generate code based on the pattern type
-        index_code = _generated_index_code(
-            pattern,
-            idx,
-            state,
-            tensor,
-            i,
-            tensor_dim,
-            in_pipeline,
-            pipeline_block_ids,
-            ast_subscripts,
-            pipeline_scalar_indices_local,
-            tensor_indices_are_scalars,
-            raw_hbm_ref,
+        from .plan_tiling import GRID_SCALAR_INDEX_DIMS
+
+        grid_scalar_dims = (
+            state.fx_node.meta.get(GRID_SCALAR_INDEX_DIMS, ())
+            if state.fx_node is not None
+            else ()
         )
+        if tensor_dim in grid_scalar_dims:
+            # The BlockSpec index map has already selected this panel.
+            index_code = "0"
+        else:
+            # Generate code based on the pattern type
+            index_code = _generated_index_code(
+                pattern,
+                idx,
+                state,
+                tensor,
+                i,
+                tensor_dim,
+                in_pipeline,
+                pipeline_block_ids,
+                ast_subscripts,
+                pipeline_scalar_indices_local,
+                tensor_indices_are_scalars,
+                raw_hbm_ref,
+            )
         parts.append(index_code)
 
         out_pos += 1
@@ -1116,8 +1128,6 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
     loop starts at 0, ``begin % block_size`` for a provably constant begin,
     or ``block_size - 1`` for a data-dependent begin.
     """
-    import sympy
-
     bs_value = state.device_function.resolved_block_size(block_id)
     if not isinstance(bs_value, int):
         return 0
@@ -1127,14 +1137,50 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
         return 0
 
     info = loops[-1].block_id_to_info.get(block_id)
-    if info is None or info.begin_expr is None:
+    if info is None:
         return 0
 
     begin = info.begin_expr
+    if begin is None:
+        name = info.begin_var_name
+        if name is None:
+            return 0
+        if name.isdigit():
+            return int(name) % bs_value
+        alignment = loop_begin_alignment(name, state)
+        if alignment is not None and alignment % bs_value == 0:
+            return 0
+        return bs_value - 1
     if isinstance(begin, (int, sympy.Integer)):
         return int(begin) % bs_value
 
     return bs_value - 1
+
+
+def loop_begin_alignment(begin_expr: str, state: CodegenState) -> int | None:
+    """Return a proven divisor of ``begin_expr``, or ``None``.
+
+    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
+    a multiple of the outer block size when that outer loop begins at 0 — so it
+    needs no extra pad. Returns that block size in that case.
+    """
+    for block_id, loops in state.codegen.active_device_loops.items():
+        if not loops:
+            continue
+        if state.codegen.offset_var(block_id) != begin_expr:
+            continue
+        info = loops[-1].block_id_to_info.get(block_id)
+        # Only sound when the outer loop begins at 0, so the offset is a clean
+        # multiple of the outer block size. A fori_loop or emit_pipeline outer
+        # loop carries its literal begin in begin_var_name, not begin_expr.
+        if info is None or not (
+            info.begin_expr in (0, sympy.Integer(0))
+            or (info.begin_expr is None and info.begin_var_name == "0")
+        ):
+            return None
+        outer_bs = state.device_function.resolved_block_size(block_id)
+        return outer_bs if isinstance(outer_bs, int) else None
+    return None
 
 
 def _loop_offset_alignment(
@@ -1149,8 +1195,6 @@ def _loop_offset_alignment(
     Return the strongest proven integer alignment, or ``None`` when a runtime
     begin has no such proof.
     """
-    import sympy
-
     bs_value = state.device_function.resolved_block_size(block_id)
     if not isinstance(bs_value, int):
         return None

@@ -30,6 +30,14 @@ def sin_func_arg(a, fn) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def sin_func_arg_static(a, fn) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size()):
+        out[tile] = fn(torch.sin(a[tile]), tile)
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 class TestClosures(RefEagerTestBase, TestCase):
     def setUp(self):
@@ -54,6 +62,30 @@ class TestClosures(RefEagerTestBase, TestCase):
 
         args = (torch.randn([512], device=DEVICE), fn_with_global)
         code, out = code_and_output(sin_func_arg, args)
+        torch.testing.assert_close(out, args[0].sin() + global_tensor)
+
+    def test_fn_arg_with_global_static_shapes(self):
+        # A static-shapes kernel fakes a global tensor through
+        # ``torch.empty_strided``; the function argument reads the global again
+        # while the device body is traced, and that allocation used to be
+        # recorded as a device node without a host origin (a KeyError in
+        # codegen).  Lifted globals are now faked once per host function.
+        def fn_with_global(x, tile) -> torch.Tensor:
+            return x + global_tensor[tile]
+
+        args = (torch.randn([512], device=DEVICE), fn_with_global)
+        code, out = code_and_output(sin_func_arg_static, args)
+        torch.testing.assert_close(out, args[0].sin() + global_tensor)
+        # Passed through as the module attribute, not re-allocated on device.
+        self.assertIn("_source_module.global_tensor", code)
+        self.assertNotIn("empty_strided", code)
+
+    def test_lambda_arg_with_global_static_shapes(self):
+        args = (
+            torch.randn([512], device=DEVICE),
+            lambda x, tile: x + global_tensor[tile],
+        )
+        code, out = code_and_output(sin_func_arg_static, args)
         torch.testing.assert_close(out, args[0].sin() + global_tensor)
 
     def test_fn_arg_with_global_different_file(self):
@@ -82,6 +114,37 @@ class TestClosures(RefEagerTestBase, TestCase):
         args = (torch.randn([512], device=DEVICE), fn_with_closure_b)
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + closure_tensor + int_closure)
+
+    def test_fn_arg_default_closure_values_specialize(self):
+        # A default of the callable argument is baked into the kernel with
+        # everything it closes over (``lift_closures`` passes defaults through
+        # raw), so a default lambda's cell value is part of the specialization:
+        # the 7.5 call must not reuse the kernel compiled for 2.5.
+        def closing_over(value):
+            return lambda t: t * value
+
+        def with_scale(scale_fn):
+            def apply(t, scale=scale_fn):
+                return scale(t)
+
+            return apply
+
+        @helion.kernel(static_shapes=False)
+        def scale_with(x: torch.Tensor, fn) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = fn(x[tile])
+            return out
+
+        x = torch.randn([512], device=DEVICE)
+        _, out_2_5 = code_and_output(scale_with, (x, with_scale(closing_over(2.5))))
+        torch.testing.assert_close(out_2_5, x * 2.5)
+        _, out_7_5 = code_and_output(scale_with, (x, with_scale(closing_over(7.5))))
+        torch.testing.assert_close(out_7_5, x * 7.5)
+        bound_7_5 = scale_with.bind((x, with_scale(closing_over(7.5))))
+        self.assertIsNot(bound_7_5, scale_with.bind((x, with_scale(closing_over(2.5)))))
+        # a rebuilt default with the same cell value shares the specialization
+        self.assertIs(bound_7_5, scale_with.bind((x, with_scale(closing_over(7.5)))))
 
     def test_fn_called_on_host(self):
         def alloc(x):

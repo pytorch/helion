@@ -7,13 +7,25 @@ from typing import cast
 import torch
 
 from ... import exc
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..device_function import DeviceFunction
 from ..dtype_utils import cast_ast
+from ..generate_ast import GenerateAST
 from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
+from .matmul_utils import SHAPE_QUERY_TARGETS
+from .matmul_utils import CuteAtomicLaneRoute
+from .matmul_utils import cute_atomic_consumer_lane_route
+from .matmul_utils import cute_per_lane_atomic_consumer
+from .matmul_utils import cute_scalar_reduction_dtype
+from .matmul_utils import loop_carries
+from .matmul_utils import reads_loop_carry
+from .matmul_utils import reads_value_of
+from .matmul_utils import strip_new_vars
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,11 +34,13 @@ if TYPE_CHECKING:
 
 
 # fx ops that preserve the underlying byte storage of a tensor (no dtype
-# change, no arithmetic).  Used to trace a matmul operand back to its raw
+# change, no arithmetic; a dot operand's ``_mask_to`` zeroes lanes of its
+# input in kind).  Used to trace a matmul operand back to its raw
 # ``memory_ops.load`` so we can tell a raw fp8 *byte* load apart from a
 # *computed* fp8 register value (e.g. ``p = exp2(...).to(fp8)``).
 _FP8_LOAD_PASSTHROUGH_TARGETS = frozenset(
     {
+        _mask_to,
         torch.ops.aten.clone.default,
         torch.ops.aten.detach.default,
         torch.ops.aten.permute.default,
@@ -313,26 +327,62 @@ def _cast_operand_to_f32(
 def _cute_active_thread_layout(
     cg: CodegenInterface,
 ) -> tuple[dict[int, int], dict[int, int]]:
-    axis_sizes: dict[int, int] = {}
+    from ..generate_ast import GenerateAST
+
+    assert isinstance(cg, GenerateAST)
+    # A reduction in a later kernel phase still reserves physical thread axes
+    # in this launch. Include them when computing the stride between K lanes.
+    axis_sizes = cg.device_function.tile_strategy.thread_axis_sizes()
+    cg._record_thread_axis_sizes(axis_sizes)
     block_axes: dict[int, int] = {}
     seen: set[int] = set()
-    active_device_loops = getattr(cg, "active_device_loops", None)
-    if isinstance(active_device_loops, dict):
-        for loops in active_device_loops.values():
-            for state in loops:
-                key = id(state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                for axis, size in state.thread_axis_sizes.items():
-                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-                block_axes.update(state.block_thread_axes)
-    current_grid_state = getattr(cg, "current_grid_state", None)
+    for loops in cg.active_device_loops.values():
+        for state in loops:
+            key = id(state)
+            if key in seen:
+                continue
+            seen.add(key)
+            for axis, size in state.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+            block_axes.update(state.block_thread_axes)
+    current_grid_state = cg.current_grid_state
     if current_grid_state is not None:
         for axis, size in current_grid_state.thread_axis_sizes.items():
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         block_axes.update(current_grid_state.block_thread_axes)
+    # Free ``hl.arange`` dims live on synthetic thread axes outside the
+    # strategy loop states, but they are launched thread rows all the same.
+    for axis, size in cg.cute_synthetic_arange_axis_sizes.items():
+        axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
     return axis_sizes, block_axes
+
+
+def _cute_launch_layout_matches(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    *,
+    thread_axis: int,
+    group_span: int,
+) -> bool:
+    """Whether the active thread layout accounts for every launched thread.
+
+    The grouped reductions key lanes by their linear thread index.  A warp
+    group (``group_span <= 32``) only needs the axes up to the contraction axis
+    to match the launch block, but the shared-memory stages index partials by
+    ``lane // group_span`` over the whole CTA, so any launch axis the layout
+    omits (a free ``hl.arange`` row, a wider axis recorded by a sibling loop)
+    makes distinct rows share one partial slot and silently sum together.
+    """
+    launch_dims = tuple(getattr(cg, "max_thread_block_dims", ()))
+    if not launch_dims:
+        return True
+    launch = {axis: size for axis, size in enumerate(launch_dims) if size > 1}
+    active = {axis: size for axis, size in axis_sizes.items() if size > 1}
+    if group_span > 32:
+        return active == launch
+    return all(
+        active.get(axis, 1) == launch.get(axis, 1) for axis in range(thread_axis + 1)
+    )
 
 
 def _emit_cute_grouped_sum_reduction_shared_two_stage(
@@ -381,6 +431,37 @@ def _emit_cute_grouped_sum_reduction_shared_tree(
     return result_var
 
 
+def _widen_lane_layout_for_barrier_phases(
+    cg: CodegenInterface, axis_sizes: dict[int, int], *, subject: str
+) -> None:
+    """Widen a cross-lane reduce's thread layout to the ``hl.barrier()`` launch.
+
+    The phases of a barrier kernel share one launch block (the elementwise
+    max of their thread extents), so another phase may run more lanes on the
+    axes around this reduce.  Surplus lanes on the reduce axis load the
+    identity through the tile/K bounds masks, so folding them in keeps every
+    lane's result complete; surplus rows on the other axes form extra
+    (redundant) groups.  ``axis_sizes`` is widened in place on all three axes
+    so the linear lane index and group count cover the whole launch, and the
+    assumed layout is recorded under ``subject`` so the launcher
+    (``backend._multi_phase_block_dims``) rejects a final block shape that
+    differs from it on any axis.  Single-phase kernels are left alone.
+    """
+    # Unit tests drive these emitters with a bare namespace; only a real
+    # ``GenerateAST`` carries the host function whose phases matter here.
+    host_function = getattr(cg, "host_function", None)
+    if host_function is None or len(host_function.device_ir.phases) <= 1:
+        return
+    device_function = DeviceFunction.current()
+    launch_dims = device_function.tile_strategy.thread_block_dims()
+    for axis in range(3):
+        if launch_dims[axis] > axis_sizes.get(axis, 1):
+            axis_sizes[axis] = launch_dims[axis]
+    device_function.cute_state.multi_phase_lane_reduce_layouts.append(
+        (subject, {axis: axis_sizes.get(axis, 1) for axis in range(3)})
+    )
+
+
 def _emit_cute_grouped_sum_reduction(
     cg: CodegenInterface,
     input_name: str,
@@ -400,6 +481,9 @@ def _emit_cute_grouped_sum_reduction(
         thread_axis = loop_block_axes.get(k_block_id)
     if thread_axis is None:
         return input_name
+    _widen_lane_layout_for_barrier_phases(
+        cg, axis_sizes, subject="staged matmul product sum"
+    )
 
     reduce_extent = axis_sizes.get(thread_axis, 1)
     if reduce_extent <= 1:
@@ -448,6 +532,14 @@ def _emit_cute_grouped_sum_reduction(
             "cute",
             "CuTe scalar matmul fallback cannot reduce a >32-thread contraction "
             "when the planned thread count exceeds the launch block",
+        )
+    if not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback cannot reduce a multi-warp contraction "
+            "when the launch block has thread rows outside the contraction layout",
         )
 
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
@@ -513,43 +605,88 @@ def _emit_cute_owned_product_sum(
     thread_axis = block_axes.get(k_block_id)
     if thread_axis is None and isinstance(loop_block_axes, dict):
         thread_axis = loop_block_axes.get(k_block_id)
-    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
-    pre = 1
-    for axis in range(thread_axis or 0):
-        pre *= axis_sizes.get(axis, 1)
-    group_span = pre * reduce_extent
-    group_count = 1
-    lane_expr = ""
-    if reduce_extent > 1 and (pre > 1 or reduce_extent > 32):
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        num_threads = 1
-        for size in axis_sizes.values():
-            num_threads *= size
-        actual_threads = 1
-        for size in getattr(cg, "max_thread_block_dims", ()):
-            actual_threads *= max(size, 1)
-        if (
-            lane_expr is None
-            or num_threads > actual_threads
-            or num_threads % group_span
-            or (group_span > 32 and group_span % 32)
-        ):
-            raise exc.BackendUnsupported(
-                "cute", "staged matmul sum has no proved physical thread group"
-            )
-        group_count = num_threads // group_span
+    if thread_axis is not None:
+        _widen_lane_layout_for_barrier_phases(
+            cg, axis_sizes, subject="staged matmul product sum"
+        )
+    reduce_extent, pre, group_span, group_count, lane_expr = (
+        _cute_lane_reduce_thread_group(
+            cg,
+            axis_sizes,
+            thread_axis,
+            subject="staged matmul sum",
+        )
+    )
+    # The grouped (shared-memory / multi-warp) reduce must see exactly the
+    # launch layout, or rows on the other thread axes collide in the
+    # two-stage buffer.
+    if group_span and not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis or 0, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "staged matmul sum has no proved physical thread group"
+        )
     return _lane_reduce_marker_expr(
         input_name,
         "sum",
         f"{backend.dtype_str(value_dtype)}(0)",
         reduce_extent,
         group_pre=pre,
-        group_span=group_span if lane_expr else 0,
+        group_span=group_span,
         group_lane_expr=lane_expr,
         group_count=group_count,
         owner_lane=owner_lane,
         matmul_contribution=True,
     )
+
+
+def _cute_lane_reduce_thread_group(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    thread_axis: int | None,
+    *,
+    subject: str,
+) -> tuple[int, int, int, int, str]:
+    """Physical thread group of a ``_helion_lane_reduce`` marker whose live
+    thread axis is ``thread_axis``.
+
+    Returns ``(reduce_extent, pre, group_span, group_count, lane_expr)``.
+    ``axis_sizes`` must be the FULL launch layout (every live thread axis,
+    including the ones a persistent reduction owns): ``pre`` is the product of
+    the sibling extents below ``thread_axis``, so the finalize folds exactly
+    the threads that share this lane's sibling coordinates instead of
+    consecutive warp lanes. ``group_span`` is 0 (and ``lane_expr`` empty)
+    when a plain consecutive-lane warp reduce is already correct.  The
+    reduction-op markers over the same lane loop derive their group from the
+    same launch layout (``BlockReductionStrategy._lane_loop_group_params``),
+    so the matmul contribution's finalize folds exactly the threads the
+    reduction finalizes.
+    """
+    backend = CompileEnvironment.current().backend
+    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
+    pre = 1
+    for axis in range(thread_axis or 0):
+        pre *= axis_sizes.get(axis, 1)
+    group_span = pre * reduce_extent
+    if reduce_extent <= 1 or (pre <= 1 and reduce_extent <= 32):
+        return reduce_extent, pre, 0, 1, ""
+    lane_expr = backend.thread_linear_index_expr(axis_sizes)
+    num_threads = 1
+    for size in axis_sizes.values():
+        num_threads *= size
+    actual_threads = 1
+    for size in getattr(cg, "max_thread_block_dims", ()):
+        actual_threads *= max(size, 1)
+    if (
+        lane_expr is None
+        or num_threads > actual_threads
+        or num_threads % group_span
+        or (group_span > 32 and group_span % 32)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", f"{subject} has no proved physical thread group"
+        )
+    return reduce_extent, pre, group_span, num_threads // group_span, lane_expr
 
 
 def _emit_cute_matmul_n_collapse(
@@ -589,13 +726,7 @@ def _emit_cute_matmul_n_collapse(
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
 
-    reduction_dtype: torch.dtype | None = acc_dtype
-    if (
-        lhs_dtype is not None
-        and rhs_dtype is not None
-        and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-    ):
-        reduction_dtype = torch.float32
+    reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype)
     value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
 
     loop_state = None
@@ -689,6 +820,200 @@ def _emit_cute_matmul_n_collapse(
     return result
 
 
+def _cute_product_ignores_lane(
+    cg: CodegenInterface, product: ast.AST, loop_state: object, lane_var: str
+) -> bool:
+    """Whether a matmul product reads nothing that varies along ``lane_var``
+    (or, when vectorized, its V-loop's coordinates), through the lane setup
+    and the statements emitted so far.  A tile mask (zeroing the lanes past
+    K) guards lanes rather than varying along them, as the lane loop
+    placement sees it."""
+    from ..ast_read_writes import ReadWrites
+    from ..tile_strategy import _cute_lane_coordinates
+    from ..tile_strategy import _lane_varying_names
+
+    masks = getattr(loop_state, "tile_masks", frozenset())
+    statements = [
+        statement
+        for statement in (
+            *getattr(loop_state, "lane_setup_statements", ()),
+            *getattr(cg, "statements_stack", [[]])[-1],
+        )
+        if not set(ReadWrites.from_ast(statement).writes) & masks
+    ]
+    coordinates = _cute_lane_coordinates(
+        lane_var, getattr(loop_state, "vec_lane_wrappers", {}).get(lane_var)
+    )
+    varying = coordinates.union(
+        *(_lane_varying_names(statements, name) for name in coordinates)
+    )
+    return not (set(ReadWrites.from_ast(product).reads) & varying)
+
+
+def _cute_k_lane_loop_is_innermost(cg: GenerateAST, loop_state: object) -> bool:
+    """Whether the K block's loop body is the innermost open statement scope.
+
+    The per-thread ``dot_acc`` running sum is zeroed one statement list up,
+    outside the K loop body and the lane loop that wraps it, and then
+    accumulates on every iteration below that point.  That equals the K
+    contraction only when nothing but the K loop and its lane loop sit between
+    the zero-init and the accumulate.  A free-axis device loop or lane loop
+    nested inside the K loop (``for lane_K: ... for tile_M: for lane_M:
+    dot_acc += ...``) would be summed as well, so such matmuls take the owned
+    product-sum marker route whose lane scheduler proves or rejects a lowering.
+
+    A device loop's body is its ``inner_statements``; the grid body is the
+    list pushed directly below the grid's ``hoist_parent_statements``.
+    """
+    from ..tile_strategy import DeviceGridState
+    from ..tile_strategy import DeviceLoopState
+
+    statements_stack = cg.statements_stack
+    if isinstance(loop_state, DeviceLoopState):
+        return statements_stack[-1] is loop_state.inner_statements
+    if isinstance(loop_state, DeviceGridState):
+        # Every grid lane loop sits between the hoist parent and the body, so
+        # a second (free-axis) lane loop would also be folded into the sum.
+        return (
+            len(statements_stack) >= 2
+            and statements_stack[-2] is loop_state.hoist_parent_statements
+            and len(loop_state.lane_loops) == 1
+        )
+    return False
+
+
+def _loop_outputs_reading(node: torch.fx.Node) -> list[torch.fx.Node]:
+    """The outputs of ``node``'s graph whose values depend on ``node``."""
+    (output,) = node.graph.find_nodes(op="output")
+    results = output.args[0]
+    if not isinstance(results, (list, tuple)):
+        results = [results]
+    reached = {node}
+    for graph_node in node.graph.nodes:
+        if graph_node.op != "output" and any(
+            arg in reached for arg in graph_node.all_input_nodes
+        ):
+            reached.add(graph_node)
+    dependents: list[torch.fx.Node] = []
+    for value in results:
+        if isinstance(value, torch.fx.Node) and value in reached:
+            if value not in dependents:
+                dependents.append(value)
+    return dependents
+
+
+def _strip_passthroughs(node: torch.fx.Node) -> torch.fx.Node:
+    """``node`` without the pure dtype / layout changes applied to it."""
+    while (
+        node.op == "call_function"
+        and node.target in _ACC_PHI_PASSTHROUGH_TARGETS
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    return node
+
+
+def _cute_running_sum_route(
+    cg: GenerateAST,
+    fx_node: object,
+    acc_node: object,
+    *,
+    has_acc: bool,
+    loop_state: object,
+    k_block_id: int,
+    lane_var: str,
+) -> str:
+    """How a matmul in a K-loop body may use the per-K-lane ``dot_acc`` running sum.
+
+    The running sum is zeroed before the K loop and adds the products of
+    every K lane of every K tile; ``dot_acc_base`` adds the accumulator from
+    before the loop.  That reduces the whole K extent, which is what a bare
+    matmul or one seeded by a loop-invariant accumulator lowers to when it
+    is stored or overwrites its carry, and the program for
+    ``carry = dot(..., acc=carry)`` when nothing else in the body reads the
+    carry or the result ("running").  ``hoist_lane_invariant_chunk_recurrence``
+    turns two more recurrences into once-per-tile updates ("recurrence"): an
+    accumulator rescaled by lane-invariant values (``acc=carry * decay``)
+    and ``carry = carry + dot(...)`` without one; it does not look inside a
+    vectorized lane loop.  Any other matmul (the carry changed after the
+    dot, another carry reading the result or the running carry, an
+    accumulator computed from another carry) takes the owned product-sum
+    route, which completes each tile's sum before its consumers ("owned").
+    A matmul outside the K loop's body graph keeps the running sum.
+    """
+    from ..device_ir import ForLoopGraphInfo
+
+    assert isinstance(cg, GenerateAST)
+    graphs = cg.codegen_graphs
+    if not isinstance(fx_node, torch.fx.Node) or (
+        has_acc and not isinstance(acc_node, torch.fx.Node)
+    ):
+        return "running"
+    carries = loop_carries(fx_node.graph, graphs)
+    if carries is None or not any(
+        isinstance(graph_info, ForLoopGraphInfo)
+        and graph_info.graph is fx_node.graph
+        and k_block_id in graph_info.block_ids
+        for graph_info in graphs
+    ):
+        return "running"
+    vectorized = lane_var in getattr(loop_state, "vec_lane_wrappers", {})
+    dependents = _loop_outputs_reading(fx_node)
+    if has_acc:
+        assert isinstance(acc_node, torch.fx.Node)
+        if not reads_loop_carry(acc_node, carries):
+            return "running" if dependents in ([], [fx_node]) else "owned"
+        carry = carries.get(fx_node)
+        if carry is None or dependents != [fx_node]:
+            return "owned"
+        if strip_new_vars(acc_node) is carry:
+            # Every lane rewrites the carry, so another read of it would see
+            # a partial sum instead of the tile's entry value.
+            copies = [acc_node]
+            while copies[-1] is not carry:
+                (source,) = copies[-1].all_input_nodes
+                copies.append(source)
+            if any(
+                user not in copies
+                and user is not fx_node
+                and user.target not in SHAPE_QUERY_TARGETS
+                for copy in copies
+                for user in copy.users
+            ):
+                return "owned"
+            return "running"
+        if (
+            not vectorized
+            and _cute_acc_is_rescaled_loop_carried(acc_node)
+            and reads_value_of(acc_node, {carry})
+        ):
+            return "recurrence"
+        return "owned"
+    if not dependents:
+        return "running"
+    if len(dependents) == 1:
+        (update,) = dependents
+        if _strip_passthroughs(update) is fx_node:
+            return "running"
+        carry = carries.get(update)
+        if (
+            not vectorized
+            and carry is not None
+            and update.target is torch.ops.aten.add.Tensor
+            and len(update.args) == 2
+            and not update.kwargs
+            and {
+                strip_new_vars(_strip_passthroughs(arg))
+                if isinstance(arg, torch.fx.Node)
+                else arg
+                for arg in update.args
+            }
+            == {fx_node, carry}
+        ):
+            return "recurrence"
+    return "owned"
+
+
 def _cute_product_uses_owned_lane_reduction(
     cg: CodegenInterface, product: ast.AST, owner_lane: str
 ) -> bool:
@@ -751,11 +1076,20 @@ def _emit_cute_matmul(
     lhs_node: object = None,
     rhs_node: object = None,
     acc_node: object = None,
+    fx_node: torch.fx.Node | None = None,
 ) -> ast.AST:
-    """Build a CuTe matmul fallback using a cross-thread reduction over K."""
+    """Build a CuTe matmul fallback using a cross-thread reduction over K.
+
+    ``fx_node`` is the matmul's own device IR node.  When its K axis turns out
+    to be split across a serial lane loop, the node's consumers decide whether
+    an ``hl.atomic_*`` user may see per-lane partial sums instead of the
+    per-thread running sum (``cute_atomic_consumer_lane_route``).
+    """
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
-    reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
+    reduction_dtype = cute_scalar_reduction_dtype(
+        lhs_dtype, rhs_dtype, acc_dtype or out_dtype
+    )
     lhs_terms: tuple[ast.AST, ...]
     if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):
         lhs_terms = tuple(lhs.terms)
@@ -771,7 +1105,6 @@ def _emit_cute_matmul(
         and rhs_dtype is not None
         and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     ):
-        reduction_dtype = torch.float32
         lhs_computed_fp8 = _cute_operand_is_computed_fp8(lhs_node)
         rhs_computed_fp8 = _cute_operand_is_computed_fp8(rhs_node)
         rhs_terms = tuple(
@@ -810,6 +1143,21 @@ def _emit_cute_matmul(
             loops = active_device_loops.get(k_block_id)
             if loops and isinstance(loops[-1], DeviceLoopOrGridState):
                 loop_state = loops[-1]
+    if loop_state is not None:
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+
+        if (
+            isinstance(loop_state.strategy, PerThreadFlattenedTileStrategy)
+            and loop_state.strategy._lane_var is not None
+        ):
+            # The fallback reduces K across the tile's threads only; the
+            # flattened tile's lane loop (fewer threads than rows) would keep
+            # one lane's products per thread: ``x[tile, :].T @ g[tile, :]``.
+            raise exc.BackendUnsupported(
+                "cute",
+                "matmul contraction over a flattened tile split across a lane "
+                "loop (fewer threads than tile elements)",
+            )
     reduction_base_acc = acc
     product_lane: str | None = None
     if loop_state is not None and k_block_id is not None:
@@ -817,25 +1165,84 @@ def _emit_cute_matmul(
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
         if not accumulate_in_lane_loop:
             lane_var = None
+        assert isinstance(cg, GenerateAST)
+        if lane_var is not None:
+            # K really is split across this lane loop, so an atomic consumer
+            # of the running sum would add every prefix of the contraction.
+            atomic_route = cute_atomic_consumer_lane_route(
+                fx_node, is_acc_none=acc is None, get_graph=cg.get_graph
+            )
+            if atomic_route is CuteAtomicLaneRoute.PER_LANE:
+                # Every K lane adds its own partial, so the atomic varies
+                # along this lane loop although its index does not cover the
+                # K block; the atomic lowering must not record it as uniform
+                # along the loop (and have the lane placement pin it to the
+                # first lane).
+                assert fx_node is not None
+                cg.device_function.cute_state.per_lane_atomic_lane_vars.setdefault(
+                    cute_per_lane_atomic_consumer(fx_node), set()
+                ).add(lane_var)
+                lane_var = None
+            elif atomic_route is CuteAtomicLaneRoute.OWNED:
+                product_lane = lane_var
+                lane_var = None
         # Keep the running sum when its inputs are independent of the owned
         # lane reductions. A reduction-fed rescale or product needs an explicit
-        # product marker and a complete staged reduction schedule.
-        if (
-            lane_var is not None
-            and acc is not None
-            and (
-                (
-                    _cute_acc_is_rescaled_loop_carried(acc_node)
-                    and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+        # product marker and a complete staged reduction schedule.  So does a K
+        # lane loop that is not the innermost open scope: the running sum would
+        # also fold the free-axis iterations nested inside it.
+        if lane_var is not None and (
+            not _cute_k_lane_loop_is_innermost(cg, loop_state)
+            or (
+                acc is not None
+                and (
+                    (
+                        _cute_acc_is_rescaled_loop_carried(acc_node)
+                        and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+                    )
+                    or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
                 )
-                or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
             )
         ):
             # Complete dependent reductions before the product sum and consume
             # that sum in the once-per-tile carry update, with or without rescale.
             product_lane = lane_var
             lane_var = None
+        running_sum_route = "running"
         if lane_var is not None:
+            assert k_block_id is not None
+            running_sum_route = _cute_running_sum_route(
+                cg,
+                fx_node,
+                acc_node,
+                has_acc=acc is not None,
+                loop_state=loop_state,
+                k_block_id=k_block_id,
+                lane_var=lane_var,
+            )
+            if running_sum_route == "owned":
+                product_lane = lane_var
+                lane_var = None
+        if lane_var is not None:
+            if _cute_product_ignores_lane(cg, product, loop_state, lane_var):
+                # Operands uniform along K (expanded size-1 dims) still make
+                # one product per lane of the K tile.  Weighting the product
+                # by the lane's K validity counts them, and keeps the running
+                # sum in the lane loop, which a lane-invariant update would
+                # leave to run once per tile.
+                assert k_block_id is not None
+                end = loop_state.block_id_to_info[k_block_id].end_var_name
+                assert end is not None
+                weight_dtype = reduction_dtype or lhs_dtype or torch.float32
+                weight = (
+                    f"{CompileEnvironment.current().backend.dtype_str(weight_dtype)}"
+                    f"({cg.index_var(k_block_id)} < {end})"
+                )
+                product = expr_from_string(
+                    "{product} * {weight}",
+                    product=product,
+                    weight=expr_from_string(weight),
+                )
             product_name = cg.lift(product, dce=True, prefix="dot_product").id
             dot_acc = cg.device_function.new_var("dot_acc")
             dot_acc_base = None
@@ -887,6 +1294,9 @@ def _emit_cute_matmul(
             running_sums = getattr(cg.device_function, "cute_matmul_running_sums", None)
             if isinstance(running_sums, set):
                 running_sums.add(dot_acc)
+            if running_sum_route == "recurrence":
+                # Exact only once restructured to update once per tile.
+                cg.device_function.cute_state.chunk_recurrence_running_sums.add(dot_acc)
         else:
             reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
         reduction_value_dtype = (

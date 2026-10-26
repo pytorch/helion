@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import itertools
+import logging
 import math
 import operator
 from typing import TYPE_CHECKING
@@ -11,6 +13,7 @@ from typing import Literal
 from typing import cast
 
 import sympy
+import torch
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import Max as SymbolicMax
 from torch.utils._sympy.functions import Min as SymbolicMin
@@ -23,13 +26,21 @@ if TYPE_CHECKING:
 
     from .device_ir import DeviceIR
 
+log = logging.getLogger(__name__)
 
 TILE_DEPENDENCY_SITE_IDS_META = "_tile_dependency_site_ids"
 TILE_DEPENDENCY_SITE_ID_ATTR = "_tile_dependency_site_id"
+# FX node meta key: the TileAccess ids a memory op contributes.
+TILE_ACCESS_META = "tile_access_ids"
 _ALLOCATION_ADDRESS_AXIS = -1
 _MAX_RELATION_PIECES = 4_096
 _MAX_RELATION_PRODUCT_STATES = 65_536
+# Caps the tagged words each rank pushes per buffer, which bounds its mailbox (two
+# parities per rank). Inband still beat peer counters at 26 MB (16-token TP4 logits).
+_INBAND_PUSH_BYTES = 1 << 25
 DependencyObligation = tuple[int, int | None, int | None]
+# Local counters, tagged data pushed to every rank, or counters every rank sees.
+Transport = Literal["counter", "inband", "peer_counter"]
 IntegerExpression = Any
 RelationBounds = tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...]
 ConcreteRelationBounds = tuple[tuple[int, int, int, int], ...]
@@ -2675,6 +2686,26 @@ class Incidence:
         return Incidence._from_constructed(items_by_key, keys_by_item=keys_by_item)
 
 
+def _interval_hull(
+    first: tuple[sympy.Expr, sympy.Expr],
+    second: tuple[sympy.Expr, sympy.Expr],
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Return the hull of two overlapping half-open intervals if it is provable."""
+
+    def at_most(a: sympy.Expr, b: sympy.Expr) -> bool:
+        # pyrefly: ignore [unsupported-operation]
+        return _is_provably_nonnegative(b - a, prove_nonnegative)
+
+    if not (at_most(first[0], second[1]) and at_most(second[0], first[1])):
+        return None
+    lows = ((first[0], second[0]), (second[0], first[0]))
+    highs = ((first[1], second[1]), (second[1], first[1]))
+    low = next((a for a, b in lows if at_most(a, b)), None)
+    high = next((b for a, b in highs if at_most(a, b)), None)
+    return None if low is None or high is None else (low, high)
+
+
 def _rectangular_fiber_spec(
     relation: CoordinateRelation,
     *,
@@ -2709,28 +2740,24 @@ def _rectangular_fiber_spec(
             (index,) = differing
             axis, begin, end, step = left.target_ranges[index]
             other_axis, other_begin, other_end, other_step = right.target_ranges[index]
+            if axis != other_axis or step != 1 or other_step != 1:
+                continue
             # pyrefly: ignore [unsupported-operation]
             left_first = sympy.simplify(end - other_begin) == 0
             # pyrefly: ignore [unsupported-operation]
             right_first = sympy.simplify(other_end - begin) == 0
-            if (
-                axis != other_axis
-                or step != 1
-                or other_step != 1
-                or not (left_first or right_first)
-                or not all(
-                    _is_provably_nonnegative(width, prove_nonnegative)
-                    for width in (end - begin, other_end - other_begin)  # pyrefly: ignore [unsupported-operation]
+            hull = (begin, other_end) if left_first else (other_begin, end)
+            if not (left_first or right_first):
+                hull = _interval_hull(
+                    (begin, end), (other_begin, other_end), prove_nonnegative
                 )
+            if hull is None or not all(
+                _is_provably_nonnegative(width, prove_nonnegative)
+                for width in (end - begin, other_end - other_begin)  # pyrefly: ignore [unsupported-operation]
             ):
                 continue
             ranges = list(left.target_ranges)
-            ranges[index] = (
-                axis,
-                begin if left_first else other_begin,
-                other_end if left_first else end,
-                1,
-            )
+            ranges[index] = (axis, *hull, 1)
             replacement = (
                 left_index,
                 right_index,
@@ -4567,6 +4594,10 @@ class TileAccess:
     # one exact dense span.  Keep that distinct from a genuinely unknown
     # indirect index, which this module must conservatively widen.
     subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
+    # The rank whose copy of a symmetric allocation a peer view reads or
+    # writes; None is this rank's own copy.
+    owner_rank: int | None = None
+    dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4681,6 +4712,12 @@ class TileDependencyGraph:
     edges: tuple[TileDependency, ...]
     execution_sites: tuple[ExecutionSite, ...] = ()
     site_ids_by_access: tuple[tuple[int, ...], ...] = ()
+    # Loop axes whose coordinates are shifted by a begin or a step.
+    noncanonical_axes: frozenset[int] = frozenset()
+    # Symmetric allocations whose cross-rank dependencies poll tagged data.
+    inband_allocation_ids: frozenset[int] = frozenset()
+    # Roots of inband stores whose words every rank's launch polls in full.
+    inband_read_roots: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -4712,6 +4749,175 @@ class TileDependencyGraph:
                     for consumer_site in consumer_sites or (None,)
                 )
         return tuple((pair, frozenset(grouped[pair])) for pair in sorted(grouped))
+
+    def transport(self, dependency: AccessDependency) -> Transport:
+        """How the scheduler must order one dependency."""
+        producer = self.accesses[dependency.producer_access_id]
+        if not _crosses_ranks(producer, self.accesses[dependency.consumer_access_id]):
+            return "counter"
+        if producer.allocation_id in self.inband_allocation_ids:
+            return "inband"
+        return "peer_counter"
+
+    def is_inband(self, access: TileAccess) -> bool:
+        """Whether codegen emits an access as an inband push or poll."""
+        return access.allocation_id in self.inband_allocation_ids and (
+            access.kind == "store" or access.owner_rank is not None
+        )
+
+    def inband_store(self, allocation_id: int) -> TileAccess:
+        return next(
+            access
+            for access in self.accesses
+            if access.allocation_id == allocation_id and access.kind == "store"
+        )
+
+    def inband_numel(self, allocation_id: int) -> int:
+        """Elements per mailbox slot: R2 makes the store fill the buffer."""
+        return math.prod(
+            _concrete_integer(extent, description="inband shape")
+            for extent in self.inband_store(allocation_id).tensor_shape
+        )
+
+    def inband_extent(
+        self, store: TileAccess, dim: int, block_size: Callable[[int], int]
+    ) -> int | None:
+        """Elements a store tile writes along ``dim`` from a multiple of their
+        count, or None if unknown."""
+        extent = _concrete_integer(store.tensor_shape[dim], description="inband shape")
+        if dim not in store.subscript_dims:
+            return extent
+        position = store.subscript_dims.index(dim)
+        block_id = store.subscript_affine_block_ids[position]
+        family = self.task_families[store.root]
+        axis = None if block_id is None else family.axis(block_id)
+        span = (
+            store.subscript_dense_spans[position]
+            if position < len(store.subscript_dense_spans)
+            else None
+        )
+        if store.subscript_is_full_slice[position]:
+            return extent
+        if span is not None:
+            extent = block_size(span[0]) * span[1]
+            return None if span[2] % extent else extent
+        if (
+            axis is not None
+            and axis.canonical_origin
+            and store.subscript_index_scales[position] == 1
+            and store.subscript_offsets[position] == 0
+            and not store.subscript_is_scalar[position]
+        ):
+            return block_size(axis.block_id)
+        offset = store.subscript_offsets[position]
+        if block_id is None and store.subscript_is_scalar[position]:
+            return None if offset is None else 1
+        static = (
+            store.subscript_static_extents[position]
+            if position < len(store.subscript_static_extents)
+            else None
+        )
+        # A proved contiguous static vector, like hl.arange(n), from its offset.
+        if block_id is None and offset is not None and static:
+            return None if offset % static else static
+        return None
+
+    def inband_row(self, store: TileAccess, block_size: Callable[[int], int]) -> int:
+        """Consecutive elements each store tile writes, aligned to their count."""
+        dim = len(store.tensor_shape) - 1
+        row = _concrete_integer(store.tensor_shape[dim], description="inband shape")
+        extent = self.inband_extent(store, dim, block_size) or 1
+        stride = _concrete_integer(
+            store.tensor_strides[dim], description="inband stride"
+        )
+        return extent if stride == 1 and row % extent == 0 else 1
+
+    def scatter_position(self, allocation_id: int) -> int | None:
+        """The data-dependent row subscript of an inband scatter store, else None."""
+        if allocation_id not in self.inband_allocation_ids:
+            return None
+        return _scatter_position(self.inband_store(allocation_id))
+
+    def crosses_ranks(self) -> bool:
+        """Whether any dependency needs a cross-rank transport."""
+        return any(
+            self.transport(dependency) != "counter"
+            for edge in self.edges
+            for dependency in edge.access_dependencies
+        )
+
+    def peer_counter_graph(self) -> TileDependencyGraph:
+        """The peer_counter dependencies over rank-invariant endpoint accesses."""
+        edges = tuple(
+            dataclasses.replace(edge, access_dependencies=peer)
+            for edge in self.edges
+            if (
+                peer := tuple(
+                    dependency
+                    for dependency in edge.access_dependencies
+                    if self.transport(dependency) == "peer_counter"
+                )
+            )
+        )
+        endpoints = {
+            access_id
+            for edge in edges
+            for dependency in edge.access_dependencies
+            for access_id in (
+                dependency.producer_access_id,
+                dependency.consumer_access_id,
+            )
+        }
+        return dataclasses.replace(
+            self,
+            accesses=tuple(
+                _rank_invariant(access, self.task_families[access.root])
+                if access.access_id in endpoints
+                else access
+                for access in self.accesses
+            ),
+            edges=edges,
+        )
+
+    def rank_digest(self) -> str:
+        """Hash the facts every rank must agree on; owners and regions may differ."""
+        peer = self.peer_counter_graph()
+        facts = (
+            tuple(
+                (a.root, a.allocation_id, a.kind, a.is_atomic, a.owner_rank is None)
+                for a in self.accesses
+            ),
+            tuple((a.dtype, a.tensor_shape, a.tensor_strides) for a in self.accesses),
+            repr(self.task_families),
+            tuple(
+                (allocation_id, self.inband_numel(allocation_id))
+                for allocation_id in sorted(self.inband_allocation_ids)
+            ),
+            # Keyed peer counters read only these rank-invariant subscripts.
+            tuple(
+                (
+                    peer.accesses[access_id].subscript_is_full_slice,
+                    peer.accesses[access_id].subscript_dense_spans,
+                )
+                for edge in peer.edges
+                for dependency in edge.access_dependencies
+                for access_id in (
+                    dependency.producer_access_id,
+                    dependency.consumer_access_id,
+                )
+            ),
+            tuple(
+                sorted(
+                    {
+                        (edge.producer_root, edge.consumer_root, transport)
+                        for edge in self.edges
+                        for dependency in edge.access_dependencies
+                        if (transport := self.transport(dependency)) != "counter"
+                    }
+                )
+            ),
+        )
+        return hashlib.sha256(repr(facts).encode()).hexdigest()[:16]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5752,6 +5958,12 @@ def instantiate_symbolic_dependencies(
                                     prove_nonnegative=prove_nonnegative,
                                 )
                                 if axes_have_canonical_origins
+                                and dependency_graph.noncanonical_axes.isdisjoint(
+                                    (
+                                        *producer_domain.axis_order,
+                                        *consumer_domain.axis_order,
+                                    )
+                                )
                                 else None
                             ),
                         )
@@ -6059,6 +6271,61 @@ def _subtract_regions(
     return pieces
 
 
+def _crosses_ranks(first: TileAccess, second: TileAccess) -> bool:
+    """Whether another rank can run one of two aliasing accesses."""
+    return first.owner_rank is not None or second.owner_rank is not None
+
+
+def _rank_invariant(access: TileAccess, family: TaskFamily) -> TileAccess:
+    """Widen every subscript but a full slice or a tile axis spanning its dimension.
+
+    Ranks compile their own rank constants into offsets and constant indices; a
+    spanning axis has offset 0 on every rank or its access is out of bounds.
+    """
+
+    def spans_dimension(position: int, block_id: int | None) -> bool:
+        axis = None if block_id is None else family.axis(block_id)
+        return (
+            axis is not None
+            and axis.canonical_origin
+            and isinstance(axis.extent, sympy.Expr)
+            and sympy.simplify(
+                axis.extent - access.tensor_shape[access.subscript_dims[position]]
+            )
+            == 0
+        )
+
+    spans = access.subscript_dense_spans or (None,) * len(access.subscript_dims)
+    kept = tuple(
+        full
+        or (
+            (span[1:] == (1, 0) if span is not None else (scale, offset) == (1, 0))
+            and spans_dimension(position, block if span is None else span[0])
+        )
+        for position, (full, block, scale, offset, span) in enumerate(
+            zip(
+                access.subscript_is_full_slice,
+                access.subscript_affine_block_ids,
+                access.subscript_index_scales,
+                access.subscript_offsets,
+                spans,
+                strict=True,
+            )
+        )
+    )
+    return dataclasses.replace(
+        access,
+        subscript_is_full_slice=tuple(
+            full or not keep
+            for full, keep in zip(access.subscript_is_full_slice, kept, strict=True)
+        ),
+        subscript_dense_spans=tuple(
+            span if keep else None for keep, span in zip(kept, spans, strict=True)
+        ),
+        affine_subscript_ranges=None,
+    )
+
+
 def _subtract_reaching_accesses(
     reaching: list[_ReachingAccess],
     writes: tuple[_ReachingAccess, ...],
@@ -6071,6 +6338,213 @@ def _subtract_reaching_accesses(
     ]
 
 
+def _reject_same_root_cross_rank_hazards(root_accesses: list[TileAccess]) -> None:
+    """No transport orders a store and a load of two ranks inside one root.
+
+    Tasks of one root are unordered on every rank, so overlapping stores are the
+    program's race; pushes to peers order against later roots like local stores.
+    """
+    for first, second in itertools.combinations_with_replacement(root_accesses, 2):
+        if (
+            first.allocation_id == second.allocation_id
+            and _crosses_ranks(first, second)
+            and {first.kind, second.kind} == {"store", "load"}
+            and not (first.is_atomic and second.is_atomic)
+        ):
+            raise exc.CrossLoopSchedulingError(
+                f"because root {first.root} may race with another rank on a "
+                f"symmetric allocation ({first.kind}/{second.kind}); load peer "
+                "data only in a later root than the one that stores it"
+            )
+
+
+def _scatter_position(store: TileAccess) -> int | None:
+    """The one data-dependent subscript of a row scatter store, else None."""
+    spans = store.subscript_dense_spans or (None,) * len(store.subscript_dims)
+    indirect = [
+        position
+        for position, (block_id, offset, full, span) in enumerate(
+            zip(
+                store.subscript_affine_block_ids,
+                store.subscript_offsets,
+                store.subscript_is_full_slice,
+                spans,
+                strict=False,
+            )
+        )
+        if block_id is None and offset is None and not full and span is None
+    ]
+    return indirect[0] if len(indirect) == 1 else None
+
+
+def _inband_failure(
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    runs_at_root: Callable[[TileAccess], bool],
+    runs_in_root_branch: Callable[[TileAccess], bool],
+    world_size: int,
+) -> str | None:
+    """The first rule a symmetric allocation breaks for inband transport."""
+    stores = [access for access in accesses if access.kind == "store"]
+    store = stores[0]
+    root_axes = task_families[store.root].logical_axis_order
+    tile_axes = [
+        block_id
+        for block_id, full, scalar, offset in zip(
+            store.subscript_affine_block_ids,
+            store.subscript_is_full_slice,
+            store.subscript_is_scalar,
+            store.subscript_offsets,
+            strict=False,
+        )
+        if not full and not (block_id is None and scalar and offset is not None)
+    ]
+    # One task writes each tile once: full slices, static indices and distinct
+    # root axes. R2 checks that the tiles still fill the whole buffer.
+    position = _scatter_position(store)
+    scatter = position is not None
+    if not (
+        len(stores) == 1
+        and store.owner_rank is None
+        and not store.is_atomic
+        and (
+            _scatter_tile(store, task_families[store.root], runs_in_root_branch)
+            if scatter
+            else (
+                not store.has_explicit_mask
+                and runs_at_root(store)
+                and len(set(root_axes)) == len(root_axes) == len(tile_axes)
+                and set(tile_axes) == set(root_axes)
+            )
+        )
+    ):
+        return "R1: one unmasked store through the local view, one tile per task"
+    region = _access_region(store, task_families[store.root])
+    numel = math.prod(region.layout[0]) if region.layout is not None else 0
+    row_major = True
+    if scatter:
+        # Rows land anywhere: the consumer keys row-major offsets back to rows.
+        shape = [
+            _concrete_integer(extent, description="inband shape")
+            for extent in store.tensor_shape
+        ]
+        numel = math.prod(shape)
+        region = _linear_region(0, numel)
+        row_major = store.storage_offset == 0 and all(
+            stride == math.prod(shape[dim + 1 :])
+            for dim, stride in enumerate(store.tensor_strides)
+        )
+    peer_loads = [access for access in accesses if access.owner_rank is not None]
+    layout = (store.tensor_shape, store.tensor_strides, store.storage_offset)
+    # The tiles fill the buffer exactly, so every element is written once.
+    if not (
+        row_major
+        and region.is_exact_contiguous
+        and region.address_interval == (0, numel)
+        and numel > 0
+        and store.dtype is not None
+        and store.dtype.itemsize <= 4
+        and store.dtype is not torch.bool
+        and not store.dtype.is_complex
+        and all(
+            (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+            and load.dtype == store.dtype
+            for load in peer_loads
+        )
+    ):
+        return "R2: the store fills a dense buffer of at most 4-byte elements"
+    if any(load.root <= store.root for load in peer_loads):
+        return "R3: peer loads run in a later root than the store"
+    # Every rank receives the whole buffer, so no polled rank's reads may surely miss
+    # part of it. A read may touch its whole interval, or all of an unknown one.
+    for rank in {load.owner_rank for load in peer_loads}:
+        spans = [
+            _access_region(load, task_families[load.root]).address_interval
+            for load in peer_loads
+            if load.owner_rank == rank
+        ]
+        covers = tuple(_linear_region(*(span or (0, numel))) for span in spans)
+        if _subtract_regions(region, covers):
+            return "R6: peer loads read the whole buffer of each polled rank"
+    if 8 * world_size * numel > _INBAND_PUSH_BYTES:
+        return "R7: each rank pushes at most 32 MiB of tagged words"
+    # Every rank then reads each scatter row it may have to fetch from the owner.
+    if scatter and not all(
+        runs_at_root(load) and not load.has_explicit_mask for load in peer_loads
+    ):
+        return "R8: a scatter's peer loads run unmasked at root"
+    return None
+
+
+def _scatter_tile(
+    store: TileAccess,
+    family: TaskFamily,
+    runs_in_root_branch: Callable[[TileAccess], bool],
+) -> bool:
+    """Whether each task of a row scatter writes whole aligned blocks of its rows.
+
+    The store runs once per task, at root or in a root-level branch, and every
+    other subscript is a full slice, a root tile, a dense span or a constant.
+    """
+    position = _scatter_position(store)
+    spans = store.subscript_dense_spans or (None,) * len(store.subscript_dims)
+    return (
+        position is not None
+        and runs_in_root_branch(store)
+        and all(
+            axis.canonical_origin and isinstance(axis.extent, int | sympy.Integer)
+            for axis in family.axes
+        )
+        and all(
+            full
+            or (span is not None and span[2] == 0)
+            or (
+                block_id is not None
+                and block_id in family.logical_axis_order
+                and scale == 1
+                and offset == 0
+                and not scalar
+            )
+            or (block_id is None and scalar and offset is not None)
+            for index, (block_id, scale, offset, scalar, full, span) in enumerate(
+                zip(
+                    store.subscript_affine_block_ids,
+                    store.subscript_index_scales,
+                    store.subscript_offsets,
+                    store.subscript_is_scalar,
+                    store.subscript_is_full_slice,
+                    spans,
+                    strict=False,
+                )
+            )
+            if index != position
+        )
+    )
+
+
+def _polls_every_rank(
+    accesses: tuple[TileAccess, ...],
+    inband_allocation_ids: set[int],
+    task_families: tuple[TaskFamily, ...],
+    runs_at_root: Callable[[TileAccess], bool],
+    world_size: int,
+) -> bool:
+    """Whether each launch polls every rank at least once (the parity credit)."""
+    polled_ranks = {
+        access.owner_rank
+        for access in accesses
+        if access.allocation_id in inband_allocation_ids
+        and access.owner_rank is not None
+        and not access.has_explicit_mask
+        and runs_at_root(access)
+        and all(
+            isinstance(axis.extent, int | sympy.Integer) and axis.extent >= 1
+            for axis in task_families[access.root].axes
+        )
+    }
+    return polled_ranks >= set(range(world_size))
+
+
 def build_tile_dependency_graph(
     accesses: tuple[TileAccess, ...],
     grid_block_ids: list[list[int]] | None = None,
@@ -6079,6 +6553,7 @@ def build_tile_dependency_graph(
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
     noncanonical_task_origin_block_ids: frozenset[int] | None = None,
+    world_size: int = 1,
 ) -> TileDependencyGraph:
     """Build the minimal source-ordered allocation hazard graph."""
     if device_ir is not None:
@@ -6132,9 +6607,11 @@ def build_tile_dependency_graph(
             "because a memory operation's allocation identity is unavailable"
         )
     accesses_by_root: list[list[TileAccess]] = [[] for _ in range(root_count)]
+    accesses_by_allocation: dict[int, list[TileAccess]] = {}
     for access in accesses:
         if 0 <= access.root < root_count and access.allocation_id >= 0:
             accesses_by_root[access.root].append(access)
+            accesses_by_allocation.setdefault(access.allocation_id, []).append(access)
 
     # Views can carry different source names at different roots while still
     # naming the same storage.  Keep one diagnostic alias set per allocation so
@@ -6156,11 +6633,20 @@ def build_tile_dependency_graph(
         for root_accesses in accesses_by_root
     ]
 
+    symmetric_allocation_ids = {
+        access.allocation_id for access in accesses if access.owner_rank is not None
+    }
+    # Other ranks may run other programs (e.g. a RANK constexpr), so a
+    # symmetric access may touch any element: it always overlaps, never kills.
     region_by_access_id = {
-        access.access_id: _access_region(access, task_families[access.root])
+        access.access_id: AllocationRegion(None, False)
+        if access.allocation_id in symmetric_allocation_ids
+        else _access_region(access, task_families[access.root])
         for access in accesses
         if 0 <= access.root < root_count and access.allocation_id >= 0
     }
+    for root_accesses in accesses_by_root:
+        _reject_same_root_cross_rank_hazards(root_accesses)
     dependencies_by_edge: dict[tuple[int, int, int], set[AccessDependency]] = {}
     reaching_writes: dict[int, list[_ReachingAccess]] = {}
     reaching_reads: dict[int, list[_ReachingAccess]] = {}
@@ -6170,6 +6656,10 @@ def build_tile_dependency_graph(
         consumer: _ReachingAccess,
         kind: TileDependencyKind,
     ) -> None:
+        if root_phases[producer.root] != root_phases[consumer.root] and not (
+            _crosses_ranks(producer.access, consumer.access)
+        ):
+            return
         dependencies_by_edge.setdefault(
             (producer.root, consumer.root, consumer.access.allocation_id), set()
         ).add(
@@ -6185,8 +6675,10 @@ def build_tile_dependency_graph(
     for consumer_root in range(root_count):
         phase = root_phases[consumer_root]
         if phase != current_phase:
-            reaching_writes.clear()
-            reaching_reads.clear()
+            # A phase barrier orders this rank's roots, not other ranks'.
+            for reaching in (reaching_writes, reaching_reads):
+                for allocation_id in reaching.keys() - symmetric_allocation_ids:
+                    del reaching[allocation_id]
             current_phase = phase
         reads = {
             allocation_id: tuple(
@@ -6312,12 +6804,88 @@ def build_tile_dependency_graph(
             for site_id in site_ids_by_graph.get(access.graph_id, ())
             if execution_sites[site_id].root == access.root
         )
+
+    def runs_at_root(access: TileAccess) -> bool:
+        site_ids = site_ids_by_access[access.access_id]
+        return bool(site_ids) and all(execution_sites[i].is_root for i in site_ids)
+
+    def runs_in_root_branch(access: TileAccess) -> bool:
+        """At root, or in one branch directly under it."""
+        sites = [execution_sites[i] for i in site_ids_by_access[access.access_id]]
+        return bool(sites) and all(
+            site.is_root
+            or (
+                site.kind == "branch"
+                and (parent := site.parent_site_id) is not None
+                and execution_sites[parent].is_root
+            )
+            for site in sites
+        )
+
+    crossing_allocation_ids = {
+        edge.allocation_id
+        for edge in edges
+        for dependency in edge.access_dependencies
+        if _crosses_ranks(
+            accesses[dependency.producer_access_id],
+            accesses[dependency.consumer_access_id],
+        )
+    }
+    failures = {
+        allocation_id: _inband_failure(
+            accesses_by_allocation[allocation_id],
+            task_families,
+            runs_at_root,
+            runs_in_root_branch,
+            world_size,
+        )
+        for allocation_id in crossing_allocation_ids
+    }
+    inband_allocation_ids = {key for key, failure in failures.items() if not failure}
+    if inband_allocation_ids and not _polls_every_rank(
+        accesses, inband_allocation_ids, task_families, runs_at_root, world_size
+    ):
+        failures.update(
+            dict.fromkeys(
+                inband_allocation_ids,
+                "R4: each launch polls every rank at least once",
+            )
+        )
+        inband_allocation_ids = set()
+    # R6 covers each polled rank; polls at root on every rank read every task.
+    inband_read_roots = {
+        access.root
+        for allocation_id in inband_allocation_ids
+        if _polls_every_rank(
+            tuple(accesses_by_allocation[allocation_id]),
+            {allocation_id},
+            task_families,
+            runs_at_root,
+            world_size,
+        )
+        and all(
+            runs_at_root(access) and not access.has_explicit_mask
+            for access in accesses_by_allocation[allocation_id]
+            if access.owner_rank is not None
+        )
+        for access in accesses_by_allocation[allocation_id]
+        if access.kind == "store"
+    }
+    for allocation_id, failure in sorted(failures.items()):
+        log.info(
+            "Cross-rank dependencies on %s use %s",
+            "/".join(sorted(tensor_names_by_allocation.get(allocation_id, ()))),
+            f"peer_counter ({failure})" if failure else "inband",
+        )
     return TileDependencyGraph(
         task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
         execution_sites=execution_sites,
         site_ids_by_access=tuple(site_ids_by_access),
+        noncanonical_axes=noncanonical_task_origin_block_ids,
+        inband_allocation_ids=frozenset(inband_allocation_ids),
+        inband_read_roots=frozenset(inband_read_roots),
     )
 
 

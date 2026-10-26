@@ -4,6 +4,8 @@ from collections import defaultdict
 import dataclasses
 import enum
 
+from .attention_plan import flash_head_dims_supported
+
 
 class FlashScheduleError(ValueError):
     """A structural flash schedule is unsafe or exceeds device resources."""
@@ -68,6 +70,9 @@ class FlashScheduleSpec:
     output_order: FlashOutputOrder = FlashOutputOrder.INTERLEAVED
     cooperative_mma: bool = False
     split_p_arrive: bool = True
+    # One P arrival per 32-column chunk (pfor, pforc0, pforc1, pfor2) instead of
+    # the 3/4 + 1/4 split; needs ``split_p_arrive``.
+    p_chunk_arrive: bool = False
     stat_depth: int = 2
     pipelined_stat_handoff: bool = False
     final_only_stat_handoff: bool = False
@@ -76,6 +81,35 @@ class FlashScheduleSpec:
     # KV tile width. Only the K/V staging rings scale with it; the query and
     # output tiles stay 128 rows wide.
     kv_tile_n: int = 128
+    # Shared memory the body adds outside the tiles and rings (the flex
+    # hook's warp-cooperative table staging, ``flex_coalesce_smem_bytes``):
+    # part of the base the K/V depth is fitted against.
+    aux_smem_bytes: int = 0
+    # V/O head dim when it differs from the Q/K ``head_dim`` (the (192, 128)
+    # MLA pair): sQ and the K tile follow ``head_dim``, the aliased ring slot
+    # the wider operand, the output tile and TMEM accumulators the V width.
+    head_dim_v: int | None = None
+    # Alternating-warpgroup family: one query tile per work item, the two
+    # softmax warpgroups own alternating KV steps on their own score and
+    # probability buffers, separate K and V rings (``kv_depth`` is the K ring,
+    # ``v_depth`` the V ring), and the output tile is staged in the finished
+    # item's dead Q stage. ``query_slots_per_cta`` is one.
+    alternating_warpgroups: bool = False
+    v_depth: int | None = None
+    # FA4's uneven aliased ring for the asymmetric pair: three slots laid out
+    # [K-wide, V-wide, K-wide] with a stage stride of half a K plus half a V
+    # tile, so a third stage fits where three K-wide slots would not. The odd
+    # slot is shifted by half the width difference toward whichever operand
+    # it holds (K and V alternate through the ring, so every slot sees both),
+    # and a K load into slot 0 also waits for slot 1 to drain (its wider
+    # tile reaches into the previous round's K bytes there).
+    uneven_kv_ring: bool = False
+    # Stage the output tiles in the Q stages instead of a separate ``sO``
+    # (FA4's overlap_sO_sQ): the output stage is written after the work
+    # item's last PV, whose completion barrier also covers every QK that read
+    # Q, and a non-persistent CTA loads no further Q tile, so both Q stages
+    # are dead by then. Needs ``stage_output``; no bytes for the staged tiles.
+    output_over_query: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,6 +184,10 @@ class FlashSchedule:
     tmem_columns: int
 
 
+# The uneven aliased ring is FA4's fixed three-slot layout.
+UNEVEN_KV_RING_DEPTH = 3
+
+
 @dataclasses.dataclass(frozen=True)
 class FlashScheduleLimits:
     shared_memory_bytes: int = 232448
@@ -175,15 +213,559 @@ def _kv_node_name(kind: str, cta_rank: int, multicast: bool) -> str:
     return f"{kind}_r{cta_rank}"
 
 
+def _value_head_dim(spec: FlashScheduleSpec) -> int:
+    """V/O head dim: ``head_dim`` unless the spec names the asymmetric pair."""
+    return spec.head_dim if spec.head_dim_v is None else spec.head_dim_v
+
+
+def _kv_cta_group_size(spec: FlashScheduleSpec) -> int:
+    # CtaGroup.TWO partitions the MMA B operand across CTAs. Merely clustering
+    # two local-MMAs does not reduce their independently resident K/V tiles.
+    return 2 if spec.cooperative_mma else 1
+
+
+def _k_tile_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one K tile."""
+    return spec.kv_tile_n * spec.head_dim * spec.dtype_bytes // _kv_cta_group_size(spec)
+
+
+def _v_tile_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one V tile (the V width of the asymmetric pair)."""
+    return (
+        spec.kv_tile_n
+        * _value_head_dim(spec)
+        * spec.dtype_bytes
+        // _kv_cta_group_size(spec)
+    )
+
+
+def _kv_slot_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one aliased K/V ring slot (the wider of the two tiles)."""
+    slot_dim = max(spec.head_dim, _value_head_dim(spec))
+    return spec.kv_tile_n * slot_dim * spec.dtype_bytes // _kv_cta_group_size(spec)
+
+
+def uneven_kv_ring_stage_stride_bytes(spec: FlashScheduleSpec) -> int:
+    """Stage stride of the uneven ring: half a K tile plus half a V tile."""
+    k_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    v_tile_bytes = spec.kv_tile_n * _value_head_dim(spec) * spec.dtype_bytes
+    return (k_tile_bytes + v_tile_bytes) // 2
+
+
+def uneven_kv_ring_shift_bytes(spec: FlashScheduleSpec) -> int:
+    """Shift of the odd uneven-ring slot: half the K/V tile width difference."""
+    k_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    v_tile_bytes = spec.kv_tile_n * _value_head_dim(spec) * spec.dtype_bytes
+    return abs(k_tile_bytes - v_tile_bytes) // 2
+
+
+def _aliased_kv_ring_bytes(spec: FlashScheduleSpec) -> int:
+    """Bytes of the aliased K/V ring: ``kv_depth`` wide slots, or FA4's uneven
+    [wide, narrow, wide] layout whose last slot starts at two stage strides."""
+    if spec.uneven_kv_ring:
+        return (spec.kv_depth - 1) * uneven_kv_ring_stage_stride_bytes(
+            spec
+        ) + _kv_slot_bytes(spec)
+    return spec.kv_depth * _kv_slot_bytes(spec)
+
+
 def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
-    kv_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    k_tile_bytes = _k_tile_bytes(spec)
+    v_tile_bytes = _v_tile_bytes(spec)
+    if spec.alternating_warpgroups:
+        # Two Q stages (the next item's tile is prefetched), the K ring, the V
+        # ring, and the stat/barrier overhead; the output tile aliases a Q stage.
+        assert spec.v_depth is not None
+        return (
+            2 * tile_bytes
+            + spec.kv_depth * k_tile_bytes
+            + spec.v_depth * v_tile_bytes
+            + _ALT_OVERHEAD_BYTES
+        )
     q_bytes = spec.query_slots_per_cta * tile_bytes
-    kv_rings = 2 if spec.separate_kv else 1
-    kv_bytes = kv_rings * spec.kv_depth * kv_tile_bytes
-    output_bytes = spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
+    if spec.separate_kv:
+        kv_bytes = spec.kv_depth * (k_tile_bytes + v_tile_bytes)
+    else:
+        # K and V alternate through one ring, so every slot is the wider tile
+        # (or the uneven ring's two wide slots around one narrow slot).
+        kv_bytes = _aliased_kv_ring_bytes(spec)
+    output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
+    output_bytes = (
+        spec.query_slots_per_cta * output_tile_bytes
+        if spec.stage_output and not spec.output_over_query
+        else 0
+    )
     # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
-    return q_bytes + kv_bytes + output_bytes + 3072
+    return q_bytes + kv_bytes + output_bytes + 3072 + spec.aux_smem_bytes
+
+
+_ALT_OVERHEAD_BYTES = 3072
+
+
+def _alt_tmem_columns(spec: FlashScheduleSpec) -> int:
+    # S_a, S_b (128 each), O (head_dim), P_a, P_b (64 each: fp16 pairs).
+    return 256 + spec.head_dim + 128
+
+
+def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
+    """Build the structural graph of the alternating-warpgroup family.
+
+    One iteration of the graph is a pair of KV steps: the even step (``_a``
+    nodes, softmax warpgroup A, buffers S_a/P_a) and the odd step (``_b``).
+    The QK warp issues QK(i) once K(i) landed and S_x was read into registers;
+    the PV warp issues PV(i) once P(i) is published and O rescaled. The running
+    max is handed A -> B inside the pair and B -> A into the next pair; alpha
+    goes to the correction warps per step; the even warpgroup hands its partial
+    row sum to the odd one once per work item. K and V have separate rings whose
+    slots are reused by the tile ``depth`` positions later, which is
+    ``depth // 2`` pairs after an even step and ``(depth + 1) // 2`` after an
+    odd one.
+    """
+    if not spec.alternating_warpgroups:
+        raise FlashScheduleError("the alternating schedule needs its spec flag")
+    if spec.head_dim not in (64, 128):
+        raise FlashScheduleError("the alternating schedule requires head_dim 64 or 128")
+    if spec.kv_depth < 2:
+        raise FlashScheduleError(
+            "the alternating schedule needs a K ring of depth >= 2"
+        )
+    if spec.v_depth is None or spec.v_depth < 2:
+        raise FlashScheduleError(
+            "the alternating schedule needs a V ring of depth >= 2"
+        )
+    if spec.cta_count != 1 or spec.query_slots_per_cta != 1:
+        raise FlashScheduleError(
+            "the alternating schedule is one CTA with one query slot"
+        )
+    if spec.causal or spec.multicast_kv or spec.cooperative_mma:
+        raise FlashScheduleError("the alternating schedule is dense and one-CTA")
+    if not spec.stage_output or not spec.split_p_arrive or spec.p_chunk_arrive:
+        raise FlashScheduleError(
+            "the alternating schedule stages its output and uses the split "
+            "probability publication"
+        )
+    if spec.kv_tile_n != 128:
+        raise FlashScheduleError("the alternating schedule uses 128-wide KV tiles")
+    if spec.persistent and (spec.kv_iterations is None or spec.kv_iterations <= 0):
+        raise FlashScheduleError(
+            "persistent schedules require a positive K/V iteration count"
+        )
+    if spec.kv_iterations is not None and (
+        spec.kv_iterations < 2 or spec.kv_iterations % 2
+    ):
+        raise FlashScheduleError(
+            "the alternating schedule needs an even K/V iteration count of at least two"
+        )
+    # The even warpgroup hands alpha over at its steps after the first; a
+    # two-step item has one even step, so that barrier, edge and slot exist
+    # only for longer items.
+    alpha_a_live = spec.kv_iterations is None or spec.kv_iterations > 2
+
+    cta = FlashSyncScope.CTA
+    tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    k_offset = 2 * tile_bytes
+    v_offset = k_offset + spec.kv_depth * tile_bytes
+    overhead_offset = v_offset + spec.v_depth * tile_bytes
+    q_load, k_load, v_load = "q_load_r0_q0", "k_load_r0", "v_load_r0"
+    output_stage, output_store = "output_stage_r0_q0", "output_store_r0_q0"
+    nodes = [
+        FlashNode(q_load, FlashNodeKind.Q_LOAD, 0, 0),
+        FlashNode(k_load, FlashNodeKind.K_LOAD, 0),
+        FlashNode(v_load, FlashNodeKind.V_LOAD, 0),
+        FlashNode(output_stage, FlashNodeKind.OUTPUT_STAGE, 0, 0),
+        FlashNode(output_store, FlashNodeKind.OUTPUT_STORE, 0, 0),
+    ]
+    for tag in "ab":
+        nodes.extend(
+            [
+                FlashNode(f"qk_{tag}", FlashNodeKind.QK_MMA, 0, 0),
+                FlashNode(f"softmax_{tag}", FlashNodeKind.SOFTMAX, 0, 0),
+                FlashNode(f"stat_{tag}", FlashNodeKind.STAT_PUBLISH, 0, 0),
+                FlashNode(f"correction_{tag}", FlashNodeKind.CORRECTION, 0, 0),
+                FlashNode(f"pv_{tag}", FlashNodeKind.PV_MMA, 0, 0),
+            ]
+        )
+    barriers = [
+        FlashBarrier("q_ready_r0_q0", 1, cta),
+        FlashBarrier("q_reuse_r0_q0", 1, cta),
+        FlashBarrier("k_ready_r0", 1, cta),
+        FlashBarrier("v_ready_r0", 1, cta),
+        FlashBarrier("k_reuse_r0", 2, cta),
+        FlashBarrier("v_reuse_r0", 2, cta),
+        FlashBarrier("o_full_r0_q0", 1, cta),
+        FlashBarrier("corr_epi_full_r0", 128, cta),
+        FlashBarrier("part_sum_r0", 128, cta),
+        FlashBarrier("part_sum_consumed_r0", 128, cta),
+        FlashBarrier("row_sum_consumed_r0", 128, cta),
+    ]
+    for tag in "ab":
+        barriers.extend(
+            [
+                FlashBarrier(f"s_full_{tag}", 1, cta),
+                FlashBarrier(f"s_empty_{tag}", 4, cta),
+                FlashBarrier(f"pfor_{tag}", 256, cta),
+                FlashBarrier(f"pfor2_{tag}", 128, cta),
+                FlashBarrier(f"pv_done_{tag}", 1, cta),
+                FlashBarrier(f"max_{tag}", 128, cta),
+            ]
+        )
+        if tag == "b" or alpha_a_live:
+            barriers.append(FlashBarrier(f"alpha_{tag}", 128, cta))
+    edges = [
+        FlashEdge(
+            q_load, "qk_a", barrier="q_ready_r0_q0", arrival_count=1, resource="Q_r0_q0"
+        ),
+        FlashEdge(q_load, "qk_b", resource="Q_r0_q0"),
+        FlashEdge(
+            k_load, "qk_a", barrier="k_ready_r0", arrival_count=1, resource="K_r0"
+        ),
+        FlashEdge(k_load, "qk_b", resource="K_r0"),
+        FlashEdge(
+            v_load, "pv_a", barrier="v_ready_r0", arrival_count=1, resource="V_r0"
+        ),
+        FlashEdge(v_load, "pv_b", resource="V_r0"),
+        # K(i)'s slot is refilled ``kv_depth`` tiles later; V likewise.
+        FlashEdge(
+            "qk_a",
+            k_load,
+            iteration_delta=spec.kv_depth // 2,
+            barrier="k_reuse_r0",
+            arrival_count=1,
+        ),
+        FlashEdge(
+            "qk_b",
+            k_load,
+            iteration_delta=(spec.kv_depth + 1) // 2,
+            barrier="k_reuse_r0",
+            arrival_count=1,
+        ),
+        FlashEdge(
+            "pv_a",
+            v_load,
+            iteration_delta=spec.v_depth // 2,
+            barrier="v_reuse_r0",
+            arrival_count=1,
+        ),
+        FlashEdge(
+            "pv_b",
+            v_load,
+            iteration_delta=(spec.v_depth + 1) // 2,
+            barrier="v_reuse_r0",
+            arrival_count=1,
+        ),
+        # running max A -> B inside the pair, B -> A into the next pair
+        FlashEdge(
+            "stat_a", "softmax_b", barrier="max_a", arrival_count=128, resource="MAX_a"
+        ),
+        FlashEdge(
+            "stat_b",
+            "softmax_a",
+            iteration_delta=1,
+            barrier="max_b",
+            arrival_count=128,
+            resource="MAX_b",
+        ),
+        # the even partial row sum reaches the odd warpgroup once per work item
+        FlashEdge(
+            "softmax_a",
+            "softmax_b",
+            barrier="part_sum_r0",
+            arrival_count=128,
+            resource="PARTSUM_r0",
+        ),
+        # ... and its slot is rewritten only after that read: the named barrier
+        # of the handoff must never see two even-side arrivals per odd sync
+        # (with one KV pair per item nothing else orders the next item's write)
+        FlashEdge(
+            "softmax_b",
+            "softmax_a",
+            iteration_delta=1,
+            barrier="part_sum_consumed_r0",
+            arrival_count=128,
+        ),
+        # the odd warpgroup's alpha slot carries the item's row sum to the
+        # correction warps; the next item's first alpha is written only after
+        # they read it (the PV chain orders the in-item alpha writes behind the
+        # previous read, but not this write across the item boundary)
+        FlashEdge(
+            "correction_b",
+            "stat_b",
+            iteration_delta=1,
+            barrier="row_sum_consumed_r0",
+            arrival_count=128,
+        ),
+        # the odd step's rescale of O waits for the even step's PV; O is drained once per item
+        FlashEdge("pv_a", "correction_b"),
+        FlashEdge("pv_a", output_stage),
+        FlashEdge(
+            "pv_b",
+            output_stage,
+            barrier="o_full_r0_q0",
+            arrival_count=1,
+            resource="O_r0_q0",
+        ),
+        FlashEdge("pv_b", "correction_a", iteration_delta=1, resource="O_r0_q0"),
+        FlashEdge(
+            output_stage,
+            output_store,
+            barrier="corr_epi_full_r0",
+            arrival_count=128,
+            resource="O_stage_r0_q0",
+        ),
+        # the Q stage goes back to the loader once the output store read it
+        FlashEdge(
+            output_store,
+            q_load,
+            iteration_delta=1,
+            barrier="q_reuse_r0_q0",
+            arrival_count=1,
+        ),
+    ]
+    for tag in "ab":
+        qk, softmax, stat = f"qk_{tag}", f"softmax_{tag}", f"stat_{tag}"
+        correction, pv = f"correction_{tag}", f"pv_{tag}"
+        edges.extend(
+            [
+                FlashEdge(
+                    qk,
+                    softmax,
+                    barrier=f"s_full_{tag}",
+                    arrival_count=1,
+                    resource=f"S_{tag}",
+                ),
+                # the score buffer is free once its row is in registers
+                FlashEdge(
+                    softmax,
+                    qk,
+                    iteration_delta=1,
+                    barrier=f"s_empty_{tag}",
+                    arrival_count=4,
+                ),
+                FlashEdge(softmax, stat),
+                FlashEdge(
+                    softmax,
+                    pv,
+                    barrier=f"pfor_{tag}",
+                    arrival_count=128,
+                    resource=f"P_{tag}",
+                ),
+                FlashEdge(softmax, pv, barrier=f"pfor2_{tag}", arrival_count=128),
+                FlashEdge(correction, pv, barrier=f"pfor_{tag}", arrival_count=128),
+                # the probability buffer is free once its PV completed
+                FlashEdge(
+                    pv,
+                    softmax,
+                    iteration_delta=1,
+                    barrier=f"pv_done_{tag}",
+                    arrival_count=1,
+                ),
+            ]
+        )
+        if tag == "b" or alpha_a_live:
+            edges.append(
+                FlashEdge(
+                    stat,
+                    correction,
+                    barrier=f"alpha_{tag}",
+                    arrival_count=128,
+                    resource=f"STAT_{tag}",
+                )
+            )
+    private = FlashVisibility.CTA_PRIVATE
+    regions = [
+        FlashMemoryRegion(
+            "Q_r0_q0",
+            FlashMemorySpace.SMEM,
+            0,
+            tile_bytes,
+            1024,
+            private,
+            q_load,
+            ("qk_a", "qk_b"),
+            alias_group="q_stage_r0",
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "O_stage_r0_q0",
+            FlashMemorySpace.SMEM,
+            0,
+            tile_bytes,
+            1024,
+            private,
+            output_stage,
+            (output_store,),
+            alias_group="q_stage_r0",
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "K_r0",
+            FlashMemorySpace.SMEM,
+            k_offset,
+            spec.kv_depth * tile_bytes,
+            1024,
+            private,
+            k_load,
+            ("qk_a", "qk_b"),
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "V_r0",
+            FlashMemorySpace.SMEM,
+            v_offset,
+            spec.v_depth * tile_bytes,
+            1024,
+            private,
+            v_load,
+            ("pv_a", "pv_b"),
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "PARTSUM_r0",
+            FlashMemorySpace.SMEM,
+            overhead_offset + 2048,
+            512,
+            16,
+            private,
+            "softmax_a",
+            ("softmax_b",),
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "S_a",
+            FlashMemorySpace.TMEM,
+            0,
+            128,
+            1,
+            private,
+            "qk_a",
+            ("softmax_a",),
+            reuse_distance=1,
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "S_b",
+            FlashMemorySpace.TMEM,
+            128,
+            128,
+            1,
+            private,
+            "qk_b",
+            ("softmax_b",),
+            reuse_distance=1,
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "O_r0_q0",
+            FlashMemorySpace.TMEM,
+            256,
+            spec.head_dim,
+            1,
+            private,
+            "pv_b",
+            ("correction_a", output_stage),
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "P_a",
+            FlashMemorySpace.TMEM,
+            256 + spec.head_dim,
+            64,
+            1,
+            private,
+            "softmax_a",
+            ("pv_a",),
+            reuse_distance=1,
+            cta_rank=0,
+        ),
+        FlashMemoryRegion(
+            "P_b",
+            FlashMemorySpace.TMEM,
+            256 + spec.head_dim + 64,
+            64,
+            1,
+            private,
+            "softmax_b",
+            ("pv_b",),
+            reuse_distance=1,
+            cta_rank=0,
+        ),
+    ]
+    for index, (tag, other) in enumerate((("a", "b"), ("b", "a"))):
+        if tag == "b" or alpha_a_live:
+            regions.append(
+                FlashMemoryRegion(
+                    f"STAT_{tag}",
+                    FlashMemorySpace.SMEM,
+                    overhead_offset + index * 512,
+                    512,
+                    16,
+                    private,
+                    f"stat_{tag}",
+                    (f"correction_{tag}",),
+                    cta_rank=0,
+                )
+            )
+        regions.append(
+            FlashMemoryRegion(
+                f"MAX_{tag}",
+                FlashMemorySpace.SMEM,
+                overhead_offset + 1024 + index * 512,
+                512,
+                16,
+                private,
+                f"stat_{tag}",
+                (f"softmax_{other}",),
+                cta_rank=0,
+            )
+        )
+    phase_cycles: tuple[FlashPhaseCycle, ...] = ()
+    if spec.persistent:
+        assert spec.kv_iterations is not None
+        steps = spec.kv_iterations
+        per_item = {
+            "k_ready_r0": steps,
+            "k_reuse_r0": steps,
+            "v_ready_r0": steps,
+            "v_reuse_r0": steps,
+            # the even warpgroup hands alpha over at its steps after the first,
+            # the odd one at every step plus the final row sum
+            "alpha_a": steps // 2 - 1,
+            "alpha_b": steps // 2 + 1,
+        }
+        cycles = []
+        for barrier in barriers:
+            uses = per_item.get(barrier.name)
+            if uses is None:
+                uses = (
+                    steps // 2
+                    if barrier.name.startswith(
+                        ("s_full", "s_empty", "pfor", "pv_done", "max_")
+                    )
+                    else 1
+                )
+            cycles.append(FlashPhaseCycle(barrier.name, (0, uses & 1, 0), uses))
+        phase_cycles = tuple(cycles)
+    return FlashSchedule(
+        spec=spec,
+        nodes=tuple(nodes),
+        edges=tuple(edges),
+        barriers=tuple(barriers),
+        memory_regions=tuple(regions),
+        output_owners=(FlashOutputOwner(0, 0, 0),),
+        phase_cycles=phase_cycles,
+        shared_memory_bytes=_shared_memory_bytes(spec),
+        tmem_columns=_alt_tmem_columns(spec),
+    )
+
+
+def fa4_schedule_fits(
+    spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
+) -> bool:
+    """Whether the schedule's SMEM layout fits at ``spec.kv_depth``."""
+    if limits is None:
+        limits = FlashScheduleLimits()
+    return _shared_memory_bytes(spec) <= limits.shared_memory_bytes
 
 
 def max_fa4_kv_depth(
@@ -192,10 +774,22 @@ def max_fa4_kv_depth(
     """Return the largest K/V depth allowed by the schedule's SMEM layout."""
     if limits is None:
         limits = FlashScheduleLimits()
+    if spec.uneven_kv_ring:
+        # The uneven layout is FA4's three-slot ring; it is either the depth
+        # that fits or the ordinary aliased ring's depth.
+        if fa4_schedule_fits(
+            dataclasses.replace(spec, kv_depth=UNEVEN_KV_RING_DEPTH), limits
+        ):
+            return UNEVEN_KV_RING_DEPTH
+        return max_fa4_kv_depth(dataclasses.replace(spec, uneven_kv_ring=False), limits)
     base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
-    # A staging slot holds one KV tile, which is ``kv_tile_n`` wide.
-    tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
-    bytes_per_stage = (2 if spec.separate_kv else 1) * tile_bytes
+    # A staging slot holds one KV tile, which is ``kv_tile_n`` wide; separate
+    # rings pay for a K and a V tile per stage, the aliased ring for the wider
+    # (each the per-CTA extent of a cooperative two-CTA MMA).
+    if spec.separate_kv:
+        bytes_per_stage = _k_tile_bytes(spec) + _v_tile_bytes(spec)
+    else:
+        bytes_per_stage = _kv_slot_bytes(spec)
     return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
 
 
@@ -235,8 +829,40 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     Score storage is always two local query slots. With two CTAs this becomes
     four aggregate CTA-local slices; it is not a temporal four-stage score ring.
     """
-    if spec.head_dim not in (64, 128):
-        raise FlashScheduleError("FA4 schedule requires head_dim 64 or 128")
+    if not flash_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
+        raise FlashScheduleError(
+            "FA4 schedule requires head_dim 64 or 128, or the 192/128 pair"
+        )
+    if spec.head_dim_v is not None and spec.head_dim_v != spec.head_dim:
+        if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
+            raise FlashScheduleError(
+                "asymmetric head dims need the one-CTA aliased K/V ring"
+            )
+    if spec.uneven_kv_ring:
+        if spec.head_dim_v is None or spec.head_dim_v == spec.head_dim:
+            raise FlashScheduleError("the uneven K/V ring needs asymmetric head dims")
+        if spec.kv_depth != UNEVEN_KV_RING_DEPTH:
+            raise FlashScheduleError("the uneven K/V ring has exactly three slots")
+        if uneven_kv_ring_shift_bytes(spec) % 1024 != 0:
+            raise FlashScheduleError(
+                "the uneven K/V ring shift must keep the 1024-byte swizzle period"
+            )
+    if spec.output_over_query:
+        if not spec.stage_output:
+            raise FlashScheduleError("output over the Q stages needs a staged output")
+        if spec.persistent:
+            raise FlashScheduleError(
+                "output over the Q stages needs a non-persistent schedule: a "
+                "persistent CTA loads the next item's Q tile while the output drains"
+            )
+        if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
+            raise FlashScheduleError(
+                "output over the Q stages needs the one-CTA aliased K/V ring"
+            )
+        if _value_head_dim(spec) > spec.head_dim:
+            raise FlashScheduleError(
+                "output over the Q stages needs output tiles no wider than Q"
+            )
     if spec.kv_depth < 2:
         raise FlashScheduleError("FA4 schedule requires at least two K/V stages")
     if spec.cta_count not in (1, 2):
@@ -301,14 +927,21 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         1 if spec.cooperative_mma else spec.cta_count if spec.multicast_kv else 1
     )
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
     q_bytes = spec.query_slots_per_cta * tile_bytes
-    kv_ring_bytes = spec.kv_depth * tile_bytes
+    kv_ring_bytes = _aliased_kv_ring_bytes(spec)
     k_offset = q_bytes
     v_offset = k_offset + (kv_ring_bytes if spec.separate_kv else 0)
     output_offset = q_bytes + (2 if spec.separate_kv else 1) * kv_ring_bytes
     overhead_offset = output_offset + (
-        spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
+        spec.query_slots_per_cta * output_tile_bytes
+        if spec.stage_output and not spec.output_over_query
+        else 0
     )
+    if spec.output_over_query:
+        # The staged output tiles alias the (dead) Q stages from offset 0.
+        output_offset = 0
+    q_alias_group = "q_stages_r{rank}" if spec.output_over_query else None
     stat_bytes_per_query = spec.stat_depth * 128 * 4
 
     load_nodes: set[str] = set()
@@ -661,6 +1294,11 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashVisibility.CTA_PRIVATE,
                     q_load,
                     (qk,),
+                    alias_group=(
+                        None
+                        if q_alias_group is None
+                        else q_alias_group.format(rank=rank)
+                    ),
                     cta_rank=rank,
                 )
             )
@@ -695,8 +1333,8 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_r{rank}_q{slot}",
                         FlashMemorySpace.TMEM,
-                        256 + slot * spec.head_dim,
-                        spec.head_dim,
+                        256 + slot * _value_head_dim(spec),
+                        _value_head_dim(spec),
                         1,
                         FlashVisibility.CTA_PRIVATE,
                         pv,
@@ -750,21 +1388,31 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_stage_r{rank}_q{slot}",
                         FlashMemorySpace.SMEM,
-                        output_offset + slot * tile_bytes,
-                        tile_bytes,
+                        output_offset + slot * output_tile_bytes,
+                        output_tile_bytes,
                         1024,
                         FlashVisibility.CTA_PRIVATE,
                         output_stage,
                         (output_store,),
+                        alias_group=(
+                            None
+                            if q_alias_group is None
+                            else q_alias_group.format(rank=rank)
+                        ),
                         cta_rank=rank,
                     )
                 )
 
+    if spec.p_chunk_arrive and not spec.split_p_arrive:
+        raise FlashScheduleError(
+            "the per-chunk probability release needs the split publication"
+        )
     for slot in range(spec.query_slots_per_cta):
         for rank in range(spec.cta_count):
             if spec.cooperative_mma:
                 pfor = f"pfor_q{slot}"
                 pfor2 = f"pfor2_q{slot}"
+                pfor_chunks = tuple(f"pforc{index}_q{slot}" for index in range(2))
                 pfor_scope = FlashSyncScope.CLUSTER_LEADER
                 if rank == 0:
                     barriers.append(
@@ -774,14 +1422,26 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                         barriers.append(
                             FlashBarrier(pfor2, 128 * spec.cta_count, pfor_scope)
                         )
+                    if spec.p_chunk_arrive:
+                        barriers.extend(
+                            FlashBarrier(name, 128 * spec.cta_count, pfor_scope)
+                            for name in pfor_chunks
+                        )
             else:
                 rank_suffix = f"_r{rank}" if spec.cta_count > 1 else ""
                 pfor = f"pfor{rank_suffix}_q{slot}"
                 pfor2 = f"pfor2{rank_suffix}_q{slot}"
+                pfor_chunks = tuple(
+                    f"pforc{index}{rank_suffix}_q{slot}" for index in range(2)
+                )
                 pfor_scope = FlashSyncScope.CTA
                 barriers.append(FlashBarrier(pfor, 256, pfor_scope))
                 if spec.split_p_arrive:
                     barriers.append(FlashBarrier(pfor2, 128, pfor_scope))
+                if spec.p_chunk_arrive:
+                    barriers.extend(
+                        FlashBarrier(name, 128, pfor_scope) for name in pfor_chunks
+                    )
             softmax = _node_name("softmax", rank, slot)
             correction = _node_name("correction", rank, slot)
             pv = _node_name("pv", rank, slot)
@@ -813,6 +1473,17 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                         arrival_count=128,
                         scope=pfor_scope,
                     )
+                )
+            if spec.p_chunk_arrive:
+                edges.extend(
+                    FlashEdge(
+                        softmax,
+                        pv,
+                        barrier=name,
+                        arrival_count=128,
+                        scope=pfor_scope,
+                    )
+                    for name in pfor_chunks
                 )
 
     phase_cycles: tuple[FlashPhaseCycle, ...] = ()
@@ -862,7 +1533,7 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 )
             )
         phase_cycles = tuple(cycles)
-    tmem_columns = 256 + spec.query_slots_per_cta * spec.head_dim
+    tmem_columns = 256 + spec.query_slots_per_cta * _value_head_dim(spec)
     return FlashSchedule(
         spec=spec,
         nodes=tuple(nodes),
@@ -1189,7 +1860,69 @@ def verify_flash_schedule(
         v_region = region_by_name.get(f"V_r{rank}")
         if k_region is None or v_region is None:
             raise FlashScheduleError("K/V ring representation is incomplete")
-        if schedule.spec.separate_kv:
+        if schedule.spec.alternating_warpgroups:
+            if (
+                not k_region.physical
+                or not v_region.physical
+                or k_region.offset + k_region.extent > v_region.offset
+                or barrier_by_name.get(f"k_reuse_r{rank}") is None
+                or barrier_by_name.get(f"v_reuse_r{rank}") is None
+            ):
+                raise FlashScheduleError(
+                    "alternating K/V rings must be distinct physical rings with "
+                    "reuse barriers"
+                )
+
+            # A slot one softmax warpgroup hands to the other over a named
+            # barrier (bar.arrive by the writer, bar.sync by the reader) is only
+            # safe when the writer cannot arrive twice before one sync. The
+            # graph's node granularity cannot show that order (the reader's
+            # other publications in the same step reach the writer earlier
+            # than its read does), so the slot needs an explicit consumption
+            # guard: a barrier edge from the reader back to the writer one
+            # iteration later, with every reader thread arriving.
+            def require_consumption_guard(region: FlashMemoryRegion) -> None:
+                for consumer in region.consumers:
+                    guard_barriers: list[FlashBarrier] = []
+                    for edge in schedule.edges:
+                        barrier_name = edge.barrier
+                        if (
+                            barrier_name is None
+                            or edge.source != consumer
+                            or edge.target != region.writer
+                            or edge.iteration_delta < 1
+                        ):
+                            continue
+                        guard_barrier = barrier_by_name.get(barrier_name)
+                        if guard_barrier is not None:
+                            guard_barriers.append(guard_barrier)
+                    if not guard_barriers or any(
+                        barrier.expected_arrivals != 128 for barrier in guard_barriers
+                    ):
+                        raise FlashScheduleError(
+                            f"handoff slot {region.name} needs a consumption guard: "
+                            f"a barrier edge from {consumer} back to {region.writer} "
+                            "one iteration later with 128 arrivals"
+                        )
+
+            for region in schedule.memory_regions:
+                if (
+                    region.space is not FlashMemorySpace.SMEM
+                    or not region.writer.startswith("softmax_")
+                    or not all(c.startswith("softmax_") for c in region.consumers)
+                ):
+                    continue
+                require_consumption_guard(region)
+            # The odd warpgroup's alpha slot doubles as its row-sum slot at the
+            # end of every item. Inside an item each alpha write follows the
+            # correction warps' read of the previous one through the PV chain;
+            # the next item's first alpha has no such order against the
+            # row-sum read, so this slot needs the same guard from the
+            # correction warps back to its writer.
+            for region in schedule.memory_regions:
+                if region.name == "STAT_b":
+                    require_consumption_guard(region)
+        elif schedule.spec.separate_kv:
             if (
                 not k_region.physical
                 or not v_region.physical
@@ -1292,7 +2025,9 @@ def verify_flash_schedule(
     if schedule.shared_memory_bytes != expected_shared_memory:
         raise FlashScheduleError("shared-memory accounting does not match the schedule")
     expected_tmem_columns = (
-        256 + schedule.spec.query_slots_per_cta * schedule.spec.head_dim
+        _alt_tmem_columns(schedule.spec)
+        if schedule.spec.alternating_warpgroups
+        else 256 + schedule.spec.query_slots_per_cta * _value_head_dim(schedule.spec)
     )
     if schedule.tmem_columns != expected_tmem_columns:
         raise FlashScheduleError("TMEM accounting does not match the schedule")

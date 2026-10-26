@@ -220,7 +220,9 @@ def _(lhs: object, rhs: object) -> object:
     assert lhs.size() == rhs.size()
     assert lhs.dtype == rhs.dtype
     assert lhs.device == rhs.device
-    return torch.empty_like(lhs)
+    result = torch.empty_like(lhs)
+    HostFunction.current().compiler_state.record_ssa_copy(result, (lhs, rhs))
+    return result
 
 
 @_decorators.codegen(_phi, "common")
@@ -406,8 +408,10 @@ def _new_var(value: _T, /) -> _T:
 @_decorators.register_fake(_new_var)
 def _(value: _T) -> _T:
     if isinstance(value, torch.Tensor):
+        result = torch.empty_like(value)
+        HostFunction.current().compiler_state.record_ssa_copy(result, (value,))
         # pyrefly: ignore [bad-return]
-        return torch.empty_like(value)
+        return result
     if isinstance(value, torch.SymInt):
         # pyrefly: ignore [bad-return]
         return CompileEnvironment.current().create_unbacked_symint()

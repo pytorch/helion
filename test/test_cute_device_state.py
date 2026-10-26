@@ -14,6 +14,7 @@ from torch.fx import Graph
 
 from helion import exc
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.cute.access_regions import tile_begin_symbol
 from helion._compiler.cute.cute_mma import _collective_load_dependency_nodes
 from helion._compiler.cute.cute_mma import _emit_tcgen05_device_segments_setup
 from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
@@ -695,13 +696,20 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         self.assertTrue(state.consume_root_lane_loop_suppression())
         self.assertFalse(state.consume_root_lane_loop_suppression())
 
-    def test_collective_handled_load_names_stay_for_load_suppression(self) -> None:
+    def test_collective_handled_loads_are_keyed_by_node(self) -> None:
+        # FX names are unique only within a graph: the root graph's first load
+        # is ``load`` like the K loop's operand load, and must not be taken for
+        # it (a scalar load beside the matmul then read 0).
         state = CuteDeviceFunctionState()
+        k_loop, root = Graph(), Graph()
+        operand_load = k_loop.call_function(operator.pos, (k_loop.placeholder("a"),))
+        root_load = root.call_function(operator.pos, (root.placeholder("a"),))
+        operand_load.name = root_load.name = "load"
 
-        state.register_collective_handled_load("operand_load")
+        state.register_collective_handled_load(operand_load)
 
-        self.assertTrue(state.is_collective_handled_load("operand_load"))
-        self.assertFalse(state.is_collective_handled_load("indices"))
+        self.assertTrue(state.is_collective_handled_load(operand_load))
+        self.assertFalse(state.is_collective_handled_load(root_load))
 
     def test_collective_load_dependency_names_keeps_pair_shared_ancestors(
         self,
@@ -1020,3 +1028,16 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
 
         self.assertEqual(loop.inner_statements, [stmt])
         self.assertFalse(state.is_tcgen05_kloop_owned_stmt(loop, stmt))
+
+
+def test_loop_states_built_in_turn_name_distinct_tile_begins() -> None:
+    # The state of a finished loop is collected before the next loop's begin
+    # symbol is built, and CPython may hand the next state the same address:
+    # the symbol names the state's serial, never its address.
+    symbols = set()
+    for _ in range(64):
+        state = _kloop_with_inner()
+        symbol = tile_begin_symbol(0, state)
+        assert f"{id(state):x}" not in symbol.name
+        symbols.add(symbol)
+    assert len(symbols) == 64

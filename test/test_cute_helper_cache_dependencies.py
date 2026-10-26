@@ -75,6 +75,41 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "_compiler/cute/kda_device_primitives.py",
             "chunk_recurrence_sm100",
         ),
+        (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/gdn_recurrence_sm100.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/gdn_recurrence_geometry.py",
+            "chunk_recurrence_warp_dv4",
+        ),
+        (
+            "helion_flash",
+            "_compiler/cute/_flash_runtime.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "helion_flash",
+            "_compiler/cute/_flash_alt_runtime.py",
+            "helion_flash_row_mma",
+        ),
+        (
+            "helion_flash_gated",
+            "_compiler/cute/_flash_gemm_ptx.py",
+            "gathered_mma_tma",
+        ),
+        (
+            "helion_flash_row_mma",
+            "_compiler/cute/_flash_row_mma_runtime.py",
+            "helion_flash",
+        ),
+        (
+            "helion_warp_mma_gemm",
+            "_compiler/cute/_warp_mma_runtime.py",
+            "helion_flash_row_mma",
+        ),
     ],
 )
 def test_transitive_helper_changes_only_its_family(
@@ -112,6 +147,28 @@ def test_wrapper_generator_edit_invalidates_all_kinds(source_tree: Path) -> None
     before = list(map(_key, kernels))
     (source_tree / "runtime/cute/launcher.py").write_text("# new wrapper generation\n")
     assert all(old != _key(kernel) for old, kernel in zip(before, kernels, strict=True))
+
+
+@pytest.mark.parametrize(
+    "edited",
+    ("_compiler/cute/reduce_helpers.py", "_compiler/cute/cluster_helpers.py"),
+)
+def test_reduction_helper_edits_invalidate_ordinary_and_wrapper_keys(
+    source_tree: Path, edited: str
+) -> None:
+    # The generated source and plans stay identical while the compiled helper
+    # changes. The pre-trace key must invalidate both ordinary and wrapper IR.
+    path = source_tree / edited
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("def helper():\n    return 1\n")
+    kernels = [_kernel(None), *map(_kernel, source_dependencies._WRAPPER_DEPENDENCIES)]
+    before = list(map(_key, kernels))
+    assert all(key is not None for key in before)
+    path.write_text("def helper():\n    return 2\n")
+    after = list(map(_key, kernels))
+    assert all(old != new for old, new in zip(before, after, strict=True))
+    path.unlink()
+    assert all(_key(kernel) is None for kernel in kernels)
 
 
 @pytest.mark.parametrize("schedule", ["scalar", "resident", "pipelined"])
@@ -275,6 +332,8 @@ def test_missing_single_helper_source_disables_only_single_disk_reuse(
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ],
 )
 def test_helper_only_edit_changes_key_without_wrapper_or_plan_change(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import ast
 import contextlib
+import re
 import unittest
 from unittest import mock
 
@@ -21,9 +21,33 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+# The load keyword carrying the L1 eviction priority (Triton's tl.load vs
+# CuTe's cute.arch.load); asserting on it keeps the `# src[...]` comments
+# that echo the kernel source from satisfying the checks.
+_EVICTION_KWARG = (
+    "level1_eviction_priority" if _get_backend() == "cute" else "eviction_policy"
+)
 
 
-@onlyBackends(["triton"])
+def _hinted_loads(code: str, policy: str) -> list[str]:
+    """The generated lines that load with L1 eviction ``policy``.
+
+    CuTe lowers a hinted scalar load to an exact-policy PTX helper
+    (``cute/scalar_policy_loads.py``) whose last argument names the policy.
+    """
+    lowered = re.compile(
+        rf"_cute_scalar_policy_load\(.*'{policy.removeprefix('evict_')}'\)"
+    )
+    return [
+        line
+        for line in code.splitlines()
+        if f"{_EVICTION_KWARG}='{policy}'" in line or lowered.search(line)
+    ]
+
+
+@onlyBackends(["triton", "cute"])
 class TestEvictionPolicy(RefEagerTestBase, TestCase):
     @contextlib.contextmanager
     def _indexing_context(self, indexing: str) -> None:
@@ -70,8 +94,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             x = torch.randn([128], device=DEVICE, dtype=torch.float32)
             code, result = code_and_output(copy_with_eviction, (x,))
             torch.testing.assert_close(result, x)
-            self.assertIn("eviction_policy", code)
-            self.assertIn("evict_last", code)
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_last")))
 
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -134,7 +157,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, x + y)
 
             # Check that evict_last appears in the generated code
-            self.assertIn("evict_last", code)
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_last")))
 
     @skipIfRefEager("Generated code inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -159,16 +182,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_eviction, (x, y))
 
         torch.testing.assert_close(result, x + y)
-        self.assertEqual(
-            sum(
-                isinstance(node, ast.keyword)
-                and node.arg == "eviction_policy"
-                and isinstance(node.value, ast.Constant)
-                and node.value.value == "evict_last"
-                for node in ast.walk(ast.parse(code))
-            ),
-            2,
-        )
+        self.assertEqual(len(_hinted_loads(code, "evict_last")), 2)
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -178,7 +192,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             @helion.kernel(
                 config={
                     "block_size": 16,
-                    "load_eviction_policies": ["first", "first"],
+                    # Only the load without an explicit policy owns a slot
+                    "load_eviction_policies": ["first"],
                     "indexing": indexing,
                 }
             )
@@ -197,7 +212,44 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             code, result = code_and_output(kernel_with_override, (x, y))
             torch.testing.assert_close(result, x + y)
 
-            self.assertIn("evict_last", code)
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_last")))
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_first")))
+
+    @skipIfRefEager("Generated code inspection not applicable in ref eager mode")
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    @skipIfRocm("ROCm does not support eviction policy")
+    def test_tile_index_load_keeps_later_eviction_slots(self) -> None:
+        """A tile-index read owns the first slot; the loads after it keep theirs."""
+
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[16, 16]):
+                rows = tile_m.index[:, None]
+                out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n] + rows
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([64, 64], device=DEVICE, dtype=torch.float32)
+        self.assertEqual(
+            kernel.bind((x, y)).config_spec.load_eviction_policies.length, 3
+        )
+        code, result = code_and_output(
+            kernel,
+            (x, y),
+            load_eviction_policies=["", "first", "last"],
+            indexing="pointer",
+        )
+        rows = torch.arange(64, device=DEVICE, dtype=torch.float32)[:, None]
+        torch.testing.assert_close(result, x + y + rows)
+        hinted = {
+            policy: _hinted_loads(code, policy)
+            for policy in ("evict_first", "evict_last")
+        }
+        self.assertEqual(len(hinted["evict_first"]), 1)
+        self.assertEqual(len(hinted["evict_last"]), 1)
+        self.assertRegex(hinted["evict_first"][0], r"\bx\b")
+        self.assertRegex(hinted["evict_last"][0], r"\by\b")
 
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
@@ -229,8 +281,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             code, result = code_and_output(kernel_multiple_loads, (x, y, z))
             torch.testing.assert_close(result, x + y + z)
 
-            self.assertIn("evict_first", code)
-            self.assertIn("evict_last", code)
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_first")))
+            self.assertTrueIfInNormalMode(bool(_hinted_loads(code, "evict_last")))
 
 
 instantiate_parametrized_tests(TestEvictionPolicy)

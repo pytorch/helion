@@ -1,4 +1,9 @@
-"""Prove private host storage before promoting half atomic outputs to FP32."""
+"""Prove private host storage for atomic outputs.
+
+``fresh_half_atomic_outputs`` promotes half atomic outputs to FP32;
+``private_fresh_host_bindings`` is the same proof for the exact zero-add
+elision of ``cute/atomic_ops.py``.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import ast
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -16,6 +22,21 @@ def fresh_half_atomic_outputs(
     body: Sequence[ast.stmt], promotions: Mapping[str, torch.dtype]
 ) -> dict[str, torch.dtype]:
     """Require a fresh allocation whose host references cannot escape as aliases."""
+    return {
+        name: promotions[name] for name in private_fresh_host_bindings(body, promotions)
+    }
+
+
+def private_fresh_host_bindings(
+    body: Sequence[ast.stmt], names: Collection[str]
+) -> set[str]:
+    """The ``names`` bound exactly once, to a fresh factory allocation, whose
+    host references never escape: every later mention is metadata, the
+    destination of ``hl.atomic_add``, or the return value.
+
+    A factory is a ``torch.*`` allocation call or a ``Tensor.new_*`` method,
+    which allocates afresh whatever its receiver (the receiver only supplies
+    the default dtype and device)."""
     factories = {
         f"torch.{name}"
         for name in (
@@ -29,19 +50,20 @@ def fresh_half_atomic_outputs(
             "full_like",
         )
     }
+    factory_methods = {"new_empty", "new_zeros", "new_ones", "new_full"}
     module = ast.Module(body=list(body), type_ignores=[])
     parents = {
         id(child): parent
         for parent in ast.walk(module)
         for child in ast.iter_child_nodes(parent)
     }
-    bindings: dict[str, list[ast.Name]] = {name: [] for name in promotions}
+    bindings: dict[str, list[ast.Name]] = {name: [] for name in names}
     escaped: set[str] = set()
     for node in ast.walk(module):
         if (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
-            and node.id in promotions
+            and node.id in names
         ):
             parent = parents[id(node)]
             ancestor = parent
@@ -96,7 +118,7 @@ def fresh_half_atomic_outputs(
             and node.id in bindings
         ):
             bindings[node.id].append(node)
-    result = {}
+    result: set[str] = set()
     for assignment in ast.walk(module):
         if (
             not isinstance(assignment, ast.Assign)
@@ -105,15 +127,19 @@ def fresh_half_atomic_outputs(
         ):
             continue
         target = assignment.targets[0]
+        value = assignment.value
         if (
             bindings.get(target.id) == [target]
             and target.id not in escaped
-            and isinstance(assignment.value, ast.Call)
-            and ast.unparse(assignment.value.func) in factories
-            and all(
-                keyword.arg not in (None, "out")
-                for keyword in assignment.value.keywords
+            and isinstance(value, ast.Call)
+            and (
+                ast.unparse(value.func) in factories
+                or (
+                    isinstance(value.func, ast.Attribute)
+                    and value.func.attr in factory_methods
+                )
             )
+            and all(keyword.arg not in (None, "out") for keyword in value.keywords)
         ):
-            result[target.id] = promotions[target.id]
+            result.add(target.id)
     return result

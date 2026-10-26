@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import enum
+import functools
 import linecache
 import os
 import re
@@ -138,6 +139,20 @@ def get_wrapper_cls(cls: type[ast.AST]) -> type[ast.AST]:
     return rv
 
 
+def clone_ast(value: object) -> object:
+    """Deep-copy Python/ExtendedAST nodes without dropping Helion source metadata."""
+    if isinstance(value, list):
+        return [clone_ast(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clone_ast(item) for item in value)
+    if isinstance(value, ast.AST):
+        fields = {field: clone_ast(getattr(value, field)) for field in value._fields}
+        if isinstance(value, ExtendedAST):
+            return value.copy(**fields)
+        return ast.copy_location(type(value)(**fields), value)
+    return value
+
+
 def create(cls: type[_T], **fields: object) -> _T:
     # pyrefly: ignore [unexpected-keyword]
     result = get_wrapper_cls(cls)(**fields, _location=current_location())
@@ -164,6 +179,13 @@ def create_arguments(args: list[ast.arg]) -> ast.arguments:
         kw_defaults=[],
         kwonlyargs=[],
     )
+
+
+@functools.lru_cache(maxsize=512)
+def _parse_statement(template: str) -> ast.stmt:
+    # Substitution rebuilds this raw tree with fresh nodes and source locations.
+    (statement,) = ast.parse(template).body
+    return statement
 
 
 def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
@@ -211,7 +233,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     modified_template = re.sub(pattern, make_unique, template)
 
     # Parse the modified template into an AST
-    (statement,) = ast.parse(modified_template).body
+    statement = _parse_statement(modified_template)
 
     # Second pass: Recursively walk the AST and replace __placeholder_N__ identifiers
     # with the actual AST nodes provided by the user

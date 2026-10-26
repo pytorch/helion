@@ -176,7 +176,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_end, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset_var = state.codegen.offset_var(index)
+    offset_var = state.codegen.tile_begin_var(index)
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
         block_size_var = "1"
@@ -295,7 +295,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.codegen(tile_id, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    offset = state.codegen.offset_var(index)
+    offset = state.codegen.tile_begin_var(index)
     block_size = state.device_function.block_size_var(index)
     if block_size is None:
         expr_str = offset

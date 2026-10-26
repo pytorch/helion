@@ -334,7 +334,7 @@ class TileBeginOrigin(GridOrigin):
     def host_str(self) -> str:
         from .device_function import DeviceFunction
 
-        return DeviceFunction.current().codegen.offset_var(self.block_id)
+        return DeviceFunction.current().codegen.tile_begin_var(self.block_id)
 
 
 @dataclasses.dataclass
@@ -345,7 +345,7 @@ class TileEndOrigin(GridOrigin):
 
         device_fn = DeviceFunction.current()
         codegen = device_fn.codegen
-        offset = codegen.offset_var(self.block_id)
+        offset = codegen.tile_begin_var(self.block_id)
         block_size = device_fn.block_size_var(self.block_id) or "1"
         naive_end = f"{offset} + {block_size}"
         mask = codegen.mask_var(self.block_id)
@@ -359,6 +359,21 @@ class TileEndOrigin(GridOrigin):
         assert end_var is not None
         backend = CompileEnvironment.current().backend
         return backend.minimum_expr(naive_end, end_var)
+
+
+@dataclasses.dataclass
+class TileExtentOrigin(GridOrigin):
+    """The number of elements the current tile of ``block_id`` holds.
+
+    The block size, clamped to the loop end on the last tile of a dim the
+    block does not divide (``tile.end - tile.begin``); a mean over the tile
+    divides by it rather than by the padded block.
+    """
+
+    def host_str(self) -> str:
+        from .device_function import DeviceFunction
+
+        return DeviceFunction.current().tile_extent_expr(self.block_id)
 
 
 @dataclasses.dataclass
@@ -386,7 +401,7 @@ class TileIdOrigin(GridOrigin):
         from .device_function import DeviceFunction
 
         device_fn = DeviceFunction.current()
-        offset = device_fn.codegen.offset_var(self.block_id)
+        offset = device_fn.codegen.tile_begin_var(self.block_id)
         block_size = device_fn.block_size_var(self.block_id)
         if block_size is None:
             return offset

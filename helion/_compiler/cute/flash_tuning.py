@@ -16,6 +16,9 @@ _FLASH_POLICY_EXP2_PACKETS = frozenset(
         "deg1_16x8",
         "deg1_8x2_corr10",
         "causal_hd128_resident3_013_prefetch2_deg2_early_acquire",
+        "causal_hd128_resident3_013_prefetch2_deg2_16x4_early_acquire",
+        "causal_hd128_resident3_013_prefetch2_deg2_16x2_early_acquire",
+        "causal_hd128_resident3_013_prefetch2_xu_early_acquire",
     }
 )
 _FLASH_POLICY_E2E_SCHEDULES = frozenset({"xu", "8/2", "16/2", "16/4", "16/6", "16/8"})
@@ -24,6 +27,7 @@ _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
     {
         "ws_overlap",
         "fa4",
+        "row_mma",
         "fa4_deep_1cta",
         "fa4_2cta_causal",
         "fa4_tma_4d",
@@ -37,6 +41,7 @@ _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
         "fa4_clc_tma_4d",
         "fa4_clc_local_tma",
         "fa4_clc_local_tma_4d",
+        "fa4_alt",
     }
 )
 _FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES = frozenset(

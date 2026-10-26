@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from typing import cast
 import unittest
 from unittest.mock import patch
 
+import sympy
 import torch
 from torch.fx import Graph
 
 import helion
 from helion import exc
 from helion._compiler.cute import cute_epilogue
+from helion._compiler.cute.epilogue_fanout import _chain_key
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
+from helion._compiler.device_function import DeviceFunction
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
@@ -100,6 +104,127 @@ class TestCuteEpilogue(unittest.TestCase):
             )
         )
         self.assertIsNone(direct_load_step.hoistable_aux_expr)
+
+    def test_runtime_scalar_expr_helpers(self) -> None:
+        """Scalar leaves render inline and never count as aux loads."""
+        graph = Graph()
+        load = cute_epilogue._AuxiliaryTensorLoadExpr(
+            load_node=graph.placeholder("load"),
+            broadcast_axis=None,
+            template="{aux}",
+        )
+        alpha = cute_epilogue._RuntimeScalarExpr(sympy.Symbol("alpha"))
+        scale_node = graph.placeholder("scale")
+        scale = cute_epilogue._RuntimeScalarExpr(scale_node)
+        self.assertTrue(alpha.is_host_scalar)
+        self.assertFalse(scale.is_host_scalar)
+        scaled_load = cute_epilogue._BinaryTensorExpr(
+            op_name="mul",
+            op_template="{lhs} * {rhs}",
+            lhs=load,
+            rhs=scale,
+        )
+        step = cute_epilogue._AuxiliaryTensorExprStep(
+            expr=cute_epilogue._BinaryTensorExpr(
+                op_name="add",
+                op_template="{lhs} + {rhs}",
+                lhs=cute_epilogue._CurrentTensorExpr(),
+                rhs=scaled_load,
+            )
+        )
+        chain = cute_epilogue.Tcgen05UnaryEpilogueChain(
+            steps=(
+                cute_epilogue._AuxiliaryTensorExprStep(
+                    expr=cute_epilogue._BinaryTensorExpr(
+                        op_name="mul",
+                        op_template="{lhs} * {rhs}",
+                        lhs=cute_epilogue._CurrentTensorExpr(),
+                        rhs=alpha,
+                    )
+                ),
+                step,
+            )
+        )
+
+        self.assertEqual(step.operands, (load,))
+        self.assertEqual(chain.auxiliary_tensor_loads, (load,))
+        self.assertEqual(chain.runtime_scalars, (alpha, scale))
+        self.assertFalse(cute_epilogue._tensor_expr_contains_current(scaled_load))
+        # Both scalar-only sides hoist like any other aux-only expression.
+        self.assertIs(chain.steps[0].hoistable_aux_expr, alpha)
+        self.assertIs(step.hoistable_aux_expr, scaled_load)
+        # Rank-0 loads key by node identity; host scalars by expression.
+        self.assertEqual(
+            _chain_key(chain),
+            _chain_key(
+                cute_epilogue.Tcgen05UnaryEpilogueChain(
+                    steps=(
+                        cute_epilogue._AuxiliaryTensorExprStep(
+                            expr=cute_epilogue._BinaryTensorExpr(
+                                op_name="mul",
+                                op_template="{lhs} * {rhs}",
+                                lhs=cute_epilogue._CurrentTensorExpr(),
+                                rhs=cute_epilogue._RuntimeScalarExpr(
+                                    sympy.Symbol("alpha")
+                                ),
+                            )
+                        ),
+                        step,
+                    )
+                )
+            ),
+        )
+        self.assertNotEqual(
+            _chain_key(chain),
+            _chain_key(
+                cute_epilogue.Tcgen05UnaryEpilogueChain(
+                    steps=(
+                        chain.steps[0],
+                        cute_epilogue._AuxiliaryTensorExprStep(
+                            expr=cute_epilogue._BinaryTensorExpr(
+                                op_name="add",
+                                op_template="{lhs} + {rhs}",
+                                lhs=cute_epilogue._CurrentTensorExpr(),
+                                rhs=cute_epilogue._BinaryTensorExpr(
+                                    op_name="mul",
+                                    op_template="{lhs} * {rhs}",
+                                    lhs=load,
+                                    rhs=cute_epilogue._RuntimeScalarExpr(
+                                        graph.placeholder("other_scale")
+                                    ),
+                                ),
+                            )
+                        ),
+                    )
+                )
+            ),
+        )
+
+        # Rendering reads the current device function: a host scalar renders
+        # its sympy expression, a rank-0 load its pinned base-pointer read.
+        scale_tensor_node = graph.placeholder("scale_tensor")
+        scale_tensor_node.meta["val"] = torch.empty((), dtype=torch.float32)
+        scale_node.args = (scale_tensor_node,)
+        device_function = SimpleNamespace(
+            sympy_expr=str,
+            tensor_arg=lambda tensor: SimpleNamespace(name="scale"),
+            placeholder_args=set(),
+        )
+        with patch.object(DeviceFunction, "current", lambda: device_function):
+            prelude, result = chain.render_prelude_and_expr(
+                "acc",
+                lambda prefix: prefix,
+                "    ",
+                aux_locals_by_expr={load: "aux_0"},
+            )
+        self.assertEqual(
+            prelude,
+            "    tcgen05_chain_step = acc * cutlass.Float32(alpha)\n"
+            "    tcgen05_aux_product = aux_0 * cutlass.Float32((scale.iterator).load())\n"
+            "    tcgen05_chain_step = tcgen05_chain_step + tcgen05_aux_product\n",
+        )
+        self.assertEqual(result, "tcgen05_chain_step")
+        self.assertEqual(device_function.placeholder_args, {"scale"})
 
     def test_auxiliary_tensor_expr_fx_helpers(self) -> None:
         """The structural precheck and metadata-aware classifier stay distinct."""

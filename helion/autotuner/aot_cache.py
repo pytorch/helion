@@ -63,6 +63,7 @@ from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
 from .benchmark_provider import _MultiShapeAutotuneArgs
+from .benchmark_provider import _searching_candidates
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1415,7 +1416,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             for config in all_configs:
                 try:
                     bound = self.kernel.kernel.bind(input_args)
-                    fn = bound.compile_config(config)
+                    with _searching_candidates():
+                        fn = bound.compile_config(config)
 
                     from triton.testing import do_bench
 

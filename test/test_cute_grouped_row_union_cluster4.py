@@ -122,7 +122,7 @@ def test_ordinary_profile_and_original_allocation(case):
     assert source.count("StaticPersistentTileScheduler.create(") == 3
     assert "tcgen05_work_tile_smem" not in source
     assert "block=(32, 6, 1)" in source
-    assert "_NUM_SM // 4" in source
+    assert "_MAX_ACTIVE_CLUSTERS" in source and "_NUM_SM // 4" not in source
     assert source.count("out = torch.empty(") == 1
     ab, out = _plans(source)
     assert (ab["bm"], ab["bn"], ab["bk"], ab["ab_stage_count"]) == (256, 80, 64, 10)

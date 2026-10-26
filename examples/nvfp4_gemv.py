@@ -236,7 +236,8 @@ def _nvfp4_gemv_bf16in_body(
     alpha: float = 1.0,
 ) -> Tensor:
     M, K_groups, _ = weight_fp4x2.shape
-    block_m = hl.register_block_size(1, 8)
+    # The body computes only tile_m.begin, so each tile must contain one row.
+    block_m = hl.register_block_size(1, 1)
     block_k = hl.register_block_size(16, K_groups)
 
     for tile_m in hl.tile(M, block_size=block_m):
@@ -278,7 +279,8 @@ def _nvfp4_gemv_fp4in_body(
     alpha: float = 1.0,
 ) -> Tensor:
     M, K_groups, _ = weight_fp4x2.shape
-    block_m = hl.register_block_size(1, 8)
+    # The body computes only tile_m.begin, so each tile must contain one row.
+    block_m = hl.register_block_size(1, 1)
     block_k = hl.register_block_size(16, K_groups)
 
     for tile_m in hl.tile(M, block_size=block_m):

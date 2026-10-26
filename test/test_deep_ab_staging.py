@@ -20,8 +20,8 @@ class TestDeepABStagingHelpers(TestCase):
         # FP8 (1 byte) -> 12 stages
         self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(1), 12)
 
-        # FP16/BF16 (2 bytes) -> 6 stages
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2), 6)
+        # FP16/BF16 (2 bytes) -> 12 stages (the SMEM budget clamps per tile)
+        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2), 12)
 
         # FP32 (4 bytes) -> 3 stages
         self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(4), 3)
@@ -81,8 +81,8 @@ class TestMaxABStagesThatFit(TestCase):
         # FP8 should support deep staging (>6 stages)
         self.assertGreater(fp8_max, 6, "FP8 should enable deep staging")
 
-        # BF16 should be limited
-        self.assertLessEqual(bf16_max, 6, "BF16 should cap at 6 or less")
+        # BF16 is limited by the budget: 7 stages of 32 KB in 232 KB
+        self.assertEqual(bf16_max, 7, "BF16 should fit 7 stages of 32 KB")
 
         # Ratio should be roughly 2x (within overhead tolerance)
         if bf16_max > 0:

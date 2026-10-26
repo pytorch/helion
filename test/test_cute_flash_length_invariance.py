@@ -23,9 +23,11 @@ import torch
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import cute_flash_row_mma
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._testing import skipUnlessBackends
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -40,14 +42,20 @@ if TYPE_CHECKING:
 
     from helion._compiler.device_function import DeviceFunction
 
+pytestmark = skipUnlessBackends(["cute"])
+
 # Length-invariance is an equality chain, so comparing the two extreme lengths
 # of a legality class gives the same guarantee as comparing every member;
 # test_flash_length_classes_preserve_only_structural_legality_boundaries pins
 # the interior lengths to their class.
 _ALIGNED_LENGTHS = (4, 4096)
+# Exactly two KV tiles is its own class: the 64-row tile's one-pass softmax
+# (``cute_flash_ws_one_pass``) exists only there, so its surface differs from
+# the other paired lengths by that one fragment (see
+# test_flash_length_classes_preserve_only_structural_legality_boundaries).
 _LENGTH_CLASSES = (
     pytest.param((3, 97), id="odd"),
-    pytest.param((2, 386), id="paired"),
+    pytest.param((34, 386), id="paired"),
     pytest.param(_ALIGNED_LENGTHS, id="div4"),
 )
 _DENSE_DEG1_PACKETS = frozenset(("deg1_16x8", "deg1_8x2_corr10"))
@@ -101,10 +109,12 @@ def _active_choice_sets(
     *,
     dtype: torch.dtype,
     is_causal: bool,
+    fast_math: bool = False,
 ) -> dict[str, frozenset[object]]:
     fragments = cute_flash.flash_autotune_fragments(
         head_dim,
         num_kv,
+        fast_math=fast_math,
         **_shape_options(dtype, is_causal),
     )
     assert all(isinstance(fragment, EnumFragment) for fragment in fragments.values())
@@ -207,19 +217,22 @@ def _shared_flash_generation(
     num_kv: int,
     dtype: torch.dtype,
     is_causal: bool,
+    fast_math: bool = False,
 ) -> ConfigGeneration:
     """Warmed ConfigGeneration shared across read-only tests.
 
     The flash structural-coverage validation costs seconds per instance and
-    depends only on these four parameters, so tests that merely query the
-    surface share one instance. Tests that mutate or patch the spec or the
-    generation must build their own.
+    depends only on these parameters, so tests that merely query the surface
+    share one instance. Tests that mutate or patch the spec or the generation
+    must build their own. ``fast_math`` admits the polynomial exp2 packets
+    (the compound structural leaves) to the surface.
     """
     generation = _flash_config_spec(
         head_dim=head_dim,
         num_kv=num_kv,
         dtype=dtype,
         is_causal=is_causal,
+        fast_math=fast_math,
     ).create_config_generation()
     with _memoized_flash_fragments():
         generation.flash_deterministic_population_configs()
@@ -232,8 +245,9 @@ def _structural_coverage_configs(
     *,
     dtype: torch.dtype,
     is_causal: bool,
+    fast_math: bool = False,
 ) -> tuple[ConfigGeneration, list[helion.Config]]:
-    generation = _shared_flash_generation(head_dim, num_kv, dtype, is_causal)
+    generation = _shared_flash_generation(head_dim, num_kv, dtype, is_causal, fast_math)
     return generation, generation.flash_deterministic_population_configs()
 
 
@@ -245,6 +259,7 @@ def _effective_pipeline_families(
     is_causal: bool,
     requires_ws_overlap: bool = False,
 ) -> frozenset[str]:
+    """Families whose explicit request survives resolution on the test grids."""
     candidates = (
         ("ws_overlap",)
         if requires_ws_overlap
@@ -262,6 +277,34 @@ def _effective_pipeline_families(
         ).pipeline_family
         == family
     )
+
+
+def _searched_pipeline_families(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    requires_ws_overlap: bool = False,
+) -> frozenset[str]:
+    """Families an unattended search measures on the test grids.
+
+    The row programs stay legal for explicit configs on any grid but join
+    unattended surfaces only inside their small-grid search bound, which the
+    64-head test grids exceed at every length.
+    """
+    families = _effective_pipeline_families(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        requires_ws_overlap=requires_ws_overlap,
+    )
+    if not cute_flash_row_mma.row_mma_search_grid(
+        num_bh=_shape_options(dtype, is_causal)["num_bh"], num_kv=num_kv
+    ):
+        families -= {cute_flash_row_mma.ROW_MMA_FAMILY}
+    return families
 
 
 def _assert_structural_coverage(
@@ -303,7 +346,7 @@ def _assert_structural_coverage(
         generation.canonicalize_flat(generation.flatten(config))[1] == config
         for config in configs
     )
-    expected_families = _effective_pipeline_families(
+    expected_families = _searched_pipeline_families(
         head_dim,
         num_kv,
         dtype=dtype,
@@ -336,8 +379,11 @@ def _flash_config_spec(
     requires_ws_overlap: bool = False,
     supports_tensor_4d_tma: bool = True,
     output_requires_tma: bool = False,
+    fast_math: bool = False,
 ) -> ConfigSpec:
-    spec = ConfigSpec(backend=CuteBackend())
+    # Exercise the generic structural search independently of the local GPU.
+    # Hardware-specific measured seeds are covered by test_cute_flash_arch.py.
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=None)
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
     spec.enable_cute_flash_search(
@@ -357,6 +403,7 @@ def _flash_config_spec(
         ),
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         output_requires_tma=output_requires_tma,
+        fast_math=fast_math,
     )
     return spec
 
@@ -972,7 +1019,8 @@ def test_flash_starting_path_limit_reserves_every_compound_only_leaf(
 
 
 def test_flash_path_limits_follow_live_compound_catalog() -> None:
-    generation = _shared_flash_generation(64, 48, torch.float16, False)
+    # The compound (polynomial packet) leaves exist on the fast_math surface.
+    generation = _shared_flash_generation(64, 48, torch.float16, False, True)
     leaves = generation.flash_structural_leaf_catalog()
     compound_count = sum(leaf.compound_exp2_packet is not None for leaf in leaves)
     live_family_count = len(
@@ -1051,6 +1099,7 @@ def test_flash_structural_coverage_distinguishes_ordinary_and_compound_2cta() ->
         48,
         dtype=torch.float16,
         is_causal=False,
+        fast_math=True,
     )
     prefix = configs[: generation.flash_structural_qualification_prefix_count()]
     expected = {
@@ -1428,8 +1477,9 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     }
     paired_only = {
         num_kv: _active_choice_sets(64, num_kv, dtype=torch.float16, is_causal=False)
-        for num_kv in (2, 34, 98, 386)
+        for num_kv in (34, 98, 386)
     }
+    two_tiles = _active_choice_sets(64, 2, dtype=torch.float16, is_causal=False)
     odd = {
         num_kv: _active_choice_sets(64, num_kv, dtype=torch.float16, is_causal=False)
         for num_kv in (3, 33, 49, 97)
@@ -1438,6 +1488,21 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     _assert_all_equal(divisible_by_four)
     _assert_all_equal(paired_only)
     _assert_all_equal(odd)
+    # Exactly two KV tiles differs from the other paired lengths only by the
+    # one-pass softmax of the 64-row tile, which needs the whole sequence in
+    # its two score buffers.
+    paired_surface = next(iter(paired_only.values()))
+    assert two_tiles[cute_flash.FLASH_WS_ONE_PASS_KEY] == frozenset((False, True))
+    assert paired_surface[cute_flash.FLASH_WS_ONE_PASS_KEY] == frozenset((False,))
+    assert {
+        key: value
+        for key, value in two_tiles.items()
+        if key != cute_flash.FLASH_WS_ONE_PASS_KEY
+    } == {
+        key: value
+        for key, value in paired_surface.items()
+        if key != cute_flash.FLASH_WS_ONE_PASS_KEY
+    }
     divisible_families = next(iter(divisible_by_four.values()))[
         cute_flash.FLASH_PIPELINE_FAMILY_KEY
     ]
@@ -1446,16 +1511,16 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     ]
     odd_families = next(iter(odd.values()))[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     singleton_families = singleton[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
-    assert singleton_families == _effective_pipeline_families(
+    assert singleton_families == _searched_pipeline_families(
         64, 1, dtype=torch.float16, is_causal=False
     )
-    assert odd_families == _effective_pipeline_families(
+    assert odd_families == _searched_pipeline_families(
         64, 33, dtype=torch.float16, is_causal=False
     )
-    assert paired_families == _effective_pipeline_families(
+    assert paired_families == _searched_pipeline_families(
         64, 34, dtype=torch.float16, is_causal=False
     )
-    assert divisible_families == _effective_pipeline_families(
+    assert divisible_families == _searched_pipeline_families(
         64, 48, dtype=torch.float16, is_causal=False
     )
     assert singleton_families == odd_families == frozenset(("ws_overlap",))
@@ -1501,9 +1566,11 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
             {(64, False): 2, (64, True): 2, (128, False): 2, (128, True): 2},
             id="singleton",
         ),
+        # The two-warpgroup ws_overlap body also chooses its O epilogue
+        # (staged coalesced store vs direct per-thread store).
         pytest.param(
             3,
-            {(64, False): 18, (64, True): 12, (128, False): 6, (128, True): 4},
+            {(64, False): 30, (64, True): 18, (128, False): 10, (128, True): 6},
             id="odd",
         ),
     ),
@@ -1925,9 +1992,56 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     assert _active_choices(
         enum_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     ) == frozenset(("ws_overlap",))
-    # 53: the ws surface pins every dimension it cannot vary to one value,
-    # including the KV tile width.
-    assert len(active_values) <= 53
+    resident_defaults = {
+        cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
+        cute_flash.FLASH_ROWMAX_KEY: "software",
+        cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
+    }
+    for key, value in resident_defaults.items():
+        assert _active_choices(enum_fragments[key]) == frozenset((value,))
+    assert set(resident_defaults.items()) <= set(active_values)
+    # 78: the ws surface pins every dimension it cannot vary to one value,
+    # including the KV tile width, the query-tile height, the one-pass
+    # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
+    # the (fa4-only) per-chunk P release, the affine bias lowering
+    # (``cute_flash_bias_form``, live only with an ALiBi/relative bias), the
+    # two row-program knobs (``cute_flash_row_warps``,
+    # ``cute_flash_row_tile_m`` of the ``row_mma`` family), the asymmetric
+    # pair's fa4 knobs (``cute_flash_uneven_kv_ring``, ``cute_flash_o_over_q``),
+    # the L2-budget halving of the causal launch group
+    # (``cute_flash_causal_lpt_l2_shift``), the single-application causal
+    # mask (``cute_flash_causal_mask_storeback``, live only on plain causal
+    # fa4 disc bodies), the per-row KV lower bound's fa4 tiling
+    # (``cute_flash_row_bound_tiling``, live only on fa4 ROW_KV_BEGIN plans),
+    # the dead stage-0 tile skip (``cute_flash_causal_skip_dead_tile``,
+    # live only on the descending plain causal fa4 PTX body) and the
+    # staggered one-head schedule (``cute_flash_causal_stagger``, live only
+    # on that body with a four-deep ring) and the grouped-query head pair
+    # (``cute_flash_causal_head_pair``, live only on that body with an even
+    # grouped-query divisor and the TMA output store) and the pre-sync
+    # prologue loads (``cute_flash_early_prologue_loads``, live only on the
+    # plain one-CTA fa4 ring), the list walk's absent-stage MMA skip
+    # (``cute_flash_flex_skip_absent``, live only on the FlexAttention
+    # envelope's fa4 PTX pair body) and its dead-stage split
+    # (``cute_flash_flex_dead_stage_split``, live only with that skip) and
+    # the flex mask form (``cute_flash_flex_mask_form``, live only on flex
+    # plans with a mask region), the split-KV walk (``cute_flash_kv_split``,
+    # live only on list-walk fa4 plans) and the flex aux staging budget
+    # (``cute_flash_flex_aux_smem``, live only on flex plans with a
+    # data-dependent table gather) and the flex table prefetch budget
+    # (``cute_flash_flex_prefetch``, live only on flex plans with per-chunk
+    # table loads) and the flex table request width
+    # (``cute_flash_flex_coalesce``, live only on flex plans with a
+    # coalescible row-table run) and the rolled flex chunk loop
+    # (``cute_flash_flex_rolled_chunks``, live only on list-walk plans), the
+    # host-built item words (``cute_flash_flex_item_words``, live only on
+    # list-walk plans) and the register-resident chunked PASS2
+    # (``cute_flash_s_resident``, live only on list-walk plans without a
+    # score region); the two-warpgroup body measures both of its O epilogues
+    # (``cute_flash_epi_stg``).
+    # Resident-only coordinates add exactly three inactive singletons; keep
+    # the upstream bound on all other values and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 80
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2162,12 +2276,18 @@ def test_local_tma_family_override_pins_persistence(family: str) -> None:
         )
 
 
-def test_compound_packet_override_pins_its_parent_schedule() -> None:
+@pytest.mark.parametrize(
+    ("head_dim", "dtype"), ((64, torch.float16), (128, torch.bfloat16))
+)
+def test_compound_packet_override_pins_its_parent_schedule(
+    head_dim: int, dtype: torch.dtype
+) -> None:
     spec = _flash_config_spec(
-        head_dim=128,
+        head_dim=head_dim,
         num_kv=48,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         is_causal=False,
+        fast_math=True,
     )
     packet = "deg2_16x6"
     generation = spec.create_config_generation(
@@ -2387,7 +2507,7 @@ def test_pipeline_lane_catalog_has_deterministic_witnesses(
     head_dim: int,
     is_causal: bool,
 ) -> None:
-    generation = _shared_flash_generation(head_dim, 48, dtype, is_causal)
+    generation = _shared_flash_generation(head_dim, 48, dtype, is_causal, True)
     catalog = generation.flash_pipeline_lane_catalog()
     witnesses = generation.flash_pipeline_lane_witnesses()
     expected_witness_keys = {
@@ -2508,14 +2628,10 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
         "EnumFragment",
         spec._flat_fields()[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY],
     )
-    expected_masked_schedules = (
-        frozenset(("inherit", "xu", "16/4", "8/2"))
-        if standard_causal_output
-        else frozenset(("inherit",))
-    )
-    assert frozenset(masked_schedule_fragment.choices) >= frozenset(
-        ("inherit", "xu", "16/4", "8/2")
-    )
+    # The descending loop split (and with it a distinct masked cadence) is
+    # proven for the standard causal body and for the modifier body alike.
+    expected_masked_schedules = frozenset(("inherit", "xu", "16/4", "8/2"))
+    assert frozenset(masked_schedule_fragment.choices) >= expected_masked_schedules
     assert _active_choices(masked_schedule_fragment) == expected_masked_schedules
     with _memoized_flash_fragments():
         coverage = spec.create_config_generation(
@@ -2537,9 +2653,7 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
     )
     spec.normalize(fixed)
     assert fixed.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is True
-    assert fixed.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == (
-        "16/4" if standard_causal_output else "inherit"
-    )
+    assert fixed.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == "16/4"
 
 
 def test_fa4_ineligible_causal_config_accepts_legacy_masked_cadence() -> None:
@@ -2597,8 +2711,16 @@ def test_family_pinned_generation_rejects_structurally_ineligible_family(
     family_fragment = cast(
         "EnumFragment", spec._flat_fields()[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     )
-    expected_active = eligible - ({"fa4_deep_1cta"} if is_causal else set())
+    expected_active = _searched_pipeline_families(
+        64,
+        num_kv,
+        dtype=torch.float16,
+        is_causal=is_causal,
+        requires_ws_overlap=requires_ws_overlap,
+    ) - ({"fa4_deep_1cta"} if is_causal else set())
     assert _active_choices(family_fragment) == expected_active
+    # Pinning a structurally ineligible family is rejected; the row
+    # programs are eligible on every grid when pinned explicitly.
     ineligible = set(cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES) - eligible
     for family in ineligible:
         with pytest.raises(InvalidConfig, match=r"is not (?:legal|effective)"):
@@ -2727,6 +2849,7 @@ def test_family_pinned_generation_rejects_conflicting_manual_packet(
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
+        fast_math=True,
     )
     with pytest.raises(InvalidConfig, match="requires cute_flash_pipeline_family"):
         generation = spec.create_config_generation(
@@ -2758,6 +2881,7 @@ def test_compound_packet_rejects_conflicting_explicit_children(
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
+        fast_math=True,
     )
     common = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
@@ -2782,6 +2906,7 @@ def test_compound_packet_preserves_parameterized_required_child() -> None:
         num_kv=48,
         dtype=torch.bfloat16,
         is_causal=True,
+        fast_math=True,
     )
     generation = spec.create_config_generation(
         overrides={
@@ -2800,6 +2925,7 @@ def test_unpinned_compound_packet_rejects_conflicting_explicit_child() -> None:
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
+        fast_math=True,
     )
     with pytest.raises(InvalidConfig, match="requires cute_flash_p_store_rep=16"):
         generation = spec.create_config_generation(
@@ -2972,6 +3098,7 @@ def test_validated_bf16_d128_values_survive_config_normalization(
         num_kv=num_kv,
         dtype=torch.bfloat16,
         is_causal=is_causal,
+        fast_math=True,
     )
     config = helion.Config.from_dict({"block_sizes": [1, 128, 128], **values})
     spec.normalize(config)
@@ -3056,7 +3183,9 @@ def test_legacy_exp2_schedule_normalization_preserves_valid_cadence() -> None:
     assert masked_cadence.config[cute_flash.FLASH_E2E_OFFSET0_KEY] == 14
 
 
-def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
+def test_causal_lpt_swizzle_defaults_to_the_l2_sized_group() -> None:
+    # 0 names FA4's L2-sized launch group at every length (the emitter sizes
+    # it: 1.5 MB per K/V head at fp16 s6144, 32 heads fit 50 MB, or the grid).
     resolved = cute_flash.resolve_flash_config(
         64,
         48,
@@ -3065,7 +3194,9 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         is_causal=True,
         standard_causal_output=True,
     )
-    assert resolved.causal_lpt_swizzle == 1
+    assert resolved.causal_lpt_swizzle == 0
+    assert cute_flash.flash_causal_lpt_l2_swizzle(64, 48) == 32
+    assert cute_flash.flash_causal_lpt_l2_swizzle(64, 48, num_bh=3) == 3
 
     fragments = cute_flash.flash_autotune_fragments(
         64,
@@ -3076,8 +3207,9 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
     )
     swizzle = fragments[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(swizzle, EnumFragment)
-    assert 0 in swizzle.choices
-    assert swizzle.search_choices == (1,)
+    assert swizzle.default() == 0
+    assert set(swizzle.search_choices or ()) == {0, 1, 3}
+    assert set(swizzle.choices) == {0, 1, 2, 3}
 
     wide = cute_flash.resolve_flash_config(
         64,
@@ -3087,7 +3219,17 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         is_causal=True,
         standard_causal_output=True,
     )
-    assert wide.causal_lpt_swizzle == 1
+    assert wide.causal_lpt_swizzle == 64
+    # Above the grid the group is the grid.
+    over = cute_flash.resolve_flash_config(
+        64,
+        48,
+        {cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 64},
+        num_bh=48,
+        is_causal=True,
+        standard_causal_output=True,
+    )
+    assert over.causal_lpt_swizzle == 48
 
     spec = _flash_config_spec(
         head_dim=64,
@@ -3100,7 +3242,25 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         cute_flash_causal_lpt_swizzle=64,
     )
     spec.normalize(legacy_wide)
-    assert legacy_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1
+    assert legacy_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 64
+    # The L2-sized group keeps its name whether requested or left unset;
+    # wider requests clamp to the grid.
+    zero = helion.Config(block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=0)
+    spec.normalize(zero)
+    assert zero.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 0
+    unset = helion.Config(block_sizes=[1, 128, 128])
+    spec.normalize(unset)
+    assert unset == zero
+    # An explicit group keeps its name (the coverage design reaches every
+    # searched value) even where it equals the L2-sized one.
+    spelled = helion.Config(block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=32)
+    spec.normalize(spelled)
+    assert spelled.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 32
+    over_wide = helion.Config(
+        block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=128
+    )
+    spec.normalize(over_wide)
+    assert over_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 64
 
 
 @pytest.mark.parametrize("num_kv", _ALIGNED_LENGTHS)
@@ -3109,7 +3269,7 @@ def test_dense_fp16_degree1_packets_are_not_shape_remapped(
     num_kv: int, packet: str
 ) -> None:
     packet_choices = _active_choice_sets(
-        64, num_kv, dtype=torch.float16, is_causal=False
+        64, num_kv, dtype=torch.float16, is_causal=False, fast_math=True
     )[cute_flash.FLASH_EXP2_PACKET_KEY]
     assert packet_choices >= _DENSE_DEG1_PACKETS
     config = {
@@ -3126,6 +3286,7 @@ def test_dense_fp16_degree1_packets_are_not_shape_remapped(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            fast_math=True,
         )
     assert resolved.exp2_packet == packet
 
@@ -3434,3 +3595,78 @@ def test_persistent_loop_canonicalizes_for_clc() -> None:
     )
     assert resolved.use_clc_scheduler
     assert resolved.persistent_loop == "while"
+
+
+@pytest.mark.parametrize("num_kv", (16, 17, 64))
+def test_flex_list_walk_surface_has_a_complete_coverage_design(num_kv: int) -> None:
+    # The FlexAttention envelope's BlockMask list walk is pinned to the fa4
+    # pair body at every KV tile count (its pair count follows the query
+    # length); every value its fragments offer must survive normalization.
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=num_kv,
+        num_bh=64,
+        dtype=torch.bfloat16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        has_list_walk=True,
+        has_score_modifiers=False,
+        plain_row_body=False,
+        score_modifier_kinds=("flex",),
+    )
+    generation = ConfigGeneration(spec)
+    with _memoized_flash_fragments():
+        configs = generation.flash_deterministic_population_configs()
+    assert configs
+    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    generation.validate_flash_structural_coverage()
+    for config in configs:
+        resolved = spec._resolve_cute_flash_config(config.config)
+        assert resolved.pipeline_family == "fa4"
+        # v1.5: static persistence (host-sorted item order) is searched.
+        assert resolved.persistent_loop == "while" or not resolved.persistent
+        assert resolved.stat_transport == "ring2"
+        assert resolved.kv_tile_n == 128
+
+
+@pytest.mark.parametrize(
+    ("mask_kind", "standard_causal_output"),
+    (
+        ("sliding_window_mask", True),
+        ("prefix_lm_mask", True),
+        ("row_kv_begin_mask", True),
+        ("document_mask", False),
+    ),
+)
+@pytest.mark.parametrize("num_kv", (16, 64))
+def test_pruned_mask_surfaces_have_a_complete_coverage_design(
+    mask_kind: str, standard_causal_output: bool, num_kv: int
+) -> None:
+    # The KV-tile-pruned masks search the fa4 pair body and ws_overlap; every
+    # value their fragments offer must survive normalization (the dense hd64
+    # body's statistics transport and persistent loop are pinned for them).
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=num_kv,
+        num_bh=64,
+        dtype=torch.bfloat16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        has_kv_tile_pruning=True,
+        standard_causal_output=standard_causal_output,
+        has_score_modifiers=True,
+        plain_row_body=False,
+        score_modifier_kinds=(mask_kind,),
+    )
+    generation = ConfigGeneration(spec)
+    with _memoized_flash_fragments():
+        configs = generation.flash_deterministic_population_configs()
+    assert configs
+    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    generation.validate_flash_structural_coverage()

@@ -105,12 +105,14 @@ def _wide(bound: BoundKernel) -> helion.Config:
     return config
 
 
-def test_physical_profile_keeps_old_domains_and_limits_source64() -> None:
-    for width, bk, cluster in itertools.product((32, 64, 224, 256), (64, 128), (1, 2)):
+def test_physical_profile_keeps_cooperative_domains_and_admits_narrow_one_cta() -> None:
+    for width, bk, cluster in itertools.product(
+        (8, 16, 32, 64, 224, 256), (64, 128), (1, 2)
+    ):
         expected = None
         if cluster == 2 and width in (32, 224, 256):
             expected = (256, width)
-        elif cluster == 1 and (width == 32 or (width == 64 and bk == 128)):
+        elif cluster == 1 and (width in (8, 16, 32) or (width == 64 and bk == 128)):
             expected = (128, width)
         assert (
             resolve_tcgen05_grouped_worklist_mma_shape(
@@ -118,10 +120,17 @@ def test_physical_profile_keeps_old_domains_and_limits_source64() -> None:
             )
             == expected
         )
-    for value in (64.0, True, "64", 16, 128):
+    for value in (64.0, True, "64", 0, 4, 24, 128):
         assert (
             resolve_tcgen05_grouped_worklist_mma_shape(
                 source_m_tile=value, block_k=128, cluster_m=1
+            )
+            is None
+        )
+    for width in (8, 16):
+        assert (
+            resolve_tcgen05_grouped_worklist_mma_shape(
+                source_m_tile=width, block_k=128, cluster_m=1, mma_m=64
             )
             is None
         )
@@ -250,7 +259,12 @@ def test_source64_reaches_original_full_search_first_benchmark(
     class HeldBenchmark(Exception):
         pass
 
-    def hold(members: Sequence[PopulationMember], *, desc: str) -> None:
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
         assert desc == "Initial population"
         delivered.extend(deepcopy(member.config) for member in members)
         raise HeldBenchmark

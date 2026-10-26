@@ -40,6 +40,11 @@ def all_gather_object(obj: T, process_group_name: str | None = None) -> list[T]:
     return object_list  # pyrefly: ignore
 
 
+def all_ranks_agree(flag: bool, process_group_name: str | None = None) -> bool:
+    """Whether ``flag`` holds on every rank of the group (one rank: ``flag``)."""
+    return all(all_gather_object(flag, process_group_name))
+
+
 def sync_object(obj: T, process_group_name: str | None = None) -> T:
     r"""
     Synchronize the number of repeations across all ranks.

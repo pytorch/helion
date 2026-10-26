@@ -12,6 +12,7 @@ from typing import cast
 
 import torch
 
+from ..._utils import prev_power_of_2
 from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ...autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
@@ -279,12 +280,12 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        # Replace an illegal pid_type with the highest-preference legal one rather
-        # than popping it: a plain pop lets ``normalize`` refill the field with
-        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
-        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
-        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
-        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        # Replace an illegal pid_type with the highest-preference legal one.
+        # ``allowed_pid_types`` is guaranteed non-empty and order-preserving, so
+        # ``[0]`` is a valid persistent choice when 'flat' is disallowed (e.g.
+        # under ``hl.barrier()`` / a data-dependent grid bound / force-persistent);
+        # it is also the value ``normalize`` fills in for a missing key, so the
+        # explicit replacement only keeps the intent visible here.
         supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
@@ -893,9 +894,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         """
         spec = env.config_spec
         out: dict[int, int] = {}
-        config_dict = dict(spec._base_default_config().config)
-        config_dict["block_sizes"] = block_sizes
-        candidate = Config.from_dict(config_dict)
+        candidate = Config.from_dict(
+            {
+                "block_sizes": block_sizes,
+                "reduction_loops": spec.reduction_loops._flat_config(
+                    spec, lambda fragment: fragment.default()
+                ),
+                **{
+                    name: fragment.default()
+                    for name, fragment in spec.user_defined_tunables.items()
+                },
+            }
+        )
         # A TUNABLE axis's per-program extent is simply the entry the config carries for it.
         # Read it straight from the list rather than round-tripping through the block-size
         # source: ``LoopSpecBlockSizeSource.from_config`` reaches for
@@ -4472,6 +4482,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     FULL_GRID_SPLIT_GAIN_THRESHOLD = 2.0
     SERIAL_LOOP_COST_ALPHA = 1.1
     MAX_BLOCK_ADJUSTMENT_PASSES = 20
+    ROW_PACK_WORKING_SET = 4096
+    MIN_ROW_PACK_WAVES = 8
 
     # Structural fact accessors.
     @classmethod
@@ -4823,7 +4835,11 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ]
         slot_of = {block.block_id: index for index, block in enumerate(specs)}
         floors = {block.block_id: cls._block_floor(block) for block in specs}
-        maximums = {block.block_id: _np2(max(1, block.size_hint)) for block in specs}
+        full_widths = {block.block_id: _np2(max(1, block.size_hint)) for block in specs}
+        maximums = {
+            block.block_id: min(block.max_size, full_widths[block.block_id])
+            for block in specs
+        }
         blocks = [floors[block.block_id] for block in specs]
 
         descriptors_by_block: dict[int, list[ReductionDescriptor]] = {}
@@ -4972,7 +4988,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         full_reduction_ids = {
             block_id
             for block_id in descriptors_by_block
-            if candidate.reduction_width(block_id) == reduction_maximums[block_id]
+            if candidate.reduction_width(block_id)
+            == full_widths.get(block_id, reduction_maximums[block_id])
         }
         adjustable_ids = {
             *(
@@ -4993,6 +5010,18 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             *non_grid_noncoalescing,
             *coalescing_ids,
         )
+
+        row_pack_floor = 1
+        if len(grid_ids) == 1:
+            (row_id,) = grid_ids
+            reduction_numel = math.prod(map(_np2, raw_reduction_extents.values()))
+            row_pack_floor = min(
+                prev_power_of_2(cls.ROW_PACK_WORKING_SET // reduction_numel),
+                prev_power_of_2(
+                    specs[slot_of[row_id]].size_hint
+                    // (cls.MIN_ROW_PACK_WAVES * num_sm)
+                ),
+            )
 
         def axis_value(current: _ReductionCandidate, block_id: int) -> int:
             if block_id in reduction_widths:
@@ -5059,11 +5088,12 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 if block_id in grid_ids:
                     required_gain = (
                         cls.FULL_GRID_SPLIT_GAIN_THRESHOLD
-                        if current_value == axis_maximums[block_id]
+                        if current_value == full_widths[block_id]
                         else cls.GRID_RESIDENCY_GAIN_THRESHOLD
                     )
                     worthwhile = (
-                        trial_ctas / max(current_ctas, 1e-9) + 1e-9 >= required_gain
+                        trial_value >= row_pack_floor
+                        and trial_ctas / max(current_ctas, 1e-9) + 1e-9 >= required_gain
                     )
                 else:
                     trial_steps = max(
@@ -5094,7 +5124,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         primary_block_id = pd.block_id
         primary_full_width = _np2(max(1, pd.size_hint))
         persistence_tunable = primary_block_id in rolled_ids or (
-            primary_block_id in slot_of and pd.category is ReductionCategory.USER_TILE
+            primary_block_id in slot_of
+            and pd.category is ReductionCategory.USER_TILE
+            and primary_full_width <= maximums[primary_block_id]
         )
         if (
             pd.row_reread

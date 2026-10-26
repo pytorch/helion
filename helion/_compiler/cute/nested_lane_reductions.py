@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import cast
 
 from ... import exc
 from .. import tile_strategy as lanes
 from ..ast_read_writes import ReadWrites
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _PROTECTED_GLOBALS = {
     "cutlass",
@@ -38,7 +42,11 @@ _SCALAR_CASTS = {
 
 
 def resolve_pruned_lane_owners(
-    body: list[ast.AST], fallbacks: dict[str, tuple[str, int, int, str]]
+    body: list[ast.AST],
+    fallbacks: dict[str, tuple[str, int, int, str]],
+    *,
+    physical_fallbacks: dict[str, tuple[int, int, str]] | None = None,
+    uniform_names: set[str] | None = None,
 ) -> None:
     """Use a concrete reshape lane only after its synthetic loop was pruned.
 
@@ -86,6 +94,123 @@ def resolve_pruned_lane_owners(
 
     for statement in body:
         visit(statement, ())
+    if physical_fallbacks:
+        _resolve_physical_reductions(
+            body, physical_fallbacks, live_names, uniform_names or set()
+        )
+
+
+def _resolve_physical_reductions(
+    body: list[ast.AST],
+    proofs: dict[str, tuple[int, int, str]],
+    live_names: set[str],
+    uniform_names: set[str],
+) -> None:
+    """Finish a hardware-only reduction at its original, uniformly reached site.
+
+    Nothing is hoisted from a branch or moved across a loop. Unknown control
+    flow, nonuniform predicates/bounds, and live synthetic coordinates retain
+    the marker for the existing strict owner validator to reject.
+    """
+    if any(
+        isinstance(node, (ast.Return, ast.Break, ast.Continue, ast.Try, ast.While))
+        for top in body
+        for node in ast.walk(top)
+    ):
+        return
+
+    def uniform(expr: ast.AST, names: set[str]) -> bool:
+        if isinstance(expr, ast.Constant):
+            return True
+        if isinstance(expr, ast.Name):
+            return lanes._is_proven_uniform_name(expr.id, names)
+        if isinstance(expr, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp)):
+            return all(
+                uniform(child, names)
+                for child in ast.iter_child_nodes(expr)
+                if isinstance(child, ast.expr)
+            )
+        if isinstance(expr, ast.Call):
+            name = ast.unparse(expr.func)
+            return (
+                name in {*_SCALAR_CASTS, "range", "cute.arch.block_idx"}
+                and not expr.keywords
+                and all(uniform(arg, names) for arg in expr.args)
+            )
+        if isinstance(expr, ast.Subscript):
+            return (
+                isinstance(expr.value, ast.Call)
+                and ast.unparse(expr.value.func) == "cute.arch.block_idx"
+                and uniform(expr.value, names)
+                and isinstance(expr.slice, ast.Constant)
+                and expr.slice.value in (0, 1, 2)
+            )
+        return False
+
+    def visit(statements: Sequence[ast.AST], names: set[str], complete: bool) -> None:
+        for stmt in statements:
+            marker = lanes._is_lane_reduce_marker_assign(stmt)
+            if marker is not None and marker.owner_lane in proofs:
+                assert marker.owner_lane is not None
+                pre, span, lane_expr = proofs[marker.owner_lane]
+                if (
+                    complete
+                    and marker.owner_lane not in live_names
+                    and (marker.group_pre, marker.group_span, marker.group_lane_expr)
+                    == (pre, span, lane_expr)
+                    and marker.group_count == marker.group_cluster_n == 1
+                    and not marker.matmul_contribution
+                    and 1 <= pre <= span <= 32
+                    and span % pre == 0
+                    and not span & (span - 1)
+                    and not pre & (pre - 1)
+                ):
+                    dtype = lanes._dtype_ctor_from_identity(marker.identity_expr)
+                    if dtype is not None:
+                        value = f"{dtype}({marker.input_name})"
+                        reduced = (
+                            lanes._grouped_warp_reduce_expr(
+                                marker.reduction_type,
+                                value,
+                                marker.identity_expr,
+                                lane_expr,
+                                pre=pre,
+                                group_span=span,
+                            )
+                            if span > pre
+                            else value
+                        )
+                        assert isinstance(stmt, ast.Assign)
+                        stmt.value = ast.parse(
+                            marker.finalize_expr(reduced), mode="eval"
+                        ).body
+            writes = set(ReadWrites.from_ast(stmt).writes)
+            if isinstance(stmt, ast.For):
+                child_names = names - writes
+                loop_uniform = (
+                    uniform(stmt.iter, names)
+                    and isinstance(stmt.target, ast.Name)
+                    and getattr(stmt, lanes.HELION_LANE_LOOP_VAR_ATTR, None) is None
+                )
+                if loop_uniform:
+                    assert isinstance(stmt.target, ast.Name)
+                    child_names.add(stmt.target.id)
+                visit(stmt.body, child_names, complete and loop_uniform)
+                visit(stmt.orelse, names - writes, False)
+            elif isinstance(stmt, ast.If):
+                branch_uniform = uniform(stmt.test, names)
+                visit(stmt.body, names - writes, complete and branch_uniform)
+                visit(stmt.orelse, names - writes, complete and branch_uniform)
+            elif (
+                isinstance(stmt, ast.Assign)
+                and all(isinstance(target, ast.Name) for target in stmt.targets)
+                and uniform(stmt.value, names)
+            ):
+                names.update(writes)
+                continue
+            names.difference_update(writes)
+
+    visit(body, set(uniform_names), True)
 
 
 def normalize_nested_lane_reductions(
@@ -104,6 +229,12 @@ def normalize_nested_lane_reductions(
     inner reduction, and its carry checks still apply to the complete body.
     Every other ownership mismatch is left for the strict owner validator.
     """
+    # Without a marker there is no reduction to move. Avoid building scalar
+    # dependency state for ordinary generated loops; their owner validation
+    # and subsequent lowering still run unchanged.
+    if not any(lanes._find_lane_reduce_call(statement) for statement in body):
+        return body
+
     shadowed_globals = {
         node.id
         for top in body

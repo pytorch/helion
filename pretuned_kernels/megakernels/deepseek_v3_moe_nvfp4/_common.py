@@ -14,12 +14,14 @@ def fp4_nibble(value: torch.Tensor) -> torch.Tensor:
     """Round scaled values to E2M1 with FlashInfer's tie convention."""
     magnitude = torch.abs(value)
     code = (magnitude > 0.25).to(torch.int32)
-    code += (magnitude >= 0.75).to(torch.int32)
-    code += (magnitude > 1.25).to(torch.int32)
-    code += (magnitude >= 1.75).to(torch.int32)
-    code += (magnitude > 2.5).to(torch.int32)
-    code += (magnitude >= 3.5).to(torch.int32)
-    code += (magnitude > 5.0).to(torch.int32)
+    # Keep these additions functional: aten.add_ returns an aliased InputBuffer,
+    # which the shared Inductor-to-Helion lowering cannot consume as pointwise IR.
+    code = code + (magnitude >= 0.75).to(torch.int32)
+    code = code + (magnitude > 1.25).to(torch.int32)
+    code = code + (magnitude >= 1.75).to(torch.int32)
+    code = code + (magnitude > 2.5).to(torch.int32)
+    code = code + (magnitude >= 3.5).to(torch.int32)
+    code = code + (magnitude > 5.0).to(torch.int32)
     return code | ((value < 0).to(torch.int32) << 3)
 
 

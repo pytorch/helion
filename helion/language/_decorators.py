@@ -176,6 +176,9 @@ def args_to_proxies(
             return x.proxy
         if isinstance(x, Thunk):
             return x.force()
+        if isinstance(x, slice):
+            # pytree treats a slice as a leaf; its symbolic bounds need proxies.
+            return slice(unpack(x.start), unpack(x.stop), unpack(x.step))
         return x
 
     return tree_map(
@@ -442,6 +445,7 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 # Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
 _DEVICE_FUNC_REPLACEMENTS: dict[object, Callable[..., object]] = {}
+_TENSOR_METHOD_REPLACEMENTS = frozenset({"chunk", "unbind"})
 
 
 def device_func_replacement(python_func: object) -> _Decorator:

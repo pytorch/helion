@@ -39,10 +39,12 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .licm_profitability import repeated_work_is_profitable
+from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -111,11 +113,7 @@ _PURE_WARP_REDUCTION_CALLS = {
     "cute.arch.warp_reduction_max",
     "cute.arch.warp_reduction_sum",
 }
-_PURE_LOAD_HELPERS = {
-    "_cute_load_l2_evict_last",
-    "_cute_load_l1_l2_evict_first",
-    "_cute_load_l1_l2_evict_last",
-}
+_PURE_LOAD_HELPERS = _CUTE_CACHE_LOAD_HELPER_NAMES
 _CUTLASS_SCALAR_TYPES = {
     "cutlass.BFloat16": 2,
     "cutlass.Boolean": 1,
@@ -140,6 +138,7 @@ _UNIFORM_GLOBAL_NAMES = {
     "min",
     "operator",
     "range",
+    *PURE_HELPERS,
 }
 
 
@@ -334,7 +333,7 @@ def _load_pointer(call: ast.Call) -> ast.AST | None:
     path = _call_path(call.func)
     if path == "cute.arch.load":
         return call.args[0] if call.args else None
-    if path is not None and path.startswith("_cute_load_"):
+    if path in _PURE_LOAD_HELPERS:
         return call.args[0] if call.args else None
     if isinstance(call.func, ast.Attribute) and call.func.attr == "load":
         return call.func.value
@@ -368,7 +367,7 @@ def _is_allowed_pure_call(call: ast.Call) -> bool:
             and not call.args
             and not call.keywords
         )
-    if path in {"abs", "max", "min", "range"}:
+    if path in {"abs", "max", "min", "range"} or path in PURE_HELPERS:
         return True
     if path in _PURE_OPERATOR_CALLS or path in _PURE_CUTLASS_CALLS:
         return True
@@ -378,7 +377,13 @@ def _is_allowed_pure_call(call: ast.Call) -> bool:
         return True
     if path == "cute.arch.load":
         return _is_generated_arch_load(call)
-    if path in {"cute.arch.block_idx", "cute.arch.lane_idx", "cute.arch.thread_idx"}:
+    if path in {
+        "cute.arch.block_idx",
+        "cute.arch.fmax",
+        "cute.arch.fmin",
+        "cute.arch.lane_idx",
+        "cute.arch.thread_idx",
+    }:
         return True
     if path in _PURE_WARP_REDUCTION_CALLS:
         return True

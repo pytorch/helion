@@ -9,6 +9,7 @@ import torch
 from torch.fx import Node
 
 from ...language.tile_ops import tile_begin
+from ...language.tile_ops import tile_index
 
 if TYPE_CHECKING:
     import ast
@@ -30,11 +31,37 @@ class CutePackedAffineLoad:
 @dataclasses.dataclass(frozen=True)
 class CuteSortableLoad:
     expr: ast.AST
+    tensor: torch.Tensor
+    value: torch.Tensor
+    extra_mask: torch.Tensor | None
     tensor_name: str
     index_exprs: tuple[str, ...]
-    sort_index_pos: int
     mask_expr: str | None
     dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteScalarLoadSite:
+    """Address pieces of a lowered scalar load.
+
+    Recorded on the load's fx node so ``hl.split`` can re-read the same tile
+    at other block-local coordinates instead of staging it in shared memory.
+    """
+
+    tensor_name: str
+    index_exprs: tuple[str, ...]
+    mask_expr: str | None
+    # ``mask_expr`` folds in ``hl.load(..., extra_mask=...)`` evaluated at this
+    # thread's own coordinates; it cannot be re-evaluated at another element.
+    has_extra_mask: bool
+    eviction_suffix: str
+    # Per load-output dim: ``(tensor_dim, block_id)``; ``None`` for a new unit
+    # axis from a ``None`` subscript. ``block_id`` is ``None`` when the dim's
+    # address is not a block index (partial slice, size-1 tensor dim, ...).
+    output_dims: tuple[tuple[int, int | None] | None, ...]
+
+
+CUTE_SCALAR_LOAD_SITE_META = "cute_scalar_load_site"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,6 +143,52 @@ def is_cute_unit_stride_iota_index(node: object) -> bool:
             or (is_scalar(lhs) and is_cute_unit_stride_iota_index(rhs))
         )
     return is_cute_unit_stride_iota_index(lhs) and is_scalar(rhs)
+
+
+def match_cute_shifted_tile_index(
+    node: object,
+) -> tuple[Node, tuple[int | torch.SymInt, ...]] | None:
+    """Match ``tile.index`` shifted by scalars: ``(tile_index node, shifts)``.
+
+    ``tile.index - c`` reaches indexing as ``sub(tile_index(block), c)``; its
+    lane coordinate is the block's own index shifted by the sum of the
+    returned terms (added scalars, negated subtracted scalars; empty for a
+    bare ``tile.index``).  ``None`` for anything else, including ``alpha != 1``
+    scaled adds and shifts by tensors.
+    """
+    terms: list[int | torch.SymInt] = []
+
+    def scalar(value: object) -> int | torch.SymInt | None:
+        if isinstance(value, Node):
+            value = value.meta.get("val")
+        return value if isinstance(value, (int, torch.SymInt)) else None
+
+    current = node
+    while True:
+        if not isinstance(current, Node) or current.op != "call_function":
+            return None
+        if current.target is tile_index:
+            return current, tuple(terms)
+        if current.kwargs.get("alpha", 1) != 1 or len(current.args) < 2:
+            return None
+        lhs, rhs = current.args[:2]
+        if current.target in (operator.sub, torch.ops.aten.sub.Tensor):
+            shift = scalar(rhs)
+            if shift is None:
+                return None
+            terms.append(-shift)
+            current = lhs
+        elif current.target in (operator.add, torch.ops.aten.add.Tensor):
+            if (shift := scalar(rhs)) is not None:
+                terms.append(shift)
+                current = lhs
+            elif (shift := scalar(lhs)) is not None:
+                terms.append(shift)
+                current = rhs
+            else:
+                return None
+        else:
+            return None
 
 
 def _match_constant_multiple(value: object) -> tuple[object, int]:

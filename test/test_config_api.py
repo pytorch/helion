@@ -1213,6 +1213,27 @@ class TestSettingsEnv(TestCase):
 
         self.assertEqual(config["block_sizes"][:2], [64, 64])
 
+    def test_block_size_declared_ceiling_outlives_the_dimension_hint(self) -> None:
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        # Only the dimension's extent caps this spec: nothing was declared.
+        extent_only = BlockSizeSpec(block_id=0, size_hint=4096)
+        extent_only.update_hint(64)
+        self.assertEqual(extent_only.max_size, 64)
+        self.assertIsNone(extent_only.declared_max_size)
+
+        # A declared ceiling (``update_max``) is kept apart from the extent
+        # cap (``update_hint``): the search range takes the smaller of the
+        # two, the declared value stays readable for surfaces that tile
+        # past the extent.
+        spec = BlockSizeSpec(block_id=0, size_hint=4096)
+        spec.update_max(128)
+        spec.update_hint(64)
+        self.assertEqual((spec.max_size, spec.declared_max_size), (64, 128))
+        spec.update_max(32)
+        self.assertEqual((spec.max_size, spec.declared_max_size), (32, 32))
+        self.assertEqual(spec._fragment(ConfigSpec(backend=TritonBackend())).high, 32)
+
     def test_bounded_inner_block_size_keeps_valid_inner_value(self) -> None:
         from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_spec import BlockSizeSpec
@@ -2476,30 +2497,36 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 repaired.config,
             )
 
-    def test_grouped_rejects_num_sm_multiplier(self) -> None:
+    def test_grouped_grid_multiplier_requires_independent_worklist(self) -> None:
         spec = self._make_cute_tcgen05_spec()
 
-        def make_config(grouped_mode: str) -> helion.Config:
+        def make_config(grouped_mode: str, multiplier: int) -> helion.Config:
             return helion.Config(
                 block_sizes=[256, 128, 64],
-                num_sm_multiplier=2,
+                num_sm_multiplier=multiplier,
                 pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
                 tcgen05_grouped_mode=grouped_mode,
             )
 
-        for grouped_mode in (
-            TCGEN05_GROUPED_MODE_STATIC,
-            TCGEN05_GROUPED_MODE_DYNAMIC,
-            TCGEN05_GROUPED_MODE_DIRECT,
-            TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        for grouped_mode, multiplier in (
+            (TCGEN05_GROUPED_MODE_STATIC, 2),
+            (TCGEN05_GROUPED_MODE_DYNAMIC, 2),
+            (TCGEN05_GROUPED_MODE_DIRECT, 2),
+            (TCGEN05_GROUPED_MODE_WORKLIST_NM, 3),
         ):
-            with self.subTest(grouped_mode=grouped_mode):
-                with self.assertRaisesRegex(exc.InvalidConfig, "num_sm_multiplier=1"):
-                    spec.normalize(make_config(grouped_mode))
+            with self.subTest(grouped_mode=grouped_mode, multiplier=multiplier):
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig, "independent single-CTA N,M worklist"
+                ):
+                    spec.normalize(make_config(grouped_mode, multiplier))
 
-                repaired = make_config(grouped_mode)
+                repaired = make_config(grouped_mode, multiplier)
                 spec.normalize(repaired, _fix_invalid=True)
                 self.assertNotIn("num_sm_multiplier", repaired.config)
+
+        independent = make_config(TCGEN05_GROUPED_MODE_WORKLIST_NM, 2)
+        spec.normalize(independent)
+        self.assertEqual(independent.config["num_sm_multiplier"], 2)
 
     def test_grouped_clc_rejects_ignored_occupancy_limits(self) -> None:
         from helion._compiler.cute.strategies import (
@@ -3075,3 +3102,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_cute_only_config_key_is_backend_specific() -> None:
+    """The base backend accepts every key outside BACKEND_SPECIFIC_KEYS, so a
+    CuTe-only knob missing from the set reaches Triton configs unrejected."""
+    from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    from helion.autotuner.config_spec import VALID_KEYS
+
+    cute_only = {key for key in VALID_KEYS if key.startswith(("cute_", "tcgen05_"))}
+    assert cute_only
+    assert sorted(cute_only - BACKEND_SPECIFIC_KEYS) == []

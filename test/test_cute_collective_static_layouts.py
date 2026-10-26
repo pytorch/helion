@@ -176,7 +176,7 @@ def test_full_search_retains_old_population_and_transfers_static_witness():
         class HeldBenchmark(Exception):
             pass
 
-        def hold(members, *, desc):
+        def hold(members, *, desc, raise_if_no_viable_config=True):
             assert desc == "Initial population"
             delivered.extend(member.config for member in members)
             raise HeldBenchmark

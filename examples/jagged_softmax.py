@@ -55,7 +55,8 @@ def reference_jagged_softmax_pytorch(
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division.
+@helion.kernel(fast_math=True)
 def jagged_softmax_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -71,7 +72,7 @@ def jagged_softmax_kernel(
     Returns:
         2-D tensor of shape (total_elements, max_M), containing the per-batch softmax scores.
     """
-    N = int(x_offsets[-1].item())
+    N = x_data.size(0)
     num_rows, M = x_offsets.size(0) - 1, x_data.size(1)
     out = torch.zeros(N * M, dtype=x_data.dtype, device=x_data.device)
 

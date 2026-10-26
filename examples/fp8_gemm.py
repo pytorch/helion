@@ -31,7 +31,12 @@ if os.environ.get("HELION_AUTOTUNE_EFFORT") == "none":
 
 # %%
 @helion.kernel(static_shapes=True, config=config)
-def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def fp8_gemm(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
     FP8 General Matrix Multiplication (GEMM).
     This kernel demonstrates FP8 computation in Helion.
@@ -40,6 +45,8 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     Args:
         x (torch.Tensor): Input tensor of shape [m, k] in FP8 format.
         y (torch.Tensor): Input tensor of shape [k, n] in FP8 format.
+        scale_a (torch.Tensor | None): Optional 0-d dequantization scale for x.
+        scale_b (torch.Tensor | None): Optional 0-d dequantization scale for y.
     Returns:
         torch.Tensor: Output tensor of shape [m, n] in half-precision format.
     """
@@ -57,6 +64,8 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             y_tile = y[tile_k, tile_n]
             # Use hl.dot for FP8 GEMM
             acc = hl.dot(x_tile, y_tile, acc=acc)
+        if scale_a is not None and scale_b is not None:
+            acc = acc * scale_a[()] * scale_b[()]
         out[tile_m, tile_n] = acc.to(HALF_DTYPE)
     return out
 
@@ -97,17 +106,17 @@ def fp8_gemm_tritonbench(
     scale_b: torch.Tensor,
 ) -> Callable[[], torch.Tensor]:
     """
-    Wrapper for TritonBench compatibility.
+    Wrapper for TritonBench compatibility (tensor-wise scaling only).
     Args:
         tb_op: TritonBench operator instance
-        a (torch.Tensor): Left input tensor in FP8 format.
-        b (torch.Tensor): Right input tensor in FP8 format.
-        scale_a (torch.Tensor): Scale factor for tensor a (unused in our implementation).
-        scale_b (torch.Tensor): Scale factor for tensor b (unused in our implementation).
+        a (torch.Tensor): Left input tensor of shape [m, k] in FP8 format.
+        b (torch.Tensor): Right input tensor of shape [n, k] in FP8 format.
+        scale_a (torch.Tensor): 0-d dequantization scale for tensor a.
+        scale_b (torch.Tensor): 0-d dequantization scale for tensor b.
     Returns:
         Callable that returns output tensor in half-precision format.
     """
-    return lambda: fp8_gemm(a, b)
+    return lambda: fp8_gemm(a, b.t(), scale_a, scale_b)
 
 
 # %%
@@ -138,6 +147,11 @@ def check(m: int, k: int, n: int, b_col_major: bool = True) -> None:
         functools.partial(reference_fp8_gemm_pytorch, scale_a=scale_a, scale_b=scale_b),
         (x_fp8, y_fp8),
     )
+
+    # Non-unit tensor-wise scales, as TritonBench passes to fp8_gemm
+    scale_a = torch.tensor(0.5, device=x_fp8.device)
+    scale_b = torch.tensor(0.25, device=x_fp8.device)
+    run_example(fp8_gemm, reference_fp8_gemm_pytorch, (x_fp8, y_fp8, scale_a, scale_b))
 
 
 # %%

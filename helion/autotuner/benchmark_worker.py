@@ -84,7 +84,14 @@ class BenchmarkWorkerDied(BenchmarkSubprocessError):
 
 
 class BenchmarkWorkerUnkillable(BenchmarkSubprocessError):
-    """A worker remained alive after the bounded SIGKILL wait."""
+    """A worker remained alive after the bounded SIGKILL wait.
+
+    ``fn_index`` is the position in the isolated batch of the candidate that
+    worker last ran (set by ``benchmark_isolated``), so the search can drop a
+    config whose kernel may have hung instead of returning it.
+    """
+
+    fn_index: int | None = None
 
 
 class BenchmarkWorker:

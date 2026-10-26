@@ -17,10 +17,15 @@ Covers both strategies (``PerThreadNDTileStrategy`` for N-D tiles,
 
 from __future__ import annotations
 
+import unittest
+
 import pytest
 import torch
+from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import run_and_get_code
 
 import helion
+from helion._compat import supports_torch_compile_template_lowering
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -141,6 +146,44 @@ def _add_explicit_evict(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         a = hl.load(x, [tile], eviction_policy="evict_last")
         out[tile] = a + y[tile]
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cast_i16_to_bf16(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn].to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cast_i32_to_f32(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.float32, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn].to(torch.float32)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _double_bf16(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn] * 2
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _unsigned_to_f32_and_flag(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty(w.shape, dtype=torch.float32, device=w.device)
+    big = torch.empty(w.shape, dtype=torch.int32, device=w.device)
+    for tk, tn in hl.tile(w.shape):
+        v = w[tk, tn]
+        out[tk, tn] = v.to(torch.float32)
+        big[tk, tn] = (v > 100).to(torch.int32)
+    return out, big
 
 
 @onlyBackends(["cute"])
@@ -357,8 +400,31 @@ class TestCutePointwiseVec(TestCase):
             cute_vector_widths=[4],
             load_eviction_policies=["l2_last", "l2_last"],
         )
-        self.assertIn("_cute_load_l2_evict_last", code)
+        self.assertIn("_cute_load_l2_evict_last(", code)
         torch.testing.assert_close(out, x * y)
+
+    def test_l2_last_eviction_policy_narrow_packets(self) -> None:
+        """``l2_last`` reaches 8- and 4-byte packets through the helper of
+        their width (it used to be dropped below 16 bytes)."""
+        for dtype, width, suffix in (
+            (torch.float32, 2, "_8b"),
+            (torch.float16, 4, "_8b"),
+            (torch.float16, 2, "_4b"),
+            (torch.bfloat16, 2, "_4b"),
+        ):
+            with self.subTest(dtype=dtype, width=width):
+                x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+                y = torch.randn_like(x)
+                code, out = code_and_output(
+                    _mul1d,
+                    (x, y),
+                    block_sizes=[1024],
+                    num_threads=[128],
+                    cute_vector_widths=[width],
+                    load_eviction_policies=["l2_last", "l2_last"],
+                )
+                self.assertIn(f"_cute_load_l2_evict_last{suffix}(", code)
+                torch.testing.assert_close(out, x * y, atol=0, rtol=0)
 
     def test_two_level_eviction_policy(self) -> None:
         """8/16-byte cache hints and scalar fallbacks preserve every element."""
@@ -384,6 +450,11 @@ class TestCutePointwiseVec(TestCase):
                         packet_bytes = selected_width * x.element_size()
                         self.assertEqual(f"{helper}(" in code, packet_bytes == 16)
                         self.assertEqual(f"{helper}_8b(" in code, packet_bytes == 8)
+                        # A width-1 site is a scalar load, not a packet.
+                        self.assertEqual(
+                            f"{helper}_4b(" in code,
+                            packet_bytes == 4 and selected_width > 1,
+                        )
                         torch.testing.assert_close(out, x * y, atol=0, rtol=0)
 
     def test_epilogue_subtile_disables_vec(self) -> None:
@@ -499,8 +570,182 @@ class TestCutePointwiseVec(TestCase):
         _, out32 = code_and_output(_sigmoid1d, (xs,), block_sizes=[8])
         torch.testing.assert_close(out32, torch.sigmoid(xs), equal_nan=True)
 
+    def test_unsigned_loads_keep_their_unsigned_type(self) -> None:
+        """A plain ``(ptr).load()`` of a uint8 / uint32 element yields the
+        signed integer of its width in CuTe DSL; values with the top bit set
+        must still convert and compare as unsigned, scalar or vectorized."""
+        torch.manual_seed(0)
+        for dtype, high in ((torch.uint8, 2**8), (torch.uint32, 2**32)):
+            w = torch.randint(0, high, (64, 1024), device=DEVICE).to(dtype)
+            wide = w.to(torch.int64)
+            for config in (
+                {"block_sizes": [8, 64]},
+                {
+                    "block_sizes": [8, 1024],
+                    "num_threads": [8, 128],
+                    "cute_vector_widths": [1, 4],
+                },
+            ):
+                with self.subTest(dtype=dtype, config=config):
+                    _, (out, big) = code_and_output(
+                        _unsigned_to_f32_and_flag, (w,), **config
+                    )
+                    torch.testing.assert_close(out, wide.to(torch.float32))
+                    torch.testing.assert_close(big, (wide > 100).to(torch.int32))
+
+    def test_int16_packet_cast_to_bf16_is_bitwise_exact(self) -> None:
+        """Every int16 value rides a V=8 Uint16 packet, is bitcast back to
+        Int16 per lane and takes the program's own bf16 cast: sign and
+        round-to-nearest-even match torch bit for bit."""
+        w = (
+            torch.arange(-32768, 32768, dtype=torch.int32, device=DEVICE)
+            .to(torch.int16)
+            .reshape(64, 1024)
+        )
+        code, out = code_and_output(
+            _cast_i16_to_bf16,
+            (w,),
+            block_sizes=[8, 1024],
+            num_threads=[8, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        self.assertIn(".bitcast(cutlass.Int16)", code)
+        self.assertIn("_cute_store_u16_vec", code)
+        self.assertTrue(
+            torch.equal(out.view(torch.int16), w.to(torch.bfloat16).view(torch.int16))
+        )
+
+    def test_int32_packet_cast_to_fp32_is_bitwise_exact(self) -> None:
+        """int32 words ride a V=4 Uint32 packet; the fp32 cast rounds the
+        values above 2**24 (ties included) exactly as torch does."""
+        generator = torch.Generator().manual_seed(0)
+        w = torch.randint(
+            -(2**31), 2**31 - 1, (128, 512), generator=generator, dtype=torch.int64
+        ).to(torch.int32)
+        w[0, :16] = torch.tensor(
+            [
+                0,
+                1,
+                -1,
+                2**24 + 1,
+                -(2**24) - 1,
+                2**24 + 3,
+                2**31 - 1,
+                -(2**31),
+                2**25 + 2,
+                -(2**25) - 2,
+                33554433,
+                -33554433,
+                12345679,
+                -12345679,
+                100000001,
+                -100000001,
+            ],
+            dtype=torch.int32,
+        )
+        w = w.to(DEVICE)
+        code, out = code_and_output(
+            _cast_i32_to_f32,
+            (w,),
+            block_sizes=[8, 512],
+            num_threads=[8, 128],
+            cute_vector_widths=[1, 4],
+        )
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+        self.assertIn("_cute_store_u32_vec", code)
+        self.assertTrue(
+            torch.equal(out.view(torch.int32), w.to(torch.float32).view(torch.int32))
+        )
+
+    def test_misaligned_views_take_scalar_loads(self) -> None:
+        """A packet needs an aligned base and row stride.  A 132-wide row
+        (264 bytes) or a view four elements into its storage stays on scalar
+        loads and still computes the exact result; the contiguous copy of the
+        same data keeps its packet."""
+        packet = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
+        for kernel, big in (
+            (
+                _cast_i16_to_bf16,
+                torch.randint(
+                    -32768, 32767, (64, 136), dtype=torch.int16, device=DEVICE
+                ),
+            ),
+            (_double_bf16, torch.randn(64, 136, dtype=torch.bfloat16, device=DEVICE)),
+        ):
+            row_stride = torch.empty((64, 132), dtype=big.dtype, device=DEVICE)
+            row_stride = row_stride[:, :128]
+            row_stride.copy_(big[:, :128])
+            views = {
+                "contiguous": big[:, :128].contiguous(),
+                "row_stride_132": row_stride,
+                "offset_4": big[:, 4:132],
+            }
+            for name, w in views.items():
+                with self.subTest(kernel=kernel.name, view=name):
+                    code, out = code_and_output(
+                        kernel,
+                        (w,),
+                        block_sizes=[8, 128],
+                        num_threads=[8, 16],
+                        cute_vector_widths=[1, 8],
+                    )
+                    self.assertEqual(packet in code, name == "contiguous")
+                    reference = (
+                        w.to(torch.bfloat16) if w.dtype is torch.int16 else w * 2
+                    )
+                    self.assertTrue(torch.equal(out, reference))
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_misaligned_view_under_torch_compile_takes_scalar_loads(self) -> None:
+        """Inductor lowers the kernel against example inputs, which must have
+        the runtime address residue: a view four bf16 elements into an aligned
+        base, a misaligned graph input, and an aligned-looking slice of one are
+        all eight bytes off a packet boundary, and a packet emitted for any of
+        them faults with a misaligned address."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
+            ),
+        )
+        def double_bf16(w: torch.Tensor) -> torch.Tensor:
+            k, n = w.shape
+            out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+            for tk, tn in hl.tile((k, n)):
+                out[tk, tn] = w[tk, tn] * 2
+            return out
+
+        packet = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
+        big = torch.randn(64, 144, dtype=torch.bfloat16, device=DEVICE)
+        # (graph input, slice taken inside the graph, packet expected)
+        cases = {
+            "sliced_offset_4": (big, 4, False),
+            "sliced_offset_8": (big, 8, True),
+            "misaligned_input": (big[:, 4:132], 0, False),
+            "aligned_slice_of_misaligned_input": (big[:, 4:], 8, False),
+        }
+        for name, (graph_input, start, expect_packet) in cases.items():
+            with self.subTest(case=name):
+
+                def f(x: torch.Tensor, start: int = start) -> torch.Tensor:
+                    return double_bf16(x[:, start : start + 128]) + 1
+
+                torch._dynamo.reset()
+                with fresh_cache():
+                    out, (code,) = run_and_get_code(
+                        torch.compile(f, fullgraph=True, backend="inductor"),
+                        graph_input,
+                    )
+                self.assertEqual(packet in code, expect_packet)
+                expected = graph_input[:, start : start + 128] * 2 + 1
+                self.assertTrue(torch.equal(out, expected))
+
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()

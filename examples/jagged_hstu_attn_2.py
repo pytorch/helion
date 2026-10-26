@@ -119,9 +119,14 @@ def reference_jagged_hstu_attention(
 
 
 # %%
+# fast_math: the SiLU gate's division takes the approximate form on both
+# backends (CuTe: x * rcp.approx instead of the IEEE divide that serializes the
+# gate; Triton: fast_dividef instead of div.full) and the exp its flush-to-zero
+# form.
 @helion.kernel(
     static_shapes=True,
     autotune_baseline_fn=reference_jagged_hstu_attention,
+    fast_math=True,
 )
 def jagged_hstu_attention(
     max_seq_len: int,

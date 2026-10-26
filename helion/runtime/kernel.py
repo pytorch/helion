@@ -59,22 +59,33 @@ from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZ
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
+from .._compiler.compile_environment import _replay_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
+from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
+from .._compiler.cute.aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
+from .._compiler.cute.aux_tensor import (
+    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+)
+from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
+from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
+from .._compiler.variable_origin import BlockSizeOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._dist_utils import kernel_declares_process_group
 from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
+from .._utils import next_power_of_2
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.benchmark_provider import _SEARCHING_CANDIDATES
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .cute_structural_config import DEFAULT_STRUCTURAL_POLICY
@@ -94,6 +105,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import PreparedGuardFactory
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
@@ -226,7 +238,74 @@ def _nested_fast_dispatch_key(
         except TypeError:
             return None
         return (value_type, tuple(entries)), has_tensor
+    if value_type is types.FunctionType and not specialize_numeric:
+        return _function_fast_dispatch_key(cast("types.FunctionType", value))
+    if value_type is types.BuiltinFunctionType:
+        # ``_specialization_extractors`` keys builtins by identity.
+        return (value_type, value), False
     return None
+
+
+def _function_fast_dispatch_key(
+    fn: types.FunctionType,
+) -> tuple[Hashable, bool] | None:
+    """Refine ``_function_key``: the code object, every closure cell's key and
+    every default value's key.
+
+    Callable arguments (score-modifier style hooks) are common in attention
+    kernels; keying them by code object keeps repeat calls on the prepared
+    fast path even when the caller rebuilds the function object per call.
+    Closure cells are re-read on every call because ``nonlocal`` rebinding can
+    change their contents without changing the function object.  Default
+    values are baked into the compiled kernel when the lifted function is
+    traced (``lift_closures`` passes ``__defaults__`` through), so they key by
+    value like constexpr arguments; a default the constexpr rules cannot key
+    (a tensor, a function) keeps the slow path.  Module globals the function
+    reads are not part of the key: like the kernel's own globals they are read
+    from the module when the kernel runs and specialized once, on the first
+    call's values.
+    """
+    closure = fn.__closure__
+    defaults = _function_defaults_fast_dispatch_key(fn)
+    if defaults is None:
+        return None
+    if not closure and not defaults:
+        return (types.FunctionType, fn.__code__), False
+    cells: list[Hashable] = []
+    has_tensor = False
+    for cell in closure or ():
+        nested = _nested_fast_dispatch_key(cell.cell_contents)
+        if nested is None:
+            return None
+        cell_key, cell_has_tensor = nested
+        cells.append(cell_key)
+        has_tensor = has_tensor or cell_has_tensor
+    if not defaults:
+        return (types.FunctionType, fn.__code__, tuple(cells)), has_tensor
+    return (types.FunctionType, fn.__code__, tuple(cells), defaults), has_tensor
+
+
+def _function_defaults_fast_dispatch_key(fn: types.FunctionType) -> Hashable | None:
+    """Value keys of ``fn``'s positional and keyword-only defaults (``()`` when
+    it has none; ``None`` when a default has no constexpr key)."""
+    defaults = fn.__defaults__ or ()
+    kwdefaults = fn.__kwdefaults__ or {}
+    if not defaults and not kwdefaults:
+        return ()
+    positional: list[Hashable] = []
+    for value in defaults:
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        positional.append(nested[0])
+    keyword: list[tuple[str, Hashable]] = []
+    for name, value in kwdefaults.items():
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        keyword.append((name, nested[0]))
+    keyword.sort()
+    return (tuple(positional), tuple(keyword))
 
 
 _TensorMetadataPathStep = (
@@ -391,6 +470,19 @@ class _PreparedMetadataSpecializationExtractor:
         return self.extractor(args)
 
 
+def _capture_safe_specialization(
+    extractor: Callable[[Sequence[object]], Hashable],
+) -> bool:
+    if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        return True
+    if isinstance(extractor, _SpecializationAlias):
+        return all(
+            _capture_safe_specialization(item)
+            for item in extractor.schemas[extractor.canonical_signature]
+        )
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class _RuntimeInputSpecializationExtractor:
     """Runtime classifier together with its source projections."""
@@ -399,6 +491,7 @@ class _RuntimeInputSpecializationExtractor:
     classifier: Callable[[Sequence[object]], Hashable]
     reusable_tensor_properties: frozenset[str]
     specialization_key: str | None = None
+    prepared_guard_factory: PreparedGuardFactory | None = None
 
     def source_values(self, args: Sequence[object]) -> tuple[object, ...]:
         return tuple(extract(args) for extract in self.source_extractors)
@@ -411,101 +504,50 @@ def _partition_prepared_extra_guards(
     args: tuple[object, ...],
     extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
 ) -> tuple[
-    Callable[[tuple[object, ...]], bool] | None,
     tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
-    tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+    tuple[Callable[[Sequence[object]], bool], ...],
 ]:
-    """Split guards into always-check and exact-tensor reusable projections.
+    """Split guards into always-check classifiers and prepared fact guards.
 
-    Tensor shape/stride/dtype/device facts are already checked by the prepared
-    argument guard.  A runtime classifier may additionally opt in to reuse
-    when its exact source tensors still have the same pointer/storage facts.
-    Classifiers that depend on tensor contents (or arbitrary Python state)
-    remain in the always-check set.
+    Tensor type/shape/stride/dtype/device facts are already checked by the
+    prepared argument guard.  A runtime input specialization may supply a
+    ``prepared_guard_factory`` that turns its expected result into a direct
+    check of the pointer/storage facts those pins leave open, so repeat calls
+    with fresh output tensors never re-run the full classifier.  Classifiers
+    without one (tensor contents, arbitrary Python state) remain in the
+    always-check set, as does any factory guard that rejects the very
+    arguments it was prepared from.
     """
     always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    reusable: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
-    # One source projection is enough for duplicate tensor objects: the
-    # prepared argument guard independently preserves the input alias topology.
-    tensor_entries: dict[
-        int,
-        tuple[
-            Callable[[Sequence[object]], Hashable],
-            torch.Tensor,
-            set[str],
-        ],
-    ] = {}
+    fact_guards: list[Callable[[Sequence[object]], bool]] = []
     for extractor, expected in extra_guards:
         if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
             continue
-        if (
-            not isinstance(extractor, _RuntimeInputSpecializationExtractor)
-            or not extractor.reusable_tensor_properties
-            or not extractor.reusable_tensor_properties <= {"data_ptr", "storage_span"}
-        ):
+        guard = (
+            _build_prepared_fact_guard(extractor, expected, args)
+            if isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            else None
+        )
+        if guard is None:
             always_check.append((extractor, expected))
-            continue
-        try:
-            source_values = extractor.source_values(args)
-        except Exception:
-            always_check.append((extractor, expected))
-            continue
-        if not source_values or any(
-            type(value) not in (torch.Tensor, torch.nn.Parameter)
-            for value in source_values
-        ):
-            always_check.append((extractor, expected))
-            continue
-        reusable.append((extractor, expected))
-        for source_extractor, value in zip(
-            extractor.source_extractors, source_values, strict=True
-        ):
-            assert isinstance(value, torch.Tensor)
-            entry = tensor_entries.get(id(value))
-            if entry is None:
-                tensor_entries[id(value)] = (
-                    source_extractor,
-                    value,
-                    set(extractor.reusable_tensor_properties),
-                )
-            else:
-                entry[2].update(extractor.reusable_tensor_properties)
+        else:
+            fact_guards.append(guard)
+    return tuple(always_check), tuple(fact_guards)
 
-    if not reusable:
-        return None, tuple(always_check), ()
 
-    namespace: dict[str, object] = {}
-    checks: list[str] = []
+def _build_prepared_fact_guard(
+    extractor: _RuntimeInputSpecializationExtractor,
+    expected: Hashable,
+    args: tuple[object, ...],
+) -> Callable[[Sequence[object]], bool] | None:
+    factory = extractor.prepared_guard_factory
+    if factory is None:
+        return None
     try:
-        for index, (extractor, tensor, properties) in enumerate(
-            tensor_entries.values()
-        ):
-            namespace[f"extract_{index}"] = extractor
-            namespace[f"ref_{index}"] = weakref.ref(tensor)
-            value_name = f"value_{index}"
-            item_checks = [
-                f"(({value_name} := extract_{index}(args)) is ref_{index}())"
-            ]
-            if "data_ptr" in properties:
-                namespace[f"data_ptr_{index}"] = int(tensor.data_ptr())
-                item_checks.append(f"{value_name}.data_ptr() == data_ptr_{index}")
-            if "storage_span" in properties:
-                storage = tensor.untyped_storage()
-                namespace[f"storage_ptr_{index}"] = int(storage.data_ptr())
-                namespace[f"storage_nbytes_{index}"] = storage.nbytes()
-                storage_name = f"storage_{index}"
-                item_checks.extend(
-                    (
-                        f"(({storage_name} := {value_name}.untyped_storage()).data_ptr() == storage_ptr_{index})",
-                        f"{storage_name}.nbytes() == storage_nbytes_{index}",
-                    )
-                )
-            checks.append(f"({' and '.join(item_checks)})")
-        reuse_guard = eval(f"lambda args: {' and '.join(checks)}", namespace)
+        guard = factory(extractor.source_extractors, expected)
+        return guard if guard(args) else None
     except Exception:
-        always_check.extend(reusable)
-        return None, tuple(always_check), ()
-    return reuse_guard, tuple(always_check), tuple(reusable)
+        return None
 
 
 def _make_prepared_arg_guard(
@@ -613,6 +655,38 @@ def _make_prepared_arg_guard(
             else:
                 namespace[f"value_{token}"] = inner
                 checks.append(f"{prefix}.value == value_{token}")
+        elif value_type is types.FunctionType and annotation is not ConstExpr:
+            # Mirror ``_function_key``: the code object identifies the
+            # function, every closure cell is guarded like an argument of its
+            # own type (cells are re-read because ``nonlocal`` can rebind them
+            # without replacing the function object), and every default value
+            # like a constexpr argument (defaults are baked into the traced
+            # kernel).  Module globals the function reads are not guarded, as
+            # the kernel's own globals are not.
+            function = cast("types.FunctionType", value)
+            namespace[f"code_{token}"] = function.__code__
+            checks.append(f"{prefix}.__code__ is code_{token}")
+            for cell_index, cell in enumerate(function.__closure__ or ()):
+                append_checks(
+                    cell.cell_contents,
+                    f"{prefix}.__closure__[{cell_index}].cell_contents",
+                )
+            if _function_defaults_fast_dispatch_key(function) is None:
+                raise TypeError("callable default without a constexpr key")
+            defaults = function.__defaults__ or ()
+            checks.append(f"len({prefix}.__defaults__ or ()) == {len(defaults)}")
+            for default_index, default in enumerate(defaults):
+                append_checks(
+                    default, f"{prefix}.__defaults__[{default_index}]", ConstExpr
+                )
+            kwdefaults = function.__kwdefaults__ or {}
+            checks.append(f"len({prefix}.__kwdefaults__ or {{}}) == {len(kwdefaults)}")
+            for name, default in kwdefaults.items():
+                checks.append(f"{name!r} in {prefix}.__kwdefaults__")
+                append_checks(default, f"{prefix}.__kwdefaults__[{name!r}]", ConstExpr)
+        elif value_type is types.BuiltinFunctionType:
+            namespace[f"value_{token}"] = value
+            checks.append(f"{prefix} is value_{token}")
         else:
             raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
 
@@ -633,12 +707,11 @@ class _PreparedCall:
     __slots__ = (
         "_dist_initialized",
         "_extra_guards",
+        "_fact_guards",
         "_is_distributed",
         "_matches_args",
         "_reset_generation",
-        "_reusable_extra_guards",
         "_specialization_generation",
-        "_tensor_storage_reuse_guard",
         "bound",
     )
 
@@ -656,11 +729,9 @@ class _PreparedCall:
         self._matches_args = _make_prepared_arg_guard(bound.kernel, args)
         self._dist_initialized = dist_initialized
         self._is_distributed = is_distributed
-        (
-            self._tensor_storage_reuse_guard,
-            self._extra_guards,
-            self._reusable_extra_guards,
-        ) = _partition_prepared_extra_guards(args, extra_guards)
+        self._extra_guards, self._fact_guards = _partition_prepared_extra_guards(
+            args, extra_guards
+        )
         self._specialization_generation = bound.kernel._specialization_generation
         self._reset_generation = bound.kernel._reset_generation
         self.bound = bound
@@ -721,12 +792,9 @@ class _PreparedCall:
             for extractor, expected in self._extra_guards:
                 if extractor(args) != expected:
                     return False
-            if self._tensor_storage_reuse_guard is None or not (
-                self._tensor_storage_reuse_guard(args)
-            ):
-                for extractor, expected in self._reusable_extra_guards:
-                    if extractor(args) != expected:
-                        return False
+            for guard in self._fact_guards:
+                if not guard(args):
+                    return False
             return (
                 self._reset_generation == kernel._reset_generation
                 and self._specialization_generation == kernel._specialization_generation
@@ -920,6 +988,7 @@ class Kernel(Generic[_R]):
         self._cute_grouped_static_tail_extra_descriptors: dict[
             Hashable, set[Hashable]
         ] = {}
+        self._cute_reduction_extent_descriptors: dict[Hashable, set[Hashable]] = {}
         if any(
             param.kind
             in (
@@ -944,6 +1013,10 @@ class Kernel(Generic[_R]):
         # Cache the number of parameters to avoid accessing self.signature.parameters
         # during torch.compile tracing.
         self._num_params: int = len(self.signature.parameters)
+        self._normalize_args_plans: dict[
+            tuple[int, tuple[str, ...]],
+            tuple[tuple[object, ...], tuple[int, ...]] | None,
+        ] = {}
 
         # Expose function attributes for compatibility with torch.library.custom_op
         # These are set as instance attributes to allow the Kernel to be used
@@ -1247,6 +1320,60 @@ class Kernel(Generic[_R]):
                 bound_kernel._cache_path_map.clear()
             return True
 
+    def _publish_guard_facts(
+        self,
+        bound_kernel: BoundKernel,
+        facts: Sequence[_PreparedMetadataSpecializationExtractor],
+    ) -> None:
+        """Append guard facts to a signature's dispatch schema.
+
+        A guard fact evaluates at any cached bound's bind-time hints, so every
+        bound of the signature (the publishing one included) is re-keyed in
+        place rather than evicted, and no runtime arguments are needed: code
+        generation can publish too.
+        """
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
+        signature = bound_kernel._base_spec_key
+        with self._bind_lock, self._specialize_extra_lock:
+            if bound_kernel._reset_generation != self._reset_generation:
+                return
+            published = self._specialize_extra.get(signature, [])
+            new_facts = [fact for fact in facts if fact not in published]
+            if not new_facts:
+                return
+            for key, bound in list(self._bound_kernels.items()):
+                if key.specialization_key not in (
+                    signature,
+                    *(
+                        alias_signature
+                        for alias_signature, alias in self._specialization_aliases.items()
+                        if alias.canonical_signature == signature
+                    ),
+                ):
+                    continue
+                del self._bound_kernels[key]
+                # Alias keys pack the canonical results; let them rebind.
+                if (
+                    key.specialization_key == signature
+                    and (results := _bound_guarded_input_facts(bound, new_facts))
+                    is not None
+                ):
+                    self._bound_kernels[
+                        BoundKernelInMemoryCacheKey(
+                            signature,
+                            (*key.extra_results, *results),
+                            compiler_seed_results=key.compiler_seed_results,
+                        )
+                    ] = bound
+            self._specialize_extra[signature] = [*published, *new_facts]
+            self._has_specialization_extras = True
+            self._specialization_generation += 1
+            for fast_key, cached_bound in list(self._dispatch_cache.items()):
+                if cached_bound._base_spec_key == signature:
+                    del self._dispatch_cache[fast_key]
+            self._prepared_call = None
+
     def _compute_is_distributed(
         self,
         args: Sequence[object],
@@ -1311,7 +1438,13 @@ class Kernel(Generic[_R]):
                 key.append(None)
             elif t is torch.dtype or t is torch.device:
                 key.append(a)
-            elif t is tuple or t is list or t is dict:
+            elif (
+                t is tuple
+                or t is list
+                or t is dict
+                or t is types.FunctionType
+                or t is types.BuiltinFunctionType
+            ):
                 nested = _nested_fast_dispatch_key(
                     a,
                     specialize_numeric=annotation is ConstExpr,
@@ -1482,8 +1615,14 @@ class Kernel(Generic[_R]):
             )
         return args
 
-    def _bind_isolated(self, args: tuple[object, ...]) -> BoundKernel[_R]:
-        """Construct a canonical bound without reading or publishing shared caches."""
+    def _bind_isolated(
+        self, args: tuple[object, ...], *, rewrite_ast: bool = True
+    ) -> BoundKernel[_R]:
+        """Construct a canonical bound without reading or publishing shared caches.
+
+        ``rewrite_ast=False`` traces the kernel as written, without the
+        backend's AST customizations.
+        """
         self._validate_structural_policy()
         args = self._validate_bind_args(args)
         args = self.normalize_args(*args)
@@ -1498,6 +1637,7 @@ class Kernel(Generic[_R]):
             base_spec_key=signature,
             is_distributed=is_distributed,
             cache_managed=False,
+            rewrite_ast=rewrite_ast,
         )
 
     def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
@@ -1515,6 +1655,7 @@ class Kernel(Generic[_R]):
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
+            created = False
             if bound_kernel is None:
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
                 extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None
@@ -1543,6 +1684,7 @@ class Kernel(Generic[_R]):
                         base_spec_key=signature,
                         is_distributed=is_distributed,
                     )
+                    created = True
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel,
@@ -1561,6 +1703,9 @@ class Kernel(Generic[_R]):
                             cache_key.extra_results,
                         )
                 self._bound_kernels[cache_key] = bound_kernel
+                if created:
+                    # Key the input-shape guards this compile recorded.
+                    bound_kernel._publish_guarded_input_facts()
             return bound_kernel
 
     def _base_specialization_key(
@@ -1691,9 +1836,57 @@ class Kernel(Generic[_R]):
         Returns:
             tuple[object, ...]: A tuple of normalized positional arguments.
         """
-        bound_args = self.signature.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        return tuple(bound_args.args)
+        key = (len(args), tuple(kwargs))
+        plans = self._normalize_args_plans
+        if torch.compiler.is_compiling():
+            # Dynamo would guard on the plan cache's contents and replay the
+            # write, recompiling once per call shape; trace inspect instead.
+            plan = None
+        elif key in plans:
+            plan = plans[key]
+        else:
+            plan = plans[key] = self._plan_normalize_args(*key)
+        if plan is None:
+            # Calls that ``inspect`` must reject (or that need its binding
+            # rules) raise its errors.
+            bound_args = self.signature.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            return tuple(bound_args.args)
+        defaults, positions = plan
+        normalized = [*args, *defaults[len(args) :]]
+        for position, value in zip(positions, kwargs.values(), strict=True):
+            normalized[position] = value
+        return tuple(normalized)
+
+    def _plan_normalize_args(
+        self, positional_count: int, keyword_names: tuple[str, ...]
+    ) -> tuple[tuple[object, ...], tuple[int, ...]] | None:
+        """Defaults template and keyword slots for one call shape, if bindable.
+
+        ``inspect.Signature.bind`` costs ~10us per call; a call shape (count of
+        positional arguments plus the keyword names) that binds cleanly to a
+        positional-or-keyword-only signature can be replayed from this plan.
+        """
+        parameters = list(self.signature.parameters.values())
+        if positional_count > len(parameters) or any(
+            parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        ):
+            return None
+        names = [parameter.name for parameter in parameters]
+        positions: list[int] = []
+        for name in keyword_names:
+            if name not in names or names.index(name) < positional_count:
+                return None
+            positions.append(names.index(name))
+        defaults = tuple(parameter.default for parameter in parameters)
+        if any(
+            default is inspect.Parameter.empty
+            for index, default in enumerate(defaults)
+            if index >= positional_count and index not in positions
+        ):
+            return None
+        return defaults, tuple(positions)
 
     def autotune(
         self,
@@ -2024,7 +2217,17 @@ class Kernel(Generic[_R]):
             and prepared.bound._run is not None
         ):
             return prepared.bound._run(*args)
-        if self._dispatch_cache:
+        # Runtime specialization extractors can inspect pointers/storage offsets.
+        # Capture may reuse metadata-only entries; legacy Dynamo integration
+        # needs their compiled launchers and cannot trace isolated binding.
+        if self._dispatch_cache and (
+            not is_compiling
+            or all(
+                _capture_safe_specialization(extractor)
+                for extractors in self._specialize_extra.values()
+                for extractor in extractors
+            )
+        ):
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.
@@ -2156,6 +2359,7 @@ class Kernel(Generic[_R]):
                 self._compiler_seed_specialize_extra = {}
                 self._specialization_aliases = {}
                 self._cute_grouped_static_tail_extra_descriptors = {}
+                self._cute_reduction_extent_descriptors = {}
                 self._has_specialization_extras = False
                 self._specialization_generation += 1
                 self._reset_generation += 1
@@ -2192,6 +2396,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         base_spec_key: tuple[Hashable, ...] | None = None,
         is_distributed: bool | None = None,
         cache_managed: bool = True,
+        rewrite_ast: bool = True,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -2204,6 +2409,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             args: A tuple of arguments to bind to the kernel.
             cache_managed: Whether this bound participates in the kernel's shared
                 specialization and bound caches.
+            rewrite_ast: Whether to apply the backend's AST customizations.
         """
         super().__init__()
         kernel._validate_structural_policy()
@@ -2253,6 +2459,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             tuple[Hashable | None, ...],
         ] = {}
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        # Shape guards recorded past this index come from code generation.
+        self._bind_guard_count = 0
+        # Hint-sized CuTe reduction extents, per generated config.
+        self._cute_reduction_extents: dict[
+            Config, tuple[_CuteReductionExtent, ...]
+        ] = {}
         self._cache_path_map: dict[Config, str | None] = {}
         self._host_semantic_fingerprints: dict[
             tuple[_HostSemanticInputNormalization, tuple[object, ...]], str
@@ -2285,9 +2497,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         if (
-            self.settings.cute_region_fission
-            or self.settings.cute_materialize_transformed_operands
-        ) and self.settings.backend == "cute":
+            rewrite_ast
+            and (
+                self.settings.cute_region_fission
+                or self.settings.cute_materialize_transformed_operands
+            )
+            and self.settings.backend == "cute"
+        ):
             from .._compiler.cute.materialize_operand import (
                 plan_operand_materialization,
             )
@@ -2350,6 +2566,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
+                        rewrite_ast=rewrite_ast,
                     )
                 except Exception:
                     config = self.env.config_spec.default_config()
@@ -2357,12 +2574,72 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.restrict_pid_types_for_persistent(args)
+                self._bind_guard_count = len(self.env.shape_env.guards)
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 runtime_args = dict(
                     zip(self.kernel.signature.parameters, args, strict=False)
                 )
                 self.env.snapshot_tensor_descriptor_alignments(runtime_args)
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                # The exact-shape detector is narrower: it gates the
+                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
+                # The compiler seeds below read these facts (the FFI
+                # direct-entry gate consults the non-tcgen05 operand
+                # flag, the cluster_m=2 seeds and the search projection
+                # the aux facts), so they are recorded before
+                # ``compiler_seed_configs`` runs; they depend only on the
+                # traced host function, not on the runtime arguments.
+                from .._compiler.cute.cute_mma import (
+                    tcgen05_fragment_epilogue_has_host_loads,
+                )
+                from .._compiler.cute.cute_mma import (
+                    tcgen05_fragment_epilogue_has_unique_anchor,
+                )
+
+                direct_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                fragment_aux_kernel_detected = tcgen05_fragment_epilogue_has_host_loads(
+                    self.host_function.device_ir.graphs
+                ) and tcgen05_fragment_epilogue_has_unique_anchor(
+                    self.host_function.device_ir.graphs,
+                    device_ir=self.host_function.device_ir,
+                )
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    direct_aux_kernel_detected or fragment_aux_kernel_detected
+                )
+                self.env.config_spec.cute_tcgen05_fragment_aux_kernel_detected = (
+                    fragment_aux_kernel_detected
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
+                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
+                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
+                )
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
@@ -2403,64 +2680,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         )
                     )
 
-                # Post-compile FX-graph scan to detect kernels
-                # whose tcgen05 matmul is followed by an
-                # aux-fused store
-                # (``out[tile] = (acc + residual[tile]).to(...)``
-                # and variants — see
-                # ``host_function_has_tcgen05_aux_kernel_pattern``
-                # for the accepted shapes). When detected, the
-                # autotune surface widens to admit
-                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
-                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
-                # productive C-input warp lift is reachable from
-                # the normal autotune path. For pure-matmul
-                # kernels the detector returns False and the
-                # autotune surface keeps the narrow
-                # ``MONOLITHIC + c_input_warps=0`` shape so
-                # autotune cannot sample the strictly-worse
-                # inert C-input warp configuration.
-                # The exact-shape detector is narrower: it gates the
-                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_matmul_has_non_tcgen05_operand,
-                )
-                from .._compiler.cute.cute_mma import (
-                    tcgen05_fragment_epilogue_has_host_loads,
-                )
-                from .._compiler.cute.cute_mma import (
-                    tcgen05_fragment_epilogue_has_unique_anchor,
-                )
-
-                direct_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
-                )
-                fragment_aux_kernel_detected = tcgen05_fragment_epilogue_has_host_loads(
-                    self.host_function.device_ir.graphs
-                ) and tcgen05_fragment_epilogue_has_unique_anchor(
-                    self.host_function.device_ir.graphs,
-                    device_ir=self.host_function.device_ir,
-                )
-                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    direct_aux_kernel_detected or fragment_aux_kernel_detected
-                )
-                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self.host_function
-                    )
-                )
-                self.env.config_spec.cute_tcgen05_fragment_aux_kernel_detected = (
-                    fragment_aux_kernel_detected
-                )
-                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
-                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
-                )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
@@ -2581,7 +2800,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Args:
             config: The configuration to use for code generation.
-            options: Optional :class:`~helion.runtime.precompile.OutputCodeOptions`.
+            options: Optional :class:`~helion.runtime.kernel.OutputCodeOptions`.
                 With ``allow_helion_deps=False`` the returned module is
                 self-contained (no ``helion`` import at runtime); ``jax_fn=True``
                 (Pallas only) emits a pure-JAX module operating on ``jax.Array``s.
@@ -2601,9 +2820,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._runtime_arg_values_for_codegen(),
                 measure("BoundKernel.generate_ast"),
             ):
+                self.env.cute_hint_sized_reduction_extents.clear()
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
+                # Code generation can guard on input sizes too.
+                self._publish_guarded_input_facts()
                 self._register_cute_grouped_static_tail_specializations()
+                self._cute_reduction_extents[config] = (
+                    _cute_reduction_extent_descriptors(self.env)
+                )
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             import_lines: list[str] = []
@@ -2621,11 +2846,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 body_start = len(root.body)
             body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
             ast.fix_missing_locations(body_root)
-        # One optional AST processing step, then the single unparse. Both rewrites run
-        # after generate_ast and outside the fake-tensor env above: jax_fn's launch
-        # capture runs the compiled kernel on *real* tensors (which specializes
-        # fake_args, so codegen must already be done); dep-free is pure-AST and
-        # unaffected by placement. jax_fn is checked first -- it spans both dep modes.
+        # Export after codegen and outside the fake-tensor environment: backends
+        # may capture launch metadata before rewriting the module. Check jax_fn
+        # first because it supports both dependency modes.
         if options is not None and options.jax_fn:
             from .._compiler.output_code_utils import build_jax_fn_module
             from .._compiler.output_code_utils import capture_jax_launch_metadata
@@ -2682,6 +2905,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config, process_group_name=self._env.process_group_name
         )
         if (rv := self._compile_cache.get(config)) is not None:
+            self._register_cute_reduction_extent_specializations(config)
             return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
@@ -2742,6 +2966,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
+        self._register_cute_reduction_extent_specializations(config)
         return rv
 
     def bench_compile_config(
@@ -3292,9 +3517,123 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     specialization.classifier,
                     frozenset(specialization.reusable_tensor_properties),
                     key,
+                    specialization.prepared_guard_factory,
                 )
             )
         return extractors
+
+    def _publish_guarded_input_facts(self) -> None:
+        """Extend the dispatch schema with guard facts it does not check yet."""
+        if self._cache_managed:
+            self.kernel._publish_guard_facts(self, self._guarded_input_facts())
+
+    def _guarded_input_facts(
+        self,
+    ) -> list[_PreparedMetadataSpecializationExtractor]:
+        """Input-shape guards this dynamic-shape compilation baked into its code.
+
+        ``static_shapes=False`` keeps 0/1 sizes symbolic so one bound kernel
+        can serve every size, but a compile-time comparison still guards on
+        them: ``size == 1`` at a size-1 dim replaces the symbol and drops that
+        dim's index, ``size != 1`` keeps a broadcast dim's index, and equal
+        sizes merge two reduction dims.  Each replacement of an input
+        size/stride (by a constant or other input sizes) and each ``!=``
+        against a constant that code generation recorded becomes a cache-key
+        fact, as do those on a reduction block symbol (an empty reduction
+        guarded 1-wide), keyed by the block its extent's input sizes give.
+        Nothing is added when no such guard fired, so the common case keeps
+        #2353's single bound kernel and its dispatch cost.
+        """
+        if self.settings.static_shapes:
+            return []
+        shape_env = self.env.shape_env
+        # Container elements share their container's source, so only direct
+        # tensor arguments replay; descriptor guards on elements are keyed by
+        # the descriptor layout extractor.
+        tensor_params = {
+            name
+            for name, fake in zip(
+                self.kernel.signature.parameters, self.fake_args, strict=False
+            )
+            if isinstance(fake, torch.Tensor)
+        }
+        sources: dict[sympy.Symbol, TensorPropertySource] = {}
+        for symbol, symbol_sources in shape_env.var_to_sources.items():
+            for source in symbol_sources:
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and isinstance(source.base, LocalSource)
+                    and source.base.local_name in tensor_params
+                ):
+                    sources[symbol] = source
+                    break
+
+        def guarded_quantity(symbol: sympy.Symbol) -> tuple[sympy.Expr, bool] | None:
+            """The input expression a guarded symbol stands for, and if a block."""
+            if (source := sources.get(symbol)) is not None:
+                # hl.specialize already keys the exact value.
+                if symbol in self.env.specialized_vars or (
+                    source in self.env.specialized_strides
+                ):
+                    return None
+                return symbol, False
+            assert self.host_function is not None
+            origin = self.host_function.expr_to_origin.get(symbol)
+            if (
+                origin is not None
+                and isinstance(origin.origin, BlockSizeOrigin)
+                and (info := self.env.block_sizes[origin.origin.block_id]).reduction
+                and isinstance(info.size, torch.SymInt)
+            ):
+                return cast("sympy.Expr", info.size._sympy_()), True
+            return None
+
+        relations: list[tuple[sympy.Symbol, sympy.Expr, bool]] = [
+            (symbol, expr, True)
+            for symbol, expr in shape_env.replacements.items()
+            if expr != symbol
+        ]
+        relations.extend(
+            (symbol, expr, True) for symbol, expr in self.env.keyed_size_equalities
+        )
+        relations.extend(
+            (lhs, rhs, False)
+            # Binding records ``!= 1`` for any size it saw >= 2 without code
+            # depending on it; code generation's (block pointers keep a
+            # broadcast dim's index) does.
+            for guard in shape_env.guards[self._bind_guard_count :]
+            if isinstance(guard.expr, sympy.Ne)
+            and isinstance(lhs := guard.expr.lhs, sympy.Symbol)
+            and isinstance(rhs := guard.expr.rhs, sympy.Integer)
+        )
+        param_names = tuple(self.kernel.signature.parameters)
+        facts: dict[_GuardedInputFact, None] = {}
+        for symbol, expr, equal in relations:
+            if (quantity := guarded_quantity(symbol)) is None:
+                continue
+            lhs, block = quantity
+            free_symbols = sorted(
+                {
+                    cast("sympy.Symbol", free)
+                    for free in (*lhs.free_symbols, *expr.free_symbols)
+                },
+                key=str,
+            )
+            if lhs.free_symbols and all(free in sources for free in free_symbols):
+                facts.setdefault(
+                    _GuardedInputFact(
+                        lhs,
+                        expr,
+                        tuple((free, sources[free]) for free in free_symbols),
+                        block,
+                        equal,
+                        param_names,
+                    )
+                )
+        return [
+            _PreparedMetadataSpecializationExtractor(fact)
+            for fact in sorted(facts, key=repr)
+        ]
 
     def _record_runtime_input_specialization_results(
         self,
@@ -3335,44 +3674,76 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env.use_runtime_arg_values(values):
             yield
 
-    def _register_cute_grouped_static_tail_specializations(self) -> None:
-        if self.kernel.settings.backend != "cute" or not self._cache_managed:
-            return
-        signature = self._base_spec_key
-        descriptors = _cute_grouped_static_tail_extra_descriptors(
-            self.env.cute_resolved_wrapper_plans
-        )
+    def _extend_cute_descriptor_specializations(
+        self,
+        seen_by_signature: dict[Hashable, set[Hashable]],
+        descriptors: Sequence[Hashable],
+        make_extractor: Callable[[Any], Callable[[Sequence[object]], Hashable]],
+    ) -> None:
+        """Key every descriptor that this signature does not key yet."""
         if not descriptors:
             return
+        signature = self._base_spec_key
         # Serialize descriptor discovery with schema extension so concurrent
         # code generation cannot publish duplicate equivalent extractors.
         with self.kernel._bind_lock:
             if self._reset_generation != self.kernel._reset_generation:
                 return
-            seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
-                signature,
-                set(),
-            )
-            new_descriptors: list[Hashable] = []
-            new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
-            for descriptor in descriptors:
-                if descriptor in seen:
-                    continue
-                new_descriptors.append(descriptor)
-                new_extractors.append(
-                    _make_cute_grouped_static_tail_extractor(descriptor)
+            seen = seen_by_signature.setdefault(signature, set())
+            new_descriptors = [
+                descriptor for descriptor in descriptors if descriptor not in seen
+            ]
+            with self._runtime_arg_values_for_codegen():
+                runtime_args = tuple(
+                    self.env.runtime_arg_values_by_name.get(name)
+                    for name in self.kernel.signature.parameters
                 )
-            runtime_args = tuple(
-                self.env.runtime_arg_values_by_name.get(name)
-                for name in self.kernel.signature.parameters
-            )
             if self.kernel._extend_bound_kernel_specializations(
                 self,
                 signature,
-                new_extractors,
+                [make_extractor(descriptor) for descriptor in new_descriptors],
                 runtime_args,
             ):
                 seen.update(new_descriptors)
+
+    def _register_cute_grouped_static_tail_specializations(self) -> None:
+        if self.kernel.settings.backend != "cute" or not self._cache_managed:
+            return
+        self._extend_cute_descriptor_specializations(
+            self.kernel._cute_grouped_static_tail_extra_descriptors,
+            _cute_grouped_static_tail_extra_descriptors(
+                self.env.cute_resolved_wrapper_plans
+            ),
+            _make_cute_grouped_static_tail_extractor,
+        )
+
+    def _register_cute_reduction_extent_specializations(self, config: Config) -> None:
+        """Key the power-of-2 bucket of each hint-sized dynamic reduction extent.
+
+        A CuTe persistent reduction sizes its thread layout (and the CTA) from
+        the extent's size hint, while one dynamic-shape bound kernel serves
+        every size: a later call with a larger extent would launch too few
+        threads along that axis and skip the rest of each row.  Every config
+        compiled to run is keyed, whether by set_config or directly through
+        compile_config (whose callable a later bind() would otherwise hand
+        back for any size), but not the configs the autotuner only measures
+        (its reference baseline and candidates), so a looped winner keeps one
+        bound kernel across sizes.
+        """
+        if (
+            self.kernel.settings.backend != "cute"
+            or not self._cache_managed
+            or _SEARCHING_CANDIDATES.get()
+        ):
+            return
+        param_names = tuple(self.kernel.signature.parameters)
+        self._extend_cute_descriptor_specializations(
+            self.kernel._cute_reduction_extent_descriptors,
+            self._cute_reduction_extents.get(self._normalized_config_copy(config), ()),
+            lambda descriptor: _PreparedMetadataSpecializationExtractor(
+                _CuteReductionExtentExtractor(descriptor, param_names)
+            ),
+        )
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
@@ -3924,13 +4295,125 @@ def _number_key(fn: Kernel, n: float | bool) -> object:
     return type(n)
 
 
-def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
-    if obj.__closure__:
-        closures = [
-            fn._specialization_key(cell.cell_contents) for cell in obj.__closure__
-        ]
-        return (obj.__code__, *closures)
-    return obj.__code__
+def _function_key(
+    fn: Kernel, obj: types.FunctionType, *, baked: bool = False
+) -> object:
+    """Specialization key of a callable argument: its code object, the key of
+    every closure cell and the key of every default.
+
+    A cell of the argument itself is a runtime input of the compiled kernel
+    (``lift_closures`` lifts it, so it is read on each call) and keys like an
+    argument of its type. Defaults are baked into the kernel when the lifted
+    function is traced, so they key like constexprs through ``_constant_key``,
+    and so does everything reachable from a default: with ``baked`` the
+    function is itself a default (``lift_closures`` passes ``__defaults__``
+    through raw, so a default function is traced with its own cells, which
+    are never lifted) and its cells key by value too. Module globals the
+    function reads are not part of the key: like the kernel's own globals
+    they are read from the module when the kernel runs and specialized once,
+    on the first call's values."""
+    cells = obj.__closure__ or ()
+    defaults = obj.__defaults__ or ()
+    kwdefaults = obj.__kwdefaults__ or {}
+    if not cells and not defaults and not kwdefaults:
+        return obj.__code__
+    if baked:
+        closures = tuple(_constant_key(fn, cell.cell_contents) for cell in cells)
+    else:
+        closures = tuple(fn._specialization_key(cell.cell_contents) for cell in cells)
+    return (
+        obj.__code__,
+        closures,
+        tuple(_constant_key(fn, value) for value in defaults),
+        tuple(
+            sorted(
+                (name, _constant_key(fn, value)) for name, value in kwdefaults.items()
+            )
+        ),
+    )
+
+
+class _IdentityKey:
+    """Hashable stand-in for a baked-in value that cannot key by its own
+    equality (a tensor or a container holding one, whose ``==`` is not a
+    bool; an unhashable object): equal only to a key of the same object. It
+    keeps the object alive, so its identity cannot pass to another object
+    while a cache holds the key."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _IdentityKey and other.value is self.value
+
+    def __repr__(self) -> str:
+        return f"_IdentityKey({self.value!r})"
+
+
+def _constant_key(fn: Kernel, value: object) -> Hashable:
+    """Key of a value baked into the compiled kernel: by value through the
+    constexpr rules (numbers, strings, dtypes, containers of them), a
+    function through ``_function_key`` with its cells baked too (a lambda
+    default rebuilt per call keys like one passed as an argument), any other
+    hashable value with no tensor inside by its own equality (a frozenset,
+    a namedtuple, an enum member, a frozen dataclass, a bound method), else
+    by identity (a tensor or a container holding one, an unhashable
+    object).
+
+    Equality here is Python's: a frozenset, namedtuple or frozen dataclass
+    holding ``1``, ``1.0`` or ``True`` (or ``0.0`` and ``-0.0``) shares one
+    specialization although the baked constant differs (``1.0`` casts an
+    int32 input through float32), the same merge a constexpr argument
+    holding that container makes. Only a default that is itself a function
+    is read through ``_function_key``: a function inside a container
+    default keys by identity with the container, so its cells are not
+    re-read (a ``nonlocal`` rebind reuses the old kernel) and a lambda
+    rebuilt per call inside a tuple is a new specialization each call."""
+    if type(value) is types.FunctionType:
+        return cast("Hashable", _function_key(fn, value, baked=True))
+    nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+    if nested is not None:
+        return nested[0]
+    try:
+        hash(value)
+    except TypeError:
+        return _IdentityKey(value)
+    if _contains_tensor(value, set()):
+        return _IdentityKey(value)
+    return (type(value), cast("Hashable", value))
+
+
+def _contains_tensor(value: object, visited: set[int]) -> bool:
+    """Whether a ``torch.Tensor`` is reachable from ``value`` through tuples,
+    lists, sets, frozensets, dict keys and values, dataclass fields or a
+    bound method's ``__self__``. ``visited`` holds the ids of the objects
+    already walked (every object reachable from ``value`` stays alive for
+    the walk), so a cycle such as a dataclass holding itself ends."""
+    if isinstance(value, torch.Tensor):
+        return True
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_tensor(item, visited) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_tensor(key, visited) or _contains_tensor(item, visited)
+            for key, item in value.items()
+        )
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _contains_tensor(getattr(value, field.name), visited)
+            for field in dataclasses.fields(value)
+        )
+    if isinstance(value, types.MethodType):
+        return _contains_tensor(value.__self__, visited)
+    return False
 
 
 def _cute_grouped_layout_has_m_tail(
@@ -3969,6 +4452,164 @@ def _cute_grouped_layout_has_m_tail(
     if cursor != len(layout_values):
         return None
     return has_m_tail
+
+
+def _tensor_property(
+    source: TensorPropertySource, root_values: dict[str, object]
+) -> int | None:
+    tensor = _replay_tensor_input_source(source.base, root_values)
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    if source.prop == TensorProperty.STORAGE_OFFSET:
+        return int(tensor.storage_offset())
+    assert source.idx is not None
+    if source.prop == TensorProperty.SIZE:
+        return int(tensor.size(source.idx))
+    return int(tensor.stride(source.idx))
+
+
+def _evaluate(expr: sympy.Expr, values: dict[sympy.Symbol, int]) -> int:
+    if isinstance(expr, sympy.Symbol):
+        return values[expr]
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    return int(expr.xreplace(values))
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardedInputFact:
+    """Whether a guard ``lhs == rhs`` (or ``!=`` without ``equal``) still holds.
+
+    Both sides are expressions of input sizes/strides; ``sources`` names the
+    input behind each symbol.  With ``block`` the guarded symbol was a
+    reduction block, whose value is ``next_power_of_2`` of the extent ``lhs``.
+    """
+
+    lhs: sympy.Expr
+    rhs: sympy.Expr
+    sources: tuple[tuple[sympy.Symbol, TensorPropertySource], ...]
+    block: bool
+    equal: bool
+    param_names: tuple[str, ...]
+
+    def _holds(self, values: dict[sympy.Symbol, int]) -> bool:
+        lhs = _evaluate(self.lhs, values)
+        same = (next_power_of_2(lhs) if self.block else lhs) == _evaluate(
+            self.rhs, values
+        )
+        # Branch rather than compare: traced by dynamo the sizes are SymInts,
+        # and their SymBool compared with a bool nests an Eq the shape env
+        # cannot evaluate, while a branch guards on it.
+        return self.equal if same else not self.equal
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        root_values = dict(zip(self.param_names, args, strict=False))
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (value := _tensor_property(source, root_values)) is None:
+                return None
+            values[symbol] = value
+        return self._holds(values)
+
+    def bound_value(self, env: CompileEnvironment) -> Hashable:
+        """This fact at ``env``'s bind-time hints (None when not recoverable)."""
+        symbols = {
+            source: symbol
+            for symbol, sources in env.shape_env.var_to_sources.items()
+            for source in sources
+        }
+        hints = shape_env_var_hints(env.shape_env)
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (
+                bound_symbol := symbols.get(source)
+            ) is None or bound_symbol not in hints:
+                return None
+            values[symbol] = int(hints[bound_symbol])
+        return self._holds(values)
+
+
+def _bound_guarded_input_facts(
+    bound: BoundKernel,
+    extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+) -> tuple[Hashable, ...] | None:
+    """Guard-fact results for a cached bound, or None if any is not a guard fact."""
+    results: list[Hashable] = []
+    for extractor in extractors:
+        if not (
+            isinstance(extractor, _PreparedMetadataSpecializationExtractor)
+            and isinstance(fact := extractor.extractor, _GuardedInputFact)
+        ):
+            return None
+        if (result := fact.bound_value(bound.env)) is None:
+            return None
+        results.append(result)
+    return tuple(results)
+
+
+class _CuteReductionExtent(NamedTuple):
+    """A dynamic reduction extent and the input size behind each of its symbols."""
+
+    extent: sympy.Expr
+    symbols: tuple[sympy.Symbol, ...]
+    sizes: tuple[TensorPropertySource, ...]
+
+
+def _input_size_of(
+    env: CompileEnvironment, symbol: sympy.Symbol
+) -> TensorPropertySource | None:
+    for source in env.shape_env.var_to_sources.get(symbol, ()):
+        if (
+            isinstance(source, TensorPropertySource)
+            and source.prop == TensorProperty.SIZE
+            and source.idx is not None
+        ):
+            return source
+    return None
+
+
+def _cute_reduction_extent_descriptors(
+    env: CompileEnvironment,
+) -> tuple[_CuteReductionExtent, ...]:
+    """Describe each recorded reduction extent by the input sizes it reads."""
+    descriptors: list[_CuteReductionExtent] = []
+    for extent in env.cute_hint_sized_reduction_extents:
+        symbols = tuple(
+            sorted(
+                (s for s in extent.free_symbols if isinstance(s, sympy.Symbol)),
+                key=str,
+            )
+        )
+        sizes = [_input_size_of(env, symbol) for symbol in symbols]
+        # A block-size symbol leaves no input size: the config fixes it.
+        if all(size is not None for size in sizes):
+            descriptors.append(
+                _CuteReductionExtent(
+                    extent,
+                    symbols,
+                    tuple(size for size in sizes if size is not None),
+                )
+            )
+    return tuple(sorted(descriptors, key=repr))
+
+
+@dataclasses.dataclass(frozen=True)
+class _CuteReductionExtentExtractor:
+    """Power-of-2 bucket of a dynamic reduction extent read from input sizes."""
+
+    descriptor: _CuteReductionExtent
+    param_names: tuple[str, ...]
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        root_values = dict(zip(self.param_names, args, strict=False))
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in zip(
+            self.descriptor.symbols, self.descriptor.sizes, strict=True
+        ):
+            if (value := _tensor_property(source, root_values)) is None:
+                return None
+            values[symbol] = value
+        return next_power_of_2(_evaluate(self.descriptor.extent, values))
 
 
 def _cute_grouped_static_tail_extra_descriptors(

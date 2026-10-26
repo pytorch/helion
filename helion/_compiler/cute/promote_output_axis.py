@@ -68,8 +68,18 @@ _FRESH_FACTORIES = frozenset(
         torch.full_like,
     )
 )
+# Factories whose result is likewise fresh storage but which the AST consumers
+# of ``_FRESH_FACTORIES`` (fan-out and fission allocation statements) do not
+# model: ``torch.empty_strided`` names its own layout, and the ``Tensor.new_*``
+# methods allocate like the ``torch.*`` factories with the receiver supplying
+# only dtype/device defaults (``register_tensor_factory_layout`` records them
+# the same way).  Freshness is about storage; the layout proofs read the
+# result's strides and storage offset themselves.
+_FRESH_STRIDED_FACTORIES = frozenset((torch.empty_strided,))
+_FRESH_TENSOR_METHODS = frozenset({"new_empty", "new_zeros", "new_ones", "new_full"})
 _READ_ONLY_HOST_CALLS = _FRESH_FACTORIES | frozenset(
     (
+        *_FRESH_STRIDED_FACTORIES,
         torch.as_strided,
         torch.detach,
         torch.flatten,
@@ -84,26 +94,29 @@ _READ_ONLY_HOST_CALLS = _FRESH_FACTORIES | frozenset(
         slice,
     )
 )
-_READ_ONLY_TENSOR_METHODS = frozenset(
-    {
-        "as_strided",
-        "detach",
-        "dim",
-        "element_size",
-        "flatten",
-        "is_contiguous",
-        "ndimension",
-        "numel",
-        "permute",
-        "reshape",
-        "size",
-        "squeeze",
-        "stride",
-        "t",
-        "transpose",
-        "unsqueeze",
-        "view",
-    }
+_READ_ONLY_TENSOR_METHODS = (
+    frozenset(
+        {
+            "as_strided",
+            "detach",
+            "dim",
+            "element_size",
+            "flatten",
+            "is_contiguous",
+            "ndimension",
+            "numel",
+            "permute",
+            "reshape",
+            "size",
+            "squeeze",
+            "stride",
+            "t",
+            "transpose",
+            "unsqueeze",
+            "view",
+        }
+    )
+    | _FRESH_TENSOR_METHODS
 )
 _PURE_CALLS = frozenset(
     (
@@ -167,13 +180,38 @@ def _read_only_host_dsl(call: ast.Call, callee: CallableType) -> bool:
     )
 
 
-def _fresh_tensors(host: HostFunction) -> set[torch.Tensor]:
+def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
+    from ... import next_power_of_2
+    from ..type_info import LiteralType
+    from ..type_info import SymIntType
+
+    return (
+        any(callee.value is function for function in (min, max, next_power_of_2))
+        and not call.keywords
+        and bool(call.args)
+        and all(
+            isinstance(arg, ExtendedAST)
+            and (
+                isinstance(arg._type_info, SymIntType)
+                or isinstance(arg._type_info, LiteralType)
+                and type(arg._type_info.value) is int
+            )
+            for arg in call.args
+        )
+    )
+
+
+def _fresh_tensors(
+    host: HostFunction, *, integer_metadata_calls: bool = False
+) -> set[torch.Tensor]:
     """Prove that factory storage survives all host-side operations.
 
-    Host tracing can mutate the same FakeTensor retained by an allocation's
-    type metadata. After ``out.set_(input)``, even that allocation node then
-    names input storage. Unknown calls or host writes therefore invalidate the
-    entire proof; a factory's current storage alone cannot establish freshness.
+    Fresh storage comes from the ``torch.*`` factories, ``torch.empty_strided``
+    and the ``Tensor.new_*`` methods.  Host tracing can mutate the same
+    FakeTensor retained by an allocation's type metadata. After
+    ``out.set_(input)``, even that allocation node then names input storage.
+    Unknown calls or host writes therefore invalidate the entire proof; a
+    factory's current storage alone cannot establish freshness.
     Check statements between and after grids too: the retained metadata is
     shared with those later operations, and packet lowering uses this proof
     for every device graph. Only verified GRID bodies execute on the device;
@@ -219,6 +257,8 @@ def _fresh_tensors(host: HostFunction) -> set[torch.Tensor]:
                 and (
                     any(callee.value is function for function in _READ_ONLY_HOST_CALLS)
                     or _read_only_host_dsl(call, callee)
+                    or integer_metadata_calls
+                    and _integer_metadata_call(call, callee)
                 )
                 or isinstance(callee, TensorAttributeType)
                 and callee.attr() in _READ_ONLY_TENSOR_METHODS
@@ -226,8 +266,15 @@ def _fresh_tensors(host: HostFunction) -> set[torch.Tensor]:
                 return set()
             if (
                 isinstance(call, ExtendedAST)
-                and isinstance(callee, CallableType)
-                and any(callee.value is factory for factory in _FRESH_FACTORIES)
+                and (
+                    isinstance(callee, CallableType)
+                    and any(
+                        callee.value is factory
+                        for factory in (*_FRESH_FACTORIES, *_FRESH_STRIDED_FACTORIES)
+                    )
+                    or isinstance(callee, TensorAttributeType)
+                    and callee.attr() in _FRESH_TENSOR_METHODS
+                )
                 and isinstance(value_type := call._type_info, TensorType)
             ):
                 storages.add(value_type.proxy().untyped_storage()._cdata)
@@ -600,8 +647,6 @@ def promote_partitioned_output_axis(
                 graph=graph.graph,
                 node_args=graph.node_args,
                 block_ids=[],
-                host_loop_reads=graph.host_loop_reads,
-                host_loop_writes=graph.host_loop_writes,
             )
         parent.args = (
             parent.args[0],

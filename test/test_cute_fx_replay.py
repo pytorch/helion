@@ -37,6 +37,7 @@ def _codegen() -> GenerateAST:
         SimpleNamespace(
             cute_state=SimpleNamespace(has_tcgen05_fragment_epilogue_plan=False),
             expr_to_var_info={},
+            inband_polls=[],
             new_var=lambda prefix: f"{prefix}_normalized",
         ),
     )

@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import math
 import os
+import subprocess
 import sys
 from typing import TYPE_CHECKING
 import unittest
@@ -19,7 +20,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._environment import is_fbcode
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
 from helion._hardware import get_hardware_info
@@ -29,6 +32,8 @@ from helion._testing import TestCase
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfCute
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 
@@ -50,6 +55,14 @@ def _current_compute_capability() -> str | None:
 def _pretuned_kernel_directory(name: str) -> Path:
     megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
     return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
+
+
+def _require_four_sm100_gpus() -> None:
+    """Skip distributed TP4 pretuned-kernel checks without four local B200s."""
+    if not is_cuda() or torch.cuda.device_count() < 4:
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
+    if any(torch.cuda.get_device_capability(device) != (10, 0) for device in range(4)):
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
 
 
 def _import_pretuned_kernel_module(name):
@@ -88,6 +101,7 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
 @pytest.mark.parametrize(
     "name",
     (
+        "kda_decode",
         "qwen3_decode_layer",
         "gemma4_a4b_moe",
         "gpt_oss_moe",
@@ -190,6 +204,112 @@ def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
     assert max(module.CONTEXT_LENGTHS) <= module.CONTEXT
 
 
+def test_kda_decode_uses_existing_tuning_surface() -> None:
+    module = _import_pretuned_kernel_module("kda_decode")
+    heuristic = _import_pretuned_heuristic("kda_decode")
+    standalone = importlib.import_module(
+        "pretuned_kernels.megakernels.kda_decode._standalone"
+    )
+
+    runner_path = PRETUNED_KERNELS_DIR / "run.py"
+    runner_spec = importlib.util.spec_from_file_location(
+        "_kda_pretuned_runner", runner_path
+    )
+    assert runner_spec is not None and runner_spec.loader is not None
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+    assert "kda_decode" in runner.KERNELS
+    assert runner._supported_hardware("kda_decode") == {"b200"}
+
+    kernel = module.kda_decode
+    assert not kernel.settings.static_shapes
+    assert not kernel.settings.triton_do_not_specialize
+    assert kernel.settings.persistent_reserved_sms == 88
+    assert set(heuristic.CONFIGS) == {
+        (batch, heads) for batch in (1, 2, 4, 8, 16) for heads in (12, 6)
+    }
+    assert heuristic.CONFIGS[16, 12]["block_sizes"] == [
+        2,
+        8,
+        16,
+        16,
+        1,
+        64,
+        128,
+        32,
+        4,
+        16,
+        16,
+        256,
+        256,
+        128,
+        256,
+    ]
+    assert all(config["maxnreg"] == 240 for config in heuristic.CONFIGS.values())
+    for config in heuristic.CONFIGS.values():
+        assert len(config["block_sizes"]) == 15
+        assert config["cross_loop_pipeline"] == "dynamic"
+        assert config["num_sm_multiplier"] == 1
+        assert config["num_warps"] in (1, 2)
+
+    expected_roots = (
+        "wide",
+        "bfa",
+        "decay",
+        "conv",
+        "recurrence",
+        "rms",
+        "output",
+    )
+    assert tuple(standalone._BLOCK_INDICES) == expected_roots
+    for batch in module.SUPPORTED_BATCHES:
+        for heads in module.SUPPORTED_HEADS:
+            megakernel_blocks = heuristic.CONFIGS[batch, heads]["block_sizes"]
+            for root in expected_roots:
+                standalone_config = standalone._root_config(batch, heads, root)
+                megakernel_root_blocks = [
+                    megakernel_blocks[index]
+                    for index in standalone._BLOCK_INDICES[root]
+                ]
+                expected_blocks = standalone._ROOT_BLOCK_OVERRIDES[batch].get(
+                    root, megakernel_root_blocks
+                )
+                assert standalone_config["block_sizes"] == expected_blocks
+                assert standalone_config["pid_type"] == "flat"
+
+    meta_device = torch.device("meta")
+    for expected, (signatures, static_args, _batch, _heads) in enumerate(
+        heuristic._SUPPORTED
+    ):
+        args = [
+            torch.empty(shape, dtype=dtype, device=meta_device)
+            for shape, dtype in signatures
+        ] + list(static_args)
+        assert heuristic.key_kda_decode(*args) == expected
+
+    source = inspect.getsource(kernel.fn)
+    assert "hl.specialize(" in source
+    assert "hl.specialize(state_indices[" not in source
+    assert "semantic_dependency" not in source
+    assert module.SUPPORTED_BATCHES == (1, 2, 4, 8, 16)
+    assert module.SUPPORTED_HEADS == (12, 6)
+    assert {(batch, heads) for _, batch, heads, _seed in module.BENCHMARK_CASES} == {
+        (batch, 12) for batch in module.SUPPORTED_BATCHES
+    }
+    assert {(batch, heads) for batch, heads, _seed in module.CORRECTNESS_CASES} == {
+        (1, 12),
+        (2, 12),
+        (4, 12),
+        (8, 12),
+        (16, 12),
+        (1, 6),
+        (2, 6),
+        (4, 6),
+        (8, 6),
+        (16, 6),
+    }
+
+
 def test_gemma4_a4b_moe_has_explicit_runtime_routing_contract() -> None:
     module = _import_pretuned_kernel_module("gemma4_a4b_moe")
     heuristic = _import_pretuned_heuristic("gemma4_a4b_moe")
@@ -290,6 +410,150 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     assert "source_ticket" not in source
     assert "w13_tma" in source
     assert "__deepseek" not in source
+
+
+def test_deepseek_v3_moe_nvfp4_tp_uses_explicit_sources() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import _standalone
+
+    config = module.deepseek_v3_moe_nvfp4_tp.configs[0].config
+    standalone_config = _standalone.deepseek_v3_moe_nvfp4_tp_local.configs[0].config
+    assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["host_tensor_descriptors"]
+    assert config["num_sm_multiplier"] == 1
+    assert module.W13_SPLIT_K == 7
+    assert module.COMMUNICATION_N == 512
+    assert standalone_config["cross_loop_pipeline"] == "dynamic"
+
+    distributed_source = inspect.getsource(module._deepseek_v3_moe_nvfp4_tp)
+    local_source = inspect.getsource(_standalone._deepseek_v3_moe_nvfp4_tp_local)
+    assert "get_remote_tensors" in distributed_source
+    assert "get_remote_tensors" not in local_source
+    for fragment in (
+        "w13_tile_split",
+        "for w2_tile_group in hl.tile(w2_groups, block_size=16):",
+        "for shared_w2_tile_group in hl.tile(w2_groups, block_size=32):",
+    ):
+        assert fragment in distributed_source
+        assert fragment in local_source
+    assert "inline_triton" not in distributed_source
+
+
+def test_deepseek_v3_attention_nvfp4_tp_exchanges_natively() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_attention_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _common
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _standalone
+
+    config = module.deepseek_v3_attention_nvfp4_tp.configs[0].config
+    assert not module.deepseek_v3_attention_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["num_sm_multiplier"] == 4
+    assert config["maxnreg"] == 128
+
+    common_source = inspect.getsource(_common)
+    distributed_source = inspect.getsource(_common.attention_boundary_source)
+    standalone_source = inspect.getsource(_standalone._attention_o_proj_local)
+    benchmark_source = inspect.getsource(module._run)
+    assert "triton" not in common_source
+    assert "get_remote_tensors" in distributed_source
+    assert "get_remote_tensors" not in standalone_source
+    assert "vllm_cutlass_flashinfer" in benchmark_source
+    assert "sglang_flashinfer" not in benchmark_source
+    # Both sides of the comparison use the same projection algorithm.
+    for fragment in (
+        "hl.load_float4_e2m1fn_x16_to_float16",
+        "nvfp4.swizzled_scale_offsets",
+        "contribution.to(torch.float32) * scale",
+    ):
+        assert fragment in distributed_source
+        assert fragment in standalone_source
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfNotTriton(
+    "the TP4 megakernels are pinned to backend='triton'; the in-band polling "
+    "assertions inspect their Triton PTX"
+)
+def test_deepseek_v3_tp_megakernels_exchange_in_band() -> None:
+    if _current_compute_capability() != "sm100":
+        pytest.skip("the TP4 megakernels are pretuned for SM100")
+    moe = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    attention = _import_pretuned_kernel_module("deepseek_v3_attention_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _common
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4 import (
+        deepseek_v3_moe_nvfp4 as source,
+    )
+
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        group = dist.group.WORLD.group_name
+        shape = source.Shape(intermediate=2048 // 4)
+        bf16 = {"device": DEVICE, "dtype": torch.bfloat16}
+        moe_args = (
+            *source._kernel_args(source._allocate(shape), shape),
+            moe.W13_SPLIT_K,
+            torch.zeros((shape.batch, shape.hidden), **bf16),
+            group,
+        )
+        n, k = _common.OUTPUT_FEATURES, _common.LOCAL_K
+        attention_args = (
+            torch.zeros((n, k // 2), device=DEVICE, dtype=torch.uint8),
+            torch.zeros((k // 2,), device=DEVICE, dtype=torch.uint8),
+            torch.zeros((n * (k // 16),), device=DEVICE, dtype=torch.int8),
+            torch.zeros((128 * (k // 16),), device=DEVICE, dtype=torch.int8),
+            1.0,
+            torch.zeros((1, n), **bf16),
+            torch.zeros((1, n), **bf16),
+            torch.zeros((n,), **bf16),
+            group,
+        )
+        for kernel, args in (
+            (moe.deepseek_v3_moe_nvfp4_tp, moe_args),
+            (attention.deepseek_v3_attention_nvfp4_tp, attention_args),
+        ):
+            code = kernel.bind(args).to_triton_code(kernel.configs[0])
+            # One store per rank pushes each word pair, a plain load reads each of
+            # the 4 mailboxes and reloads it on a CTA vote, one asm reloads the
+            # stale words (4 per thread), and nothing else orders the ranks.
+            assert code.count("st.relaxed.sys.global.v2.u64") == 4
+            assert code.count("volatile=True") == 2 * 4
+            assert code.count("while inband_stale != 0:") == 1
+            assert code.count("@p bra SPIN") == 1
+            assert code.count("ld.volatile.global.b64") == 4 * 4
+            assert "_wait_at_least" not in code
+            assert "_add_on_every_rank" not in code
+    finally:
+        dist.destroy_process_group()
+
+
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@pytest.mark.parametrize(
+    "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
+)
+def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
+    _require_four_sm100_gpus()
+    if _under_xdist():
+        pytest.skip("four-rank runs need every local GPU")
+    # main() checks every rank's output against the matched references.
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=4",
+            str(_pretuned_kernel_directory(name) / f"{name}.py"),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(PRETUNED_KERNELS_DIR.parent),
+            "NVSHMEM_DISABLE_CUDA_VMM": "1",
+        },
+        check=True,
+    )
 
 
 def test_pre_captured_graph_sweep_passes_resets(
@@ -624,10 +888,11 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "fused_qk_norm_rope": {
         "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
     },
-    # These are fixed-capacity B200 gates.  Allowing every individual win to
-    # cross parity avoids a flaky binary pass/fail; the aggregate geomean is the
-    # regression signal.  Combined with the 10% band below, 1.0 expresses a
-    # 0.90x production-vLLM floor for every model-region benchmark.
+    # These are fixed-capacity B200 gates. The KDA perf sweep gates the five
+    # tuned TP8/H12 envelopes; TP16/H6 remains in the correctness matrix.
+    "kda_decode": {
+        "sm100": ExpectedPerf(helion_wins=3, total=5, geomean=1.05, wins_slack=1),
+    },
     "qwen3_decode_layer": {
         "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),
     },
@@ -649,6 +914,9 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
 # vLLM. Keep the historical production-vLLM gate above, while independently
 # guarding against large regressions from each matched boundary.
 _MATCHED_STANDALONE_GEOMEAN_FLOOR = {
+    # Source-matched seven-launch PDL measured at 1.345x on GB200; retain a
+    # conservative but real megakernel advantage after timing noise.
+    "kda_decode": 1.15,
     "qwen3_decode_layer": 0.80,
     "gemma4_a4b_moe": 0.80,
     "gpt_oss_moe": 0.80,
@@ -671,7 +939,12 @@ _PRODUCTION_GEOMEAN_FLOOR = {
 _GEOMEAN_NOISE_BAND = 0.10
 
 
-@onlyBackends(["triton"])
+# The SM100 megakernels pass backend="triton" to their decorator, so a cute run
+# would repeat the Triton run.
+_PINNED_TO_TRITON = "megakernel is pinned to backend='triton'"
+
+
+@onlyBackends(["triton", "cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsCorrectness(TestCase):
     """Numerical correctness vs. PyTorch eager."""
@@ -758,9 +1031,13 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_per_token_group_fp8_quant(self):
         self._run_vllm_ported_correctness("per_token_group_fp8_quant")
 
+    # CuTe compiles these kernels cold in ~40-50s on B200.
+    @pytest.mark.timeout(300)
     def test_rms_norm_dynamic_per_token_quant(self):
         self._run_vllm_ported_correctness("rms_norm_dynamic_per_token_quant")
 
+    # CuTe compiles these kernels cold in ~40-50s on B200.
+    @pytest.mark.timeout(300)
     def test_rms_norm_per_block_quant(self):
         self._run_vllm_ported_correctness("rms_norm_per_block_quant")
 
@@ -771,6 +1048,17 @@ class TestPretunedKernelsCorrectness(TestCase):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
+    def test_kda_decode(self):
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("kda_decode is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("kda_decode")
+        if not module.has_vllm():
+            self.skipTest("kda_decode correctness requires vLLM.")
+        module.correctness_check()
+
+    @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_qwen3_decode_layer(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("qwen3_decode_layer is pretuned for NVIDIA SM100.")
@@ -780,6 +1068,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_gemma4_a4b_moe(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("gemma4_a4b_moe is pretuned for NVIDIA SM100.")
@@ -789,6 +1078,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_gpt_oss_moe(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("gpt_oss_moe is pretuned for NVIDIA SM100.")
@@ -798,6 +1088,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(600)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_flash_mla(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("flash_mla is pretuned for NVIDIA SM100.")
@@ -807,6 +1098,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_deepseek_v3_moe_nvfp4(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("deepseek_v3_moe_nvfp4 is pretuned for NVIDIA SM100.")
@@ -1087,9 +1379,12 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertIn(
             "while tcgen05_role_local_0_work_tile.is_valid_tile", persistent_code
         )
-        self.assertIn(
+        # One tile per CTA makes the raster swizzle a no-op; the plan drops it
+        # and the swizzle-8 render is the one-shot render, byte for byte.
+        self.assertNotIn(
             "while tcgen05_role_local_0_work_tile.is_valid_tile", swizzled_code
         )
+        self.assertEqual(swizzled_code, one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
 
@@ -1181,6 +1476,8 @@ class TestPretunedCuteCodegen(TestCase):
                 self.assertLess(tmem_copy, aux_load)
 
 
+# The perf targets were measured with the Triton backend running the checked-in
+# Triton-tuned heuristics; a cute run of those configs has no calibrated target.
 @onlyBackends(["triton"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsPerformance(TestCase):
@@ -1319,6 +1616,13 @@ class TestPretunedKernelsPerformance(TestCase):
     @pytest.mark.timeout(600)
     def test_fused_qk_norm_rope(self):
         self._run_pretuned_kernel_perf("fused_qk_norm_rope")
+
+    @pytest.mark.timeout(600)
+    def test_kda_decode(self):
+        module = _import_pretuned_kernel_module("kda_decode")
+        if not module.has_vllm():
+            self.skipTest("kda_decode performance requires vLLM.")
+        self._run_pretuned_kernel_perf("kda_decode")
 
     @pytest.mark.timeout(600)
     def test_qwen3_decode_layer(self):

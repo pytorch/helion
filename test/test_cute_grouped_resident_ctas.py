@@ -159,41 +159,97 @@ def test_actual_SDK_layouts_bound_two_resident_allocations(case):
     list(itertools.product((1, 2, 80, 148, 200), (1, 2, 10, 160, 296, 297))),
 )
 def test_real_grid_expression_has_complete_disjoint_role_coverage(sm_count, tile_count):
+    # The driver reports at most ``sm_count // 4`` co-resident four-CTA
+    # clusters (33 on a 148-SM B200, whose GPCs hold uneven TPC counts).
+    max_active_clusters = max(1, sm_count * 33 // 148)
     for ctas in (1, 2):
         plan = SimpleNamespace(
             row_union=GroupedRowUnionPlan(
                 8, 2560, 512, 512, 0, 1, 2, "offsets", "union", ctas
             )
         )
-        strategy = SimpleNamespace(
-            _tcgen05_cluster_m=lambda: 1,
-            _tcgen05_cluster_n=lambda: 1,
-            _tcgen05_plan=lambda selected=plan: selected,
-            grid_size_expr="_NUM_SM",
-        )
-        capacity = (
-            Tcgen05PersistentProgramIDs._tcgen05_max_persistent_work_clusters_expr(
-                strategy
-            )
-        )
-        strategy._tcgen05_max_persistent_work_clusters_expr = lambda value=capacity: (
-            value
-        )
-        expr = Tcgen05PersistentProgramIDs._tcgen05_grid_work_clusters_expr(
-            strategy, str(tile_count)
-        )
-        grid = eval(expr, {"_NUM_SM": sm_count})
+        strategy = _grid_strategy_stub(cluster_m=1, cluster_n=1, plan=plan, pid_axes=3)
+        grid = _grid_work_clusters(strategy, tile_count, sm_count, max_active_clusters)
         assert grid == min(tile_count, sm_count * ctas)
-        role_work = [
-            [list(range(block, tile_count, grid)) for block in range(grid)]
-            for _ in range(3)
-        ]
-        assert role_work[0] == role_work[1] == role_work[2]
-        flat = [i for work in role_work[0] for i in work]
-        assert len(flat) == len(set(flat)) == tile_count
-        assert sorted(flat) == list(range(tile_count))
+        _assert_complete_disjoint_role_coverage(grid, tile_count)
         if (sm_count, tile_count, ctas) == (148, 160, 2):
-            assert all(len(work) == 1 for work in role_work[0])
+            assert all(len(work) == 1 for work in _role_work(grid, tile_count)[0])
+    # Batched cluster_n=2 grids (no row-union plan) are capped in whole 4-CTA
+    # clusters, at the device's co-resident cluster count, so the persistent
+    # CTAs recycle their pipelines across tiles; the coverage stays complete
+    # and disjoint under that cap.
+    batched = _grid_strategy_stub(cluster_m=2, cluster_n=2, plan=None, pid_axes=3)
+    grid = _grid_work_clusters(batched, tile_count, sm_count, max_active_clusters)
+    assert grid == min(tile_count, max_active_clusters)
+    _assert_complete_disjoint_role_coverage(grid, tile_count)
+    # The CtaGroup.TWO pair keeps the exact ``_NUM_SM // 2`` capacity.
+    pair = _grid_strategy_stub(cluster_m=2, cluster_n=1, plan=None, pid_axes=3)
+    grid = _grid_work_clusters(pair, tile_count, sm_count, max_active_clusters)
+    assert grid == min(tile_count, max(1, sm_count // 2))
+    _assert_complete_disjoint_role_coverage(grid, tile_count)
+
+
+def _grid_strategy_stub(
+    *, cluster_m: int, cluster_n: int, plan: object, pid_axes: int
+) -> SimpleNamespace:
+    """A ``Tcgen05PersistentProgramIDs`` stand-in for the grid-capacity helpers.
+
+    The grid-shape helpers are run unbound on this namespace, so it carries
+    the attributes they read (``pid_info`` is only measured for its length)
+    and the real batched-grid predicates; the host constexpr for the
+    co-resident cluster count is named directly since it needs a device
+    function to be defined.
+    """
+    strategy = SimpleNamespace(
+        _tcgen05_cluster_m=lambda: cluster_m,
+        _tcgen05_cluster_n=lambda: cluster_n,
+        _tcgen05_plan=lambda: plan,
+        _tcgen05_max_active_clusters_var=lambda: "_MAX_ACTIVE_CLUSTERS",
+        pid_info=(None,) * pid_axes,
+        grid_size_expr="_NUM_SM",
+    )
+    for name in (
+        "_tcgen05_batched_grid",
+        "_tcgen05_batched_cluster_n2",
+        "_tcgen05_whole_cluster_capacity_expr",
+    ):
+        method = getattr(Tcgen05PersistentProgramIDs, name)
+        setattr(
+            strategy,
+            name,
+            lambda *args, _method=method, **kwargs: _method(strategy, *args, **kwargs),
+        )
+    return strategy
+
+
+def _grid_work_clusters(
+    strategy, tile_count: int, sm_count: int, max_active_clusters: int
+) -> int:
+    capacity = Tcgen05PersistentProgramIDs._tcgen05_max_persistent_work_clusters_expr(
+        strategy
+    )
+    strategy._tcgen05_max_persistent_work_clusters_expr = lambda value=capacity: value
+    expr = Tcgen05PersistentProgramIDs._tcgen05_grid_work_clusters_expr(
+        strategy, str(tile_count)
+    )
+    return eval(
+        expr, {"_NUM_SM": sm_count, "_MAX_ACTIVE_CLUSTERS": max_active_clusters}
+    )
+
+
+def _role_work(grid: int, tile_count: int) -> list[list[list[int]]]:
+    return [
+        [list(range(block, tile_count, grid)) for block in range(grid)]
+        for _ in range(3)
+    ]
+
+
+def _assert_complete_disjoint_role_coverage(grid: int, tile_count: int) -> None:
+    role_work = _role_work(grid, tile_count)
+    assert role_work[0] == role_work[1] == role_work[2]
+    flat = [i for work in role_work[0] for i in work]
+    assert len(flat) == len(set(flat)) == tile_count
+    assert sorted(flat) == list(range(tile_count))
 
 
 @pytest.mark.parametrize("value", (None, True, False, 0, -1, 3, 4, 2.0, "2"))

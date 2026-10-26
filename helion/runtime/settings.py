@@ -434,6 +434,16 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
         )
     )
+    autotune_handoff: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_HANDOFF", False
+        )
+    )
+    autotune_handoff_budget_seconds: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", 1500
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -692,7 +702,8 @@ class Settings(_Settings):
             "Override with HELION_CUTE_RNG_STREAM."
         ),
         "fast_math": (
-            "If True, enable fast math approximations (Helion-level and Inductor-level). "
+            "If True, enable fast math approximations (Helion-level, including the CuTe "
+            "flash-attention polynomial exp2 packets, and Inductor-level). "
             "May reduce numerical precision and change NaN/Inf behavior. "
             "Set HELION_FAST_MATH=1 to enable."
         ),
@@ -723,9 +734,22 @@ class Settings(_Settings):
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_log_details": (
-            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
-            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
-            "configs tested, keyed by config_id). Off by default; needs autotune_log."
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to write /tmp/run.trace.jsonl "
+            "with config evaluations, rebenchmarks, selection, exact LLM prompts/"
+            "responses, and timestamps, plus the cost-model dataset sidecar "
+            "/tmp/run.meta.jsonl (kernel identity and configs keyed by config_id). "
+            "Off by default; needs autotune_log."
+        ),
+        "autotune_handoff": (
+            "Hand configuration search to a native-source agent automatically. "
+            "Off by default; enable with HELION_AUTOTUNE_HANDOFF=1. "
+            "Uses the existing search budget or search completion, "
+            "then saves validated standalone source beside the autotune logs."
+        ),
+        "autotune_handoff_budget_seconds": (
+            "Wall-clock budget for the native-source agent session, excluding "
+            "search and export. Default 1500 seconds; override with "
+            "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
@@ -743,7 +767,14 @@ class Settings(_Settings):
             "vice versa. Default 1 (current single-trial behavior). Set "
             "HELION_AUTOTUNE_BEST_OF_K=N to override."
         ),
-        "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
+        "autotune_accuracy_check": (
+            "If True, validate candidate configs against the baseline kernel output "
+            "before accepting them during autotuning. Unless autotune_baseline_fn is "
+            "set, the baseline is the output of the config the kernel runs by default "
+            "(a compiler-promoted default when there is one, else the conservative "
+            "autotuning reference, which is also the fallback when the promoted "
+            "default fails to compile or run)."
+        ),
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
@@ -983,6 +1014,9 @@ class Settings(_Settings):
                 f"set HELION_AUTOTUNE_BEST_OF_K to a positive integer "
                 f"(default 1 = single-trial behavior)"
             )
+
+        if self.autotune_handoff_budget_seconds < 1:
+            raise ValueError("autotune_handoff_budget_seconds must be positive")
 
         self._check_ref_eager_mode_before_print_output_code()
 

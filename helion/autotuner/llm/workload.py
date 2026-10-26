@@ -15,6 +15,7 @@ from ..._compiler.autotuner_heuristics.common import op_name_parts
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..base_search import _AutotunableKernel
@@ -98,7 +99,10 @@ def _gpu_hardware_lines(device: torch.device) -> list[str]:
 
 def describe_kernel(kernel: _AutotunableKernel, args: Sequence[object]) -> str:
     """Build a description of the kernel, its inputs, and the target GPU."""
-    parts = [f"## Kernel Source Code\n```python\n{_kernel_source_text(kernel)}\n```"]
+    parts = [
+        f"## Selected Backend\n{kernel.config_spec.backend_name}",
+        f"## Kernel Source Code\n```python\n{_kernel_source_text(kernel)}\n```",
+    ]
 
     if tensor_lines := _input_tensor_lines(args):
         parts.append("## Input Tensors\n" + "\n".join(tensor_lines))
@@ -172,14 +176,23 @@ def _summary_hints(
     return hints
 
 
-def _attention_reduction_hints(tensors: Sequence[torch.Tensor]) -> list[str]:
+def _attention_reduction_hints(
+    tensors: Sequence[torch.Tensor],
+    *,
+    flat_fields: Mapping[str, object],
+    backend: str,
+) -> list[str]:
     """Suggest conservative but diverse starting families for attention-like kernels."""
+    aggressive_settings = "num_warps/num_stages or advanced toggles"
+    if backend == "cute":
+        aggressive_settings = "settings"
+
     hints = [
         (
             "Compiler detected matmul-family ops with reductions/"
             "normalization; keep at least one attention/reduction-style "
             "family with moderate streaming tiles, and reserve very "
-            "aggressive num_warps/num_stages or advanced toggles for a "
+            f"aggressive {aggressive_settings} for a "
             "minority of configs."
         ),
         (
@@ -188,18 +201,24 @@ def _attention_reduction_hints(tensors: Sequence[torch.Tensor]) -> list[str]:
             "diversity too, instead of forcing every family to jump to a "
             "much larger tile."
         ),
-        (
+    ]
+    if backend != "cute":
+        hints.append(
             "Keep most balanced configs on moderate warps and stages; "
             "for attention-style streaming kernels, 4 warps is often the "
             "balanced choice, while 8+ warps or 4+ stages are "
             "exploratory unless tiles are clearly large and compile "
             "cleanly."
-        ),
-        (
-            "Include at least one persistent scheduling family when "
-            "available for long streaming dimensions."
-        ),
-    ]
+        )
+    hints.append(
+        "Include at least one persistent scheduling family when "
+        "available for long streaming dimensions."
+    )
+    if backend == "cute" and (
+        "block_sizes" not in flat_fields
+        or any(key.startswith("cute_flash_") for key in flat_fields)
+    ):
+        return hints
     shapes = [list(tensor.shape) for tensor in tensors]
     if len(tensors) < 3 or not all(len(shape) >= 2 for shape in shapes[:3]):
         return hints
@@ -211,24 +230,24 @@ def _attention_reduction_hints(tensors: Sequence[torch.Tensor]) -> list[str]:
 
     mid_tile = min(seq, 64)
     inner_tile = min(head_dim, 64)
-    hints.extend(
-        [
-            (
-                "Attention/reduction-style starting point: try a "
-                f"family near [1, {mid_tile}, {inner_tile}] if that matches the "
-                "config space."
-            ),
-            (
-                "Within that starting family, include a couple of "
-                "balanced variants that keep block_sizes fixed and "
-                "vary num_stages through 2-3 before moving to much "
-                "larger tiles or higher warps."
-            ),
-        ]
+    hints.append(
+        "Attention/reduction-style starting point: try a "
+        f"family near [1, {mid_tile}, {inner_tile}] if that matches the "
+        "config space."
     )
-    if inner_tile >= 32:
+    if backend != "cute":
         hints.append(
-            "A nearby family like "
+            "Within that starting family, include a couple of "
+            "balanced variants that keep block_sizes fixed and "
+            "vary num_stages through 2-3 before moving to much "
+            "larger tiles or higher warps."
+        )
+    if inner_tile >= 32:
+        bounds = (
+            "Within the displayed block_sizes bounds, a" if backend == "cute" else "A"
+        )
+        hints.append(
+            f"{bounds} nearby family like "
             f"[1, {mid_tile}, {max(16, inner_tile // 2)}] is already "
             "distinct for this shape; prefer that kind of inner-tile "
             "change before doubling the streaming tile, and keep tiles "
@@ -238,17 +257,59 @@ def _attention_reduction_hints(tensors: Sequence[torch.Tensor]) -> list[str]:
     return hints
 
 
-def _reduction_hints() -> list[str]:
-    """Cache-eviction guidance for pure (non-attention) reductions.
+def _reduction_hints(
+    *,
+    flat_fields: Mapping[str, object],
+    backend: str,
+    workload_traits: frozenset[str],
+) -> list[str]:
+    """Backend-specific guidance for reduction operations.
 
-    Memory-bound row reductions recover their remaining headroom from
+    Triton's memory-bound row reductions recover their remaining headroom from
     ``load_eviction_policies`` (which the LLM tends to leave at default), not
     larger tiles. Family-general: no specific kernel or shape.
     """
+    if workload_traits & {"matmul", "attention_reduction"}:
+        return []
+    streaming_hint = (
+        "This kernel is a memory-bound reduction/normalization that streams "
+        "each input row once. "
+    )
+    if backend == "cute":
+        settings = []
+        if "block_sizes" in flat_fields:
+            settings.append("one row per program (small leading block_size, e.g. 1)")
+        if "reduction_loops" in flat_fields:
+            settings.append(
+                "no reduction looping (reduction_loops null) when the reduction dim fits"
+            )
+        if "num_stages" in flat_fields:
+            settings.append("num_stages 1-2")
+        conservative = "The best configs are usually conservative"
+        if settings:
+            conservative += ": " + ", ".join(settings)
+        hints = [
+            streaming_hint + conservative + " — not large tiles or deep pipelining."
+        ]
+        if "load_eviction_policies" in flat_fields:
+            hints.append(
+                "The main remaining speedup for such streaming reductions is "
+                "cache-eviction hints, which the search often overlooks: set "
+                "load_eviction_policies to 'last' (or 'first') on the streamed input "
+                "loads instead of leaving them empty, so a value read once is not "
+                "kept in cache. Include several configs that try 'last' on every "
+                "load_eviction_policies entry."
+            )
+        if "num_warps" in flat_fields:
+            hints.append(
+                "num_warps 4 is usually the balanced choice here; reserve 8+ warps "
+                "and any aggressive tiling for a small minority of exploratory "
+                "configs."
+            )
+        return hints
     return [
         (
-            "This kernel is a memory-bound reduction/normalization that streams "
-            "each input row once. The best configs are usually conservative: one "
+            streaming_hint + "The best configs are usually conservative: one "
             "row per program (small leading block_size, e.g. 1), no reduction "
             "looping (reduction_loops null) when the reduction dim fits, and "
             "num_stages 1-2 — not large tiles or deep pipelining."
@@ -273,12 +334,13 @@ def _reduction_hints() -> list[str]:
 def _matmul_hints(
     tensors: Sequence[torch.Tensor],
     *,
+    flat_fields: Mapping[str, object],
+    backend: str,
     workload_traits: frozenset[str],
 ) -> list[str]:
     """Suggest matmul-oriented starting tiles when the traced graph looks matmul-like."""
     if "matmul" not in workload_traits:
         return []
-
     shapes = [list(tensor.shape) for tensor in tensors]
     ndims = [len(shape) for shape in shapes]
     is_2d_compatible = len(tensors) >= 2 and all(dim == 2 for dim in ndims[:2])
@@ -302,28 +364,48 @@ def _matmul_hints(
     # scheduling and a K<=64 tile that are counterproductive at this size). Gated
     # to a pure matmul so a reduction/attention-fused kernel keeps its own hints.
     is_pure_matmul = not (workload_traits & {"reduction", "attention_reduction"})
-    if is_pure_matmul and _is_large_balanced_gemm(m, n, k, total_tiles_64):
+    if (
+        backend != "cute"
+        and is_pure_matmul
+        and _is_large_balanced_gemm(m, n, k, total_tiles_64)
+    ):
         hints.extend(_large_matmul_hints(m, n))
         return hints
 
     if total_tiles_64 > num_compute_units() * 4:
+        if backend != "cute":
+            hints.append(
+                "Problem large enough for persistent kernels - "
+                "try pid_type='persistent_blocked' with l2_groupings=8-64"
+            )
+        elif "pid_type" in flat_fields:
+            grouping = " with l2_groupings" if "l2_groupings" in flat_fields else ""
+            hints.append(
+                "Problem large enough for persistent kernels - "
+                f"try persistent pid_type choices{grouping} when available in the config space"
+            )
+    if backend != "cute" or "block_sizes" in flat_fields:
+        condition = " if that matches the config space" if backend == "cute" else ""
         hints.append(
-            "Problem large enough for persistent kernels - "
-            "try pid_type='persistent_blocked' with l2_groupings=8-64"
+            f"Try block_sizes near [{min(m, 128)}, {min(n, 128)}, "
+            f"{min(k, 64)}] as starting point{condition}"
         )
-    hints.extend(
-        [
-            (
-                f"Try block_sizes near [{min(m, 128)}, {min(n, 128)}, "
-                f"{min(k, 64)}] as starting point"
-            ),
-            (
-                "High-perf matmul tips: try asymmetric tiles like [64,128,64], "
-                "num_stages=3-4, maxnreg=128 or 256, "
-                "range_multi_buffers=[true,true] for double-buffering, "
-                "load_eviction_policies with 'first' or 'last'"
-            ),
-        ]
+    if backend == "cute":
+        if "block_sizes" in flat_fields:
+            hints.append(
+                "High-perf matmul tips: try asymmetric tiles like [64,128,64] "
+                "if that matches the config space"
+            )
+        if "load_eviction_policies" in flat_fields:
+            hints.append(
+                "High-perf matmul tips: try load_eviction_policies with 'first' or 'last'"
+            )
+        return hints
+    hints.append(
+        "High-perf matmul tips: try asymmetric tiles like [64,128,64], "
+        "num_stages=3-4, maxnreg=128 or 256, "
+        "range_multi_buffers=[true,true] for double-buffering, "
+        "load_eviction_policies with 'first' or 'last'"
     )
     return hints
 
@@ -373,14 +455,35 @@ def _format_workload_analysis(hints: list[str]) -> str:
 
 
 def compute_workload_hints(
-    args: Sequence[object], *, workload_traits: frozenset[str] = frozenset()
+    args: Sequence[object],
+    *,
+    flat_fields: Mapping[str, object],
+    backend: str,
+    workload_traits: frozenset[str] = frozenset(),
 ) -> str:
     """Analyze the kernel workload and produce optimization hints."""
     tensors = _tensor_args(args)
     hints = _summary_hints(tensors, workload_traits=workload_traits)
     if "attention_reduction" in workload_traits:
-        hints.extend(_attention_reduction_hints(tensors))
-    elif "reduction" in workload_traits and "matmul" not in workload_traits:
-        hints.extend(_reduction_hints())
-    hints.extend(_matmul_hints(tensors, workload_traits=workload_traits))
+        hints.extend(
+            _attention_reduction_hints(
+                tensors, flat_fields=flat_fields, backend=backend
+            )
+        )
+    if "reduction" in workload_traits:
+        hints.extend(
+            _reduction_hints(
+                flat_fields=flat_fields,
+                backend=backend,
+                workload_traits=workload_traits,
+            )
+        )
+    hints.extend(
+        _matmul_hints(
+            tensors,
+            flat_fields=flat_fields,
+            backend=backend,
+            workload_traits=workload_traits,
+        )
+    )
     return _format_workload_analysis(hints)

@@ -12,6 +12,7 @@ import torch
 
 from ... import exc
 from ..backend import Backend
+from ..backend import BackendState
 from ..backend import _largest_divisor_at_most
 from ..cute.backend import CuteBackend
 from ._constants import MAX_THREAD_AXES
@@ -71,12 +72,17 @@ class MetalBackend(Backend):
             "num_threads",
             "num_warps",
             "reduction_loops",
+            "reduction_fusion",
         }
     )
 
     @property
     def name(self) -> str:
         return "metal"
+
+    @property
+    def state(self) -> BackendState:
+        return BackendState.EXPERIMENTAL
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         dtype_map = self._get_dtype_to_metal()

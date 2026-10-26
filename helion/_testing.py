@@ -7,11 +7,13 @@ import importlib
 import inspect
 import io
 import logging
+import math
 import operator
 import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -24,6 +26,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import filelock
 import pytest
 import torch
 import torch.distributed as dist
@@ -34,6 +37,7 @@ from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_block_ptr
 from ._compat import supports_host_tensor_descriptor
 from ._compat import supports_tensor_descriptor
 from ._compat import target_device_capability
@@ -410,6 +414,13 @@ def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "cute", reason)
 
 
+# The torch.chunk / torch.unbind device lowering (view_ops._check_split_backend).
+skipUnlessChunkLowering = skipIfFn(
+    lambda: _get_backend() not in ("triton", "cute"),
+    "torch.chunk/torch.unbind device lowering exists on Triton and CuTe only",
+)
+
+
 def matchesBackends(backends: Sequence[str]) -> bool:
     """Return whether `_get_backend() in backends`, matching onlyBackends."""
     backend = _get_backend()
@@ -514,6 +525,19 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
 
 
+def skipUnlessBlockPtr(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless the installed Triton still supports block pointers.
+
+    Triton >= 3.9 removed ``tl.make_block_ptr`` (triton-lang/triton#10833);
+    tests that pin ``indexing="block_ptr"`` and check the generated code have
+    nothing to check there.  Other backends keep running them as numerics
+    checks.
+    """
+    return skipIfFn(
+        lambda: matchesBackends(["triton"]) and not supports_block_ptr(), reason
+    )
+
+
 def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless Triton's host tensor descriptor API is supported."""
     return skipIfFn(
@@ -575,7 +599,7 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
         try:
             from jax.experimental import pallas  # noqa: F401
 
-            return hasattr(torch, "tpu") and torch.tpu.is_available()
+            return hasattr(torch, "tpu") and torch.accelerator.is_available()
         except Exception:
             return False
 
@@ -658,6 +682,10 @@ def skipIfLowVRAM(
     When called with only a reason, returns a decorator that skips tests on GPUs
     with less than ~30 GiB total VRAM. When provided with required_bytes, uses
     that value as the threshold.
+
+    The pytest-xdist workers of a run share one GPU, so these tests take turns:
+    otherwise two of them could both pass the free-memory check and then
+    allocate together.  Each releases its cached memory for the other workers.
     """
 
     threshold_bytes = (
@@ -681,7 +709,35 @@ def skipIfLowVRAM(
         return False
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(is_low_vram, reason=reason)
+    skip_if_low_vram = skipIfFn(is_low_vram, reason=reason)
+
+    def decorator(test_fn: Callable) -> Callable:
+        checked_fn = skip_if_low_vram(test_fn)
+
+        @functools.wraps(test_fn)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            with _vram_test_lock():
+                try:
+                    return checked_fn(*args, **kwargs)
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        return wrapper
+
+    return decorator
+
+
+@contextlib.contextmanager
+def _vram_test_lock() -> Generator[None, None, None]:
+    """Hold the skipIfLowVRAM lock shared by the xdist workers of this run."""
+    run_id = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if run_id is None:
+        yield
+        return
+    path = os.path.join(tempfile.gettempdir(), f"helion-vram-{run_id}.lock")
+    with filelock.FileLock(path):
+        yield
 
 
 def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
@@ -1182,6 +1238,7 @@ def run_example(
     max_mismatch_pct: float | None = None,
     max_mismatched_abs_diff: float | None = None,
     bwd: bool = False,
+    bwd_relative_l2: float | None = None,
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
@@ -1204,6 +1261,13 @@ def run_example(
         max_mismatched_abs_diff: If set with max_mismatch_pct, bound the largest
             absolute difference among mismatched elements.
         bwd: Whether to also test backward pass (default: False)
+        bwd_relative_l2: If set, judge each gradient by relative L2 error
+            (see :func:`assert_relative_l2_close`) instead of the elementwise
+            ``rtol``/``atol`` check. Use this for backward passes of chained
+            half-precision matmuls, where a forward intermediate rounded to
+            half precision after an fp32 accumulation differs from the
+            reference by one ulp in a few elements and a full-row reduction
+            spreads each such flip across a whole gradient row.
         trace_path: if not None, do profiling and save trace to this path
     """
 
@@ -1310,13 +1374,19 @@ def run_example(
 
                     if baseline_grad is not None:
                         assert tensor.grad is not None
-                        torch.testing.assert_close(
-                            tensor.grad.to(torch.float32),
-                            baseline_grad.to(torch.float32),
-                            rtol=rtol,
-                            atol=atol,
-                            msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}",
-                        )
+                        msg = f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}"
+                        if bwd_relative_l2 is not None:
+                            assert_relative_l2_close(
+                                tensor.grad, baseline_grad, bwd_relative_l2, msg=msg
+                            )
+                        else:
+                            torch.testing.assert_close(
+                                tensor.grad.to(torch.float32),
+                                baseline_grad.to(torch.float32),
+                                rtol=rtol,
+                                atol=atol,
+                                msg=msg,
+                            )
 
                 # Clear gradients for next test
                 for t in grad_tensors:
@@ -1859,6 +1929,31 @@ class TestCase(unittest.TestCase):
             sys.stdout, sys.stderr = old_stdout, old_stderr
 
 
+def assert_relative_l2_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    max_relative_l2: float,
+    *,
+    msg: str = "",
+) -> None:
+    """Assert ``||actual - expected|| / ||expected|| <= max_relative_l2``.
+
+    Unlike an elementwise check this tolerates a handful of large per-element
+    deviations as long as they are small relative to the whole tensor, which is
+    the signature of accumulation-order noise amplified by a reduction (e.g. a
+    one-ulp flip in a forward intermediate shifting an entire gradient row).
+    """
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    expected_f32 = expected.to(torch.float32)
+    diff = (actual.to(torch.float32) - expected_f32).norm().item()
+    relative_l2 = diff / max(expected_f32.norm().item(), 1e-8)
+    # ``<=`` rather than ``not >`` so a NaN error also fails.
+    assert relative_l2 <= max_relative_l2, (
+        f"{msg or 'Tensors are not close'}: relative L2 error {relative_l2:.3e} "
+        f"exceeds {max_relative_l2:.3e}"
+    )
+
+
 def assert_close_with_mismatch_tolerance(
     actual: object,
     expected: object,
@@ -1914,12 +2009,27 @@ def assert_close_with_mismatch_tolerance(
         ):
             raise
 
+    # torch.isclose requires matching dtypes; compare in the promoted one so a
+    # dtype mismatch is still judged numerically rather than raising a
+    # RuntimeError, which the autotuner's accuracy check would not catch.
+    dtype = torch.promote_types(actual.dtype, expected.dtype)
+    actual, expected = actual.to(dtype), expected.to(dtype)
     abs_diff = (actual - expected).abs()
     total = actual.numel()
 
-    # Use the same mismatch definition as torch.testing.assert_close:
-    # an element is mismatched when |actual - expected| > atol + rtol * |expected|
-    mismatch_mask = abs_diff > atol + rtol * expected.abs()
+    # Same elementwise contract as torch.testing.assert_close: mismatched when
+    # |actual - expected| > atol + rtol * |expected|, and infinities match only
+    # when equal (so e.g. -inf padding agrees exactly on both sides). NaNs are
+    # tolerated only when both sides are NaN.
+    mismatch_mask = ~torch.isclose(
+        actual, expected, rtol=rtol, atol=atol, equal_nan=True
+    )
+    # A NaN difference comes from inf - inf or a NaN operand. Where isclose
+    # accepted the pair (matching infinities or NaNs) it contributes nothing,
+    # so it cannot poison the max() in the bounds below; where it did not (a
+    # one-sided NaN or inf) it is an infinite miss that those bounds reject.
+    nan_diff = torch.where(mismatch_mask, math.inf, 0.0)
+    abs_diff = torch.where(abs_diff.isnan(), nan_diff, abs_diff)
     mismatched = mismatch_mask.sum().item()
     mismatch_pct = mismatched / total if total > 0 else 0.0
 
@@ -1945,6 +2055,7 @@ def assert_close_with_mismatch_tolerance(
 
     if max_rel_diff is not None:
         rel_diff = abs_diff / expected.abs().clamp(min=1e-6)
+        rel_diff = torch.where(rel_diff.isnan(), nan_diff, rel_diff)
         worst_rel = rel_diff.max().item()
         if worst_rel > max_rel_diff:
             raise AssertionError(

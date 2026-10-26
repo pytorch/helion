@@ -104,6 +104,7 @@ def test_sm103_flash_target_policy() -> None:
         dtype=torch.bfloat16,
         is_causal=False,
         standard_dense_output=True,
+        target_device_capability=(10, 3),
     )
     with patch.object(
         cute_flash, "get_flash_target_policy", return_value=multi_workload_policy
@@ -655,3 +656,16 @@ def test_flash_policy_choice_tables_match_codegen_schema() -> None:
         )
         == flash_tuning._FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES
     )
+
+
+def test_flash_policy_accepts_every_compound_exp2_packet() -> None:
+    """Every compound packet (including the resident cadence siblings) can be
+    entered into a tuning table with its canonical schedule name."""
+    for packet in cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS:
+        schedule = cute_flash._flash_manual_exp2_packet_schedule_name(packet)
+        policy = flash_tuning.FlashDenseTuningPolicy(
+            256, packet, schedule, 0, 0, "single"
+        )
+        assert policy.exp2_packet == packet
+        assert policy.e2e_schedule == schedule
+        assert policy.requires_fp16_hd64

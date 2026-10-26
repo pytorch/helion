@@ -707,6 +707,7 @@ def _fbwd_epilogue_block(
     io_dtype: str,
     dkv_wait: str,
     v_empty_expr: str,
+    gm_expr: str | None = None,
 ) -> str:
     """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> a free
     smem buffer as (128, 64) SWIZZLE_128B boxes -> one TMA store per box.
@@ -719,7 +720,7 @@ def _fbwd_epilogue_block(
     tile's K loads overlap the epilogue."""
     buf = "sV" if h == 0 else "sdS"
     tma = "_fbwd_tma_dv" if h == 0 else "_fbwd_tma_dk"
-    gm = "_fbwd_mdVt" if h == 0 else "_fbwd_mdKt"
+    gm = ("_fbwd_mdVt" if h == 0 else "_fbwd_mdKt") if gm_expr is None else gm_expr
     warp_lo = 4 if h == 0 else 8
     chunks = "".join(
         (
@@ -784,7 +785,7 @@ def _fbwd_epilogue_block(
         fbwd_epi_slot0 = {f"{d // 64} * (FBWD_KV_SLOT)" if h == 0 else "0"}
         fbwd_gEpi = cute.local_tile({gm}, (128, 64), (None, None)){kv_empty}{chunks}
         if warp_idx == {warp_lo}:
-            cute.arch.cp_async_bulk_wait_group(0){hs}
+            cute.arch.cp_async_bulk_wait_group(0, read=True){hs}
 """
 
 
@@ -1110,7 +1111,7 @@ def _fbwd_wrap_persistent(body: str, plan: AttentionBwdPlan, total_tiles: int) -
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1  # WG0's V-slot release sits under the same if
         regions.append((s, e))
@@ -1638,7 +1639,7 @@ def _fbwd2_wrap_persistent(body: str, plan: AttentionBwdPlan, total_pairs: int) 
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1
         regions.append((s, e))
@@ -2402,6 +2403,12 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     df = cg.device_function
     match = df.cute_state.attention_flash_bwd_match
+    from .flex_bwd_match import FlexBwdMatch
+
+    if isinstance(match, FlexBwdMatch):
+        from .cute_flash_bwd_flex import codegen_attention_flash_bwd_flex
+
+        return codegen_attention_flash_bwd_flex(cg, match)
     if not isinstance(match, AttentionBwdMatch):
         return False
     plan: AttentionBwdPlan = match.plan
@@ -2596,7 +2603,7 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
         return False
     match = match_attention_bwd(device_ir)
     if match is None:
-        return False
+        return _detect_flex_bwd_search_surface(device_ir)
     env = CompileEnvironment.current()
     kv_block_id = device_ir.grid_block_ids[0][0]
     inner_block_id = None
@@ -2614,5 +2621,47 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=_flash_bwd_two_cta_allowed(match.plan),
+    )
+    return True
+
+
+def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
+    """Enable the bwd flash search surface for the FlexAttention backward
+    envelope (pins the KV tile and the Q tile to 128 rows; the list walk has
+    a CLC persistent variant but no 2-CTA one)."""
+    from ..backend import _flash_block_sizes_reachable
+    from ..compile_environment import CompileEnvironment
+    from .flex_bwd_match import match_flex_attention_bwd
+    from .flex_match import FLEX_PLAN_ENABLED
+
+    if not FLEX_PLAN_ENABLED:
+        return False
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 3:
+        return False
+    env = CompileEnvironment.current()
+    match = match_flex_attention_bwd(
+        device_ir.graphs, device_ir.grid_block_ids[0], env=env
+    )
+    if match is None:
+        return False
+    targets = {match.kv_block_id: 128, match.q_block_id: 128}
+    if not _flash_block_sizes_reachable(env, targets):
+        return False
+    from .cute_flash_bwd_flex import additive_bias_region
+    from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
+    from .cute_flash_bwd_flex import fbwd_tile_group_choices
+
+    env.config_spec.enable_cute_flash_bwd_search(
+        block_size_targets=targets,
+        two_cta_allowed=False,
+        persistent_allowed=True,
+        flex=True,
+        tile_groups=fbwd_tile_group_choices(match.plan),
+        fast_math=bool(env.settings.fast_math),
+        aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
+        ds_tmem_allowed=match.plan.head_dim == 64,
+        has_mask=match.plan.mask_region is not None,
+        has_score=match.plan.score_region is not None,
+        additive_bias=additive_bias_region(match.plan) is not None,
     )
     return True

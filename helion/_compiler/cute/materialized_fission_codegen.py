@@ -21,6 +21,8 @@ import torch
 
 from ...exc import InvalidConfig
 from ...language import _tracing_ops
+from ...language.reduce_ops import _reduce
+from ...language.scan_ops import _associative_scan
 from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
@@ -50,11 +52,89 @@ _MEMORY_COUNTERS = (
 )
 
 
+_WARP_ROLE_SELECTOR = "cute.arch.make_warp_uniform(cute.arch.warp_idx())"
+
+
+def _is_griddepcontrol_wait(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and ast.unparse(stmt.value.func) == "cute.arch.griddepcontrol_wait"
+    )
+
+
+def _loads_through_atom(node: ast.AST, atom: str) -> bool:
+    """Whether ``node`` issues a TMA load through ``atom``.
+
+    ``cute.copy(atom, ...)`` is the one statement that reads operand memory
+    through a TMA atom; ``tma_partition`` and ``prefetch_descriptor`` also
+    name the atom but read layout and descriptor metadata only.
+    """
+    return any(
+        isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "cute.copy"
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == atom
+        for call in ast.walk(node)
+    )
+
+
+def _dependent_load_before_wait(body: list[ast.stmt], atom: str) -> bool:
+    """Whether a load through ``atom`` in ``body`` runs before any wait.
+
+    Statements execute in source order, so a ``griddepcontrol_wait`` at the
+    top level of ``body`` covers every later statement of that body.  A wait
+    nested in a branch or loop body covers only the rest of that body: a load
+    after the nested block still needs a wait of its own.  Any other compound
+    statement holding a load fails closed.
+    """
+    for stmt in body:
+        if _is_griddepcontrol_wait(stmt):
+            return False
+        if isinstance(stmt, (ast.If, ast.While, ast.For)):
+            if any(
+                _dependent_load_before_wait(nested, atom)
+                for nested in (stmt.body, stmt.orelse)
+            ):
+                return True
+            continue
+        if _loads_through_atom(stmt, atom):
+            return True
+    return False
+
+
+def _tma_role_waits_before_dependent_loads(device: ast.FunctionDef, atom: str) -> bool:
+    """Whether the TMA-load role waits on the producer grid ahead of ``atom``.
+
+    Every load through the dependent operand's atom must sit in one warp-role
+    block ``if <warp selector> == <n>:`` of the device function, and inside
+    it, in the one-shot and the ``while ... is_valid_tile`` layouts alike, a
+    ``griddepcontrol_wait`` must dominate the first such load.
+    """
+    roles = [stmt for stmt in device.body if _loads_through_atom(stmt, atom)]
+    if len(roles) != 1:
+        return False
+    role = roles[0]
+    if not (
+        isinstance(role, ast.If)
+        and not role.orelse
+        and isinstance(role.test, ast.Compare)
+        and ast.unparse(role.test.left) == _WARP_ROLE_SELECTOR
+        and len(role.test.ops) == 1
+        and isinstance(role.test.ops[0], ast.Eq)
+    ):
+        return False
+    return not _dependent_load_before_wait(role.body, atom)
+
+
 def _stage_config(
     config: Config,
     plan: MaterializedFissionPlan,
     stage_index: int,
     stage: HostFunction | None = None,
+    *,
+    releases_dependents_at_entry: bool = False,
 ) -> Config:
     pointwise = stage_index in plan.pointwise_region_indices
     project_ffi = pointwise and config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
@@ -63,14 +143,23 @@ def _stage_config(
         for key in ("tcgen05_region_ab_stages", "tcgen05_region_c_stages")
     )
     fanout = config.get("tcgen05_epilogue_fanout") == "shared"
+    # The stage that releases its dependents at entry (the materialized-PDL
+    # producer) has to stay an ordinary launch.  Launched as a programmatic
+    # dependent itself it would start, and release the consumer, while the
+    # kernels ahead of it still run, and the consumer's TMA role loads the
+    # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it.
+    drop_pdl = releases_dependents_at_entry and config.get("cute_pdl") is True
     if (
         "cute_pointwise_pid_type" not in config.config
         and not project_ffi
         and not has_region_stages
         and not fanout
+        and not drop_pdl
     ):
         return config
     result = copy.deepcopy(config)
+    if drop_pdl:
+        result.config.pop("cute_pdl")
     for kind in ("ab", "c"):
         key = f"tcgen05_region_{kind}_stages"
         region_stages = result.config.pop(key, None)
@@ -118,7 +207,10 @@ def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
         result.add(graph_id)
         for node in graphs[graph_id].graph.nodes:
             assert node.target is not _tracing_ops._if
-            if _tracing_ops.is_for_loop_target(node.target):
+            if _tracing_ops.is_for_loop_target(node.target) or node.target in (
+                _reduce,
+                _associative_scan,
+            ):
                 child = node.args[0]
                 assert isinstance(child, int)
                 pending.append(child)
@@ -216,8 +308,10 @@ def generate_materialized_fission(
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
 ) -> ast.Module:
+    from ..generate_ast import VloopSinkNotApplied
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
+    from ..generate_ast import vloop_sink_off_config
 
     env = CompileEnvironment.current()
     roots = func.body[plan.root_index : plan.root_index + plan.region_count]
@@ -245,15 +339,27 @@ def generate_materialized_fission(
     }
     used_names.update(arg.arg for arg in func.args.args)
     used_names.update(extra_params or ())
-    for stage_index, root in enumerate(roots):
-        assert isinstance(root, ast.For)
-        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
-        assert not claimed_graphs.intersection(graph_ids)
-        claimed_graphs.update(graph_ids)
-        stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
-        module = generate_ast(
+
+    pdl_roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+    if not config.get("tcgen05_materialized_pdl", False):
+        pdl_roots = None
+
+    def generate_stage(
+        stage: HostFunction,
+        stage_config: Config,
+        stage_index: int,
+        *,
+        releases_dependents_at_entry: bool,
+    ) -> ast.Module:
+        return generate_ast(
             stage,
-            _stage_config(config, plan, stage_index, stage),
+            _stage_config(
+                stage_config,
+                plan,
+                stage_index,
+                stage,
+                releases_dependents_at_entry=releases_dependents_at_entry,
+            ),
             False,
             store_transform=store_transform,
             load_transform=load_transform,
@@ -262,12 +368,43 @@ def generate_materialized_fission(
             _memory_counters=memory_counters,
             _host_prefix=prefix if stage_index == 0 else None,
         )
-        pdl_roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
-        if (
-            config.get("tcgen05_materialized_pdl", False)
-            and pdl_roots is not None
-            and func.device_ir.root_ids[stage_index] == pdl_roots[0]
-        ):
+
+    for stage_index, root in enumerate(roots):
+        assert isinstance(root, ast.For)
+        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
+        assert not claimed_graphs.intersection(graph_ids)
+        claimed_graphs.update(graph_ids)
+        stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
+        root_id = func.device_ir.root_ids[stage_index]
+        releases_at_entry = pdl_roots is not None and root_id == pdl_roots[0]
+        try:
+            module = generate_stage(
+                stage,
+                config,
+                stage_index,
+                releases_dependents_at_entry=releases_at_entry,
+            )
+        except VloopSinkNotApplied:
+            # ``cute_vloop_sink`` shaped this stage's thread layout but sank
+            # nothing.  The knob must not change the code by itself, so
+            # regenerate exactly the knob-off stage, from graphs the knob-on
+            # layout planning has not annotated.
+            off_config = vloop_sink_off_config(config)
+            stage = _stage_host(
+                func,
+                root,
+                stage_index,
+                func.device_ir.build_codegen_graphs(off_config),
+                graph_ids,
+                plan,
+            )
+            module = generate_stage(
+                stage,
+                off_config,
+                stage_index,
+                releases_dependents_at_entry=releases_at_entry,
+            )
+        if releases_at_entry:
             # Every launched CTA must release the dependent grid, including
             # persistent CTAs with no work. Keep this ahead of all entry guards.
             device = next(
@@ -279,25 +416,61 @@ def generate_materialized_fission(
             device.body.insert(
                 0, statement_from_string("cute.arch.griddepcontrol_launch_dependents()")
             )
-        if (
-            config.get("tcgen05_materialized_pdl", False)
-            and pdl_roots is not None
-            and func.device_ir.root_ids[stage_index] == pdl_roots[1]
-        ):
+            # Releasing ahead of everything else is only sound for an
+            # ordinary launch, one that started after its predecessors
+            # completed; ``_stage_config`` keeps ``cute_pdl`` away from this
+            # stage and no native plan of a pointwise stage launches with it.
+            assert not any(
+                isinstance(stmt, ast.Assign)
+                and ast.unparse(stmt.targets[0])
+                == f"{device.name}._helion_cute_use_pdl"
+                for stmt in module.body
+            )
+        if pdl_roots is not None and root_id == pdl_roots[1]:
             ab_plans = [
                 item
                 for item in env.cute_resolved_wrapper_plans
                 if item["kind"] == "tcgen05_ab_tma"
             ]
-            if not (
-                len(ab_plans) == 1
-                and ab_plans[0].get("use_pdl") is True
-                and ab_plans[0].get("use_2cta_instrs", ab_plans[0]["bm"] == 256)
-                and ab_plans[0]["cluster_m"] == 2
-                and ab_plans[0]["cluster_n"] == 1
-            ):
+            device = next(
+                stmt
+                for stmt in module.body
+                if isinstance(stmt, ast.FunctionDef)
+                and stmt.name == f"_helion_{stage.name}"
+            )
+            # The consumer must launch with the programmatic dependency AND its
+            # TMA role must wait on it before its first load of the
+            # materialized operand (the ordinary operand's initial loads may
+            # precede the wait); the static persistent role-local builder
+            # emits that wait for the paired TWO family and, on request, for
+            # the plain one-CTA family.
+            consumer_ok = False
+            if len(ab_plans) == 1:
+                ab_plan = ab_plans[0]
+                atom_a, _tensor_a, atom_b, _tensor_b = cast(
+                    "list[str]", ab_plan["kernel_args"]
+                )
+                dependent_atom = atom_b if pdl_roots.dependent_side == "rhs" else atom_a
+                consumer_ok = (
+                    ab_plan.get("use_pdl") is True
+                    and ab_plan["cluster_n"] == 1
+                    and (
+                        (
+                            ab_plan.get("use_2cta_instrs", ab_plan["bm"] == 256)
+                            and ab_plan["cluster_m"] == 2
+                        )
+                        or (
+                            not ab_plan.get("use_2cta_instrs", False)
+                            and ab_plan["cluster_m"] == 1
+                        )
+                    )
+                    and _tma_role_waits_before_dependent_loads(device, dependent_atom)
+                )
+            if not consumer_ok:
                 raise InvalidConfig(
-                    "materialized operand PDL requires the emitted native TWO TMA consumer"
+                    "materialized operand PDL requires the emitted native TMA "
+                    "consumer whose TMA role waits on the dependency before its "
+                    "first load of the materialized operand"
                 )
         resolved_plans.extend(env.cute_resolved_wrapper_plans)
         host_def = next(

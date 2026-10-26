@@ -13,7 +13,7 @@ from ._cute_aux import _cpu_codegen
 from .test_cute_tile_loop_vec_hoist import _reduction_kernel
 import helion
 from helion._compiler.tile_strategy import DeviceGridState
-from helion._compiler.tile_strategy import TileStrategy
+from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._compiler.tile_strategy import VecLaneWrapper
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
@@ -227,6 +227,7 @@ def test_store_emitter_uses_captured_axis(lane_axis: int) -> None:
             "value",
             None,
             torch.bfloat16,
+            scalar_stmt=ast.parse("pointer.store(value)").body[0],
             lane_axis_pos=lane_axis,
         )
     expected = ["row", "col"]
@@ -249,8 +250,12 @@ def test_deferred_scope_uses_the_complete_body(inner_live: bool) -> None:
     assert isinstance(outer, ast.For)
     vloop = outer.body[1]
     assert isinstance(vloop, ast.For)
+    # Only the per-thread lane strategies defer vector ops; the wrap consults
+    # the strategy's collected-store registry once the body is complete.
+    strategy = Mock(spec=PerThreadNDTileStrategy)
+    strategy._cute_lane_vec_stores_by_block = {}
     grid = DeviceGridState(
-        strategy=Mock(spec=TileStrategy),
+        strategy=strategy,
         block_id_to_info={},
         lane_loops=[("lane", 8), ("inner", 64)],
         lane_setup_statements=[*ast.parse("index = base + vi\nother = inner").body],
@@ -278,10 +283,34 @@ def test_branch_sites_remain_inside_the_branch() -> None:
     assert "_tile_store_vals_" not in code
 
 
-def test_body_defined_index_is_not_hoisted() -> None:
+def test_body_defined_uniform_index_is_hoisted_after_its_definition() -> None:
     code = _code((torch.empty((2, 2048), dtype=torch.bfloat16),), _local_index_tile)
+    # The computed row selector is uniform across the vector lanes, so the
+    # gathered row is loaded as one vector (commit 3df5c429); the load must
+    # follow the selector's definition inside the lane body.
+    assert "_tile_unroll_vec_" in code
+    selector = code.index(" % ")
+    assert code.index("_tile_unroll_vec_") > selector
+    assert "_tile_store_vals_" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _lane_dependent_index_tile(x: torch.Tensor) -> torch.Tensor:
+    rows, columns = x.shape
+    out = torch.empty_like(x)
+    for row, col in hl.tile([rows, columns], block_size=[1, None]):
+        selected = (col.index * 7 + row.begin) % columns
+        out[row.begin, col] = x[row.begin, selected]
+    return out
+
+
+def test_lane_dependent_index_is_not_hoisted() -> None:
+    code = _code(
+        (torch.empty((2, 2048), dtype=torch.bfloat16),), _lane_dependent_index_tile
+    )
+    # The column selector varies with the vectorized lane, so no single vector
+    # load covers the gathered elements.
     assert "_tile_unroll_vec_" not in code
-    # The output address is independent of the computed input selector.
     assert "_tile_store_vals_" in code
 
 

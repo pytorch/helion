@@ -499,6 +499,24 @@ for synthetic_lane_7 in range(8):
     )
 
 
+def test_hinted_vector_load_helpers_key_like_plain_loads() -> None:
+    # Cross-sweep matching keys on the load text with hints stripped: a
+    # hinted helper packet keys as the plain ``cute.arch.load`` it stands for.
+    from helion._compiler.cute.fuse_two_pass_loads import _load_kind
+    from helion._compiler.cute.fuse_two_pass_loads import _node_text
+
+    vector_type = "ir.VectorType.get([4], cutlass.Uint16.mlir_type)"
+    plain = ast.parse(f"cute.arch.load(x.iterator + i, {vector_type})", mode="eval")
+    hinted = ast.parse(
+        f"_cute_load_l2_evict_last_8b(x.iterator + i, {vector_type})", mode="eval"
+    )
+    assert _load_kind(plain.body) == "vec"
+    assert _load_kind(hinted.body) == "vec"
+    assert _node_text(plain.body) == _node_text(hinted.body)
+    other = ast.parse(f"cute.arch.load(y.iterator + i, {vector_type})", mode="eval")
+    assert _node_text(other.body) != _node_text(hinted.body)
+
+
 @pytest.fixture(autouse=True)
 def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests in this file pin codegen details of the ORIGINAL online
@@ -576,6 +594,28 @@ class TestCuteFuseTwoPassLoads(TestCase):
             code[consume_start:],
             "consume sweep must read from _fuse_cache_, not gmem",
         )
+
+    def test_fuser_fires_across_a_cache_hinted_consume_load(self) -> None:
+        """A consume-sweep load carrying an L2 hint (an 8-byte
+        ``_cute_load_l2_evict_last_8b`` packet here) is the same logical load
+        as the reduce sweep's plain ``cute.arch.load``: the fuser still
+        matches the pair and the consume sweep reads the cache."""
+        x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            _reduction_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+            load_eviction_policies=["", "l2_last"],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertIn("_fuse_cache_", code)
+        consume_start = code.rfind("for tile_offset_2 in range")
+        self.assertGreater(consume_start, 0)
+        self.assertNotIn("cute.arch.load(", code[consume_start:])
+        self.assertNotIn("_cute_load_", code[consume_start:])
 
     def test_fuser_skips_when_cache_size_too_large(self) -> None:
         """The fuser caps cache_size at 64 to avoid the register-pressure

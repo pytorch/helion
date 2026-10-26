@@ -17,7 +17,8 @@ from ...language import _decorators
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
-from ..ast_extension import statement_from_string
+from .distributed_ops import inband_load_codegen
+from .distributed_ops import inband_store_codegen
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -65,6 +66,7 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
+        codegen_store = inband_store_codegen(state, strategy.codegen_store)
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
                 state,
@@ -73,10 +75,10 @@ def _(state: CodegenState) -> ast.AST:
                 value,
                 extra_mask,
                 cache_modifier,
-                strategy.codegen_store,
+                codegen_store,
             )
 
-        return strategy.codegen_store(
+        return codegen_store(
             state, tensor, [*subscript], value, extra_mask, cache_modifier
         )
     if isinstance(tensor, tuple):
@@ -113,7 +115,8 @@ def _(state: CodegenState) -> ast.AST:
     if state.fx_node is not None and state.fx_node.meta.get(
         INTRA_LOOP_RAW_BARRIER_META
     ):
-        state.add_statement(statement_from_string("tl.debug_barrier()"))
+        for statement in state.device_function.cta_barrier():
+            state.add_statement(statement)
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -125,11 +128,13 @@ def _(state: CodegenState) -> ast.AST:
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
 
     device_fn = state.device_function
-    load_idx = device_fn.device_load_index
-    device_fn.device_load_index += 1
 
-    # If no explicit eviction_policy and we're in device code, use tunable
+    # If no explicit eviction_policy and we're in device code, use tunable.
+    # Only such loads own a load_eviction_policies slot (see
+    # _load_needs_eviction_tunable).
     if eviction_policy is None and state.codegen.on_device:
+        load_idx = device_fn.device_load_index
+        device_fn.device_load_index += 1
         policies = state.config.load_eviction_policies
         if isinstance(policies, str):
             policy_value = policies
@@ -162,6 +167,7 @@ def _(state: CodegenState) -> ast.AST:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
+        codegen_load = inband_load_codegen(state, strategy.codegen_load)
         if state.codegen.load_transform is not None:
             return state.codegen.load_transform(
                 state,
@@ -170,10 +176,10 @@ def _(state: CodegenState) -> ast.AST:
                 extra_mask,
                 eviction_policy,
                 cache_modifier,
-                strategy.codegen_load,
+                codegen_load,
             )
 
-        return strategy.codegen_load(
+        return codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy, cache_modifier
         )
     if isinstance(tensor, tuple):

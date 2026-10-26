@@ -26,6 +26,7 @@ from helion._compiler.autotuner_heuristics.triton import (
 )
 from helion._compiler.autotuner_heuristics.triton import _batched_static_matmul_fact
 from helion._compiler.autotuner_heuristics.triton import _generalized_static_matmul_fact
+from helion.autotuner.block_id_sequence import BlockIdSequence
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
@@ -71,6 +72,8 @@ def _matmul_config_spec(
         matmul_facts=[] if matmul_facts is None else matmul_facts,
         block_sizes=[object(), object(), object()],
         allowed_pid_types=("flat",),
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(
             block_sizes=[1, 1, 1],
             l2_groupings=[1],
@@ -334,6 +337,8 @@ def _generalized_spec(
         kernel_grid_fact=None,
         block_sizes=_block_sizes_stub(valid_block_ids),
         grid_block_ids=grid_block_ids,
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(
             block_sizes=[1] * len(valid_block_ids)
         ),
@@ -609,6 +614,8 @@ def test_register_estimate_picks_its_peak_by_resolved_bytes() -> None:
                     matmuls=(),
                 ),
                 block_sizes=_block_sizes_stub([]),
+                reduction_loops=BlockIdSequence(),
+                user_defined_tunables={},
                 _base_default_config=lambda: helion.Config(block_sizes=[]),
             ),
             block_sizes=[],
@@ -798,6 +805,8 @@ def test_multi_matmul_ranking_prefers_a_carried_accumulator_then_work() -> None:
         spec = SimpleNamespace(
             kernel_matmul_fact=mm,
             block_sizes=_block_sizes_stub([0]),
+            reduction_loops=BlockIdSequence(),
+            user_defined_tunables={},
             _base_default_config=lambda: helion.Config(block_sizes=[64]),
         )
         env = SimpleNamespace(
@@ -857,6 +866,8 @@ def test_candidate_dot_work_counts_serial_attention_axis_once() -> None:
     spec = SimpleNamespace(
         kernel_matmul_fact=mm,
         block_sizes=_block_sizes_stub([0, 1]),
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(block_sizes=[128, 64]),
     )
     env = SimpleNamespace(
@@ -910,6 +921,8 @@ def _kernel_smem_env(
             resident_regions=(),
         ),
         block_sizes=_block_sizes_stub(block_ids),
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(block_sizes=[1] * len(block_ids)),
     )
     return SimpleNamespace(config_spec=spec, block_sizes=[], size_hint=int)
@@ -981,6 +994,8 @@ def test_symbolic_loop_bounds_resolve_candidates_and_preserve_unknowns() -> None
     outer_tile_id = sympy.Symbol("outer_tile_id", integer=True, nonnegative=True)
     spec = SimpleNamespace(
         block_sizes=_block_sizes_stub([0, 1]),
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(block_sizes=[1, 1]),
     )
     env = SimpleNamespace(
@@ -1183,6 +1198,8 @@ def _knob_spec(
         kernel_grid_fact=None,
         block_sizes=_block_sizes_stub(block_ids),
         grid_block_ids=grid_block_ids,
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(block_sizes=[1] * len(block_ids)),
     )
     spec.autotune_reference_config = lambda: spec._base_default_config()
@@ -1596,6 +1613,8 @@ def test_multi_focal_seeds_default_fill_and_canonical_dedupe() -> None:
         ),
         block_sizes=_block_sizes_stub([0, 1, 2, 7]),
         l2_groupings=_block_sizes_stub([0, 7]),
+        reduction_loops=BlockIdSequence(),
+        user_defined_tunables={},
         _base_default_config=lambda: helion.Config(
             block_sizes=[16, 16, 16, 128],
             l2_groupings=[1, 1],
@@ -1700,6 +1719,8 @@ def _steps_env(
                 live_tile_steps=tuple(tuple(starmap(mk, step)) for step in steps)
             ),
             block_sizes=_block_sizes_stub([]),
+            reduction_loops=BlockIdSequence(),
+            user_defined_tunables={},
             _base_default_config=lambda: helion.Config(block_sizes=[]),
         ),
         block_sizes=[],

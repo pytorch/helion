@@ -34,6 +34,7 @@ from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.epilogue_fanout import render_chain
 from helion._compiler.cute.epilogue_fanout import render_shared_suffix
 from helion._compiler.cute.epilogue_fanout import schedule_supported
+from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
@@ -65,6 +66,23 @@ def paired(
         for k in hl.tile(reduction):
             accumulator = torch.addmm(accumulator, left[row, k], right[k, column])
         gate = torch.sigmoid(accumulator).to(left.dtype)
+        gate_out[row, column] = gate
+        product_out[row, column] = residual[row, column] * gate
+    return gate_out, product_out
+
+
+def rounded_sigmoid(
+    left: torch.Tensor, right: torch.Tensor, residual: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, reduction = left.shape
+    columns = right.size(1)
+    gate_out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    product_out = torch.empty_like(gate_out)
+    for row, column in hl.tile((rows, columns)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[row, k], right[k, column])
+        gate = torch.sigmoid(accumulator.to(left.dtype))
         gate_out[row, column] = gate
         product_out[row, column] = residual[row, column] * gate
     return gate_out, product_out
@@ -354,7 +372,7 @@ def plan_for(bound: BoundKernel[Any]) -> PairedFanoutPlan:
     return plan
 
 
-@pytest.mark.parametrize("fn", (paired, renamed_relu, duplicate))
+@pytest.mark.parametrize("fn", (paired, rounded_sigmoid, renamed_relu, duplicate))
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @skipUnlessBackends(["cute"])
 def test_typed_public_fanout_and_default_source(
@@ -454,7 +472,7 @@ def test_original_cuda_traced_two_region_binding() -> None:
     bound = original_bound()
     plan = plan_for(bound)
     assert plan.shape == (4096, 1024)
-    assert plan.prefix_steps == 1 and plan.rounded_suffix
+    assert plan.prefix_steps == 2 and plan.rounded_suffix
     assert bound.host_function is not None
     assert len(bound.host_function.device_ir.root_ids) == 2
     selected = helion.Config(
@@ -580,14 +598,29 @@ def test_known_metadata_constants_and_fp32_outputs_remain_supported() -> None:
 
 @skipUnlessBackends(["cute"])
 def test_carrierless_binding_keeps_old_search_registry() -> None:
-    for bound in (bind(), bind(rows=257)):
+    # A 256x128 output has fewer 128x128 tiles than SMs, so the tcgen05 seeds
+    # include one-CTA small-grid tiles (128x{16,32,64}x64), and those carry
+    # the fanout. Carrierless bindings therefore need a geometry no small
+    # tile divides: odd rows, or a column count off the 16/32/64 tile widths.
+    # (The register-MMA family's 8-column seeds may still tile 120 columns;
+    # they never carry the fanout.)
+    for bound in (bind(rows=257), bind(columns=120)):
         assert plan_for(bound)
+        assert all(
+            FANOUT_CONFIG_KEY not in seed.config
+            and seed.config.get("cute_matmul_family") == "warp_mma"
+            for seed in bound.config_spec.compiler_seed_configs
+        )
         state = bound.config_spec._cute_tcgen05_config
         assert not state.epilogue_fanout_search_enabled
         assert not any(
             group.key == FANOUT_CONFIG_KEY
             for group in bound.config_spec.compiler_coverage_groups
         )
+    seeded = bind()
+    assert plan_for(seeded)
+    assert seeded.config_spec.compiler_seed_configs
+    assert seeded.config_spec._cute_tcgen05_config.epilogue_fanout_search_enabled
 
 
 @pytest.mark.parametrize(
@@ -638,6 +671,38 @@ def test_live_typed_store_proof_negatives(change: str) -> None:
 
 
 @skipUnlessBackends(["cute"])
+def test_store_mode_field_survives_the_fanout_registration() -> None:
+    # The fan-out carriers are normalized before the heuristic flips
+    # ``epilogue_fanout_search_enabled``; a store-mode field that left the
+    # search surface with that flip stranded the carriers' ``normal`` on a
+    # key the flat schema no longer had (coverage transfer failed).  The field
+    # stays on the surface and only the TMA store is sampled.
+    bound = original_bound()
+    spec = bound.config_spec
+    assert spec._cute_tcgen05_config.epilogue_fanout_search_enabled
+    fragment = spec._flat_fields()[TCGEN05_C_STORE_MODE_CONFIG_KEY]
+    assert fragment.choices == ("normal", "direct")
+    assert fragment.search_choices == ("normal",)
+    (group,) = [g for g in spec.compiler_coverage_groups if g.key == FANOUT_CONFIG_KEY]
+    assert all(
+        witness.carrier.config[TCGEN05_C_STORE_MODE_CONFIG_KEY] == "normal"
+        for witness in group.witnesses
+    )
+    # ``direct`` is the plain store protocol: with the fan-out epilogue on it
+    # is repaired back to the TMA store (search) or rejected (explicit).
+    carrier = group.witnesses[0].carrier
+    carrier.config[FANOUT_CONFIG_KEY] = "shared"
+    carrier.config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = "direct"
+    with bound.env:
+        repaired = dict(carrier.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert repaired[TCGEN05_C_STORE_MODE_CONFIG_KEY] == "normal"
+        assert repaired[FANOUT_CONFIG_KEY] == "shared"
+        with pytest.raises(InvalidConfig, match="owns the output store"):
+            spec.normalize(dict(carrier.config))
+
+
+@skipUnlessBackends(["cute"])
 def test_registered_witnesses_are_independent_and_cache_visible() -> None:
     bound = original_bound()
     spec = bound.config_spec
@@ -679,8 +744,9 @@ def test_registered_witnesses_are_independent_and_cache_visible() -> None:
 
 def _rendered_plan(
     dtype: torch.dtype,
+    fn: Callable[..., object] = paired,
 ) -> tuple[PairedFanoutPlan, dict[_AuxiliaryTensorLoadExpr, str]]:
-    bound = bind(dtype=dtype)
+    bound = bind(fn, dtype=dtype)
     plan = plan_for(bound)
     leaves = plan.chains[1].auxiliary_tensor_loads
     assert len(leaves) == 1
@@ -688,12 +754,14 @@ def _rendered_plan(
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("fn", (paired, rounded_sigmoid))
 @skipUnlessBackends(["cute"])
 def test_actual_typed_suffix_ieee_bits_and_required_rounding(
     dtype: torch.dtype,
+    fn: Callable[..., object],
 ) -> None:
     """Test arbitrary FP32 prefix results; do not emulate CUDA's approximate exp."""
-    plan, auxiliary = _rendered_plan(dtype)
+    plan, auxiliary = _rendered_plan(dtype, fn)
     names = count()
     rendered = render_chain(
         plan.chains[1], "prefix", lambda name: f"{name}_{next(names)}", "", auxiliary

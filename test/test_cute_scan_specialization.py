@@ -143,7 +143,26 @@ def _scan_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
-def test_scan_preserves_alias_specialization_and_serial_codegen(
+def test_grid_writing_container_input_view_registers_alias_guard(
+    static_shapes: bool,
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=static_shapes)
+    def write_view(xs: list[torch.Tensor]) -> torch.Tensor:
+        out = xs[1].view_as(xs[0])
+        for tile in hl.tile(xs[0].numel()):
+            out[tile] = xs[0][tile] + 1
+        return out
+
+    x, y = torch.empty(64), torch.empty(64)
+    bound = write_view.bind(([x, y],))
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY in (
+        bound.env.runtime_input_specializations
+    )
+    assert write_view.bind(([x, x.view_as(x)],)) is not bound
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_scan_preserves_alias_specialization_and_shuffle_scan_codegen(
     static_shapes: bool,
 ) -> None:
     kernel = helion.kernel(_scan_into, backend="cute", static_shapes=static_shapes)
@@ -154,11 +173,13 @@ def test_scan_preserves_alias_specialization_and_serial_codegen(
         bound.env.runtime_input_specializations
     )
     config = bound.config_spec.default_config()
-    assert "for scan_i in range(" in bound.to_code(config)
+    # The default config puts the 128 scanned rows on 128 threads, which the
+    # CuTe backend lowers as a cross-warp shuffle scan (see cute/scan_ops.py).
+    assert "cute.arch.shuffle_sync_up(" in bound.to_code(config)
     for alias in (x, x.view_as(x)):
         alias_bound = kernel.bind((x, alias))
         assert alias_bound is not bound
-        assert "for scan_i in range(" in alias_bound.to_code(config)
+        assert "cute.arch.shuffle_sync_up(" in alias_bound.to_code(config)
 
 
 def test_nested_scan_registers_alias_facts_before_codegen() -> None:
@@ -184,8 +205,11 @@ def test_nested_scan_registers_alias_facts_before_codegen() -> None:
         if any(node.target is _associative_scan for node in info.graph.nodes)
     ]
     assert scan_graphs and not set(scan_graphs).intersection(ir.root_ids)
-    # Registration is conservative; divergent scans retain scalar lowering.
-    assert "for scan_i in range(" in bound.to_code(bound.config_spec.default_config())
+    # Registration is conservative; the branch-nested scan still lowers (as a
+    # shuffle scan over the 128 row threads) once the alias facts are known.
+    assert "cute.arch.shuffle_sync_up(" in bound.to_code(
+        bound.config_spec.default_config()
+    )
 
 
 def test_reduction_specializations_are_unchanged() -> None:

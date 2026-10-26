@@ -2023,31 +2023,6 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
-def _pipeline_begin_alignment(
-    begin_expr: str,
-    state: CodegenState,
-) -> int | None:
-    """Return a proven divisor of ``begin_expr``, or ``None``.
-
-    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
-    a multiple of the outer block size when that outer loop begins at 0 — so it
-    needs no extra pad. Returns that block size in that case.
-    """
-    for block_id, loops in state.codegen.active_device_loops.items():
-        if not loops:
-            continue
-        if state.codegen.offset_var(block_id) != begin_expr:
-            continue
-        info = loops[-1].block_id_to_info.get(block_id)
-        # Only sound when the outer loop begins at 0, so the offset is a clean
-        # multiple of the outer block size.
-        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
-            return None
-        outer_bs = state.device_function.resolved_block_size(block_id)
-        return outer_bs if isinstance(outer_bs, int) else None
-    return None
-
-
 def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
     """Return a direct ``end = begin + constant`` loop extent, if present.
 
@@ -2117,6 +2092,8 @@ def _compute_pipeline_or_dma_extra_pad(
     begin that is provably a multiple of ``block_size`` (e.g. an outer tile's
     aligned offset) needs no extra padding at all.
     """
+    from . import codegen as pallas_codegen
+
     if begin_expr == "0":
         return 0
     bs_val = state.device_function.resolved_block_size(bid)
@@ -2126,7 +2103,7 @@ def _compute_pipeline_or_dma_extra_pad(
         extent = _fixed_loop_extent(state, loop_dim_index)
         if extent is not None and extent % bs_val == 0:
             return 0
-    alignment = _pipeline_begin_alignment(begin_expr, state)
+    alignment = pallas_codegen.loop_begin_alignment(begin_expr, state)
     if alignment is not None and alignment % bs_val == 0:
         return 0
     return bs_val - 1
@@ -2488,14 +2465,14 @@ def _apply_pre_broadcast_transform(
 
     - The subscript[..., None] unsqueezes become identity (the trailing dim
       is already present in the scratch).
-    - A _pre_broadcast_tile op is inserted where the narrow (128-wide)
-      value needs to match a wider dimension (e.g. head_dim=256), generating
-      jnp.tile(tensor, block_size // 128) in the output code.
+    - A _pre_broadcast_tile op is inserted where the 128-wide value needs to
+      match a consumer. Wider dimensions are tiled in 128-element groups;
+      narrower dimensions read the required prefix.
     - Lower-rank values (e.g. reduction results) get an unsqueeze to [..., 1]
       so JAX broadcasting against the [..., 128] scratch still works.
 
     The transform is gated by the pallas_pre_broadcast config flag and only
-    applies when all broadcast target dimensions are multiples of 128.
+    applies when each broadcast target is at most 128 or a multiple of 128.
     """
     candidates = _find_pre_broadcast_candidates(
         graph, carried, proxy_args, env, state.config
@@ -2560,12 +2537,20 @@ def _dim_concrete_size(
     """
     if isinstance(dim, int):
         return dim
+    replaced = env.shape_env.replace(_symint_sympy_expr(dim))
+    if isinstance(replaced, (int, sympy.Integer, sympy.Number)):
+        return int(replaced)
     block_id = env.get_block_id(dim)
     if block_id is not None and block_id < len(env.block_sizes):
         val = env.block_sizes[block_id].from_config(config)
         if isinstance(val, int):
             return val
     return None
+
+
+def _pre_broadcast_target_is_supported(size: int) -> bool:
+    """Whether a 128-wide value can be repeated or sliced to ``size``."""
+    return size <= PRE_BROADCAST_SIZE or size % PRE_BROADCAST_SIZE == 0
 
 
 def _placeholder_has_broadcast_usage(
@@ -2580,8 +2565,8 @@ def _placeholder_has_broadcast_usage(
     First finds unsqueeze nodes (subscript[..., None]) reachable from the
     placeholder through same-rank ops.  Then checks whether any unsqueeze
     result is consumed by an op whose sibling arg has a wider last dimension,
-    confirming an actual broadcast.  All broadcast target dimensions must be
-    multiples of PRE_BROADCAST_SIZE for the optimization to be valid.
+    confirming an actual broadcast. Each target must be at most
+    PRE_BROADCAST_SIZE or a multiple of it.
     """
     unsqueeze_nodes: list[torch.fx.Node] = []
     worklist = [ph]
@@ -2622,7 +2607,7 @@ def _placeholder_has_broadcast_usage(
                 if isinstance(arg_last, int) and arg_last == 1:
                     continue
                 size = _dim_concrete_size(arg_last, env, config)
-                if size is not None and size % PRE_BROADCAST_SIZE != 0:
+                if size is not None and not _pre_broadcast_target_is_supported(size):
                     return False
                 found_broadcast = True
     return found_broadcast
@@ -2786,7 +2771,7 @@ def _rewrite_scratch_init_for_pre_broadcast(
 def _rewrite_outer_subscripts_for_pre_broadcast(
     for_loop_node: torch.fx.Node | None,
     candidates: dict[int, torch.fx.Node],
-    config: object,
+    config: Config,
 ) -> None:
     """Rewrite outer-scope subscript[..., None] to identity for pre-broadcast results.
 
@@ -2871,16 +2856,33 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
         last_dim_int = int(last_dim)
         if last_dim_int > PRE_BROADCAST_SIZE:
             continue
+        # A same-rank narrow peer fixes the result width. In that case the
+        # pre-broadcast operand is sliced at this consumer instead of making
+        # the consumer itself 128-wide.
         has_pre_broadcast_arg = False
+        has_narrow_peer = False
         for arg in node.args:
-            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
-                arg_val = arg.meta.get("val", None)
-                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
-                    arg_last = arg_val.shape[-1]
-                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
-                        has_pre_broadcast_arg = True
-                        break
-        if has_pre_broadcast_arg:
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor) or len(arg_val.shape) < 2:
+                continue
+            arg_last = arg_val.shape[-1]
+            arg_last_size = _dim_concrete_size(
+                arg_last, CompileEnvironment.current(), config
+            )
+            if (
+                arg.name in all_pre_broadcast_outer
+                and arg_last_size == PRE_BROADCAST_SIZE
+            ):
+                has_pre_broadcast_arg = True
+            elif (
+                len(arg_val.shape) == len(node_val.shape)
+                and arg_last_size is not None
+                and arg_last_size not in (1, PRE_BROADCAST_SIZE)
+            ):
+                has_narrow_peer = True
+        if has_pre_broadcast_arg and not has_narrow_peer:
             new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
             node.meta["val"] = node_val.new_empty(new_shape)
             all_pre_broadcast_outer.add(node.name)
@@ -2895,7 +2897,7 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
             continue
         last_dim = node_val.shape[-1]
         last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
             continue
         args_list = list(node.args)
         changed = False
@@ -3013,7 +3015,7 @@ def _annotate_pre_broadcast(
             continue
         last_dim = node_val.shape[-1]
         last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
             continue
         args_list = list(node.args)
         changed = False
@@ -3117,35 +3119,40 @@ def _annotate_pre_broadcast(
                         prepare_node_lowering(graph_lowering, node)
 
 
-@_decorators.codegen(_pre_broadcast_tile, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    tensor_ast = state.ast_arg(0)
-    target_size = state.proxy_arg(1)
-    if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
-        block_id = CompileEnvironment.current().get_block_id(target_size)
-        bs_var = (
-            state.device_function.block_size_var(block_id)
-            if block_id is not None
-            else None
-        )
-        if bs_var:
-            return expr_from_string(
-                f"jnp.tile({{tensor}}, {bs_var} // {PRE_BROADCAST_SIZE})",
-                tensor=tensor_ast,
-            )
+def _pre_broadcast_to_fixed_size(tensor_ast: ast.AST, target_size: int) -> ast.AST:
+    """Repeat or trim a 128-wide value to one fixed consumer width."""
+    if target_size < PRE_BROADCAST_SIZE:
         return expr_from_string(
-            f"jnp.tile({{tensor}}, {target_expr} // {PRE_BROADCAST_SIZE})",
+            f"{{tensor}}[..., :{target_size}]",
             tensor=tensor_ast,
         )
-    assert isinstance(target_size, int)
     factor = target_size // PRE_BROADCAST_SIZE
-    if factor <= 1:
+    if factor == 1:
         return tensor_ast
     return expr_from_string(
         f"jnp.tile({{tensor}}, {factor})",
         tensor=tensor_ast,
     )
+
+
+@_decorators.codegen(_pre_broadcast_tile, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor_ast = state.ast_arg(0)
+    target_size = state.proxy_arg(1)
+    if isinstance(target_size, torch.SymInt):
+        env = CompileEnvironment.current()
+        fixed_size = _dim_concrete_size(target_size, env, state.config)
+        if fixed_size is not None:
+            return _pre_broadcast_to_fixed_size(tensor_ast, fixed_size)
+        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
+        return expr_from_string(
+            f"jnp.tile({{tensor}}, max(1, ({target_expr} + "
+            f"{PRE_BROADCAST_SIZE - 1}) // {PRE_BROADCAST_SIZE}))"
+            f"[..., :{target_expr}]",
+            tensor=tensor_ast,
+        )
+    assert isinstance(target_size, int)
+    return _pre_broadcast_to_fixed_size(tensor_ast, target_size)
 
 
 def _lane_tile(
@@ -3211,14 +3218,11 @@ def _record_aligned_tiles(
     from .backend import _slice_addressing
     from .plan_tiling import NonePattern
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import aligned_window_sublane
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
-    sublanes = [
-        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
-        for t in HostFunction.current().tensor_to_origin
-        if isinstance(t, torch.Tensor) and t.is_floating_point()
-    ]
-    if not sublanes:
+    sublane = aligned_window_sublane(env)
+    if sublane is None:
         return
 
     # Strictest addressing each row needs over the tensors it slices.
@@ -3254,7 +3258,6 @@ def _record_aligned_tiles(
             else:
                 addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
-    sublane = max(sublanes)
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
@@ -3509,11 +3512,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # ``hl.tile(0, dynamic_end)``, or even a static ``hl.tile(0, k)``
                 # with ``k < dim_size`` -- a full-block store would overrun into
                 # live rows of the tensor, so the extent must be clamped.
-                covers_full_dim = (
-                    begin_is_zero
-                    and _is_static_int(end_expr)
-                    and isinstance(dim_size, int)
-                    and int(end_expr) == dim_size
+                covers_full_dim = begin_is_zero and (
+                    (
+                        _is_static_int(end_expr)
+                        and isinstance(dim_size, int)
+                        and int(end_expr) == dim_size
+                    )
+                    or (
+                        bool(state.device_function.carry_tiles)
+                        and isinstance(
+                            size := env.block_sizes[bid].size,
+                            (int, torch.SymInt),
+                        )
+                        and env.known_equal(size, dim_size)
+                    )
                 )
                 # Set when the emitted access is clamped to the backing tensor,
                 # so it cannot overrun and needs no host-side padding.
@@ -3607,7 +3619,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     # Static, from-zero loop: a block-aligned index is exact.
                     # Identical to the pre-existing codegen.
                     block_shape_parts.append(pipeline_slice_size_expr)
-                    if iter_step_expr == slice_size_expr:
+                    if (
+                        group_size == 1
+                        and iter_step_expr == slice_size_expr
+                        and _is_unaligned_full_dim(
+                            state, env, fake, dim_idx, bid, begin_expr
+                        )
+                    ):
+                        lambda_parts.append("0")
+                    elif iter_step_expr == slice_size_expr:
                         lambda_parts.append(lambda_params[bid_idx])
                     else:
                         lambda_parts.append(
@@ -3644,6 +3664,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
+                    _record_loop_pad(state, fake, dim_idx, bid)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
@@ -3714,6 +3735,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 and bid not in _bid_to_pid_var
                 and state.codegen.active_device_loops.get(bid)
                 and not is_dynamic_bound_tile(state, bid)
+                and not _is_unaligned_full_dim(state, env, fake, dim_idx, bid)
             ):
                 offset = state.codegen.offset_var(bid)
                 bs_var = state.device_function.block_size_var(bid)
@@ -4086,6 +4108,60 @@ def _is_supported_contiguous_row_slab_dma(
     return isinstance(lane_dim, int) and lane_dim % 128 == 0
 
 
+def _is_unaligned_full_dim(
+    state: CodegenState,
+    env: CompileEnvironment,
+    fake: torch.Tensor,
+    dim_idx: int,
+    bid: int,
+    begin_expr: str | None = None,
+) -> bool:
+    """Whether ``bid`` tiles ``fake``'s ``dim_idx`` in one unaligned full-dim block.
+
+    Mosaic only preserves the ``(R, 128)`` HBM tile layout on a slice smaller
+    than the tile alignment (128 on the lane dim, 8 on the sublane dim) when
+    the slice start is a compile-time constant 0 and the slice size equals the
+    full HBM dimension.
+    """
+    if not state.device_function.carry_tiles:
+        return False
+    ndim = fake.ndim
+    if ndim < 2 or dim_idx < ndim - 2:
+        return False
+    if begin_expr is None:
+        loops = state.codegen.active_device_loops.get(bid)
+        info = loops[-1].block_id_to_info.get(bid) if loops else None
+        begin_expr = info.begin_var_name if info is not None else None
+    if begin_expr != "0":
+        return False
+    alignment = 128 if dim_idx == ndim - 1 else 8
+    bs = state.device_function.resolved_block_size(bid)
+    if not isinstance(bs, int) or bs % alignment == 0:
+        return False
+    dim = fake.shape[dim_idx]
+    size = env.block_sizes[bid].size
+    if not isinstance(size, (int, torch.SymInt)) or not env.known_equal(size, dim):
+        return False
+    return bs == env.size_hint(dim)
+
+
+def _full_dim_dma_shape(
+    fake: torch.Tensor,
+    sub_meta: Sequence[object],
+    env: CompileEnvironment,
+) -> tuple[int | None, ...]:
+    """Return per-dim size when a tiled slice covers the full dim, else None."""
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    return tuple(
+        env.size_hint(dim)
+        if (bid := dim_to_bid.get(dim_idx)) is not None
+        and isinstance(size := env.block_sizes[bid].size, (int, torch.SymInt))
+        and env.known_equal(size, dim)
+        else None
+        for dim_idx, dim in enumerate(fake.shape)
+    )
+
+
 def _can_stream_inner_tile(
     fake: torch.Tensor,
     sub_meta: Sequence[object],
@@ -4096,7 +4172,12 @@ def _can_stream_inner_tile(
     state: CodegenState,
 ) -> bool:
     """Return whether a loop-local tensor should use the inner streaming path."""
-    if is_tpu_dma_aligned_shape(vmem_shape, fake.dtype):
+    full_shape = (
+        _full_dim_dma_shape(fake, sub_meta, env)
+        if state.device_function.carry_tiles
+        else None
+    )
+    if is_tpu_dma_aligned_shape(vmem_shape, fake.dtype, full_shape):
         return True
     if direction != "load":
         return False
@@ -5155,6 +5236,12 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 begin_expr = loop_window.begin_exprs[bid_idx]
                 iter_step_expr = loop_window.iter_step_exprs[bid_idx]
                 slice_size_expr = loop_window.slice_size_exprs[bid_idx]
+                if iter_step_expr == slice_size_expr and _is_unaligned_full_dim(
+                    state, env, fake, dim_idx, bid, begin_expr
+                ):
+                    vmem_parts.append(":")
+                    hbm_parts.append(":")
+                    continue
                 dim_idx_expr = iteration_indices[bid_idx]
                 offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
                 annotated_offset_expr = _annotate_provable_sublane_alignment(
@@ -5235,7 +5322,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                         state, bid, state.codegen.offset_var(bid)
                     )
                     bs_var = state.device_function.block_size_var(bid)
-                    if bs_var:
+                    if bs_var and not _is_unaligned_full_dim(
+                        state, env, fake, dim_idx, bid
+                    ):
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
                         hbm_needs_slice = True
                         _record_loop_pad(state, fake, dim_idx, bid)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import itertools
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -135,17 +136,6 @@ def test_rectangular_grid_has_exactly_one_writer(
 ) -> None:
     initialized_before = torch.cuda.is_initialized()
     rows, columns = (65, 97) if offset else (64, 128)
-    if tile == (8, 128) and not swap:
-        # This mapping needs z=128. Integer-coordinate completeness alone
-        # does not make that a valid CUDA launch, even at 1024 total threads.
-        with pytest.raises(exc.BackendUnsupported, match="per-axis"):
-            _code(
-                _rectangular_pointwise,
-                _args(rows, columns, offset=offset),
-                _config(*tile, swap=swap),
-            )
-        assert torch.cuda.is_initialized() is initialized_before
-        return
     code = _code(
         _rectangular_pointwise,
         _args(rows, columns, offset=offset),
@@ -155,6 +145,13 @@ def test_rectangular_grid_has_exactly_one_writer(
     assert coordinates == Counter(
         itertools.product(range(2), range(rows), range(columns))
     )
+    # Removing an inactive batch axis can make formerly oversized z mappings
+    # legal. Check the emitted mapping and CUDA limits together.
+    block = _launch_block(code)
+    assert all(
+        0 < size <= limit for size, limit in zip(block, (1024, 1024, 64), strict=True)
+    )
+    assert math.prod(block) <= 1024
     assert torch.cuda.is_initialized() is initialized_before
 
 
@@ -311,7 +308,7 @@ def test_pointwise_fact_excludes_other_collective_roots(kind: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tile", [(4, 64), (64, 4)])
+@pytest.mark.parametrize("tile", [(4, 64), (64, 4), (8, 128)])
 @pytest.mark.parametrize("swap", [False, True])
 def test_rectangular_pointwise_runtime(tile: tuple[int, int], swap: bool) -> None:
     args = _args(65, 97, offset=True, device=DEVICE)

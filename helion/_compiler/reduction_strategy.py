@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+from itertools import starmap
 import logging
 import operator
 from typing import TYPE_CHECKING
+from typing import NoReturn
 from typing import cast
 
 import sympy
@@ -21,11 +23,18 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.layout import LayoutTag as _CuteLayoutTag
 from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
+from .cute.math_templates import argreduce_candidate_expr
+from .cute.matmul_fallback import _widen_lane_layout_for_barrier_phases
+from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
 from .inductor_lowering import install_inductor_kernel_handlers
+from .roll_reduction import FREE_IOTA_REDUCTION_META
+from .tile_strategy import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .tile_strategy import CompactedShape
+from .tile_strategy import CuteLaneAxis
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import LoopDimInfo
@@ -34,17 +43,34 @@ from .tile_strategy import PerThreadFlattenedTileStrategy
 from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
+from .tile_strategy import _grouped_two_stage_reduce_stmts
+from .tile_strategy import _grouped_warp_reduce_expr
 from .tile_strategy import _to_sympy
 
 if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
+    from .tile_dispatch import TileStrategyDispatch
 
 log = logging.getLogger(__name__)
 
 
 def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
+
+
+def reduction_acc_dtype(
+    reduction_type: str, fake_input: torch.Tensor, fake_output: torch.Tensor
+) -> torch.dtype:
+    """The dtype a reduction accumulates and combines in.
+
+    The reduction input already carries torch's promotion (a bool or integer
+    sum arrives as Int64), so a value reduction accumulates in the output's
+    computation dtype; argmin/argmax track the input's values.
+    """
+    if CompileEnvironment.current().backend.is_indexed_reduction(reduction_type):
+        return get_computation_dtype(fake_input.dtype)
+    return get_computation_dtype(fake_output.dtype)
 
 
 def _cute_shared_memory_budget_bytes() -> int:
@@ -100,6 +126,58 @@ _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD = 256
 _CUTE_WARP_REDUCTION_THREADS = 32
 
 
+def _cute_register_tile_shape(
+    fn: DeviceFunction, block_index: int, lane_extent: int
+) -> bool:
+    """Whether a scalar synthetic reduction lane of ``lane_extent`` over
+    reduction block ``block_index`` can nest outside the tile lane loops of
+    ``fn`` as a per-thread register tile.
+
+    Mirrors ``DeviceGridState.nest_reduction_lane_outside_vector_tiles`` from
+    the tile strategies' construction-time state: every tile block that has a
+    lane loop must be vectorized with one V-wide fragment per thread (elements
+    per thread == V), at least one such block must exist, no matmul lowering
+    may replace the lane bodies, the unrolled per-thread element count stays
+    within ``CUTE_REGISTER_TILE_MAX_ELEMENTS``, the device IR admits the
+    reduction block (``ConfigSpec.cute_register_tile_reduction_blocks``) and no
+    earlier pass over this kernel rejected the register tile
+    (``CompileEnvironment.cute_register_tile_disabled``).
+    """
+    env = CompileEnvironment.current()
+    if (
+        env.cute_register_tile_disabled
+        or env.config_spec.matmul_facts
+        or block_index not in env.config_spec.cute_register_tile_reduction_blocks
+    ):
+        return False
+    unrolled = lane_extent
+    found = False
+    for strategy in fn.tile_strategy.strategies:
+        if isinstance(strategy, PerThreadFlattenedTileStrategy):
+            if strategy._lane_var is None:
+                continue
+            vec_width = strategy._cute_lane_vec_width_by_block.get(
+                strategy.block_ids[-1], 1
+            )
+            if vec_width <= 1 or strategy._elements_per_thread != vec_width:
+                return False
+            unrolled *= vec_width
+            found = True
+            continue
+        if not isinstance(strategy, PerThreadNDTileStrategy):
+            continue
+        for block_id in strategy._lane_var_by_block:
+            vec_width = strategy._cute_lane_vec_width_by_block.get(block_id, 1)
+            if (
+                vec_width <= 1
+                or strategy._elements_per_thread_for_block(block_id) != vec_width
+            ):
+                return False
+            unrolled *= vec_width
+            found = True
+    return found and unrolled <= CUTE_REGISTER_TILE_MAX_ELEMENTS
+
+
 def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
     """Pick the default CuTe loop chunk for reductions wider than one warp."""
     return min(size_hint, max_threads * _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD)
@@ -114,7 +192,7 @@ def cute_live_reduction_threads(max_threads: int) -> int:
 
 
 def _strategies_concurrent_with_block(
-    tile_dispatch: object,
+    tile_dispatch: TileStrategyDispatch,
     block_index: int,
 ) -> list[TileStrategy]:
     """Return strategies that can co-execute with reduction ``block_index``.
@@ -125,11 +203,9 @@ def _strategies_concurrent_with_block(
     branch paths) this returns every strategy unchanged.
     """
     from .device_ir import DeviceIR
-    from .host_function import HostFunction
 
-    strategies = list(getattr(tile_dispatch, "strategies", []))
-    device_ir = HostFunction.current().device_ir
-    red_paths = device_ir.reduction_block_id_branch_paths()
+    strategies = list(tile_dispatch.strategies)
+    red_paths = tile_dispatch.reduction_branch_paths()
     own_paths = red_paths.get(block_index)
     if not own_paths:
         return strategies
@@ -221,6 +297,41 @@ def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
     return block_index in env.config_spec.cute_indexed_reduction_block_ids
 
 
+def cute_mark_cross_block_vec_lanes(state: CodegenState, block_id: int) -> None:
+    """Record the constexpr V-loops that enclose a reduction over ``block_id``
+    but iterate another block (``CuteDeviceFunctionState.unfoldable_vec_lanes``).
+
+    The V-fold of ``cute/hoist_warp_reduce.py`` combines a V-loop's lanes
+    before the cross-thread reduce, which is the reduction itself only when
+    the lanes are elements of the reduced block.  A vector width on the tile
+    of ``s[tile] = x[tile, :].sum(-1)`` gives each lane its own row, so those
+    lanes must each reduce on their own and feed one element of the vector
+    store.
+    """
+    from .tile_strategy import PerThreadFlattenedTileStrategy
+    from .tile_strategy import PerThreadNDTileStrategy
+
+    env = CompileEnvironment.current()
+    if env.backend.name != "cute":
+        return
+    codegen = state.codegen
+    active_block_ids = {
+        block for block, loops in codegen.active_device_loops.items() if loops
+    }
+    if codegen.current_grid_state is not None:
+        active_block_ids.update(codegen.current_grid_state.block_ids)
+    reduced = env.canonical_block_id(block_id)
+    unfoldable = state.device_function.cute_state.unfoldable_vec_lanes
+    for strategy in state.device_function.tile_strategy.strategies:
+        if not isinstance(
+            strategy, (PerThreadNDTileStrategy, PerThreadFlattenedTileStrategy)
+        ):
+            continue
+        for other, vec_lane_var in strategy._cute_vec_lane_var_by_block.items():
+            if other in active_block_ids and env.canonical_block_id(other) != reduced:
+                unfoldable.add(vec_lane_var)
+
+
 class ReductionStrategy(TileStrategy):
     def __init__(
         self,
@@ -255,12 +366,52 @@ class ReductionStrategy(TileStrategy):
         """Return threads used for this reduction on thread-aware backends."""
         return 0
 
+    def use_shared_thread_extent(self, extent: int) -> None:
+        """Spread the reduction over ``extent`` threads of its launch axis.
+
+        See ``TileStrategyDispatch._normalize_shared_reduction_thread_extents``.
+        """
+        raise self._shared_thread_extent_error(extent)
+
+    def _shared_thread_extent_error(self, extent: int) -> exc.BackendUnsupported:
+        return exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            f"reduction block {self.block_index} spans "
+            f"{self._reduction_thread_count()} lanes but its launch axis has "
+            f"{extent} threads; the surplus lanes would corrupt the cross-lane "
+            "reduction",
+        )
+
+    def _claims_thread_axis(self) -> bool:
+        """Whether this reduction owns a launch thread axis.
+
+        A reduction spread across several live threads owns one axis.  On the
+        CuTe backend a reduction left with a single live thread (shrunk by
+        ``CuteBackend.adjust_reduction_thread_count`` once the tile axes fill
+        the CTA, or a dim whose padded extent is 1) walks its whole extent in
+        its synthetic lane loop and indexes with the constant 0
+        (``_index_init_expr``).  Its thread coordinate is never read, so it
+        claims no axis and records no ``block_thread_axes`` entry: the
+        dispatcher parks it on the lowest axis no threaded reduction holds
+        (``TileStrategyDispatch.thread_axis_for_strategy``), which a tile may
+        use.  Giving every such reduction a private axis ran past the three
+        hardware axes as soon as a kernel held four reduction dims (an
+        attention kernel whose value head dim differs from the q/k head dim,
+        plus the two tile-sized dims that ``tile.index[:, None]`` slices
+        allocate).
+        """
+        count = self._reduction_thread_count()
+        if count <= 0:
+            return False
+        return count > 1 or CompileEnvironment.current().backend.name != "cute"
+
     def thread_axes_used(self) -> int:
-        return 1 if self._reduction_thread_count() > 0 else 0
+        return 1 if self._claims_thread_axis() else 0
 
     def thread_block_sizes(self) -> list[int]:
-        count = self._reduction_thread_count()
-        return [count] if count > 0 else []
+        if not self._claims_thread_axis():
+            return []
+        return [self._reduction_thread_count()]
 
     def _reduction_block_has_lane_loops(self) -> bool:
         """Return True when this reduction block is being traversed via a
@@ -360,8 +511,7 @@ class ReductionStrategy(TileStrategy):
         self,
     ) -> tuple[int, int, str] | None:
         """Return ``(pre, group_span, lane_expr)`` for a reshape-merged
-        reduction whose live thread axis is interleaved with a *sibling*
-        thread axis, or ``None`` when no such interleaving exists.
+        reduction, including a contiguous or entirely serial source layout.
 
         When ``x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)`` merges
         ``tile1`` (a live thread axis) and ``tile2`` (a lane loop) into a
@@ -375,10 +525,9 @@ class ReductionStrategy(TileStrategy):
 
         This computes the ``pre`` (product of live thread extents on axes
         *below* the reduce axis) and ``group_span`` (``pre`` times the
-        reduce axis extent) used by ``_cute_grouped_reduce_warp``. Returns
-        ``None`` when ``pre == 1`` (no sibling axis below the reduce axis),
-        in which case the plain consecutive-lane warp reduction is already
-        correct.
+        reduce axis extent) used by ``_cute_grouped_reduce_warp``. A contiguous
+        group still needs an explicit source-lane owner when reshaping removes
+        the synthetic coordinate. Unsupported source layouts return ``None``.
         """
         env = CompileEnvironment.current()
         backend = env.backend
@@ -386,6 +535,8 @@ class ReductionStrategy(TileStrategy):
             return None
         numel = env.block_sizes[self.block_index].numel
         if not isinstance(numel, sympy.Expr):
+            return None
+        if numel != sympy.prod(numel.free_symbols):
             return None
         # Source block ids merged into this reduction dim by the reshape.
         source_block_ids: set[int] = set()
@@ -416,7 +567,31 @@ class ReductionStrategy(TileStrategy):
             reduce_axis = axis
             reduce_extent = max(reduce_extent, extent)
         if reduce_axis is None:
-            return None
+            # No source axis has hardware lanes. A single serial source lane
+            # plus active singleton tiles needs no physical thread reduction.
+            owners: set[str] = set()
+            for block_id in source_block_ids:
+                active = {
+                    id(loop): loop
+                    for loop in self.fn.codegen.active_device_loops.get(block_id, [])
+                    if isinstance(loop, DeviceLoopState)
+                    and isinstance(loop.strategy, PerThreadNDTileStrategy)
+                }
+                if len(active) != 1:
+                    return None
+                loop = next(iter(active.values()))
+                if block_id in loop.lane_loop_blocks:
+                    owner = cast(
+                        "PerThreadNDTileStrategy", loop.strategy
+                    )._lane_var_by_block.get(block_id)
+                    if owner is None:
+                        return None
+                    owners.add(owner)
+                elif self.fn.resolved_block_size(block_id) != 1:
+                    return None
+            if len(owners) != 1:
+                return None
+            return 1, 1, "0"
         # Live thread extents of ALL blocks (siblings included) so the linear
         # lane index strides are computed correctly. The reduction block's own
         # synthetic thread axis is excluded -- it is fictional (no real warp
@@ -434,12 +609,6 @@ class ReductionStrategy(TileStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= logical_axis_sizes.get(axis, 1)
-        if pre <= 1:
-            # No sibling thread axis below the reduce axis: the reduce axis is
-            # already at the bottom of the linear lane index, so consecutive
-            # warp lanes belong to the reduction and the plain warp reduce is
-            # correct.
-            return None
         group_span = pre * reduce_extent
         if group_span > 32:
             # Cross-warp grouped reduction is not handled by the marker path.
@@ -448,6 +617,104 @@ class ReductionStrategy(TileStrategy):
         if lane_expr is None:
             return None
         return pre, group_span, lane_expr
+
+    def _reshape_physical_reduction_group_params(
+        self, state: CodegenState
+    ) -> tuple[int, int, str] | None:
+        """Prove a merged reduction is distributed entirely over hardware lanes.
+
+        Unlike the serial-lane fallback, every source tile must fit its own
+        active physical axis. Two adjacent axes may form one warp group; an
+        unrelated axis between them, a partial tile, or a serial source cannot.
+        This records layout only. The post-wrap pass must also prove uniform
+        execution and the absence of the synthetic coordinate and loop.
+        """
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        if (
+            env.backend.name != "cute"
+            or self.fn.cute_state.simt_cluster_n != 1
+            or not isinstance(numel, sympy.Expr)
+            or numel != sympy.prod(numel.free_symbols)
+        ):
+            return None
+        sources: set[int] = set()
+        for symbol in numel.free_symbols:
+            block_id = env.get_block_id(symbol)
+            if block_id is None:
+                return None
+            sources.add(env.canonical_block_id(block_id))
+        if len(sources) < 2:
+            return None
+        dispatch = self.fn.tile_strategy
+        source_axes: set[int] = set()
+        for block_id in sources:
+            active = {
+                id(loop): loop
+                for loop in state.codegen.active_device_loops.get(block_id, [])
+                if isinstance(loop, DeviceLoopState)
+                and isinstance(loop.strategy, PerThreadNDTileStrategy)
+            }
+            if len(active) != 1:
+                return None
+            loop = next(iter(active.values()))
+            if block_id in loop.lane_loop_blocks:
+                return None
+            size = self.fn.resolved_block_size(block_id)
+            if size is None:
+                return None
+            axis = loop.block_thread_axes.get(block_id)
+            if axis is None:
+                if size != 1:
+                    return None
+                continue
+            if (
+                axis not in range(3)
+                or dispatch.thread_axis_for_block_id(block_id) != axis
+                or dispatch.thread_extent_for_block_id(block_id) != size
+                or axis in source_axes
+            ):
+                return None
+            if size > 1:
+                source_axes.add(axis)
+
+        # Use only actual active source/sibling axes, not the fictional merged
+        # strategy. Final launch dimensions are likewise based on live indices.
+        sizes: dict[int, int] = {}
+        for block_id, loops in state.codegen.active_device_loops.items():
+            for loop in loops:
+                if not isinstance(loop, (DeviceGridState, DeviceLoopState)):
+                    continue
+                axis = loop.block_thread_axes.get(block_id)
+                if axis is None or block_id == self.block_index:
+                    continue
+                extent = dispatch.thread_extent_for_block_id(block_id)
+                if extent is None or axis not in range(3):
+                    return None
+                if extent > 1:
+                    if axis in sizes and sizes[axis] != extent:
+                        return None
+                    sizes[axis] = extent
+                    if axis in source_axes and block_id not in sources:
+                        return None
+        if not source_axes:
+            return 1, 1, "0"
+        first, last = min(source_axes), max(source_axes)
+        if any(axis not in source_axes for axis in sizes if first <= axis <= last):
+            return None
+        pre = 1
+        span = 1
+        for axis in range(last + 1):
+            extent = sizes.get(axis, 1)
+            if extent <= 0 or extent & (extent - 1):
+                return None
+            if axis < first:
+                pre *= extent
+            span *= extent
+        if span > 32:
+            return None
+        lane_expr = env.backend.thread_linear_index_expr(sizes)
+        return (pre, span, lane_expr) if lane_expr is not None else None
 
     def _lane_reduce_marker_unsupported(self, state: CodegenState) -> bool:
         """Return True when the two-pass lane-reduction marker cannot be
@@ -576,6 +843,10 @@ class ReductionStrategy(TileStrategy):
                                 covered.add(block_id)
                         elif block_id in loop.block_thread_axes:
                             covered.add(block_id)
+                        elif self.fn.resolved_block_size(block_id) == 1:
+                            # An active singleton tile contributes no lane or
+                            # hardware coordinate to the merged reduction.
+                            covered.add(block_id)
                     if (
                         covered == source_blocks
                         and len(owners) == 1
@@ -611,9 +882,23 @@ class ReductionStrategy(TileStrategy):
             if isinstance(strategy, PerThreadNDTileStrategy):
                 owner = strategy._lane_var_by_block.get(self.block_index)
                 if owner is not None:
+                    vector_loop = strategy._cute_lane_vloop_by_block.get(
+                        self.block_index
+                    )
+                    if vector_loop is not None:
+                        setattr(vector_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, owner)
                     return owner
             elif isinstance(strategy, PerThreadFlattenedTileStrategy):
                 if strategy._lane_var is not None:
+                    vector_loop = strategy._cute_lane_vloop_by_block.get(
+                        strategy.block_ids[-1]
+                    )
+                    if vector_loop is not None:
+                        setattr(
+                            vector_loop,
+                            HELION_VECTOR_REDUCTION_OWNER_ATTR,
+                            strategy._lane_var,
+                        )
                     return strategy._lane_var
         raise exc.BackendUnsupported("cute", "reduction lane owner is not proven")
 
@@ -741,12 +1026,11 @@ class ReductionStrategy(TileStrategy):
         fake_output: torch.Tensor,
     ) -> str:
         backend = CompileEnvironment.current().backend
-        acc_dtype = get_computation_dtype(fake_input.dtype)
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         if backend.is_indexed_reduction(reduction_type):
-            index_var = self.index_var(self.block_index)
             return self.call_indexed_reduction(
                 input_name,
-                self.broadcast_str(index_var, fake_input, dim),
+                self.broadcast_str(self.argreduce_position_var(), fake_input, dim),
                 reduction_type,
                 dim,
                 fake_output,
@@ -763,14 +1047,38 @@ class ReductionStrategy(TileStrategy):
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
         backend = env.backend
+        if backend.name == "cute" and self._reduction_thread_count() == 1:
+            # A single-thread reduction claims no thread axis of its own
+            # (``_claims_thread_axis``); the axis the dispatcher parks it on
+            # may belong to a sibling tile and must not shift this index.
+            return backend.reduction_index_zero_expr(dtype)
         size = env.block_sizes[block_idx].size
         if isinstance(size, int) and size == 0:
             return backend.reduction_index_zero_expr(dtype)
         if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
             return backend.reduction_index_zero_expr(dtype)
+        if self._reduction_thread_count() == 1:
+            # On the other thread-aware backends a reduction shrunk to one
+            # live thread (``adjust_reduction_thread_count``) still reserves a
+            # thread axis (``thread_axes_used() == 1``).  Alone, that axis is
+            # one thread wide and ``thread_idx()[axis]`` is always 0.  Beside
+            # a sibling reduction with more threads the reductions share one
+            # reservation and ``TileStrategy._compute_thread_axis_offset``
+            # lets a tile strategy take this axis, so ``thread_idx()[axis]``
+            # would alias the tile's thread id.  The constant 0 is the lane
+            # index in both cases.
+            return backend.reduction_index_zero_expr(dtype)
         return backend.reduction_index_expr(
             block_size_var, dtype, block_idx, axis=self._get_thread_axis()
         )
+
+    def argreduce_position_var(self) -> str:
+        """Positions along the reduced dim, as argmin/argmax return them.
+
+        A reduction dim walks its whole extent from 0, so its index is the
+        position.
+        """
+        return self.index_var(self.block_index)
 
     def call_indexed_reduction(
         self,
@@ -823,6 +1131,44 @@ class ReductionStrategy(TileStrategy):
         )
 
 
+def _int_argument_symbol(numel: object) -> str | None:
+    """The name of the int argument a symbolic extent depends on, by provenance.
+
+    ``CompileEnvironment.to_fake`` records a bare input ``LocalSource`` for the
+    unbacked symbol of an int argument and nothing else does; a tensor size's
+    symbol carries a ``TensorPropertySource``, whatever host local names it
+    (``m, n = x.size()`` gives the size symbol a ``NameOrigin`` too, which is
+    why the origin's class cannot tell them apart).  ``None`` for a static
+    extent and for an extent of tensor sizes and block sizes.
+    """
+    from torch._dynamo.source import LocalSource
+
+    expr = numel._sympy_() if isinstance(numel, torch.SymInt) else numel
+    if not isinstance(expr, sympy.Expr):
+        return None
+    var_to_sources = CompileEnvironment.current().shape_env.var_to_sources
+    for symbol in sorted(expr.free_symbols, key=str):
+        if not isinstance(symbol, sympy.Symbol):
+            continue
+        for source in var_to_sources.get(symbol, ()):
+            if type(source) is LocalSource and source.is_input:
+                return source.local_name
+    return None
+
+
+def _cute_is_folded_matmul_contraction(block_index: int) -> bool:
+    """Whether ``block_index`` is the contraction of a matmul the scalar
+    fallback lowers (no 16-bit operand a warp-MMA plan may take)."""
+    from .cute.matmul_utils import cute_kernel_has_half_precision_matmul
+    from .cute.matmul_utils import cute_matmul_contraction_block_ids
+
+    env = CompileEnvironment.current()
+    return (
+        env.canonical_block_id(block_index) in cute_matmul_contraction_block_ids()
+        and not cute_kernel_has_half_precision_matmul()
+    )
+
+
 class PersistentReductionStrategy(ReductionStrategy):
     def __init__(
         self,
@@ -832,13 +1178,49 @@ class PersistentReductionStrategy(ReductionStrategy):
         from .device_ir import ReductionLoopGraphInfo
 
         env = CompileEnvironment.current()
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
         if isinstance(numel, (int, sympy.Integer)):
             size_hint = int(numel)
         elif isinstance(numel, sympy.Expr):
-            size_hint = shape_env_size_hint(env.shape_env, numel)
+            # Reduction extents can refer to tile sizes. Resolve those symbols
+            # from this config before planning physical threads or lane loops;
+            # the tracing hint can be larger or smaller than the chosen tile.
+            block_symbols, _ = find_block_size_symbols(numel)
+            configured_sizes = {
+                symbol: sympy.Integer(size)
+                for symbol, block_id in block_symbols.items()
+                if isinstance(size := fn.resolved_block_size(block_id), int)
+            }
+            resolved_numel = numel.xreplace(configured_sizes)
+            size_hint = shape_env_size_hint(env.shape_env, resolved_numel)
         else:
             size_hint = env.size_hint(numel)
+        if (
+            env.backend.name == "cute"
+            and (int_argument := _int_argument_symbol(numel)) is not None
+        ):
+            # The thread layout below is sized from the bound value's hint
+            # and fixed at codegen; a register dim ``hl.zeros([tile, bsz])``
+            # with ``bsz`` an int argument then holds the hint's elements at
+            # every call, dropping or repeating the dim's at another value
+            # (an int argument is not part of the specialization key).
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"a reduction dim sized by the int argument {int_argument}: the "
+                "persistent reduction's thread layout is fixed at codegen from "
+                "the bound value and would not follow the argument",
+            )
+        extent = numel._sympy_() if isinstance(numel, torch.SymInt) else numel
+        hint_bucket: int | None = None
+        if (
+            env.backend.name == "cute"
+            and isinstance(extent, sympy.Expr)
+            and extent.free_symbols
+        ):
+            # The same layout follows a dynamic tensor size only within the
+            # hint's power-of-2 bucket; the bound kernel keys that bucket.
+            env.cute_hint_sized_reduction_extents.add(extent)
+            hint_bucket = next_power_of_2(size_hint)
         # Skip the mask when RDIM_SIZE == numel (no padding needed).
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
@@ -857,6 +1239,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             mask_var=mask_var,
             block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
+        self._cute_hint_bucket = hint_bucket
         self.offset_vars[block_index] = "0"
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
@@ -883,6 +1266,18 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 if isinstance(requested, int) and 0 < requested < self._thread_count:
                     self._thread_count = requested
+                elif (
+                    requested == 0
+                    and size_hint > max_threads
+                    and _cute_is_folded_matmul_contraction(block_index)
+                ):
+                    # A matmul contraction longer than the CTA's threads is
+                    # split into synthetic lanes, which the scalar fallback
+                    # folds serially per output element
+                    # (``emit_cute_synthetic_lane_fold_mm``): more threads on
+                    # it would only repeat that fold.  The free tile axes take
+                    # them instead.
+                    self._thread_count = 1
         else:
             self._thread_count = 0
         # On cute, the launch block dim is capped at MAX_THREADS_PER_BLOCK.
@@ -920,6 +1315,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         self._cute_lane_body: list[ast.AST] | None = None
         self._cute_lane_vloop: ast.For | None = None
         self._cute_resident_reduction = False
+        self._cute_register_tile_predicted = False
         if env.backend.name == "cute":
             from .cute.resident_reductions import supports_resident_threads
 
@@ -927,6 +1323,15 @@ class PersistentReductionStrategy(ReductionStrategy):
         is_graph_reduction_dim = any(
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
+        )
+        merged_tiled_extent = (
+            env.backend.name == "cute"
+            and isinstance(numel, sympy.Expr)
+            and len(numel.free_symbols) >= 2
+            and numel == sympy.prod(numel.free_symbols)
+            and all(
+                env.get_block_id(symbol) is not None for symbol in numel.free_symbols
+            )
         )
         if self._thread_count > 0:
             # For a non-graph-reduction dim we always try to recover the
@@ -940,25 +1345,105 @@ class PersistentReductionStrategy(ReductionStrategy):
             # graph-reduction dim only addresses the first ``thread_count``
             # elements (e.g. layer_norm_bwd's feature axis), leaving the
             # remaining columns/partial sums uncomputed.
-            needs_synthetic = not is_graph_reduction_dim or (
-                self._thread_count < next_power_of_2(size_hint)
-                if max_threads is not None
-                else False
+            needs_synthetic = (
+                merged_tiled_extent
+                or not is_graph_reduction_dim
+                or (
+                    self._thread_count < next_power_of_2(size_hint)
+                    if max_threads is not None
+                    else False
+                )
             )
             if needs_synthetic:
                 lane_extent = env.backend.create_synthetic_reduction_lanes(
                     self._thread_count, size_hint
                 )
+                if (
+                    env.backend.name == "cute"
+                    and lane_extent is not None
+                    and self._thread_count * lane_extent
+                    != next_power_of_2(max(1, size_hint))
+                ):
+                    # Uneven synthetic slices would let an unmasked vector or
+                    # register row access beyond its padded reduction extent.
+                    # Keep a power-of-two live count within the thread budget
+                    # so every slice fits, then plan the layout from that count.
+                    self._thread_count = 1 << (self._thread_count.bit_length() - 1)
+                    lane_extent = env.backend.create_synthetic_reduction_lanes(
+                        self._thread_count, size_hint
+                    )
+                # A merged tiled axis can still contain a serial source lane
+                # when its configured total extent fits in one warp. Keep an
+                # explicit logical owner for the reduction; after wrapping,
+                # resolve_pruned_lane_owners maps unused synthetic coordinates
+                # back to the proven source lane and its physical subgroup.
+                if lane_extent is None and merged_tiled_extent:
+                    lane_extent = 1
+                # One complete vector per live thread: the requested V exactly
+                # covers each thread's synthetic slice, so the lane loop is a
+                # constexpr V-fold with no loop-carried lanes.  The memory-op
+                # gate independently caps each load/store at 16 bytes for its
+                # dtype.
+                requested_vec = 1
+                if mask_var is None and not self._cute_resident_reduction:
+                    configured_vec = env.config_spec.cute_vector_widths.config_get(
+                        cast(
+                            "list[int]",
+                            fn.config.config.get("cute_vector_widths", []) or [],
+                        ),
+                        block_index,
+                        1,
+                    )
+                    if isinstance(configured_vec, int) and configured_vec > 1:
+                        requested_vec = configured_vec
                 # The synthetic lane loop folds each lane into a per-thread
-                # accumulator that is then combined with a single warp reduction
-                # over ``_reduction_thread_count`` threads. That warp reduction
-                # is only correct within one warp, so cap the thread count to
-                # the warp size and let the lane loop grow to cover the rest;
-                # otherwise a multi-warp group silently drops lanes (#2643).
+                # accumulator that is then combined across the live threads.
+                # A single warp reduction is only correct within one warp, so
+                # a lane-looped multi-warp group caps its thread count to the
+                # warp size and lets the lane loop grow to cover the rest;
+                # otherwise the group silently drops lanes (#2643).  A
+                # one-vector-per-thread row keeps its warp-aligned multi-warp
+                # thread count instead (``row_len / V`` threads, e.g. 128 for
+                # a 1024-wide bf16 row): its finalize combines the per-thread
+                # V-folds with the cross-warp two-stage shared reduce (see
+                # ``_sibling_axis_group_params``), matching the one-LDG.128
+                # -per-thread shape of the Triton kernel instead of a 32-thread
+                # CTA looping over scalar lanes.
+                vector_row = (
+                    lane_extent is not None
+                    and requested_vec > 1
+                    and lane_extent == requested_vec
+                )
+                multiwarp_vector_row = (
+                    vector_row
+                    and self._thread_count % _CUTE_WARP_REDUCTION_THREADS == 0
+                )
+                # A scalar lane over one-vector tile wrappers nests OUTSIDE
+                # them as a trace-time register tile (see
+                # ``DeviceGridState.nest_reduction_lane_outside_vector_tiles``)
+                # whose finalize combines each tile element across the group
+                # with the cross-warp column reduce, so it keeps a multi-warp
+                # thread count too.  The prediction mirrors the grid-time
+                # check; ``codegen_preamble`` rejects the config if the grid
+                # turns out not to match.
+                self._cute_register_tile_predicted = (
+                    not vector_row
+                    and mask_var is None
+                    and lane_extent is not None
+                    and lane_extent > 1
+                    and not self._cute_resident_reduction
+                    and _cute_register_tile_shape(fn, block_index, lane_extent)
+                )
+                multiwarp_register_tile = (
+                    self._cute_register_tile_predicted
+                    and self._thread_count % _CUTE_WARP_REDUCTION_THREADS == 0
+                )
                 if (
                     lane_extent is not None
                     and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
                     and not self._cute_resident_reduction
+                    and not multiwarp_vector_row
+                    and not multiwarp_register_tile
                 ):
                     self._thread_count = _CUTE_WARP_REDUCTION_THREADS
                     lane_extent = env.backend.create_synthetic_reduction_lanes(
@@ -991,29 +1476,97 @@ class PersistentReductionStrategy(ReductionStrategy):
                             vector_width=min(width, lane_extent),
                             index_name=self.index_var(block_index),
                         )
-                    if mask_var is None:
-                        cfg = fn.config.config
-                        vec_width = env.config_spec.cute_vector_widths.config_get(
-                            cast(
-                                "list[int]",
-                                cfg.get("cute_vector_widths", []) or [],
-                            ),
-                            block_index,
-                            1,
-                        )
-                        # One complete vector per live thread.  The memory-op
-                        # gate independently caps each load/store at 16 bytes
-                        # for its dtype.
-                        if (
-                            isinstance(vec_width, int)
-                            and vec_width > 1
-                            and lane_extent == vec_width
-                            and not self._cute_resident_reduction
-                        ):
-                            self._cute_reduction_vec_width = vec_width
+                    # Tested against the lane extent AFTER the cap: a row the
+                    # cap brings down to exactly V lanes per thread (a 256-wide
+                    # bf16 row asked for 64 or 128 threads with V=8) keeps its
+                    # one-warp vector loads exactly as a 32-thread request does.
+                    if requested_vec > 1 and lane_extent == requested_vec:
+                        self._cute_reduction_vec_width = requested_vec
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
+
+    def use_shared_thread_extent(self, extent: int) -> None:
+        if self._synthetic_cute_lane_var is not None or (
+            extent > _CUTE_WARP_REDUCTION_THREADS
+            and _block_has_indexed_reduction(self.fn, self.block_index)
+        ):
+            # The lane loop strides by the thread count, so the surplus
+            # threads would alias the elements of later lanes; argmin/argmax
+            # combine within one warp only (see ``__init__``).
+            raise self._shared_thread_extent_error(extent)
+        # One thread per element: the extent mask also drops the surplus
+        # threads, which then hold the identity through the widened combine.
+        self._thread_count = extent
+        if self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
+
+    def cute_tile_base_expr(self, block_id: int) -> str | None:
+        """The persistent axis covers its whole extent: the tile base is 0."""
+        if block_id != self.block_index:
+            return None
+        return self.offset_var(block_id)
+
+    def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
+        """Thread / synthetic-lane distribution of the persistent axis.
+
+        ``None`` for another block, for a vectorised or resident row (their
+        per-thread values are not one scalar per lane step) and when no live
+        thread count is known.  Each synthetic lane step is one
+        ``threads``-wide chunk of consecutive elements
+        (``index = thread + step * threads``).
+        """
+        if (
+            block_id != self.block_index
+            or self._thread_count <= 0
+            or self._cute_reduction_vec_width > 1
+            or self._cute_resident_reduction
+        ):
+            return None
+        lane_var = self._synthetic_cute_lane_var
+        lane_steps = self._synthetic_cute_lane_extent if lane_var is not None else 1
+        return CuteLaneAxis(
+            extent=self._thread_count * lane_steps,
+            threads=self._thread_count,
+            lane_var=lane_var,
+            lane_steps=lane_steps,
+            vec_lane_var=None,
+            vec_width=1,
+            strided=lane_var is not None,
+        )
+
+    def _cute_runtime_lane_group_params(self, group_span: int) -> tuple[str, int]:
+        """Lane expression and group count that key a two-stage shared reduce's
+        shared memory on the FULL runtime thread id.
+
+        The thread-axis sizes known at this point only reflect the axes
+        discovered so far. A sibling control-flow branch can still introduce a
+        *redundant* thread axis later in codegen -- e.g. a free ``hl.arange``
+        that another (mutually-exclusive) branch maps onto thread axis 1/2 --
+        which enlarges the launch block beyond the threads counted here. Those
+        extra threads re-run the reduction; if every redundant row keyed its
+        shared memory on the same slots the cross-warp combine would race
+        (producing intermittently wrong partial reductions). Keying the
+        per-group shared memory on the flattened thread id (from the runtime
+        block dims) gives each redundant row its own region; when the reduction
+        owns the whole launch block (``blockDim.x == group_span``) the extra
+        groups simply go unused. Only valid for a reduce group at the bottom of
+        the linear lane index (thread axis 0), where ``group_span`` consecutive
+        linear lanes form one group.
+        """
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        env = CompileEnvironment.current()
+        backend = env.backend
+        index_type = backend.index_type_str(env.index_dtype)
+        tid0 = backend.cast_expr("cute.arch.thread_idx()[0]", index_type)
+        tid1 = backend.cast_expr("cute.arch.thread_idx()[1]", index_type)
+        tid2 = backend.cast_expr("cute.arch.thread_idx()[2]", index_type)
+        bdim0 = backend.cast_expr("cute.arch.block_dim()[0]", index_type)
+        bdim1 = backend.cast_expr("cute.arch.block_dim()[1]", index_type)
+        lane_expr = f"{tid0} + ({tid1}) * ({bdim0}) + ({tid2}) * ({bdim0}) * ({bdim1})"
+        group_count = (MAX_THREADS_PER_BLOCK + group_span - 1) // group_span
+        return lane_expr, group_count
 
     def offset_var(self, block_idx: int) -> str:
         assert block_idx == self.block_index
@@ -1023,7 +1576,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         backend = env.backend
         block_idx = self.block_index
-        numel = env.block_sizes[block_idx].numel
+        numel = env.specialize_expr(env.block_sizes[block_idx].numel)
         index_var = self.index_var(block_idx)
         mask_var = self._mask_var
         block_size_var = self.block_size_var(self.block_index)
@@ -1050,6 +1603,26 @@ class PersistentReductionStrategy(ReductionStrategy):
                         f"{block_size_var} = {backend.dynamic_rdim_size_expr(expr_str)}"
                     )
                     state.codegen.host_statements.append(stmt)
+                    if (bucket := self._cute_hint_bucket) is not None:
+                        # The bound kernel keys this bucket, but a compiled
+                        # config called directly at another size bypasses
+                        # the key.  The layout spans the whole bucket and the
+                        # dynamic extent is always masked (needs_mask), so a
+                        # smaller extent runs exactly; a larger one would
+                        # leave the rest of the dim uncovered.
+                        message = (
+                            f"CuTe kernel compiled for {expr_str} in the "
+                            f"power-of-2 bucket {bucket}: a config compiled at "
+                            "one size cannot run a larger bucket; call the "
+                            "Kernel itself (not the compiled config) so it "
+                            "rebinds"
+                        )
+                        state.codegen.host_statements.append(
+                            statement_from_string(
+                                f"if {block_size_var} > {bucket}:\n"
+                                f"    raise RuntimeError({message!r})"
+                            )
+                        )
         current_grid = state.codegen.current_grid_state
         synthetic_lane_var = self._synthetic_cute_lane_var
         if synthetic_lane_var is not None and current_grid is not None:
@@ -1094,11 +1667,39 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
             else:
-                current_grid.add_lane_loop(
-                    block_idx,
-                    synthetic_lane_var,
-                    self._synthetic_cute_lane_extent,
+                # A scalar synthetic lane over a grid of one-vector tile
+                # wrappers becomes a trace-time loop OUTSIDE those wrappers
+                # (a per-thread register tile: one vector transaction per
+                # lane, every lane's loads issued before the first store).
+                # Otherwise the lane keeps its rolled innermost position.
+                register_tile = (
+                    self._cute_register_tile_predicted
+                    and current_grid.nest_reduction_lane_outside_vector_tiles(
+                        block_idx,
+                        synthetic_lane_var,
+                        self._synthetic_cute_lane_extent,
+                        max_unrolled_elements=CUTE_REGISTER_TILE_MAX_ELEMENTS,
+                    )
                 )
+                if not register_tile:
+                    if (
+                        self._cute_register_tile_predicted
+                        and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+                    ):
+                        # The multi-warp thread count was kept for a register
+                        # tile that the grid does not provide; a rolled
+                        # multi-warp lane loop would drop lanes (#2643), so
+                        # ``generate_ast`` regenerates the kernel with the
+                        # rolled nesting and its warp-capped thread count.
+                        raise RegisterTileUnsupported(
+                            "the grid does not provide one-vector tile "
+                            "wrappers for the reduction lane"
+                        )
+                    current_grid.add_lane_loop(
+                        block_idx,
+                        synthetic_lane_var,
+                        self._synthetic_cute_lane_extent,
+                    )
                 index_expr = (
                     f"({self._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                     f" + cutlass.Int32({synthetic_lane_var}) * {self._thread_count}"
@@ -1112,11 +1713,16 @@ class PersistentReductionStrategy(ReductionStrategy):
                         ],
                         synthetic_lane_var,
                     )
-            current_grid.thread_axis_sizes[axis] = max(
-                current_grid.thread_axis_sizes.get(axis, 1),
-                self._thread_count,
-            )
-            current_grid.block_thread_axes[block_idx] = axis
+            if self._claims_thread_axis():
+                current_grid.thread_axis_sizes[axis] = max(
+                    current_grid.thread_axis_sizes.get(axis, 1),
+                    self._thread_count,
+                )
+                current_grid.block_thread_axes[block_idx] = axis
+            if self._cute_resident_reduction:
+                # ``materialize_resident_reductions`` rewrites this loop and
+                # its prelude as a unit.
+                current_grid.undistributable_lane_vars.add(synthetic_lane_var)
             current_grid.lane_setup_statements.append(
                 statement_from_string(f"{index_var} = {index_expr}")
             )
@@ -1142,7 +1748,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._thread_count > 0:
+        if self._claims_thread_axis():
             tracker.record(
                 self.block_index, self._get_thread_axis(), self._thread_count
             )
@@ -1194,39 +1800,17 @@ class PersistentReductionStrategy(ReductionStrategy):
             constant_repr(default_value), _dtype_str(dtype)
         )
         # The two-stage shared reduce takes ``dtype`` (the accumulation dtype,
-        # ``get_computation_dtype(fake_input.dtype)``) from ``type(identity)``.
+        # ``reduction_acc_dtype``) from ``type(identity)``.
         # Upcast the (possibly fp16/bf16) masked input to that same dtype so the
         # helper's ``input if mask else identity`` selection unifies cleanly and
         # the reduction still accumulates in the wider accumulation dtype.
         input_expr = backend.cast_expr(input_name, _dtype_str(dtype))
 
         if reduction_axis == 0:
-            # ``axis_sizes`` only reflects the thread axes discovered so far. A
-            # sibling control-flow branch can still introduce a *redundant*
-            # thread axis later in codegen -- e.g. a free ``hl.arange`` that
-            # another (mutually-exclusive) branch maps onto thread axis 1/2 --
-            # which enlarges the launch block beyond ``num_threads``. Those extra
-            # threads re-run this reduction; if every redundant row keyed its
-            # shared memory on the same slots the cross-warp combine would race
-            # (producing intermittently wrong partial reductions). Key the
-            # per-group shared memory on the FULL flattened thread id (from the
-            # runtime block dims) so each redundant row reduces into its own
-            # region. When the reduction owns thread axis 0
-            # (``blockDim.x == group_span``) this is identical to the
-            # single-axis path whenever there is no redundancy; the extra
-            # groups simply go unused.
-            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
-
-            index_type = backend.index_type_str(env.index_dtype)
-            tid0 = backend.cast_expr("cute.arch.thread_idx()[0]", index_type)
-            tid1 = backend.cast_expr("cute.arch.thread_idx()[1]", index_type)
-            tid2 = backend.cast_expr("cute.arch.thread_idx()[2]", index_type)
-            bdim0 = backend.cast_expr("cute.arch.block_dim()[0]", index_type)
-            bdim1 = backend.cast_expr("cute.arch.block_dim()[1]", index_type)
-            lane_expr = (
-                f"{tid0} + ({tid1}) * ({bdim0}) + ({tid2}) * ({bdim0}) * ({bdim1})"
-            )
-            group_count = (MAX_THREADS_PER_BLOCK + group_span - 1) // group_span
+            # A redundant thread axis can still appear later in codegen, so key
+            # the shared memory on the full runtime thread id (see
+            # ``_cute_runtime_lane_group_params``).
+            lane_expr, group_count = self._cute_runtime_lane_group_params(group_span)
         else:
             # The two-stage shared-memory reduction assumes its ``lane_var`` is
             # the linear thread index across ALL of the launch block's threads.
@@ -1238,6 +1822,15 @@ class PersistentReductionStrategy(ReductionStrategy):
             planned_dims = self._planned_thread_dims()
             planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
             if num_threads != planned_block_threads:
+                if len(HostFunction.current().device_ir.phases) > 1:
+                    # The warp-level fallback shuffles at most 32 lanes, so for
+                    # a >32-thread reduce it would silently drop lanes.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"persistent reduction over {group_span} lanes cannot "
+                        "prove its thread group under the hl.barrier() launch "
+                        f"{planned_dims}",
+                    )
                 return None
             lane_expr = backend.thread_linear_index_expr(axis_sizes)
             if lane_expr is None:
@@ -1259,9 +1852,20 @@ class PersistentReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _live_thread_axis_sizes(self, state: CodegenState) -> dict[int, int]:
+        """Thread extent per launch axis.
+
+        The active loops and the grid, and the axes every strategy of the
+        kernel reserves: a sibling strategy whose loop is not active here
+        (``x[t, 1::2].argmax(-1)`` rolled over thread axis 0, then a
+        persistent ``x[t, 8:32].argmin(-1)`` on axis 1) still occupies its
+        launch axis, so it still interleaves this reduction's lanes.
+        """
+        return state.codegen._strategy_thread_axis_sizes()
+
     def _sibling_axis_group_params(
         self, state: CodegenState
-    ) -> tuple[int, int, str, int] | None:
+    ) -> tuple[int, int, str, int, str] | None:
         """Group params for a lane-reduce marker whose live thread axis has
         unrelated sibling thread axes BELOW it in the launch block.
 
@@ -1270,10 +1874,17 @@ class PersistentReductionStrategy(ReductionStrategy):
         occupies the lowest strides. With a sibling axis below (e.g. a
         128-thread matmul contraction on axis 0 under this 4-thread reduce axis
         on axis 1), the reduce lanes are strided by the sibling extent, so the
-        finalize must use the grouped (pre-strided) reduction instead. Returns
-        ``(pre, group_span, lane_expr, group_count)``, or ``None`` when the
-        plain consecutive fold is already correct (``pre == 1``) or the layout
-        cannot be de-interleaved safely.
+        finalize must use the grouped (pre-strided) reduction instead. A
+        bottom-axis reduce group wider than one warp (a resident row or a
+        one-vector-per-thread multi-warp row) also needs these params: its
+        finalize is the cross-warp two-stage shared reduce, since a warp
+        shuffle cannot span warps. Returns ``(pre, group_span, lane_expr,
+        group_count, shared_lane_expr)`` -- ``lane_expr`` is the static linear
+        lane the marker analysis parses, ``shared_lane_expr`` the (possibly
+        different) lane keying the two-stage helper's shared memory, or ``""``
+        for the same -- or ``None`` when the plain consecutive fold is already
+        correct (``pre == 1`` within one warp) or the layout cannot be
+        de-interleaved safely.
         """
         env = CompileEnvironment.current()
         backend = env.backend
@@ -1283,21 +1894,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         if reduce_extent <= 1:
             return None
         reduce_axis = self._get_thread_axis()
-        axis_sizes: dict[int, int] = {}
-        codegen = state.codegen
-        seen: set[int] = set()
-        for loops in codegen.active_device_loops.values():
-            for loop_state in loops:
-                key = id(loop_state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                for axis, size in loop_state.thread_axis_sizes.items():
-                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-        current_grid = codegen.current_grid_state
-        if current_grid is not None:
-            for axis, size in current_grid.thread_axis_sizes.items():
-                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        axis_sizes = self._live_thread_axis_sizes(state)
         if axis_sizes.get(reduce_axis, reduce_extent) != reduce_extent:
             # Another block shares the reduce axis with a different extent;
             # the linear-lane stride math below would not isolate this axis.
@@ -1306,7 +1903,10 @@ class PersistentReductionStrategy(ReductionStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1 and not (self._cute_resident_reduction and reduce_extent > 32):
+        if pre <= 1 and reduce_extent <= _CUTE_WARP_REDUCTION_THREADS:
+            # The reduce axis is already at the bottom of the linear lane
+            # index and fits one warp: consecutive warp lanes belong to the
+            # reduction, so the plain warp reduce is correct.
             return None
         group_span = pre * reduce_extent
         if group_span > 32 and group_span % 32 != 0:
@@ -1325,7 +1925,144 @@ class PersistentReductionStrategy(ReductionStrategy):
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
             return None
-        return pre, group_span, lane_expr, num_threads // group_span
+        if pre <= 1 and not self._cute_resident_reduction:
+            # A one-vector-per-thread multi-warp row or a register tile
+            # (``_cute_register_tile_predicted``): the only other ways a
+            # synthetic-lane reduction keeps more than one warp.  Their
+            # finalize is the two-stage shared reduce (per tile element or
+            # column for the register tile), which keys its per-group shared
+            # memory on the linear thread index across ALL launch-block
+            # threads.  Like the non-synthetic cross-warp path, key that shared
+            # memory on the full runtime thread id: a redundant thread axis can
+            # still appear later in codegen, and the thread axes counted so far
+            # would then let the redundant rows race on the same slots (see
+            # ``_cute_runtime_lane_group_params``).  The marker's own lane
+            # stays the static ``lane_expr``: the post-pass parses it to find
+            # the reduce axis and the consume stores that need an owner.
+            if reduce_axis == 0:
+                shared_lane_expr, group_count = self._cute_runtime_lane_group_params(
+                    group_span
+                )
+                return pre, group_span, lane_expr, group_count, shared_lane_expr
+            # Above thread axis 0 the runtime id cannot isolate the group, so
+            # the axes counted so far must already cover the planned launch
+            # block; otherwise the emitted reduce would race across the
+            # missing axis.
+            planned_dims = self._planned_thread_dims()
+            if num_threads != planned_dims[0] * planned_dims[1] * planned_dims[2]:
+                return None
+        return pre, group_span, lane_expr, num_threads // group_span, ""
+
+    def _cute_sibling_axis_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+        default_value: float | bool,
+    ) -> str | None:
+        """Thread combine for a reduce axis above live sibling thread axes.
+
+        A plain ``warp_reduction_*`` (or the ``pre=1`` cross-warp reduce)
+        folds consecutive linear lanes, which here are the sibling rows below
+        the reduce axis -- e.g. ``x[tile, :, :].sum(-1)`` with the middle full
+        slice on thread axis 0 -- rather than this axis.  Use the grouped
+        reductions that keep the ``pre`` interleaved sibling lanes distinct.
+        Returns ``None`` when the reduce axis is at the bottom of the lanes.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if (
+            backend.name != "cute"
+            or self._thread_count <= 1
+            or self._synthetic_cute_lane_var is not None
+        ):
+            return None
+        reduce_axis = self._get_thread_axis()
+        axis_sizes = self._live_thread_axis_sizes(state)
+        pre = 1
+        for axis in range(reduce_axis):
+            pre *= axis_sizes.get(axis, 1)
+        if pre <= 1:
+            return None
+        params = self._sibling_axis_group_params(state)
+        if params is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{reduction_type} over thread axis {reduce_axis} interleaved "
+                f"with {pre} sibling lanes below it (thread axes {axis_sizes})",
+            )
+        pre, group_span, lane_expr, group_count, _ = params
+        # The warp combine needs the launch to match the axes up to this one
+        # (they order the warp lanes); the two-stage combine keys shared
+        # memory on the linear thread index, so it needs every launch axis.
+        planned_dims = self._planned_thread_dims()
+        checked_axes = (
+            range(reduce_axis + 1)
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS
+            else range(len(planned_dims))
+        )
+        if any(axis_sizes.get(axis, 1) != planned_dims[axis] for axis in checked_axes):
+            launch = (
+                "hl.barrier() launch"
+                if len(HostFunction.current().device_ir.phases) > 1
+                else "launch"
+            )
+            raise exc.BackendUnsupported(
+                "cute",
+                f"persistent reduction over {self._thread_count} lanes cannot "
+                f"prove its thread group under the {launch} {planned_dims}",
+            )
+
+        def grouped_reduce(value: str, combine: str, identity: str) -> str:
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS:
+                return _grouped_warp_reduce_expr(
+                    combine, value, identity, lane_expr, pre=pre, group_span=group_span
+                )
+            result_var = self.fn.new_var("persistent_reduce_result", dce=True)
+            for stmt in _grouped_two_stage_reduce_stmts(
+                result_var,
+                combine,
+                value,
+                identity,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+                group_count=group_count,
+            ):
+                state.add_statement(stmt)
+            return result_var
+
+        indexed = backend.is_indexed_reduction(reduction_type)
+        dtype_str = _dtype_str(
+            reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        )
+        identity_expr = backend.cast_expr(constant_repr(default_value), dtype_str)
+        input_expr = backend.cast_expr(input_name, dtype_str)
+        if not indexed:
+            return grouped_reduce(input_expr, reduction_type, identity_expr)
+        # argmin/argmax: the winning value, then the lowest index holding it.
+        value_var = self.fn.new_var("persistent_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + grouped_reduce(
+                input_expr,
+                "min" if reduction_type == "argmin" else "max",
+                identity_expr,
+            )
+        )
+        index_dtype_str = backend.index_type_str(env.index_dtype)
+        max_index = backend.cast_expr(
+            repr(torch.iinfo(env.index_dtype).max), index_dtype_str
+        )
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        candidate = argreduce_candidate_expr(index, input_expr, value_var, max_index)
+        return backend.cast_expr(
+            grouped_reduce(candidate, "min", max_index),
+            backend.dtype_str(fake_output.dtype),
+        )
 
     def codegen_reduction(
         self,
@@ -1343,21 +2080,38 @@ class PersistentReductionStrategy(ReductionStrategy):
         # sibling grid branch reuses this axis instead of claiming a fresh one that
         # would widen the launch block and race this single-axis reduction. No-op
         # outside a dynamic ``_if`` branch.
-        if backend.name == "cute":
+        if backend.name == "cute" and self._claims_thread_axis():
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         numel = env.block_sizes[self.block_index].numel
         if isinstance(numel, sympy.Integer) and numel == 0:
-            default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+            default = ir.Reduction.default_accumulator(
+                reduction_type,
+                reduction_acc_dtype(reduction_type, fake_input, fake_output),
+            )
             assert isinstance(default, (float, int, bool))
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
             return expr_from_string(
                 backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
-        acc_dtype = get_computation_dtype(fake_input.dtype)
+        if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+            from .cute.argreduce import codegen_packed_reduction
+
+            packed = codegen_packed_reduction(
+                state,
+                self,
+                None,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+            )
+            if packed is not None:
+                return packed
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
             self._synthetic_cute_lane_var is not None
-            and not backend.is_indexed_reduction(reduction_type)
             and isinstance(default, (float, int, bool))
             and not self._lane_reduce_marker_unsupported(state)
             and (threads := self._lane_reduce_threads_in_group()) is not None
@@ -1373,45 +2127,114 @@ class PersistentReductionStrategy(ReductionStrategy):
                 constant_repr(default), _dtype_str(acc_dtype)
             )
             group_params = self._reshape_merged_reduction_group_params()
+            physical_group = self._reshape_physical_reduction_group_params(state)
+            if physical_group is not None:
+                group_params = physical_group
+                previous = self.fn.cute_state.reshape_physical_fallbacks.setdefault(
+                    self._synthetic_cute_lane_var, physical_group
+                )
+                if previous != physical_group:
+                    raise exc.BackendUnsupported(
+                        "cute", "reshape reduction has conflicting physical groups"
+                    )
             owner_lane = self._lane_reduce_owner(state, reshape_group=group_params)
-            if group_params is not None:
-                group_pre, group_span, group_lane_expr = group_params
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    group_pre=group_pre,
-                    group_span=group_span,
-                    group_lane_expr=group_lane_expr,
-                    owner_lane=owner_lane,
+            sibling_params = (
+                self._sibling_axis_group_params(state) if group_params is None else None
+            )
+
+            def marker(value: str, combine: str, identity: str) -> str:
+                if group_params is not None:
+                    group_pre, group_span, group_lane_expr = group_params
+                    return _lane_reduce_marker_expr(
+                        value,
+                        combine,
+                        identity,
+                        threads,
+                        group_pre=group_pre,
+                        group_span=group_span,
+                        group_lane_expr=group_lane_expr,
+                        owner_lane=owner_lane,
+                    )
+                if sibling_params is not None:
+                    (
+                        group_pre,
+                        group_span,
+                        group_lane_expr,
+                        group_count,
+                        shared_lane_expr,
+                    ) = sibling_params
+                    return _lane_reduce_marker_expr(
+                        value,
+                        combine,
+                        identity,
+                        threads,
+                        group_pre=group_pre,
+                        group_span=group_span,
+                        group_lane_expr=group_lane_expr,
+                        group_count=group_count,
+                        owner_lane=owner_lane,
+                        shared_lane_expr=shared_lane_expr,
+                    )
+                return _lane_reduce_marker_expr(
+                    value, combine, identity, threads, owner_lane=owner_lane
                 )
-            elif (sibling_params := self._sibling_axis_group_params(state)) is not None:
-                group_pre, group_span, group_lane_expr, group_count = sibling_params
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    group_pre=group_pre,
-                    group_span=group_span,
-                    group_lane_expr=group_lane_expr,
-                    group_count=group_count,
-                    owner_lane=owner_lane,
-                )
+
+            if not backend.is_indexed_reduction(reduction_type):
+                expr = marker(input_name, reduction_type, identity_expr)
             else:
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    owner_lane=owner_lane,
+                # argmin/argmax: the winning value across the lanes, then the
+                # lowest index holding it, as two dependent lane reductions.
+                # The post-pass slices each marker's input by name, so it
+                # stays a plain variable; the accumulator applies the cast.
+                value_var = self.fn.new_var("lane_reduce_value", dce=True)
+                state.add_statement(
+                    f"{value_var} = "
+                    + marker(
+                        input_name,
+                        "min" if reduction_type == "argmin" else "max",
+                        identity_expr,
+                    )
+                )
+                max_index = backend.cast_expr(
+                    repr(torch.iinfo(env.index_dtype).max),
+                    backend.index_type_str(env.index_dtype),
+                )
+                index = self.broadcast_str(
+                    self.index_var(self.block_index), fake_input, dim
+                )
+                input_expr = backend.cast_expr(input_name, _dtype_str(acc_dtype))
+                candidate_var = self.fn.new_var("lane_reduce_index", dce=True)
+                state.add_statement(
+                    f"{candidate_var} = "
+                    + argreduce_candidate_expr(index, input_expr, value_var, max_index)
+                )
+                expr = backend.cast_expr(
+                    marker(candidate_var, "min", max_index),
+                    backend.dtype_str(fake_output.dtype),
                 )
             return expr_from_string(
                 self.maybe_reshape(expr, dim, fake_input, fake_output)
             )
+        if self._synthetic_cute_lane_var is not None and backend.is_indexed_reduction(
+            reduction_type
+        ):
+            # Without the lane marker each synthetic lane would overwrite the
+            # previous lane's result.
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{reduction_type} over a reduction axis split across synthetic "
+                "lanes whose lane reduction cannot be split into two passes",
+            )
         if isinstance(default, (float, int, bool)):
-            cross_warp = self._cute_cross_warp_reduction_expr(
+            cross_warp = self._cute_sibling_axis_reduction_expr(
+                state,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+                default,
+            ) or self._cute_cross_warp_reduction_expr(
                 state, input_name, reduction_type, default, acc_dtype
             )
         else:
@@ -1541,12 +2364,34 @@ class LoopedReductionStrategy(ReductionStrategy):
                     self._cute_reduction_lane_extent = (
                         self._cute_reduction_lane_extent // vec_width
                     )
-        if env.known_multiple(
-            env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if env.known_multiple(numel, self._loop_block_size):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
+        # A masked vec lattice keeps its vector transactions when every
+        # V-wide chunk is provably all-in or all-out of the extent: a chunk
+        # base is a multiple of V, so ``extent % V == 0`` makes the bounds
+        # mask uniform across the chunk and it is evaluated once per chunk
+        # (``_cute_reduction_chunk_uniform_mask``).  Without that proof
+        # (a symbolic extent whose cache-key residue is not a multiple of V)
+        # the lane body carries an explicit whole-chunk predicate so full
+        # chunks still use one vector load/store while the straddling tail
+        # chunk falls back to per-element accesses.
+        self._cute_reduction_chunk_uniform_mask = False
+        self._cute_reduction_chunk_full_var: str | None = None
+        if (
+            env.backend.name == "cute"
+            and mask_var is not None
+            and self._cute_reduction_vec_width > 1
+        ):
+            from .cute.memory_ops import cute_known_multiple
+
+            self._cute_reduction_chunk_uniform_mask = cute_known_multiple(
+                env,
+                env.block_sizes[block_index].numel,
+                self._cute_reduction_vec_width,
+            )
         super().__init__(
             fn=fn,
             block_index=block_index,
@@ -1559,6 +2404,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         # cluster; decided lazily at the first ``codegen_device_loop`` (see
         # ``_maybe_apply_cute_rolled_cluster``).
         self._cute_rolled_cluster_n = 1
+        self._cute_rolled_cluster_slice_len = 0
         self._cute_rolled_cluster_checked = False
 
     def _maybe_apply_cute_rolled_cluster(self, state: CodegenState) -> None:
@@ -1599,11 +2445,6 @@ class LoopedReductionStrategy(ReductionStrategy):
             or _block_has_indexed_reduction(self.fn, self.block_index)
         ):
             return
-        # A masked roll cannot be cluster-split: the mask compares against
-        # the full extent, so a partial trailing chunk would read into the
-        # next rank's slice and double-count it.
-        if self._mask_var is not None:
-            return
         # Statements outside the roll loop execute once per cluster CTA —
         # benign for plain (idempotent) stores, but a read-modify-write
         # would repeat ``cluster_n`` times.
@@ -1618,16 +2459,34 @@ class LoopedReductionStrategy(ReductionStrategy):
             size > 1 for size in grid_axis_sizes.values()
         ):
             return
-        numel = env.block_sizes[self.block_index].numel
-        try:
-            numel_int = int(numel)
-        except (TypeError, ValueError):
+        numel = env.specialize_expr(env.block_sizes[self.block_index].numel)
+        # Static tails can be padded to whole chunks per CTA. Each rank owns
+        # a disjoint contiguous padded slice, and the original extent still
+        # masks the loads and reduction inputs. Dynamic extents retain the
+        # exact input-metadata guard used by the unmasked cluster schedule.
+        static_numel = isinstance(numel, sympy.Integer)
+        if not static_numel and not env.specialized_multiple(
+            numel, cl * self._loop_block_size
+        ):
             return
-        # Each CTA must roll whole chunks of its own contiguous slice.
-        if numel_int % (cl * self._loop_block_size) != 0:
+        numel_int = shape_env_size_hint(env.shape_env, numel)
+        if numel_int <= 0:
             return
+        slice_len = (
+            -(-numel_int // (cl * self._loop_block_size)) * self._loop_block_size
+            if static_numel
+            else numel_int // cl
+        )
         self._cute_rolled_cluster_n = cl
+        self._cute_rolled_cluster_slice_len = slice_len
         self.fn.cute_state.simt_cluster_n = cl
+        if slice_len * cl == numel_int:
+            self._mask_var = None
+        elif self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
+            self._cute_reduction_chunk_uniform_mask = env.known_multiple(
+                numel, self._cute_reduction_vec_width
+            )
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -1635,7 +2494,11 @@ class LoopedReductionStrategy(ReductionStrategy):
     def _active_thread_axis_sizes(
         self, state: CodegenState, device_loop: DeviceLoopState
     ) -> dict[int, int]:
-        axis_sizes: dict[int, int] = {}
+        axis_sizes = self.fn.tile_strategy.thread_axis_sizes()
+        # Earlier phases may have emitted axes outside this root's strategy
+        # plan. Those threads still participate in shared-memory reductions.
+        for axis, size in enumerate(state.codegen.max_thread_block_dims):
+            axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         seen: set[int] = set()
         for loops in state.codegen.active_device_loops.values():
             for loop_state in loops:
@@ -1654,6 +2517,117 @@ class LoopedReductionStrategy(ReductionStrategy):
         for axis, size in device_loop.thread_axis_sizes.items():
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         return axis_sizes
+
+    def _cute_lanes_below_reduce_axis(
+        self, state: CodegenState, device_loop: DeviceLoopState
+    ) -> tuple[int, dict[int, int]]:
+        """``(pre, axis_sizes)``: the live threads on the launch axes below this
+        rolled reduction's thread axis, which interleave with its lanes."""
+        axis_sizes = self._active_thread_axis_sizes(state, device_loop)
+        pre = 1
+        for axis in range(self._get_thread_axis()):
+            pre *= axis_sizes.get(axis, 1)
+        return pre, axis_sizes
+
+    def _cute_sibling_axis_reduction_expr(
+        self,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+        acc: str,
+        reduction_type: str,
+        default_value: float | bool,
+        dtype: torch.dtype,
+    ) -> str | None:
+        """Thread combine of a rolled reduction above live sibling thread axes.
+
+        A plain ``warp_reduction_*`` (and the ``pre=1`` cross-warp reduce of
+        ``_cute_cross_warp_reduction_expr``) folds consecutive linear lanes,
+        which here are the sibling lanes below the reduce axis:
+        ``out[tile] = buf[:, :].sum(-1)`` with the row dim on thread axis 0 and
+        a rolled column chunk on axis 1 summed rows instead of column lanes.
+        Use the grouped reductions that keep the ``pre`` interleaved sibling
+        lanes distinct, as ``PersistentReductionStrategy`` does.  Returns
+        ``None`` when the reduce axis is at the bottom of the lanes.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if backend.name != "cute" or self._thread_count <= 1:
+            return None
+        pre, axis_sizes = self._cute_lanes_below_reduce_axis(state, device_loop)
+        if pre <= 1:
+            return None
+        reduce_axis = self._get_thread_axis()
+
+        def refuse(reason: str) -> NoReturn:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"rolled {reduction_type} over thread axis {reduce_axis} "
+                f"interleaved with {pre} sibling lanes below it: {reason}",
+            )
+
+        if self._cute_rolled_cluster_n > 1:
+            refuse("the cluster-split reduce combines whole CTAs")
+        if axis_sizes.get(reduce_axis, self._thread_count) != self._thread_count:
+            refuse("another block shares the reduce axis")
+        axis_sizes[reduce_axis] = self._thread_count
+        group_span = pre * self._thread_count
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        if (
+            group_span > _CUTE_WARP_REDUCTION_THREADS
+            and group_span % _CUTE_WARP_REDUCTION_THREADS != 0
+        ) or num_threads % group_span != 0:
+            refuse("the thread axes do not tile the reduce group")
+        # The warp combine needs the launch to match the axes up to this one
+        # (they order the warp lanes); the two-stage combine keys shared memory
+        # on the linear thread index, so it needs every launch axis.
+        planned_dims = tuple(
+            starmap(
+                max,
+                zip(
+                    self._planned_thread_dims(),
+                    state.codegen.max_thread_block_dims,
+                    strict=True,
+                ),
+            )
+        )
+        checked_axes = (
+            range(reduce_axis + 1)
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS
+            else range(len(planned_dims))
+        )
+        if any(axis_sizes.get(axis, 1) != planned_dims[axis] for axis in checked_axes):
+            refuse(f"its thread group is not provable under the launch {planned_dims}")
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            refuse("no linear thread index for the block layout")
+        identity_expr = backend.cast_expr(
+            constant_repr(default_value), _dtype_str(dtype)
+        )
+        if group_span <= _CUTE_WARP_REDUCTION_THREADS:
+            return _grouped_warp_reduce_expr(
+                reduction_type,
+                acc,
+                identity_expr,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+            )
+        result_var = self.fn.new_var("looped_reduce_result", dce=True)
+        device_loop.outer_suffix.extend(
+            _grouped_two_stage_reduce_stmts(
+                result_var,
+                reduction_type,
+                acc,
+                identity_expr,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+                group_count=num_threads // group_span,
+            )
+        )
+        return result_var
 
     def _cute_cross_warp_reduction_expr(
         self,
@@ -1699,27 +2673,48 @@ class LoopedReductionStrategy(ReductionStrategy):
         if num_threads % group_span != 0:
             unsupported("thread axes do not tile the reduce group")
             return None
-        # The two-stage shared-memory reduction assumes its ``lane_var`` is
-        # the linear thread index across ALL of the launch block's threads.
-        # If ``axis_sizes`` only covers a subset of the planned block dims
-        # (e.g. an inner reduction strategy contributes another thread axis
-        # that hasn't been entered yet), the emitted reduction would race
-        # across the missing axis. Bail out and fall back to the warp-level
-        # path in that case.
-        planned_dims = self._planned_thread_dims()
-        planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
-        if num_threads != planned_block_threads:
-            unsupported("another strategy contributes unentered thread axes")
-            return None
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        if lane_expr is None:
-            unsupported("no linear thread index for the block layout")
-            return None
+        if reduction_axis == 0 and cluster_n == 1:
+            # An independent output axis can be entered after this reduction,
+            # but still enlarge the launch. Each duplicate reduction needs its
+            # own shared-memory slots, keyed by the complete physical thread ID.
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            index_type = backend.index_type_str(env.index_dtype)
+            tid0 = backend.cast_expr("cute.arch.thread_idx()[0]", index_type)
+            tid1 = backend.cast_expr("cute.arch.thread_idx()[1]", index_type)
+            tid2 = backend.cast_expr("cute.arch.thread_idx()[2]", index_type)
+            bdim0 = backend.cast_expr("cute.arch.block_dim()[0]", index_type)
+            bdim1 = backend.cast_expr("cute.arch.block_dim()[1]", index_type)
+            lane_expr = (
+                f"{tid0} + ({tid1}) * ({bdim0}) + ({tid2}) * ({bdim0}) * ({bdim1})"
+            )
+            group_count = (MAX_THREADS_PER_BLOCK + group_span - 1) // group_span
+        else:
+            # Other layouts require every planned or previously emitted axis
+            # to participate in the shared reduction's linear thread index.
+            planned_dims = tuple(
+                starmap(
+                    max,
+                    zip(
+                        self._planned_thread_dims(),
+                        state.codegen.max_thread_block_dims,
+                        strict=True,
+                    ),
+                )
+            )
+            planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
+            if num_threads != planned_block_threads:
+                unsupported("another strategy contributes unentered thread axes")
+                return None
+            lane_expr = backend.thread_linear_index_expr(axis_sizes)
+            if lane_expr is None:
+                unsupported("no linear thread index for the block layout")
+                return None
+            group_count = num_threads // group_span
 
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
-        group_count = num_threads // group_span
         if cluster_n > 1:
             if group_count != 1:
                 # The cluster reduce combines across the WHOLE CTA; a
@@ -1827,16 +2822,84 @@ class LoopedReductionStrategy(ReductionStrategy):
                 statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
             )
 
+    def _register_cute_dynamic_trip_count(
+        self,
+        state: CodegenState,
+        numel: sympy.Expr,
+        offset_var: str,
+        block_size_var: str,
+    ) -> None:
+        """Expose a symbolic extent's trip count as a constexpr kernel param.
+
+        A symbolic extent has no static trip count, so the host computes
+        ``ceil(extent / block)`` and passes it as ``cutlass.Constexpr``.  The
+        roll then iterates ``range(0, TRIPS * block, block)``: the same trips
+        as ``range(0, extent, block)`` but with a trace-time constant bound
+        the DSL can unroll, and the two-pass load fuser sizes its per-thread
+        cache as ``TRIPS * lanes * V`` (exact for every runtime extent) while
+        making its profitability decision from the bound size hint.  Each
+        distinct trip count is a distinct constexpr value and so traces the
+        kernel again: launch schemas that bake tensor shapes already trace
+        once per shape, while shape-agnostic schemas (matmul wrapper plans)
+        gain one trace per trip count.  The entry is keyed by the roll's
+        offset variable, the loop target the later AST passes match on.
+        """
+        trips = state.device_function.cute_state.dynamic_reduction_trips
+        if offset_var in trips or isinstance(numel, (int, sympy.Integer)):
+            return
+        if self._cute_rolled_cluster_n > 1:
+            return
+        env = CompileEnvironment.current()
+        block_mapping, _ = find_block_size_symbols(numel)
+        if block_mapping:
+            return
+        trips_var = f"_REDUCTION_TRIPS_{self.block_index}"
+        host_numel = HostFunction.current().sympy_expr(numel)
+        state.device_function.constexpr_arg_with_host_def(
+            trips_var,
+            f"({host_numel} + {block_size_var} - 1) // {block_size_var}",
+        )
+        size_hint = shape_env_size_hint(env.shape_env, numel)
+        hint_trips = max(1, -(-size_hint // self._loop_block_size))
+        trips[offset_var] = (hint_trips, trips_var)
+
+    def cute_chunk_in_bounds_expr(self, state: CodegenState) -> str:
+        """Predicate on the chunk base admitting one whole V-wide packet.
+
+        When ``extent % V == 0`` the chunk base decides every lane, so the
+        packet is in bounds exactly when its base is; otherwise its last lane
+        must be in bounds.  The chunk-level mask statements of
+        ``codegen_device_loop`` and the packet guard of the vector hoist are
+        both spelled from this expression, so the load pipeliner rebases them
+        alike.
+        """
+        base_var = self._cute_lane_base_index_var
+        assert base_var is not None
+        numel_expr = state.sympy_expr(
+            CompileEnvironment.current().block_sizes[self.block_index].numel
+        )
+        if self._cute_reduction_chunk_uniform_mask:
+            return f"{base_var} < {numel_expr}"
+        return f"{base_var} + {self._cute_reduction_vec_width - 1} < {numel_expr}"
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         self._maybe_apply_cute_rolled_cluster(state)
         block_index = self.block_index
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if self._cute_rolled_cluster_n > 1:
+            # Only the successfully claimed cluster needs a concrete extent.
+            # The coverage proof used this exact metadata-guarded bound value.
+            numel = sympy.Integer(shape_env_size_hint(env.shape_env, numel))
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)
         assert block_size_var is not None
         self._register_block_size_constexpr(state, block_size_var)
+        if env.backend.name == "cute":
+            self._register_cute_dynamic_trip_count(
+                state, numel, offset_var, block_size_var
+            )
         inner_body: list[ast.AST] = [
             statement_from_string(
                 f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
@@ -1864,10 +2927,12 @@ class LoopedReductionStrategy(ReductionStrategy):
         consume_unroll = vec > 1 and (
             not graph_has_reduction or self._cute_reduction_vec_mode == "unroll"
         )
-        # Map from (tensor_name, base_expr) -> (hoist_var, dtype) so the
-        # dispatcher can reuse one hoist per (tensor, base) pair instead of
-        # emitting a fresh vec load on every dispatcher call.
-        self._cute_lane_vec_loads: dict[tuple[str, str], tuple[str, torch.dtype]] = {}
+        # Map from (tensor_name, base_expr, packet guard) -> (hoist_var, dtype)
+        # so the dispatcher can reuse one hoist per (tensor, base) pair
+        # instead of emitting a fresh vec load on every dispatcher call.
+        self._cute_lane_vec_loads: dict[
+            tuple[str, str, str | None], tuple[str, torch.dtype]
+        ] = {}
         # Variable name holding the per-lane-iter base index for vec hoists
         # in ``unroll`` mode — the dispatcher uses this to compute the vec
         # pointer offset once.
@@ -1876,6 +2941,9 @@ class LoopedReductionStrategy(ReductionStrategy):
         # codegen_device_loop); used to position vec hoists and vec-store
         # flushes relative to the V-loop.
         self._cute_lane_vloop: ast.For | None = None
+        # The lane body list of the current sweep, which the dispatcher splices
+        # hoists into; None until the consume-unroll form below builds it.
+        self._cute_lane_body: list[ast.AST] | None = None
         # Vec-store flush sites already spliced into the current lane body
         # (list of list-var names), in source order.
         self._cute_lane_vec_stores: list[str] = []
@@ -1909,12 +2977,35 @@ class LoopedReductionStrategy(ReductionStrategy):
                 inner_body[0] = statement_from_string(
                     f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} + cutlass.Int32({reduction_lane_var}) * {self._thread_count}"
                 )
+        chunk_mask_stmts: list[ast.AST] = []
         if (mask_var := self._mask_var) is not None:
-            inner_body.append(
-                statement_from_string(
-                    f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
+            numel_expr = state.sympy_expr(numel)
+            if consume_unroll and self._cute_lane_base_index_var is not None:
+                chunk_in_bounds = self.cute_chunk_in_bounds_expr(state)
+                if self._cute_reduction_chunk_uniform_mask:
+                    # ``numel % V == 0``: the chunk base decides every lane of
+                    # the chunk, so the mask is defined once above the V-loop
+                    # and vector loads/stores can be predicated on it.
+                    chunk_mask_stmts.append(
+                        statement_from_string(f"{mask_var} = {chunk_in_bounds}")
+                    )
+                else:
+                    # The tail chunk may straddle the extent: keep the
+                    # per-element mask and expose the whole-chunk predicate
+                    # for the vector fast path; its negation selects the
+                    # per-element tail.
+                    self._cute_reduction_chunk_full_var = self.fn.new_var(
+                        f"reduction_chunk_full_{block_index}", dce=True
+                    )
+                    chunk_mask_stmts.append(
+                        statement_from_string(
+                            f"{self._cute_reduction_chunk_full_var} = {chunk_in_bounds}"
+                        )
+                    )
+            if not self._cute_reduction_chunk_uniform_mask or not chunk_mask_stmts:
+                inner_body.append(
+                    statement_from_string(f"{mask_var} = {index_var} < {numel_expr}")
                 )
-            )
         body = inner_body
         if reduction_lane_var is not None:
             from .tile_strategy import _create_lane_loop
@@ -1936,6 +3027,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
                 lane_body: list[ast.AST] = [
                     base_stmt,
+                    *chunk_mask_stmts,
                     vec_for,
                 ]
                 body = [
@@ -1963,12 +3055,22 @@ class LoopedReductionStrategy(ReductionStrategy):
 
         range_begin = "0"
         range_end = state.sympy_expr(numel)
+        dynamic_trips = state.device_function.cute_state.dynamic_reduction_trips.get(
+            offset_var
+        )
+        if env.backend.name == "cute" and dynamic_trips is not None:
+            # Same ``ceil(extent / block)`` trips as ``range(0, extent, block)``
+            # (the bounds mask still covers the tail), but the bound is a
+            # trace-time constant, so the DSL can unroll the short roll and
+            # keep the trip-indexed register cache in registers instead of
+            # dynamically indexed local memory.
+            range_end = f"{dynamic_trips[1]} * {block_size_var}"
         if self._cute_rolled_cluster_n > 1:
             # Cluster split: each of the ``cluster_n`` CTAs rolls over its
             # own contiguous slice (the launch adds a grid dim of
             # ``cluster_n`` CTAs per outer index); the finalize combines
             # the partials across the cluster.
-            slice_len = int(numel) // self._cute_rolled_cluster_n
+            slice_len = self._cute_rolled_cluster_slice_len
             rank_expr = env.backend.program_id_expr(1, index_dtype="cutlass.Int32")
             range_begin = f"{rank_expr} * {slice_len}"
             range_end = f"{rank_expr} * {slice_len} + {slice_len}"
@@ -1996,7 +3098,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._thread_count > 0:
+        if self._claims_thread_axis():
             tracker.record(block_index, self._get_thread_axis(), self._thread_count)
         return DeviceLoopState(
             self,
@@ -2020,18 +3122,44 @@ class LoopedReductionStrategy(ReductionStrategy):
         # See ``PersistentReductionStrategy.codegen_reduction``: record the branch
         # path of this reduction's thread axis so a mutually-exclusive sibling
         # branch's free ``hl.arange`` can reuse the axis (CuTe backend only).
-        if CompileEnvironment.current().backend.name == "cute":
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and self._claims_thread_axis()
+        ):
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
+        assert state.fx_node is not None
+        if state.fx_node.meta.get(FREE_IOTA_REDUCTION_META):
+            # Its input is computed outside the loop from a free hl.arange, so
+            # every chunk would fold the same full-extent value; only the
+            # computed-fragment lowering re-reads it per chunk.
+            raise exc.BackendUnsupported(
+                CompileEnvironment.current().backend.name,
+                "a rolled reduction of a value computed outside its loop",
+            )
         with install_inductor_kernel_handlers(state.codegen, {}):
             env = CompileEnvironment.current()
             backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
+            if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+                from .cute.argreduce import codegen_packed_reduction
+
+                packed = codegen_packed_reduction(
+                    state,
+                    self,
+                    device_loop,
+                    input_name,
+                    reduction_type,
+                    dim,
+                    fake_input,
+                    fake_output,
+                )
+                if packed is not None:
+                    return packed
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
-            acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
+            acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
-            assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
             acc_full = backend.reduction_acc_init_expr(
                 shape_dims, constant_repr(default), acc_dtype
@@ -2089,13 +3217,23 @@ class LoopedReductionStrategy(ReductionStrategy):
                     reduction_type, acc, vec_input, acc_dtype
                 )
                 state.add_statement(f"{acc} = {combine_expr}")
-                expr = self._cute_cross_warp_reduction_expr(
-                    state,
-                    device_loop,
-                    acc,
-                    reduction_type,
-                    default,
-                    acc_dtype,
+                expr = (
+                    self._cute_sibling_axis_reduction_expr(
+                        state,
+                        device_loop,
+                        acc,
+                        reduction_type,
+                        default,
+                        acc_dtype,
+                    )
+                    or self._cute_cross_warp_reduction_expr(
+                        state,
+                        device_loop,
+                        acc,
+                        reduction_type,
+                        default,
+                        acc_dtype,
+                    )
                 ) or self.call_reduction_function(
                     acc,
                     reduction_type,
@@ -2104,6 +3242,18 @@ class LoopedReductionStrategy(ReductionStrategy):
                     fake_output,
                 )
             else:
+                if (
+                    backend.name == "cute"
+                    and self._thread_count > 1
+                    and self._cute_lanes_below_reduce_axis(state, device_loop)[0] > 1
+                ):
+                    # The argreduce finalize folds consecutive lanes too.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"rolled {reduction_type} over thread axis "
+                        f"{self._get_thread_axis()} interleaved with sibling "
+                        "lanes below it",
+                    )
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
                 index_dtype = env.index_dtype
                 device_loop.outer_prefix.append(
@@ -2169,6 +3319,15 @@ class BlockReductionStrategy(ReductionStrategy):
         # instead of the newly created one from TileStrategy.__init__
         return self._codegen.index_var(block_idx)
 
+    def argreduce_position_var(self) -> str:
+        # argmax over ``x[tm, tn]`` counts positions from the tile's first
+        # element, as torch does on the tile; the index holds tile.begin +
+        # position.
+        return (
+            f"(({self.index_var(self.block_index)}) - "
+            f"({self._codegen.tile_begin_var(self.block_index)}))"
+        )
+
     def _reduction_thread_count(self) -> int:
         """Return the live thread extent of the reduced tile block.
 
@@ -2182,12 +3341,12 @@ class BlockReductionStrategy(ReductionStrategy):
         extent = self.fn.tile_strategy.thread_extent_for_block_id(self.block_index)
         return extent if extent is not None and extent > 0 else 0
 
-    def _lane_loop_cross_warp_group_params(
+    def _lane_loop_group_params(
         self,
     ) -> tuple[int, int, int, str] | None:
         """Return ``(pre, group_span, group_count, lane_expr)`` for a tile block
         that is reduced over its inner (tiled) dim AND carries a runtime lane
-        loop, or ``None`` when no cross-warp de-interleaving is required.
+        loop, or ``None`` when no de-interleaving is required.
 
         When the reduced block is mapped to a thread axis ABOVE a sibling tile
         axis (e.g. ``hl.tile([o, d])`` where ``d`` is reduced, ``d`` on
@@ -2206,8 +3365,11 @@ class BlockReductionStrategy(ReductionStrategy):
         * ``lane_expr`` — the linear thread index across all live thread axes.
 
         Returns ``None`` (so the caller keeps the plain warp-reduce / no-op
-        finalize) unless the reduce group is genuinely cross-warp
-        (``pre > 1`` and ``group_span`` a multiple of 32 greater than 32).
+        finalize) for contiguous groups (``pre == 1``) fitting one warp.
+        Strided groups use a single-warp grouped reduce when
+        ``group_span <= 32``. Wider groups, including contiguous ones, use
+        the two-stage shared reduce when ``group_span`` is a multiple of 32;
+        groups straddling a warp boundary without that alignment are rejected.
         """
         env = CompileEnvironment.current()
         backend = env.backend
@@ -2219,6 +3381,14 @@ class BlockReductionStrategy(ReductionStrategy):
             reduce_axis = self._aliased_active_thread_axis(block_axes)
         if reduce_axis is None:
             return None
+        # Under an ``hl.barrier()`` launch another phase may run more lanes on
+        # the sibling axes than this phase's loops; the finalize must stride
+        # by the shared launch, and the launcher checks the assumed layout.
+        _widen_lane_layout_for_barrier_phases(
+            self._codegen,
+            axis_sizes,
+            subject=f"lane-loop reduction over tile block {self.block_index}",
+        )
         # Live thread extents per axis (sibling axes included) so the linear
         # lane index strides are computed correctly.
         logical_axis_sizes = {
@@ -2226,28 +3396,41 @@ class BlockReductionStrategy(ReductionStrategy):
         }
         if reduce_axis not in logical_axis_sizes:
             return None
+        # Earlier full-slice reductions can own physical axes absent from
+        # the active tile mapping. Their lanes still stride this reduction.
+        for axis, size in enumerate(self._planned_thread_dims()):
+            if size > 1:
+                logical_axis_sizes.setdefault(axis, size)
         pre = 1
         for axis in range(reduce_axis):
             pre *= logical_axis_sizes.get(axis, 1)
-        if pre <= 1:
-            # The reduce axis is already at the bottom of the linear lane
-            # index: consecutive warp lanes belong to the reduction, so the
-            # plain warp reduce is correct (no de-interleaving needed).
-            return None
         reduce_extent = logical_axis_sizes[reduce_axis]
-        group_span = pre * reduce_extent
-        if group_span <= 32 or group_span % 32 != 0:
-            # Single-warp (or non-warp-aligned) groups are not handled by the
-            # cross-warp two-stage path.
+        if pre <= 1 and reduce_extent <= 32:
+            # The reduce axis is already at the bottom of the linear lane
+            # index and fits one warp: consecutive warp lanes belong to the
+            # reduction, so the plain warp reduce is correct.  A wider
+            # bottom-axis group (> 32 threads) still needs the cross-warp
+            # shared reduce below: a warp shuffle cannot span warps.
             return None
+        group_span = pre * reduce_extent
         num_threads = 1
         for size in logical_axis_sizes.values():
             num_threads *= size
-        if num_threads % group_span != 0:
-            return None
         lane_expr = backend.thread_linear_index_expr(logical_axis_sizes)
-        if lane_expr is None:
-            return None
+        if (
+            (group_span > 32 and group_span % 32 != 0)
+            or num_threads % group_span != 0
+            or lane_expr is None
+        ):
+            # A reduce group that straddles a warp boundary (or an uneven
+            # group tiling of the CTA) cannot be de-interleaved by either the
+            # single-warp grouped reduce or the two-stage shared reduce.
+            raise exc.BackendUnsupported(
+                "cute",
+                "lane-loop reduction group is interleaved with a sibling thread "
+                f"axis but is not warp-aligned (pre={pre}, span={group_span}, "
+                f"threads={num_threads})",
+            )
         return pre, group_span, num_threads // group_span, lane_expr
 
     def _active_thread_layout(self) -> tuple[dict[int, int], dict[int, int]]:
@@ -2270,6 +3453,17 @@ class BlockReductionStrategy(ReductionStrategy):
             for axis, size in current_grid.thread_axis_sizes.items():
                 axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
             block_axes.update(current_grid.block_thread_axes)
+        # Full-slice axes need not be in the active loop nest. Their threads
+        # still determine the stride between rows of a tiled reduction.
+        for strategy in self.fn.tile_strategy.strategies:
+            if isinstance(
+                strategy, (PersistentReductionStrategy, LoopedReductionStrategy)
+            ):
+                count = strategy._reduction_thread_count()
+                axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+                if count > 1 and axis is not None:
+                    block_axes[strategy.block_index] = axis
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), count)
         return block_axes, axis_sizes
 
     def _aliased_active_thread_axis(self, block_axes: dict[int, int]) -> int | None:
@@ -2310,6 +3504,25 @@ class BlockReductionStrategy(ReductionStrategy):
                     ):
                         return candidate_block_id
         return None
+
+    def _launch_thread_axis_extent(self, axis: int, extent: int) -> int:
+        """``extent`` widened to the launch's thread count along ``axis``.
+
+        Sibling loop paths reuse a CUDA axis and the launch takes the widest
+        of them, so a narrower sibling (a 16-row ``hl.tile`` beside a
+        32-thread K loop) runs with surplus threads: their tile mask fails,
+        so they hold the reduction's identity, but they execute every
+        collective of the body.  A cross-thread combine over the axis has to
+        span them.  A group sized to the strategy's own extent leaves the
+        surplus threads reducing among themselves, so a value every thread of
+        the row is meant to hold -- a per-column sum multiplied back into the
+        row and stored by all of them -- differs between the real and the
+        surplus writers of one address, and the shared-memory combines index
+        slots past their allocation.  ``_normalize_shared_tile_thread_extents``
+        widens SIMT tile strategies to the launch ahead of codegen, but not in
+        a kernel with a matmul, whose layouts keep their own thread contracts.
+        """
+        return max(extent, self._codegen.launch_thread_axis_sizes().get(axis, 1))
 
     def _strided_thread_reduction_expr(
         self,
@@ -2496,9 +3709,6 @@ class BlockReductionStrategy(ReductionStrategy):
         if backend.name != "cute":
             debug("skip backend", backend.name)
             return None
-        if backend.is_indexed_reduction(reduction_type):
-            debug("skip indexed", reduction_type)
-            return None
         if self._reduction_block_is_serial():
             debug("skip serial", self.block_index)
             return None
@@ -2589,7 +3799,21 @@ class BlockReductionStrategy(ReductionStrategy):
             strategy = self.fn.tile_strategy.block_id_to_strategy.get(
                 (self.block_index,)
             )
-            if strategy is not None:
+            # A strategy's starting axis belongs to its first block that
+            # holds threads.  A block of one holds none (its
+            # ``_thread_axis_map`` entry is the next block's axis), so a
+            # reduction over it has nothing to combine across: taking the
+            # axis would fold the sibling block's tile instead of passing
+            # the single element through.  A single-thread reduction block
+            # reports an extent of 1 but claims no axis either
+            # (``_claims_thread_axis``): the axis the dispatcher parks it on
+            # may be a wider tile's, so it must not be reduced across.
+            if (
+                strategy is not None
+                and strategy.thread_axes_used() > 0
+                and self.fn.tile_strategy.thread_extent_for_block_id(self.block_index)
+                is not None
+            ):
                 reduce_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
             if reduce_axis is not None:
                 hint = _reduction_threads_from_annotation(state)
@@ -2650,6 +3874,24 @@ class BlockReductionStrategy(ReductionStrategy):
                 logical_axis_sizes.get(reduce_axis, 1),
                 self._codegen.max_thread_block_dims[reduce_axis],
             )
+
+        # Earlier full-slice reductions can own physical axes absent from
+        # the active tile mapping. Their lanes still stride this reduction.
+        for axis, size in enumerate(self._planned_thread_dims()):
+            if size > 1:
+                logical_axis_sizes.setdefault(axis, size)
+
+        # Every axis the tile is distributed over spans the launch's threads
+        # along it: the surplus threads of a sibling narrower than the launch
+        # execute this combine holding the identity, and the lane expression
+        # has to follow the physical layout (``_launch_thread_axis_extent``).
+        # An axis of extent 1 is not distributed: every thread holds the same
+        # element there, so the launch's threads along it are not combined.
+        strategy_axis_sizes = dict(logical_axis_sizes)
+        for axis, size in strategy_axis_sizes.items():
+            if size > 1:
+                logical_axis_sizes[axis] = self._launch_thread_axis_extent(axis, size)
+        surplus_threads = logical_axis_sizes != strategy_axis_sizes
 
         pre = 1
         for axis in range(reduce_axis):
@@ -2725,7 +3967,19 @@ class BlockReductionStrategy(ReductionStrategy):
         # the reduction block is no longer in ``active_device_loops``
         # (e.g. ``cute_dynamic_row_sum``'s ``acc.sum(-1)`` after the
         # inner ``hl.tile`` exits) and would silently drop the reduce.
-        if pre <= 1 and group_span <= 32 and num_threads == group_span:
+        # Under surplus threads the direct path would size its group by the
+        # block's own extent, so the strided form is kept.  The same drop
+        # happens with one warp per CTA when the block's loop has exited
+        # (one row per CTA on 32 column threads: ``acc.mean(dim=1)`` after
+        # the loop became each thread's own column), so the shortcut is
+        # only taken by a block with a live thread axis.
+        if (
+            pre <= 1
+            and group_span <= 32
+            and num_threads == group_span
+            and not surplus_threads
+            and self._reduction_block_has_live_thread_axis()
+        ):
             debug(
                 "skip small direct",
                 tuple(fake_input.size()),
@@ -2770,7 +4024,6 @@ class BlockReductionStrategy(ReductionStrategy):
                 f"num_threads ({num_threads}) must be divisible by "
                 f"group_span ({group_span})"
             )
-            smem_budget_bytes = _cute_shared_memory_budget_bytes()
             group_count = num_threads // group_span
             lane_var = self.fn.new_var("strided_lane", dce=True)
             lane_in_group_var = self.fn.new_var("strided_lane_in_group", dce=True)
@@ -2778,12 +4031,31 @@ class BlockReductionStrategy(ReductionStrategy):
             state.add_statement(f"{lane_var} = {lane_expr}")
             state.add_statement(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
             state.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}")
+        elif self._lane_reduce_cluster_n() > 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_cluster_n > 1 requires a cross-warp reduce group; "
+                "this config reduces within single warps",
+            )
+
+        def grouped_reduce(
+            value: str, combine: str, identity: str, value_dtype: torch.dtype
+        ) -> str:
+            if group_span <= 32:
+                return (
+                    "_cute_grouped_reduce_warp("
+                    f"{value}, {combine!r}, {identity}, {lane_expr}, "
+                    f"pre={pre}, group_span={group_span})"
+                )
+            smem_budget_bytes = _cute_shared_memory_budget_bytes()
             if group_span % 32 == 0:
                 warps_per_group = group_span // 32
                 partials_size = group_count * pre * warps_per_group
                 results_size = group_count * pre
                 if (
-                    _cute_reduction_smem_bytes(partials_size + results_size, acc_dtype)
+                    _cute_reduction_smem_bytes(
+                        partials_size + results_size, value_dtype
+                    )
                     > smem_budget_bytes
                 ):
                     raise exc.BackendUnsupported(
@@ -2801,10 +4073,10 @@ class BlockReductionStrategy(ReductionStrategy):
                     )
                 return self._strided_thread_reduction_expr_shared_two_stage(
                     state=state,
-                    input_name=input_expr,
-                    reduction_type=reduction_type,
-                    acc_dtype=acc_dtype,
-                    identity_expr=identity_expr,
+                    input_name=value,
+                    reduction_type=combine,
+                    acc_dtype=value_dtype,
+                    identity_expr=identity,
                     lane_var=lane_var,
                     lane_in_group_var=lane_in_group_var,
                     lane_mod_pre_var=lane_mod_pre_var,
@@ -2813,7 +4085,7 @@ class BlockReductionStrategy(ReductionStrategy):
                     group_count=group_count,
                 )
             if (
-                _cute_reduction_smem_bytes(num_threads + group_count * pre, acc_dtype)
+                _cute_reduction_smem_bytes(num_threads + group_count * pre, value_dtype)
                 > smem_budget_bytes
             ):
                 raise exc.BackendUnsupported(
@@ -2827,10 +4099,10 @@ class BlockReductionStrategy(ReductionStrategy):
                 )
             return self._strided_thread_reduction_expr_shared_tree(
                 state=state,
-                input_name=input_expr,
-                reduction_type=reduction_type,
+                input_name=value,
+                reduction_type=combine,
                 fake_input=fake_input,
-                identity_expr=identity_expr,
+                identity_expr=identity,
                 lane_var=lane_var,
                 lane_in_group_var=lane_in_group_var,
                 lane_mod_pre_var=lane_mod_pre_var,
@@ -2840,16 +4112,236 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
-        if self._lane_reduce_cluster_n() > 1:
+        if not backend.is_indexed_reduction(reduction_type):
+            return grouped_reduce(input_expr, reduction_type, identity_expr, acc_dtype)
+        # argmin/argmax: the winning value, then the lowest index holding it,
+        # as the persistent strategy's grouped combine does.
+        value_var = self.fn.new_var("strided_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + grouped_reduce(
+                input_expr,
+                "min" if reduction_type == "argmin" else "max",
+                identity_expr,
+                acc_dtype,
+            )
+        )
+        index_dtype = env.index_dtype
+        index_dtype_str = backend.index_type_str(index_dtype)
+        max_index = backend.cast_expr(
+            repr(torch.iinfo(index_dtype).max), index_dtype_str
+        )
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        candidate = argreduce_candidate_expr(index, input_expr, value_var, max_index)
+        return backend.cast_expr(
+            grouped_reduce(candidate, "min", max_index, index_dtype),
+            backend.dtype_str(torch.int64),
+        )
+
+    def _lane_loop_marker_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        acc_dtype: torch.dtype,
+        default: float | bool,
+        threads: int,
+        *,
+        strided_restore: bool = False,
+    ) -> str:
+        """Emit the two-pass lane-reduction marker for a lane-looped block.
+
+        The ``split_lane_loop_reductions`` post-pass rewrites the marker into
+        accumulate-across-lanes -> combine-across-``threads`` -> consume.  When
+        the reduced tile dim sits ABOVE a sibling tile axis on the linear
+        thread index, the grouped/strided params are attached so the finalize
+        de-interleaves the sibling rows (single-warp grouped reduce or the
+        cross-warp two-stage shared reduction) instead of folding consecutive
+        lanes that belong to different rows.
+        """
+        from .tile_strategy import _lane_reduce_marker_expr
+
+        env = CompileEnvironment.current()
+        identity_expr = env.backend.cast_expr(
+            constant_repr(default), _dtype_str(acc_dtype)
+        )
+        reduce_axis = self.fn.tile_strategy.thread_axis_for_block_id(self.block_index)
+        if (
+            threads > 1
+            and reduce_axis is not None
+            and self._launch_thread_axis_extent(reduce_axis, threads) != threads
+        ):
+            # The surplus threads of the launch walk this lane loop too; with
+            # a strided lane layout their elements alias the real threads'
+            # and a group spanning them would count those twice, while a
+            # group of the block's own threads leaves them a partial every
+            # owner-guarded consume store would race with.
             raise exc.BackendUnsupported(
                 "cute",
-                "cute_cluster_n > 1 requires a cross-warp reduce group; "
-                "this config reduces within single warps",
+                "lane-looped reduction over a tile axis narrower than the "
+                f"launch (threads={threads}, launch="
+                f"{self._launch_thread_axis_extent(reduce_axis, threads)})",
             )
-        return (
-            "_cute_grouped_reduce_warp("
-            f"{input_expr}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
-            f"pre={pre}, group_span={group_span})"
+        group_params = self._lane_loop_group_params()
+        owner_lane = self._lane_reduce_owner(state)
+        cluster_n = self._lane_reduce_cluster_n()
+        if cluster_n > 1 and group_params is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_cluster_n > 1 requires the cross-warp grouped reduce path",
+            )
+        if group_params is None:
+            return _lane_reduce_marker_expr(
+                input_name,
+                reduction_type,
+                identity_expr,
+                threads,
+                owner_lane=owner_lane,
+                strided_restore=strided_restore,
+            )
+        group_pre, group_span, group_count, group_lane_expr = group_params
+        return _lane_reduce_marker_expr(
+            input_name,
+            reduction_type,
+            identity_expr,
+            threads,
+            group_pre=group_pre,
+            group_span=group_span,
+            group_lane_expr=group_lane_expr,
+            group_count=group_count,
+            group_cluster_n=cluster_n,
+            owner_lane=owner_lane,
+            strided_restore=strided_restore,
+        )
+
+    def _device_lane_loop_marker_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        acc_dtype: torch.dtype,
+        default: float | bool,
+    ) -> str | None:
+        """Two-pass marker for a block distributed by a ``DeviceLoopState``
+        lane loop, or ``None`` when this reduction is not lane-looped.
+
+        Without this, a lane-looped tile reduction whose block also owns a
+        live thread axis falls through to the per-element strided thread
+        reduction: every synthetic lane then pays a full cross-thread (warp
+        shuffle or shared-memory two-stage) combine, e.g. 256 CTA-wide
+        shared reductions per row tile instead of one after the lane loop.
+        """
+        env = CompileEnvironment.current()
+        if (
+            env.backend.name != "cute"
+            or not isinstance(default, (float, int, bool))
+            or not self._reduction_block_in_device_lane_loop()
+            or self._lane_reduce_marker_unsupported(state)
+        ):
+            return None
+        for loops in self._codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceLoopState)
+                    and self.block_index in loop_state.lane_loop_blocks
+                    and isinstance(loop_state.strategy, PerThreadNDTileStrategy)
+                    and loop_state.strategy._cute_lane_vec_width_by_block.get(
+                        self.block_index, 1
+                    )
+                    != 1
+                ):
+                    # The marker would sit inside the block's constexpr vector
+                    # loop, which the two-pass lane splitter does not fold;
+                    # the vector-fold (``hoist_warp_reduce``) and resident
+                    # sequence lowerings own that shape.
+                    return None
+        threads = self._lane_reduce_threads_in_group()
+        if threads is None:
+            return None
+        # The loop body keeps its per-element strided form; when the two-pass
+        # split is unsafe the marker is finalized per lane, which is complete
+        # for lane-carry consumers, and the shares are totalled over the lanes
+        # for any other lane-invariant consumer (``_restore_lane_markers``).
+        return self._lane_loop_reduction_expr(
+            state,
+            input_name,
+            reduction_type,
+            dim,
+            fake_input,
+            acc_dtype,
+            default,
+            threads,
+            strided_restore=True,
+        )
+
+    def _lane_loop_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        acc_dtype: torch.dtype,
+        default: float | bool,
+        threads: int,
+        *,
+        strided_restore: bool = False,
+    ) -> str:
+        """The lane-loop marker of a value reduction, or for argmin/argmax
+        the winning value across the lanes and then the lowest index holding
+        it, as two dependent lane reductions (as the persistent strategy's
+        synthetic lanes do)."""
+        backend = CompileEnvironment.current().backend
+        if not backend.is_indexed_reduction(reduction_type):
+            return self._lane_loop_marker_expr(
+                state,
+                input_name,
+                reduction_type,
+                acc_dtype,
+                default,
+                threads,
+                strided_restore=strided_restore,
+            )
+        index_dtype = CompileEnvironment.current().index_dtype
+        value_var = self.fn.new_var("lane_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + self._lane_loop_marker_expr(
+                state,
+                input_name,
+                "min" if reduction_type == "argmin" else "max",
+                acc_dtype,
+                default,
+                threads,
+                strided_restore=strided_restore,
+            )
+        )
+        max_index = torch.iinfo(index_dtype).max
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        input_expr = backend.cast_expr(input_name, _dtype_str(acc_dtype))
+        # The post-pass slices each marker's input by name, so the candidate
+        # stays a plain variable.
+        candidate_var = self.fn.new_var("lane_reduce_index", dce=True)
+        max_index_expr = backend.cast_expr(
+            repr(max_index), backend.index_type_str(index_dtype)
+        )
+        state.add_statement(
+            f"{candidate_var} = "
+            + argreduce_candidate_expr(index, input_expr, value_var, max_index_expr)
+        )
+        return backend.cast_expr(
+            self._lane_loop_marker_expr(
+                state,
+                candidate_var,
+                "min",
+                index_dtype,
+                max_index,
+                threads,
+                strided_restore=strided_restore,
+            ),
+            backend.dtype_str(torch.int64),
         )
 
     def _strided_thread_reduction_expr_shared_two_stage(
@@ -2867,8 +4359,21 @@ class BlockReductionStrategy(ReductionStrategy):
         group_span: int,
         group_count: int,
     ) -> str:
-        result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        from .cute.integer_loop_reduction import defer_collective
+
         cluster_n = self._lane_reduce_cluster_n()
+        if cluster_n == 1 and defer_collective(
+            state,
+            block=self.block_index,
+            operation=reduction_type,
+            dtype=acc_dtype,
+            identity=identity_expr,
+            pre=pre,
+            span=group_span,
+            groups=group_count,
+        ):
+            return input_name
+        result_var = self.fn.new_var("strided_reduce_result", dce=True)
         if cluster_n > 1 and pre == 1 and group_count == 1:
             # The reduced axis is additionally split across the CTAs of a
             # thread-block cluster (``cute_cluster_n``): combine within-CTA
@@ -2936,7 +4441,8 @@ class BlockReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         _log_cute_reduction_layout(state)
-        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         assert isinstance(default, (float, int, bool))
         env = CompileEnvironment.current()
         dim_size = fake_input.size(dim)
@@ -2954,6 +4460,27 @@ class BlockReductionStrategy(ReductionStrategy):
                 env.backend.full_expr(
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
+            )
+        if (
+            env.backend.name == "cute"
+            and (
+                symbolic_extent := self.fn.tile_strategy.symbolic_thread_extent_expr(
+                    self.block_index
+                )
+            )
+            is not None
+        ):
+            # The dim lives one element per thread on a launch axis whose
+            # extent is a kernel argument (``hl.tile(n, block_size=bsz)``).
+            # Every combine across threads is sized at codegen, where the
+            # extent is unknown: the strided and direct forms find no thread
+            # axis and the fallback below passes each thread's own element
+            # through as the total.
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"{reduction_type} over tile dim {self.block_index}, whose "
+                f"{symbolic_extent} threads are sized by a kernel argument: the "
+                "combine across them needs a static thread extent",
             )
         has_lane_loop = (
             self._reduction_block_has_lane_loops()
@@ -2979,6 +4506,23 @@ class BlockReductionStrategy(ReductionStrategy):
         if sequence_expr is not None:
             expr = sequence_expr
         elif (
+            lane_marker_expr := self._device_lane_loop_marker_expr(
+                state, input_name, reduction_type, dim, fake_input, acc_dtype, default
+            )
+        ) is not None:
+            expr = lane_marker_expr
+        elif (
+            env.backend.is_indexed_reduction(reduction_type)
+            and self._reduction_block_in_device_lane_loop()
+        ):
+            # The per-element combine below would leave each lane's own
+            # winner; only the two-pass lane marker sees every lane.
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"{reduction_type} over tile dim {self.block_index} split across "
+                "a lane loop the two-pass lane reduction cannot place",
+            )
+        elif (
             strided_expr := self._strided_thread_reduction_expr(
                 state,
                 input_name,
@@ -2986,7 +4530,7 @@ class BlockReductionStrategy(ReductionStrategy):
                 dim,
                 fake_input,
                 default,
-                get_computation_dtype(fake_output.dtype),
+                acc_dtype,
             )
         ) is not None:
             expr = strided_expr
@@ -3005,49 +4549,16 @@ class BlockReductionStrategy(ReductionStrategy):
                 # that the ``split_lane_loop_reductions`` post-pass rewrites
                 # into a two-pass (accumulate across lanes -> combine across
                 # ``threads`` -> consume) lane structure.
-                from .tile_strategy import _lane_reduce_marker_expr
-
-                acc_dtype = get_computation_dtype(fake_input.dtype)
-                identity_expr = env.backend.cast_expr(
-                    constant_repr(default), _dtype_str(acc_dtype)
+                expr = self._lane_loop_reduction_expr(
+                    state,
+                    input_name,
+                    reduction_type,
+                    dim,
+                    fake_input,
+                    acc_dtype,
+                    default,
+                    threads,
                 )
-                group_params = self._lane_loop_cross_warp_group_params()
-                owner_lane = self._lane_reduce_owner(state)
-                cluster_n = self._lane_reduce_cluster_n()
-                if cluster_n > 1 and group_params is None:
-                    raise exc.BackendUnsupported(
-                        "cute",
-                        "cute_cluster_n > 1 requires the cross-warp "
-                        "grouped reduce path",
-                    )
-                if group_params is not None:
-                    # The reduce group is spread across warps (the reduced tile
-                    # dim sits ABOVE a sibling tile axis on the linear thread
-                    # index). Carry the strided/grouped params so the post-pass
-                    # finalize uses the cross-warp two-stage shared reduction
-                    # instead of a (row-cross-contaminating) consecutive-lane
-                    # warp reduce.
-                    group_pre, group_span, group_count, group_lane_expr = group_params
-                    expr = _lane_reduce_marker_expr(
-                        input_name,
-                        reduction_type,
-                        identity_expr,
-                        threads,
-                        group_pre=group_pre,
-                        group_span=group_span,
-                        group_lane_expr=group_lane_expr,
-                        group_count=group_count,
-                        group_cluster_n=cluster_n,
-                        owner_lane=owner_lane,
-                    )
-                else:
-                    expr = _lane_reduce_marker_expr(
-                        input_name,
-                        reduction_type,
-                        identity_expr,
-                        threads,
-                        owner_lane=owner_lane,
-                    )
             else:
                 # A serial device loop (or no thread axis at all). A warp-level
                 # reduction would fold together unrelated tensor elements, so
@@ -3055,6 +4566,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 # the surrounding loop-carried accumulator performs the real
                 # reduction.
                 expr = input_name
+                if env.backend.is_indexed_reduction(reduction_type):
+                    # That one element wins at its own position, not its value.
+                    expr = env.backend.cast_expr(
+                        self.argreduce_position_var(),
+                        env.backend.dtype_str(torch.int64),
+                    )
         else:
             expr = self.call_reduction_function(
                 input_name,

@@ -10,8 +10,10 @@ import torch
 from .test_cute_grid_launch_extents import _code
 from .test_cute_grid_launch_extents import _config
 from .test_cute_grid_launch_extents import _grid_argreduce
+import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -111,3 +113,74 @@ def test_argreduce_offset_ctas_and_tail_validity(
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(run(*args), actual, atol=0, rtol=0)
     torch.testing.assert_close((a, b), saved, atol=0, rtol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _packed_row_argreduce(x: torch.Tensor, largest: hl.constexpr) -> torch.Tensor:
+    out = torch.empty((x.size(0),), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        if largest:
+            out[row] = torch.argmax(x[row, :], dim=-1)
+        else:
+            out[row] = torch.argmin(x[row, :], dim=-1)
+    return out
+
+
+@pytest.mark.parametrize(
+    "dtype,width,packed",
+    [
+        (torch.bfloat16, 65, True),
+        (torch.float16, 65, True),
+        (torch.float32, 65, False),
+        (torch.bfloat16, 65536, False),
+    ],
+)
+def test_packed_argreduce_codegen_guards(
+    dtype: torch.dtype, width: int, packed: bool
+) -> None:
+    code = _code(
+        _packed_row_argreduce,
+        (torch.empty((17, width), dtype=dtype), True),
+        helion.Config(block_sizes=[4], num_threads=[4, 32]),
+    )
+    assert ("_cute_argreduce_key" in code) == packed
+    if packed:
+        assert code.count("cute.arch.warp_reduction_max") == 1
+        assert "argmax_acc_index" not in code
+        assert "alloc_smem" not in code
+
+
+def _argreduce_extremes(width: int, dtype: torch.dtype) -> torch.Tensor:
+    x = torch.randn((17, width), dtype=dtype, device=DEVICE)
+    x[0] = 0.0
+    x[0, 0::2] = -0.0
+    x[1] = 0.0
+    x[1, 1::2] = -0.0
+    x[2] = float("inf")
+    x[3] = -float("inf")
+    x[4] = torch.arange(width, device=DEVICE).remainder(3).to(dtype)
+    x[5, width // 2] = float("nan")
+    x[5, -1] = float("nan")
+    x[6] = float("nan")
+    x[-1] = 0.0
+    x[-1, -1] = 10.0
+    return x
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("width", [1, 31, 65, 513, 32768])
+@pytest.mark.parametrize("largest", [False, True])
+def test_packed_argreduce_ties_nan_and_padding(
+    dtype: torch.dtype, width: int, largest: bool
+) -> None:
+    x = _argreduce_extremes(width, dtype)
+    original = x.clone()
+    args = (x, largest)
+    bound = _packed_row_argreduce._bind_isolated(args)
+    config = helion.Config(block_sizes=[4], num_threads=[4] if width == 1 else [4, 32])
+    assert ("_cute_argreduce_key" in bound.to_code(config)) == (width > 1)
+    actual = bound.compile_config(config)(*args)
+    fn = torch.argmax if largest else torch.argmin
+    torch.testing.assert_close(actual, fn(original, dim=1), rtol=0, atol=0)
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))

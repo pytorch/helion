@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -43,6 +44,21 @@ def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = acc.to(out.dtype)
     return out
+
+
+def _reshape_view_lhs_gemm(x3: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    b, m, k = x3.shape
+    _, n = w.shape
+    # Host-side view: neither an input nor a fresh allocation. It inherits its
+    # input's recorded base alignment, so codegen proves its TMA descriptor.
+    x2 = x3.reshape([b * m, k])
+    out = torch.empty((b * m, n), dtype=x3.dtype, device=x3.device)
+    for tile_m, tile_n in hl.tile((b * m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x2[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out.view(b, m, n)
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +169,69 @@ def test_ineligible_bind_has_no_ordinary_ffi_search_coordinate(
         assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
 
 
+def _assert_ffi_seed_declined(bound: BoundKernel) -> None:
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is False
+        assert not tc.full_tile_direct_entry_seed_eligible()
+        assert tc.full_tile_direct_entry_seed_config() is None
+        assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
+        # The fact is decided before the seed heuristics run, so the FFI
+        # population seed is withheld as well, not just the default projection.
+        assert all(
+            seed.config.get("tcgen05_tvm_ffi_launch") is not True
+            for seed in bound.config_spec.compiler_seed_configs
+        )
+        generator = ConfigGeneration(bound.config_spec)
+        default = generator.unflatten(generator.default_flat())
+        assert default.config.get("tcgen05_tvm_ffi_launch") is not True
+        assert default.config.get("tcgen05_flat_role_coordinates") is not True
+        assert default.config["tcgen05_layout_strategy"] == "default"
+        assert default.config["tcgen05_cluster_m"] == 1
+
+
+def test_reshape_view_lhs_keeps_ffi_seed() -> None:
+    # examples/broadcast_matmul.py at (16, 512, 768, 1024): the flattened
+    # 8192x768x1024 GEMM is shape-eligible for the direct-entry seed and its
+    # LHS is a pointer-preserving view of one aligned input. The bind-time
+    # proof must agree with codegen, which proves such views through the
+    # input's recorded base alignment, so the validated FFI default stays.
+    args = (
+        torch.empty((16, 512, 768), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE),
+    )
+    kernel = helion.kernel(_reshape_view_lhs_gemm, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is True
+        assert tc.full_tile_direct_entry_seed_eligible()
+        assert "tcgen05_tvm_ffi_launch" in tc.optional_fragments(for_search=True)
+
+
+@pytest.mark.parametrize("misalignment", ["stride", "base"])
+def test_unaligned_input_declines_ffi_seed(misalignment: str) -> None:
+    # A 772-element bf16 row stride is 1544 bytes and a 4-element storage
+    # offset is 8 bytes: neither is 16-byte aligned, so the live TensorMap
+    # alignment classifier declines exactly as codegen would, and the plain
+    # cluster_m=1 default is projected instead of the TMA-only FFI seed.
+    if misalignment == "stride":
+        lhs = torch.empty((8192, 772), dtype=torch.bfloat16, device=CPU_DEVICE)[:, :768]
+    else:
+        lhs = torch.empty(8192 * 768 + 4, dtype=torch.bfloat16, device=CPU_DEVICE)[
+            4:
+        ].view(8192, 768)
+    args = (lhs, torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE))
+    kernel = helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True)
+    _assert_ffi_seed_declined(kernel.bind(args))
+    # The identical GEMM over aligned inputs keeps the validated FFI default.
+    bound = _bind(torch.bfloat16, (8192, 1024, 768))
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is True
+        assert tc.full_tile_direct_entry_seed_eligible()
+
+
 def test_missing_ab_budget_retains_ffi_decline() -> None:
     with patch.object(
         CuteTcgen05Config, "per_cta_ab_smem_budget_bytes", return_value=0
@@ -248,3 +327,70 @@ def _cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
             requires_grad=tensor.requires_grad,
         )
     return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
+
+
+_PREFETCH = "cute.nvgpu.cpasync.prefetch_descriptor("
+_PREFETCH_RE = re.escape(_PREFETCH)
+
+
+@pytest.mark.parametrize(
+    ("pid_type", "two_cta"),
+    [
+        ("flat", False),
+        ("persistent_interleaved", False),
+        ("persistent_interleaved", True),
+    ],
+)
+def test_plain_gemm_prefetches_every_tma_descriptor_once(
+    pid_type: Literal["flat", "persistent_interleaved"], two_cta: bool
+) -> None:
+    bound = _bind(torch.bfloat16, (2048, 4096, 1024))
+    if two_cta:
+        requested = helion.Config(
+            block_sizes=[256, 256, 128],
+            loop_orders=[[0, 1]],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type=pid_type,
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_tvm_ffi_launch=False,
+        )
+    else:
+        requested = helion.Config(
+            block_sizes=[128, 64, 64],
+            loop_orders=[[0, 1]],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type=pid_type,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_tvm_ffi_launch=False,
+        )
+    with bound.env:
+        config = bound.config_spec.normalized_config(requested)
+    source = bound.to_code(config)
+    # The native tcgen05 TMA mainloop and the TMA-store epilogue are active.
+    assert "cute.nvgpu.cpasync.tma_partition(tma_atom_a" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    # Every descriptor the kernel receives as an argument is prefetched exactly
+    # once at kernel entry: A/B by the TMA-load warp, D by epilogue warp 0.
+    assert source.count(_PREFETCH) == 3
+    for atom in ("tma_atom_a", "tma_atom_b", "tcgen05_tma_store_atom"):
+        assert source.count(f"{_PREFETCH}{atom}") == 1, atom
+    assert re.search(
+        rf"if tcgen05_tma_warp:\n\s+{_PREFETCH_RE}tma_atom_a\w*\)\n"
+        rf"\s+{_PREFETCH_RE}tma_atom_b\w*\)",
+        source,
+    )
+    assert re.search(
+        rf"if tcgen05_warp_idx == cutlass\.Int32\(0\):\n"
+        rf"\s+{_PREFETCH_RE}tcgen05_tma_store_atom\w*\)",
+        source,
+    )
+    ab_prefetch = source.index(f"{_PREFETCH}tma_atom_a")
+    assert ab_prefetch < source.index("cute.copy(tma_atom_a")
+    d_prefetch = source.index(f"{_PREFETCH}tcgen05_tma_store_atom")
+    assert d_prefetch < source.index("cute.copy(tcgen05_tma_store_atom")

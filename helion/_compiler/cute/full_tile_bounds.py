@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import cast
 
+from ..ast_extension import clone_ast
 from .proven_loop_bounds import _Context
 from .proven_loop_bounds import _Form
 from .proven_loop_bounds import _Proof
@@ -66,9 +67,15 @@ class FullTilePlan:
             guards.append(f"{tensor}.layout.stride[0] == 1")
             if tensor != self.relation.tensor:
                 guards.append(f"cute.size({tensor}, mode=[0]) == {extent}")
-        return ast.parse(
-            f"cutlass.const_expr({' and '.join(guards)})", mode="eval"
-        ).body
+        # Nest to the right: the SDK preprocessor repeats the accumulated
+        # left operand of a flat ``and`` four times per term, so a flat chain
+        # of these guards (14 for three tensors) grew an exponential tree and
+        # took minutes to preprocess.  Values and short-circuit order are
+        # unchanged.
+        condition = guards[-1]
+        for guard in reversed(guards[:-1]):
+            condition = f"{guard} and ({condition})"
+        return ast.parse(f"cutlass.const_expr({condition})", mode="eval").body
 
 
 def _host_linear(
@@ -392,8 +399,6 @@ def specialize_full_tile_bounds(
     packet_prefetch: int = 0,
     proven_disjoint_tensor_pairs: AbstractSet[frozenset[str]] = frozenset(),
 ) -> list[ast.stmt]:
-    from ..device_function import _clone_extended_ast
-
     module = ast.Module(body=body, type_ignores=[])
     nodes = list(ast.walk(module))
     if len(nodes) > 32768 or not _supported(body):
@@ -441,7 +446,7 @@ def specialize_full_tile_bounds(
         proof.maximum_blocks * plan.block_size,
         quotient.scale(plan.block_size),
     )
-    optimized = proof.block(cast("list[ast.stmt]", _clone_extended_ast(body)), context)
+    optimized = proof.block(cast("list[ast.stmt]", clone_ast(body)), context)
     if proof.changed == 0:
         return body
     if packet_prefetch:

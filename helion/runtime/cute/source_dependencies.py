@@ -4,21 +4,37 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import sys
+import types
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Mapping
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 # Ordinary generated kernels import these helpers without a wrapper plan.
-# Include their implementations and the L2 compatibility helper in every key;
+# Include their implementations and transitive cluster support in every key;
 # a generated import statement alone cannot identify the compiled device code.
 _COMMON_DEPENDENCIES = (
     "runtime/cute/launcher.py",
+    "runtime/cute/register_tensor.py",
+    "_compiler/cute/reduce_helpers.py",
+    "_compiler/cute/cluster_helpers.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
     "_compiler/cute/cutedsl_compat.py",
+)
+
+# The flash families (dense, gated, backward) share one generated preamble that
+# imports these runtime modules; the alternating-warpgroup body adds its own.
+_FLASH_DEPENDENCIES = (
+    "_compiler/cute/_flash_runtime.py",
+    "_compiler/cute/_flash_alt_runtime.py",
+    "_compiler/cute/_flash_gemm_ptx.py",
+    "_compiler/cute/_mlir_compat.py",
+    "_compiler/cute/epilogue_helpers.py",
 )
 
 # Keep transitive Helion device helpers with each wrapper or ordinary kernel
@@ -58,15 +74,36 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ),
     "gathered_mma_tma": (
         "_compiler/cute/_mlir_compat.py",
         "_compiler/cute/gathered_mma_runtime.py",
     ),
+    "helion_flash": _FLASH_DEPENDENCIES,
+    "helion_flash_gated": _FLASH_DEPENDENCIES,
+    "helion_flash_bwd": _FLASH_DEPENDENCIES,
+    "helion_flash_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
+    "helion_warp_mma_gemm": (
+        "_compiler/cute/_warp_mma_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",
         "_compiler/cute/kda_device_primitives.py",
+    ),
+    "gdn_recurrence_sm100": (
+        "_compiler/cute/gdn_recurrence_sm100.py",
+        "_compiler/cute/gdn_recurrence_geometry.py",
+        "_compiler/cute/affine_recurrence_primitives.py",
+    ),
+    "helion_mma_dag_tma": (
+        "_compiler/cute/_mma_dag_runtime.py",
+        "_compiler/cute/_mma_dag_tcgen05_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+        "_compiler/cute/_warp_mma_runtime.py",
     ),
 }
 
@@ -93,6 +130,58 @@ def wrapper_source_dependencies(
             return None
         result.append((relative, hashlib.sha256(source).hexdigest()))
     return tuple(result)
+
+
+# Modules whose functions a generated kernel can call as device code.  The
+# launcher is host code, keyed whole through ``_COMMON_DEPENDENCIES``; its own
+# (host-side) imports are not followed.
+_DEVICE_HELPER_PACKAGES = ("helion._compiler.cute.", "helion.runtime.cute.")
+_HOST_LAUNCHER_MODULE = "helion.runtime.cute.launcher"
+
+
+def _defining_module(value: object) -> str | None:
+    if isinstance(value, types.ModuleType):
+        return value.__name__
+    module = getattr(value, "__module__", None)
+    return module if isinstance(module, str) else None
+
+
+def referenced_helper_sources(
+    namespace: Mapping[str, object],
+) -> tuple[tuple[str, str], ...] | None:
+    """Fingerprint the Helion device-helper modules a generated kernel calls.
+
+    The generated source names helpers (``_cute_grouped_reduce_warp``, ...)
+    but not their implementations, so a helper fix must change the key of
+    every kernel that calls it.  ``namespace`` is the kernel's globals; each
+    referenced helper module's own helper imports are followed as well.
+    Missing source disables disk reuse, as in ``wrapper_source_dependencies``.
+    """
+    pending = [_defining_module(value) for value in namespace.values()]
+    seen: set[str] = set()
+    result = []
+    while pending:
+        name = pending.pop()
+        if (
+            name is None
+            or name in seen
+            or name == _HOST_LAUNCHER_MODULE
+            or not name.startswith(_DEVICE_HELPER_PACKAGES)
+        ):
+            continue
+        seen.add(name)
+        module = sys.modules.get(name)
+        if module is None:
+            return None
+        relative = "/".join(name.split(".")[1:])
+        relative += "/__init__.py" if hasattr(module, "__path__") else ".py"
+        try:
+            source = (_PACKAGE_ROOT / relative).read_bytes()
+        except OSError:
+            return None
+        result.append((relative, hashlib.sha256(source).hexdigest()))
+        pending.extend(_defining_module(value) for value in vars(module).values())
+    return tuple(sorted(result))
 
 
 def set_helper_source_hash(kernel: object, kind: str) -> None:

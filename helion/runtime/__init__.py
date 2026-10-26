@@ -50,6 +50,7 @@ from .cute.launcher import (
 )
 from .cute.launcher import cute_cuda_graph as cute_cuda_graph
 from .cute.launcher import default_cute_launcher as default_cute_launcher
+from .cute.occupancy import get_max_active_clusters as get_max_active_clusters
 from .kernel import Kernel as Kernel
 from .kernel import OutputCodeOptions as OutputCodeOptions
 from .kernel import kernel as kernel
@@ -75,7 +76,11 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
-    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
+    _persistent_state_specs: tuple[
+        tuple[torch.Tensor, int, torch.dtype, bool], ...
+    ] = (),
+    _persistent_state_process_group_name: str | None = None,
+    _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -100,6 +105,8 @@ def default_launcher(
             _remote_barrier_process_group_name=_remote_barrier_process_group_name,
             _remote_copy_scratch_specs=_remote_copy_scratch_specs,
             _persistent_state_specs=_persistent_state_specs,
+            _persistent_state_process_group_name=_persistent_state_process_group_name,
+            _persistent_state_rank_digest=_persistent_state_rank_digest,
             _minimum_resident_programs=_minimum_resident_programs,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,

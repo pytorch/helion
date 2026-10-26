@@ -246,8 +246,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
     # ── Prompt building ─────────────────────────────────────────────
 
     def _build_system_prompt(self) -> str:
-        """Return the fixed instruction block shared by every LLM request."""
-        return build_system_prompt()
+        """Build the instruction block for this backend."""
+        return build_system_prompt(backend=self.config_spec.backend_name)
 
     def _build_initial_search_guidance(self) -> str:
         """Describe the round-0 search strategy for this config space."""
@@ -255,6 +255,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
             flat_fields=self.config_spec._flat_fields(),
+            backend=self.config_spec.backend_name,
         )
 
     def _build_initial_prompt(self) -> str:
@@ -269,8 +270,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _build_refinement_prompt(self, round_num: int) -> str:
         """Summarize search progress so the LLM can propose the next batch."""
-        del round_num
         return build_refinement_prompt(
+            backend=self.config_spec.backend_name,
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
             failed_count=len(failed_benchmark_results(self._all_benchmark_results)),
@@ -305,6 +306,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _call_llm(self, messages: list[dict[str, str]]) -> str:
         """Send one synchronous request to the configured provider and time it."""
         t0 = time.perf_counter()
+        trace_request = None
         try:
             provider = self.provider or _infer_provider(self.model)
             if provider == "unsupported":
@@ -314,18 +316,44 @@ class LLMGuidedSearch(PopulationBasedSearch):
                     "Responses. Set HELION_LLM_PROVIDER to override the provider "
                     "when using a proxy."
                 )
-            return _call_provider(
+            max_output_tokens = self._max_output_tokens_for_request()
+            trace_request = self.log.record_llm_request(
+                provider=provider,
+                model=self.model,
+                round=len(self._llm_call_times),
+                messages=messages,
+                max_output_tokens=max_output_tokens,
+                request_timeout_s=self.request_timeout_s,
+                effort_level=self.effort_level,
+                fast_mode=self.fast_mode,
+            )
+            response = _call_provider(
                 provider,
                 model=self.model,
                 api_base=self.api_base,
                 api_key=self.api_key,
                 messages=messages,
-                max_output_tokens=self._max_output_tokens_for_request(),
+                max_output_tokens=max_output_tokens,
                 request_timeout_s=self.request_timeout_s,
                 effort_level=self.effort_level,
                 fast_mode=self.fast_mode,
             )
+            self.log.record_llm_response(
+                trace_request,
+                status="ok",
+                response=response,
+                duration_s=time.perf_counter() - t0,
+            )
+            return response
         except Exception as e:
+            # Provider errors may contain credentials or headers. Record the
+            # exception class, while keeping the existing diagnostic log intact.
+            self.log.record_llm_response(
+                trace_request,
+                status="error",
+                error_type=type(e).__name__,
+                duration_s=time.perf_counter() - t0,
+            )
             self.log.warning(f"LLM call failed: {type(e).__name__}: {e}")
             raise
         finally:
@@ -664,10 +692,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         for round_num in self._budgeted_range(1, self.max_rounds):
             if self._run_refinement_round(round_num, state):
                 break
-
-        best = self.final_rebenchmark_best(self.best)
-        best = self.run_finishing_phase(best, self.finishing_rounds)
-        return best.config
+        return self._finalize()
 
     def _log_search_stats(self) -> None:
         """Report how much time went to LLM calls and benchmarking."""

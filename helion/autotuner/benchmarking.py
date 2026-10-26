@@ -15,12 +15,14 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import TypeVar
+from typing import cast
 
 import torch
 
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from helion._dist_utils import all_ranks_agree
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
@@ -31,7 +33,7 @@ T = TypeVar("T")
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
 _MIRRORED_BENCH_MAX_SWEEPS = 64
-_ROCM_INTERLEAVED_EVENT_PAIRS = 1024
+_INTERLEAVED_EVENT_PAIRS_CAP = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +120,95 @@ def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
     return replay
 
 
+# A single CUDA-graph replay per event pair carries the graph launch latency
+# (~4-6 us on B200) quantized to ~2 us steps, so kernels shorter than a few
+# tens of microseconds all read the same value.  Below this per-call estimate
+# the interleaved bench times one graph holding ``calls`` x [L2 flush; call]
+# and subtracts a graph holding the same flushes, which cancels the launch
+# latency and keeps every call cold in L2.
+_BATCHED_REPLAY_BELOW_US = 64.0
+_BATCHED_REPLAY_MAX_CALLS = 16
+# do_bench times the flush-only graph once per this many batched samples.
+_BATCHED_FLUSH_EVERY = 4
+
+
+def _batched_replay_calls(estimate_us: float) -> int:
+    """How many flushed calls to fold into one timed graph replay."""
+    if not math.isfinite(estimate_us) or estimate_us <= 0:
+        return 1
+    if estimate_us >= _BATCHED_REPLAY_BELOW_US:
+        return 1
+    return max(
+        1,
+        min(
+            _BATCHED_REPLAY_MAX_CALLS, math.ceil(_BATCHED_REPLAY_BELOW_US / estimate_us)
+        ),
+    )
+
+
+def _make_batched_cudagraph_replay(
+    fn: Callable[[], object] | None, clear_cache: Callable[[], None], calls: int
+) -> Callable[[], None]:
+    """Capture ``calls`` x [``clear_cache``; ``fn``] (``fn`` may be None for the
+    flush-only reference graph) and return its replay."""
+    from ..runtime import cute_cuda_graph
+
+    if fn is not None:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            fn()
+        torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    prior_stream = torch.cuda.current_stream()
+    try:
+        with cute_cuda_graph() as graph:
+            for _ in range(calls):
+                clear_cache()
+                if fn is not None:
+                    fn()
+    except Exception:
+        # An invalidated capture leaves the capture stream current.
+        torch.cuda.set_stream(prior_stream)
+        raise
+    torch.cuda.synchronize()
+    return graph.replay
+
+
+def _batched_flushed_replays(
+    fns: list[Callable[[], object]],
+    clear_cache: Callable[[], None],
+    calls: int,
+) -> tuple[list[Callable[[], None]], Callable[[], None]] | None:
+    """Batched graphs for ``fns`` plus the flush-only graph, or None when a
+    capture fails (the caller keeps the single-replay path)."""
+    try:
+        batched = [_make_batched_cudagraph_replay(fn, clear_cache, calls) for fn in fns]
+        flush_replay = _make_batched_cudagraph_replay(None, clear_cache, calls)
+    except Exception:
+        _log.debug("Batched CUDA graph capture failed; falling back", exc_info=True)
+        return None
+    return batched, flush_replay
+
+
+def _positive_median(samples: list[float]) -> float:
+    """Median of the samples; a non-positive median (possible only when the
+    flush subtraction is swamped by interference) falls back to the positive
+    samples, and to ``inf`` when there are none, so a poisoned candidate is
+    never ranked best."""
+    median = statistics.median(samples)
+    if median > 0:
+        return median
+    positive = [sample for sample in samples if sample > 0]
+    return statistics.median(positive) if positive else math.inf
+
+
+def _positive_mean(samples: list[float]) -> float:
+    """Mean of the positive samples (a non-positive flush-corrected sample is
+    interference, not kernel time); ``inf`` when there are none."""
+    positive = [sample for sample in samples if sample > 0]
+    return statistics.mean(positive) if positive else math.inf
+
+
 def _maybe_cudagraph_replay(
     fn: Callable[[], T], *, default_enabled: bool = False
 ) -> Callable[[], T]:
@@ -129,10 +220,12 @@ def _maybe_cudagraph_replay(
         _log.debug("Skipping CUDA graph benchmarking: %s", reason)
         return fn
 
+    prior_stream = torch.cuda.current_stream()
     try:
         return _make_cudagraph_replay(fn)
     except Exception:
         _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
+        torch.cuda.set_stream(prior_stream)
         return fn
 
 
@@ -270,6 +363,7 @@ def interleaved_bench(
     desc: str | None = None,
     default_cudagraph: bool = False,
     max_total_ms: float | None = None,
+    process_group_name: str | None = None,
 ) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
@@ -282,6 +376,9 @@ def interleaved_bench(
         desc: Optional description for progress bar
         max_total_ms: Optional wall-clock budget for the whole timed loop;
             ``repeat`` is lowered so one measured sweep times ``repeat`` fits
+        process_group_name: Distributed group whose ranks run this bench in
+            lockstep; the graph batch size is agreed across it so every rank
+            launches the same number of kernels
     """
     from triton import runtime
 
@@ -296,13 +393,53 @@ def interleaved_bench(
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     if max_total_ms is not None:
         repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
-    # Large finalist passes can create hundreds of thousands of live HIP events
-    # and crash in hipEventCreateWithFlags. Reuse a bounded set after collecting
-    # each batch's timings, preserving the full sample count and interleaving.
+    di.synchronize()
+    benchmark_functions = [
+        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
+    ]
+
+    calls = 1
+    flush_replay: Callable[[], None] | None = None
+    if fns and all(
+        bf is not fn for bf, fn in zip(benchmark_functions, fns, strict=True)
+    ):
+        # Every function replays a CUDA graph: fold short calls into batches.
+        # Every rank must agree on the batch: a kernel holding a collective
+        # hangs when one rank replays it a different number of times.
+        calls = sync_object(
+            _batched_replay_calls(
+                min(
+                    _single_replay_estimate_us(bf, clear_cache, di)
+                    for bf in benchmark_functions
+                )
+            ),
+            process_group_name=process_group_name,
+        )
+        if calls > 1:
+            batched = _batched_flushed_replays(fns, clear_cache, calls)
+            if not all_ranks_agree(batched is not None, process_group_name):
+                batched = None
+            if batched is None:
+                calls = 1
+            else:
+                benchmark_functions, flush_replay = batched
+                # Each sample now averages ``calls`` kernel executions.
+                repeat = max(min(repeat, 20), math.ceil(repeat / calls))
+
+    # Large finalist passes can create hundreds of thousands of live timing
+    # events outstanding at once. On ROCm that crashes in
+    # hipEventCreateWithFlags. On XPU, each Event.record() submits a real
+    # profiling-tag command to the queue, and the Level Zero backend only
+    # reclaims completed events near a synchronization point, so per-event
+    # cost grows superlinearly with the backlog (flat ~0.3ms/event when
+    # synchronized every ~1000 events, tens of ms/event past ~100k
+    # unsynchronized events), turning a single rebenchmark pass into a
+    # multi-minute stall. Reuse a bounded set after collecting each batch's
+    # timings, preserving the full sample count and interleaving.
     batch_size = repeat
-    if torch.version.hip is not None:
+    if torch.version.hip is not None or torch.xpu.is_available():
         batch_size = min(
-            repeat, max(1, _ROCM_INTERLEAVED_EVENT_PAIRS // max(1, len(fns)))
+            repeat, max(1, _INTERLEAVED_EVENT_PAIRS_CAP // max(1, len(fns)))
         )
     start_events = [
         [di.Event(enable_timing=True) for _ in range(batch_size)]
@@ -312,11 +449,14 @@ def interleaved_bench(
         [di.Event(enable_timing=True) for _ in range(batch_size)]
         for _ in range(len(fns))
     ]
-
-    di.synchronize()
-    benchmark_functions = [
-        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
-    ]
+    flush_events = (
+        [
+            (di.Event(enable_timing=True), di.Event(enable_timing=True))
+            for _ in range(batch_size)
+        ]
+        if flush_replay is not None
+        else None
+    )
 
     # When a description is supplied we show a progress bar so the user can
     # track the repeated benchmarking loop.
@@ -330,19 +470,57 @@ def interleaved_bench(
     for i in iterator:
         slot = i % batch_size
         for j in range(len(benchmark_functions)):
-            clear_cache()
+            if flush_replay is None:
+                clear_cache()
             start_events[j][slot].record()
             benchmark_functions[j]()
             end_events[j][slot].record()
+        if flush_events is not None:
+            assert flush_replay is not None
+            flush_events[slot][0].record()
+            flush_replay()
+            flush_events[slot][1].record()
         if slot + 1 == batch_size or i + 1 == repeat:
             di.synchronize()
             for j in range(len(fns)):
-                timings[j].extend(
-                    start_events[j][k].elapsed_time(end_events[j][k])
-                    for k in range(slot + 1)
-                )
+                if flush_events is None:
+                    timings[j].extend(
+                        start_events[j][k].elapsed_time(end_events[j][k])
+                        for k in range(slot + 1)
+                    )
+                else:
+                    timings[j].extend(
+                        (
+                            start_events[j][k].elapsed_time(end_events[j][k])
+                            - flush_events[k][0].elapsed_time(flush_events[k][1])
+                        )
+                        / calls
+                        for k in range(slot + 1)
+                    )
 
-    return [statistics.median(samples) for samples in timings]
+    if flush_events is None:
+        return [statistics.median(samples) for samples in timings]
+    return [_positive_median(samples) for samples in timings]
+
+
+def _single_replay_estimate_us(
+    replay: Callable[[], object],
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+    samples: int = 3,
+) -> float:
+    """Best of ``samples`` flushed single replays, in microseconds."""
+    best = math.inf
+    for _ in range(samples):
+        clear_cache()
+        start = di.Event(enable_timing=True)
+        end = di.Event(enable_timing=True)
+        start.record()
+        replay()
+        end.record()
+        di.synchronize()
+        best = min(best, start.elapsed_time(end) * 1000.0)
+    return best
 
 
 def interleaved_bench_generic(
@@ -647,22 +825,23 @@ def _estimate_runtime_and_warmup(
     warmup: int,
     rep: int,
     process_group_name: str | None,
-) -> tuple[float, int]:
-    """Estimate one launch and avoid redundant work for long-running kernels."""
+) -> tuple[float, int, bool]:
+    """Estimate one launch and identify a probe that is already a valid sample."""
     first_elapsed_ms = run_batch(1)
     first_estimate_ms = sync_object(
         first_elapsed_ms, process_group_name=process_group_name
     )
     if first_estimate_ms >= max(warmup, rep):
-        # The setup and estimate calls have already warmed the kernel.
-        return first_estimate_ms, 0
+        # The setup call warmed the kernel, and this cache-cleared probe already
+        # exceeds the complete timing window. Reuse it as the sole sample.
+        return first_estimate_ms, 0, True
 
     remaining_elapsed_ms = run_batch(4)
     estimate_ms = sync_object(
         (first_elapsed_ms + remaining_elapsed_ms) / 5,
         process_group_name=process_group_name,
     )
-    return estimate_ms, max(1, int(warmup / estimate_ms))
+    return estimate_ms, max(1, int(warmup / estimate_ms)), False
 
 
 # This function is copied from triton._testing.do_bench with modification
@@ -680,6 +859,7 @@ def do_bench(
     default_cudagraph: bool = False,
     fixed_repetitions: int | None = None,
     probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -699,10 +879,11 @@ def do_bench(
     :type return_mode: str
     :param fixed_repetitions: Skip adaptive estimation and time exactly this many
         calls after the initial setup call.
-    :param probe_long_kernel: Estimate from a single call first and skip the
-        four remaining estimate calls when that call already exceeds both
-        timing windows; CuTe flash enables it for multi-second attention
-        candidates.
+    :param probe_long_kernel: Estimate from a single call first and reuse that
+        probe as the timing sample when it already exceeds both timing windows;
+        CuTe flash enables it for multi-second attention candidates.
+    :param pre_warmed: Skip the setup launch when the caller has already run
+        and synchronized this exact benchmark callable.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -711,7 +892,8 @@ def do_bench(
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
-    fn()
+    if not pre_warmed:
+        fn()
     di.synchronize()
     # Backward benchmarks mutate grad fields between iterations, so keep their
     # existing launch path.
@@ -722,6 +904,15 @@ def do_bench(
     )
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
+    calls = 1
+    flush_replay: Callable[[], None] | None = None
+    if benchmark_function is not fn:
+        # The first L2 flush and the first replay of a fresh graph pay their
+        # one-time costs; keep those out of the estimate that sizes the
+        # repetitions and the batch.
+        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        benchmark_function()
+        di.synchronize()
 
     if fixed_repetitions is None and probe_long_kernel:
 
@@ -736,12 +927,17 @@ def do_bench(
             di.synchronize()
             return float(batch_start.elapsed_time(batch_end))
 
-        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+        estimate_ms, n_warmup, probe_is_sample = _estimate_runtime_and_warmup(
             run_estimate_batch,
             warmup=warmup,
             rep=rep,
             process_group_name=process_group_name,
         )
+        if probe_is_sample:
+            return cast(
+                "float | tuple[float, ...]",
+                _summarize_statistics([estimate_ms], quantiles, return_mode),
+            )
         n_repeat = max(1, int(rep / estimate_ms))
     elif fixed_repetitions is None:
         # Estimate the runtime of the function
@@ -766,8 +962,49 @@ def do_bench(
             raise ValueError("fixed_repetitions must be at least 1")
         n_warmup = 0
         n_repeat = fixed_repetitions
+        estimate_ms = math.inf
+        if benchmark_function is not fn:
+            # One flushed replay decides whether the fixed repetitions are
+            # batched (the final verification pins the sample count).
+            estimate_ms = (
+                _single_replay_estimate_us(
+                    benchmark_function,
+                    functools.partial(runtime.driver.active.clear_cache, cache),  # pyrefly: ignore
+                    di,
+                    samples=1,
+                )
+                / 1000.0
+            )
+
+    # A short graph-replayed kernel is timed as a batched flushed graph (see
+    # _BATCHED_REPLAY_BELOW_US); every rank must agree on the batch.  The
+    # batch is sized from the kernel's own replay time (the estimate above
+    # includes the L2 flush).  The flush-only graph is timed every few samples
+    # so the subtraction never spans a clock or thermal drift.
+    if benchmark_function is not fn:
+        clear_cache = functools.partial(runtime.driver.active.clear_cache, cache)  # pyrefly: ignore
+        calls = sync_object(
+            _batched_replay_calls(
+                _single_replay_estimate_us(benchmark_function, clear_cache, di)
+            ),
+            process_group_name=process_group_name,
+        )
+        if calls > 1:
+            batched = _batched_flushed_replays([fn], clear_cache, calls)
+            # a capture that failed on one rank drops the batch on every rank
+            if not all_ranks_agree(batched is not None, process_group_name):
+                batched = None
+            if batched is None:
+                calls = 1
+            else:
+                (benchmark_function,), flush_replay = batched
+                if fixed_repetitions is None:
+                    # Each sample now covers ``calls`` executions.
+                    n_warmup = max(1, n_warmup // calls)
+                    n_repeat = max(1, n_repeat // calls)
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+    flush_events: list[tuple[Any, Any]] = []
     # Warm-up
     for _ in range(n_warmup):
         benchmark_function()
@@ -779,8 +1016,18 @@ def do_bench(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        if flush_replay is None:
+            # we clear the L2 cache before each run
+            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        elif i % _BATCHED_FLUSH_EVERY == 0:
+            # the batched graph flushes before every call it holds; time the
+            # matching flush-only graph next to the samples it corrects
+            flush_start = di.Event(enable_timing=True)
+            flush_end = di.Event(enable_timing=True)
+            flush_start.record()
+            flush_replay()
+            flush_end.record()
+            flush_events.append((flush_start, flush_end))
         # record time of `fn`
         start_event[i].record()
         benchmark_function()
@@ -788,7 +1035,116 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    if flush_replay is not None:
+        flushes = [start.elapsed_time(end) for start, end in flush_events]
+        times = [
+            (t - flushes[i // _BATCHED_FLUSH_EVERY]) / calls
+            for i, t in enumerate(times)
+        ]
+        if return_mode == "median" and statistics.median(times) <= 0:
+            return _positive_median(times)
+        if return_mode == "mean":
+            return _positive_mean(times)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
+
+
+def do_bench_cuda_graph(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    fixed_repetitions: int | None = None,
+    pre_warmed: bool = False,
+    reset: Callable[[], None] | None = None,
+    phase: Callable[[str], None] | None = None,
+) -> float | tuple[float, ...]:
+    """Time GPU execution with external event nodes inside one CUDA graph.
+
+    Input reset and L2 clearing precede the start event. Python dispatch and
+    graph submission are excluded. ``reset`` must contain capturable device
+    operations; it runs before every invocation, including capture and warmup.
+
+    Warmup/repetition windows bound sampling wall time; reported samples are
+    device milliseconds. Capture errors propagate without a timing fallback.
+    """
+    from triton.testing import _summarize_statistics
+
+    from ..runtime import cute_cuda_graph
+
+    reason = _cudagraph_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"GPU-only CUDA graph timing is unavailable: {reason}")
+    if grad_to_none is not None:
+        raise ValueError("CUDA graph timing requires an explicit device reset callback")
+    if fixed_repetitions is not None and fixed_repetitions < 1:
+        raise ValueError("fixed_repetitions must be at least 1")
+    if warmup < 0 or rep <= 0:
+        raise ValueError("warmup must be nonnegative and rep must be positive")
+    if return_mode not in ("min", "max", "mean", "median", "all"):
+        raise ValueError(f"Invalid return_mode: {return_mode}")
+
+    clear_l2 = _make_l2_cache_clearer()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
+    with torch.cuda.stream(stream):
+        if reset is not None:
+            reset()
+        if not pre_warmed:
+            fn()
+        # Materialize event handles before capture.
+        start.record()
+        end.record()
+    stream.synchronize()
+    if phase is not None:
+        phase("capture")
+    with cute_cuda_graph(stream=stream) as graph:
+        if reset is not None:
+            reset()
+        clear_l2()
+        start.record()
+        # Keep the captured output alive until all replays finish.
+        _output = fn()
+        end.record()
+
+    def sample() -> float:
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        elapsed = float(start.elapsed_time(end))
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise ValueError(f"Invalid GPU-only timing: {elapsed}")
+        return elapsed
+
+    if phase is not None:
+        phase("warmup")
+    if fixed_repetitions is None:
+        began = time.perf_counter()
+        sample()
+        # Count complete replays, including cache clearing and synchronization,
+        # to avoid excessive sampling work for microsecond kernels.
+        iteration_ms = sync_object(
+            max((time.perf_counter() - began) * 1000, 1e-6), process_group_name
+        )
+        n_warmup = max(0, int(warmup / iteration_ms))
+        n_repeat = max(1, int(rep / iteration_ms))
+    else:
+        n_warmup = 0
+        n_repeat = fixed_repetitions
+    for _ in range(n_warmup):
+        sample()
+    if phase is not None:
+        phase("measure")
+    samples = [sample() for _ in range(n_repeat)]
+    return cast(
+        "float | tuple[float, ...]",
+        _summarize_statistics(samples, quantiles, return_mode),
+    )
 
 
 def do_bench_generic(
@@ -803,18 +1159,21 @@ def do_bench_generic(
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
     fixed_repetitions: int | None = None,
     probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
 
     ``fixed_repetitions`` skips adaptive estimation and times exactly that many
-    calls after the initial setup call. ``probe_long_kernel`` avoids four
-    redundant estimate calls when the first call already exceeds both timing
-    windows; CuTe flash enables it for multi-second attention candidates.
+    calls after the initial setup call. ``probe_long_kernel`` reuses the first
+    probe as the timing sample when it already exceeds both timing windows;
+    CuTe flash enables it for multi-second attention candidates.
+    ``pre_warmed`` skips that setup call when the caller already ran and
+    synchronized the same callable.
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    _output = fn()
+    _output = None if pre_warmed else fn()
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
@@ -833,12 +1192,14 @@ def do_bench_generic(
             end = time.perf_counter()
             return (end - start) * 1000
 
-        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+        estimate_ms, n_warmup, probe_is_sample = _estimate_runtime_and_warmup(
             run_estimate_batch,
             warmup=warmup,
             rep=rep,
             process_group_name=process_group_name,
         )
+        if probe_is_sample:
+            return _summarize_statistics_fallback([estimate_ms], quantiles, return_mode)
         n_repeat = max(1, int(rep / estimate_ms))
     elif fixed_repetitions is None:
         synchronize_device()

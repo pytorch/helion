@@ -922,11 +922,19 @@ def assert_correct(
             if case.check == "dropout":
                 continue
             if case.check == "relative_l2":
-                relative_error = (
-                    a.float() - b.float()
-                ).norm().item() / b.float().norm().clamp(min=1e-8).item()
-                assert relative_error < case.rtol, (
-                    f"Relative L2 error {relative_error} exceeds {case.rtol}"
+                from helion._testing import assert_relative_l2_close
+
+                assert_relative_l2_close(a, b, case.rtol)
+            elif case.check == "mismatch_budget":
+                from helion._testing import assert_close_with_mismatch_tolerance
+
+                assert_close_with_mismatch_tolerance(
+                    a.float(),
+                    b.float(),
+                    rtol=case.rtol,
+                    atol=case.atol,
+                    max_mismatch_pct=case.max_mismatch_pct,
+                    max_mismatched_abs_diff=case.max_mismatched_abs_diff,
                 )
             else:
                 torch.testing.assert_close(

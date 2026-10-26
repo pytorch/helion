@@ -8,6 +8,8 @@ from typing import Literal
 from typing import Protocol
 from typing import cast
 
+import torch
+
 from ... import exc
 
 if TYPE_CHECKING:
@@ -26,15 +28,26 @@ if TYPE_CHECKING:
     from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
+    from .cute_flash_gated import GatedAttentionMatch
+    from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_mma_dag import MmaDagPlan
+    from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_bwd_match import FlexBwdMatch
+    from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .published_scalars import PublishedScalarRequest
+    from .radix_selection import RadixSelectionPlan
+    from .register_producers import RegisterProducerRequest
+    from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -42,6 +55,7 @@ if TYPE_CHECKING:
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+    from .topk import CuteTopKPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -587,6 +601,49 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         return (self.physical_m_threads, self.launched_warp_count, 1)
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteVloopWrapperFact:
+    """A grid tile axis partitioned into an outer lane loop x constexpr V-loop.
+
+    Recorded by ``PerThreadNDTileStrategy.codegen_grid`` for every
+    ``VecLaneWrapper`` so the late vector-loop sinking pass can identify the
+    V-loop by its constexpr lane variable and reason about the per-element
+    index (``index_var = base_index_var + vec_lane_var``) and bounds mask.
+    """
+
+    block_id: int
+    vec_width: int
+    lane_var: str
+    vec_lane_var: str
+    base_index_var: str
+    index_var: str
+    # The block's bounds mask variable, or None when the strategy elided it.
+    mask_var: str | None
+    # The tile extent is a proven multiple of ``vec_width`` and the tile
+    # starts at zero, so every V-wide chunk lies entirely inside or entirely
+    # outside the extent: a bound on the per-element index is equivalent to
+    # the same bound on the chunk base.
+    uniform_vector_mask: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteVloopLoadFact:
+    """A scalar tile load that a sunk V-loop may turn into one vector load.
+
+    Recorded by the load lowering (keyed by the scalar pointer expression)
+    when the site addresses the vectorized grid axis at its stride-1 dim with
+    the plain per-element index but sits inside loops nested in the V-loop,
+    where the ordinary hoist above the V-loop cannot reach it.
+    """
+
+    vec_lane_var: str
+    tensor_name: str
+    vec_width: int
+    dtype: torch.dtype
+    # The site's cache-policy marker, applied to the vector form of the load.
+    eviction_suffix: str
+
+
 class CuteDeviceFunctionState:
     """CuTe-owned state for one DeviceFunction codegen instance."""
 
@@ -595,6 +652,18 @@ class CuteDeviceFunctionState:
         # The launcher consults only names that survive final AST lowering;
         # this does not depend on blocked/strided index-expression spelling.
         self.grid_thread_extents: dict[str, tuple[int, int]] = {}
+        # Grid V-loop wrappers (by constexpr lane variable) and sinkable scalar
+        # loads (by pointer expression) for ``cute/sink_vector_loops.py``.
+        self.vloop_sink_wrappers: dict[str, CuteVloopWrapperFact] = {}
+        self.vloop_sink_loads: dict[str, CuteVloopLoadFact] = {}
+        # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
+        # no V-loop is sunk after all, codegen restarts with the knob off.
+        self.vloop_sink_layout_applied = False
+        # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
+        # matmul product sum or a lane-loop reduction marker) assumed for the
+        # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
+        # block shape that differs from them on any axis.
+        self.multi_phase_lane_reduce_layouts: list[tuple[str, dict[int, int]]] = []
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
@@ -603,12 +672,54 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # Lane loops claimed by a register/shuffle ``hl.associative_scan``
+        # lowering, mapped to the direction (``True`` = reverse) their lanes
+        # are visited in.  A second scan over the same lane loop must agree
+        # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
+        self.scan_lane_directions: dict[str, bool] = {}
+        # Constexpr V-loop variables that enclose a reduction over ANOTHER block
+        # (``s[tile] = x[tile, :].sum(-1)`` with a vector width on ``tile``):
+        # each V lane is a different output element, so
+        # ``cute/hoist_warp_reduce.py`` must not fold the lanes into one
+        # accumulator before the cross-thread reduce.
+        self.unfoldable_vec_lanes: set[str] = set()
+        # Matmul ``dot_acc`` running sums whose K-loop carry is only exact
+        # once ``hoist_lane_invariant_chunk_recurrence`` restructures it to
+        # update once per tile (``cute/matmul_fallback.py``); a nest the pass
+        # does not recognize is rejected rather than summed across tiles.
+        self.chunk_recurrence_running_sums: set[str] = set()
+        # Rolled reductions over a symbolic extent expose their trip count as
+        # a host-computed ``cutlass.Constexpr`` kernel parameter so the
+        # two-pass load fuser can size a per-thread register cache that is
+        # exact for every runtime extent.  Keyed by the roll's offset variable
+        # (``roffset_N``), the loop target the AST passes see: (size-hint trip
+        # count used for profitability decisions, constexpr parameter name).
+        self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
         self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.reshape_physical_fallbacks: dict[str, tuple[int, int, str]] = {}
         self.resident_sequence_regions: dict[int, SequenceRegion] = {}
         self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
+        # ``hl.atomic_add`` nodes that receive the per-K-lane partial sums of a
+        # scalar matmul whose K axis is split across a serial lane loop
+        # (``cute/matmul_fallback.py``), mapped to the lane variables of those
+        # loops.  Such an atomic varies along the loop although its index does
+        # not cover the loop's block, so the atomic lowering does not record
+        # it as uniform along the loop (``atomic_ops._cute_uniform_lane_vars``).
+        self.per_lane_atomic_lane_vars: dict[Node, set[str]] = {}
+        # The load_eviction_policies slot each load node took
+        # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
+        # matmul operand re-lowered under a block remap) keeps its slot.
+        self.load_eviction_slots: dict[Node, int] = {}
+        # Merging / splitting reshapes lowered so far: True when each thread
+        # holds the element at its own coordinates (proven by
+        # ``cute_reshape._chain_keeps_thread_elements``), False when the
+        # elements sit on other threads; only a store path that re-reads them
+        # where they sit may store such a value, the generic store refuses
+        # (``cute_reshape.is_cute_thread_moving_reshape_value``).
+        self.reshape_elements_in_place: dict[Node, bool] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).
@@ -627,6 +738,15 @@ class CuteDeviceFunctionState:
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
         self.matmul_fx_nodes: set[torch.fx.Node] = set()
+        # Pointwise ops on a tcgen05 epilogue chain whose block-id re-binding
+        # check waits for the store's epilogue classifier
+        # (``cute_reshape.check_pointwise_rebound_block_ids``).
+        self.deferred_rebound_pointwise_nodes: list[torch.fx.Node] = []
+        # ``build_inner_outputs_index_from_graphs`` of the codegen graphs,
+        # built once for those checks (the graphs are fixed per codegen).
+        self.rebound_inner_outputs_index: (
+            dict[int, tuple[torch.fx.Node | None, ...]] | None
+        ) = None
         # tcgen05 matmul anchor -> registered result var. Fused epilogue walks
         # from a store value back to the anchor and reuses the store value
         # registered under this result var, even when user-visible names were
@@ -647,6 +767,14 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # The materialized-operand dependency wait was emitted inside the
+        # initial AB prefetch (independent operand first); the role-local
+        # prelude must not wait again ahead of those loads.
+        self.tcgen05_pdl_wait_in_prefetch: bool = False
+        # One-shot clustered tcgen05 kernels: the cluster ``pipeline_init_arrive``
+        # statement after which ``program_id`` re-emits the TMA-load warp's
+        # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
+        self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -662,7 +790,7 @@ class CuteDeviceFunctionState:
         ] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
-        self._collective_handled_loads: set[str] = set()
+        self._collective_handled_loads: set[Node] = set()
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
@@ -701,6 +829,9 @@ class CuteDeviceFunctionState:
         # Its CTA shape is authoritative because the direct lowering replaces
         # the ordinary lane topology.
         self.direct_affine_plan: DirectAffinePlan | None = None
+        self.topk_plan: CuteTopKPlan | None = None
+        self.radix_selection_plan: RadixSelectionPlan | None = None
+        self.register_region_plan: RegisterRegionPlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
         self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None
@@ -710,6 +841,13 @@ class CuteDeviceFunctionState:
         self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
         self.collective_register_chain_lowered = False
         self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
+        # Launch shape ``finalize_shared_reduce_groups`` sized the shared
+        # cross-warp reductions for (None when it rewrote nothing); the
+        # launcher refuses to emit a different ``block=`` for such a body.
+        self.shared_reduce_launch_block: tuple[int, int, int] | None = None
+        self.owned_root_block_dims: tuple[int, int, int] | None = None
+        self.published_scalar_requests: list[PublishedScalarRequest] = []
+        self.register_producer_requests: list[RegisterProducerRequest] = []
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
@@ -718,6 +856,10 @@ class CuteDeviceFunctionState:
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        # Whole-root gated-delta-rule (gdn_fwd_h) chunk recurrence.  Installed
+        # only after the semantic two-contraction graph match and the shape
+        # admission limits of the SM100 tcgen05 schedule both hold.
+        self.gdn_recurrence_plan: CuteGdnRecurrencePlan | None = None
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the
@@ -725,13 +867,43 @@ class CuteDeviceFunctionState:
         # ``.notes/spikes/fa_tcgen05_spike.py``.
         self.attention_flash_block_ids: list[int] | None = None
         self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Set by the flex-envelope matcher (``flex_match.py``): the
+        # whole-graph-set match, probed once per device function. Every
+        # device loop of the two BlockMask list walks answers ``mma_mode``
+        # from it, and the flash codegen reads its operands from it.
+        self.attention_flex_match: FlexMatch | None = None
+        self.attention_flex_probed: bool = False
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+        # Set by the gated (softmax-free) attention detector: the matched
+        # kernel facts plus the config-selected KV tile / TMA ring depth.
+        self.attention_flash_gated_match: GatedAttentionPlan | None = None
+        # Config-independent gated match, probed once per device function
+        # (``attention_flash_gated_probed`` records that the probe ran).
+        self.attention_flash_gated_probe: GatedAttentionMatch | None = None
+        self.attention_flash_gated_probed: bool = False
+        # The fused body may run one CTA per (grid index, lane): the launch
+        # grid is the PID strategy's grid times this factor.
+        self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
+        # whole-graph-set match, probed once per device function.
+        self.attention_flex_bwd_match: FlexBwdMatch | None = None
+        self.attention_flex_bwd_probed: bool = False
+        # Set by the register-MMA GEMM detector (``cute_matmul_family=
+        # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
+        # its tile; the dedicated codegen emits the whole device body and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
+        # the matched serial MMA state recurrence and its tile / warp /
+        # stage selection; the dedicated codegen owns the matched root and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.mma_dag_plan: MmaDagPlan | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan
@@ -1020,24 +1192,29 @@ class CuteDeviceFunctionState:
 
     def register_collective_handled_load(
         self,
-        name: str,
+        load_node: Node,
         *,
         dependency_nodes: Sequence[Node] = (),
     ) -> None:
         """Register collective operand-load state for later codegen decisions.
 
-        Load names drive regular load suppression. FX node object identities
-        drive statement-ownership marking for load/dependency scaffolding; this
-        is scoped to one codegen pass where the FX graph and AST lists retain
-        the same objects.
+        FX node object identities drive both regular load suppression and
+        statement-ownership marking for load/dependency scaffolding; this is
+        scoped to one codegen pass where the FX graph and AST lists retain the
+        same objects.  Node names are only unique within one graph: the root
+        graph's first load is ``load`` like the K loop's operand load.
         """
-        self._collective_handled_loads.add(name)
+        self._collective_handled_loads.add(load_node)
         self._collective_handled_load_or_dependency_node_ids.update(
             id(node) for node in dependency_nodes
         )
 
-    def is_collective_handled_load(self, name: str) -> bool:
-        return name in self._collective_handled_loads
+    def is_collective_handled_load(self, load_node: Node) -> bool:
+        return load_node in self._collective_handled_loads
+
+    @property
+    def collective_handled_loads(self) -> frozenset[Node]:
+        return frozenset(self._collective_handled_loads)
 
     def is_collective_handled_load_or_dependency_node(self, node: Node) -> bool:
         return id(node) in self._collective_handled_load_or_dependency_node_ids

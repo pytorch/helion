@@ -10,6 +10,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.test_cute_persistent_reduction_coverage import _assert_fragment_norm_coverage
+
 import helion
 from helion._compiler.cute.loop_nesting import boundary_only_grid_blocks
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
@@ -187,6 +189,14 @@ def test_norm_backward_reuses_coarse_grid_threads(norm_bound: BoundKernel) -> No
             return_value=set(),
         ):
             original = norm_bound.to_code(config)
+
+    if "fragment_buffer" in code:
+        assert norm_bound.kernel.name == "layer_norm_bwd"
+        # Complete fragment ownership bypasses both scalar grid variants.
+        # Check their equivalence and every feature/output coordinate.
+        assert ast.dump(ast.parse(original)) == ast.dump(ast.parse(code))
+        _assert_fragment_norm_coverage(code, 256, 1024)
+        return
 
     # The coarse grid's 32 redundant threads previously consumed the budget
     # needed by the feature dimension. Retain its tile width and row loop,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from contextlib import nullcontext
 import dataclasses
-import functools
 import hashlib
 import logging
 from typing import TYPE_CHECKING
@@ -14,7 +13,9 @@ import torch
 from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import Buffer
+from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
@@ -23,6 +24,7 @@ from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
+from torch._inductor.ir import is_unaligned
 from torch._inductor.lowering import clone
 from torch._inductor.lowering import register_lowering
 from torch._inductor.select_algorithm import AlgorithmSelectorCache
@@ -30,11 +32,14 @@ from torch._inductor.select_algorithm import (
     ExternalTritonTemplateKernel,  # pyrefly: ignore[missing-module-attribute]
 )
 from torch._inductor.select_algorithm import PartialRender
+from torch._inductor.utils import GPU_ALIGN_BYTES
 from torch._inductor.utils import Placeholder
 from torch._inductor.utils import convert_shape_to_symint
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import free_symbol_is_type
 
 from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
@@ -45,10 +50,12 @@ from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
 from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
 from .._dynamo.variables import _get_flat_output
 from ..ast_extension import unparse
+from ..compile_environment import HELION_STATIC_DIMS_ATTR
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
 from ..output_header import get_needed_import_lines
+from helion._compat import torch_uses_template_producer_fusion
 from helion.runtime.config import Config
 
 if TYPE_CHECKING:
@@ -183,13 +190,18 @@ class HelionTemplateBuffer(TemplateBuffer):
 
             return kernel, render
 
+        prologue_input_key = (
+            "load_input_fusion_allowed_inputs"
+            if torch_uses_template_producer_fusion()
+            else "allowed_prologue_inps"
+        )
         super().__init__(
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
             mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,
             named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
+            **{prologue_input_key: allowed_prologue_inps},
         )
 
     @staticmethod
@@ -454,6 +466,18 @@ class HelionTemplateBuffer(TemplateBuffer):
                 return True
         return False
 
+    def get_allowed_prologue_inps(self) -> OrderedSet[str]:
+        """Expose a single accessor across the PyTorch template API rename."""
+        if torch_uses_template_producer_fusion():
+            return self.load_input_fusion_allowed_inputs  # pyrefly: ignore[missing-attribute]
+        return super().get_allowed_prologue_inps()  # pyrefly: ignore[missing-attribute]
+
+    def has_aliasing_or_mutation_for_producer_fusion(
+        self, scheduler_node: object
+    ) -> bool:
+        # Keep both scheduler entrypoints on Helion's mutation-safety policy.
+        return self.has_aliasing_or_mutation_for_prologue_fusion(scheduler_node)
+
     def _build_call_args(
         self,
         call_order: list[str],
@@ -542,6 +566,15 @@ class HelionTemplateBuffer(TemplateBuffer):
             for inp in inputs  # type: ignore[union-attr]
             if inp.get_read_names() & mutated_inp_names
         }
+        size_indexed_inp_names = {
+            inp.get_name()
+            for inp in inputs
+            if isinstance(inp, ComputedBuffer)
+            and any(
+                isinstance(dep, MemoryDep) and _read_offset_uses_size_vars(dep)
+                for dep in inp.get_read_writes().reads
+            )
+        }
         buf = cls(
             layout=MultiOutputLayout(device=dev),  # pyrefly: ignore[bad-argument-type]
             inputs=inputs,
@@ -552,6 +585,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 if inp.get_name() not in mutated_inp_names
                 and inp.get_name() not in container_inp_names
                 and inp.get_name() not in mutation_dependent_inp_names
+                and inp.get_name() not in size_indexed_inp_names
             ),
             named_inputs=realized_inputs,
             **buffer_kwargs,
@@ -663,8 +697,6 @@ class HelionTemplateBuffer(TemplateBuffer):
         config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
         self._bound_kernel.env.config_spec.normalize(config)
         extra_params = [p for p, _ in self._extra_params]
-        # Prologue deduplication tracking scoped to this codegen pass.
-        prologue_first_indexing: dict[str, str] = {}
 
         with self._bound_kernel.env:
             host_function = self._bound_kernel.host_function
@@ -675,10 +707,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 store_transform=self._codegen_epilogue_fusion
                 if fm.epilogue_idx_by_param
                 else None,
-                load_transform=functools.partial(
-                    self._codegen_prologue_fusion,
-                    prologue_first_indexing=prologue_first_indexing,
-                )
+                load_transform=self._codegen_prologue_fusion
                 if fm.prologue_fused_params
                 else None,
                 extra_params=extra_params,
@@ -767,7 +796,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         #    store_output() sets on range tree entries.  The x_ prefix ensures
         #    get_block_shape recognizes them as XBLOCK-sized.
         per_dim = SubscriptIndexing.compute_per_dim_indexing(
-            state, tensor, [*subscript], extra_mask
+            state, tensor, [*subscript], extra_mask, for_store=True
         )
         assert not per_dim.needs_broadcast(), (
             f"Epilogue fusion does not support broadcasted stores for param "
@@ -827,8 +856,6 @@ class HelionTemplateBuffer(TemplateBuffer):
         eviction_policy: ast.AST | None,
         cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
-        *,
-        prologue_first_indexing: dict[str, str],
     ) -> ast.expr:
         """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
 
@@ -837,8 +864,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
         by the hook closure), then returns a reference to the result variable.
 
-        ``prologue_first_indexing`` tracks which params have already been
-        emitted in this codegen pass (for multi-output deduplication).
+        ``state.codegen.prologue_first_indexing`` tracks which params this
+        codegen pass has already emitted (for multi-output deduplication).
+        It belongs to the pass: a kernel ``generate_ast`` regenerates after a
+        rejected first pass emits every placeholder again.
         """
         assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
@@ -862,6 +891,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         # encounter; subsequent references just reuse the result variable.
         # Prologue variables emitted once; reuse is safe because all loads
         # of the same fused input use the same subscript (same tile indices).
+        prologue_first_indexing = state.codegen.prologue_first_indexing
         if param_name not in prologue_first_indexing:
             xindex_name = prologue_vars["xindex"]
             xmask_name = prologue_vars["xmask"]
@@ -967,6 +997,47 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         kernel._bind_lock.release()
 
 
+def _read_offset_uses_size_vars(dep: MemoryDep) -> bool:
+    """Whether a producer's read differs from its own contiguous iteration by
+    a size-variable term (a dynamic slice's offset, or a symbolic stride).
+
+    A fused prologue renders that term as a size variable (``ks0``) which the
+    Helion kernel does not define, so such a producer stays unfused.
+    """
+    flat = sympy.Add(
+        *(sympy.Mul(var, *dep.size[i + 1 :]) for i, var in enumerate(dep.var_names))
+    )
+    return free_symbol_is_type(
+        sympy.expand(sympy.Add(dep.index, sympy.Mul(-1, flat))),
+        (SymT.SIZE, SymT.PRECOMPUTED_SIZE, SymT.UNBACKED_INT),
+    )
+
+
+def _example_storage_offset(node: IRNode) -> int:
+    """Storage offset that gives ``node``'s example input its runtime alignment.
+
+    Backends specialize on address residues (CuTe vector packets, Triton's
+    16-byte TMA base), and Inductor promises 16-byte alignment only for inputs
+    it has not recorded as unaligned.  Example storage comes from the caching
+    allocator, so an offset within one 16-byte window reproduces a known
+    residue, and a nonzero offset stays nonzero for zero-offset checks.  An
+    unknown residue (unaligned base or symbolic offset) becomes a one-element
+    shift, the weakest alignment an element offset can express; 16-byte
+    elements cannot be misaligned by element offsets in the first place.
+    """
+    offset = node.get_layout().offset
+    window = max(GPU_ALIGN_BYTES // node.get_dtype().itemsize, 1)
+    if not is_unaligned(node):
+        return 0 if V.graph.sizevars.statically_known_equals(offset, 0) else window
+    if (
+        isinstance(node, ReinterpretView)
+        and not is_unaligned(node.data)
+        and isinstance(offset, (int, sympy.Integer))
+    ):
+        return int(offset) % window
+    return 1
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -1009,18 +1080,37 @@ def lower_helion_kernel(
         )
 
     all_args: dict[str, object] = {**constant_args}
+    has_static_dims = False
     for n, r in realized.items():
         # Reused as autotune_args; uninitialized memory may contain NaN
         # bytes that spuriously fail accuracy checks. rand_strided
         # matches inductor's benchmark_example_value.
         device = r.get_device()
         assert device is not None
-        all_args[n] = rand_strided(
-            [as_int(s, 64) for s in r.get_size()],
-            [as_int(s, 1) for s in r.get_stride()],
+        size = [as_int(s, 64) for s in r.get_size()]
+        stride = [as_int(s, 1) for s in r.get_stride()]
+        offset = _example_storage_offset(r)
+        example = rand_strided(
+            size,
+            stride,
             dtype=r.get_dtype(),
             device=device,
-        )
+            extra_size=offset,
+        ).as_strided(size, stride, offset)
+        if not kernel.settings.static_shapes:
+            # Capture bound Dynamo's FakeTensors, whose static dims are
+            # literal ints; keep them literal here too, or this bind traces
+            # them as symbols (a size-1 one guarded to 1) and its host trace
+            # no longer matches the captured one.
+            static_dims = frozenset(
+                i
+                for i, s in enumerate(r.get_size())
+                if isinstance(s, (int, sympy.Integer))
+            )
+            if static_dims:
+                setattr(example, HELION_STATIC_DIMS_ATTR, static_dims)
+                has_static_dims = True
+        all_args[n] = example
     _rebuild_container_args(all_args)
 
     fake_tensors: list[object] = [
@@ -1029,7 +1119,9 @@ def lower_helion_kernel(
         if n in all_args or p.default is not p.empty
     ]
     bind_args = tuple(fake_tensors)
-    if output_spec.get(_REQUIRES_ISOLATED_LOWERING):
+    # Static dims are not part of a dynamic-shape kernel's cache key, so a
+    # bound that keeps them literal must not be shared through the cache.
+    if output_spec.get(_REQUIRES_ISOLATED_LOWERING) or has_static_dims:
         bound = kernel._bind_isolated(bind_args)
     else:
         bound = _bind_kernel_for_lowering(kernel, bind_args)
@@ -1169,7 +1261,8 @@ def lower_helion_kernel(
             if name in realized
         },
         on_tensor_leaf=on_tensor_leaf,
-        fusion_enabled=kernel.settings.torch_compile_fusion,
+        fusion_enabled=kernel.settings.torch_compile_fusion
+        and bound.env.backend.supports_inductor_fusion,
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

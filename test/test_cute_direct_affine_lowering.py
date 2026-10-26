@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 import operator
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from helion import exc
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute import direct_affine_lowering as lowering
@@ -753,6 +755,42 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
     assert "block=(32, 4, 1)" in source
     assert "indices_2" not in source
     assert "indices_3" not in source
+
+
+@pytest.mark.parametrize(
+    "key,value,message",
+    [
+        ("cute_fragment_threads", 32, "direct affine schedules"),
+        ("cute_fragment_reduction", "warp", "direct affine schedules"),
+        (
+            "cute_reduction_schedule",
+            "resident",
+            "resident CuTe reductions require static serial-row sums",
+        ),
+    ],
+)
+def test_direct_affine_rejects_conflicting_fragment_schedule(
+    key: str, value: int | str, message: str
+) -> None:
+    from test.test_cute_affine_scan_heuristic import _fake_cute_context
+    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
+    from test.test_cute_fixed_token_rank1_recurrence import _inputs
+
+    with _fake_cute_context():
+        bound = _fixed_rank1._bind_isolated(
+            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+        )
+        config = deepcopy(
+            next(
+                seed
+                for seed in bound.config_spec.compiler_seed_configs
+                if seed.config.get("cute_affine_scan_schedule") == "direct_m16n8_v1"
+                and seed.config.get("block_sizes") == [64]
+            )
+        )
+        config.config[key] = value
+        with pytest.raises(exc.InvalidConfig, match=message):
+            bound.to_code(config)
 
 
 def _runtime_inputs(token_count: int) -> tuple[object, ...]:

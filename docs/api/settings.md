@@ -122,8 +122,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.fast_math
 
    If ``True``, enable fast math approximations. This activates both Helion-level optimizations
-   (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
-   etc.). May reduce numerical precision and change NaN/Inf behavior. Default is ``False``.
+   (e.g. fast sigmoid, the CuTe flash-attention polynomial exp2 packets) and Inductor-level fast
+   math (flush-to-zero exp, fast online softmax, etc.). May reduce numerical precision and change
+   NaN/Inf behavior. Default is ``False``.
    Controlled by ``HELION_FAST_MATH=1``.
 
 .. autoattribute:: Settings.persistent_reserved_sms
@@ -169,6 +170,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    ``ir_graph`` is a config-independent, node-link dump of the kernel's device IR (the per-tile computation lowered to the Triton kernel body), captured once per run. Load it with ``networkx.node_link_graph(record["ir_graph"], edges="edges")`` (requires ``networkx>=3.4``). It is ``null`` when the device IR is unavailable or extraction fails. Block dimensions stay symbolic in the dump; recover concrete tile sizes by joining with each config's ``block_sizes``. Because the device IR is a function of ``run_id``'s inputs, every record sharing a ``run_id`` carries an identical ``ir_graph``.
    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
+
+   This flag also appends ``<autotune_log>.trace.jsonl`` with timestamped search
+   stages, config evaluations, rebenchmarks, selection, and exact LLM prompts
+   and responses. Recording is disabled by default; set
+   ``HELION_AUTOTUNE_LOG=/tmp/run`` and ``HELION_AUTOTUNE_LOG_DETAILS=1`` before
+   importing the kernel. Each trace uses a per-search ``run_id``, distinct from
+   the identity used by the CSV and metadata.
 
 .. autoattribute:: Settings.autotune_log_search_space
 
@@ -249,6 +257,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_budget_seconds
 
    Wall-clock budget in seconds for autotuning. When the budget is exceeded, Helion returns the best configuration found so far. Controlled by ``HELION_AUTOTUNE_BUDGET_SECONDS``.
+
+.. autoattribute:: Settings.autotune_handoff
+
+   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
+
+.. autoattribute:: Settings.autotune_handoff_budget_seconds
+
+   Time budget for native-source rounds, excluding search and export. Defaults to 1500 seconds. Controlled by ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS``.
 
 .. autoattribute:: Settings.autotune_ignore_errors
 
@@ -399,6 +415,11 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
+| ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). |
+| ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS`` | ``autotune_handoff_budget_seconds`` | Native-source session budget in seconds (default 1500). |
+| ``HELION_HANDOFF_AGENT`` | (source agent) | Agent CLI: ``codex`` (default) or ``claude``. |
+| ``HELION_HANDOFF_MODEL`` | (source agent) | Model override; defaults to ``gpt-6-astra`` for Codex, ``opus`` for Claude. |
+| ``HELION_HANDOFF_EFFORT`` | (source agent) | Reasoning effort supported by the selected CLI; defaults to ``ultra`` for Codex, ``max`` for Claude. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |
@@ -406,6 +427,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
 | ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
+| ``HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS`` | (effort profile ``final_selection``) | Rounds of the full-effort final selection, which picks the returned config with harness-grade windows after the search (and after the finishing phase and any backend refinement): a 5 s thermal warmup, one 500+500 ms screen of the retained shortlist when it is longer than the finalists, then the best 8 survivors plus the best seed and the search's incumbent run 4 rounds of 500+500 ms steady windows in alternating order; the median across rounds decides and a finalist that misses a round cannot win. This adds about 60-150 s to every full-effort autotune on every backend (the search's own 50-200 ms windows mis-rank finalists by 3-6% on power-limited GPUs, and a window needs about 500 ms of warmup after the idle gap between windows before the B200 power limiter settles). ``0`` restores the single-pass final verification and its ``HELION_AUTOTUNE_FINAL_REBENCHMARK_*`` knobs, which the selection otherwise ignores (warned once). Under ``HELION_AUTOTUNE_BUDGET_SECONDS`` the search phase keeps the phase's estimated time back plus the wall time of one search generation (the generation in flight finishes its benchmark pass after the budget check); together they take at most a quarter of the budget, so a long generation shortens the selection rather than the search, except that the selection's smallest plan (up to four finalists: two survivors plus the seed and the incumbent, two rounds, no screen or thermal warmup, about 11-17 s) stays reserved past that generation whenever a quarter of the budget covers it (budgets under about 70 s do not, and skip the selection). The phase is sized to whatever is left when it starts: the screen goes first, then rounds (down to 2), then survivors (down to 2), then the thermal warmup; it is skipped when even that does not fit. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
@@ -415,7 +437,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
 | ``HELION_AUTOTUNE_CACHE`` | ``autotune_cache`` | Cache class to use (``"LocalAutotuneCache"`` (default), ``"StrictLocalAutotuneCache"``, ``"RemoteAutotuneCache"``, ``"StrictRemoteAutotuneCache"``, ``"AOTAutotuneCache"``). |
 | ``HELION_REMOTE_CACHE_BACKEND`` | (used by ``RemoteAutotuneCache`` and warm-start) | Fully-qualified class path to a ``RemoteCacheBackend`` subclass (e.g. ``mypackage.cache.RedisBackend``); enables remote read-through/write-through caching and, when the backend overrides ``list()``, remote warm-start lookups for ``from_best_available`` / ``helion.from_cache``. |
-| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). |
+| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |
 | ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |
