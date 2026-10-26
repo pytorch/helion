@@ -3677,9 +3677,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             """The input expression a guarded symbol stands for, and if a block."""
             if (source := sources.get(symbol)) is not None:
                 # hl.specialize already keys the exact value.
-                if symbol in self.env.specialized_vars or (
-                    source in self.env.specialized_strides
-                ):
+                if (
+                    symbol in self.env.specialized_vars
+                    and symbol not in self.env.singleton_vars
+                ) or source in self.env.specialized_strides:
                     return None
                 return symbol, False
             assert self.host_function is not None
