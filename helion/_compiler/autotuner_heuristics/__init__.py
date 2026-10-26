@@ -177,6 +177,7 @@ from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_packed_operand import register_packed_operand_coverage
 from .cute_radix_selection import CuteRadixSelectionHeuristic
 from .cute_radix_selection import register_radix_selection_coverage
+from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
@@ -229,6 +230,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteChunkRecurrenceHeuristic,
         CuteGdnRecurrenceHeuristic,
         CuteMmaDagHeuristic,
+        CuteRegisterSubblocksHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,
         CuteTopKHeuristic,
