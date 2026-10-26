@@ -933,3 +933,30 @@ def test_one_cta_pdl_requires_the_persistent_role_local_schedule() -> None:
             spec.normalized_config(flat)
         spec.normalize(flat, _fix_invalid=True)
         assert "tcgen05_materialized_pdl" not in flat.config
+
+
+def test_flat_producer_twins_precede_their_persistent_twins() -> None:
+    # The search population is the first seeds in list order, and the
+    # producer that inherits the bundle's persistent launch is never the
+    # better one for a cold pass over the operand: every flat twin precedes
+    # the persistent twin of the same native seed.
+    bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        seeds = list(bound.config_spec.compiler_seed_configs)
+
+    def twin_key(config: helion.Config) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (key, repr(value))
+            for key, value in config.config.items()
+            if key != "cute_pointwise_pid_type"
+        )
+
+    twins: dict[frozenset[tuple[str, str]], dict[object, int]] = {}
+    for index, seed in enumerate(seeds):
+        twins.setdefault(twin_key(seed), {})[
+            seed.config.get("cute_pointwise_pid_type")
+        ] = index
+    pairs = [positions for positions in twins.values() if len(positions) == 2]
+    assert pairs
+    assert all(set(positions) == {"flat", None} for positions in pairs)
+    assert all(positions["flat"] < positions[None] for positions in pairs)

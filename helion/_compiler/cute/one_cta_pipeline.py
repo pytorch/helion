@@ -12,7 +12,10 @@ from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import deepest_fitting_ab_stages
 from .pipeline_smem import tcgen05_bookkeeping_smem_bytes
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
@@ -107,6 +110,10 @@ def one_cta_pipeline_smem_bytes(
     ab_stages: int,
     c_stages: int,
     acc_stages: int,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Conservative AB + actual-width DEFAULT D + bookkeeping bound.
 
@@ -115,17 +122,36 @@ def one_cta_pipeline_smem_bytes(
     follows the same with-source convention as the device/descriptor resolver.
     The model prices one- and two-byte operands (the FP8 persistent pipeline
     and the flat 16-bit launches of an ordered barrier chain run the same
-    role-local CtaGroup.ONE schedule).  This function does not change any
-    legacy one- or two-CTA allocation model.
+    role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
+    ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
+    auxiliary operand (``facts.exact_aux_count``), ``epi_warp_groups``
+    multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
+    ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
+    paired model does.  This function does not change any legacy one- or
+    two-CTA allocation model.
     """
     assert one_cta_pipeline_tile_modeled(
         bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
     )
     assert facts.input_dtype_bytes in (1, 2) and facts.output_dtype_bytes in (2, 4)
-    assert ab_stages > 0
+    assert ab_stages > 0 and epi_warp_groups >= 1
     width = facts.output_dtype_bytes * 8
     epi_m, epi_n = tcgen05_default_epilogue_tile_size(
         bm, bn, elem_width_d=width, elem_width_c=width
+    )
+    c_tile_m, c_tile_n = epi_m, epi_n
+    if epi_subtile_n is not None:
+        c_tile_m, c_tile_n = min(bm, 128), epi_subtile_n
+    aux_ring_bytes = (
+        tcgen05_aux_ring_smem_bytes_per_cta(
+            epi_tile_m=epi_m,
+            epi_tile_n=epi_n,
+            dtype_bytes=facts.output_dtype_bytes,
+            aux_stages=aux_stages,
+            ring_count=facts.exact_aux_count,
+        )
+        if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
+        else 0
     )
     return (
         tcgen05_ab_smem_bytes_per_cta(
@@ -137,11 +163,12 @@ def one_cta_pipeline_smem_bytes(
             cluster_m=1,
         )
         + tcgen05_c_smem_bytes_per_cta(
-            epi_tile_m=epi_m,
-            epi_tile_n=epi_n,
+            epi_tile_m=c_tile_m,
+            epi_tile_n=c_tile_n,
             dtype_bytes=facts.output_dtype_bytes,
-            c_stages=c_stages,
+            c_stages=c_stages * epi_warp_groups,
         )
+        + aux_ring_bytes
         + tcgen05_bookkeeping_smem_bytes(ab_stages=ab_stages, acc_stages=acc_stages)
     )
 
@@ -155,6 +182,10 @@ def max_one_cta_pipeline_ab_stages(
     c_stages: int,
     acc_stages: int,
     max_stages: int = TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Deepest AB ring in ``1..max_stages`` the one-CTA launch fits, else 0."""
     return deepest_fitting_ab_stages(
@@ -166,6 +197,10 @@ def max_one_cta_pipeline_ab_stages(
             ab_stages=stages,
             c_stages=c_stages,
             acc_stages=acc_stages,
+            aux_load_mode=aux_load_mode,
+            aux_stages=aux_stages,
+            epi_warp_groups=epi_warp_groups,
+            epi_subtile_n=epi_subtile_n,
         ),
         facts.capacity_bytes,
         max_stages=max_stages,

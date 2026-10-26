@@ -33,9 +33,11 @@ from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
 from .active_blocks import active_block_ids
 from .host_zero_fills import lower_host_zero_fills
-from .tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
+from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
+from .tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
-from .tcgen05_constants import TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from .materialized_fission import MaterializedFissionPlan
+    from .tcgen05_config import CuteTcgen05Config
 
 
 _MEMORY_COUNTERS = (
@@ -154,8 +157,27 @@ def _stage_config(
     # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it.
     drop_pdl = releases_dependents_at_entry and config.get("cute_pdl") is True
     region_pid_types = config.get(TCGEN05_REGION_PID_TYPES_CONFIG_KEY)
+    # The exact-shape auxiliary mechanisms are projected per GEMM launch of a
+    # materialized chain (``region_launch_config``: inert on a launch without
+    # such an operand); a bundle without them, region keys or the shared
+    # fanout renders the whole-kernel config as is.
+    aux_mechanisms = (
+        config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) in TCGEN05_AUX_LOAD_MODES_STAGED
+        or bool(config.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY))
+        or config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True
+    )
+    state: CuteTcgen05Config | None = None
+    positions: tuple[int, ...] = ()
+    if region_pid_types is not None or has_region_stages or fanout or aux_mechanisms:
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        # One entry per GEMM launch; launches without a native MMA (plain
+        # barrier phases) have no entry.
+        if state.materialized_matmul_block_ids:
+            positions = state.materialized_matmul_region_indices
+    gemm_launch = stage_index in positions
     if (
-        "cute_pointwise_pid_type" not in config.config
+        not gemm_launch
+        and "cute_pointwise_pid_type" not in config.config
         and not project_ffi
         and not has_region_stages
         and not fanout
@@ -166,13 +188,6 @@ def _stage_config(
     result = copy.deepcopy(config)
     if drop_pdl:
         result.config.pop("cute_pdl")
-    positions: tuple[int, ...] = ()
-    if region_pid_types is not None or has_region_stages:
-        # One entry per GEMM launch; launches without a native MMA (plain
-        # barrier phases) have no entry.
-        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
-        positions = state.materialized_matmul_region_indices
-    result.config.pop(TCGEN05_REGION_PID_TYPES_CONFIG_KEY, None)
     if region_pid_types is not None:
         # An ordered barrier chain: normalization admitted the knob only with
         # the complete two-CTA region schedule.  A persistent GEMM launch runs
@@ -184,40 +199,42 @@ def _stage_config(
         assert isinstance(region_pid_types, list) and len(region_pid_types) == len(
             positions
         )
-        region_pid_type = (
-            region_pid_types[positions.index(stage_index)]
-            if stage_index in positions
-            else TCGEN05_REGION_PID_TYPE_INHERIT
-        )
-        if region_pid_type != TCGEN05_REGION_PID_TYPE_INHERIT:
-            result.config["pid_type"] = region_pid_type
-            result.config.update(TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION)
-        else:
-            result.config["tcgen05_cluster_m"] = 1
-            result.config["tcgen05_cluster_n"] = 1
-            result.config["tcgen05_cta_group"] = "auto"
     for kind in ("ab", "c"):
-        key = f"tcgen05_region_{kind}_stages"
-        region_stages = result.config.pop(key, None)
+        region_stages = config.get(f"tcgen05_region_{kind}_stages")
         if region_stages is not None:
-            # Launches without an entry keep the shared knobs.
             assert isinstance(region_stages, list) and len(region_stages) == len(
                 positions
             )
-            if stage_index in positions:
-                count = region_stages[positions.index(stage_index)]
-                assert type(count) is int and 0 <= count <= 16
-                if count:
-                    result.config[f"tcgen05_{kind}_stages"] = count
+            assert all(
+                type(count) is int and 0 <= count <= 16 for count in region_stages
+            )
+    owns_pair: bool | None = None
     if fanout:
-        assert stage is not None
-        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        assert stage is not None and state is not None
         active = stage.device_ir.codegen_active_block_ids
         assert active is not None
         owns_pair = any(
             set(pair.block_ids).issubset(active) for pair in state.epilogue_fanout_plans
         )
-        if not owns_pair:
+    if gemm_launch:
+        # A native GEMM launch of a materialized chain renders the config the
+        # normalizer judged for it: its region's pid type, cluster and ring
+        # depths, its share of the shared fanout, and the exact-shape
+        # auxiliary mechanisms only where it has such an operand.
+        assert state is not None
+        result.config = state.region_launch_config(
+            result.config, positions.index(stage_index), owns_fanout_pair=owns_pair
+        )
+    else:
+        result.config.pop(TCGEN05_REGION_PID_TYPES_CONFIG_KEY, None)
+        if region_pid_types is not None:
+            result.config["tcgen05_cluster_m"] = 1
+            result.config["tcgen05_cluster_n"] = 1
+            result.config["tcgen05_cta_group"] = "auto"
+        for kind in ("ab", "c"):
+            # Launches without an entry keep the shared knobs.
+            result.config.pop(f"tcgen05_region_{kind}_stages", None)
+        if fanout and not owns_pair:
             result.config.pop("tcgen05_epilogue_fanout")
             result.config.pop("tcgen05_aux_load_placement", None)
             if result.config.get("tcgen05_c_acquire_placement") == "before_store":

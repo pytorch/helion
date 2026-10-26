@@ -610,3 +610,215 @@ def test_plain_fission_plan_two_cta_schedule() -> None:
     assert _rel_l2(out_flat, middle_flat.float() @ args[2].float()) < 2e-3
     torch.testing.assert_close(middle_paired, middle_flat, atol=0, rtol=0)
     torch.testing.assert_close(out_paired, out_flat, atol=0, rtol=0)
+
+
+# The exact-shape auxiliary mechanisms on the chain's persistent pair launch
+# (``test_cute_chain_aux_epilogue.py`` pins the admission and the renders):
+# each moves the relu mask read of ``grad_c = acc.to(fp16) * (c[tile] > 0)``
+# out of the per-subtile epilogue path without touching the tiles, the K
+# order or the arithmetic, so every render is bitwise the plain pair's.
+_AUX_MECHANISMS: dict[str, dict[str, object]] = {
+    "prefetch_ring": {"tcgen05_aux_prefetch_subtiles": 2},
+    "fragment_hoist": {"tcgen05_aux_fragment_hoist": True},
+    "epi_tma": {"tcgen05_aux_load_mode": "epi_tma"},
+    "epi_warp_groups": {"tcgen05_epi_warp_groups": 2},
+    "epi_subtile": {"tcgen05_epi_subtile_n": 32},
+    "ring_groups_subtile": {
+        "tcgen05_aux_prefetch_subtiles": 1,
+        "tcgen05_epi_warp_groups": 2,
+        "tcgen05_epi_subtile_n": 32,
+    },
+}
+
+
+@pytest.mark.parametrize("mechanism", sorted(_AUX_MECHANISMS))
+def test_bwd_dc_pair_launch_aux_mechanisms_match_bitwise(mechanism: str) -> None:
+    _requires_sm100()
+    t = _inputs()
+    args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
+    grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
+        1.0 - t["d"].float()
+    )
+    grad_c_ref = (grad_cb.to(torch.float16).float() @ t["b"].float().T) * (t["c"] > 0)
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_bwd_dc.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    # grad_c: 512x256x512 on the 256x128 CtaGroup.TWO pair (2 x 2 pairs).
+    recipe: dict[str, object] = {"tcgen05_aux_load_placement": "pre_acc_wait"}
+    plain = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=[256, 128, 64],
+        region_ab_stages=[4],
+        pdl=True,
+        **recipe,
+    )
+    staged = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=[256, 128, 64],
+        region_ab_stages=[4],
+        pdl=True,
+        **recipe,
+        **_AUX_MECHANISMS[mechanism],
+    )
+    for key, value in _AUX_MECHANISMS[mechanism].items():
+        assert staged.config[key] == value, key
+    # (the bundle module embeds the stage sources as string constants, so the
+    # launch attribute appears with escaped quotes)
+    source = bound.to_code(staged)
+    assert "CtaGroup.TWO" in source and "use_pdl" in source
+    plain_out = bound.compile_config(plain, allow_print=False)(*args)
+    staged_out = bound.compile_config(staged, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    assert _rel_l2(plain_out[1], grad_c_ref) < 2e-3
+    torch.testing.assert_close(staged_out, plain_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mechanism", sorted(_AUX_MECHANISMS))
+def test_bwd_dc_pair_launch_aux_mechanisms_wrap_rings_across_tiles(
+    mechanism: str,
+) -> None:
+    """The same mechanisms under persistent reuse: more pair tiles than CTA
+    pairs on the device, at the chain seeds' deepest bk=64 region ring, so
+    every ring (AB, C, the aux ring) wraps its phase across tiles."""
+    _requires_sm100()
+    t = _inputs((8192, 512, 512))
+    args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
+    grad_cb = (t["grad_out"].float() * t["x"].float() * t["d"].float()) * (
+        1.0 - t["d"].float()
+    )
+    grad_c_ref = (grad_cb.to(torch.float16).float() @ t["b"].float().T) * (t["c"] > 0)
+    # grad_c: 8192x512x512 on the 256x128 pair: 32 x 4 = 128 pair tiles.
+    tiles = [256, 128, 64]
+    pair_tiles = (8192 // tiles[0]) * (512 // tiles[1])
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    assert pair_tiles > sm_count // 2, (pair_tiles, sm_count)
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_bwd_dc.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    recipe: dict[str, object] = {"tcgen05_aux_load_placement": "pre_acc_wait"}
+    plain = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=tiles,
+        region_ab_stages=[8],
+        pdl=True,
+        **recipe,
+    )
+    staged = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=tiles,
+        region_ab_stages=[8],
+        pdl=True,
+        **recipe,
+        **_AUX_MECHANISMS[mechanism],
+    )
+    for key, value in _AUX_MECHANISMS[mechanism].items():
+        assert staged.config[key] == value, key
+    assert staged.config["tcgen05_region_ab_stages"] == [8]
+    plain_out = bound.compile_config(plain, allow_print=False)(*args)
+    staged_out = bound.compile_config(staged, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    assert _rel_l2(plain_out[1], grad_c_ref) < 2e-3
+    torch.testing.assert_close(staged_out, plain_out, atol=0, rtol=0)
+
+
+def test_bwd_dc_128_row_pair_fragment_hoist_matches_bitwise() -> None:
+    """The hoist on the chain's own 128x256 pair tile (a 64-row per-CTA
+    fragment of the relu mask, 256 B per epilogue thread)."""
+    _requires_sm100()
+    t = _inputs()
+    args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_bwd_dc.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    recipe: dict[str, object] = {"tcgen05_aux_load_placement": "pre_acc_wait"}
+    plain = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=[128, 256, 64],
+        region_ab_stages=[4],
+        pdl=True,
+        **recipe,
+    )
+    hoisted = _chain_config(
+        bound,
+        ["persistent_blocked"],
+        tiles=[128, 256, 64],
+        region_ab_stages=[4],
+        pdl=True,
+        tcgen05_aux_fragment_hoist=True,
+        **recipe,
+    )
+    assert hoisted.config["tcgen05_aux_fragment_hoist"] is True
+    assert "aux_rmem_full" in bound.to_code(hoisted)
+    plain_out = bound.compile_config(plain, allow_print=False)(*args)
+    hoisted_out = bound.compile_config(hoisted, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(hoisted_out, plain_out, atol=0, rtol=0)
+
+
+def test_bwd_dc_flat_launch_epi_tma_matches_bitwise() -> None:
+    """A GEMM launch left flat (the one-CTA pipeline) takes the
+    epilogue-issued aux ring as well, priced by the one-CTA model; the
+    register prefetch ring and the warp groups are refused there."""
+    _requires_sm100()
+    t = _inputs()
+    args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_bwd_dc.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated(args)
+    tiles = [128, 128, 64]
+    flat = _chain_config(
+        bound,
+        None,
+        tiles=tiles,
+        region_ab_stages=[],
+        pdl=True,
+        tcgen05_ab_stages=4,
+        tcgen05_aux_load_placement="pre_acc_wait",
+    )
+    staged = _chain_config(
+        bound,
+        None,
+        tiles=tiles,
+        region_ab_stages=[],
+        pdl=True,
+        tcgen05_ab_stages=4,
+        tcgen05_aux_load_placement="pre_acc_wait",
+        tcgen05_aux_load_mode="epi_tma",
+    )
+    assert staged.config["tcgen05_aux_load_mode"] == "epi_tma"
+    with pytest.raises(helion.exc.InvalidConfig, match="launch left flat"):
+        _chain_config(
+            bound,
+            None,
+            tiles=tiles,
+            region_ab_stages=[],
+            pdl=True,
+            tcgen05_ab_stages=4,
+            tcgen05_aux_load_placement="pre_acc_wait",
+            tcgen05_aux_prefetch_subtiles=1,
+        )
+    flat_out = bound.compile_config(flat, allow_print=False)(*args)
+    staged_out = bound.compile_config(staged, allow_print=False)(*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(staged_out, flat_out, atol=0, rtol=0)
