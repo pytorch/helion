@@ -298,6 +298,33 @@ def tcgen05_c_smem_bytes_per_cta(
     return c_stages * epi_tile_m * epi_tile_n * dtype_bytes
 
 
+def tcgen05_aux_ring_smem_bytes_per_cta(
+    *,
+    epi_tile_m: int,
+    epi_tile_n: int,
+    dtype_bytes: int,
+    aux_stages: int,
+    ring_count: int,
+) -> int:
+    """Per-CTA SMEM of the staged exact-shape auxiliary rings plus barriers.
+
+    The staged aux load modes (``tcgen05_aux_load_mode`` in
+    ``TCGEN05_AUX_LOAD_MODES_STAGED``) allocate one ``make_smem_layout_epi``
+    ring of ``aux_stages`` epilogue subtiles per exact-shape operand
+    (``cute_mma._emit_tcgen05_aux_pipeline_setup``), each 1 KiB aligned, and
+    one full/empty mbarrier pair per stage. Zero without staged operands.
+    """
+    assert aux_stages >= 1 and ring_count >= 0
+    if ring_count == 0:
+        return 0
+    stage_bytes = tcgen05_round_up_smem_bytes(
+        epi_tile_m * epi_tile_n * dtype_bytes, TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
+    )
+    return ring_count * aux_stages * stage_bytes + 2 * aux_stages * (
+        TCGEN05_SMEM_MBARRIER_BYTES
+    )
+
+
 # C-store epilogue placement knobs. Keeping these in Config makes generated-code
 # changes visible to BoundKernel's Config-keyed compile cache; most values are
 # used for diagnostics, while the output-edge + K-tail seed uses the measured
@@ -437,6 +464,10 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     output_itemsize: int
     rows: tuple[Tcgen05RowvecAuxRow, ...]
     output_count: int = 1
+    # Exact-shape rank-2 auxiliary operands of the output's dtype on the
+    # store that reads the most of them: the staged aux load modes keep one
+    # ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand.
+    exact_aux_count: int = 0
 
 
 def tcgen05_rowvec_stage_smem_bytes(
@@ -517,9 +548,35 @@ TCGEN05_C_STORE_MODES = (
 TCGEN05_AUX_LOAD_MODE_CONFIG_KEY = "tcgen05_aux_load_mode"
 TCGEN05_AUX_LOAD_MODE_SIMT = "simt"
 TCGEN05_AUX_LOAD_MODE_TMA = "tma"
+# Exact-shape auxiliary tiles of the epilogue chain (a residual, a gate, a
+# mask of the output's shape and dtype) staged per subtile through a TMA ring
+# that the epilogue warps fill themselves: warp 0 issues the first
+# ``tcgen05_aux_stages`` subtiles' bulk loads before the accumulator wait
+# (they land under the tile's MMA) and refills the ring one subtile ahead of
+# the reads. Unlike ``tma`` it needs no producer warp or scheduler, so the
+# monolithic strategy, the static two-CTA pair and the fanout family take it,
+# and the AB ring keeps every stage the SMEM model (``pipeline_smem``,
+# ``default_layout_smem_bytes``) proves fits beside the aux ring.
+TCGEN05_AUX_LOAD_MODE_EPI_TMA = "epi_tma"
 TCGEN05_AUX_LOAD_MODES = (
     TCGEN05_AUX_LOAD_MODE_SIMT,
     TCGEN05_AUX_LOAD_MODE_TMA,
+    TCGEN05_AUX_LOAD_MODE_EPI_TMA,
+)
+# Modes that stage exact-shape auxiliary tiles through the per-subtile SMEM
+# aux rings (one ring per staged operand, ``tcgen05_aux_stages`` deep).
+TCGEN05_AUX_LOAD_MODES_STAGED = (
+    TCGEN05_AUX_LOAD_MODE_TMA,
+    TCGEN05_AUX_LOAD_MODE_EPI_TMA,
+)
+# Both staged modes bulk-load every exact-shape auxiliary operand through a
+# row-major TensorMap; codegen refuses them with this reason unless each
+# operand proves a 16-byte base, 16-byte outer strides and a unit last stride
+# (``cute_mma._tcgen05_tma_aux_tensor_is_legal``), and the normalizer /
+# search surface mirror the bind-time proof (``exact_aux_tma_provable``).
+TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON = (
+    "requires TMA-legal auxiliary tensors (a 16-byte base, 16-byte outer "
+    "strides and a contiguous last axis)"
 )
 TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY = "tcgen05_acc_producer_mode"
 TCGEN05_ACC_PRODUCER_MODE_NORMAL = "normal"
@@ -617,6 +674,15 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 TCGEN05_AUX_STAGES_CONFIG_KEY = "tcgen05_aux_stages"
 TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
 TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
+# The epilogue-issued ring (``tcgen05_aux_load_mode="epi_tma"``) may also
+# hold a whole four-subtile per-CTA tile ahead of the accumulator wait; its
+# SMEM model (``CuteTcgen05Config.epi_tma_ab_stage_limit``) prices the depth.
+TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES = (2, 3, 4)
+TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES = tuple(
+    dict.fromkeys(
+        (*TCGEN05_AUX_STAGE_COUNT_CHOICES, *TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES)
+    )
+)
 
 # Cycle 15 hypothesis 2 (``cute_plan.md`` §6 Target 8): per-config
 # knob for the consumer-warp ``setmaxregister_increase`` ceiling. The

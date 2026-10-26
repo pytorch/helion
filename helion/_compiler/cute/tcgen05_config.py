@@ -133,15 +133,20 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
@@ -242,6 +247,7 @@ from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
+from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
@@ -628,6 +634,15 @@ class CuteTcgen05Config:
         # the compiler-facts phase by
         # ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``.
         self.matmul_operands_tma_provable: bool = True
+        # False when an exact-shape rank-2 auxiliary operand of the analyzed
+        # store chains fails the aux TMA proof (a 16-byte base and outer
+        # strides, a contiguous last axis: ``cute_mma``
+        # ``_tcgen05_tma_aux_tensor_is_legal``). The staged aux modes
+        # (``tma`` / ``epi_tma``) bulk-load those operands through a
+        # row-major TensorMap and codegen refuses them otherwise, so the
+        # search surface, the seeds and the normalizer mirror the proof.
+        # Decided beside ``matmul_operands_tma_provable``.
+        self.exact_aux_tma_provable: bool = True
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -1418,6 +1433,24 @@ class CuteTcgen05Config:
             ),
             store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
             epi_warps=cast("int", config.get("tcgen05_num_epi_warps", 4)),
+            aux_load_mode=self._config_aux_load_mode(config),
+            aux_stages=self._config_aux_stages(config),
+        )
+
+    @staticmethod
+    def _config_aux_load_mode(config: dict[str, object]) -> str:
+        mode = config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT)
+        return mode if isinstance(mode, str) else TCGEN05_AUX_LOAD_MODE_SIMT
+
+    @staticmethod
+    def _config_aux_stages(config: dict[str, object]) -> int:
+        stages = config.get(
+            TCGEN05_AUX_STAGES_CONFIG_KEY, TCGEN05_AUX_STAGE_COUNT_DEFAULT
+        )
+        return (
+            stages
+            if type(stages) is int and stages > 0
+            else TCGEN05_AUX_STAGE_COUNT_DEFAULT
         )
 
     def region_pid_type_choices(self) -> tuple[str, ...] | None:
@@ -2078,42 +2111,69 @@ class CuteTcgen05Config:
                         if facts.has_auxiliary_loads
                         else ("post_acc_wait",)
                     )
-                    for placement in placements:
-                        maximum = max_pipeline_ab_stages(
-                            facts,
-                            bm=bm,
-                            bn=bn,
-                            bk=bk,
-                            c_stages=2,
-                            acc_stages=acc_stages,
-                            aux_load_placement=placement,
+                    # The epilogue-issued aux ring (``epi_tma``) is a second
+                    # aux mode on the 256-row pair tiles that stage an
+                    # exact-shape operand: seeded at the deepest AB ring the
+                    # model fits beside the rings, with both placements.
+                    aux_modes: tuple[str, ...] = (TCGEN05_AUX_LOAD_MODE_SIMT,)
+                    if (
+                        facts.exact_aux_count > 0
+                        and self.exact_aux_tma_provable
+                        and bm == TCGEN05_TWO_CTA_BLOCK_M
+                        and facts.input_dtype_bytes == 2
+                    ):
+                        aux_modes = (
+                            TCGEN05_AUX_LOAD_MODE_SIMT,
+                            TCGEN05_AUX_LOAD_MODE_EPI_TMA,
                         )
-                        # Include shallow and deepest fitting rings without
-                        # changing the C/accumulator allocation or store protocol.
-                        for stages in dict.fromkeys((min(2, maximum), maximum)):
-                            if stages <= 0:
-                                continue
-                            seed = Config(
-                                block_sizes=block_sizes,
-                                pid_type=pid,
-                                tcgen05_cta_group="two",
-                                tcgen05_cluster_m=2,
-                                tcgen05_cluster_n=1,
-                                tcgen05_ab_stages=stages,
-                                tcgen05_c_stages=2,
-                                tcgen05_acc_stages=acc_stages,
-                                tcgen05_persistence_model="static_persistent",
-                                tcgen05_strategy="role_local_monolithic",
-                                tcgen05_layout_strategy="default",
-                                tcgen05_tvm_ffi_launch=False,
-                                tcgen05_flat_role_coordinates=False,
-                                **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                    for placement in placements:
+                        for aux_mode in aux_modes:
+                            maximum = max_pipeline_ab_stages(
+                                facts,
+                                bm=bm,
+                                bn=bn,
+                                bk=bk,
+                                c_stages=2,
+                                acc_stages=acc_stages,
+                                aux_load_placement=placement,
+                                aux_load_mode=aux_mode,
                             )
-                            if facts.has_auxiliary_loads:
-                                seed.config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
-                                    placement
+                            # Include shallow and deepest fitting rings without
+                            # changing the C/accumulator allocation or store
+                            # protocol; the staged ring takes the deepest only.
+                            depths = (
+                                (maximum,)
+                                if aux_mode == TCGEN05_AUX_LOAD_MODE_EPI_TMA
+                                else (min(2, maximum), maximum)
+                            )
+                            for stages in dict.fromkeys(depths):
+                                if stages <= 0:
+                                    continue
+                                seed = Config(
+                                    block_sizes=block_sizes,
+                                    pid_type=pid,
+                                    tcgen05_cta_group="two",
+                                    tcgen05_cluster_m=2,
+                                    tcgen05_cluster_n=1,
+                                    tcgen05_ab_stages=stages,
+                                    tcgen05_c_stages=2,
+                                    tcgen05_acc_stages=acc_stages,
+                                    tcgen05_persistence_model="static_persistent",
+                                    tcgen05_strategy="role_local_monolithic",
+                                    tcgen05_layout_strategy="default",
+                                    tcgen05_tvm_ffi_launch=False,
+                                    tcgen05_flat_role_coordinates=False,
+                                    **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
                                 )
-                            seeds.append(seed)
+                                if facts.has_auxiliary_loads:
+                                    seed.config[
+                                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+                                    ] = placement
+                                if aux_mode != TCGEN05_AUX_LOAD_MODE_SIMT:
+                                    seed.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = (
+                                        aux_mode
+                                    )
+                                seeds.append(seed)
         return seeds
 
     def _small_grid_seed_configs(self) -> list[Config]:
@@ -3692,6 +3752,7 @@ class CuteTcgen05Config:
         constraints = self.cluster_m2_search_constraints
         return (
             self.exact_shape_aux_kernel_detected
+            and self.exact_aux_tma_provable
             and constraints is not None
             and constraints.allow_edge_k_tail_family
         )
@@ -3707,6 +3768,7 @@ class CuteTcgen05Config:
         constraints = self.cluster_m2_search_constraints
         return (
             self.exact_shape_aux_kernel_detected
+            and self.exact_aux_tma_provable
             and not self.matmul_has_leading_passthrough
             and constraints is not None
             and not constraints.allow_edge_k_tail_family
@@ -5693,6 +5755,8 @@ class CuteTcgen05Config:
         stage_rows: bool,
         epi_warps: int = 4,
         acc_stages: int = 2,
+        aux_load_mode: str = TCGEN05_AUX_LOAD_MODE_SIMT,
+        aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     ) -> int | None:
         """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
 
@@ -5713,7 +5777,10 @@ class CuteTcgen05Config:
         rings without facts are sized for the widest (32-bit) output the
         epilogue stores (the with-source subtile rule makes that ring at
         least as large as any narrower output's), so an unanalyzed store
-        chain is judged conservatively rather than refused.
+        chain is judged conservatively rather than refused. A staged aux load
+        mode (``TCGEN05_AUX_LOAD_MODES_STAGED``) adds one ``aux_stages``-deep
+        ring of the with-source epilogue subtile per exact-shape auxiliary
+        operand (``facts.exact_aux_count``).
         """
         constraints = self.ab_stages_three_search_constraints
         facts = self.rowvec_aux_facts
@@ -5757,6 +5824,11 @@ class CuteTcgen05Config:
                         and constraints.dtype_bytes == 2
                         and cluster_m == 2
                         and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+                        # An exact-shape auxiliary operand keeps the plan's
+                        # with-source subtile (``cute_mma``:
+                        # ``tcgen05_plain_narrow_subtile`` needs an aux-free
+                        # epilogue).
+                        and facts.exact_aux_count == 0
                     )
                 )
                 and tcgen05_explicit_epilogue_tile_supported(
@@ -5797,10 +5869,25 @@ class CuteTcgen05Config:
         # without the shared fanout epilogue.
         if facts is not None:
             c_bytes *= max(facts.output_count, 1)
+        # The staged aux rings take the plan's with-source subtile whatever
+        # the C ring's tile is (``cute_mma``: ``tcgen05_epi_tile``).
+        aux_ring_bytes = 0
+        if facts is not None and aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED:
+            ring_tile_m, ring_tile_n = tcgen05_default_epilogue_tile_size(
+                bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
+            )
+            aux_ring_bytes = tcgen05_aux_ring_smem_bytes_per_cta(
+                epi_tile_m=ring_tile_m,
+                epi_tile_n=ring_tile_n,
+                dtype_bytes=output_itemsize,
+                aux_stages=aux_stages,
+                ring_count=facts.exact_aux_count,
+            )
         return (
             ab_bytes
             + c_bytes
             + stage_bytes
+            + aux_ring_bytes
             + tcgen05_fixed_smem_overhead_bytes(
                 ab_stages=ab_stages, acc_stages=acc_stages, cluster_m=cluster_m
             )
@@ -5818,6 +5905,8 @@ class CuteTcgen05Config:
         stage_rows: bool,
         epi_warps: int = 4,
         acc_stages: int = 2,
+        aux_load_mode: str = TCGEN05_AUX_LOAD_MODE_SIMT,
+        aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     ) -> bool:
         """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
 
@@ -5838,6 +5927,8 @@ class CuteTcgen05Config:
             stage_rows=stage_rows,
             epi_warps=epi_warps,
             acc_stages=acc_stages,
+            aux_load_mode=aux_load_mode,
+            aux_stages=aux_stages,
         )
         if arena_bytes is None:
             return False
@@ -6474,6 +6565,8 @@ class CuteTcgen05Config:
                 stage_rows=stage_rows,
                 epi_warps=epi_warps,
                 acc_stages=acc_stages,
+                aux_load_mode=self._config_aux_load_mode(config),
+                aux_stages=self._config_aux_stages(config),
             )
 
         if fits(cast("int", ab_stages), cast("int", c_stages)):
@@ -6898,6 +6991,14 @@ class CuteTcgen05Config:
         if not self._aux_tma_full_tile_search_enabled():
             return
         if config.get("tcgen05_cluster_m") != 2:
+            return
+        if (
+            config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_EPI_TMA
+        ):
+            # The epilogue-issued ring keeps its sampled depth: the SMEM
+            # model (``_normalize_epi_tma``) judges it instead of this ab=2
+            # producer-warp projection.
             return
         if not self._is_validated_cluster_m2_full_tile_search_candidate(config):
             return
@@ -8128,13 +8229,218 @@ class CuteTcgen05Config:
         config.update(seed.config)
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        if not self._aux_tma_search_enabled():
+        choices = [TCGEN05_AUX_LOAD_MODE_SIMT]
+        if self._aux_tma_search_enabled():
+            choices.append(TCGEN05_AUX_LOAD_MODE_TMA)
+        if self.epi_tma_search_enabled():
+            choices.append(TCGEN05_AUX_LOAD_MODE_EPI_TMA)
+        if len(choices) == 1:
             return {}
-        return {
-            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: EnumFragment(
-                (TCGEN05_AUX_LOAD_MODE_SIMT, TCGEN05_AUX_LOAD_MODE_TMA)
+        return {TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: EnumFragment(tuple(choices))}
+
+    def epi_tma_search_enabled(self) -> bool:
+        """Whether ``tcgen05_aux_load_mode="epi_tma"`` is on the search surface.
+
+        The epilogue-issued aux ring needs an exact-shape rank-2 auxiliary
+        operand of the output's dtype (``exact_shape_aux_kernel_detected``)
+        on a rank-2 matmul; every per-config condition (static full tiles,
+        the standard TMA-store epilogue, the SMEM budget) is judged by
+        ``_normalize_epi_tma`` on the sample.
+        """
+        return (
+            self.search_enabled
+            and self.exact_shape_aux_kernel_detected
+            and self.exact_aux_tma_provable
+            and not self.matmul_has_leading_passthrough
+        )
+
+    def epi_tma_refusal(self, config: dict[str, object]) -> str | None:
+        """Why ``config`` cannot take the epilogue-issued aux ring, or ``None``.
+
+        Mirrors the codegen gate in ``cute_mma`` (which fails closed on the
+        same facts) so a sample is repaired and an explicit config refused
+        before a compile: an exact-shape auxiliary operand, static full tiles
+        of the config's blocks, the default-layout normal TMA-store epilogue,
+        no producer warp, the CtaGroup.TWO pair for a clustered config (not
+        its ``bm=128`` tile), a rank-2 row-major output and the plain K loop.
+        """
+        if not self.exact_shape_aux_kernel_detected:
+            return (
+                "requires an exact-shape rank-2 auxiliary operand of the output's "
+                "dtype in the epilogue chain"
             )
-        }
+        if not self.exact_aux_tma_provable:
+            return TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
+        if self.matmul_has_leading_passthrough:
+            return "requires a rank-2 matmul"
+        view = self._matmul_config_view(config)
+        if view is None:
+            return "requires the tcgen05 matmul block view"
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
+            return "requires integer tcgen05 block sizes"
+        bm, bn, bk = cast("int", bm), cast("int", bn), cast("int", bk)
+        if not self._static_full_tiles(bm=bm, bn=bn, bk=bk):
+            return "requires static full output tiles"
+        if config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, Tcgen05LayoutStrategy.DEFAULT.value
+        ) != Tcgen05LayoutStrategy.DEFAULT.value or any(
+            config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS
+        ):
+            return "requires the default epilogue layout"
+        if (
+            config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+            != TCGEN05_C_STORE_MODE_NORMAL
+            or config.get(TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, "normal") != "normal"
+        ):
+            return "requires the normal TMA-store epilogue"
+        if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None:
+            return "is not available for grouped matmuls"
+        if config.get(TCGEN05_STRATEGY_CONFIG_KEY) == (
+            Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+        ):
+            return "requires a role-local strategy"
+        if (
+            config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ):
+            return "is not validated with CLC persistence"
+        if any(
+            config.get(key, 0) != 0
+            for key in (
+                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+            )
+        ):
+            return (
+                "replaces the aux producer warp: requires "
+                "tcgen05_warp_spec_c_input_warps=0 and tcgen05_warp_spec_store_warps=0"
+            )
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        if cluster_m == 2:
+            if not self._config_is_two_cta_mma(config, bm=bm, cluster_m=2):
+                return "requires the CtaGroup.TWO pair when tcgen05_cluster_m=2"
+            if bm != TCGEN05_TWO_CTA_BLOCK_M:
+                return "is not validated on the bm=128 CtaGroup.TWO epilogue tile"
+        facts = self.pipeline_smem_facts
+        if facts is not None and facts.output_column_major:
+            return "requires a row-major output"
+        if (
+            config.get(FANOUT_CONFIG_KEY, "off") not in ("off", "shared")
+            or config.get("cute_materialized_operand_schedule", "off") != "off"
+            or config.get("cute_materialized_schedule", "off") != "off"
+            or config.get("cute_split_k_workspace")
+            or config.get("cute_split_k_schedule", "legacy") != "legacy"
+        ):
+            return "requires the plain K loop of one native GEMM"
+        return None
+
+    def epi_tma_ab_stage_limit(self, config: dict[str, object]) -> int | None:
+        """Deepest AB ring that fits beside the epilogue-issued aux rings.
+
+        The paired pipeline's complete allocation proof where it applies
+        (``_paired_pipeline_stage_limit``), otherwise the DEFAULT-layout arena
+        model with the staged rings charged (``default_layout_smem_fits``).
+        ``None`` where no SMEM budget is recorded (nothing is proved and the
+        config is left alone, as for the other budget gates).
+        """
+        limit = self._paired_pipeline_stage_limit(config)
+        if limit is not None:
+            return limit
+        view = self._matmul_config_view(config)
+        if view is None or self.ab_stages_three_search_constraints is None:
+            return None
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        ab_stages = config.get("tcgen05_ab_stages", 2)
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if not all(
+            type(value) is int and value > 0
+            for value in (bm, bn, bk, cluster_m, ab_stages, c_stages)
+        ) or cluster_m not in (1, 2):
+            return None
+        if (
+            self.default_layout_smem_bytes(
+                bm=cast("int", bm),
+                bn=cast("int", bn),
+                bk=cast("int", bk),
+                cluster_m=cast("int", cluster_m),
+                ab_stages=1,
+                c_stages=cast("int", c_stages),
+                stage_rows=self._store_lowering_stages_rows(config),
+            )
+            is None
+        ):
+            return None
+        for stages in range(cast("int", ab_stages), 0, -1):
+            if self.default_layout_smem_fits(
+                bm=cast("int", bm),
+                bn=cast("int", bn),
+                bk=cast("int", bk),
+                cluster_m=cast("int", cluster_m),
+                ab_stages=stages,
+                c_stages=cast("int", c_stages),
+                stage_rows=self._store_lowering_stages_rows(config),
+                epi_warps=self._config_epi_warps(config),
+                acc_stages=self._config_acc_stages(config),
+                aux_load_mode=TCGEN05_AUX_LOAD_MODE_EPI_TMA,
+                aux_stages=self._config_aux_stages(config),
+            ):
+                return stages
+        return 0
+
+    def _normalize_epi_tma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``tcgen05_aux_load_mode="epi_tma"`` renders only inside its envelope.
+
+        A sample outside it (``fix_invalid``) falls back to the register
+        (SIMT) aux reads; one whose AB ring does not fit beside the aux rings
+        keeps the mode at the deepest fitting ring depth; one carrying a
+        C-input or store warp beside the ring keeps the ring and drops the
+        warp (the ring replaces the producer warp). An explicit config is
+        refused with the reason.
+
+        Runs from ``normalize_pre_pid_type``, ahead of ``fix_search_config``:
+        the warp has to be dropped here, before the aux-TMA full-tile
+        projection (``_fix_aux_tma_full_tile_search_config``) would see a
+        repaired ``simt`` sample and project it onto the producer-warp
+        regime.
+        """
+        if (
+            config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_EPI_TMA
+        ):
+            return
+        if fix_invalid:
+            for key in (
+                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+            ):
+                if config.get(key, 0) != 0:
+                    config[key] = 0
+        reason = self.epi_tma_refusal(config)
+        if reason is None:
+            limit = self.epi_tma_ab_stage_limit(config)
+            ab_stages = config.get("tcgen05_ab_stages", 2)
+            if limit is None or (type(ab_stages) is int and 0 < ab_stages <= limit):
+                return
+            if limit > 0 and fix_invalid:
+                config["tcgen05_ab_stages"] = limit
+                return
+            reason = (
+                f"needs tcgen05_ab_stages={ab_stages} beside its auxiliary rings, "
+                f"but at most {limit} AB stages fit the per-CTA SMEM budget"
+            )
+        if fix_invalid:
+            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
+        raise InvalidConfig(
+            f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AUX_LOAD_MODE_EPI_TMA!r} {reason}"
+        )
 
     def aux_stages_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         """Per-config aux-pipeline stage-count knob.
@@ -8711,9 +9017,30 @@ class CuteTcgen05Config:
         self._validate_int_enum_config(
             config,
             TCGEN05_AUX_STAGES_CONFIG_KEY,
-            TCGEN05_AUX_STAGE_COUNT_CHOICES,
+            TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES,
             fix_invalid=fix_invalid,
         )
+        # Only the epilogue-issued ring prices the deeper stage counts; the
+        # producer-warp ring keeps its validated depths.
+        aux_stages = config.get(TCGEN05_AUX_STAGES_CONFIG_KEY)
+        if (
+            type(aux_stages) is int
+            and aux_stages not in TCGEN05_AUX_STAGE_COUNT_CHOICES
+            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_EPI_TMA
+        ):
+            if fix_invalid:
+                config[TCGEN05_AUX_STAGES_CONFIG_KEY] = max(
+                    TCGEN05_AUX_STAGE_COUNT_CHOICES
+                )
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_AUX_STAGES_CONFIG_KEY}={aux_stages} is only "
+                    f"available with {TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_MODE_EPI_TMA!r}; the producer-warp ring "
+                    f"takes {TCGEN05_AUX_STAGE_COUNT_CHOICES!r}"
+                )
+        self._normalize_epi_tma(config, fix_invalid=fix_invalid)
         self._validate_int_enum_config(
             config,
             TCGEN05_CONSUMER_REGS_CONFIG_KEY,

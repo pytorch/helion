@@ -132,6 +132,7 @@ from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
 from .strategies import tcgen05_explicit_epilogue_tile_expr
 from .strategies import tcgen05_explicit_epilogue_tile_supported
+from .strategies import tcgen05_is_two_cta_m128
 from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
@@ -159,12 +160,14 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
@@ -225,6 +228,7 @@ from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ...autotuner.config_spec import ConfigSpec
@@ -728,6 +732,11 @@ class _Tcgen05AuxPipelinePlan:
     # matmul plan so no block-shape fields are plumbed through
     # this dataclass.
     epi_tile_var: str
+    # ``tcgen05_aux_load_mode="epi_tma"``: no producer warp; the epilogue
+    # warps' warp 0 issues the TMA loads itself (the first ``stage_count``
+    # subtiles of a tile before the accumulator wait, then one subtile ahead
+    # of the reads; ``memory_ops`` emits both sites next to the consumer).
+    epilogue_issued: bool = False
 
 
 @dataclass(frozen=True)
@@ -1302,6 +1311,24 @@ def _tcgen05_tma_destination_is_legal(
     ) == expected_major and _tcgen05_tma_tensor_is_aligned(env, tensor)
 
 
+def _tcgen05_tma_aux_tensor_is_legal(
+    env: CompileEnvironment, tensor: torch.Tensor
+) -> bool:
+    """Whether a staged auxiliary tile may be bulk-loaded from ``tensor``.
+
+    The aux rings (``tcgen05_aux_load_mode`` ``"tma"`` / ``"epi_tma"``) are
+    filled through a row-major TensorMap over the host tensor
+    (``append_tcgen05_epilogue_tma_wrapper`` with the ROW_MAJOR epilogue
+    tile), so the operand's contiguous axis has to be its last one and its
+    base and outer strides have to satisfy the TensorMap proof above; a
+    column-major view, an offset base or an outer stride off a 16-byte
+    multiple would land the wrong elements in the ring without an error.
+    """
+    return _tcgen05_tma_matrix_major(
+        tensor
+    ) == "row" and _tcgen05_tma_tensor_is_aligned(env, tensor)
+
+
 def _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info: _MmaOperandInfo) -> bool:
     """Whether a grouped RHS form is exempt from the TMA-store destination proof.
 
@@ -1384,9 +1411,57 @@ def host_function_matmul_operands_tma_provable(
     outside any (``compiler_seed_configs`` called directly), while the MMA
     analysis reads the current one, so ``env`` is entered when none is active.
     """
+    device_ir = host_function.device_ir
+    with _host_function_tma_proof_scope(env, host_function):
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                if candidate is None:
+                    continue
+                for operand in (candidate.operands.lhs, candidate.operands.rhs):
+                    if not _tcgen05_tma_operand_is_aligned(env, operand):
+                        return False
+                if not _tcgen05_mma_output_tma_store_provable(
+                    env, node, candidate, device_ir.graphs
+                ):
+                    return False
+    return True
+
+
+def host_function_exact_aux_tma_provable(
+    env: CompileEnvironment, host_function: HostFunction
+) -> bool:
+    """Return False when a staged auxiliary operand fails the aux TMA proof.
+
+    The aux rings of ``tcgen05_aux_load_mode`` ``"tma"`` / ``"epi_tma"`` are
+    filled through a row-major TensorMap over every exact-shape rank-2
+    auxiliary operand of the analyzed store chains (the descriptors
+    ``c_input_aux_tensor_descriptors`` stages); codegen refuses either mode
+    unless each passes ``_tcgen05_tma_aux_tensor_is_legal``. Evaluated at
+    bind time (``CuteTcgen05ClusterM2FfiHeuristic.register_facts``) under
+    the same proof scope as the operand proof, so the search surface, the
+    seeds and the normalizer never offer the staged modes to a kernel whose
+    residual, gate or seed is an offset, strided or column-major view.
+    """
+    from .aux_tensor import host_function_tcgen05_exact_shape_aux_tensors
+
+    with _host_function_tma_proof_scope(env, host_function):
+        return all(
+            _tcgen05_tma_aux_tensor_is_legal(env, tensor)
+            for tensor in host_function_tcgen05_exact_shape_aux_tensors(host_function)
+        )
+
+
+@contextlib.contextmanager
+def _host_function_tma_proof_scope(
+    env: CompileEnvironment, host_function: HostFunction
+) -> Iterator[None]:
+    """The bind-time TMA proofs' scope: ``env`` and ``host_function`` current,
+    the active runtime argument values classified into a temporary alignment
+    snapshot that is restored afterwards (see
+    ``host_function_matmul_operands_tma_provable``)."""
     from ..compile_environment import CompileEnvironment
 
-    device_ir = host_function.device_ir
     saved = env.bound_runtime_input_specialization_results
     with contextlib.ExitStack() as stack:
         if CompileEnvironment.has_current():
@@ -1399,21 +1474,9 @@ def host_function_matmul_operands_tma_provable(
                     env.runtime_arg_values_by_name
                 )
             with host_function:
-                for graph_info in device_ir.graphs:
-                    for node in graph_info.graph.nodes:
-                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
-                        if candidate is None:
-                            continue
-                        for operand in (candidate.operands.lhs, candidate.operands.rhs):
-                            if not _tcgen05_tma_operand_is_aligned(env, operand):
-                                return False
-                        if not _tcgen05_mma_output_tma_store_provable(
-                            env, node, candidate, device_ir.graphs
-                        ):
-                            return False
+                yield
         finally:
             env.bound_runtime_input_specialization_results = saved
-        return True
 
 
 def _compose_axis_orders(
@@ -11870,7 +11933,7 @@ def _emit_mma_pipeline(
         explicit_epi_aux_supported = not c_input_aux_tensor_descriptors_value or (
             tcgen05_warp_spec.c_input_warps == 0
             and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
-            != TCGEN05_AUX_LOAD_MODE_TMA
+            not in (TCGEN05_AUX_LOAD_MODE_TMA, TCGEN05_AUX_LOAD_MODE_EPI_TMA)
         )
         explicit_epi_tile_supported = (
             tcgen05_explicit_epilogue_tile_supported(
@@ -12950,6 +13013,16 @@ def _emit_mma_pipeline(
                         f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires auxiliary "
                         "tensor dtype to match the epilogue/output dtype",
                     )
+                if tcgen05_aux_tma_requested and not all(
+                    _tcgen05_tma_aux_tensor_is_legal(env, desc.host_tensor_val)
+                    for desc in c_input_aux_tensor_descriptors
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} "
+                        f"{TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON}",
+                    )
                 tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
                 tcgen05_aux_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
                     df.config
@@ -13034,6 +13107,126 @@ def _emit_mma_pipeline(
                         ),
                     )
                 )
+        if (
+            df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_EPI_TMA
+        ):
+            # ``tcgen05_aux_load_mode="epi_tma"``: the exact-shape auxiliary
+            # tiles take the same per-subtile SMEM rings as the ``tma``
+            # producer-warp path, but the epilogue warps issue the bulk loads
+            # themselves (``memory_ops``: the first ``tcgen05_aux_stages``
+            # subtiles ahead of the accumulator wait, then one subtile ahead
+            # of each read). No producer warp, no scheduler, no persistence
+            # requirement, so the monolithic strategy and the two-CTA pair
+            # take it. Every precondition fails closed: a config that reaches
+            # codegen outside the envelope is refused here rather than
+            # rendered with unstaged reads.
+            epi_tma_descriptors = tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+            epi_tma_reason: str | None = None
+            if (
+                tcgen05_matmul_plan.has_c_input_warp
+                or tcgen05_matmul_plan.has_store_warp
+            ):
+                epi_tma_reason = (
+                    "replaces the aux producer warp: requires "
+                    "``tcgen05_warp_spec_c_input_warps=0`` and "
+                    "``tcgen05_warp_spec_store_warps=0``"
+                )
+            elif not epi_tma_descriptors:
+                epi_tma_reason = (
+                    "requires at least one exact-shape rank-2 auxiliary tensor "
+                    "in the epilogue chain"
+                )
+            elif len({d.store_value_node for d in epi_tma_descriptors}) > 1:
+                epi_tma_reason = (
+                    "requires single-store fan-out for the staged aux descriptors"
+                )
+            elif not tcgen05_use_tma_store_epilogue:
+                epi_tma_reason = "requires the TMA-store epilogue"
+            elif not tcgen05_static_output_tiles:
+                epi_tma_reason = "requires static full output tiles"
+            elif tcgen05_m_subtile_count > 1:
+                epi_tma_reason = "does not support paired M subtiles"
+            elif tcgen05_is_two_cta_m128(is_two_cta=tcgen05_is_two_cta, bm=bm):
+                epi_tma_reason = (
+                    "is not validated on the bm=128 CtaGroup.TWO epilogue tile"
+                )
+            elif tcgen05_cluster_m == 2 and not tcgen05_is_two_cta:
+                epi_tma_reason = (
+                    "requires the CtaGroup.TWO pair when tcgen05_cluster_m=2"
+                )
+            elif any(
+                env.backend.dtype_str(desc.host_tensor_val.dtype) != epi_elem_dtype_str
+                for desc in epi_tma_descriptors
+            ):
+                epi_tma_reason = (
+                    "requires auxiliary tensor dtype to match the epilogue/output dtype"
+                )
+            elif not all(
+                _tcgen05_tma_aux_tensor_is_legal(env, desc.host_tensor_val)
+                for desc in epi_tma_descriptors
+            ):
+                epi_tma_reason = TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
+            if epi_tma_reason is not None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_MODE_EPI_TMA!r} {epi_tma_reason}",
+                )
+            epi_tma_dtype_strs = tuple(
+                env.backend.dtype_str(desc.host_tensor_val.dtype)
+                for desc in epi_tma_descriptors
+            )
+            epi_tma_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
+                df.config
+            )
+            epi_tma_plan = _new_tcgen05_aux_pipeline_plan(
+                df,
+                num_rings=len(epi_tma_descriptors),
+                epi_tile_var=tcgen05_plan.epi_tile,
+                use_tma_load=True,
+                stage_count=epi_tma_stage_count,
+                epilogue_issued=True,
+            )
+            for desc, ring, aux_dtype_str in zip(
+                epi_tma_descriptors,
+                epi_tma_plan.rings,
+                epi_tma_dtype_strs,
+                strict=True,
+            ):
+                tma_atom = ring.tma_atom
+                tma_tensor = ring.tma_tensor
+                assert tma_atom is not None
+                assert tma_tensor is not None
+                aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
+                df.placeholder_args.add(aux_tensor_name)
+                df.wrapper_only_params.extend([tma_atom, tma_tensor])
+                cg.cute_wrapper_plans.append(
+                    {
+                        "kind": "tcgen05_aux_tma",
+                        "c_name": aux_tensor_name,
+                        "bm": bm,
+                        "bn": bn,
+                        "stage_count": epi_tma_stage_count,
+                        "input_dtype": aux_dtype_str,
+                        "kernel_args": [tma_atom, tma_tensor],
+                    }
+                )
+            df.cute_state.register_tcgen05_aux_pipeline_plan(epi_tma_plan)
+            prefix.extend(
+                _emit_tcgen05_aux_pipeline_setup(
+                    epi_tma_plan,
+                    descriptor_dtype_strs=epi_tma_dtype_strs,
+                    tile_shape_expr=tcgen05_plan.epi_tile,
+                    # TMA producer: the SIMT thread count is unused.
+                    c_input_warp_thread_count=0,
+                    epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
+                    defer_sync=(
+                        tcgen05_use_cluster_deferred_pipelines
+                        or tcgen05_use_merged_pipeline_init
+                    ),
+                )
+            )
         if not tcgen05_use_tma:
             _emit_tcgen05_tmem_setup()
     else:
@@ -16907,6 +17100,7 @@ def _new_tcgen05_aux_pipeline_plan(
     epi_tile_var: str,
     use_tma_load: bool,
     stage_count: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epilogue_issued: bool = False,
 ) -> _Tcgen05AuxPipelinePlan:
     """Allocate variable names for the C-input warp's aux-tensor
     SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
@@ -16934,9 +17128,10 @@ def _new_tcgen05_aux_pipeline_plan(
         "in ``_codegen_cute_mma`` should not call this with an empty "
         "descriptor tuple"
     )
-    assert stage_count in TCGEN05_AUX_STAGE_COUNT_CHOICES, (
+    assert stage_count in TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES, (
         f"aux pipeline stage_count={stage_count!r} not in "
-        f"TCGEN05_AUX_STAGE_COUNT_CHOICES={TCGEN05_AUX_STAGE_COUNT_CHOICES!r}"
+        "TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES="
+        f"{TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES!r}"
     )
     rings = tuple(
         _Tcgen05AuxPerDescriptorRingNames(
@@ -16962,6 +17157,7 @@ def _new_tcgen05_aux_pipeline_plan(
         rings=rings,
         use_tma_load=use_tma_load,
         stage_count=stage_count,
+        epilogue_issued=epilogue_issued,
         epi_tile_var=epi_tile_var,
     )
 

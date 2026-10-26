@@ -219,7 +219,7 @@ def test_facts_distinguish_aux_on_every_store() -> None:
     assert gated.aux_kernel_detected and gated.exact_shape_aux_kernel_detected
     assert not gated.aux_loads_on_every_store
     assert gated.rowvec_aux_facts == Tcgen05RowvecAuxFacts(
-        output_itemsize=2, rows=(), output_count=2
+        output_itemsize=2, rows=(), output_count=2, exact_aux_count=1
     )
     assert gated.pre_acc_wait_admissible_via_fanout()
 

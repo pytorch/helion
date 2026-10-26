@@ -8159,6 +8159,7 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         host_function = device_ir.host_function
         if host_function is None or not env.config_spec.cute_tcgen05_search_enabled:
             return frozenset()
+        from ..cute.cute_mma import host_function_exact_aux_tma_provable
         from ..cute.cute_mma import host_function_matmul_operands_tma_provable
 
         # Codegen proves a pointer-preserving host view operand through its
@@ -8175,9 +8176,17 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         env.compiler_fact_specialization_facts = saved | facts
         try:
             provable = host_function_matmul_operands_tma_provable(env, host_function)
+            # The staged aux modes (``tma`` / ``epi_tma``) bulk-load every
+            # exact-shape auxiliary operand through a row-major TensorMap;
+            # the same proof over those operands keeps both modes off the
+            # search surface, the seeds and the normalizer for an offset,
+            # strided or column-major residual / gate view (codegen refuses
+            # them with ``TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON``).
+            aux_provable = host_function_exact_aux_tma_provable(env, host_function)
         finally:
             env.compiler_fact_specialization_facts = saved
         env.config_spec.cute_tcgen05_matmul_operands_tma_provable = provable
+        env.config_spec.cute_tcgen05_exact_aux_tma_provable = aux_provable
         return facts
 
     @classmethod
