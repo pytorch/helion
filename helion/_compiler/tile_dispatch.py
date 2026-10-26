@@ -389,7 +389,7 @@ class TileStrategyDispatch:
 
         if (
             self._has_rolled_reductions
-            and CompileEnvironment.current().backend.name == "triton"
+            and CompileEnvironment.current().codegen_name == "triton"
             and not isinstance(expr, sympy.Symbol)
         ):
             block_symbols, _ = find_block_size_symbols(expr)

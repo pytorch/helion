@@ -190,7 +190,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
     # Other backends' tensor argument handling is untested with views, and
     # without static_shapes kernels aren't specialized on strides, so a later
     # input's flatten() might copy.
-    enabled = env.backend.name in ("triton", "cute") and env.settings.static_shapes
+    enabled = env.codegen_name in ("triton", "cute") and env.settings.static_shapes
 
     def require_chain_support(detail: str) -> None:
         if env.backend.name == "cute":
