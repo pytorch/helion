@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..device_ir import GraphInfo
+    from .cute_mma_dag_tcgen05 import StreamedLoopFacts
     from .cute_mma_dag_tcgen05 import Tcgen05Facts
     from .cute_mma_dag_tcgen05 import Tcgen05Plan
 
@@ -146,13 +147,25 @@ MMA_DAG_EXCHANGE_CHOICES: tuple[str, ...] = (
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
+MMA_DAG_PASS_WARPS_MMA = "mma"
 # tcgen05 at eight warps with loop operand passes: ``on`` has warps 4-7
 # rewrite the operand tiles one tile ahead of the epilogue warps' chain
 # (handing each over through a per-stage mbarrier); ``off`` runs the passes
-# on the chain, the extra warps draining the stores.
+# on the chain, the extra warps draining the stores.  ``mma`` (the
+# tensor-memory region programs' streamed K loops with operand passes,
+# ``cute_mma_dag_tcgen05_regions``): one more warp issues the MMAs and the
+# ring refills while every warp of the config runs the passes, each ring
+# slot handed over through a ``ready`` mbarrier -- no CTA barrier in the
+# loop, the pass of one iteration overlaps the tensor core's work on the
+# previous (se_block backward at 4096x1024 on a B200: dx 22.1 -> 21.1 us,
+# dw 39.9 -> 35.9 against the campaign winners, the cell 69.6 -> 63.4 us
+# graph; bit-equal to the chain schedule's render of the same tile).  The
+# warp owns no packet of the passes and drains it reaches outside its loop
+# (``pass_guard``).
 MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_OFF,
     MMA_DAG_PASS_WARPS_ON,
+    MMA_DAG_PASS_WARPS_MMA,
 )
 # Ring depth the pass-warp seed asks for: the next tile must land before
 # its pass is due (at two slots the TMA of tile i + 1 goes out with
@@ -1468,18 +1481,21 @@ class AuxLoadFacts:
     """A per-thread side load varying with an innermost ring loop that
     ``cute_mma_dag_aux='ring'`` stages beside the loop's operand tiles
     (``mma_dag_aux_records``; what the smem estimate needs without the
-    graphs).  ``kind``: ``"scalar"`` (a word per thread), ``"across"`` (a
-    pass operand's vector across its packets' run: a word per packet the
-    thread owns), ``"run"`` (a pass operand's vector along the source tile's
-    contiguous dim, copied once per CTA as 16-byte runs), ``"packed"`` (such
-    a vector whose runs cannot be 16-byte copies: a word per packet element)
-    or ``"shared"`` (an fp32 vector the lanes read by coordinate -- the carry
-    rescale's row, a derived value's row -- copied once per CTA, element by
-    element).  ``index`` numbers the load within its loop (a vector read by
-    two operands is copied once); ``axis`` is its one tile dim (-1: a
-    scalar), ``elem_bytes`` its element size; a pass operand's record carries
-    the operand tile's rows / cols axes, contiguous axis and element size
-    (its packets per thread size the word slots)."""
+    graphs).  ``kind``: ``"shared"`` (an fp32 scalar or one-dim vector
+    copied once per CTA into the loop's side tile -- the scalar by thread 0,
+    element ``t`` of the vector by thread ``t`` -- and read by any lane at
+    any coordinate: a pass operand's decay scalar / gate row across its
+    packets, the carry rescale's scalar / row, a derived value's row),
+    ``"scalar"`` (a 16-bit / integer pass-operand scalar: a word per
+    thread), ``"across"`` (a 16-bit pass-operand vector across its packets'
+    run: a word per packet the thread owns), ``"run"`` (a pass operand's
+    vector along the source tile's contiguous dim, copied once per CTA as
+    16-byte runs) or ``"packed"`` (such a vector whose runs cannot be 16-byte
+    copies: a word per packet element).  ``index`` numbers the load within
+    its loop (a vector read by two operands is copied once); ``axis`` is its
+    one tile dim (-1: a scalar), ``elem_bytes`` its element size; a pass
+    operand's record carries the operand tile's rows / cols axes, contiguous
+    axis and element size (its packets per thread size the word slots)."""
 
     loop: int
     kind: str
@@ -1646,19 +1662,25 @@ class SmemTileSpec:
 
 @dataclasses.dataclass(frozen=True)
 class AuxRing:
-    """The ``MMA_DAG_AUX_RING`` slots of one innermost ring loop: per stage,
-    ``words`` 4-byte slots per thread (``[slot][thread]`` words: a scalar or
-    a row-vector element the thread's packets read, copied and read by the
-    same thread) followed by the vectors along the source tiles' contiguous
-    dim (``vector_bytes`` in all, copied once per CTA with 16-byte
-    ``cp.async`` by the first threads and read behind a barrier: a packet
-    reads its run of ``run`` elements), then the fp32 vectors the lanes read
-    by coordinate (``shared_bytes`` in all: the carry rescale's decay row, a
-    derived value's gate row -- copied once per CTA element by element, read
-    by any lane at any coordinate behind the iteration barrier).  ``runs``
-    maps the run accesses to ``(elements per packet run, bytes per run, byte
-    offset in the stage)``; ``shared`` maps the shared accesses to
-    ``(elements, byte offset among the shared vectors)``."""
+    """The ``MMA_DAG_AUX_RING`` slots of one innermost ring loop.  Per
+    stage (``stages`` of them from ``offset``), ``words`` 4-byte slots per
+    thread (``[slot][thread]`` words: a 16-bit scalar or row-vector element
+    the thread's packets read, copied and read by the same thread) followed
+    by the vectors along the source tiles' contiguous dim (``vector_bytes``
+    in all, copied once per CTA with 16-byte ``cp.async`` by the first
+    threads and read behind a barrier: a packet reads its run of ``run``
+    elements); both ride the operand tile's cp.async group.  Then the side
+    tile: ``shared_slots`` (``stages + 1``) slots of ``shared_bytes`` from
+    ``shared_base``, each holding the fp32 scalars and vectors the lanes
+    read by coordinate (the pass operands' decay scalar / gate row, the
+    carry rescale's, a derived value's row) -- the scalar copied by thread
+    0, element ``t`` of a vector by thread ``t``, the tile of iteration ``i
+    + stages`` issued with the group of operand tile ``i + stages - 1`` so
+    the iteration's wait and barrier publish it one iteration ahead of its
+    reads, which then sit anywhere in the iteration (ahead of the operand
+    wait included).  ``runs`` maps the run accesses to ``(elements per
+    packet run, bytes per run, byte offset in the stage)``; ``shared`` maps
+    the side tile's accesses to ``(elements, byte offset in the slot)``."""
 
     offset: int
     words: int
@@ -1667,15 +1689,16 @@ class AuxRing:
     threads: int
     shared: dict[Node, tuple[int, int]] = dataclasses.field(default_factory=dict)
     shared_bytes: int = 0
+    shared_base: int = 0
+    shared_slots: int = 2
 
     @property
     def stage_bytes(self) -> int:
-        return self.threads * self.words * 4 + self.vector_bytes + self.shared_bytes
-
-    @property
-    def shared_offset(self) -> int:
-        """Byte offset of the shared vectors within a stage."""
+        """Bytes per stage of the per-thread words and the runs."""
         return self.threads * self.words * 4 + self.vector_bytes
+
+    def total_bytes(self, stages: int) -> int:
+        return mma_dag_aux_ring_bytes(self.stage_bytes, self.shared_bytes, stages)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1735,10 +1758,20 @@ class MmaDagPlan:
     # packets (``MMA_DAG_L2_HINTS``: the config's ``load_eviction_policies``
     # at the load's slot); absent: a plain packet.
     load_hints: dict[Node, str] = dataclasses.field(default_factory=dict)
+    # ``cute_mma_dag_pass_warps='mma'`` (tensor-memory region programs): one
+    # warp beyond the config's issues the streamed loops' MMAs and refills;
+    # ``threads`` stays the config's warps (the passes, the epilogue), the
+    # launch adds the warp (``launch_threads``).
+    mma_warp: bool = False
 
     @property
     def threads(self) -> int:
         return 32 * self.warps
+
+    @property
+    def launch_threads(self) -> int:
+        """The CTA's thread count: the config's warps plus the MMA warp."""
+        return self.threads + (32 if self.mma_warp else 0)
 
     def block(self, axis: Axis) -> int:
         """The config's block size of ``axis`` (see ``blocks``)."""
@@ -2273,9 +2306,9 @@ def mma_dag_smem_estimate(
     plus the double-buffered staging tile of every loop snapshot.  Under
     ``derived='pass'`` a pass chain's exchange tile is a ring tile instead;
     under ``aux='ring'`` (at a known ``warps``) each ring loop's aux ring
-    (``stages`` stages of its staged side loads, ``mma_dag_aux_estimate``)
-    follows the frames.  The planner's ``smem_bytes`` is this number for
-    its selected routes."""
+    (``stages`` stages of its per-thread side loads and ``stages + 1`` side
+    tile slots, ``mma_dag_aux_estimate``) follows the frames.  The
+    planner's ``smem_bytes`` is this number for its selected routes."""
     exchanged: set[int] | None = None
     layouts: Layouts = {}
     if warps is not None and (facts.edges or facts.vecs):
@@ -2322,10 +2355,12 @@ def mma_dag_smem_estimate(
 def mma_dag_aux_stage(
     records: Sequence[AuxLoadFacts], resolved: Sequence[int], threads: int
 ) -> tuple[int, int, int]:
-    """One loop's aux ring per stage at ``resolved`` block sizes (by axis
-    index) over ``threads``: ``(words per thread, run bytes, shared
-    bytes)`` of its records (``AuxLoadFacts``; ``mma_dag_aux_ring`` lays
-    the same numbers out by node)."""
+    """One loop's aux ring at ``resolved`` block sizes (by axis index) over
+    ``threads``: ``(words per thread, run bytes, side tile bytes)`` of its
+    records (``AuxLoadFacts``; ``mma_dag_aux_ring`` lays the same numbers
+    out by node).  The words and runs are per stage; the side tile (the
+    ``"shared"`` records, a 16-byte-aligned slot per vector or scalar) is
+    per slot, and the ring keeps ``stages + 1`` of them."""
     words = vector_bytes = shared_bytes = 0
     seen: set[tuple[str, int]] = set()
     for record in records:
@@ -2336,7 +2371,9 @@ def mma_dag_aux_stage(
             if ("shared", record.index) in seen:
                 continue
             seen.add(("shared", record.index))
-            shared_bytes += -(-resolved[record.axis] * record.elem_bytes // 16) * 16
+            shared_bytes += mma_dag_aux_tile_bytes(
+                mma_dag_aux_elements(record, resolved), record.elem_bytes
+            )
             continue
         es = record.operand_bytes
         run_elems = 16 // es
@@ -2357,17 +2394,24 @@ def mma_dag_aux_stage(
 
 
 def mma_dag_aux_cap_reason(
-    loop: int, words: int, vector_bytes: int, shared_bytes: int, threads: int
+    loop: int,
+    words: int,
+    vector_bytes: int,
+    shared_bytes: int,
+    threads: int,
+    stages: int,
 ) -> str | None:
     """Why one loop's aux ring exceeds ``MMA_DAG_AUX_MAX_BYTES`` per thread
-    per stage (None: it fits): the thread's words plus its share of the
-    CTA-wide copies."""
-    per_thread = words * 4 + -(-vector_bytes // threads) + -(-shared_bytes // threads)
-    if per_thread > MMA_DAG_AUX_MAX_BYTES:
+    per stage (None: it fits): the ring's bytes (``mma_dag_aux_ring_bytes``:
+    ``stages`` stages of the thread's words and the CTA-wide runs, ``stages +
+    1`` slots of the side tile) over its stages and threads."""
+    total = mma_dag_aux_ring_bytes(
+        words * 4 * threads + vector_bytes, shared_bytes, stages
+    )
+    if -(-total // (stages * threads)) > MMA_DAG_AUX_MAX_BYTES:
         return (
-            f"{MMA_DAG_AUX_KEY}: loop {loop}'s side loads take"
-            f" {words * 4 * threads + vector_bytes + shared_bytes} B per stage,"
-            f" more than {MMA_DAG_AUX_MAX_BYTES} per thread"
+            f"{MMA_DAG_AUX_KEY}: loop {loop}'s side loads take {total} B over"
+            f" {stages} stages, more than {MMA_DAG_AUX_MAX_BYTES} per thread per stage"
         )
     return None
 
@@ -2380,9 +2424,10 @@ def mma_dag_aux_estimate(
     base: int,
 ) -> tuple[int, str | None]:
     """The aux rings' shared memory behind the frames' ``base`` bytes under
-    ``MMA_DAG_AUX_RING`` (each ring 128-byte aligned, ``stages`` stages; the
-    bytes ``mma_dag_aux_rings`` lays out) and the first loop's per-thread
-    cap reason (``mma_dag_aux_cap_reason``; None: every loop fits)."""
+    ``MMA_DAG_AUX_RING`` (each ring 128-byte aligned: ``stages`` stages of
+    words and runs, then ``stages + 1`` side tile slots; the bytes
+    ``mma_dag_aux_rings`` lays out) and the first loop's per-thread cap
+    reason (``mma_dag_aux_cap_reason``; None: every loop fits)."""
     offset = base
     reason: str | None = None
     by_loop: dict[int, list[AuxLoadFacts]] = {}
@@ -2394,17 +2439,34 @@ def mma_dag_aux_estimate(
         )
         if reason is None:
             reason = mma_dag_aux_cap_reason(
-                loop, words, vector_bytes, shared_bytes, threads
+                loop, words, vector_bytes, shared_bytes, threads, stages
             )
         offset = (offset + 127) // 128 * 128
-        offset += (threads * words * 4 + vector_bytes + shared_bytes) * stages
+        offset += mma_dag_aux_ring_bytes(
+            threads * words * 4 + vector_bytes, shared_bytes, stages
+        )
     return offset - base, reason
 
 
 def mma_dag_aux_tile_bytes(elements: int, elem_bytes: int = 4) -> int:
-    """Bytes of one shared vector of ``elements`` within an aux ring stage
-    (each vector starts at a 16-byte boundary)."""
+    """Bytes of one shared vector of ``elements`` within an aux ring's side
+    tile (each vector starts at a 16-byte boundary)."""
     return -(-elements * elem_bytes // 16) * 16
+
+
+def mma_dag_aux_elements(record: AuxLoadFacts, resolved: Sequence[int]) -> int:
+    """Elements of a ``"shared"`` record's side tile entry at ``resolved``
+    block sizes: the vector's block extent, or one for a scalar."""
+    return 1 if record.axis < 0 else resolved[record.axis]
+
+
+def mma_dag_aux_ring_bytes(stage_bytes: int, shared_bytes: int, stages: int) -> int:
+    """Shared memory of one loop's aux ring: ``stages`` stages of its
+    per-thread words and runs (``stage_bytes`` each) followed by the
+    ``stages + 1`` slots of its side tile (``shared_bytes`` each: the tile
+    of iteration ``i + stages`` is issued one group ahead of operand tile
+    ``i + stages - 1``, while iteration ``i``'s is still read)."""
+    return stage_bytes * stages + shared_bytes * (stages + 1)
 
 
 def mma_dag_ring_loops(
@@ -2445,19 +2507,27 @@ def mma_dag_aux_records(
     """The side loads of innermost ring loop ``loop`` the aux ring stages
     (``MMA_DAG_AUX_RING``), as ``(load node, record)`` in program order: per
     pass operand (a load rewritten by a pointwise pass) each aux load
-    varying with the loop -- a scalar a word per thread, a vector across
-    the operand's packets a word per packet the thread owns, one along the
+    varying with the loop -- an fp32 scalar or an fp32 vector across the
+    operand's packets (the decay scalar, the gate row) an entry of the
+    loop's side tile (``"shared"``: copied once per CTA, the scalar by
+    thread 0 and element ``t`` by thread ``t``, read by coordinate; the
+    tile is never more packets than the words per thread would be, since
+    a packet run spans at least 16 bytes of the operand row) when its
+    elements all exist (``side_tile`` below; else the per-thread kind: the
+    tile copies the block extent, the per-thread words the unpredicated
+    sites alone), a 16-bit scalar a word per thread, a 16-bit vector
+    across the packets a word per packet the thread owns, one along the
     source tile's contiguous dim a 16-byte run per packet copied once per
     CTA (a word per packet element where its runs cannot be 16-byte
-    copies) -- and the other per-thread side loads varying with the loop
-    that the lanes read at their own coordinates (the carry rescale's decay
-    scalar / row, a derived value's gate row, a store's or reduction's
-    vector): fp32 scalars (a word per thread) and one-dim fp32 vectors
-    (``"shared"``: the vector's block extent copied once per CTA, read by
-    coordinate) of a tensor the program never stores, with no window and no
-    ragged axis (their elements all exist: the packets read nothing past an
-    extent).  Whether the loop's ring exists for the bound inputs is
-    ``mma_dag_ring_loops``' question."""
+    copies) -- and the other per-thread
+    side loads varying with the loop that the lanes read at their own
+    coordinates (the carry rescale's decay scalar / row, a derived value's
+    gate row, a store's or reduction's vector): fp32 scalars and one-dim
+    fp32 vectors (``"shared"`` entries of the side tile too) of a tensor
+    the program never stores, with no window and no ragged axis (their
+    elements all exist: the packets read nothing past an extent).  Whether
+    the loop's ring exists for the bound inputs is ``mma_dag_ring_loops``'
+    question."""
     from ...language import memory_ops
 
     index = loop.index
@@ -2466,6 +2536,24 @@ def mma_dag_aux_records(
 
     def number(node: Node) -> int:
         return numbers.setdefault(node, len(numbers))
+
+    stored = {
+        _storage(store.access) for store in (*program.stores, *program.vec_stores)
+    }
+    ragged = ragged_root_axes(program)
+
+    def side_tile(access: Access) -> bool:
+        """Whether ``access`` can take an entry of the side tile: an fp32
+        scalar or one-dim vector of a tensor the program never stores, with
+        no window and no ragged axis (the tile copies the vector's block
+        extent once per CTA, so every element must exist)."""
+        return (
+            access.dtype == torch.float32
+            and len(access.tile_dims) <= 1
+            and not access.windows
+            and _storage(access) not in stored
+            and not any(axis.index in ragged for axis in access.tile_dims)
+        )
 
     for dot in program.dots:
         if dot.loop != index:
@@ -2506,12 +2594,13 @@ def mma_dag_aux_records(
                     both = len(positions) > 1
                 else:
                     along_vector = access.tile_dims[0] is along
+                shared = side_tile(access)
                 if not access.tile_dims:
-                    kind = "scalar"
+                    kind = "shared" if shared else "scalar"
                 elif both:
                     kind = "packed"
                 elif not along_vector:
-                    kind = "across"
+                    kind = "shared" if shared else "across"
                 elif (
                     len(access.tile_dims) == 1
                     and access.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -2535,10 +2624,6 @@ def mma_dag_aux_records(
                     )
                 )
     operand_nodes = {node for node, _record in records}
-    stored = {
-        _storage(store.access) for store in (*program.stores, *program.vec_stores)
-    }
-    ragged = ragged_root_axes(program)
     scalar_nodes = {access.node for access in program.scalar_loads}
     for access in program.accesses:
         node = access.node
@@ -2549,17 +2634,10 @@ def mma_dag_aux_records(
             or node in numbers
         ):
             continue
-        if (
-            len(access.tile_dims) > 1
-            or access.dtype != torch.float32
-            or access.windows
-            or _storage(access) in stored
-            or any(axis.index in ragged for axis in access.tile_dims)
-            or program.level(access) != index
-        ):
+        if not side_tile(access) or program.level(access) != index:
             continue
         if not access.tile_dims:
-            records.append((node, AuxLoadFacts(index, "scalar", number(node))))
+            records.append((node, AuxLoadFacts(index, "shared", number(node))))
         else:
             records.append(
                 (
@@ -2898,6 +2976,7 @@ def mma_dag_config_reason(
     lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
     aux: str = MMA_DAG_AUX_REGISTER,
     persistent: bool = False,
+    pass_warps: str = MMA_DAG_PASS_WARPS_OFF,
 ) -> str | None:
     """Why the block sizes / warps / stages cannot run the program in
     ``mode`` (None: they can).
@@ -2911,7 +2990,9 @@ def mma_dag_config_reason(
     slot in tensor memory); ``aux`` the ``cute_mma_dag_aux`` route (the
     warp mode's aux rings take shared memory); ``persistent`` the
     ``cute_mma_dag_persistent`` launch (a tensor-memory region program's
-    root items then live beside the loop frames).
+    root items then live beside the loop frames); ``pass_warps`` the
+    ``cute_mma_dag_pass_warps`` schedule (``mma`` adds the streamed loops'
+    ``ready`` barriers and needs their accumulators in tensor memory).
     """
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_warps_reason
@@ -2980,6 +3061,7 @@ def mma_dag_config_reason(
             epilogue=epilogue,
             lookahead=lookahead,
             persistent=persistent,
+            pass_warps=pass_warps,
         )
     if epilogue != MMA_DAG_EPILOGUE_ROW:
         return f"{MMA_DAG_EPILOGUE_KEY}={epilogue!r} needs the tcgen05 mode"
@@ -3172,15 +3254,51 @@ def mma_dag_pass_warps_lead(facts: CuteMmaDagFacts, resolved: Sequence[int]) -> 
     )
 
 
+def streamed_loop_subject(loop: StreamedLoopFacts, derived: str) -> bool:
+    """Whether ``cute_mma_dag_pass_warps='mma'`` has a subject in streamed
+    candidate ``loop`` at the derived route: the loop streams (no pass
+    chain, or the pass route writes the chain's ring tile) and some operand
+    takes a pass (the pass warps have work the MMA warp overlaps)."""
+    if loop.chains and derived != MMA_DAG_DERIVED_PASS:
+        return False
+    return bool(loop.passes or loop.chains)
+
+
 def mma_dag_pass_warps_reason(
-    facts: CuteMmaDagFacts, warps: int, stages: int, mode: str
+    facts: CuteMmaDagFacts,
+    warps: int,
+    stages: int,
+    mode: str,
+    pass_warps: str = MMA_DAG_PASS_WARPS_ON,
+    derived: str = MMA_DAG_DERIVED_EXCHANGE,
 ) -> str | None:
-    """Why ``cute_mma_dag_pass_warps='on'`` has no subject for this config
-    (None: it has): the tcgen05 single-loop emitter at eight warps with loop
-    operand passes and a ring of at least two slots (the pass warps rewrite
-    the next tile while the chain's MMA reads the current one)."""
+    """Why ``cute_mma_dag_pass_warps=pass_warps`` has no subject for this
+    config (None: it has).  ``on``: the tcgen05 single-loop emitter at eight
+    warps with loop operand passes and a ring of at least two slots (the
+    pass warps rewrite the next tile while the chain's MMA reads the current
+    one).  ``mma``: a tensor-memory region program with a streamed K loop
+    (``Tcgen05Facts.streamed``) whose operand tiles take a pass -- a
+    conversion or pointwise rewrite of a loaded tile, or a pass chain --
+    where a loop with a pass chain streams under
+    ``cute_mma_dag_derived='pass'`` only (the chain's tile is an exchange
+    tile otherwise, ``streamed_loop_subject``)."""
     if mode != MMA_DAG_TCGEN05:
         return "the warp mode runs its passes on every warp"
+    if pass_warps == MMA_DAG_PASS_WARPS_MMA:
+        if facts.tcgen05 is None or not facts.tcgen05.regions:
+            return "the MMA warp serves the region renderer's streamed loops"
+        if not facts.tcgen05.streamed:
+            return "no K loop streams over ring tiles"
+        if not any(
+            streamed_loop_subject(loop, derived) for loop in facts.tcgen05.streamed
+        ):
+            if any(loop.chains for loop in facts.tcgen05.streamed):
+                return (
+                    f"a streamed loop with a pass chain streams under "
+                    f"{MMA_DAG_DERIVED_KEY}={MMA_DAG_DERIVED_PASS!r} only"
+                )
+            return "no streamed loop operand needs a pass"
+        return None
     if facts.tcgen05 is None or facts.tcgen05.regions:
         return "the region renderer has no pass warps"
     if facts.loop_passes == 0:
@@ -7629,6 +7747,10 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if reason is not None:
         raise _decline(reason)
     assert type(cluster) is int and isinstance(split_mode, str)
+    if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
+        raise _decline(
+            f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
+        )
     reason = mma_dag_config_reason(
         facts,
         sizes_by_block,
@@ -7640,6 +7762,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         lookahead=cast("str", lookahead),
         aux=cast("str", aux_mode),
         persistent=persistent > 0,
+        pass_warps=cast("str", pass_warps),
     )
     if reason is not None:
         raise _decline(reason)
@@ -7651,10 +7774,6 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         raise _decline(
             f"{MMA_DAG_EXCHANGE_KEY} {exchange_mode!r} must be one of {MMA_DAG_EXCHANGE_CHOICES}"
         )
-    if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
-        raise _decline(
-            f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
-        )
     if loads_mode not in MMA_DAG_LOADS_CHOICES:
         raise _decline(
             f"{MMA_DAG_LOADS_KEY} {loads_mode!r} must be one of {MMA_DAG_LOADS_CHOICES}"
@@ -7664,8 +7783,15 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             f"{MMA_DAG_AUX_KEY} {aux_mode!r} must be one of {MMA_DAG_AUX_CHOICES}"
         )
     assert type(warps) is int and type(stages) is int
-    if pass_warps == MMA_DAG_PASS_WARPS_ON:
-        reason = mma_dag_pass_warps_reason(facts, warps, stages, cast("str", mode))
+    if pass_warps != MMA_DAG_PASS_WARPS_OFF:
+        reason = mma_dag_pass_warps_reason(
+            facts,
+            warps,
+            stages,
+            cast("str", mode),
+            cast("str", pass_warps),
+            cast("str", derived_mode),
+        )
         if reason:
             raise _decline(f"{MMA_DAG_PASS_WARPS_KEY}: {reason}")
     if persistent:
@@ -7777,6 +7903,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             epilogue=cast("str", epilogue),
             lookahead=cast("str", lookahead),
             exchange_mode=cast("str", exchange_mode),
+            mma_warp=pass_warps == MMA_DAG_PASS_WARPS_MMA,
         )
         for loop in program.loops:
             if loop.tile_end is None:
@@ -7809,6 +7936,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             split_mode=split_mode if cluster > 1 else MMA_DAG_SPLIT_CLUSTER,
             derived_mode=cast("str", derived_mode),
             epilogue=cast("str", epilogue),
+            mma_warp=tc.mma_warp,
         )
     plan = MmaDagPlan(
         program=program,
@@ -7964,16 +8092,20 @@ def mma_dag_aux_ring(
     loop: Loop,
     sizes: Sequence[int],
     threads: int,
+    stages: int,
 ) -> AuxRing | None:
-    """The side-load slots of innermost ring loop ``loop`` per stage (None:
-    it has none; ``mma_dag_aux_records`` names them): per pass operand (a
-    load rewritten by a pointwise pass) and per aux load varying with the
-    loop, a scalar takes a word per thread, a vector along the tile's rows
-    a word per packet the thread owns, one along the contiguous dim its
-    block extent once per CTA (a word per packet element when its runs
-    cannot be 16-byte copies); the other fp32 side loads of the loop take a
-    word per thread (a scalar) or their block extent once per CTA, read by
-    coordinate (a vector)."""
+    """The side-load slots of innermost ring loop ``loop`` (None: it has
+    none; ``mma_dag_aux_records`` names them), at ``offset`` 0 and a side
+    tile of two slots (``mma_dag_aux_rings`` places the ring and sizes the
+    tile to ``stages + 1``; ``stages`` sizes the per-thread cap alone): per
+    pass operand (a load rewritten by a pointwise pass) and per aux load
+    varying with the loop, an fp32 scalar
+    or vector across the tile's packets takes an entry of the side tile
+    (its block extent once per CTA, read by coordinate), a 16-bit scalar a
+    word per thread, a 16-bit vector across the packets a word per packet
+    the thread owns, one along the contiguous dim its block extent once per
+    CTA (a word per packet element when its runs cannot be 16-byte copies);
+    the other fp32 side loads of the loop take side tile entries too."""
     records = mma_dag_aux_records(env, program, loop)
     if not records:
         return None
@@ -7981,7 +8113,7 @@ def mma_dag_aux_ring(
         [record for _node, record in records], sizes, threads
     )
     reason = mma_dag_aux_cap_reason(
-        loop.index, words, vector_bytes, shared_bytes, threads
+        loop.index, words, vector_bytes, shared_bytes, threads, stages
     )
     if reason is not None:
         raise _decline(reason)
@@ -7996,7 +8128,7 @@ def mma_dag_aux_ring(
             runs[node] = (run_elems, run_bytes, run_offset)
             run_offset += (sizes[record.along] * es // 16) * run_bytes
         elif record.kind == "shared" and node not in shared:
-            elements = sizes[record.axis]
+            elements = mma_dag_aux_elements(record, sizes)
             shared[node] = (elements, shared_offset)
             shared_offset += mma_dag_aux_tile_bytes(elements, record.elem_bytes)
     assert run_offset == vector_bytes and shared_offset == shared_bytes
@@ -8005,7 +8137,9 @@ def mma_dag_aux_ring(
 
 def mma_dag_aux_rings(plan: MmaDagPlan) -> tuple[dict[int, AuxRing], int]:
     """The side-load slot regions of the plan's innermost ring loops, placed
-    after the operand tiles (loop index -> ring), and their total bytes."""
+    after the operand tiles (loop index -> ring: ``stages`` stages of words
+    and runs, then the ``stages + 1`` side tile slots), and their total
+    bytes."""
     env = CompileEnvironment.current()
     program = plan.program
     rings: dict[int, AuxRing] = {}
@@ -8019,12 +8153,19 @@ def mma_dag_aux_rings(plan: MmaDagPlan) -> tuple[dict[int, AuxRing], int]:
         # copies ride its issues.
         if not (plan.ring_operands(loop.index) or plan.ring_derived(loop.index)):
             continue
-        ring = mma_dag_aux_ring(env, program, loop, plan.sizes, plan.threads)
+        ring = mma_dag_aux_ring(
+            env, program, loop, plan.sizes, plan.threads, plan.stages
+        )
         if ring is None:
             continue
         offset = (offset + 127) // 128 * 128
-        rings[loop.index] = dataclasses.replace(ring, offset=offset)
-        offset += ring.stage_bytes * plan.stages
+        rings[loop.index] = dataclasses.replace(
+            ring,
+            offset=offset,
+            shared_base=offset + ring.stage_bytes * plan.stages,
+            shared_slots=plan.stages + 1,
+        )
+        offset += ring.total_bytes(plan.stages)
     return rings, (offset - base if rings else 0)
 
 
