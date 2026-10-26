@@ -50,6 +50,11 @@ TCGEN05_TWO_CTA_DEEP_AB_STAGES = 6
 # in 2x2 clusters with a 64x10 K ring for fp16 1024^3).  Admitted by the
 # search projection and seeded when the 256x256 grid is below the SM count.
 TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS = (128, 64)
+# The N tiles the tcgen05 CTA pair (``tcgen05_cluster_m=2`` on the 256-row
+# pair tile) runs its MMA at throughout the backend: the paired pipeline, the
+# materialized two-CTA regions and the cluster_m=2 search projection all take
+# ``bn in (64, 128, 256)``.
+TCGEN05_TWO_CTA_PAIR_BLOCK_NS = (256, 128, 64)
 # The post row-vector-staging Target8 CLC + aux-TMA edge rows now measure
 # fastest with two accumulator stages. Keep the historical edge-family default
 # above for non-CLC/non-aux variants. Narrow-N keeps a separate value above.
