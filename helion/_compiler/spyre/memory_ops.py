@@ -135,10 +135,22 @@ def _(state: CodegenState) -> None:
             "spyre", f"store of a non-buffer value: {type(value).__name__}"
         )
 
-    import os as _os
-    if _os.environ.get("SPYRE_DBG_STORE"):
-        print(f"[dbg] store: value.stick={value.stick_dim} dest.stick={dest.stick_dim}"
-              f" dest={dest.name} dest_alloc={dest.allocation}", flush=True)
+    # Rank first: a rank mismatch makes the stick dims incomparable, and the
+    # relayout path below would fail with an opaque IndexError out of
+    # ``stickify`` instead of naming the cause. A Spyre reduction result is
+    # keepdim on the device (one live element per stick), so a rank-dropped
+    # destination is a genuinely different layout -- see
+    # ``repros/reduction_rank_dropped.py``, where the reference's own specs
+    # give 139.43 max error that way.
+    if len(value.sizes) != len(dest.sizes):
+        raise exc.BackendUnsupported(
+            "spyre",
+            f"storing a rank-{len(value.sizes)} value into a"
+            f" rank-{len(dest.sizes)} buffer: a Spyre reduction output keeps"
+            " the reduced dim, so use `keepdim=True` and an output tensor"
+            f" that keeps it ({value.sizes} rather than {dest.sizes})",
+        )
+
     if value.stick_dim != dest.stick_dim:
         # Closing relayout, the mirror of M3's opening one. The compute follows
         # the *inputs'* stick axis, but the destination buffer need not share it
@@ -159,6 +171,11 @@ def _(state: CodegenState) -> None:
         return
 
     emitter.redirect_output(value, dest)
+    # Unconditional: a store whose subscript needs no index arithmetic leaves
+    # the device body empty and DCE then rejects the loop. A reduction is the
+    # case that exposed it (both the rank-dropped and the keepdim spelling),
+    # but the marker is inert whenever the body is already non-empty.
+    _mark_device_body(state)
 
 
 def _reject_narrowing(subscript: object) -> None:

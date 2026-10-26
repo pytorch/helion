@@ -250,6 +250,19 @@ class SpyreBackend(Backend):
 
         The floor is the widest stick any supported dtype uses (64 elements at
         fp16/bf16; fp32 uses 32 and is therefore also satisfied).
+
+        The same floors also keep the **core budget** reachable. The product of
+        the per-dim splits is the core count, bounded by ``sencores`` (32), and
+        ``autotune_config_is_viable`` already rejects candidates that overshoot
+        -- but the autotuner's *reference* config is taken straight from these
+        fragment defaults (``benchmark_provider.py:876``) and never goes through
+        that check. On 512x512 the default landed on ``block_sizes=[32, 64]``,
+        which asks for 16*8 = 128 cores and dies in ``dbo-opt`` with SIGABRT.
+        The generic recovery cannot help: it *shrinks* block sizes
+        (``_compute_reference_baseline``), and on a fixed extent a smaller block
+        means **more** cores, so every retry moves further over budget (128 ->
+        256 -> 512). Raising the floors here fixes it at the source, since
+        ``BlockSizeSpec._fragment`` clamps its default to ``min_size``.
         """
         from ...autotuner.config_spec import BlockSizeSpec
 
@@ -265,6 +278,42 @@ class SpyreBackend(Backend):
             if isinstance(extent, int) and extent < _MAX_ELEMS_PER_STICK:
                 continue
             trailing.update_min(_MAX_ELEMS_PER_STICK)
+
+        self._raise_floors_for_core_budget(specs)
+
+    @staticmethod
+    def _raise_floors_for_core_budget(specs: list[object]) -> None:
+        """Raise block-size floors until the minimum core count fits sencores.
+
+        At each floor the split of a dim is ``extent // min_size``, so the
+        product over dims is the fewest cores any in-bounds config can ask for.
+        While that exceeds the budget, double the floor of the dim currently
+        contributing the most splits -- halving its core count -- which
+        converges and keeps the floors as low as the budget allows.
+        """
+        budget = _sencores()
+
+        def splits(spec: object) -> int:
+            extent = int(getattr(spec, "size_hint", 0) or 0)
+            floor = max(1, int(getattr(spec, "min_size", 1) or 1))
+            return max(1, extent // floor) if extent > 0 else 1
+
+        for _ in range(32):
+            counts = [splits(s) for s in specs]
+            cores = 1
+            for c in counts:
+                cores *= c
+            if cores <= budget:
+                return
+            # Double the floor of the worst offender; a power-of-two floor is
+            # required (update_min asserts it).
+            worst = specs[counts.index(max(counts))]
+            floor = max(1, int(getattr(worst, "min_size", 1) or 1))
+            extent = int(getattr(worst, "size_hint", 0) or 0)
+            if floor >= extent:
+                # Already one core on this dim; nothing further to give.
+                return
+            worst.update_min(floor * 2)
 
     def autotune_config_is_viable(
         self, config_spec: object, config: Config

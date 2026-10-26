@@ -117,9 +117,7 @@ class SpyreOpLowering(Lowering):
         if is_matmul(self.target):
             return _emit_matmul(self.backend, ctx, node, op)
         if is_reduction(self.target):
-            raise exc.BackendUnsupported(
-                "spyre", f"reduction {self.target} (plan M4, not yet implemented)"
-            )
+            return _emit_reduction(self.backend, ctx, node, op)
         return _emit_pointwise(self.backend, ctx, node, op)
 
 
@@ -170,9 +168,19 @@ def _emit_pointwise(
             for o in inputs
         ]
 
-    out = emitter.add_intermediate(
-        node.name, sizes, val.dtype, stick_dim, residency="lx"
-    )
+    # Accumulating into a loop carry writes the carry itself, in place. A fresh
+    # output buffer would leave the carry never updated, so each iteration would
+    # recompute ``initial_carry + this_tile`` and only the last one would
+    # survive. ``_emit_addmm`` does this by hand for M2b's combine (arg0 and
+    # arg2 both the accumulator); a rolled reduction reaches the same combine
+    # through an ordinary pointwise ``add``, so the rule belongs here.
+    carry = _carried_input(ctx, node)
+    if carry is not None and carry.sizes == sizes:
+        out = carry
+    else:
+        out = emitter.add_intermediate(
+            node.name, sizes, val.dtype, stick_dim, residency="lx"
+        )
 
     iteration_space = _iteration_space(
         symbols, sizes, splits, stick_dim, val.dtype
@@ -191,6 +199,234 @@ def _emit_pointwise(
         )
     )
     return out
+
+
+def _carried_input(ctx: LoweringContext, node: Node) -> Operand | None:
+    """The loop-carry buffer among this node's inputs, if one of them is it.
+
+    A carry crosses the loop boundary as an ``ast.Name`` (tracing_ops._new_var),
+    so it is recognised by that placeholder rather than by buffer identity.
+    """
+    import ast as _ast
+
+    from ..compile_environment import CompileEnvironment
+
+    emitter = CompileEnvironment.current().backend.emitter
+    for arg in node.all_input_nodes:
+        value = ctx.env.get(arg)
+        if isinstance(value, _ast.Name):
+            carried = emitter.carry(value.id)
+            if carried is not None:
+                return carried
+    return None
+
+
+def _reduced_dims(node: Node, rank: int) -> list[int]:
+    """Host dims this reduction collapses, normalized and sorted.
+
+    ``sum.default`` (no dim argument) reduces everything; ``sum.dim_IntList``
+    and ``amax``/``amin`` carry an explicit dim list in ``args[1]``.
+    """
+    if len(node.args) < 2 or node.args[1] is None:
+        return list(range(rank))
+    dims = node.args[1]
+    if isinstance(dims, int):
+        dims = [dims]
+    if not isinstance(dims, (list, tuple)):
+        raise exc.BackendUnsupported("spyre", f"reduction dims {dims!r}")
+    return sorted((int(d) % rank) for d in dims)
+
+
+def _emit_reduction(
+    backend: SpyreBackend, ctx: LoweringContext, node: Node, op: str
+) -> Operand:
+    """One reduction ``OpSpec`` over the stick axis, unrolled (no ``LoopSpec``).
+
+    The reduced symbol **stays** in the iteration space at its full extent --
+    the reduction is internal to the op, as it is for ``batchmatmul``'s K -- and
+    disappears only from the *output's* coordinates. Both captured references
+    (golden/ref_row_sum.py, golden/ref_row_amax.py) show exactly that: input
+    ``[4, 64, 64]`` at ``[floor(c1/64), c0, Mod(c1, 64)]``, output
+    ``[1, 64, 64]`` at ``[0, c0, 0]``.
+
+    Helion's node shape follows ``keepdim``, but Spyre's output is *always*
+    keepdim on the device: the reduced host dim survives as an extent-1 axis
+    indexed by the constant 0, holding one live element per stick. Registering
+    the output with keepdim sizes makes ``stickify`` produce the reference's
+    layout with no reduction-specific layout code -- and a dense rank-dropped
+    destination is a genuinely different layout, which ``redirect_output``
+    rejects rather than silently mis-addresses.
+
+    Only a stick-axis reduction is emitted. ``_check_stick_all_same``
+    (op_spec_validation.py:657) requires every arg to share one stick symbol,
+    and the output's stick coordinate is the constant 0 whose stick symbol is
+    the reduced one -- so reducing a *non*-stick dim would leave the output
+    sticked on a different symbol than the input and is rejected. torch-spyre's
+    own rule is the mirror image for the normalization ops
+    (``_check_stick_norm``, :709: the stick symbol *must* be the reduced one).
+    """
+    emitter = backend.emitter
+    inputs = _operand_inputs(ctx, node)
+    if len(inputs) != 1:
+        raise exc.BackendUnsupported(
+            "spyre", f"{op} with {len(inputs)} operands, expected 1"
+        )
+    source = inputs[0]
+
+    in_node = node.all_input_nodes[0]
+    in_val = in_node.meta["val"]
+    assert isinstance(in_val, torch.Tensor)
+    sizes, splits = tile_space(in_val)
+    rank = len(sizes)
+    symbols = _iteration_symbols(rank)
+
+    reduced = _reduced_dims(node, rank)
+    if len(reduced) != 1:
+        raise exc.BackendUnsupported(
+            "spyre", f"{op} over {len(reduced)} dims at once (dims {reduced})"
+        )
+    axis = reduced[0]
+
+    # The input's own stick axis is the one the reduction must run along, and
+    # the operand may disagree with it (a transposed input). Relayout rather
+    # than reduce along the wrong axis: that is bug #6's failure mode.
+    if source.stick_dim != axis:
+        source = emitter.emit_restickify(source, axis, symbols)
+
+    val = node.meta["val"]
+    assert isinstance(val, torch.Tensor)
+    out_sizes = [1 if d == axis else extent for d, extent in enumerate(sizes)]
+    out = emitter.add_intermediate(
+        node.name, out_sizes, val.dtype, axis, residency="lx"
+    )
+
+    # The reduced dim must not be split across cores: each core would produce a
+    # partial with no combine step to merge them. The references keep it at
+    # split 1 even with 32 cores available on the other axis.
+    splits = list(splits)
+    splits[axis] = 1
+    iteration_space = _iteration_space(symbols, sizes, splits, axis, val.dtype)
+
+    # Rolled into a sequential loop over the reduced dim, ``tile_space`` reports
+    # one coarse tile, so the streamed input must advance by a tile per
+    # iteration or every iteration re-reads the first one. That was measured:
+    # without the advance a 4-iteration rolled sum returned 4x the first tile
+    # (predicted max|4*t0 - full| = 31.87, observed error 31.25).
+    #
+    # The advance goes on a *read-copy* into a tile-sized staging buffer, not on
+    # the reduction's own operand: the operand spans the whole reduced extent,
+    # so an advance on it addresses a buffer whose shape disagrees with the
+    # iteration space. golden/ref_matmul_ktiled.py shows the same split for the
+    # K-tiled matmul (full-extent advancing read -> one-tile pool window).
+    block_id = _block_id_of(in_val, axis)
+    if block_id is not None and emitter.tiled_block_size(block_id) is not None:
+        source = _stage_reduced_tile(
+            emitter, node, source, sizes, symbols, axis, block_id
+        )
+
+    op_key = f"reduce_{node.name}"
+    tiling = emitter.tiling_for(op_key)
+    tiled_symbols, trip_counts = tiling if tiling is not None else ([], {})
+
+    # The output's reduced axis is extent 1, so ``tensor_arg`` addresses it at
+    # coordinate 0 on its own -- giving the reference's [0, c0, 0].
+    args = [
+        source.tensor_arg(symbols, is_input=True),
+        out.tensor_arg(symbols, is_input=False),
+    ]
+    emitter.emit(
+        emitter.op_spec(
+            op,
+            is_reduction=True,
+            iteration_space=iteration_space,
+            args=args,
+            tiled_symbols=tiled_symbols,
+            tiled_symbol_trip_counts=trip_counts,
+            output=out,
+            output_symbols=symbols,
+        )
+    )
+    return out
+
+
+def _stage_reduced_tile(
+    emitter: object,
+    node: Node,
+    operand: Operand,
+    sizes: list[int],
+    symbols: list[sympy.Expr],
+    axis: int,
+    block_id: int,
+) -> Operand:
+    """Read-copy one coarse tile of the reduced dim into a staging buffer.
+
+    The reduction mirror of ``_stage_advancing_operand``. The source arg spans
+    the **full** reduced extent and carries the per-iteration advance; the
+    destination is tile-shaped, so the reduction op reads a buffer matching its
+    own iteration space.
+    """
+    import dataclasses as _dc
+
+    from torch_spyre._inductor.op_spec import TensorArg
+
+    from ..compile_environment import CompileEnvironment
+    from . import layout as _layout
+
+    tile = sizes[axis]
+    full_extent = int(CompileEnvironment.current().block_sizes[block_id].size_hint())
+    if full_extent == tile:
+        return operand
+
+    op_key = f"read_copy_{node.name}"
+    level = emitter.level_symbol_for(op_key)
+    full_sizes = [full_extent if d == axis else e for d, e in enumerate(sizes)]
+    full = _dc.replace(operand, sizes=full_sizes)
+    device_size, coords = layout_stickify(full, symbols)
+    advance = emitter.tile_advance_for(
+        device_size, coords, symbols[axis], tile, level_symbol=level
+    )
+    if advance is None:
+        return operand
+
+    staged = emitter.add_intermediate(
+        f"{node.name}_rtile",
+        list(sizes),
+        operand.dtype,
+        axis,
+        residency="hbm_pool",
+    )
+    src_arg = TensorArg(
+        is_input=True,
+        arg_index=operand.arg_index,
+        device_dtype=_layout.device_dtype(operand.dtype),
+        device_size=device_size,
+        device_coordinates=coords,
+        allocation=dict(operand.allocation),
+        device_tile_advance_expr=advance,
+    )
+    tiling = emitter.tiling_for(op_key)
+    tiled_symbols, trip_counts = tiling if tiling is not None else ([], {})
+    emitter.emit(
+        emitter.op_spec(
+            "identity",
+            is_reduction=False,
+            iteration_space=_iteration_space(symbols, sizes, [1] * len(sizes)),
+            args=[src_arg, staged.tensor_arg(symbols, is_input=False)],
+            tiled_symbols=tiled_symbols,
+            tiled_symbol_trip_counts=trip_counts,
+        )
+    )
+    return staged
+
+
+def _block_id_of(val: torch.Tensor, dim: int) -> int | None:
+    """Block id behind host dim ``dim`` of a tile-shaped value, if tiled."""
+    from ..compile_environment import CompileEnvironment
+
+    sizes = list(val.size())
+    if dim >= len(sizes):
+        return None
+    return CompileEnvironment.current().resolve_block_id(sizes[dim])
 
 
 @dataclasses.dataclass

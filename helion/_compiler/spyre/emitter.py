@@ -62,6 +62,14 @@ class Operand:
         ``device_coordinates`` in different OpSpecs because the iteration
         symbols differ, which is exactly why layout is applied here and not
         cached on the operand.
+
+        An **extent-1 host dim is addressed at coordinate 0**, whatever symbol
+        the consuming op iterates it with. That is what makes a reduced buffer
+        broadcast correctly back against the full-extent input: the reference's
+        softmax ``sub`` reads its ``[1, 64, 64]`` operand at ``[0, c0, 0]``
+        while reading the full operand at ``[floor(c1/64), c0, Mod(c1, 64)]``
+        (golden/ref_softmax.py op 3). Indexing the reduced buffer with the full
+        coordinates instead validates, compiles, launches -- and is 100% wrong.
         """
         from torch_spyre._inductor.op_spec import TensorArg
 
@@ -72,8 +80,14 @@ class Operand:
                 "spyre", "an lx buffer cannot carry a device_tile_advance_expr"
             )
 
+        import sympy
+
+        indexing = [
+            sympy.Integer(0) if extent == 1 else sym
+            for extent, sym in zip(self.sizes, symbols, strict=True)
+        ]
         device_size, device_coordinates = layout.stickify(
-            self.sizes, symbols, self.stick_dim, self.dtype
+            self.sizes, indexing, self.stick_dim, self.dtype
         )
         if indirect_dim is not None:
             # Replace the coordinate for one host dim with a runtime index read

@@ -71,13 +71,24 @@ _ACCUMULATING_MATMUL: dict[object, str] = {
     aten.baddbmm.default: "batchmatmul",
 }
 
-#: Reductions. ``prod`` cannot reduce along the stick dim
-#: (constants.REDUCTIONS_NON_STICK_DIM_ONLY), which the layout code must honour.
+#: Reductions. The name is the *reduction* op, not the pointwise op with the
+#: same mathematical meaning: ``maximum``/``minimum`` are elementwise two-input
+#: ops and ``add`` is elementwise addition, all three in POINTWISE_OPS, so
+#: emitting one with ``is_reduction=True`` is rejected by
+#: op_spec_validation.py:930 ("pointwise op must have is_reduction=False").
+#: The reduction names are ``sum``/``max``/``min``
+#: (constants.py:259, SINGLE_INPUT_REDUCTION_OPS).
+#:
+#: ``prod`` cannot reduce along the stick dim
+#: (constants.REDUCTIONS_NON_STICK_DIM_ONLY), so it is deliberately absent.
+#: ``aten.max.dim``/``min.dim`` are absent too: they return a
+#: ``(values, indices)`` tuple, which one OpSpec with one output cannot
+#: represent. ``amax``/``amin`` are the value-only forms.
 _REDUCTION: dict[object, str] = {
-    aten.sum.default: "add",
-    aten.sum.dim_IntList: "add",
-    aten.amax.default: "maximum",
-    aten.amin.default: "minimum",
+    aten.sum.default: "sum",
+    aten.sum.dim_IntList: "sum",
+    aten.amax.default: "max",
+    aten.amin.default: "min",
 }
 
 
