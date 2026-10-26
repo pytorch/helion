@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -20,6 +21,11 @@ from ..cute.epilogue_fanout import schedule_supported
 from ..cute.tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
+from ..cute.tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
+from ..cute.tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_PAIR_BLOCK_NS
 
@@ -653,6 +659,147 @@ def register_aux_fragment_hoist_coverage(
                 CoverageWitness(carrier, mode)
                 for carrier in carriers
                 for mode in (False, True)
+            ),
+            dependencies=(
+                (
+                    CoverageDependency(
+                        "cute.epilogue_fanout", FANOUT_CONFIG_KEY, "shared"
+                    ),
+                )
+                if needs_fanout
+                else ()
+            ),
+        )
+    )
+
+
+def register_epi_warp_groups_coverage(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> None:
+    """Additive coverage for the epilogue warp groups of a heavy epilogue.
+
+    ``tcgen05_epi_warp_groups`` splits the role-local TMA-store epilogue's
+    subtile walk over two groups of four warps so one group's math hides the
+    other's TMEM-load, barrier and store latencies; it pays off where a heavy
+    epilogue (two outputs, an exact-shape auxiliary read) is exposed at few
+    tiles per CTA. Carriers: the widest CTA-pair fanout geometry at the
+    (128, 32) subtile (``tcgen05_epi_subtile_n``: on the 256-wide pair tile
+    the plan's (128, 64) subtile leaves no register room for either group's
+    auxiliary ring) with the deepest auxiliary prefetch ring both one and
+    two groups admit, and the fanout group's one-CTA carrier; each paired
+    with one and two groups so the search measures the split against the
+    same rings. The per-group whole-fragment hoist is one hoist flip away
+    from the two-group witness (the hoist's budget is the per-group share).
+    """
+    spec = env.config_spec
+    state = spec._cute_tcgen05_config
+    if device_ir.host_function is None or not state.epilogue_group_search_enabled():
+        return
+    facts = state.rowvec_aux_facts
+    needs_fanout = facts is not None and facts.output_count >= 2
+    indices = state._matmul_block_indices()
+    if indices is None:
+        return
+    n_index = indices[1]
+    sources: list[Config] = []
+    if needs_fanout:
+        groups = [
+            g for g in spec.compiler_coverage_groups if g.key == FANOUT_CONFIG_KEY
+        ]
+        if not groups:
+            return
+        sources.extend(_synthesized_pair_fanout_carriers(spec, state))
+        for witness in groups[0].witnesses:
+            carrier = witness.carrier
+            if carrier not in sources:
+                sources.append(carrier)
+    else:
+        for seed in spec.compiler_seed_configs:
+            candidate = Config.from_dict(deepcopy(seed.config))
+            try:
+                spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            if schedule_supported(candidate.config) and candidate not in sources:
+                sources.append(candidate)
+    witnessed_groups = (1, 2)
+    admitted: list[Config] = []
+    for source in sources:
+        recipe: dict[str, object] = {}
+        if needs_fanout:
+            recipe[FANOUT_CONFIG_KEY] = "shared"
+        if state.exact_shape_aux_kernel_detected:
+            recipe[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = TCGEN05_AUX_LOAD_PLACEMENTS[
+                1
+            ]
+            recipe[TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY] = False
+        if (
+            source.config.get("tcgen05_cluster_m", 1) == 2
+            and source.block_sizes[n_index] == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+        ):
+            recipe[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = 32
+        trial = Config.from_dict(deepcopy(source.config) | recipe)
+        if state.exact_shape_aux_kernel_detected:
+            # The deepest ring every witnessed group count admits, so the
+            # group flip changes nothing else on the carrier.
+            limits = []
+            for count in witnessed_groups:
+                probe = dict(trial.config)
+                probe[TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY] = count
+                limits.append(state.aux_prefetch_depth_limit(probe))
+            if any(limit is None for limit in limits):
+                continue
+            trial.config[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = min(
+                cast("list[int]", limits)
+            )
+        carrier: Config | None = None
+        try:
+            for count in witnessed_groups:
+                requested = Config.from_dict(
+                    deepcopy(trial.config) | {TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY: count}
+                )
+                spec.normalize(requested)
+                if requested.config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY) != count:
+                    raise InvalidConfig("epilogue warp groups not effective")
+                if count == witnessed_groups[0]:
+                    carrier = requested
+        except InvalidConfig:
+            continue
+        assert carrier is not None
+        carrier.config.pop(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, None)
+        if carrier not in admitted:
+            admitted.append(carrier)
+    # Two carriers: the first CTA-pair geometry (the widest tile, in source
+    # order) at the K tile whose AB ring holds the most steps (the 64-wide K
+    # tile's five stages over the 128-wide one's two: the measured witness),
+    # and the first one-CTA geometry.
+    carriers: list[Config] = []
+    pairs = [t for t in admitted if t.config.get("tcgen05_cluster_m", 1) == 2]
+    if pairs:
+        geometry = _carrier_geometry(pairs[0], indices[2])
+        carriers.append(
+            max(
+                (t for t in pairs if _carrier_geometry(t, indices[2]) == geometry),
+                key=lambda t: cast("int", t.config["tcgen05_ab_stages"]),
+            )
+        )
+    for trial in admitted:
+        if trial.config.get("tcgen05_cluster_m", 1) == 1:
+            carriers.append(trial)
+            break
+    if not carriers:
+        return
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            mechanism="cute.epi_warp_groups",
+            version=1,
+            key=TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY,
+            domain=TCGEN05_EPI_WARP_GROUP_CHOICES,
+            legacy=TCGEN05_EPI_WARP_GROUP_CHOICES[0],
+            witnesses=tuple(
+                CoverageWitness(carrier, count)
+                for carrier in carriers
+                for count in witnessed_groups
             ),
             dependencies=(
                 (

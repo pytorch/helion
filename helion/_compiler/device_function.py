@@ -2212,6 +2212,11 @@ class DeviceFunction:
                     )
                 )
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
+        if self.cute_state.tcgen05_min_blocks_per_mp is not None:
+            # The tcgen05 role launch's own requirement wins over the
+            # tunable: the epilogue-group block is one CTA per SM by SMEM
+            # anyway, and a higher count would only cap its registers.
+            min_blocks = self.cute_state.tcgen05_min_blocks_per_mp
         if (
             CompileEnvironment.current().backend.name == "cute"
             and isinstance(min_blocks, int)

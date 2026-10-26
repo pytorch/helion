@@ -443,6 +443,98 @@ def tcgen05_aux_fragment_bytes_per_thread(
     return -(-bm * bn * itemsize // (epi_warps * 32))
 
 
+# Register prefetch ring of an exact-shape auxiliary tile
+# (``tcgen05_aux_prefetch_subtiles``): the fragment of epilogue subtile
+# ``i + d`` is read at the top of subtile ``i`` (the first ``d`` fragments ahead
+# of the accumulator wait), so each read lands ``d`` subtiles of TMEM load,
+# math, barriers and TMA-store issue later. ``0`` is the per-subtile read at
+# the subtile itself; a depth that reaches the group's last subtile is the
+# whole-fragment hoist (``tcgen05_aux_fragment_hoist``), which keeps its own
+# key. The ring holds ``d + 1`` subtile fragments per thread, bounded by the
+# hoist's register budget (``tcgen05_aux_prefetch_bytes_per_thread``).
+TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY = "tcgen05_aux_prefetch_subtiles"
+TCGEN05_AUX_PREFETCH_MAX_SUBTILES = 4
+
+
+def tcgen05_aux_subtile_fragment_bytes_per_thread(
+    *, epi_tile_m: int, epi_tile_n: int, itemsize: int
+) -> int:
+    """Bytes of one epilogue subtile of an exact-shape auxiliary tile per thread.
+
+    The four epilogue warps of a group partition the ``(epi_tile_m,
+    epi_tile_n)`` subtile over their 128 threads.
+    """
+    assert epi_tile_m > 0 and epi_tile_n > 0 and itemsize > 0
+    return -(-epi_tile_m * epi_tile_n * itemsize // 128)
+
+
+def tcgen05_aux_prefetch_bytes_per_thread(
+    *, epi_tile_m: int, epi_tile_n: int, itemsize: int, depth: int
+) -> int:
+    """Register bytes per thread of a ``depth``-deep auxiliary prefetch ring."""
+    assert depth >= 0
+    return (depth + 1) * tcgen05_aux_subtile_fragment_bytes_per_thread(
+        epi_tile_m=epi_tile_m, epi_tile_n=epi_tile_n, itemsize=itemsize
+    )
+
+
+# Epilogue warp groups of the role-local TMA-store epilogue
+# (``tcgen05_epi_warp_groups``): ``G`` groups of four epilogue warps, where
+# warps ``w`` and ``w + 4`` own the same 32 TMEM lanes and group ``g`` walks
+# the epilogue subtiles congruent to ``g`` modulo ``G`` with its own named
+# barrier (id ``TCGEN05_EPI_GROUP_BARRIER_BASE_ID + g``), its own C stages of a
+# ``G x tcgen05_c_stages`` ring per output and its own bulk-store groups.
+# While one group sits in its TMEM-load latency, barriers and store issue the
+# other group's math keeps the MUFU/FMA pipes busy; a heavy epilogue (two
+# 16-bit outputs, an exact-shape auxiliary read, a sigmoid) that a one-tile
+# per-CTA grid leaves fully exposed shortens (the 256x256 CTA-pair two-output
+# epilogue: 16.9 -> 14.5 us with two groups at the (128, 32) subtile). More
+# groups add SMEM and barrier traffic without more pipe throughput (warps
+# ``w``, ``w + 4``, ``w + 8`` share one SMSP), so 3 and 4 are admitted but
+# unseeded. The block grows to ``4G + 2`` warps with no ``setmaxnreg`` split
+# (every split of the 10-warp block hung: the CTA register pool is the launch
+# allocation ptxas picks after seeing the split) and ``min_blocks_per_mp=1``
+# so ptxas caps the per-thread allocation at ``65536 / threads``.
+TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY = "tcgen05_epi_warp_groups"
+TCGEN05_EPI_WARP_GROUP_CHOICES = (1, 2, 3, 4)
+TCGEN05_EPI_WARPS_PER_GROUP = 4
+TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
+# The groups' named barriers: ids 4 .. 7, disjoint from the role-local
+# kernel's TMEM-alloc (1), one-group epilogue (2) and pipeline-init (3)
+# barriers (``cute_mma`` asserts the disjointness); a one-group epilogue keeps
+# ``TCGEN05_EPILOG_SYNC_BARRIER_ID``.
+TCGEN05_EPI_GROUP_BARRIER_BASE_ID = 4
+
+
+def tcgen05_role_launch_n_width(epi_warp_groups: int) -> int:
+    """SIMT N width covering the ``4G + 2`` role warps: a power of two, at least 8.
+
+    The tcgen05 role launch is one warp per row of the SIMT N axis, whose width
+    has to divide the N tile; the launch clamps the spare rows to the role
+    count (``cute_mma._tcgen05_root_n_threads``).
+    """
+    width = 8
+    while width < TCGEN05_EPI_WARPS_PER_GROUP * epi_warp_groups + 2:
+        width *= 2
+    return width
+
+
+# Epilogue subtile width of the role-local TMA-store epilogue
+# (``tcgen05_epi_subtile_n``): ``None`` keeps the matmul plan's rule (CuTe's
+# with-source ``compute_epilogue_tile_shape`` -- (128, 64) on a 256-wide
+# 16-bit tile -- or the plan's own (128, 32) for plain and promoted-row
+# epilogues); 32 or 64 pins the subtile ``(per-CTA M, n)`` with ``n`` as the
+# TMA store box width through the explicit-tile path. The narrow subtile
+# halves the registers a heavy epilogue keeps live per subtile (the (128, 64)
+# subtile of a two-output + auxiliary epilogue holds 64 accumulator, 32
+# auxiliary and 64 output registers and spills) at the cost of twice the
+# TMEM-load / barrier / store iterations; it is what lets the auxiliary
+# prefetch ring and the per-group hoist fit their register budget on the
+# 256-wide CTA-pair tile.
+TCGEN05_EPI_SUBTILE_N_CONFIG_KEY = "tcgen05_epi_subtile_n"
+TCGEN05_EPI_SUBTILE_N_CHOICES = (None, 32, 64)
+
+
 class Tcgen05RowvecAuxRow(NamedTuple):
     """One N-broadcast (row-vector) aux operand of a tcgen05 epilogue."""
 

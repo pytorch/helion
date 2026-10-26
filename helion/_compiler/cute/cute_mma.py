@@ -130,6 +130,7 @@ from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
+from .strategies import tcgen05_epilogue_subtile_m
 from .strategies import tcgen05_explicit_epilogue_tile_expr
 from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import tcgen05_is_two_cta_m128
@@ -161,6 +162,7 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -175,6 +177,11 @@ from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_EPI_GROUP_BARRIER_BASE_ID
+from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_WARP_GROUP_CHOICES
+from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
@@ -224,6 +231,7 @@ from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_store_shape
+from .tcgen05_constants import tcgen05_role_launch_n_width
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -328,6 +336,12 @@ _TCGEN05_V_LEADER_PREDICATE = (
 _TCGEN05_TMEM_ALLOC_BARRIER_ID = 1
 _TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
 _TCGEN05_PIPELINE_INIT_BARRIER_ID = 3
+# With several epilogue warp groups (``tcgen05_epi_warp_groups``) group ``g``
+# syncs on ``TCGEN05_EPI_GROUP_BARRIER_BASE_ID + g``: the ids skip the
+# pipeline-init barrier, whose 96-thread use would otherwise share id 3 with
+# group 1's 128-thread barrier on the one-CTA merged-init path.
+assert TCGEN05_EPI_GROUP_BARRIER_BASE_ID > _TCGEN05_PIPELINE_INIT_BARRIER_ID
+assert TCGEN05_EPI_GROUP_BARRIER_BASE_ID + max(TCGEN05_EPI_WARP_GROUP_CHOICES) <= 16
 
 
 @dataclass(frozen=True)
@@ -5389,7 +5403,21 @@ class _MmaRoleCoordinatePlan:
         return f"({self.mma_n_coord}) < cutlass.Int32({self.mma_active_n_threads})"
 
 
-def _mma_epi_tidx_expr(*, lane_idx: str, warp_idx: str, epi_active: str) -> str:
+def _mma_epi_tidx_expr(
+    *, lane_idx: str, warp_idx: str, epi_active: str, epi_warp_groups: int = 1
+) -> str:
+    """Thread index of an epilogue warp inside the four-warp TMEM partition.
+
+    With several epilogue warp groups (``tcgen05_epi_warp_groups``) warps
+    ``w`` and ``w + 4`` own the same 32 TMEM lanes: the partition index wraps
+    at the group size and the group index (``warp // 4``) selects the
+    subtiles the warp walks.
+    """
+    if epi_warp_groups > 1:
+        return (
+            f"{lane_idx} + ({warp_idx} % cutlass.Int32(4)) * cutlass.Int32(32) "
+            f"if {epi_active} else cutlass.Int32(0)"
+        )
     return (
         f"{lane_idx} + {warp_idx} * cutlass.Int32(32) "
         f"if {epi_active} else cutlass.Int32(0)"
@@ -11408,6 +11436,8 @@ def _emit_mma_pipeline(
     lane_idx: str | None = None
     epi_active: str | None = None
     epi_tidx: str | None = None
+    epi_group = ""
+    epi_leader = ""
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
@@ -11517,6 +11547,8 @@ def _emit_mma_pipeline(
     # it never uses; consumed only at later tcgen05-gated emission
     # sites that share this `if mma_impl == "tcgen05":` predicate.
     tcgen05_epi_warp_count_value = 0
+    tcgen05_epi_warps_per_group_value = 0
+    tcgen05_epi_warp_groups_value = 1
     tcgen05_tmem_allocator_warp = 0
     tcgen05_pipeline_init_barrier = ""
     tcgen05_free_tmem_in_epilogue = False
@@ -11534,6 +11566,7 @@ def _emit_mma_pipeline(
     tcgen05_smem_swizzle_a: int | None = None
     tcgen05_smem_swizzle_b: int | None = None
     tcgen05_explicit_epi_tile_configured = False
+    tcgen05_explicit_epi_tile_overrides = False
     tcgen05_narrow_subtile_nounroll_k_loop = False
     tcgen05_explicit_epi_tile_m: int | None = None
     tcgen05_explicit_epi_tile_n: int | None = None
@@ -11613,6 +11646,37 @@ def _emit_mma_pipeline(
                 tcgen05_explicit_d_store_box_n,
             )
         )
+        # ``tcgen05_epi_subtile_n``: the configured width of the role-local
+        # TMA-store epilogue's subtile, rendered through the explicit-tile
+        # path as ``(per-CTA M, n)`` with ``n`` as the store box width (the
+        # same three values a layout override sets, so the plan, the store
+        # body and the wrapper's TMA store box agree). A layout override and
+        # the knob together are refused by the config normalizer; here the
+        # knob fails closed where it cannot render.
+        # The layout-override surface alone (not the subtile knob below) takes
+        # the explicit-store family's no-unroll K loop.
+        tcgen05_explicit_epi_tile_overrides = tcgen05_explicit_epi_tile_configured
+        tcgen05_epi_subtile_n_value = df.config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+        if tcgen05_epi_subtile_n_value is not None:
+            if (
+                type(tcgen05_epi_subtile_n_value) is not int
+                or tcgen05_epi_subtile_n_value not in TCGEN05_EPI_SUBTILE_N_CHOICES
+                or tcgen05_explicit_epi_tile_configured
+                or tcgen05_nm_orientation
+                or not tcgen05_use_tma_store_epilogue
+                or epi_elem_dtype_str not in ("cutlass.Float16", "cutlass.BFloat16")
+            ):
+                raise exc.InvalidConfig(
+                    f"{TCGEN05_EPI_SUBTILE_N_CONFIG_KEY}="
+                    f"{tcgen05_epi_subtile_n_value!r} needs a 16-bit role-local "
+                    "TMA-store epilogue without explicit layout overrides"
+                )
+            tcgen05_explicit_epi_tile_m = tcgen05_epilogue_subtile_m(
+                bm=tcgen05_mma_bm, is_two_cta=tcgen05_is_two_cta
+            )
+            tcgen05_explicit_epi_tile_n = tcgen05_epi_subtile_n_value
+            tcgen05_explicit_d_store_box_n = tcgen05_epi_subtile_n_value
+            tcgen05_explicit_epi_tile_configured = True
         if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
             # The mixed TMA/scalar edge path writes logical (_row, _col)
             # coordinates into the tcgen05 A SMEM view. With bk=128,
@@ -11648,8 +11712,50 @@ def _emit_mma_pipeline(
                 bk=bk,
                 input_dtype=input_dtype,
             )
-        tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
+        tcgen05_epi_warps_per_group_value = _tcgen05_epi_warp_count(
             tcgen05_warp_spec, cta_thread_count=tcgen05_cta_thread_count
+        )
+        # ``tcgen05_epi_warp_groups``: G groups of the four epilogue warps,
+        # each walking every G-th epilogue subtile with its own named barrier
+        # and C stages (``memory_ops``); the role launch grows to ``4G + 2``
+        # warps and the accumulator pipeline counts every group's warps.
+        # Admitted on the standard role-local TMA-store schedule only (the
+        # config normalizer's ``epi_warp_groups_refusal``); fails closed
+        # here on the plan-level facts, the store lowering on the rest.
+        tcgen05_epi_warp_groups_value = _tcgen05_config_int(
+            df.config, TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1
+        )
+        if tcgen05_epi_warp_groups_value != 1 and (
+            tcgen05_epi_warp_groups_value not in TCGEN05_EPI_WARP_GROUP_CHOICES
+            or tcgen05_epi_warps_per_group_value != 4
+            or not tcgen05_use_tma_store_epilogue
+            or not tcgen05_use_role_local_epi
+            or not tcgen05_static_full_tiles
+            or tcgen05_nm_orientation
+            or tcgen05_grouped_plan is not None
+            or row_union_plan is not None
+            or tcgen05_use_pure_matmul_role_lifecycle
+            or tcgen05_requested_flat_role_coordinates
+            or tcgen05_m_subtile_count != 1
+            or tcgen05_warp_spec.scheduler_warps != 0
+            or tcgen05_warp_spec.c_input_warps != 0
+            or tcgen05_warp_spec.store_warps != 0
+            or (tcgen05_cluster_m == 2 and not tcgen05_is_two_cta)
+            or (tcgen05_is_two_cta and tcgen05_mma_bm != TCGEN05_TWO_CTA_BLOCK_M)
+            or df.config.get(
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT
+            )
+            != TCGEN05_AUX_LOAD_MODE_SIMT
+        ):
+            raise exc.InvalidConfig(
+                f"{TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY}="
+                f"{tcgen05_epi_warp_groups_value!r} needs the standard role-local "
+                "TMA-store epilogue (four epilogue warps, static full tiles, "
+                "register auxiliary reads, no scheduler / C-input / store warps, "
+                "the 256-row pair when clustered)"
+            )
+        tcgen05_epi_warp_count_value = (
+            tcgen05_epi_warps_per_group_value * tcgen05_epi_warp_groups_value
         )
         tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
             tcgen05_epi_warp_count_value
@@ -11849,7 +11955,7 @@ def _emit_mma_pipeline(
             and tcgen05_promoted_rowvec_epilogue(
                 cg,
                 fx_node,
-                epi_warp_count=tcgen05_epi_warp_count_value,
+                epi_warp_count=tcgen05_epi_warps_per_group_value,
                 bn=tcgen05_mma_bn,
                 output_column_major=output_column_major,
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
@@ -12395,10 +12501,23 @@ def _emit_mma_pipeline(
                     f"{warp_idx} < cutlass.Int32({tcgen05_matmul_plan.epi_warp_count})"
                 )
             )
+            if tcgen05_epi_warp_groups_value > 1:
+                epi_group = df.new_var("tcgen05_epi_group")
+                epi_leader = df.new_var("tcgen05_epi_leader")
+                prefix.append(
+                    statement_from_string(
+                        f"{epi_group} = {warp_idx} // cutlass.Int32(4)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"{epi_leader} = {warp_idx} % cutlass.Int32(4) == cutlass.Int32(0)"
+                    )
+                )
             prefix.append(
                 statement_from_string(
                     f"{epi_tidx} = "
-                    f"{_mma_epi_tidx_expr(lane_idx=lane_idx, warp_idx=warp_idx, epi_active=epi_active)}"
+                    f"{_mma_epi_tidx_expr(lane_idx=lane_idx, warp_idx=warp_idx, epi_active=epi_active, epi_warp_groups=tcgen05_epi_warp_groups_value)}"
                 )
             )
             # Register reallocation must be uniform within each four-warp
@@ -12419,7 +12538,18 @@ def _emit_mma_pipeline(
             # gate as ``aux_stages``), so T1-T7 stay byte-identical at
             # the 256 default.
             consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
-            if df.config.get(TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY, True) and (
+            # Several epilogue warp groups run without a ``setmaxnreg`` split:
+            # the CTA's register pool is the launch allocation ptxas picks
+            # after seeing the split, and every split of the 10-warp block
+            # hung at its first ``USETMAXREG.TRY_ALLOC``; at one CTA per SM
+            # (the groups' SMEM) the producer warps' registers buy nothing.
+            # ``min_blocks_per_mp=1`` caps the allocation at ``65536 /
+            # threads`` instead (204 registers at 10 warps).
+            if tcgen05_epi_warp_groups_value > 1:
+                df.cute_state.tcgen05_min_blocks_per_mp = 1
+            elif df.config.get(
+                TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY, True
+            ) and (
                 row_profile is None
                 or row_profile.paired_protocol is None
                 or not row_profile.paired_protocol.static_registers
@@ -15250,7 +15380,7 @@ def _emit_mma_pipeline(
             # use this loop form; every other kernel keeps the unrolled ``range``.
             tcgen05_use_nounroll_k_loop = (
                 (
-                    tcgen05_explicit_epi_tile_configured
+                    tcgen05_explicit_epi_tile_overrides
                     or tcgen05_narrow_subtile_nounroll_k_loop
                     or output_column_major
                 )
@@ -16033,13 +16163,22 @@ def _emit_mma_pipeline(
                 bn=tcgen05_mma_bn,
                 bk=bk,
                 thr_mma=thr_mma,
-                epi_warp_count=tcgen05_epi_warp_count_value,
+                epi_warp_count=tcgen05_epi_warps_per_group_value,
+                epi_warp_groups=tcgen05_epi_warp_groups_value,
+                epi_group=epi_group,
+                epi_leader=epi_leader,
                 epi_acc_frag_base=tcgen05_epi_acc_frag_base,
                 epi_tidx=epi_tidx,
                 warp_idx=warp_idx,
                 epi_tile=tcgen05_plan.epi_tile,
-                c_stage_count=tcgen05_c_stage_count_value,
-                epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
+                c_stage_count=tcgen05_c_stage_count_value
+                * tcgen05_epi_warp_groups_value,
+                c_stages_per_group=tcgen05_c_stage_count_value,
+                epilog_sync_barrier_id=(
+                    TCGEN05_EPI_GROUP_BARRIER_BASE_ID
+                    if tcgen05_epi_warp_groups_value > 1
+                    else _TCGEN05_EPILOG_SYNC_BARRIER_ID
+                ),
                 tmem_load_atom=tcgen05_plan.tmem_load_atom,
                 epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
                 tma_store_atom=tma_store_atom,
@@ -16155,17 +16294,27 @@ def _tcgen05_root_m_threads(bm: int, bn: int) -> int:
     return min(32, bm)
 
 
-def _tcgen05_root_n_threads(bn: int) -> int:
+def _tcgen05_epi_warp_groups(config: object) -> int:
+    """Epilogue warp groups of ``config`` (``tcgen05_epi_warp_groups``, 1..4)."""
+    groups = _tcgen05_config_int(config, TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1)
+    return groups if groups in TCGEN05_EPI_WARP_GROUP_CHOICES else 1
+
+
+def _tcgen05_root_n_threads(bn: int, *, epi_warp_groups: int = 1) -> int:
     # The SIMT N axis of a tcgen05 root.  The launch planning resolves an
     # automatic count to this width, and the launch shape takes the smaller
     # of it and the plan's role warp count along y (six warps, eight with a
-    # scheduler or C-input warp), so it has to cover every role warp: a
-    # narrower explicit count (four) launched a CTA without the MMA and TMA
-    # role warps and the 96-thread pipeline-init barrier could never
-    # complete, a wider one was only ever clamped to the role count.  An
-    # explicit count of another width is declined by the MMA detection
-    # (``_specialized_mma_root_threads_support_impl``) like the M axis.
-    return min(bn, 8)
+    # scheduler or C-input warp, ``4G + 2`` with G epilogue warp groups), so
+    # it has to cover every role warp: a narrower explicit count (four)
+    # launched a CTA without the MMA and TMA role warps and the 96-thread
+    # pipeline-init barrier could never complete, a wider one was only ever
+    # clamped to the role count.  An explicit count of another width is
+    # declined by the MMA detection
+    # (``_specialized_mma_root_threads_support_impl``) like the M axis.  The
+    # width has to divide the N tile (the SIMT layout contract), so the
+    # groups' ``4G + 2`` warps round up to a power of two and the launch
+    # clamps the spare rows away.
+    return min(bn, tcgen05_role_launch_n_width(epi_warp_groups))
 
 
 def _tcgen05_tmem_barrier_thread_count(epi_warp_count: int) -> int:
