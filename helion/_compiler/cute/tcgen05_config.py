@@ -68,6 +68,7 @@ from .grouped_row_union import schedule_supported as row_union_schedule_supporte
 from .one_cta_pipeline import Tcgen05OneCtaPipelineFacts
 from .one_cta_pipeline import max_one_cta_pipeline_ab_stages
 from .one_cta_pipeline import one_cta_pipeline_supported
+from .one_cta_pipeline import one_cta_pipeline_tile_modeled
 from .pipeline_smem import TCGEN05_CTA_GROUP_CHOICES
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
@@ -1475,14 +1476,16 @@ class CuteTcgen05Config:
     def region_pid_type_choices(self) -> tuple[str, ...] | None:
         """Pid types the GEMM launches of an ordered barrier chain may take.
 
-        ``None`` where ``tcgen05_region_pid_types`` has no subject: one
-        native launch, a fission plan (its persistent pid types already apply
-        to every launch), or a chain some region of which lacks the complete
-        single-output allocation facts the two-CTA budget is proved from.
+        ``None`` where ``tcgen05_region_pid_types`` has no subject: a kernel
+        that is not an ordered barrier chain, a fission plan (its persistent
+        pid types already apply to every launch), or a chain some region of
+        which lacks the complete single-output allocation facts the two-CTA
+        budget is proved from.  A chain with one GEMM launch beside plain
+        phases has one entry.
         """
         if (
             not self.region_pid_type_search_enabled
-            or len(self.materialized_matmul_block_ids) < 2
+            or not self.materialized_matmul_block_ids
             or "flat" not in self.allowed_pid_types
             or len(self.materialized_pipeline_facts)
             != len(self.materialized_matmul_block_ids)
@@ -1515,11 +1518,127 @@ class CuteTcgen05Config:
             )
         return (pid_type,) * count
 
-    def _flat_region_ab_stage_limit(self) -> int:
-        """AB ring depth the flat one-CTA launch of a chain's GEMM validates."""
-        fragment = self.optional_fragments()["tcgen05_ab_stages"]
-        assert isinstance(fragment, IntegerFragment)
-        return fragment.high
+    def _flat_region_ab_stage_cap(self) -> int:
+        """Deepest AB ring a flat GEMM launch of a chain may search.
+
+        The dtype's hardware-validated cap (``_get_dtype_ab_stages_hard_cap``,
+        the depth the standalone single-GEMM surface searches); each launch's
+        tile is then clamped to its own one-CTA SMEM fit
+        (``_flat_region_ab_stage_limits``).
+        """
+        return min(
+            self._get_dtype_ab_stages_hard_cap(facts.input_dtype_bytes)
+            for facts in self.materialized_pipeline_facts
+            if facts is not None
+        )
+
+    def _flat_region_ab_stage_limits(
+        self, config: dict[str, object]
+    ) -> list[int] | None:
+        """Deepest AB ring each GEMM launch of a chain admits as a flat launch.
+
+        A flat (``inherit``) launch runs the one-CTA role-local pipeline on
+        its region's tile.  Its ring is bounded exactly as the standalone
+        single-GEMM surface bounds the same tile (``max_ab_stages_that_fit``:
+        the AB ring within the per-CTA capacity less the
+        ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES`` reservation, capped at
+        the dtype's validated depth) and, where the complete one-CTA model
+        applies (``one_cta_pipeline_tile_modeled``), tightened to the fit of
+        the whole A and B tile beside the launch's DEFAULT epilogue subtile
+        ring (``tcgen05_region_c_stages`` entry or the kernel's
+        ``tcgen05_c_stages``, as ``_stage_config`` applies them) and the
+        barriers, priced against the region's complete single-output
+        allocation proof (``materialized_pipeline_facts``).  Rings the
+        standalone surface refuses are never admitted here: at bm=128/bk=128
+        the deeper 16-bit rings it refuses were measured to change the GEMM's
+        rounding.  ``None`` where the chain has no such proof or the config's
+        block sizes do not name every launch's tile.
+        """
+        if self.region_pid_type_choices() is None:
+            return None
+        blocks = config.get("block_sizes")
+        if not isinstance(blocks, list):
+            return None
+        acc_stages = config.get("tcgen05_acc_stages", 2)
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if type(acc_stages) is not int or type(c_stages) is not int:
+            return None
+        c_counts = config.get("tcgen05_region_c_stages")
+        cap = self._flat_region_ab_stage_cap()
+        limits = []
+        for region, (axes, facts) in enumerate(
+            zip(
+                self.materialized_matmul_block_ids,
+                self.materialized_pipeline_facts,
+                strict=True,
+            )
+        ):
+            assert facts is not None
+            indices = [self._config_block_index(axis) for axis in axes]
+            if any(index is None or index >= len(blocks) for index in indices):
+                return None
+            bm, bn, bk = (blocks[cast("int", index)] for index in indices)
+            if not all(type(value) is int and value > 0 for value in (bm, bn, bk)):
+                return None
+            c_count = c_stages
+            if isinstance(c_counts, list) and region < len(c_counts):
+                entry = c_counts[region]
+                if type(entry) is not int:
+                    return None
+                c_count = entry or c_stages
+            ab_one = tcgen05_ab_smem_bytes_per_cta(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                dtype_bytes=facts.input_dtype_bytes,
+                ab_stages=1,
+                cluster_m=1,
+            )
+            budget = facts.capacity_bytes - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+            limit = min(cap, max(budget, 0) // ab_one) if ab_one > 0 else 0
+            if limit > 0 and one_cta_pipeline_tile_modeled(
+                bm=bm, bn=bn, bk=bk, c_stages=c_count, acc_stages=acc_stages
+            ):
+                limit = max_one_cta_pipeline_ab_stages(
+                    facts,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    c_stages=c_count,
+                    acc_stages=acc_stages,
+                    max_stages=limit,
+                )
+            limits.append(limit)
+        return limits
+
+    def _shared_ring_flat_launches(self, config: dict[str, object]) -> list[int]:
+        """Regions of a flat chain whose GEMM launch reads ``tcgen05_ab_stages``.
+
+        A launch left flat (``inherit``) keeps the kernel's ring unless its
+        ``tcgen05_region_ab_stages`` entry replaces it (``_stage_config``);
+        the entries bind only with the complete two-CTA region schedule
+        (``_normalize_epilogue_fanout`` drops them otherwise), and a
+        persistent launch's ring is validated per region
+        (``_validate_cta_group_config``).  Empty where no launch reads the
+        kernel's knob.
+        """
+        if config.get("pid_type") != "flat":
+            return []
+        pid_types = self._region_pid_types(config)
+        counts = config.get("tcgen05_region_ab_stages")
+        if (
+            not isinstance(counts, list)
+            or len(counts) != len(pid_types)
+            or self._materialized_paired_stage_limits(config) is None
+        ):
+            counts = [0] * len(pid_types)
+        return [
+            region
+            for region, (pid_type, count) in enumerate(
+                zip(pid_types, counts, strict=True)
+            )
+            if pid_type == "flat" and not count
+        ]
 
     def _region_two_cta_schedule_supported(self, config: dict[str, object]) -> bool:
         """The standard role-local static persistent CtaGroup.TWO schedule.
@@ -1604,7 +1723,13 @@ class CuteTcgen05Config:
             or not self._region_two_cta_schedule_supported(config)
         ):
             return None
-        flat_limit = self._flat_region_ab_stage_limit()
+        # A chain's launches left flat keep the one-CTA pipeline at the depth
+        # their tile fits; a fission plan has no flat launch to price.
+        flat_limits: list[int] | None = None
+        if "flat" in pid_types:
+            flat_limits = self._flat_region_ab_stage_limits(config)
+            if flat_limits is None:
+                return None
         fanout = config.get(FANOUT_CONFIG_KEY, "off")
         if fanout == "shared":
             if not (
@@ -1633,7 +1758,8 @@ class CuteTcgen05Config:
             )
         ):
             if pid_types[region] == "flat":
-                limits.append(flat_limit)
+                assert flat_limits is not None
+                limits.append(flat_limits[region])
                 continue
             indices = [self._config_block_index(axis) for axis in axes]
             if any(index is None or index >= len(blocks) for index in indices):
@@ -4887,7 +5013,7 @@ class CuteTcgen05Config:
             valid = (
                 isinstance(stages, list)
                 and len(stages) == len(self.materialized_matmul_block_ids)
-                and len(stages) >= 2
+                and len(stages) >= 1
                 and all(type(stage) is int and stage in domain for stage in stages)
             )
             if not valid:
@@ -7416,6 +7542,33 @@ class CuteTcgen05Config:
                 )
         if type(ab_stages) is not int or ab_stages <= 3:
             return
+        flat_limits = (
+            self._flat_region_ab_stage_limits(config)
+            if config.get("pid_type") == "flat"
+            else None
+        )
+        if flat_limits is not None:
+            # The flat GEMM launches of an ordered chain that keep the
+            # kernel's ring share the knob; the shallowest admission among
+            # them bounds it.  Where none reads it (every GEMM launch is
+            # persistent or carries its own region entry) the knob is dead
+            # for the chain's launches and any value is harmless.  A tile
+            # that fits no ring at all falls through to the standalone
+            # surface's handling below.
+            readers = self._shared_ring_flat_launches(config)
+            if not readers:
+                return
+            limit = min(flat_limits[region] for region in readers)
+            if limit > 0:
+                if ab_stages <= limit:
+                    return
+                if fix_invalid:
+                    config["tcgen05_ab_stages"] = limit
+                    return
+                raise InvalidConfig(
+                    "the flat GEMM launches of the ordered hl.barrier() chain "
+                    f"exceed per-CTA shared memory (maximum AB stages: {limit})"
+                )
         if self._grouped_dynamic_deep_config_matches(config):
             return
         if self._grouped_worklist_nm_ab_config_matches(config, ab_stages):
@@ -8178,6 +8331,12 @@ class CuteTcgen05Config:
             not for_search or self._preferred_persistent_pid_type() is not None
         ):
             ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        if region_chain:
+            # The flat GEMM launches of an ordered chain search the depth the
+            # standalone surface searches; each launch's tile is clamped to
+            # the ring that surface admits for it, tightened by the one-CTA
+            # model (``_validate_direct_entry_ab_stage_envelope``).
+            ab_stages_max = max(ab_stages_max, self._flat_region_ab_stage_cap())
         if for_search:
             l2_swizzle_choices = tuple(
                 v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= 8
@@ -8359,9 +8518,7 @@ class CuteTcgen05Config:
             )
             fragments[WARP_MMA_FAMILY_KEY] = EnumFragment(families)
             fragments[WARP_MMA_WARPS_KEY] = EnumFragment(WARP_MMA_WARP_CHOICES)
-        region_launches = (
-            len(self.materialized_matmul_block_ids) >= 2 and two_cta_regions
-        )
+        region_launches = bool(self.materialized_matmul_block_ids) and two_cta_regions
         if region_launches:
             fragments["tcgen05_region_ab_stages"] = ListOf(
                 IntegerFragment(0, 16, 0), len(self.materialized_matmul_block_ids)
@@ -8858,18 +9015,34 @@ class CuteTcgen05Config:
         if swizzle_value is None or swizzle_value == 1:
             return
         indices = self._matmul_block_indices()
-        if indices is None:
+        if indices is not None:
+            n_axes = [(indices[1], self.config_spec.block_sizes[indices[1]].size_hint)]
+        elif (
+            self.region_pid_type_search_enabled
+            and self.materialized_matmul_block_ids
+            and any(pid_type != "flat" for pid_type in self._region_pid_types(config))
+        ):
+            # The persistent GEMM launches of an ordered chain raster under
+            # the shared swizzle as the standalone persistent pipeline does;
+            # the narrowest launch bounds it.  A flat launch has no tile
+            # scheduler to swizzle, so a chain whose GEMM launches are all
+            # flat keeps swizzle 1, as does a fission plan.
+            n_axes = []
+            for axes, shape in zip(
+                self.materialized_matmul_block_ids,
+                self.materialized_matmul_shapes,
+                strict=True,
+            ):
+                n_block_index = self._config_block_index(axes[1])
+                if n_block_index is None:
+                    config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
+                    return
+                n_axes.append((n_block_index, shape[1]))
+        else:
             config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
             return
-        n_block_index = indices[1]
         block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list) or n_block_index >= len(block_sizes):
-            return
-        bn = block_sizes[n_block_index]
-        if not isinstance(bn, int) or isinstance(bn, bool) or bn <= 0:
-            return
-        n_hint = self.config_spec.block_sizes[n_block_index].size_hint
-        if n_hint <= 0:
+        if not isinstance(block_sizes, list):
             return
         cluster_n_raw = config.get("tcgen05_cluster_n", 1)
         cluster_n = (
@@ -8878,7 +9051,18 @@ class CuteTcgen05Config:
             else 1
         )
         cluster_n = max(cluster_n, 1)
-        ncluster_n = max(((n_hint + bn - 1) // bn) // cluster_n, 1)
+        ncluster_n: int | None = None
+        for n_block_index, n_hint in n_axes:
+            if n_block_index >= len(block_sizes):
+                return
+            bn = block_sizes[n_block_index]
+            if not isinstance(bn, int) or isinstance(bn, bool) or bn <= 0:
+                return
+            if n_hint <= 0:
+                return
+            clusters = max(((n_hint + bn - 1) // bn) // cluster_n, 1)
+            ncluster_n = clusters if ncluster_n is None else min(ncluster_n, clusters)
+        assert ncluster_n is not None
         if not isinstance(swizzle_value, int) or isinstance(swizzle_value, bool):
             return
         if swizzle_value <= ncluster_n:
