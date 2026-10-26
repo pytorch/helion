@@ -7,11 +7,11 @@ import ast
 import operator
 from typing import TYPE_CHECKING
 
-from examples.se_block import se_block_bwd_dw
-from examples.se_block import se_block_bwd_dx
 import pytest
 import torch
 
+from test._se_block_derived_operand_kernels import se_block_bwd_dw
+from test._se_block_derived_operand_kernels import se_block_bwd_dx
 from test.test_cute_materialize_operand import _bind
 from test.test_cute_materialize_operand import _computed_rhs
 from test.test_cute_materialize_operand import _cpu_b200 as _cpu_b200
