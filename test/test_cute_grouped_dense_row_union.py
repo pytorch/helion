@@ -679,5 +679,9 @@ def test_grouped_kernels_wait_at_entry_under_cute_pdl(case: tuple) -> None:
                 and any("group_offsets.iterator" in ast.unparse(n) for n in node.body)
             )
             assert ast.unparse(epilogue.body[0]) == "cute.arch.griddepcontrol_wait()"
-        plain = bound.to_code(config)
+        # (``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface; the
+        # knob-off render pins it off)
+        without_knob = deepcopy(config)
+        without_knob.config["cute_pdl"] = False
+        plain = bound.to_code(without_knob)
         assert "griddepcontrol" not in plain[plain.index("@cute.kernel") :]

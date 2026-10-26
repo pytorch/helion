@@ -108,6 +108,10 @@ def sources() -> dict[str, str]:
         assert profile is not None
         assert spec.block_sizes[2].declared_max_size == 64
         recipe = _recipe(spec)
+        # The renders pin ``cute_pdl`` off (the sm_90+ tcgen05 surface
+        # defaults to True): the host wrapper under test launches without
+        # the PDL attribute.
+        recipe.config["cute_pdl"] = False
         for balanced in (False, True):
             recipe.config[BALANCED] = balanced
             result[str(balanced)] = bound.to_code(spec.normalized_config(recipe))
