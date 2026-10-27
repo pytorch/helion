@@ -3136,8 +3136,19 @@ def _try_splice_tcgen05_unary_epilogue(
     # scalar lowering may use the accumulator's placeholder value, whose
     # dtype intentionally does not track intermediate casts. Remove it only
     # when no actual emitted consumer remains; shared CSE values stay live.
+    # The chain's rank-0 device scalars (``scale[()]``) are re-read by the
+    # splice inside the epilogue role, so their hoisted loads are dead too;
+    # left in the prologue they are global reads ahead of every role wait and
+    # force ``cute_pdl`` to wait at kernel entry instead of in the roles.
     state.codegen.allow_dead_assignments_owned_by_nodes(
-        _pure_epilogue_ancestors(value_node)
+        (
+            *_pure_epilogue_ancestors(value_node),
+            *(
+                leaf.source
+                for leaf in chain.runtime_scalars
+                if isinstance(leaf.source, torch.fx.Node)
+            ),
+        )
     )
     stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
     for stmt in stmts:

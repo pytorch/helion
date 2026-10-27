@@ -25,8 +25,11 @@ from .cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from .cute.strategies import TCGEN05_BATCH_RASTER_DEFAULT
 from .cute.strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+from .cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from .cute.strategies import batch_raster_from_config
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.strategies import persistent_grid_cap_from_config
 from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -1811,6 +1814,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return TCGEN05_BATCH_RASTER_DEFAULT
         return batch_raster_from_config(config)
 
+    def _tcgen05_persistent_grid_cap(self) -> str:
+        """``tcgen05_persistent_grid_cap``; the default outside a device function."""
+        try:
+            config = DeviceFunction.current().config
+        except NoCurrentFunction:
+            return TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+        return persistent_grid_cap_from_config(config)
+
     def _tcgen05_scheduler_axes(
         self, *, cluster_n: int | None = None
     ) -> tuple[int, ...]:
@@ -2012,7 +2023,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         than leaving a second hardware wave to re-run the prologue; the
         whole-cluster cap is the device's co-resident cluster count
         (``_MAX_ACTIVE_CLUSTERS``), which for clusters larger than the
-        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.
+        CtaGroup.TWO pair is below ``_NUM_SM // cluster_size``.  Plain
+        cluster_n=2 grids take the same whole-cluster cap when the
+        ``tcgen05_persistent_grid_cap=resident_clusters`` knob asks for it
+        (a 2048x4096x2048 GEMM on 256x128 pair tiles launches 64 clusters:
+        two hardware waves of one-tile CTAs under the pair cap, ~2 tiles
+        per persistent CTA under the resident-cluster cap).
         """
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
@@ -2033,6 +2049,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and plan.row_union is not None
             and plan.row_union.schedule is not None
         ):
+            return self._tcgen05_whole_cluster_capacity_expr()
+        if (
+            cluster_n > 1
+            and self._tcgen05_persistent_grid_cap()
+            == TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+        ):
+            # ``tcgen05_persistent_grid_cap=resident_clusters``: a plain
+            # cluster_n=2 grid with more clusters than the device co-schedules
+            # keeps its CTAs persistent over several tiles instead of
+            # launching a second hardware wave of one-tile CTAs (see
+            # ``TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY``).
             return self._tcgen05_whole_cluster_capacity_expr()
         return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
 
@@ -2873,10 +2900,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             and isinstance(stmt, ast.If)
             and ast.unparse(stmt.test) == tma_predicate
         ]
-        assert len(role_indices) == 1, (
-            "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
-            f"after the cluster arrive, found {len(role_indices)}"
-        )
+        if len(role_indices) != 1:
+            # A scheduler full/edge phase split emits two TMA role blocks;
+            # the hoist predicates exclude scheduler warps, so this is a
+            # precondition violation, reported as unsupported rather than
+            # asserted.
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 TMA-role hoist expects exactly one TMA-load role block "
+                f"after the cluster arrive, found {len(role_indices)}",
+            )
         role_block = setup.pop(role_indices[0])
         setup.insert(anchor_index + 1, role_block)
 
@@ -3820,6 +3853,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ),
             ]
         )
+        prelude_wait = device_function.cute_state.tcgen05_tma_role_prelude_wait
+        if (
+            prelude_wait is not None
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            # The hoisted TMA-load role joins the cluster rendezvous here,
+            # after its scheduler setup and ahead of its first mbarrier / TMA
+            # operation (``cute_mma`` ``tcgen05_hoist_row_union_tma_role``).
+            prelude.append(statement_from_string(prelude_wait))
         tile_counter_var, increment_tile_counter_per_tile = (
             self._finish_role_local_prelude(
                 device_function,
@@ -4834,10 +4876,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
 
         prelude: list[ast.stmt] = []
-        if (
-            emit_pdl_wait
+        # ``cute_pdl``: the epilogue warps wait ahead of their first global
+        # access (the row-union interval read of their prelude, the output
+        # stores) like the MONOLITHIC path's ``general_pdl``; with the TMA
+        # and scheduler warps' own waits every global access of the kernel
+        # then follows a role wait and ``DeviceFunction._cute_pdl_applies``
+        # emits no entry wait.
+        epilogue_pdl = (
+            device_function.config.get("cute_pdl") is True
+            and not device_function.config.get("tcgen05_materialized_pdl", False)
+            and CompileEnvironment.current().cute_fission_plan is None
+            # Only where the TMA-load role waits too (the two-CTA kernels):
+            # the one-CTA scheduler kernel keeps its entry wait, and a role
+            # wait beside it would be redundant.
             and self._tcgen05_is_two_cta()
-            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+        )
+        if emit_pdl_wait and (
+            (
+                self._tcgen05_is_two_cta()
+                and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            )
+            or epilogue_pdl
         ):
             # Same PDL hand-off as the MONOLITHIC path.
             prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
@@ -6105,8 +6165,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
         # collapse continues to work.
         clc_helper_call = "_cute_issue_clc_query_nomulticast"
+        # Throttled pacing: wait for the TMA-load warp's per-tile credit
+        # (``cute_mma._tcgen05_clc_throttle_credit``) before each query.
+        clc_throttle_barrier = device_function.cute_state.clc_throttle_barrier
         clc_query_block = [
             statement_from_string("cute.arch.sync_warp()"),
+            *(
+                [statement_from_string(f"{clc_throttle_barrier}.arrive_and_wait()")]
+                if clc_throttle_barrier
+                else []
+            ),
             create(
                 ast.If,
                 test=expr_from_string(leader_predicate),

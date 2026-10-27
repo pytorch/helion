@@ -168,6 +168,8 @@ from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_TILE
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
@@ -325,6 +327,14 @@ _TCGEN05_V_LEADER_PREDICATE = (
 _TCGEN05_TMEM_ALLOC_BARRIER_ID = 1
 _TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
 _TCGEN05_PIPELINE_INIT_BARRIER_ID = 3
+# The row-union kernels' prologue publication (every warp but the TMA-load
+# warp): the CTA-local interval tables and the TMEM allocation.
+_TCGEN05_ROW_UNION_PUBLICATION_BARRIER_ID = 4
+# The CLC query throttle: the leader CTA's TMA-load warp arrives once per
+# tile it starts, the scheduler warp syncs before every CLC query
+# (``TCGEN05_CLC_QUERY_PACING_CONFIG_KEY``).  Two warps, strictly alternating.
+_TCGEN05_CLC_THROTTLE_BARRIER_ID = 5
+_TCGEN05_CLC_THROTTLE_BARRIER_THREADS = 64
 
 
 @dataclass(frozen=True)
@@ -760,6 +770,9 @@ class _Tcgen05SchedPipelinePlan:
     clc_mbar_smem_ptr: str = ""
     clc_mbar_tensor: str = ""
     clc_mbar_phase: str = ""
+    # Named barrier pacing the CLC queries to the TMA-load warp's tile starts
+    # (``TCGEN05_CLC_QUERY_PACING_CONFIG_KEY`` = "tile"); empty when eager.
+    clc_throttle_barrier: str = ""
 
 
 _ConfigLike = Mapping[str, object]
@@ -11089,13 +11102,19 @@ def _emit_mma_pipeline(
                 "cutlass.pipeline.pipeline_init_wait("
                 f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
             )
-            if tcgen05_hoist_tma_role:
+            if tcgen05_hoist_tma_role or tcgen05_hoist_row_union_tma_role:
                 # The TMA-load warp's role block is moved right after the
-                # arrive and carries its own wait (ahead of its first stage);
-                # every other warp waits here.
+                # arrive and carries its own wait (ahead of its first stage
+                # on the one-shot kernel; in its role prelude, after the
+                # scheduler setup and ahead of the persistent loop, on the
+                # row-union kernel); every other warp waits here.
                 df.cute_state.tcgen05_tma_role_hoist_anchor = (
                     tcgen05_cluster_init_arrive
                 )
+                if tcgen05_hoist_row_union_tma_role:
+                    df.cute_state.tcgen05_tma_role_prelude_wait = (
+                        tcgen05_cluster_init_wait
+                    )
                 tcgen05_cluster_init_wait = (
                     f"if not {tma_warp}:\n    {tcgen05_cluster_init_wait}"
                 )
@@ -11104,12 +11123,16 @@ def _emit_mma_pipeline(
             assert warp_idx is not None and lane_idx is not None
             prefix.extend(
                 ast.parse(
-                    row_union_plan.cooperative_setup(warp=warp_idx, lane=lane_idx)
+                    row_union_plan.cooperative_setup(
+                        warp=warp_idx,
+                        lane=lane_idx,
+                        dependent_launch=tcgen05_pdl_launch,
+                    )
                 ).body
             )
         prefix.append(
             statement_from_string(
-                f"if {epi_active}:\n"
+                f"if {tcgen05_plan.exec_active if tcgen05_mma_warp_frees_tmem else epi_active}:\n"
                 f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
                 + (
                     f"\n    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
@@ -11188,14 +11211,54 @@ def _emit_mma_pipeline(
             # the TMA-load warp behind the ~150 ns allocation; later prefix
             # insertions anchor on the ``wait_for_alloc`` statement instead.
             tcgen05_tmem_publication = None
+        elif row_union_plan is not None:
+            # The row-union kernels publish CTA-local SMEM tables through this
+            # barrier (the linear-record profile's coverage flag and fallback
+            # intervals, written by the coverage warp in ``cooperative_setup``
+            # right above and read by the epilogue warps) and the paired
+            # startup prefill anchors ahead of it, so the barrier stays; but
+            # the TMA-load warp neither writes nor reads those tables and
+            # never retrieves the TMEM pointer, so it is left out: a CTA-wide
+            # ``sync_threads`` held it behind the ``tcgen05.alloc`` of the
+            # epilogue warps (+0.27 us per call on grouped_gemm s1, whose
+            # CTAs run one tile each, the whole prologue on the critical
+            # path).  Every other warp (epilogue, MMA, scheduler and padding
+            # warps) still meets here before ``wait_for_alloc`` below.
+            assert tcgen05_matmul_plan is not None
+            # Every launched warp but the one TMA-load warp (``tma_warp`` is
+            # ``warp_idx == tma_warp_id``) joins, so the count follows the
+            # launch itself (``block_shape``: the flat 8-warp launch when the
+            # role coordinates are flat, else the role warps) rather than
+            # the role count the launch may pad.
+            tcgen05_row_union_block = tcgen05_matmul_plan.block_shape
+            tcgen05_row_union_launched_warps = (
+                tcgen05_row_union_block[0]
+                * tcgen05_row_union_block[1]
+                * tcgen05_row_union_block[2]
+                // 32
+            )
+            assert tcgen05_row_union_launched_warps > 1
+            tcgen05_row_union_publication_barrier = df.new_var(
+                "tcgen05_row_union_publication_barrier"
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_row_union_publication_barrier} = "
+                    "cutlass.pipeline.NamedBarrier("
+                    f"barrier_id={_TCGEN05_ROW_UNION_PUBLICATION_BARRIER_ID}, "
+                    f"num_threads={32 * (tcgen05_row_union_launched_warps - 1)})"
+                )
+            )
+            tcgen05_tmem_publication = statement_from_string(
+                f"if not {tma_warp}:\n"
+                f"    {tcgen05_row_union_publication_barrier}.arrive_and_wait()"
+            )
         else:
-            # The grouped and row-union kernels keep the CTA-wide barrier: their
-            # prologues publish CTA-local SMEM tables through it (the
-            # linear-record profile's coverage flag and fallback intervals,
-            # written by the coverage warp in ``cooperative_setup`` right above
-            # and read by the epilogue warps), and the paired startup prefill
-            # anchors ahead of it.  Dropping it left those reads unordered
-            # (99.9% mismatches on test_ordinary_paired_profile_cuda).
+            # The grouped kernels keep the CTA-wide barrier: their prologues
+            # publish CTA-local SMEM tables through it.  Dropping it left
+            # those reads unordered (99.9% mismatches on
+            # test_ordinary_paired_profile_cuda before the row-union barrier
+            # above existed).
             tcgen05_tmem_publication = statement_from_string("cute.arch.sync_threads()")
         if tcgen05_tmem_publication is not None:
             prefix.append(tcgen05_tmem_publication)
@@ -11461,10 +11524,12 @@ def _emit_mma_pipeline(
     # sites that share this `if mma_impl == "tcgen05":` predicate.
     tcgen05_epi_warp_count_value = 0
     tcgen05_tmem_allocator_warp = 0
+    tcgen05_mma_warp_frees_tmem = False
     tcgen05_pipeline_init_barrier = ""
     tcgen05_free_tmem_in_epilogue = False
     tcgen05_one_shot_role_scheduler = False
     tcgen05_hoist_tma_role = False
+    tcgen05_hoist_row_union_tma_role = False
     tcgen05_output_stores_value: tuple[Node, ...] | None = None
     tcgen05_tmem_barrier_thread_count_value = 0
     tcgen05_acc_consumer_arrive_count_value = 0
@@ -12101,6 +12166,32 @@ def _emit_mma_pipeline(
             and tcgen05_grouped_plan is None
             and not df.config.get(STARTUP_PREFILL_KEY, False)
         )
+        # The clustered row-union kernel with the static persistent scheduler
+        # (the transposed profile) hoists its TMA-load role the same way; the
+        # role's scheduler setup then overlaps the cluster rendezvous and the
+        # warp joins it once, in its prelude ahead of the persistent loop
+        # (``program_id`` emits that wait from
+        # ``cute_state.tcgen05_tma_role_prelude_wait``).  The CLC-scheduled
+        # paired profile keeps the prefix wait: its startup prefill already
+        # issues ahead of the publication and its role follows the scheduler
+        # mailbox.
+        tcgen05_hoist_row_union_tma_role = (
+            tcgen05_use_cluster_deferred_pipelines
+            and row_union_plan is not None
+            and not row_union_plan.linear_record_clc
+            and tcgen05_use_role_local_tma_producer
+            and tcgen05_effective_scheduler_warps == 0
+            and not df.config.get(STARTUP_PREFILL_KEY, False)
+        )
+        # The same kernels let the MMA warp own the TMEM allocation and free
+        # it right after its accumulator ``producer_tail`` while the epilogue
+        # warps store (``Tcgen05LifecycleContext.mma_warp_frees_tmem``).
+        tcgen05_mma_warp_frees_tmem = (
+            tcgen05_hoist_row_union_tma_role
+            and tcgen05_is_two_cta
+            and tcgen05_relinquish_permit_early
+            and not tcgen05_free_tmem_in_epilogue
+        )
         from .atomic_ops import reject_atomics_beside_warp_roles
 
         reject_atomics_beside_warp_roles(
@@ -12589,11 +12680,16 @@ def _emit_mma_pipeline(
         # the pipeline-init barrier).  ``free`` and ``relinquish`` follow the
         # allocator warp inside ``TmemAllocator``; the retrieve barrier is
         # unchanged.
-        tcgen05_tmem_allocator_warp = (
-            1
-            if tcgen05_use_merged_pipeline_init and tcgen05_epi_warp_count_value >= 2
-            else 0
-        )
+        if tcgen05_mma_warp_frees_tmem:
+            assert tcgen05_matmul_plan is not None
+            tcgen05_tmem_allocator_warp = tcgen05_matmul_plan.exec_warp_id
+        else:
+            tcgen05_tmem_allocator_warp = (
+                1
+                if tcgen05_use_merged_pipeline_init
+                and tcgen05_epi_warp_count_value >= 2
+                else 0
+            )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
@@ -12670,7 +12766,17 @@ def _emit_mma_pipeline(
         assert tcgen05_matmul_plan is not None
         if tcgen05_matmul_plan.has_scheduler_warp:
             tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
-                df, use_clc=tcgen05_matmul_plan.is_clc_persistent
+                df,
+                use_clc=tcgen05_matmul_plan.is_clc_persistent,
+                clc_throttle=(
+                    tcgen05_matmul_plan.is_clc_persistent
+                    and tcgen05_use_role_local_tma_producer
+                    and df.config.get(
+                        TCGEN05_CLC_QUERY_PACING_CONFIG_KEY,
+                        TCGEN05_CLC_QUERY_PACING_TILE,
+                    )
+                    == TCGEN05_CLC_QUERY_PACING_TILE
+                ),
             )
             df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
@@ -13730,6 +13836,7 @@ def _emit_mma_pipeline(
                 ab_tma_plan.update(
                     {
                         "row_union_schedule": row_profile.name,
+                        "row_union_ab_stages": row_profile.ab_stages,
                         "a_producer_partition": row_profile.producer_cluster,
                         "lhs_tma_order": (1, 0),
                         "rhs_tma_order": (0, 1),
@@ -14504,6 +14611,11 @@ def _emit_mma_pipeline(
                         tma_gA2=tma_gA2 if tcgen05_m_subtile_count > 1 else "",
                         tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
                     )
+                    # The throttled CLC scheduler's per-tile credit leads the
+                    # tile's loads so the next tile's query overlaps them.
+                    tcgen05_clc_throttle_credit = _tcgen05_clc_throttle_credit(
+                        df, tcgen05_matmul_plan
+                    )
                     if (
                         row_profile is not None
                         and row_profile.paired_protocol is not None
@@ -14570,6 +14682,12 @@ def _emit_mma_pipeline(
                             assert isinstance(private_packet, ast.If)
                             private_body = [
                                 "cute.arch.griddepcontrol_wait()",
+                                # The prefilled first tile is started here.
+                                *(
+                                    [tcgen05_clc_throttle_credit]
+                                    if tcgen05_clc_throttle_credit is not None
+                                    else []
+                                ),
                                 f"{private_state} = {tma_producer_state}.clone()",
                                 f"{record} = cutlass.Int32(cute.arch.block_idx()[2])",
                                 f"{ga} = cute.local_tile({tma_tensor_a}, ({row_profile.mma_m}, {bk}), ({column}, None))",
@@ -14604,6 +14722,14 @@ def _emit_mma_pipeline(
                                 body=[fill],
                                 orelse=[],
                             )
+                        if tcgen05_clc_throttle_credit is not None:
+                            credit = tcgen05_clc_throttle_credit
+                            if df.cute_state.ab_startup_prefill is not None:
+                                credit = (
+                                    f"if not {df.cute_state.ab_startup_prefill.first_record}:\n"
+                                    + textwrap.indent(credit, "    ")
+                                )
+                            _emit_per_tile(credit, tma_load=True)
                         prefix.append(fill)
                         per_tile_stmts.append(fill)
                         tma_load_role_stmts.append(fill)
@@ -14613,6 +14739,11 @@ def _emit_mma_pipeline(
                                 tma_load=True,
                             )
                     else:
+                        if tcgen05_clc_throttle_credit is not None:
+                            _emit_per_tile(
+                                tcgen05_clc_throttle_credit,
+                                tma_load=tcgen05_use_role_local_tma_producer,
+                            )
                         _emit_per_tile(
                             f"{tma_initial_full_tile} = "
                             + _tcgen05_tma_tile_predicate(
@@ -15759,6 +15890,9 @@ def _emit_mma_pipeline(
             tmem_allocator_warp=tcgen05_tmem_allocator_warp,
             free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
             pdl_release=tcgen05_pdl and tcgen05_use_role_local_mma_exec,
+            drain_after_dealloc=tcgen05_is_two_cta and row_union_plan is not None,
+            mma_warp_frees_tmem=tcgen05_mma_warp_frees_tmem,
+            exec_acc_tmem_ptr=tcgen05_exec_acc_tmem_ptr,
         )
         tcgen05_pure_matmul_object = (
             Tcgen05PureMatmulObjectModel(
@@ -15817,6 +15951,21 @@ def _emit_mma_pipeline(
                     f"    {row_union_plan.all_rows} = {row_union_plan.coverage_flag}[0] != cutlass.Int32(0)"
                 ).body
             )
+        elif row_union_plan is not None and tcgen05_use_role_local_tma_producer:
+            # The group intervals are read from global memory and consumed
+            # only by the epilogue warps, so the whole setup is one-shot
+            # epilogue-role prelude: ``program_id`` moves it inside the
+            # epilogue role block behind that role's ``griddepcontrol_wait``.
+            # Emitted here in the prologue it was the one global read ahead
+            # of every role wait, which gave a ``cute_pdl`` kernel the entry
+            # wait and serialized the whole prologue behind the previous
+            # kernel (grouped_gemm s1: 4.21 -> 3.84 us per call once the
+            # prologue overlaps).
+            interval_setup = ast.parse(row_union_plan.interval_setup()).body
+            if row_profile is not None:
+                interval_setup.extend(ast.parse(row_union_plan.full_coverage()).body)
+            prefix.extend(interval_setup)
+            df.cute_state.register_tcgen05_epi_role_prelude_stmts(interval_setup)
         elif row_union_plan is not None:
             assert epi_active is not None
             interval_setup = ast.parse(row_union_plan.interval_setup()).body
@@ -16651,6 +16800,7 @@ def _new_tcgen05_sched_pipeline_plan(
     df: DeviceFunction,
     *,
     use_clc: bool = False,
+    clc_throttle: bool = False,
 ) -> _Tcgen05SchedPipelinePlan:
     """Allocate variable names for the scheduler-broadcast pipeline.
 
@@ -16671,12 +16821,15 @@ def _new_tcgen05_sched_pipeline_plan(
     clc_mbar_smem_ptr = ""
     clc_mbar_tensor = ""
     clc_mbar_phase = ""
+    clc_throttle_barrier = ""
     if use_clc:
         clc_response_smem_ptr = df.new_var("tcgen05_clc_response_smem_ptr")
         clc_response_tensor = df.new_var("tcgen05_clc_response_tensor")
         clc_mbar_smem_ptr = df.new_var("tcgen05_clc_mbar_smem_ptr")
         clc_mbar_tensor = df.new_var("tcgen05_clc_mbar_tensor")
         clc_mbar_phase = df.new_var("tcgen05_clc_mbar_phase")
+        if clc_throttle:
+            clc_throttle_barrier = df.new_var("tcgen05_clc_throttle_barrier")
     return _Tcgen05SchedPipelinePlan(
         barriers=df.new_var("tcgen05_sched_pipeline_mbars"),
         producer_group=df.new_var("tcgen05_sched_pipeline_producer_group"),
@@ -16689,6 +16842,7 @@ def _new_tcgen05_sched_pipeline_plan(
         clc_mbar_smem_ptr=clc_mbar_smem_ptr,
         clc_mbar_tensor=clc_mbar_tensor,
         clc_mbar_phase=clc_mbar_phase,
+        clc_throttle_barrier=clc_throttle_barrier,
     )
 
 
@@ -16747,7 +16901,40 @@ def _emit_clc_smem_setup(plan: _Tcgen05SchedPipelinePlan) -> list[ast.AST]:
         # body flips this each iteration; initialized to 0 so the
         # first wait pairs with the first arrival's phase.
         statement_from_string(f"{plan.clc_mbar_phase} = cutlass.Int32(0)"),
+        *(
+            [
+                statement_from_string(
+                    f"{plan.clc_throttle_barrier} = cutlass.pipeline.NamedBarrier("
+                    f"barrier_id={_TCGEN05_CLC_THROTTLE_BARRIER_ID}, "
+                    f"num_threads={_TCGEN05_CLC_THROTTLE_BARRIER_THREADS})"
+                )
+            ]
+            if plan.clc_throttle_barrier
+            else []
+        ),
     ]
+
+
+def _tcgen05_clc_throttle_credit(
+    df: DeviceFunction, plan: CuteTcgen05MatmulPlan
+) -> str | None:
+    """The TMA-load warp's per-tile credit for a throttled CLC scheduler.
+
+    One ``bar.arrive`` on the throttle barrier each time the warp starts a
+    tile; the scheduler warp (leader CTA only when the cluster has several
+    CTAs, so the credit is gated the same way) syncs on it before every CLC
+    query.  Credits and queries alternate strictly: the warp cannot start tile
+    k+1 before the record the k+1-th query fetched exists.  ``None`` when the
+    kernel has no throttle barrier.
+    """
+    sched_plan = df.cute_state.sched_pipeline_plan
+    if sched_plan is None or not sched_plan.clc_throttle_barrier:
+        return None
+    arrive = f"{sched_plan.clc_throttle_barrier}.arrive()"
+    df.cute_state.clc_throttle_barrier = sched_plan.clc_throttle_barrier
+    if plan.cluster_m * plan.cluster_n > 1:
+        return f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:\n    {arrive}"
+    return arrive
 
 
 def _emit_sched_pipeline_setup(

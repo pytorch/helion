@@ -6693,16 +6693,18 @@ def test_cluster_split_codegen() -> None:
             "cute.arch.cluster_wait()",
             "for md_i in cutlass.range(0, 32):",
             # The streamed K loop: warp 0 alone waits for the slot's tile,
-            # issues the batch and commits it to ``md_cb`` and the slot's
-            # ``md_empty``; the refill waits for the slot's previous reader
-            # alone; the loop exit waits for the last slot, then ``md_cb``.
+            # issues the batch and commits it to the slot's ``md_empty``;
+            # the producer warp waits for the slot's previous reader alone
+            # and refills; the loop exit waits for the last slot, commits
+            # ``md_cb`` once for every batch, then waits for it.
             f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
-            f"{P}.tcgen05_commit(md_cb,",
             f"{P}.tcgen05_commit(md_empty0 + md_st0,",
-            "md_cn = md_cn + 1",
+            "if md_warp == 1:",
             f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 1) % 2, (md_rk0 + 1) // 2 & 1)",
             "md_tma1.get_ptr(), [cutlass.Int32(md_a2), cutlass.Int32((md_i + 1) * 64)]",
             f"{RT}.mbar_wait(md_empty0 + (md_rk0 - 1) % 2, (md_rk0 - 1) // 2 + 1 & 1)",
+            f"{P}.tcgen05_commit(md_cb,",
+            "md_cn = md_cn + 1",
             f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
             # The mean and the centered variance share one round: this
             # CTA's row sum and its second moment about its own mean (the
@@ -6994,6 +6996,183 @@ def test_epilogue_side_vectors_load_in_packets() -> None:
     epilogue = body[body.index("md_cn = md_cn + 1") :]
     assert epilogue.count(f"{WARP_RT}.ldg_v4_b32(") == 64
     assert f"{WARP_RT}.ldg_f16_as_f32(" not in epilogue
+
+
+def test_a_plain_streamed_k_loop_refills_from_a_producer_warp() -> None:
+    # The plain K loop (no pass, no aux tile) streams with two warps: warp
+    # 0 waits for the slot's tile, issues the batch and commits it to
+    # ``md_cb`` and the slot's ``md_empty``; warp 1 waits for the previous
+    # batch's commit on the slot it refills and issues the TMA.  With warp
+    # 0 doing both, batch i+1 was issued only once batch i-1 had completed
+    # and the tensor core's queue drained every iteration (matmul_layernorm
+    # at (512, 1024, 1024): 7.27 -> 6.2 us per call).
+    bound = _bind_mln(512, 1024, 1024)
+    body = _kernel_body(_source(bound, _mln_config(64, 128, 4, 8)))
+    prologue, loop = body.split("for md_i in cutlass.range(0, 8):", 1)
+    body_text, after = loop.split("md_rk0 = md_rk0 + 1", 1)
+    # The prologue's three issues are warp 0's (the loop has not started).
+    assert "if md_warp == 1:" not in prologue
+    assert prologue.count(f"{P}.mbarrier_arrive_expect_tx(md_full0") == 3
+    _assert_in_order(
+        body_text,
+        [
+            "if md_warp == 0:",
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_empty0 + md_st0,",
+            "if md_warp == 1:",
+            f"if {P}.elect_sync():",
+            "if md_i + 3 < 8 - 0:",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 3) % 4, (md_rk0 + 3) // 4 & 1)",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 3) % 4, 49152)",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(",
+        ],
+    )
+    # No CTA barrier, no ``md_cb`` commit or wait and no commit count
+    # inside the iteration (the batches commit to their slots alone); warp
+    # 0 never waits on a slot's ``md_empty`` (the producer does).
+    assert "cute.arch.barrier()" not in body_text
+    assert f"{RT}.mbar_wait(md_cb" not in body_text
+    assert f"{P}.tcgen05_commit(md_cb" not in body_text
+    assert "md_cn = md_cn + 1" not in body_text
+    assert f"{P}.cp_async_bulk_wait_group(" not in body_text
+    warp0 = body_text.split("if md_warp == 1:", 1)[0]
+    assert f"{RT}.mbar_wait(md_empty0" not in warp0
+    assert body_text.count("if md_warp == 1:") == 1
+    # The loop exit waits for the last slot (every batch is done), then
+    # one ``md_cb`` commit stands for them all, counted once, and the
+    # epilogue waits for it.
+    _assert_in_order(
+        after,
+        [
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 - 1) % 4, (md_rk0 - 1) // 4 + 1 & 1)",
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.AFTER_THREAD_SYNC)",
+            "if md_warp == 0:",
+            f"{P}.tcgen05_commit(md_cb,",
+            "md_cn = md_cn + 1",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+        ],
+    )
+    assert after.count(f"{P}.tcgen05_commit(md_cb") == 1
+    assert _commits_while_one_is_outstanding(body) == []
+    # A streamed loop whose passes write the slot keeps warp 0 as the
+    # refilling warp behind the iteration's barrier (se_block dx under
+    # ``pass``: ``test_a_k_loop_over_ring_tiles_streams_behind_slot_barriers``).
+    from test.test_cute_mma_dag import _bind_se_block
+
+    passes = _kernel_body(
+        _source(
+            _bind_se_block("se_block_bwd_dx"),
+            _config(64, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass"),
+        )
+    )
+    assert "if md_warp == 1:" not in passes.split("for md_i in cutlass.range(", 1)[1]
+
+
+def test_wide_rows_stream_the_epilogue_chunk_by_chunk() -> None:
+    # A 128-row fragment of 256 columns is 256 fp32 values per thread: held
+    # whole across the epilogue they spill (ptxas reports spills; the
+    # layer-norm epilogue cost 4.7 us over a plain-store twin at 2048^3).
+    # The root epilogue block streams the row from tensor memory a
+    # 64-column chunk at a time per phase: the statistics phase loads each
+    # chunk, sums it, takes its second moment about its own mean and folds
+    # it into the running pair (Chan), the split's round follows, and the
+    # normalize / store phase re-loads each chunk with its side-vector
+    # packets issued ahead of the chunk's math.
+    bound = _bind_mln(2048, 2048, 2048)
+    spec = bound.config_spec
+    assert spec.cute_mma_dag_epilogue is not None
+    assert spec.cute_mma_dag_epilogue.choices == ("row", "split", "streamed")
+    config = _config(128, 64, warps=8, stages=3, cute_mma_dag_cluster=8)
+    config = helion.Config(
+        **{
+            **config.config,
+            "cute_mma_dag_split": "fixup",
+            "cute_mma_dag_epilogue": "streamed",
+        }
+    )
+    # The whole-row form (the default): one load per chunk, one wait, the
+    # row's 256 values live through the round.
+    whole = helion.Config(**{**config.config, "cute_mma_dag_epilogue": "row"})
+    body = _kernel_body(_source(bound, whole))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    assert epilogue.count(f"{P}.tcgen05_ld(") == 4
+    assert epilogue.count(f"{P}.tcgen05_wait(kind={P}.Tcgen05Wait.LOAD)") == 1
+    assert spec.normalized_config(whole).config["cute_mma_dag_epilogue"] == "row"
+    body = _kernel_body(_source(bound, config))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    loads = [
+        i for i, line in enumerate(epilogue.splitlines()) if f"{P}.tcgen05_ld(" in line
+    ]
+    # Two passes of four chunks, one wait per chunk load.
+    assert len(loads) == 8
+    assert epilogue.count(f"{P}.tcgen05_wait(kind={P}.Tcgen05Wait.LOAD)") == 8
+    lines = epilogue.splitlines()
+    # Statistics: each chunk's mean (over 64 columns) and the running
+    # combine (over 128, then 192 columns) precede the next chunk's load;
+    # the tile's pair goes out once, after the fourth chunk.
+    first = "\n".join(lines[loads[0] : loads[1]])
+    assert "/ cutlass.Float32(64.0)" in first and "stg_f32(md_fx" not in first
+    third = "\n".join(lines[loads[2] : loads[3]])
+    assert "/ cutlass.Float32(128.0)" in third
+    fourth = "\n".join(lines[loads[3] : loads[4]])
+    assert "/ cutlass.Float32(192.0)" in fourth
+    assert fourth.count(f"{WARP_RT}.stg_f32(md_fx") == 2
+    assert f"{RT}.spin_until_reached_acquire_gpu_u32(" in fourth
+    assert "md_vv1 = " in fourth
+    # Normalize / store: the chunk's eight weight and eight bias packets
+    # are issued before its first staged packet; four chunks stage 32
+    # packets in all and the four TMA boxes follow the last chunk.
+    for chunk in range(4):
+        end = loads[5 + chunk] if chunk < 3 else len(lines)
+        part = "\n".join(lines[loads[4 + chunk] : end])
+        packets = part.index(f"{WARP_RT}.sts_v4_b32(")
+        assert part[:packets].count(f"{WARP_RT}.ldg_v4_b32(") == 16
+        assert part.count(f"{WARP_RT}.ldg_v4_b32(") == 16
+        assert part.count(f"{WARP_RT}.sts_v4_b32(") == 8
+    assert epilogue.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 4
+    _assert_in_order(
+        epilogue,
+        [
+            f"{WARP_RT}.sts_v4_b32(",
+            f"{P}.tcgen05_ld(",
+            f"{WARP_RT}.sts_v4_b32(",
+            f"{P}.cp_async_bulk_tensor_global_shared_cta(",
+        ],
+    )
+    # A 64-row fragment reads half rows (64 columns per lane): the
+    # whole-row form stays under the knob, one load per chunk and one wait.
+    narrow = _mln_config(64, 32, 4, 8)
+    narrow = helion.Config(**{**narrow.config, "cute_mma_dag_epilogue": "streamed"})
+    body = _kernel_body(_source(bound, narrow))
+    epilogue = body[body.index("md_cn = md_cn + 1") :]
+    assert epilogue.count(f"{P}.tcgen05_ld(") == 2
+    assert epilogue.count(f"{P}.tcgen05_wait(kind={P}.Tcgen05Wait.LOAD)") == 1
+    # The knob is inert off the tensor-memory mode and where no epilogue
+    # store exists (no fragment), and the seeds stream the wide rows only.
+    off = helion.Config(
+        **{
+            **config.config,
+            "cute_mma_dag": "off",
+            "cute_mma_dag_cluster": 1,
+            "cute_mma_dag_epilogue": "streamed",
+        }
+    )
+    assert spec.normalized_config(off).config["cute_mma_dag_epilogue"] == "row"
+    assert _bind_fwd().config_spec.cute_mma_dag_epilogue is not None
+    assert "streamed" not in _bind_fwd().config_spec.cute_mma_dag_epilogue.choices
+    seeds = [c.config for c in spec.compiler_seed_configs]
+    forms = {
+        (tuple(seed["block_sizes"]), seed["cute_mma_dag_cluster"]): (
+            seed.get("cute_mma_dag_epilogue", "row")
+        )
+        for seed in seeds
+        if seed["cute_mma_dag"] == "tcgen05"
+    }
+    assert forms
+    for ((bm, _bk), cluster), form in forms.items():
+        local = (2048 // cluster) if bm > 64 else (2048 // cluster) // 2
+        assert form == ("streamed" if local > 128 else "row"), (bm, cluster, forms)
 
 
 def test_wide_row_stores_go_out_by_tma_slab_by_slab() -> None:
@@ -7425,7 +7604,7 @@ def test_the_split_epilogue_is_normalized_to_its_subject() -> None:
     bound = _bind_head_sum()
     spec = bound.config_spec
     assert spec.cute_mma_dag_epilogue is not None
-    assert spec.cute_mma_dag_epilogue.choices == ("row", "split")
+    assert spec.cute_mma_dag_epilogue.choices == ("row", "split", "streamed")
 
     def normalized(config: helion.Config) -> dict[str, object]:
         with bound.env:

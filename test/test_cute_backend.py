@@ -12744,7 +12744,13 @@ class TestCuteBackend(TestCase):
                 for seed in bound.config_spec.compiler_seed_configs
                 if seed.block_sizes == [1, 256, 256, 64]
             }
-            self.assertEqual(seed_layouts, {None, "explicit_epi_tile"})
+            # The batched GEMM also registers the two-CTA paired-pipeline seeds
+            # (``tcgen05_cta_group="two"``, default layout) since the paired
+            # SMEM facts analyze rank-3 operands.
+            self.assertEqual(seed_layouts, {None, "explicit_epi_tile", "default"})
+            self.assertTrue(
+                bound.config_spec._cute_tcgen05_config.paired_pipeline_search_enabled()
+            )
 
             projected = {
                 "block_sizes": [1, 128, 128, 64],
@@ -12856,10 +12862,13 @@ class TestCuteBackend(TestCase):
                 with self.subTest(kernel=kernel.name):
                     kernel.reset()
                     bound = kernel.bind(args)
+                    # The two-CTA paired schedule's batched seeds spell the
+                    # default layout out; it is the same layout as an absent key.
                     layouts = {
-                        seed.config.get("tcgen05_layout_strategy")
+                        strategy if strategy != "default" else None
                         for seed in bound.config_spec.compiler_seed_configs
                         if seed.block_sizes == [1, 256, 256, 64]
+                        for strategy in (seed.config.get("tcgen05_layout_strategy"),)
                     }
                     self.assertEqual(layouts, expected_layouts)
                     config_generation = bound.config_spec.create_config_generation()
@@ -14660,14 +14669,21 @@ class TestCuteBackend(TestCase):
             and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
-            (seed["block_sizes"][2], seed["tcgen05_ab_stages"]) for seed in seeds
+            (seed["block_sizes"][1], seed["block_sizes"][2], seed["tcgen05_ab_stages"])
+            for seed in seeds
         )
-        self.assertEqual(staged, [(64, 6), (128, 3)])
+        # The 256x256 pairs hold one tile per CTA here (128 CTAs), so the
+        # multi-tile 256x128 pair seed (deepest ring, resident-cluster cap)
+        # joins the 2x2 family.
+        self.assertEqual(staged, [(128, 64, 8), (256, 64, 6), (256, 128, 3)])
         for seed in seeds:
             self.assertEqual(seed["tcgen05_cluster_m"], 2)
             self.assertEqual(seed["tcgen05_aux_load_placement"], "pre_acc_wait")
             self.assertEqual(seed["pid_type"], "persistent_interleaved")
-            self.assertNotIn("tcgen05_strategy", seed)
+            self.assertEqual(
+                seed.get("tcgen05_persistent_grid_cap", "sm_pairs"),
+                "resident_clusters" if seed["block_sizes"][1] == 128 else "sm_pairs",
+            )
 
     def test_matmul_mma_tcgen05_one_wave_seeds_and_projection(self) -> None:
         """GEMMs whose 256x256 grid idles most SMs seed one-wave tiles.
@@ -14761,11 +14777,32 @@ class TestCuteBackend(TestCase):
             constraints = spec._tcgen05_cluster_m2_search_constraints
         assert constraints is not None
         self.assertFalse(constraints.one_wave_only)
-        self.assertTrue(
-            all(
-                seed["block_sizes"][1] == 256
+        # No one-wave seeds, but the 256x256 pairs hold exactly one tile per
+        # CTA (128 CTAs), so the multi-tile 256x128 pair seeds (2x2 on the
+        # resident-cluster cap and 2x1) join the 256x256 two-CTA seeds.
+        pair_widths = {
+            seed["block_sizes"][1]
+            for seed in seeds
+            if seed.get("tcgen05_cluster_m") == 2
+        }
+        self.assertEqual(pair_widths, {128, 256})
+        multi_tile = [
+            seed
+            for seed in seeds
+            if seed.get("tcgen05_cluster_m") == 2 and seed["block_sizes"][1] == 128
+        ]
+        self.assertEqual(
+            [
+                (seed["tcgen05_cluster_n"], seed.get("tcgen05_persistent_grid_cap"))
+                for seed in multi_tile
+            ],
+            [(2, "resident_clusters"), (1, None)],
+        )
+        self.assertTrue(all(seed["block_sizes"][2] == 64 for seed in multi_tile))
+        self.assertFalse(
+            any(
+                seed["block_sizes"][1] == 64 and seed.get("tcgen05_cluster_m") == 2
                 for seed in seeds
-                if seed.get("tcgen05_cluster_m") == 2
             )
         )
 
@@ -15118,13 +15155,24 @@ class TestCuteBackend(TestCase):
         ]
         staged = sorted(
             (
+                seed["block_sizes"][1],
                 seed["block_sizes"][2],
                 seed["tcgen05_ab_stages"],
                 seed.get("tcgen05_aux_load_placement"),
             )
             for seed in seeds
         )
-        self.assertEqual(staged, [(64, 5, "pre_acc_wait"), (128, 3, None)])
+        # The multi-tile 256x128 pair seed keeps the stage next to its
+        # 8-deep ring: at bn=128 the row stage and the (128, 64) C ring are
+        # half the 256-wide seeds' and fit beside 8 x 24 KiB of AB stages.
+        self.assertEqual(
+            staged,
+            [
+                (128, 64, 8, "pre_acc_wait"),
+                (256, 64, 5, "pre_acc_wait"),
+                (256, 128, 3, None),
+            ],
+        )
         tcgen05 = spec._cute_tcgen05_config
         facts = tcgen05.rowvec_aux_facts
         assert facts is not None
@@ -15185,7 +15233,13 @@ class TestCuteBackend(TestCase):
             and seed.config.get("cute_pdl") is not True
         )
         self.assertEqual(
-            chain_seeds, [(64, 6, "pre_acc_wait"), (128, 3, "pre_acc_wait")]
+            chain_seeds,
+            # The multi-tile 256x128 pair seed (ab=8) keeps the placement too.
+            [
+                (64, 6, "pre_acc_wait"),
+                (64, 8, "pre_acc_wait"),
+                (128, 3, "pre_acc_wait"),
+            ],
         )
 
     def test_matmul_mma_tcgen05_sampled_pre_acc_wait_keeps_the_row_stage_within_smem(

@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .._compiler.cute.cute_epilogue import _LeafBindings
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.epilogue_fanout import RenderedChain
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
@@ -234,17 +235,11 @@ def _tcgen05_rowvec_aux_stage_copy_elems(
     copy_bits: int = 128,
 ) -> int | None:
     """Return the vector width when a row-vector aux can be staged safely."""
+    from .._compiler.cute.cute_epilogue import rowvec_aux_stage_copy_elems
 
-    if aux_extent is None or aux_dtype_bits <= 0:
-        return None
-    if copy_bits % aux_dtype_bits != 0:
-        return None
-    copy_elems = copy_bits // aux_dtype_bits
-    if copy_elems <= 0:
-        return None
-    if block_n % copy_elems != 0 or aux_extent % copy_elems != 0:
-        return None
-    return copy_elems
+    return rowvec_aux_stage_copy_elems(
+        aux_dtype_bits, block_n, aux_extent, copy_bits=copy_bits
+    )
 
 
 @has_side_effect
@@ -3031,6 +3026,14 @@ def _codegen_cute_store_tcgen05_tile(
     aux_steps_in_chain: tuple[_AuxiliaryTensorLoadExpr, ...] = (
         epilogue_chain.auxiliary_tensor_loads if epilogue_chain is not None else ()
     )
+    # Rank-0 device scalars of the chain (``acc * scale[()]``) bind once per
+    # output tile in the per-tile setup, ahead of the accumulator wait, instead
+    # of re-reading global memory inside every subtile iteration.
+    runtime_scalar_prelude, runtime_scalar_locals = (
+        epilogue_chain.render_runtime_scalar_bindings(df.new_var, "")
+        if epilogue_chain is not None and epilogue_chain.steps
+        else ("", {})
+    )
     tcgen05_aux_load_placement = df.config.get(
         TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
         TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
@@ -3104,12 +3107,20 @@ def _codegen_cute_store_tcgen05_tile(
     aux_matmul_plan = df.cute_state.matmul_plan
 
     def can_stage_rowvec_per_warp(
-        broadcast_axis: int | None,
-        copy_elems: int | None,
-        *,
-        has_full_register_hoist: bool,
+        rec: _AuxStepRecord, *, has_full_register_hoist: bool
     ) -> bool:
-        """Whether this rowvec can use a warp-private full-tile SMEM stage."""
+        """Whether this rowvec uses a warp-private full-tile FP32 SMEM stage.
+
+        The site conditions here; the shape half (a 32-bit N-broadcast row
+        whose width splits into whole 32-lane copies -- the warp-private
+        stage is one ``make_tiled_copy_tv`` over 32 lanes x ``copy_elems``
+        values, so a shorter row would let the upper lanes copy past it --
+        on the B200 sweep's profitable widths) is
+        ``rowvec_aux_takes_per_warp_f32_stage``, shared with the fan-out
+        config gate.  16-bit rows take the promoted shared stage instead
+        (``rowvec_stage_promotes_to_f32``).
+        """
+        from .._compiler.cute.cute_epilogue import rowvec_aux_takes_per_warp_f32_stage
 
         return (
             tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -3117,31 +3128,15 @@ def _codegen_cute_store_tcgen05_tile(
             and not tcgen05_value.partial_output_tma_store
             and not tcgen05_value.output_column_major
             and tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
-            and broadcast_axis == 1
-            and copy_elems is not None
-            # The warp-private stage is one ``make_tiled_copy_tv`` over 32
-            # lanes x ``copy_elems`` values; a row shorter than that tile
-            # would let the upper lanes copy past the row (into the next
-            # warp's stage or beyond the allocation).
-            and tcgen05_value.bn % (32 * copy_elems) == 0
             and not has_full_register_hoist
+            and rowvec_aux_takes_per_warp_f32_stage(
+                aux_dtype_bits=rec.aux_dtype_bits,
+                broadcast_axis=rec.broadcast_axis,
+                epi_warp_count=tcgen05_value.epi_warp_count,
+                bn=tcgen05_value.bn,
+                aux_extent=rec.aux_extent,
+            )
         )
-
-    def is_profitable_rowvec_per_warp_config(aux_dtype_bits: int) -> bool:
-        """Whether reuse should amortize this warp-private FP32 stage.
-
-        16-bit rows take the promoted shared stage instead
-        (``rowvec_stage_promotes_to_f32``).
-        """
-
-        if aux_dtype_bits != 32:
-            return False
-        stage_bytes = (
-            tcgen05_value.epi_warp_count * tcgen05_value.bn * (aux_dtype_bits // 8)
-        )
-        # B200 sweep boundaries: bn=32 only breaks even, and the largest
-        # winning stage used 4 KiB without changing occupancy.
-        return tcgen05_value.bn >= 64 and stage_bytes <= 4 * 1024
 
     def rowvec_stage_promotes_to_f32(rec: _AuxStepRecord) -> bool:
         """16-bit row vector consumed only by the FP32 carrier op.
@@ -3504,10 +3499,8 @@ def _codegen_cute_store_tcgen05_tile(
             and copy_elems is not None
         )
         stage_rowvec_per_warp = can_stage_rowvec_per_warp(
-            rec.broadcast_axis,
-            copy_elems,
-            has_full_register_hoist=rec.aux_rmem_full is not None,
-        ) and is_profitable_rowvec_per_warp_config(rec.aux_dtype_bits)
+            rec, has_full_register_hoist=rec.aux_rmem_full is not None
+        )
         shared_copy_shape = shared_rowvec_stage_copy_shape(rec)
         shared_copy_threads, shared_copy_elems = (
             shared_copy_shape if shared_copy_shape is not None else (0, None)
@@ -3550,6 +3543,15 @@ def _codegen_cute_store_tcgen05_tile(
             )
         else:
             rowvec_aux_stage_records.append(None)
+    if fanout_plan is not None and any(
+        stage is not None for stage in rowvec_aux_stage_records
+    ):
+        # The shared two-output traversal concatenates both stores' per-tile
+        # setups; a staged rowvec's SMEM stage, cooperative copy and barrier
+        # are per store and are not composed.
+        raise exc.BackendUnsupported(
+            "cute", "shared fanout does not compose with SMEM-staged rowvec aux"
+        )
     partial_tma_needs_full_tile_guard = tcgen05_value.partial_output_tma_store and any(
         # ``aux_ring_smem_names`` and ``rowvec_aux_stage_records`` are both
         # positionally aligned with ``aux_step_records``.
@@ -3911,7 +3913,9 @@ def _codegen_cute_store_tcgen05_tile(
         SIMT path: C-input staging is only safe for full tiles because
         the producer-side bulk copy is not predicated for M/N fringes.
         """
-        lines: list[str] = []
+        lines: list[str] = [
+            line for line in runtime_scalar_prelude.splitlines() if line.strip()
+        ]
         if not aux_step_records:
             return lines
         if define_thr_copy_t2r:
@@ -4565,6 +4569,7 @@ def _codegen_cute_store_tcgen05_tile(
         safe_direct_aux_with_full_tile: bool = False,
         coord_layout: str = "ttr",
         unconditional_full_tile: bool = False,
+        bind_runtime_scalars: bool = True,
     ) -> tuple[str, str, str]:
         """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
 
@@ -4647,8 +4652,15 @@ def _codegen_cute_store_tcgen05_tile(
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
             unconditional_full_tile=unconditional_full_tile,
         )
-        aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
+        aux_locals_by_expr: _LeafBindings = {
+            rec.expr: rec.aux_loaded for rec in aux_step_records
+        }
         assert len(aux_locals_by_expr) == len(aux_step_records)
+        if bind_runtime_scalars:
+            # Bound once per tile by ``_aux_tile_setup_lines``; the diagnostic
+            # module-helper layout renders into a separate function and keeps
+            # the inline reads.
+            aux_locals_by_expr.update(runtime_scalar_locals)
         if (
             len(epilogue_chain.steps) == 1
             and epilogue_chain.steps[0].hoistable_aux_expr is not None
@@ -5493,6 +5505,18 @@ def _codegen_cute_store_tcgen05_tile(
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
             f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
+        # Per-aux-step partitioning lines (one chain per auxiliary
+        # tensor) and the per-tile scalar bindings: address math and
+        # accumulator-independent reads, issued ahead of the accumulator
+        # wait as on the TMA-store path.  No-op when the chain has no aux
+        # steps; generated source is byte-identical to the unary-chain
+        # shape for unary chains and to the identity-store golden for
+        # identity stores.
+        *_aux_tile_setup_lines(
+            thr_copy_t2r_var=thr_copy_t2r,
+            define_thr_copy_t2r=False,
+            force_gmem_aux=simt_edge_only,
+        ),
         *(
             [
                 (
@@ -5505,16 +5529,6 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
-        # Per-aux-step partitioning lines (one chain per auxiliary
-        # tensor). No-op when the chain has no aux steps; generated
-        # source is byte-identical to the unary-chain shape for
-        # unary chains and to the identity-store golden for identity
-        # stores.
-        *_aux_tile_setup_lines(
-            thr_copy_t2r_var=thr_copy_t2r,
-            define_thr_copy_t2r=False,
-            force_gmem_aux=simt_edge_only,
-        ),
         (
             f"{ttr_racc} = cute.make_rmem_tensor("
             f"{ttr_gc_grouped}[(None, None, None, 0)].shape, cutlass.Float32)"
@@ -6370,7 +6384,13 @@ def _codegen_cute_store_tcgen05_tile(
                 release=acc_release,
                 register_store=f"        {store_target}.store({acc_vec})\n",
                 chain=fanout_chain,
-                auxiliary_names={rec.expr: rec.aux_loaded for rec in aux_step_records},
+                # The shared suffix renders this store's chain against its
+                # aux-load locals and the per-tile scalar bindings of its
+                # setup (``_aux_tile_setup_lines``), as the single-output
+                # splice does; without the bindings a rank-0 leaf would be
+                # re-read from global memory inside the subtile loop.
+                auxiliary_names={rec.expr: rec.aux_loaded for rec in aux_step_records}
+                | runtime_scalar_locals,
                 pre_wait_aux=pre_wait_aux,
             )
         return (
@@ -6628,7 +6648,7 @@ def _codegen_cute_store_tcgen05_tile(
         # source order for unary chains and identity stores in this
         # diagnostic layout.
         module_early_aux, module_late_prelude, rhs = _splice_acc_vec(
-            "tcgen05_tRS_rAcc", "    "
+            "tcgen05_tRS_rAcc", "    ", bind_runtime_scalars=False
         )
         prelude = module_early_aux + module_late_prelude
         return (

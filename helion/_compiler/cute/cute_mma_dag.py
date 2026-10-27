@@ -232,6 +232,7 @@ MMA_DAG_DERIVED_CHOICES: tuple[str, ...] = (
 MMA_DAG_EPILOGUE_KEY = "cute_mma_dag_epilogue"
 MMA_DAG_EPILOGUE_ROW = "row"
 MMA_DAG_EPILOGUE_SPLIT = "split"
+MMA_DAG_EPILOGUE_STREAMED = "streamed"
 # How the tensor-memory region programs' epilogue threads hold a fragment:
 # ``row`` keeps one row per thread on four epilogue warps (half a row at the
 # 64-row tiles, whose 16x32bx2 loads split the row over the lane halves);
@@ -244,10 +245,20 @@ MMA_DAG_EPILOGUE_SPLIT = "split"
 # us against Triton's 128-column tiles at 30 us).  The split has no subject
 # outside the region programs, with fewer than eight warps, or where a
 # fragment reduction / vector needs whole rows (fail closed: ``row``).
+# ``streamed`` keeps the one-row-per-thread layout but re-reads the row from
+# tensor memory a 64-column chunk at a time per phase (a row reduction ends a
+# phase), so a wide row (256 fp32 columns per thread spill under the
+# 255-register budget: matmul_layernorm at 2048^3 lost ~1.5 us per call to
+# the spills) never sits whole in registers; offered only where a root block
+# without derived values stores fragments (``epilogue_knob_admitted``).
 MMA_DAG_EPILOGUE_CHOICES: tuple[str, ...] = (
     MMA_DAG_EPILOGUE_ROW,
     MMA_DAG_EPILOGUE_SPLIT,
+    MMA_DAG_EPILOGUE_STREAMED,
 )
+# Local fp32 columns per thread above which the seeds stream the epilogue
+# (two 64-column chunks fit the registers; four spill).
+MMA_DAG_EPILOGUE_STREAM_COLS = 128
 MMA_DAG_LOOKAHEAD_KEY = "cute_mma_dag_lookahead"
 MMA_DAG_LOOKAHEAD_OFF = "off"
 MMA_DAG_LOOKAHEAD_ON = "on"
@@ -1698,6 +1709,9 @@ class MmaDagPlan:
     cluster: int = 1
     split_axis: int = -1
     split_mode: str = MMA_DAG_SPLIT_CLUSTER
+    # ``MMA_DAG_EPILOGUE_KEY``: the region renderer's root epilogue reads
+    # its fragment rows whole (``row`` / ``split``) or streamed chunk by chunk.
+    epilogue: str = MMA_DAG_EPILOGUE_ROW
     # Dots contracting over a varying-bound loop axis whose bound leaves
     # some CTA a partial last trip: dot node -> the role of the load operand
     # whose pass zeroes the elements past the bound (``mma_dag_bound_masks``).
@@ -2801,6 +2815,15 @@ def cluster_split_axis(program: MmaDagProgram) -> Axis | None:
         and axis not in vec_axes
     ]
     return candidates[0] if len(candidates) == 1 else None
+
+
+def epilogue_knob_admitted(facts: CuteMmaDagFacts) -> bool:
+    """Whether ``cute_mma_dag_epilogue`` has a subject: a tensor-memory
+    region program whose root epilogue stores fragments (the streamed form
+    reads such a block's rows chunk by chunk where they span more than one
+    64-column load; narrower rows keep the whole-row form either way)."""
+    tc = facts.tcgen05
+    return tc is not None and tc.regions and bool(tc.root_store_slots)
 
 
 def fixup_admitted(facts: CuteMmaDagFacts) -> bool:
@@ -7785,6 +7808,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
             split_axis=facts.split_axis if cluster > 1 else -1,
             split_mode=split_mode if cluster > 1 else MMA_DAG_SPLIT_CLUSTER,
             derived_mode=cast("str", derived_mode),
+            epilogue=cast("str", epilogue),
         )
     plan = MmaDagPlan(
         program=program,
@@ -8029,6 +8053,8 @@ __all__ = [
     "MMA_DAG_EPILOGUE_KEY",
     "MMA_DAG_EPILOGUE_ROW",
     "MMA_DAG_EPILOGUE_SPLIT",
+    "MMA_DAG_EPILOGUE_STREAMED",
+    "MMA_DAG_EPILOGUE_STREAM_COLS",
     "MMA_DAG_EXCHANGE_CHOICES",
     "MMA_DAG_EXCHANGE_KEY",
     "MMA_DAG_FIXUP_MAX_TILES",
@@ -8098,6 +8124,7 @@ __all__ = [
     "async_tile_reason",
     "cluster_split_axis",
     "emulate_ldmatrix",
+    "epilogue_knob_admitted",
     "fixup_admitted",
     "frag_register_route",
     "ldmatrix_lane_address",

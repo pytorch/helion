@@ -19,6 +19,7 @@ from ...autotuner.config_fragment import ListOf
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..compile_environment import FixedBlockSizeSource
+from .cute_epilogue import fanout_pre_wait_stages_rowvec_aux
 from .cute_warp_mma_gemm import MATMUL_FAMILIES
 from .cute_warp_mma_gemm import MATMUL_FAMILY_TCGEN05
 from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
@@ -50,6 +51,9 @@ from .grouped_full_coverage import full_coverage_smem_upper_bound
 from .grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
 from .grouped_panel_raster import GROUPED_PANEL_RATIO_CHOICES
 from .grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from .grouped_row_union import AB_STAGES_CHOICES as GROUPED_ROW_UNION_AB_STAGES_CHOICES
+from .grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
+from .grouped_row_union import AB_STAGES_MIN
 from .grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from .grouped_row_union import LEGACY_SCHEDULE
 from .grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -57,7 +61,9 @@ from .grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
 from .grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
 from .grouped_row_union import STARTUP_PREFILL_KEY
 from .grouped_row_union import TRANSPOSED_SCHEDULE
+from .grouped_row_union import ab_stages_supported as row_union_ab_stages_supported
 from .grouped_row_union import physical_schedule
+from .grouped_row_union import schedule_by_name as row_union_schedule_by_name
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
 from .one_cta_pipeline import Tcgen05OneCtaPipelineFacts
 from .one_cta_pipeline import max_one_cta_pipeline_ab_stages
@@ -84,6 +90,10 @@ from .strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from .strategies import TCGEN05_PERSISTENCE_MODEL_PID_TYPES
+from .strategies import TCGEN05_PERSISTENT_GRID_CAP_CHOICES
+from .strategies import TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY
+from .strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+from .strategies import TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEYS
 from .strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
@@ -148,6 +158,9 @@ from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_C_STORE_MODES
+from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_TILE
+from .tcgen05_constants import TCGEN05_CLC_QUERY_PACINGS
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
@@ -304,10 +317,15 @@ class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
 
     The 3-stage AB pipeline is only safe to search when its larger SMEM
     allocation fits after reserving space for CuTe runtime/barrier scratch.
+    ``output_dtype_bytes`` / ``output_stores`` describe the TMA-store rings
+    (one per output store) the fit estimate charges beyond that reservation;
+    ``None`` keeps the AB-only estimate.
     """
 
     dtype_bytes: int
     per_cta_smem_budget_bytes: int
+    output_dtype_bytes: int | None = None
+    output_stores: int = 1
 
 
 class Tcgen05GroupedWorklistSmemFacts(NamedTuple):
@@ -443,6 +461,7 @@ TCGEN05_GROUPED_DYNAMIC_RESERVED_SMEM_BYTES = 2 * 1024
 CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     GROUPED_ROW_UNION_KEY,
     GROUPED_ROW_UNION_SCHEDULE_KEY,
+    GROUPED_ROW_UNION_AB_STAGES_KEY,
     STARTUP_PREFILL_KEY,
     GROUPED_RESIDENT_CTAS_KEY,
     FANOUT_CONFIG_KEY,
@@ -470,6 +489,8 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_num_epi_warps",
     TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
     TCGEN05_BATCH_RASTER_CONFIG_KEY,
+    TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY,
+    TCGEN05_CLC_QUERY_PACING_CONFIG_KEY,
     WARP_MMA_FAMILY_KEY,
     WARP_MMA_WARPS_KEY,
 )
@@ -1340,7 +1361,11 @@ class CuteTcgen05Config:
             or view is None
             or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
             or config.get("tcgen05_cluster_m", 1) != 2
-            or config.get("tcgen05_cluster_n", 1) != 1
+            # cluster_n=2 is the 2x2 cluster of CTA pairs (A multicast across
+            # the N neighbours); the SMEM model is per CTA either way. The
+            # column-major-output family keeps its priced cluster_n=1 schedule.
+            or config.get("tcgen05_cluster_n", 1)
+            not in ((1,) if facts.output_column_major else (1, 2))
             or config.get("pid_type")
             not in (
                 "persistent_blocked",
@@ -1376,6 +1401,28 @@ class CuteTcgen05Config:
             or acc_stages not in (1, 2)
         ):
             return None
+        if (
+            self.matmul_has_leading_passthrough
+            and config.get("tcgen05_cluster_n", 1) == 2
+        ):
+            # The batched cluster_n=2 kernel pairs N tiles on the scheduler's
+            # swapped dim 1 and keeps the plain raster (``cute_mma`` rejects
+            # the rest); mirror it so the config is invalid, not a codegen
+            # failure (``_fix_batched_cluster_n2_search_config`` repairs it).
+            extents = self.matmul_compile_time_static_extents
+            n = extents[1] if extents is not None else None
+            groupings = config.get("l2_groupings", [])
+            if (
+                not isinstance(n, int)
+                or n % bn != 0
+                or (n // bn) % 2 != 0
+                or config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) != 1
+                or (
+                    isinstance(groupings, list)
+                    and any(grouping != 1 for grouping in groupings)
+                )
+            ):
+                return None
         if facts.output_column_major:
             bounds = self._matmul_search_bounds()
             if bounds is None or any(
@@ -1692,6 +1739,15 @@ class CuteTcgen05Config:
         if limit is not None and limit > 0:
             return
         if fix_invalid:
+            # A batched cluster_n=2 sample whose N tiles do not pair keeps
+            # the CTA pair at cluster_n=1 (the search projection) before the
+            # pair itself is given up.
+            view = self._matmul_config_view(config)
+            if view is not None:
+                self._fix_batched_cluster_n2_search_config(config, view[0][view[2]])
+                limit = self._paired_pipeline_stage_limit(config)
+                if limit is not None and limit > 0:
+                    return
             config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
             return
         raise InvalidConfig(
@@ -2718,6 +2774,127 @@ class CuteTcgen05Config:
                 emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 1)
                 if self._one_wave_cluster_n2_is_valid(two_cta[1]):
                     emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 2)
+        return seeds
+
+    def _multi_tile_two_cta_seed_configs(self) -> list[Config]:
+        """Persistent two-CTA seeds for GEMMs whose 256x256 grid is one tile per CTA.
+
+        When the 256x256 CtaGroup.TWO grid holds at most one tile per SM, the
+        generated kernel runs a single tile per CTA: its prologue and its
+        whole epilogue sit on the critical path with nothing to overlap.
+        Quack's autotuner picks the 256x128 two-CTA tile in a 2x2 cluster for
+        that shape and runs its 128 pair tiles PERSISTENTLY on the device's
+        co-resident cluster count, so the epilogue of one tile hides behind
+        the mainloop of the next and the exposed tail is half a tile.  Seed
+        that geometry: the narrower one-wave N tiles whose CTA count exceeds
+        the SM count, in a 2x2 cluster capped at the resident clusters
+        (``tcgen05_persistent_grid_cap=resident_clusters``) and as plain CTA
+        pairs (already capped at one pair per SM pair), with the deepest AB
+        ring that fits.  The search's timer separates these families only
+        with the seeds in the initial population.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        dtype = self.matmul_input_dtype
+        constraints = self.cluster_m2_search_constraints
+        if (
+            not self.search_enabled
+            or self.device_sm_count <= 0
+            or extents is None
+            or fragments is None
+            or dtype is None
+            or constraints is None
+            or not constraints.allow_one_wave_tiles
+            or self.matmul_has_leading_passthrough
+            or any(value is None or value <= 0 for value in extents)
+            or "persistent_interleaved" not in self.allowed_pid_types
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        sm_count = self.device_sm_count
+        bm = TCGEN05_TWO_CTA_BLOCK_M
+        if (
+            m % bm
+            or not (bm_fragment.low <= bm <= bm_fragment.high)
+            or n % TCGEN05_TWO_CTA_BLOCK_N
+            or (m // bm) * (n // TCGEN05_TWO_CTA_BLOCK_N) * 2 > sm_count
+        ):
+            return []
+        dtype_bytes = torch.empty((), dtype=dtype).element_size()
+        bk_choices = (64, 128) if dtype_bytes >= 2 else (128, 64)
+        bk = next(
+            (
+                value
+                for value in bk_choices
+                if k % value == 0
+                and bk_fragment.low <= value <= bk_fragment.high
+                and self.cluster_m2_bk_is_valid(value, constraints)
+            ),
+            None,
+        )
+        if bk is None:
+            return []
+        rowvec_aux_only = (
+            self.aux_kernel_detected and not self.exact_shape_aux_kernel_detected
+        )
+        seeds: list[Config] = []
+        for bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS:
+            if (
+                n % bn
+                or not (bn_fragment.low <= bn <= bn_fragment.high)
+                or (m // bm) * (n // bn) * 2 <= sm_count
+            ):
+                continue
+            block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+            assert block_sizes is not None
+            fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=2)
+            stages = max(1, min(k // bk, fit if fit > 0 else 2))
+            for cluster_n in (2, 1):
+                if cluster_n == 2 and not self._one_wave_cluster_n2_is_valid(bn):
+                    continue
+                seed_config: dict[str, Any] = {
+                    "block_sizes": block_sizes,
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cta_group": "auto",
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_cluster_n": cluster_n,
+                    "tcgen05_ab_stages": stages,
+                    "tcgen05_c_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "l2_groupings": [1],
+                    "tcgen05_l2_swizzle_size": 1,
+                    "tcgen05_persistence_model": "static_persistent",
+                    "tcgen05_strategy": "role_local_monolithic",
+                    "tcgen05_layout_strategy": "default",
+                    **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                }
+                if cluster_n == 2:
+                    seed_config[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY] = (
+                        TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS
+                    )
+                if rowvec_aux_only and self.rowvec_aux_stage_fits(
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    cluster_m=2,
+                    ab_stages=stages,
+                    c_stages=2,
+                ):
+                    seed_config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                        TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                    )
+                if self.epilogue_fanout_plans and self.epilogue_fanout_config_supported(
+                    seed_config
+                ):
+                    # Two outputs of one tile share the TMEM read and the
+                    # bias load; the two-CTA fan-out is validated for exactly
+                    # this 256x128 16-bit tile.
+                    seed_config[FANOUT_CONFIG_KEY] = "shared"
+                seeds.append(Config(**seed_config))
+            # The narrowest multi-tile N keeps the seed count small; the
+            # search widens or narrows the tile from there.
+            break
         return seeds
 
     def _one_cta_persistent_parameters(
@@ -3830,6 +4007,7 @@ class CuteTcgen05Config:
         seeds.extend(self._small_grid_seed_configs())
         seeds.extend(self._warp_mma_seed_configs())
         seeds.extend(self._one_wave_seed_configs())
+        seeds.extend(self._multi_tile_two_cta_seed_configs())
         seeds.extend(self._batched_multi_tile_seed_configs())
         plain_clc_seed = self._plain_clc_seed_config()
         if plain_clc_seed is not None:
@@ -4097,8 +4275,20 @@ class CuteTcgen05Config:
             and not edge_k_tail_family
             and not is_narrow_clc_aux_tma
             # Exact-shape (source-C) epilogues keep the validated 256x256
-            # aux-TMA regime, as ``_one_wave_seed_configs`` does.
-            and not self.exact_shape_aux_kernel_detected
+            # aux-TMA regime (``_fix_aux_tma_full_tile_search_config``: the
+            # TMA aux producer and its C-input warp); a sample on the SIMT aux
+            # load without that warp reads its tile per subtile from global
+            # memory and takes the narrow tiles like any other epilogue.
+            and (
+                not self.exact_shape_aux_kernel_detected
+                or (
+                    config.get(
+                        TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT
+                    )
+                    == TCGEN05_AUX_LOAD_MODE_SIMT
+                    and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) == 0
+                )
+            )
             and self._one_wave_two_cta_tile_is_valid(
                 block_sizes[m_index], block_sizes[n_index]
             )
@@ -4444,6 +4634,24 @@ class CuteTcgen05Config:
                 )
             config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY, None)
             schedule = LEGACY_SCHEDULE
+        stages = config.get(GROUPED_ROW_UNION_AB_STAGES_KEY)
+        base_profile = (
+            row_union_schedule_by_name(schedule)
+            if schedule != LEGACY_SCHEDULE and value is True
+            else None
+        )
+        if stages is None:
+            config.pop(GROUPED_ROW_UNION_AB_STAGES_KEY, None)
+        elif base_profile is None or not row_union_ab_stages_supported(
+            base_profile, stages
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{GROUPED_ROW_UNION_AB_STAGES_KEY}={stages!r} requires a "
+                    "physical row-union schedule and a ring depth between "
+                    f"{AB_STAGES_MIN} and the profile's own"
+                )
+            config.pop(GROUPED_ROW_UNION_AB_STAGES_KEY, None)
         prefill = config.get(STARTUP_PREFILL_KEY, False)
         if prefill is False:
             config.pop(STARTUP_PREFILL_KEY, None)
@@ -4501,6 +4709,7 @@ class CuteTcgen05Config:
             config.pop(GROUPED_ROW_UNION_KEY, None)
             config.pop(STARTUP_PREFILL_KEY, None)
             config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY, None)
+            config.pop(GROUPED_ROW_UNION_AB_STAGES_KEY, None)
             config.pop(GROUPED_RESIDENT_CTAS_KEY, None)
         else:
             raise InvalidConfig(
@@ -4521,6 +4730,13 @@ class CuteTcgen05Config:
 
     def epilogue_fanout_config_supported(self, config: dict[str, object]) -> bool:
         if not self.epilogue_fanout_plans or not fanout_schedule_supported(config):
+            return False
+        if (
+            self.materialized_matmul_block_ids
+            and config.get("tcgen05_cluster_n", 1) != 1
+        ):
+            # The materialized-operand pipeline's consumer-wait proof keeps the
+            # paired TWO family at cluster_n=1 (materialized_fission_codegen).
             return False
         blocks = config.get("block_sizes")
         if not isinstance(blocks, list):
@@ -4544,11 +4760,23 @@ class CuteTcgen05Config:
                     or plan.output_dtype.itemsize != 2
                 ):
                     return False
-            if (
-                config.get("tcgen05_aux_load_placement") == "pre_acc_wait"
-                and not plan.pre_wait_aux_safe
-            ):
-                return False
+            if config.get("tcgen05_aux_load_placement") == "pre_acc_wait":
+                if not plan.pre_wait_aux_safe:
+                    return False
+                # The splice declines SMEM-staged row-vector leaves under
+                # fan-out (per-store stage and barrier); decide it here so
+                # the config is invalid rather than a codegen failure.
+                m_index = self._config_block_index(plan.block_ids[0])
+                n_index = self._config_block_index(plan.block_ids[1])
+                assert m_index is not None and n_index is not None
+                epi_warps = config.get("tcgen05_num_epi_warps", 4)
+                if type(epi_warps) is not int or fanout_pre_wait_stages_rowvec_aux(
+                    plan.chains,
+                    bm=blocks[m_index],
+                    bn=blocks[n_index],
+                    epi_warp_count=epi_warps,
+                ):
+                    return False
         return True
 
     def _normalize_epilogue_fanout(
@@ -4697,6 +4925,43 @@ class CuteTcgen05Config:
             raise InvalidConfig(
                 f"{TCGEN05_BATCH_RASTER_CONFIG_KEY} requires a batched "
                 "(leading passthrough) tcgen05 GEMM"
+            )
+
+    def _normalize_persistent_grid_cap(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``tcgen05_persistent_grid_cap`` only matters on a plain cluster_n=2 grid.
+
+        The knob chooses between the SM-pair cap and the resident-cluster cap
+        of a static-persistent launch (``program_id``).  Both caps agree on
+        ``cluster_n=1`` grids and batched grids already take the
+        resident-cluster cap, so the knob is inert there: an explicit default
+        is dropped (fragment validation refills it), and a non-default value
+        on an inert bind is dropped by the fix pass and rejected by validation.
+        """
+        if TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY not in config:
+            return
+        value = config[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY]
+        if value == TCGEN05_PERSISTENT_GRID_CAP_DEFAULT:
+            config.pop(TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY)
+            return
+        pid_type = config.get("pid_type")
+        live = (
+            not self.matmul_has_leading_passthrough
+            and config.get("tcgen05_cluster_n", 1) == 2
+            and pid_type in ("persistent_blocked", "persistent_interleaved")
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        if live:
+            return
+        if fix_invalid:
+            config.pop(TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY, None)
+        else:
+            raise InvalidConfig(
+                f"{TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY}={value!r} requires a "
+                "plain (non-batched) static-persistent tcgen05 GEMM with "
+                "tcgen05_cluster_n=2"
             )
 
     @classmethod
@@ -5266,6 +5531,7 @@ class CuteTcgen05Config:
         self._normalize_dense_aligned_n(config, fix_invalid=fix_invalid)
         self._normalize_warp_mma_family(config, fix_invalid=fix_invalid)
         self._normalize_batch_raster(config, fix_invalid=fix_invalid)
+        self._normalize_persistent_grid_cap(config, fix_invalid=fix_invalid)
         # An explicit physical schedule owns its projection.  Validate the
         # requested carrier before generic block normalization can repair it.
         self._normalize_grouped_row_union(
@@ -5506,6 +5772,8 @@ class CuteTcgen05Config:
         *,
         dtype_bytes: int,
         device: torch.device,
+        output_dtype_bytes: int | None = None,
+        output_stores: int = 1,
     ) -> None:
         assert dtype_bytes > 0, "dtype_bytes must be positive"
         if self._matmul_block_indices() is None:
@@ -5518,6 +5786,10 @@ class CuteTcgen05Config:
         self.ab_stages_three_search_constraints = Tcgen05AbStagesThreeSearchConstraints(
             dtype_bytes=dtype_bytes,
             per_cta_smem_budget_bytes=budget_bytes,
+            output_dtype_bytes=(
+                output_dtype_bytes if output_dtype_bytes in (2, 4) else None
+            ),
+            output_stores=max(1, output_stores),
         )
 
     def register_grouped_worklist_smem_facts(
@@ -5763,9 +6035,14 @@ class CuteTcgen05Config:
         )
         # One C ring per output store: two fresh outputs of one accumulator
         # (``se_block_fwd``'s ``s`` and ``out``) allocate two rings, with or
-        # without the shared fanout epilogue.
-        if facts is not None:
-            c_bytes *= max(facts.output_count, 1)
+        # without the shared fanout epilogue.  The row-vector facts count the
+        # analyzed stores; without them the constraints' store count (the
+        # traced stores, all ``default_layout_smem_fits`` has) prices the
+        # rings.
+        c_bytes *= max(
+            1,
+            facts.output_count if facts is not None else constraints.output_stores,
+        )
         return (
             ab_bytes
             + c_bytes
@@ -5864,11 +6141,15 @@ class CuteTcgen05Config:
         )
         # The epilogue processes the full per-CTA output tile (bm, bn); unlike
         # the AB operands it is NOT split across the cluster, so the C-ring
-        # bytes do not depend on cluster_m. ``elem_width`` is the operand /
-        # output element width in bits (the validated families are uniform
-        # 16-bit). ``elem_width_c`` is None for no-source-C (plain) kernels so
-        # the helper picks the smaller no-source-C epilogue tile.
-        elem_width = constraints.dtype_bytes * 8
+        # bytes do not depend on cluster_m. ``elem_width`` is the OUTPUT
+        # element width in bits (the operand width where the output dtype is
+        # not recorded; the validated 16-bit families are uniform, an fp8 GEMM
+        # stores 16-bit outputs). ``elem_width_c`` is None for no-source-C
+        # (plain) kernels so the helper picks the smaller no-source-C epilogue
+        # tile. Every output store owns a ring of its own (two-output
+        # epilogues), so the ring bytes are charged per store.
+        output_bytes = constraints.output_dtype_bytes or constraints.dtype_bytes
+        elem_width = output_bytes * 8
         epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
             bm,
             bn,
@@ -5878,9 +6159,10 @@ class CuteTcgen05Config:
         c_bytes = tcgen05_c_smem_bytes_per_cta(
             epi_tile_m=epi_tile_m,
             epi_tile_n=epi_tile_n,
-            dtype_bytes=constraints.dtype_bytes,
+            dtype_bytes=output_bytes,
             c_stages=c_stages,
         )
+        c_bytes *= max(1, constraints.output_stores)
         return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
 
     @staticmethod
@@ -7223,6 +7505,54 @@ class CuteTcgen05Config:
             self.persistence_model_default_from_config(config).value
         )
 
+    def _config_uses_clc_scheduler(self, config: dict[str, object]) -> bool:
+        """Whether ``config`` runs a scheduler warp that issues CLC queries:
+        the explicit CLC persistence model, the grouped runtime-direct CLC
+        worklist, or the paired row-union profile (its codegen values set the
+        CLC model)."""
+        if (
+            config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ):
+            return True
+        if self._is_grouped_runtime_direct_clc_config(config):
+            return True
+        return (
+            config.get(GROUPED_ROW_UNION_KEY) is True
+            and config.get(GROUPED_ROW_UNION_SCHEDULE_KEY) == PAIRED_CLC_SCHEDULE
+        )
+
+    def _validate_clc_query_pacing_config(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._validate_enum_config(
+            config,
+            TCGEN05_CLC_QUERY_PACING_CONFIG_KEY,
+            TCGEN05_CLC_QUERY_PACINGS,
+            fix_invalid=fix_invalid,
+        )
+        if TCGEN05_CLC_QUERY_PACING_CONFIG_KEY not in config:
+            return
+        # The default pacing is implied: a normalized config never carries it,
+        # so configs that differ only in whether a seed, a flattened search
+        # point or a coverage witness spelled it out read alike (the same
+        # convention as the startup prefill's default).  The non-default
+        # pacing stays only where a CLC scheduler reads it; elsewhere it is
+        # a contradiction the search repairs and a user config may not make.
+        if config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] == TCGEN05_CLC_QUERY_PACING_TILE:
+            config.pop(TCGEN05_CLC_QUERY_PACING_CONFIG_KEY, None)
+        elif not self._config_uses_clc_scheduler(config):
+            if fix_invalid:
+                config.pop(TCGEN05_CLC_QUERY_PACING_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_CLC_QUERY_PACING_CONFIG_KEY} requires a kernel whose "
+                    "scheduler warp issues CLC queries ("
+                    f"{TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY}="
+                    f"{Tcgen05PersistenceModel.CLC_PERSISTENT.value!r} or the "
+                    f"{PAIRED_CLC_SCHEDULE!r} row-union profile)"
+                )
+
     def _validate_sched_stage_count_config(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -7581,6 +7911,8 @@ class CuteTcgen05Config:
         cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        ab_stages_three_output_dtype_bytes: int | None = None,
+        ab_stages_three_output_stores: int = 1,
     ) -> None:
         # Keep the default tcgen05 surface to combinations with runtime
         # coverage. Some unvalidated combinations fail loudly at CuTe
@@ -7643,6 +7975,8 @@ class CuteTcgen05Config:
             self.allow_ab_stages_three_search(
                 dtype_bytes=ab_stages_three_dtype_bytes,
                 device=ab_stages_three_device,
+                output_dtype_bytes=ab_stages_three_output_dtype_bytes,
+                output_stores=ab_stages_three_output_stores,
             )
 
     def optional_fragments(
@@ -7797,6 +8131,16 @@ class CuteTcgen05Config:
             fragments[TCGEN05_BATCH_RASTER_CONFIG_KEY] = EnumFragment(
                 TCGEN05_BATCH_RASTER_CHOICES
             )
+        if not self.matmul_has_leading_passthrough and (
+            not for_search or 2 in cluster_n_choices
+        ):
+            # How a plain static-persistent ``cluster_n=2`` grid caps its
+            # launch (see ``TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY``); batched
+            # grids always use the resident-cluster cap and ``cluster_n=1``
+            # grids are unaffected, so neither carries the knob.
+            fragments[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY] = EnumFragment(
+                TCGEN05_PERSISTENT_GRID_CAP_CHOICES
+            )
         if not for_search or self.grouped_full_coverage_eligible:
             fragments[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_FULL_COVERAGE_MODES
@@ -7819,8 +8163,25 @@ class CuteTcgen05Config:
             if not for_search or self.grouped_row_union_paired_clc_eligible:
                 choices.append(PAIRED_CLC_SCHEDULE)
             fragments[GROUPED_ROW_UNION_SCHEDULE_KEY] = EnumFragment(tuple(choices))
+            # The physical ring depth of the selected profile (``None`` = its
+            # deepest fitting ring); values a profile cannot take are repaired
+            # to ``None`` by normalization.
+            fragments[GROUPED_ROW_UNION_AB_STAGES_KEY] = EnumFragment(
+                GROUPED_ROW_UNION_AB_STAGES_CHOICES
+            )
         if not for_search or self.grouped_row_union_paired_clc_eligible:
             fragments[STARTUP_PREFILL_KEY] = BooleanFragment()
+        if (
+            not for_search
+            or self.grouped_row_union_paired_clc_eligible
+            or self._clc_persistence_search_enabled()
+        ):
+            # How the scheduler warp paces its CLC queries (see
+            # ``TCGEN05_CLC_QUERY_PACING_CONFIG_KEY``); normalization drops the
+            # knob from configs without a CLC scheduler.
+            fragments[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = EnumFragment(
+                TCGEN05_CLC_QUERY_PACINGS
+            )
         if not for_search or (
             self.grouped_row_union_eligible
             and self.grouped_row_union_multi_resident_supported
@@ -8821,6 +9182,7 @@ class CuteTcgen05Config:
                     f"{Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value!r}"
                 )
         self._validate_sched_stage_count_config(config, fix_invalid=fix_invalid)
+        self._validate_clc_query_pacing_config(config, fix_invalid=fix_invalid)
 
     def _validate_enum_config(
         self,
@@ -9048,7 +9410,9 @@ class CuteTcgen05Config:
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)
+        self._fix_persistent_grid_cap_search_config(config)
         self._validate_sched_stage_count_config(config, fix_invalid=True)
+        self._validate_clc_query_pacing_config(config, fix_invalid=True)
         self._validate_cta_group_config(config, fix_invalid=True)
         self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=True)
 
@@ -9081,6 +9445,34 @@ class CuteTcgen05Config:
                 return None
             entries.append(matches[0])
         return entries
+
+    def _fix_persistent_grid_cap_search_config(self, config: dict[str, object]) -> None:
+        """Return the grid cap to its default where the projected tuple makes it inert.
+
+        The projections above may reset ``tcgen05_cluster_n`` to 1 (one-CTA
+        samples, odd N tile counts) or leave a non-persistent walk; the knob
+        then has no effect, and two samples differing only in it would be the
+        same kernel twice. Keep the search schema's canonical representation.
+        """
+        if TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY not in config:
+            return
+        live = (
+            config.get("tcgen05_cluster_n", 1) == 2
+            and config.get("pid_type")
+            in ("persistent_blocked", "persistent_interleaved")
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        if live:
+            return
+        if TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY in self.optional_fragments(
+            for_search=True
+        ):
+            config[TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY] = (
+                TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+            )
+        else:
+            config.pop(TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY, None)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .cute_epilogue import _LeafBindings
 
 WARP_MMA_FAMILY_KEY = "cute_matmul_family"
 MATMUL_FAMILY_TCGEN05 = "tcgen05"
@@ -1577,7 +1578,7 @@ def emit_warp_mma_gemm_device_body(
                 for j in range(4):
                     carrier = f"wm_acc_{am}_{an}_{j}"
                     if store.chain.steps:
-                        aux_locals = {
+                        aux_locals: _LeafBindings = {
                             aux.leaf: aux_value[(si, li, am, an, j)]
                             for li, aux in enumerate(store.aux)
                         }

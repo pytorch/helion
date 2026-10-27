@@ -1652,6 +1652,75 @@ def test_the_fixup_counters_survive_the_wrap() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    ("shape", "bm", "bk", "stages", "cluster", "split"),
+    (
+        # 256 columns per thread through the fixup grid (the fused round).
+        ((256, 512, 2048), 128, 64, 4, 8, "fixup"),
+        # ... and through a cluster.
+        ((256, 512, 2048), 128, 128, 2, 8, "cluster"),
+        # The whole axis in one CTA: no round, the two reductions are
+        # separate phases (three passes over the chunks).
+        ((128, 256, 256), 128, 64, 4, 1, "cluster"),
+        # Two chunks (a 128-column slice at two CTAs per SM).
+        ((512, 512, 2048), 128, 64, 3, 16, "fixup"),
+    ),
+    ids=lambda v: str(v).replace(" ", ""),
+)
+def test_the_streamed_epilogue_matches_the_reference(
+    shape: tuple[int, int, int],
+    bm: int,
+    bk: int,
+    stages: int,
+    cluster: int,
+    split: str,
+) -> None:
+    # ``cute_mma_dag_epilogue = "streamed"``: the fragment row read from
+    # tensor memory a 64-column chunk at a time per phase, the statistics
+    # folded chunk by chunk (Chan), the normalize / store phase re-reading
+    # the chunks.  Each launch repeats bitwise.
+    torch.manual_seed(0)
+    m, k, n = shape
+    x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+    y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+    weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    bias = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+    outs = {}
+    for epilogue in ("row", "streamed"):
+        config = _config(
+            [bm, bk],
+            4,
+            stages,
+            cute_mma_dag_cluster=cluster,
+            cute_mma_dag_split=split,
+            cute_mma_dag_epilogue=epilogue,
+        )
+        source, (out,) = _run_cute(_matmul_layernorm, (x, y, weight, bias), config)
+        chunks = -(-(n // cluster) // 64)
+        # Streamed: a pass per phase -- the fused mean / variance round and
+        # the store under a split, the two reductions and the store without.
+        phases = 2 if cluster > 1 else 3
+        loads = source.count(f"{RT}.prims.tcgen05_ld(")
+        assert loads == (phases * chunks if epilogue == "streamed" else chunks), (
+            epilogue,
+            loads,
+        )
+        bound = helion.kernel(
+            _matmul_layernorm, backend="cute", static_shapes=True
+        ).bind((x, y, weight, bias))
+        fn = bound.compile_config(bound.config_spec.normalized_config(config))
+        assert torch.equal(fn(x, y, weight, bias), fn(x, y, weight, bias))
+        outs[epilogue] = out
+    ref = torch.nn.functional.layer_norm(
+        (x @ y).float(), [n], weight.float(), bias.float()
+    )
+    for out in outs.values():
+        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        outs["streamed"].float(), outs["row"].float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def test_the_fixup_split_is_deterministic_and_matches_the_cluster_form() -> None:
     # The same partials in the same tile order through the workspace as
     # through distributed shared memory: the two forms agree bitwise, and a
