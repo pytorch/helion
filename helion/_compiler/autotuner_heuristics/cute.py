@@ -4069,7 +4069,6 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
-        max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
         chunk = _reduction_chunk_size(size_hint, spec.max_reduction_loop)
         seed: dict[str, Any] = {
