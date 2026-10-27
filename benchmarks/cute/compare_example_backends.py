@@ -159,6 +159,37 @@ def worker(args: argparse.Namespace) -> None:
         write_json(args.output, result)
 
 
+# The documented opt-out of the graph dispatch warm-up (``graph_state_regime``)
+# is the one HELION_* variable a sweep's workers inherit from the driver.
+GRAPH_WARMUP_ENV = "HELION_BENCHMARK_GRAPH_WARMUP"
+
+
+def graph_state_regime() -> str:
+    """The CUDA graph dispatch state every job's readings are taken in (the
+    per-job ``graph_state_warmup`` note records what actually ran); see
+    ``example_baselines.graph_state_warmup``.  In the steady state each
+    kernel node of a Helion-launched kernel costs ~0.35-0.4 us more than in a
+    fresh process while torch's cuBLAS kernels barely change, so the
+    ``cute_vs_*`` ratios of sub-10 us units read a few percent lower than in
+    sweeps taken before the warm-up existed; compare sweeps of one regime.
+    ``HELION_BENCHMARK_GRAPH_WARMUP=0`` in the driver's environment reaches
+    the workers and measures the fast state instead."""
+    from helion.runtime.settings import _env_get_bool
+
+    if _env_get_bool(GRAPH_WARMUP_ENV, default=True):
+        return (
+            "steady: every timed reading after helion.autotuner.benchmarking."
+            "steady_graph_dispatch (16 eager launches on side streams, the state "
+            "any long-running PyTorch process runs in and the autotuner ranks in); "
+            "Helion-launched kernel nodes read ~0.35-0.4 us slower per node than "
+            "in a fresh process, torch's cuBLAS kernels barely"
+        )
+    return (
+        f"fast: {GRAPH_WARMUP_ENV}=0, no warm-up; each job's first graphs replay "
+        "in a fresh process's fast dispatch state and later ones may not"
+    )
+
+
 def worker_environment(
     gpu: str, provider: str, cache: Path, seed: int
 ) -> dict[str, str]:
@@ -167,6 +198,8 @@ def worker_environment(
     env = {
         key: value for key, value in os.environ.items() if not key.startswith("HELION_")
     }
+    if GRAPH_WARMUP_ENV in os.environ:
+        env[GRAPH_WARMUP_ENV] = os.environ[GRAPH_WARMUP_ENV]
     env.update(
         CUDA_VISIBLE_DEVICES=gpu,
         HELION_BACKEND=provider if provider in {"cute", "triton"} else "triton",
@@ -312,10 +345,12 @@ def run(args: argparse.Namespace) -> None:
             "call) and graph_ms (one call); graph_long_ms (primary where present): "
             "the same reading of a graph grown by powers of two until one replay "
             "takes >= 400 us (event times are quantized to 1.953 us), with "
-            "graph_long_calls"
+            "graph_long_calls; every reading is taken in the CUDA graph dispatch "
+            "state named by graph_state"
         ),
         "graph_calls": GRAPH_CALLS,
         "autotune_regime": "HELION_AUTOTUNE_L2_FLUSH=replay (flush, then a back-to-back batch)",
+        "graph_state": graph_state_regime(),
         "jobs": [],
     }
 
