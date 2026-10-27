@@ -691,7 +691,13 @@ def test_reduction_tile_heuristic_seeds_multiwarp_vector_row(
             cast("list[str]", row.config["cute_reduction_reloads"])[reload_index]
             == "register_prefetch"
         )
-    rolled = seeds[-1]
+    # The warp-per-row, rows-per-CTA seeds (``warp_rows_seed_configs``) close
+    # the list; the two-packet rolled row precedes them.
+    warp_rows = CuteReductionTileHeuristic.warp_rows_seed_configs(
+        bound.env, host.device_ir
+    )
+    assert seeds[len(seeds) - len(warp_rows) :] == warp_rows
+    rolled = seeds[len(seeds) - len(warp_rows) - 1]
     assert rolled == CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
         bound.env, host.device_ir
     )
@@ -748,6 +754,9 @@ def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> N
         # 1000 is not a whole number of 16-element thread slices; 128 gives
         # 8 threads.
         assert rolled is None
+    expected.extend(
+        CuteReductionTileHeuristic.warp_rows_seed_configs(bound.env, host.device_ir)
+    )
     assert seeds == expected
 
 

@@ -726,6 +726,20 @@ class Backend(abc.ABC):
         """
         return None
 
+    @classmethod
+    def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
+        """Rank of ``config`` among the autotuner's finalists it cannot tell
+        apart (``BaseSearch._prefer_backend_preference_within_tolerance``):
+        lower wins, equal ranks keep the faster config.  For what a config
+        costs or saves outside the kernel's own isolated timing; the default
+        prefers nothing.  ``source`` renders the finalist's generated module
+        on demand (the rendered kernel, not the config's keys, says which
+        lowering a config took).  A class method: the search reaches it
+        through the backend's registered name (``Settings.backend``), without
+        an instance.
+        """
+        return 0
+
     def get_paired_device_micros_bench(
         self,
     ) -> Callable[..., list[tuple[float, float]]] | None:

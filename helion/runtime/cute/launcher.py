@@ -53,7 +53,13 @@ from ..._compiler.cute.grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
 from ..._compiler.cute.grouped_panel_raster import grouped_device_panel_index_domain
 from ..._compiler.cute.grouped_panel_raster import grouped_panel_ratio_index_domain
 from ..._compiler.cute.grouped_row_union import (
+    ab_stages_supported as row_union_ab_stages_supported,
+)
+from ..._compiler.cute.grouped_row_union import (
     schedule_by_name as row_union_schedule_by_name,
+)
+from ..._compiler.cute.grouped_row_union import (
+    with_ab_stages as row_union_with_ab_stages,
 )
 from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
@@ -2345,6 +2351,12 @@ def _append_cute_wrapper_plan(
     if row_union_schedule is not None and row_profile is None:
         raise exc.BackendUnsupported("cute", "unknown row-union physical descriptor")
     if row_profile is not None:
+        row_union_ab_stages = plan.get("row_union_ab_stages", row_profile.ab_stages)
+        if not row_union_ab_stages_supported(row_profile, row_union_ab_stages):
+            raise exc.BackendUnsupported(
+                "cute", "row-union physical descriptor ring depth"
+            )
+        row_profile = row_union_with_ab_stages(row_profile, row_union_ab_stages)
         expected = {
             "row_union_schedule": row_profile.name,
             "bm": row_profile.mma_m,

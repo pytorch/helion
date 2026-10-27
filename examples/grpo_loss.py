@@ -401,6 +401,9 @@ class GrpoLossFunction(torch.autograd.Function):
             eps_high,
         )
 
+        # Only ``loss`` is differentiated; without this the autograd engine
+        # materializes zero gradients (two memsets) for kl_loss and is_clipped.
+        ctx.set_materialize_grads(False)  # type: ignore[attr-defined]
         ctx.save_for_backward(  # type: ignore[attr-defined]
             logits,
             completion_ids,

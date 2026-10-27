@@ -7,6 +7,8 @@ import torch
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 
+from .kernel_args import PortableFunction
+
 if TYPE_CHECKING:
     from ..runtime.settings import Settings
 
@@ -252,8 +254,24 @@ def assert_close(
                 raise AssertionError(
                     f"string mismatch {actual_leaf} vs {expected_leaf}"
                 )
+        elif _is_function_leaf(actual_leaf):
+            # A callable argument (an epilogue, possibly serialized by code
+            # for the benchmark subprocess) is not something a kernel can
+            # write to; comparing the post-call arguments against the
+            # baseline's only concerns the tensors around it, and
+            # ``torch.testing.assert_close`` has no pair for functions.
+            if not _is_function_leaf(expected_leaf):
+                raise AssertionError(
+                    "Leaf type mismatch during autotuner accuracy check: "
+                    f"actual is {type(actual_leaf).__name__}, expected is "
+                    f"{type(expected_leaf).__name__}"
+                )
         else:
             torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+
+
+def _is_function_leaf(leaf: object) -> bool:
+    return callable(leaf) or isinstance(leaf, PortableFunction)
 
 
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:

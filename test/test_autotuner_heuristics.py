@@ -5955,15 +5955,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Callers decide whether both are expected in the supplied population;
         # every automatic cluster_m=2 seed must match a legacy validated tile
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
-        # (two 256-row subtiles sharing B; baseline ab=2 only), or the
-        # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
-        # one canonical-envelope seed must be present. Explicit paired-CTA
-        # seeds have independent geometry and allocation checks below.
+        # (two 256-row subtiles sharing B; baseline ab=2 at the expected K
+        # step, or its 64-wide deep ring: ab=3 next to a four-deep C ring),
+        # or the deep-staged short-K variant (bk=64 with the ab=6 pipeline).
+        # At least one canonical-envelope seed must be present. Explicit
+        # paired-CTA seeds have independent geometry and allocation checks
+        # below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
             block_sizes = seed["block_sizes"][:3]
             if block_sizes[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+                if block_sizes[2] == 64 and expected_block_k != 64:
+                    self.assertEqual(
+                        block_sizes,
+                        [2 * TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+                    )
+                    self.assertEqual(seed["tcgen05_ab_stages"], 3)
+                    self.assertEqual(seed["tcgen05_c_stages"], 4)
+                    continue
                 self.assertEqual(
                     block_sizes,
                     [

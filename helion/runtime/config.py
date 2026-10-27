@@ -30,6 +30,7 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n16_v1",
 ]
 CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
+CutePdlReleaseLiteral = Literal["auto", "entry", "none", "exit", "last_wave"]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -77,6 +78,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
@@ -170,6 +172,30 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_pdl_release: Where a ``cute_pdl`` kernel releases its own
+                dependents (``griddepcontrol.launch_dependents``), which is what
+                lets the next kernel of a sequence launch early too. ``entry``
+                releases right after the wait, so the dependents' CTAs become
+                resident while this kernel runs; ``exit`` releases after the
+                body's last statement; ``none`` leaves the implicit trigger at
+                grid completion, after which a dependent starts later than a
+                plain stream edge would have launched it; ``last_wave`` releases
+                at entry in the CTAs of the launch's last wave only (the CTAs
+                whose dispatch-order index lies within the resident capacity of
+                the grid's end; the earlier CTAs count as released when they
+                exit), so the dependents launch as the last wave starts and
+                fill the slots its tail frees, which is plain ``entry`` for a
+                grid that fits in one wave and keeps the middle waves of a
+                larger grid undisturbed. ``auto`` (the default) picks ``entry``
+                while the launch grid is known to fit in one wave of resident
+                CTAs (the SM count times the CTAs an SM holds, from the launch
+                block or ``cute_min_blocks_per_mp``) and ``last_wave`` past it
+                or when the grid is sized at runtime; the search leaves the
+                placement at ``auto``. Every placement reads the same data: a
+                dependent's own wait blocks until this grid has completed and
+                flushed. Inert when ``cute_pdl`` is off and on the
+                tcgen05 GEMM families, whose lowering places its own release
+                after the last MMA.
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
@@ -270,6 +296,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_pdl_release": cute_pdl_release,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,

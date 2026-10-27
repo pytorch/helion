@@ -8,7 +8,9 @@ tile (16x8 .. 64x64), stages the whole K extent of its A and B tiles into
 XOR-swizzled shared memory with ``cp.async`` packets issued at kernel entry
 (one commit group per ``bk`` K chunk, all issued before the first wait), and
 runs ``ldmatrix`` + ``mma.sync.m16n8k16`` (fp16/bf16) or ``m16n8k32`` (e4m3)
-with fp32 accumulators in a fixed K order.  The epilogue chain the store
+with fp32 accumulators in a fixed K order; an M-contiguous A (the
+``mat1.T @ grad_out`` GEMM of a matmul backward) and an N-contiguous B are
+staged transposed and read with ``ldmatrix.trans``.  The epilogue chain the store
 analysis admits (casts, pointwise ops, bias rows, residual tiles) runs on the
 fp32 fragments in registers and the outputs are stored as 4- or 8-byte pairs.
 No TMEM, no TMA descriptors, no mbarrier pipeline: the per-CTA chain is one
@@ -54,10 +56,12 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..device_function import DeviceFunction
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .cute_epilogue import _LeafBindings
 
 WARP_MMA_FAMILY_KEY = "cute_matmul_family"
 MATMUL_FAMILY_TCGEN05 = "tcgen05"
@@ -85,6 +89,11 @@ _CAST_PACKET_WORDS_IN_FLIGHT = 64
 # MACs) wins by 0.25-0.4 us, 512^3 (134M) loses by 0.3-0.6 us, 1024^3 loses
 # 3-5x; the cut sits between the two measured regimes.
 WARP_MMA_MAX_MACS = 1 << 25
+# Grouped row union: the body reads every offset and clamps every interval
+# per thread and tests each of the lane's output rows against every group, so
+# the prologue grows with the group count; one warp's worth of groups (the
+# paired row-union profile's own cap) bounds it.
+WARP_MMA_GROUPED_MAX_GROUPS = 32
 # Seeds for admitted problems (measured winners, campaign regime): fp8 256^3
 # 16x8 one-warp; fp16 256^3 + bias and bmm (4, 64, 128, 128) 64x8 four-warp,
 # then 32x32 four-warp, 32x16 two-warp and 16x16 one-warp within 0.1 us.
@@ -94,6 +103,11 @@ WARP_MMA_SEED_TILES: tuple[tuple[int, int, int], ...] = (
     (32, 32, 4),
     (32, 16, 2),
     (16, 16, 1),
+    # The fp16 256^3 matmul backward pair (16x32 two-warp, the campaign's
+    # cold-autotune winner) and the 640x128x128 grouped row union (64x16
+    # four-warp 1.38 us vs 32x32 1.36 vs cuBLAS 1.48 in the 16-call graph).
+    (16, 32, 2),
+    (64, 16, 4),
 )
 _RUNTIME = "_helion_warp_mma"
 _PREAMBLE = f"import helion._compiler.cute._warp_mma_runtime as {_RUNTIME}\n"
@@ -215,10 +229,12 @@ def warp_mma_admission_reason(
         return f"operand dtype {dtype} is not fp16, bf16 or e4m3"
     if static_m is None or static_n is None or static_k is None:
         return "the problem extents must be static"
-    if lhs_major != "row":
-        return "A must be K-contiguous"
+    if lhs_major not in ("row", "col"):
+        return "A must be K- or M-contiguous"
     if rhs_major not in ("row", "col"):
         return "B must be N- or K-contiguous"
+    if kind == "e4m3" and lhs_major != "row":
+        return "an e4m3 A must be K-contiguous (ldmatrix.trans moves 16-bit elements)"
     if kind == "e4m3" and rhs_major != "col":
         return "an e4m3 B must be K-contiguous (ldmatrix.trans moves 16-bit elements)"
     if operands_permuted:
@@ -226,7 +242,10 @@ def warp_mma_admission_reason(
     if lhs_strides is None or rhs_strides is None:
         return "the operand strides must be static"
     elem = dtype.itemsize
-    if lhs_strides[-1] != 1 or (lhs_strides[-2] * elem) % 16:
+    if lhs_major == "col":
+        if lhs_strides[-2] != 1 or (lhs_strides[-1] * elem) % 16:
+            return "an M-contiguous A needs 16-byte aligned columns"
+    elif lhs_strides[-1] != 1 or (lhs_strides[-2] * elem) % 16:
         return "A rows must be K-contiguous and 16-byte aligned"
     if rhs_major == "col":
         if rhs_strides[-2] != 1 or (rhs_strides[-1] * elem) % 16:
@@ -278,6 +297,24 @@ class WarpMmaStoreMatch:
 
 
 @dataclasses.dataclass(frozen=True)
+class WarpMmaGroupedMatch:
+    """The grouped row union the family lowers as one dense GEMM.
+
+    ``out[rows of group g] = A_packed[rows] @ B`` for every group, with the
+    group rows ``[offsets[g], offsets[g + 1])`` clamped to ``[0, m)`` exactly
+    as the row-union carrier normalizes them: the body tiles the union
+    ``[0, m) x [0, n)``, loads every A row of its tile, and stores only the
+    rows some group owns (rows outside every group keep the output's prior
+    contents, rows two groups share hold the one value both compute).
+    """
+
+    groups: int
+    offsets_fake: torch.Tensor
+    # Element stride of the offsets vector.
+    offsets_stride: int
+
+
+@dataclasses.dataclass(frozen=True)
 class CuteWarpMmaGemmMatch:
     """The matched plain GEMM and the tile the config selected."""
 
@@ -296,6 +333,12 @@ class CuteWarpMmaGemmMatch:
     bk: int
     warps: int
     stores: tuple[WarpMmaStoreMatch, ...]
+    # A is M-contiguous (``x.T`` of a row-major x, the ``mat1.T @ grad_out``
+    # GEMM of a matmul backward): its tiles are staged as [k][m] rows and the
+    # fragments come from ``ldmatrix.trans``, like an N-contiguous B.
+    lhs_m_major: bool = False
+    # The grouped row union (``detect_warp_mma_grouped_gemm``), else None.
+    grouped: WarpMmaGroupedMatch | None = None
     # The half dtype an operand is cast to on the way to shared memory (a
     # bare ``load.to(bf16 | fp16)`` of an int16 tile), or None when the
     # operand is read as loaded (``_MmaOperandInfo.cast_dtype``).
@@ -422,6 +465,11 @@ def detect_warp_mma_gemm(
                 and env.canonical_block_id(candidate.operands.k_block_id) == k_block_id
             ):
                 candidates.append((node, candidate))
+    if not candidates and len(root) == 3:
+        # ``for g in hl.grid(G): for tile_m, tile_n in hl.tile([M_g, N]):``
+        # flattens to one (group, m, n) root grid whose matmul reads the
+        # group's rows through the offsets: the grouped row union.
+        return detect_warp_mma_grouped_gemm(fn, block_ids, root=root, config=config)
     if len(candidates) != 1:
         raise _decline("the K loop must hold exactly one dense matmul")
     mma_node, candidate = candidates[0]
@@ -507,6 +555,7 @@ def detect_warp_mma_gemm(
     # (The operand stride and batch-stride alignment gates are part of the
     # admission above.)
     rhs_k_major = rhs_major == "col"
+    lhs_m_major = lhs_major == "col"
     stores = warp_mma_store_matches(graphs, mma_node, operands, env=env)
     _require_complete_root(
         graphs,
@@ -529,10 +578,210 @@ def detect_warp_mma_gemm(
         bk=bk,
         warps=warps,
         stores=stores,
+        lhs_m_major=lhs_m_major,
         lhs_cast=lhs.cast_dtype,
         rhs_cast=rhs.cast_dtype,
     )
     return True
+
+
+def detect_warp_mma_grouped_gemm(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    root: tuple[int, ...],
+    config: object,
+) -> bool:
+    """Match the shared-RHS grouped GEMM (``examples/grouped_gemm.py``'s
+    jagged kernel) as the dense row union the family lowers.
+
+    The kernel's ``hl.grid(G)`` and the group's ``hl.tile([M_g, N])`` form one
+    three-axis root grid; the K loop holds the one ``addmm`` whose A rows are
+    the group's rows of the packed matrix.  The proof is the row-union
+    carrier's own (``_analyze_rank3_rhs_grouped_mma``,
+    ``_grouped_full_coverage_semantics``: group-invariant operands, an
+    identity store of a zero-seeded contraction into a fresh exclusive output,
+    Int32 offsets) and its metadata (contiguous rank-2 operands, extents
+    specialized under shape guards), with the family's tiles in place of the
+    carrier's 128x64x128.
+    """
+    from itertools import permutations
+
+    from ..device_ir import ForLoopGraphInfo
+    from .cute_mma import _analyze_rank3_rhs_grouped_mma
+    from .cute_mma import _grouped_full_coverage_semantics
+    from .cute_mma import _grouped_row_union_metadata
+    from .cute_mma import _GroupedMmaAxes
+    from .cute_mma import _tcgen05_tma_matrix_major
+    from .cute_mma import analyze_tcgen05_matmul_store_chains
+
+    env = CompileEnvironment.current()
+    cg = fn.codegen
+    graphs = cg.codegen_graphs
+    k_graphs = [
+        graph
+        for graph in graphs
+        if isinstance(graph, ForLoopGraphInfo) and graph.block_ids == block_ids
+    ]
+    if len(k_graphs) != 1:
+        raise _decline("the K reduction must be one device loop")
+    k_graph = k_graphs[0]
+    addmm_nodes = [
+        node
+        for node in k_graph.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.aten.addmm.default
+    ]
+    if len(addmm_nodes) != 1:
+        raise _decline("the K loop must hold exactly one dense matmul")
+    mma_node = addmm_nodes[0]
+    proof = None
+    m_block_id = n_block_id = root[0]
+    for segment_block_id, m_block_id, n_block_id in permutations(root):
+        proof = _analyze_rank3_rhs_grouped_mma(
+            cg,
+            mma_node,
+            axes=_GroupedMmaAxes(
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+                segment_block_id=segment_block_id,
+            ),
+        )
+        if proof is not None:
+            break
+    if proof is None or not _grouped_full_coverage_semantics(cg, mma_node, proof):
+        raise _decline(
+            "the grouped GEMM must be a pure shared-RHS BF16 row union with "
+            "Int32 offsets and an identity store into a fresh output"
+        )
+    assert proof.worklist_store is not None
+    bm = env.block_sizes[m_block_id].from_config(config)  # pyrefly: ignore[bad-argument-type]
+    bn = env.block_sizes[n_block_id].from_config(config)  # pyrefly: ignore[bad-argument-type]
+    bk = env.block_sizes[block_ids[0]].from_config(config)  # pyrefly: ignore[bad-argument-type]
+    if not isinstance(bm, int) or not isinstance(bn, int) or not isinstance(bk, int):
+        raise _decline("the tile sizes must be static")
+    warps = _config_int(config, WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
+    lhs_fake, rhs_fake = proof.lhs.source_fake, proof.rhs.source_fake
+    dtype = lhs_fake.dtype
+    limit = (1 << 31) - 1
+
+    def domain(groups: int, m: int, n: int, k: int) -> bool:
+        return (
+            0 < groups <= WARP_MMA_GROUPED_MAX_GROUPS
+            and max(m * k, m * n, k * n) <= limit
+            and warp_mma_tile_reason(
+                m=m, n=n, k=k, bm=bm, bn=bn, bk=bk, warps=warps, dtype=dtype
+            )
+            is None
+        )
+
+    metadata = _grouped_row_union_metadata(
+        cg, mma_node, proof, specialize=True, index_domain=domain
+    )
+    if metadata is None:
+        raise _decline(
+            f"tile {bm}x{bn}x{bk} on {warps} warps does not run this grouped "
+            "problem (contiguous rank-2 operands, whole tiles, the family's "
+            f"tile limits, at most {WARP_MMA_GROUPED_MAX_GROUPS} groups)"
+        )
+    groups, m, n, k = metadata
+    rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
+    assert rhs_major in ("row", "col")
+    rhs_strides = (n, 1) if rhs_major == "row" else (1, k)
+    reason = warp_mma_admission_reason(
+        static_m=m,
+        static_n=n,
+        static_k=k,
+        leading=1,
+        dtype=dtype,
+        lhs_major="row",
+        rhs_major=rhs_major,
+        num_sms=_device_sm_count(lhs_fake.device),
+        lhs_strides=(k, 1),
+        rhs_strides=rhs_strides,
+    )
+    if reason is not None:
+        raise _decline(reason)
+    analyzed = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    assert analyzed is not None and len(analyzed) == 1
+    store_node, chain = analyzed[0]
+    assert store_node is proof.worklist_store.store_node and not chain.steps
+    out_fake = store_node.args[0].meta["val"]  # pyrefly: ignore[missing-attribute]
+    assert isinstance(out_fake, torch.Tensor)
+    if out_fake.dtype not in _OUT_DTYPES:
+        raise _decline(f"output dtype {out_fake.dtype} is not fp16, bf16 or fp32")
+    _require_complete_grouped_body(graphs, k_graph=k_graph, store_node=store_node)
+    offsets = proof.layout_tensor
+    offsets_stride = _static_int(env, offsets.stride(0))
+    if offsets_stride is None:
+        raise _decline("the group offsets must have a static stride")
+    fn.cute_state.warp_mma_gemm_plan = CuteWarpMmaGemmMatch(
+        mma_node=mma_node,
+        lhs_fake=lhs_fake,
+        rhs_fake=rhs_fake,
+        lhs_strides=(k, 1),
+        rhs_strides=rhs_strides,
+        rhs_k_major=rhs_major == "col",
+        batch=1,
+        m=m,
+        n=n,
+        k=k,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        warps=warps,
+        stores=(
+            WarpMmaStoreMatch(
+                store_node=store_node,
+                chain=chain,
+                fake=out_fake,
+                strides=(n, 1),
+                aux=(),
+            ),
+        ),
+        grouped=WarpMmaGroupedMatch(
+            groups=groups, offsets_fake=offsets, offsets_stride=offsets_stride
+        ),
+    )
+    return True
+
+
+def _require_complete_grouped_body(
+    graphs: Sequence[object], *, k_graph: ForLoopGraphInfo, store_node: Node
+) -> None:
+    """The family replaces the whole device body of the grouped kernel: decline
+    unless every other graph holds only the matched store, the accumulator
+    init, the K loop and read-only nodes (the offsets, the group's row
+    bookkeeping and the masks the flattened ``if M_g != 0`` became).
+    """
+    from ...language import _tracing_ops
+    from ...language import creation_ops
+    from .cute_mma import _is_tracing_for_loop_node
+    from .fold_noop_stores import _is_read_only
+
+    for graph_info in graphs:
+        if graph_info is k_graph:
+            continue
+        for node in graph_info.graph.nodes:  # pyrefly: ignore[missing-attribute]
+            if node.op in ("placeholder", "output", "get_attr"):
+                continue
+            if node is store_node:
+                continue
+            if _is_tracing_for_loop_node(node):
+                if node.args[0] != k_graph.graph_id:
+                    raise _decline("the root tile loop must hold exactly the K loop")
+                continue
+            if node.op == "call_function" and node.target in (
+                creation_ops.full,
+                _tracing_ops._new_var,
+                _tracing_ops._phi,
+            ):
+                continue
+            if not _is_read_only(node):
+                raise _decline(
+                    "the grouped kernel may only hold the GEMM, its store and "
+                    f"the group bookkeeping ({node.target} is not part of it)"
+                )
 
 
 def warp_mma_store_matches(
@@ -802,6 +1051,11 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
     df.placeholder_args.update((a_arg.name, b_arg.name, *out_args))
     for names in aux_args:
         df.placeholder_args.update(names)
+    offsets_name: str | None = None
+    if match.grouped is not None:
+        offsets_arg = df.tensor_arg(match.grouped.offsets_fake)
+        offsets_name = offsets_arg.name
+        df.placeholder_args.add(offsets_name)
     emit_warp_mma_gemm_module_statements(cg)
     plan: dict[str, object] = {
         "kind": WARP_MMA_PLAN_KIND,
@@ -819,6 +1073,8 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
         "rhs_name": b_arg.name,
         "out_name": out_args[0],
     }
+    if offsets_name is not None:
+        plan["offsets_name"] = offsets_name
     first_aux = aux_args[0] if aux_args else []
     if first_aux:
         plan["epi_aux_count"] = len(first_aux)
@@ -846,6 +1102,7 @@ def codegen_warp_mma_gemm(cg: GenerateAST) -> bool:
         out_pairs=out_pairs,
         aux_pairs=aux_pairs,
         pdl=pdl,
+        offsets_name=offsets_name,
     )
     df.preamble = []
     return True
@@ -874,6 +1131,7 @@ def emit_warp_mma_gemm_device_body(
     out_pairs: list[bool] | None = None,
     aux_pairs: list[list[bool]] | None = None,
     pdl: bool = False,
+    offsets_name: str | None = None,
 ) -> list[ast.AST]:
     """Render the register-MMA GEMM body (see the module docstring).
 
@@ -881,7 +1139,8 @@ def emit_warp_mma_gemm_device_body(
     as element pairs (pair-aligned bases); the rest move element by element.
     ``pdl``: wait on the previous grid ahead of the first global access (the
     aux loads and operand packets) and release the dependents after the last
-    MMA, ahead of the output stores.
+    MMA, ahead of the output stores.  ``offsets_name`` (a grouped row union):
+    the group offsets whose clamped intervals gate the stores row by row.
     """
     if out_pairs is None:
         out_pairs = [True] * len(match.stores)
@@ -909,16 +1168,23 @@ def emit_warp_mma_gemm_device_body(
     ]
     # ---- global strides in bytes
     a_batch = match.lhs_strides[0] * es if match.lhs_fake.ndim == 3 else 0
-    a_row = match.lhs_strides[-2] * es
+    if match.lhs_m_major:
+        a_row = match.lhs_strides[-1] * es  # one k column of A (M contiguous)
+    else:
+        a_row = match.lhs_strides[-2] * es  # one m row of A (K contiguous)
     b_batch = match.rhs_strides[0] * es if match.rhs_fake.ndim == 3 else 0
     if match.rhs_k_major:
         b_row = match.rhs_strides[-1] * es  # one n column of B (K contiguous)
     else:
         b_row = match.rhs_strides[-2] * es  # one k row of B (N contiguous)
-    # ---- smem tiles per K chunk
-    ra = bk * es
+    # ---- smem tiles per K chunk (an M-contiguous A is staged as bk rows of
+    # bm elements, the layout its coalesced packets and ldmatrix.trans read)
+    if match.lhs_m_major:
+        ra, a_rows = bm * es, bk
+    else:
+        ra, a_rows = bk * es, bm
     cpr_a = ra // 16
-    a_chunk = bm * ra
+    a_chunk = a_rows * ra
     if match.rhs_k_major:
         rb, b_rows = bk * es, bn
     else:
@@ -950,7 +1216,7 @@ def emit_warp_mma_gemm_device_body(
     emit(f"wm_s_b = wm_s_a + {nk * a_chunk}")
     emit(
         f"wm_a_g = {a_name}.iterator.toint() + cutlass.Int64(wm_pb) * {a_batch} "
-        f"+ cutlass.Int64(wm_m0) * {a_row}"
+        f"+ cutlass.Int64(wm_m0) * {es if match.lhs_m_major else a_row}"
     )
     if match.rhs_k_major:
         emit(
@@ -971,6 +1237,46 @@ def emit_warp_mma_gemm_device_body(
         # Programmatic dependent launch: everything above is address math
         # and the shared allocation; every global access follows this wait.
         emit("cute.arch.griddepcontrol_wait()")
+    # ---- grouped row union: the clamped group intervals (the row-union
+    # carrier's normalization: a negative or reversed interval is empty, an
+    # overlong one is cut at m) and, per output row of the lane, whether some
+    # group owns it.  The offsets are a few uniform words; every thread reads
+    # them (L1 broadcast, plain loads the compiler may batch with the
+    # operand packets; they follow the dependent-launch wait above) and the
+    # chains are warp-uniform per row.
+    row_selected: dict[tuple[int, int], str] = {}
+    if match.grouped is not None:
+        assert offsets_name is not None
+        grouped = match.grouped
+        for g in range(grouped.groups + 1):
+            emit(
+                f"wm_off_{g} = cutlass.Int32(({offsets_name}.iterator + "
+                f"cutlass.Int64({g * grouped.offsets_stride})).load())"
+            )
+        for g in range(grouped.groups):
+            emit(f"wm_ext_{g} = max(wm_off_{g + 1} - wm_off_{g}, cutlass.Int32(0))")
+            emit(
+                f"wm_start_{g} = min(max(wm_off_{g}, cutlass.Int32(0)), cutlass.Int32({m}))"
+            )
+            emit(
+                f"wm_end_{g} = wm_start_{g} + min(max(wm_ext_{g} + min(wm_off_{g}, "
+                f"cutlass.Int32(0)), cutlass.Int32(0)), cutlass.Int32({m}) - wm_start_{g})"
+            )
+        for am in range(atoms_m):
+            for half in range(2):
+                name = f"wm_sel_{am}_{half}"
+                row_selected[(am, half)] = name
+                emit(f"wm_r_{am}_{half} = wm_row + {am * 16 + 8 * half}")
+                # Right-nested: the DSL preprocessor copies the accumulated
+                # left operand of a flat ``or`` chain four times per term.
+                terms = [
+                    f"(wm_start_{g} <= wm_r_{am}_{half} and wm_r_{am}_{half} < wm_end_{g})"
+                    for g in range(grouped.groups)
+                ]
+                selected = terms[-1]
+                for term in reversed(terms[:-1]):
+                    selected = f"{term} or ({selected})"
+                emit(f"{name} = {selected}")
     # ---- aux loads: issued at entry so their latency overlaps the operands.
     aux_value: dict[tuple[int, int, int, int, int], str] = {}
     for si, store in enumerate(match.stores):
@@ -1133,6 +1439,10 @@ def emit_warp_mma_gemm_device_body(
         # chunk's wait + barrier like the rest.
         if pending_words() >= _CAST_PACKET_WORDS_IN_FLIGHT:
             convert_pending()
+        if match.lhs_m_major:
+            a_gsrc = f"wm_a_g + cutlass.Int64({i * bk} + wm_prow) * {a_row} + cutlass.Int64(wm_pch * 16)"
+        else:
+            a_gsrc = f"wm_a_g + cutlass.Int64(wm_prow) * {a_row} + cutlass.Int64({i * bk * es} + wm_pch * 16)"
         issue(
             tag="a",
             chunk=i,
@@ -1140,7 +1450,7 @@ def emit_warp_mma_gemm_device_body(
             packets=a_packets,
             cpr=cpr_a,
             row_bytes=ra,
-            gsrc=f"wm_a_g + cutlass.Int64(wm_prow) * {a_row} + cutlass.Int64({i * bk * es} + wm_pch * 16)",
+            gsrc=a_gsrc,
             cast=match.lhs_cast,
         )
         if match.rhs_k_major:
@@ -1170,10 +1480,18 @@ def emit_warp_mma_gemm_device_body(
                 )
             )
     # ---- per-lane ldmatrix row / chunk terms.
-    # A x4: lanes 0-7 rows 0-7 chunk 2s, 8-15 rows 8-15 chunk 2s, 16-23 rows 0-7
-    # chunk 2s+1, 24-31 rows 8-15 chunk 2s+1 -> (a0, a1, a2, a3).
-    emit(f"wm_arow = wm_wmi * {wtm} + wm_l8 + 8 * (wm_lq % 2)")
-    emit("wm_achunk = wm_lq // 2")
+    if match.lhs_m_major:
+        # A x4.trans over the [k][m] tile: lanes 0-7 (k rows 0-7, m chunk 0)
+        # a0; 8-15 (k 0-7, m chunk 1) a1; 16-23 (k 8-15, m chunk 0) a2; 24-31
+        # (k 8-15, m chunk 1) a3 -- the transposed delivery hands lane (g, c)
+        # A[m = g][k = 2c, 2c + 1] of each 8x8 block, the row-major fragment.
+        emit("wm_arow = wm_l8 + 8 * (wm_lq // 2)")
+        emit(f"wm_achunk = wm_wmi * {wtm * es // 16} + wm_lq % 2")
+    else:
+        # A x4: lanes 0-7 rows 0-7 chunk 2s, 8-15 rows 8-15 chunk 2s, 16-23 rows
+        # 0-7 chunk 2s+1, 24-31 rows 8-15 chunk 2s+1 -> (a0, a1, a2, a3).
+        emit(f"wm_arow = wm_wmi * {wtm} + wm_l8 + 8 * (wm_lq % 2)")
+        emit("wm_achunk = wm_lq // 2")
     if match.rhs_k_major:
         # x4 over two n-tiles: lanes 0-7 (n-tile j, chunk 2s) b0; 8-15 (j, 2s+1)
         # b1; 16-23 (j+1, 2s) b0; 24-31 (j+1, 2s+1) b1.  x2 uses lanes 0-15.
@@ -1190,11 +1508,17 @@ def emit_warp_mma_gemm_device_body(
         emit(sync)
         for st in range(steps):
             for am in range(atoms_m):
-                row = f"(wm_arow + {am * 16})"
-                chunk = f"({2 * st} + wm_achunk)"
+                if match.lhs_m_major:
+                    row = f"({16 * st} + wm_arow)"
+                    chunk = f"(wm_achunk + {am * 16 * es // 16})"
+                    a_op = "ldmatrix_x4_trans"
+                else:
+                    row = f"(wm_arow + {am * 16})"
+                    chunk = f"({2 * st} + wm_achunk)"
+                    a_op = "ldmatrix_x4"
                 swz = _swizzled_chunk(row, chunk, cpr_a)
                 emit(
-                    f"wm_a_{am}_0, wm_a_{am}_1, wm_a_{am}_2, wm_a_{am}_3 = {rt}.ldmatrix_x4("
+                    f"wm_a_{am}_0, wm_a_{am}_1, wm_a_{am}_2, wm_a_{am}_3 = {rt}.{a_op}("
                     f"wm_s_a + {i * a_chunk} + {row} * {ra} + {swz} * 16)"
                 )
             an = 0
@@ -1254,7 +1578,7 @@ def emit_warp_mma_gemm_device_body(
                 for j in range(4):
                     carrier = f"wm_acc_{am}_{an}_{j}"
                     if store.chain.steps:
-                        aux_locals = {
+                        aux_locals: _LeafBindings = {
                             aux.leaf: aux_value[(si, li, am, an, j)]
                             for li, aux in enumerate(store.aux)
                         }
@@ -1271,19 +1595,26 @@ def emit_warp_mma_gemm_device_body(
                     off = (am * 16 + 8 * half) * o_row + an * 8 * oes
                     lo, hi = values[2 * half], values[2 * half + 1]
                     address = f"wm_o{si} + cutlass.Int64({off})"
+                    indent = ""
+                    if (am, half) in row_selected:
+                        # A grouped row union stores the rows some group owns.
+                        emit(f"if {row_selected[(am, half)]}:")
+                        indent = "    "
                     if not out_pairs[si]:
                         scalar = {
                             torch.float32: "stg_f32",
                             torch.float16: "stg_f16",
                             torch.bfloat16: "stg_bf16",
                         }[odt]
-                        emit(f"{rt}.{scalar}({address}, {lo})")
-                        emit(f"{rt}.{scalar}({address} + {oes}, {hi})")
+                        emit(f"{indent}{rt}.{scalar}({address}, {lo})")
+                        emit(f"{indent}{rt}.{scalar}({address} + {oes}, {hi})")
                     elif odt == torch.float32:
-                        emit(f"{rt}.stg_v2_f32({address}, {lo}, {hi})")
+                        emit(f"{indent}{rt}.stg_v2_f32({address}, {lo}, {hi})")
                     else:
                         pack = "pack_f16x2" if odt == torch.float16 else "pack_bf16x2"
-                        emit(f"{rt}.stg_b32({address}, {rt}.{pack}({lo}, {hi}))")
+                        emit(
+                            f"{indent}{rt}.stg_b32({address}, {rt}.{pack}({lo}, {hi}))"
+                        )
     source = "\n".join(lines) + "\n"
     return list(ast.parse(textwrap.dedent(source)).body)
 

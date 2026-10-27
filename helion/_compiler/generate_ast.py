@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.host_remainder_fills import RemainderFill
     from .cute.iota_utils import FreeArangeLanes
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -2913,6 +2914,11 @@ def _generate_ast(
                     codegen.suppressed_lane_names,
                     codegen.device_function.dce_vars,
                 )
+            remainder_fills: list[RemainderFill] = []
+            if CompileEnvironment.current().backend_name == "cute":
+                from .cute.host_remainder_fills import append_device_remainder_fills
+
+                remainder_fills = append_device_remainder_fills(codegen, func, config)
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()
@@ -3151,6 +3157,11 @@ def _generate_ast(
             if env.backend_name == "cute":
                 from .cute.host_paired_sum import PAIRED_SUM_KEY
                 from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_remainder_fills import lower_host_remainder_fills
+
+                final_host_statements = lower_host_remainder_fills(
+                    final_host_statements, remainder_fills
+                )
                 from .cute.host_single_sum import lower_host_single_sum
 
                 final_host_statements = lower_host_sum_pairs(
@@ -3161,6 +3172,15 @@ def _generate_ast(
                     ),
                 )
                 final_host_statements = lower_host_single_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                from .cute.host_full_sum import lower_host_full_sum
+
+                final_host_statements = lower_host_full_sum(
                     func,
                     final_host_statements,
                     cast(

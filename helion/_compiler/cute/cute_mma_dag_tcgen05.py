@@ -345,6 +345,11 @@ class Tcgen05Facts:
     # Derived values' tile inputs that may ride a loop ring (the
     # ``cute_mma_dag_loads`` knob has a subject).
     aux_items: int = 0
+    # Region programs: the fragment slots the root epilogue stores when no
+    # root derived value is materialized (the subject of
+    # ``cute_mma_dag_epilogue``: a row wider than one 64-column load is
+    # streamed chunk by chunk under the knob).
+    root_store_slots: tuple[int, ...] = ()
     # Region programs: the live groups with the region emitter's exchange
     # points (a root fragment's exchange tile is written once ahead of the
     # loop reading it), for the TMEM layout; None: the planner's.
@@ -3960,6 +3965,18 @@ class _Tcgen05Emitter(_Emitter):
         self.emit(f"{_PRIMS}.tcgen05_wait(kind={_PRIMS}.Tcgen05Wait.LOAD)")
         self.slot_regs[slot] = f"{self.vec}{slot}_"
 
+    def emit_ld_chunk(self, slot: int, chunk: int) -> None:
+        """Load one 64-column chunk of this thread's row of fragment ``slot``
+        (``md_v{slot}_{chunk}``): the streamed epilogue reads a wide row a
+        chunk at a time instead of holding it whole in registers."""
+        self.emit(
+            f"{self.vec}{slot}_{chunk} = {_PRIMS}.tcgen05_ld({self.ld_shape(slot)}, "
+            f"{self.tmem_ptr(slot, chunk * TCGEN05_LD_COLS)}, "
+            f"num={self.chunk_cols(slot, chunk)}{self.ld_offset(slot)})"
+        )
+        self.emit(f"{_PRIMS}.tcgen05_wait(kind={_PRIMS}.Tcgen05Wait.LOAD)")
+        self.slot_regs[slot] = f"{self.vec}{slot}_"
+
     def emit_st_array(self, name: str, slot: int, chunk: int) -> None:
         self.emit(
             f"{_PRIMS}.tcgen05_st({self.ld_shape(slot)}, "
@@ -4222,13 +4239,18 @@ class _Tcgen05Emitter(_Emitter):
         )
 
     def emit_stage_in(  # type: ignore[override]
-        self, store: Store, parity: str, evaluate: bool
+        self,
+        store: Store,
+        parity: str,
+        evaluate: bool,
+        window: tuple[int, int] | None = None,
     ) -> None:
         """This thread's fragment row as 16-byte packets of the store dtype
         into the staging buffer (``staging_address``).  ``evaluate`` renders
         the store's pointwise chain per element (its trailing cast folded
         into the pack); otherwise the value is the fragment itself or its
-        cast and the registers are packed directly."""
+        cast and the registers are packed directly.  ``window`` restricts
+        the packets to the local columns ``[lo, hi)`` (a streamed chunk)."""
         slot = self.program.frag_slots[store.frag]
         geometry = self.slot(slot)
         dtype = store.access.dtype
@@ -4246,7 +4268,8 @@ class _Tcgen05Emitter(_Emitter):
             self.fold_root(store.value)
             self.hoist_scalars(store.value)
             self.evaluator.enter_frag(slot)
-        for col in range(0, self.local_cols(slot), per_packet):
+        lo, hi = window if window is not None else (0, self.local_cols(slot))
+        for col in range(lo, hi, per_packet):
             chunk = self.chunk_expr(slot, col // per_packet, per_packet)
             if row_bytes <= ATOM_MAX_BYTES:
                 swz = _swizzled_chunk(row, chunk, row_bytes // 16)

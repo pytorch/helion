@@ -185,6 +185,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
@@ -5532,6 +5533,40 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_clc.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
+            eager = helion.Config(
+                **{**config.config, TCGEN05_CLC_QUERY_PACING_CONFIG_KEY: "eager"}
+            )
+            eager_code = bound.to_triton_code(eager)
+
+        # Default CLC query pacing ("tile"): the leader CTA's TMA-load warp
+        # arrives at the throttle barrier once per tile it starts, right
+        # before the tile's initial AB prefetch, and the scheduler warp syncs
+        # on it before each query; eager pacing emits none of it.
+        self.assertEqual(
+            code.count(
+                "tcgen05_clc_throttle_barrier = cutlass.pipeline.NamedBarrier("
+                "barrier_id=5, num_threads=64)"
+            ),
+            1,
+        )
+        self.assertEqual(code.count("tcgen05_clc_throttle_barrier.arrive()"), 1)
+        credit = re.search(
+            r"if cute\.arch\.make_warp_uniform\(cute\.arch\.block_idx_in_cluster\(\)\) "
+            r"== cutlass\.Int32\(0\):\n +tcgen05_clc_throttle_barrier\.arrive\(\)",
+            code,
+        )
+        self.assertIsNotNone(credit)
+        assert credit is not None
+        self.assertLess(credit.start(), code.index("tma_initial_full_tile ="))
+        self.assertEqual(
+            code.count("tcgen05_clc_throttle_barrier.arrive_and_wait()"), 1
+        )
+        self.assertLess(
+            code.index("tcgen05_clc_throttle_barrier.arrive_and_wait()"),
+            code.index("_cute_issue_clc_query_nomulticast(tcgen05_clc_mbar_smem_ptr"),
+        )
+        self.assertNotIn("tcgen05_clc_throttle_barrier", eager_code)
+        self.assertEqual(eager_code.count("_cute_issue_clc_query_nomulticast"), 2)
 
         # CLC issuance helper: appears exactly twice in the generated
         # module (one import line at the top + one call inside the
@@ -8997,6 +9032,115 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("_cute_gelu_erf_exact_f32x2(", code)
         self.assertNotIn("cute.math.tanh", code)
 
+    def test_tcgen05_fused_gelu_exact_default_keeps_exact_erf(self) -> None:
+        """Without ``fast_math`` the GELU helper call carries no fastmath flag."""
+        code = self._gelu_erf_epilogue_code(fast_math=False)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertNotIn("fastmath", call)
+
+    def test_tcgen05_fused_gelu_fast_math_uses_approximate_erf(self) -> None:
+        """``fast_math`` routes the fused GELU through the DSL's approximate erf,
+        as the pointwise lowering of ``erf`` does under the same setting."""
+        code = self._gelu_erf_epilogue_code(fast_math=True)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertIn("fastmath=True)", call)
+
+    def test_tcgen05_fused_erf_fast_math_template(self) -> None:
+        """A plain ``torch.erf`` epilogue step takes ``fastmath=True`` under ``fast_math``."""
+        for fast_math, expected in (
+            (False, "cute.math.erf("),
+            (True, "fastmath=True)"),
+        ):
+            code = self._unary_epilogue_code("erf", fast_math=fast_math)
+            (call,) = [line for line in code.splitlines() if "cute.math.erf(" in line]
+            self.assertIn(expected, call)
+            if not fast_math:
+                self.assertNotIn("fastmath", call)
+
+    def _gelu_erf_epilogue_code(self, *, fast_math: bool) -> str:
+        return self._unary_epilogue_code("gelu", fast_math=fast_math)
+
+    def _unary_epilogue_code(self, op: str, *, fast_math: bool) -> str:
+        """Rendered source of a tcgen05 GEMM whose epilogue applies ``op``
+        (``"gelu"`` or ``"erf"``; two kernels because a kernel body cannot
+        close over the op)."""
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_gelu_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_erf_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.erf(acc).to(x.dtype)
+            return out
+
+        kernel = {"gelu": cute_matmul_gelu_epilogue, "erf": cute_matmul_erf_epilogue}[
+            op
+        ]
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = kernel.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            return bound.to_triton_code(cfg)
+
+    def test_tcgen05_fused_gelu_fast_math_runtime_correctness(self) -> None:
+        """The approximate-erf GELU epilogue stays within half-precision tolerance."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", fast_math=True)
+        def cute_matmul_gelu_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_gelu_fast.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        self.assertIn("fastmath=True)", bound.to_triton_code(cfg))
+        out = bound(x, y)
+        expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_gelu_exact_cute_pointwise_tensor_ssa_numeric_runtime_correctness(
         self,
     ) -> None:
@@ -9354,8 +9498,15 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound.set_config(config)
         code = bound.to_triton_code(config)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
-        self.assertIn("* cutlass.Float32(scale_b.iterator.load())", code)
+        # The rank-0 scales are bound once per output tile (ahead of the
+        # accumulator wait) and the chain multiplies by the bound locals.
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn(
+            "tcgen05_scalar_1 = cutlass.Float32(scale_b.iterator.load())", code
+        )
+        self.assertIn("* tcgen05_scalar\n", code)
+        self.assertIn("* tcgen05_scalar_1\n", code)
+        self.assertNotIn("* cutlass.Float32(scale_a.iterator.load())", code)
         out = bound(x, y, scale_a, scale_b)
         expected = ((x @ y).to(torch.float32) * scale_a * scale_b).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=4e-1, rtol=1e-2)
@@ -9404,7 +9555,8 @@ class TestCuteLowerings(unittest.TestCase):
         bound.set_config(config)
         code = bound.to_triton_code(config)
         self.assertIn("cutlass.Float8E4M3FN", code)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("* tcgen05_scalar\n", code)
         out = bound(x, y, scale_a, scale_b)
         expected = (x.float() @ y.float() * scale_a * scale_b).to(torch.bfloat16)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)

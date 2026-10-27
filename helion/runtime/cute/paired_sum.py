@@ -29,14 +29,16 @@ if TYPE_CHECKING:
 # ATen sum dispatch plus the headers that define the admitted FP32 tree. This
 # is a library-implementation compatibility gate, independent of workload or
 # GPU shape. Missing sources or a different build retain ordinary Torch calls.
-# torch 2.16.0.dev20261014+cu130 (nightly branch; main a970aa8b98). Audited
-# against the previous pin 332a69317e (2026-08-29 nightly, main e2dee2a4b9):
-# ReduceSumProdKernel.cu, Reduce.cuh, SharedReduceOps.h, ReduceOpsUtils.h,
-# thread_constants.h and block_reduce.cuh are unchanged; TensorIterator.cpp
-# only refactored operand bookkeeping (no byte-offset split change); the CUDA
-# float accumulate type moved verbatim to torch/headeronly; Copy.cu gained
-# vectorized copies that keep the per-element static_cast rounding.
-_ATEN_SUM_GIT = "ef46daf1aa35294a3cb297ef3f59b5a6463063f8"
+# torch 2.16.0.dev20261026+cu130 (nightly branch; main 6d5f66bd5b). Audited
+# against the previous pin ef46daf1aa (2026-10-14 nightly, main a970aa8b98):
+# of ReduceSumProdKernel.cu, Reduce.cuh, SharedReduceOps.h, ReduceOpsUtils.h,
+# thread_constants.h, block_reduce.cuh, TensorIterator.cpp, ReduceOps.cpp,
+# AccumulateType.h and Copy.cu only ReduceOps.cpp changed, and only its device
+# check (MPS added to the accepted devices); the pinned header hashes below are
+# unchanged. The 2026-10-14 pin had been audited against 332a69317e (2026-08-29
+# nightly, main e2dee2a4b9): the reduction tree and the per-element cast
+# rounding were unchanged there too.
+_ATEN_SUM_GIT = "bb84fa86fa8ba26f77e2cbdc3c8e7820b7c3b18f"
 _ATEN_SUM_HEADERS = {
     "ATen/native/cuda/thread_constants.h": "61e0f733a01a729f96036cd84b78645731d126534f3ecc972a3e91d3c37416d2",
     "ATen/native/cuda/Reduce.cuh": "8f04b32331911bd301938abe566ff6b3a390bd409ec3a98e1222d7ed698de09e",

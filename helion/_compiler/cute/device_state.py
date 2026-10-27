@@ -756,6 +756,17 @@ class CuteDeviceFunctionState:
         # (``roffset_N``), the loop target the AST passes see: (size-hint trip
         # count used for profitability decisions, constexpr parameter name).
         self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
+        # Cross-thread reductions over a block that a device loop's VECTORIZED
+        # lane loop distributes (several packets per thread per trip).  The
+        # reduce is emitted once per lane and so reduces one lane's packet;
+        # ``cute/fold_lane_reductions.py`` folds the per-lane partials across
+        # the unrolled lanes and runs the cross-thread combine once per trip.
+        # The lane variable of each such loop, mapped to the keys of the
+        # reduce calls emitted inside it (``fold_site_key``: the call with its
+        # input replaced).  Two loops may emit identical calls (the grouped
+        # warp reduce takes a raw thread-index expression), so the lane
+        # variable is the primary key.
+        self.lane_fold_reduce_sites: dict[str, set[str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
@@ -830,6 +841,11 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # Name of the CLC throttle named barrier once the TMA-load role has
+        # emitted its per-tile credit (``cute_mma``); the scheduler-warp body
+        # (``program_id``) syncs on it before every CLC query only then, so a
+        # producer path without the credit never leaves the scheduler waiting.
+        self.clc_throttle_barrier: str | None = None
         # The materialized-operand dependency wait was emitted inside the
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
@@ -842,6 +858,10 @@ class CuteDeviceFunctionState:
         # statement after which ``program_id`` re-emits the TMA-load warp's
         # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
         self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
+        # Row-union kernels whose TMA-load role is hoisted: the cluster
+        # ``pipeline_init_wait`` the role executes once in its prelude, after
+        # its scheduler setup and ahead of its persistent loop.
+        self.tcgen05_tma_role_prelude_wait: str | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -912,6 +932,12 @@ class CuteDeviceFunctionState:
         # cross-warp reductions for (None when it rewrote nothing); the
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
+        # The static ``block=`` the launcher call was emitted with
+        # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
+        # kernel definition's codegen); None before that call, and for a
+        # launch with an argument-sized axis.  ``_implicit_pdl_release``
+        # estimates the resident CTAs per SM from it.
+        self.launch_block: tuple[int, int, int] | None = None
         self.owned_root_block_dims: tuple[int, int, int] | None = None
         # ``(needed, capacity)`` when the computed-fragment owner declined the
         # current root because its shared memory exceeds the CTA capacity; a

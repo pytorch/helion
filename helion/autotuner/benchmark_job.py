@@ -16,10 +16,12 @@ from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import PhasedJob
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
+from .benchmarking import steady_graph_dispatch
 from .benchmarking import synchronize_device
 from .kernel_args import _clone_args
 from .kernel_args import load_private_kernel_args
 from .kernel_args import load_trusted_kernel_args
+from .kernel_args import resolve_portable_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
 from .precompile_future import _unload_compiled_fn
@@ -92,6 +94,9 @@ class BenchmarkJob(PhasedJob):
                 else:
                     args = load_private_kernel_args(self.args_path, self.args_slot)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
+                # The worker warmed the current device before this job; the
+                # kernel's graphs run on its arguments' device.
+                steady_graph_dispatch(device=_cuda_device_of(args))
                 benchmark_fn = functools.partial(fn, *args)
                 # Compile and run once; the timers then skip their setup call.
                 benchmark_fn()
@@ -119,7 +124,11 @@ class BenchmarkJob(PhasedJob):
 
 @functools.cache
 def _load_trusted_baseline_output(path: str) -> object:
-    return torch.load(path, weights_only=False)
+    # The baseline's post-call arguments carry the same function leaves as
+    # the arguments file, serialized by code when standard pickling refused
+    # them (``PortableFunction``); rebuild them as ``load_trusted_kernel_args``
+    # does so both sides of the comparison hold the same kinds of leaves.
+    return resolve_portable_args(torch.load(path, weights_only=False))
 
 
 def _cuda_device_of(args: object) -> torch.device | None:

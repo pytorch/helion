@@ -103,25 +103,38 @@ def _grouped_warp_shuffle_load_offset(t):
 
 @cute.jit
 def _grouped_warp_copy_ab(a, b, a_packed, b_grouped, start, length, group, offset, t{copy_parameters}):
+    # One 64-bit address per operand per chunk; the packets step it by a
+    # precomputed stride multiple (the per-packet products were a quarter of
+    # the kernel's instructions on a latency-bound unit).
+    first_row = offset + t // 16
+    k = (t % 16) * 4
+    a_source = a_packed.iterator + (start + cutlass.Int64(first_row)) * a_packed.layout.stride[0] + cutlass.Int64({global_k}) * a_packed.layout.stride[1]
+    a_step = a_packed.layout.stride[0] * 32
     for packet in cutlass.range_constexpr(4):
-        row = offset + t // 16 + packet * 32
-        k = (t % 16) * 4
-        source = a_packed.iterator + (start + cutlass.Int64(row)) * a_packed.layout.stride[0] + cutlass.Int64({global_k}) * a_packed.layout.stride[1]
+        row = first_row + packet * 32
         valid_bytes = cutlass.Int32(16) if cutlass.Int64(row) < length else cutlass.Int32(0)
         cute.arch.cp_async_shared_global(
             a.iterator + cute.crd2idx((t // 16 + packet * 32, k), a.layout),
-            source, 16, "cg", cp_size=valid_bytes,
+            a_source, 16, "cg", cp_size=valid_bytes,
         )
+        a_source = a_source + a_step
     cute.arch.cp_async_commit_group()
+    n = t % 64
+    k = t // 64
+    b_valid_bytes = cutlass.Int32(4) if {b_valid} else cutlass.Int32(0)
+    b_base = b_grouped.iterator + cutlass.Int64(group) * b_grouped.layout.stride[0] + cutlass.Int64({global_n}) * b_grouped.layout.stride[1] + cutlass.Int64({global_k}) * b_grouped.layout.stride[2]
+    b_step = b_grouped.layout.stride[2] * 8
+    # Two running pointers (K offsets 0, 8, 16, 24 and 32, 40, 48, 56), selected
+    # per packet by plain Python indexing: the DSL would scope an ``if``.
+    b_pointers = [b_base, b_base + b_grouped.layout.stride[2] * 32]
     for packet in cutlass.range_constexpr(8):
         # Retain the original B packet issue order: 0, 32, 8, 40, 16, 48, 24, 56.
         k = t // 64 + (packet // 2) * 8 + (packet % 2) * 32
-        n = t % 64
-        source = b_grouped.iterator + cutlass.Int64(group) * b_grouped.layout.stride[0] + cutlass.Int64({global_n}) * b_grouped.layout.stride[1] + cutlass.Int64({global_k}) * b_grouped.layout.stride[2]
-        valid_bytes = cutlass.Int32(4) if {b_valid} else cutlass.Int32(0)
+        source = b_pointers[packet % 2]
+        b_pointers[packet % 2] = source + b_step
         cute.arch.cp_async_shared_global(
             b.iterator + cute.crd2idx((n, k), b.layout),
-            source, 4, "ca", cp_size=valid_bytes,
+            source, 4, "ca", cp_size=b_valid_bytes,
         )
     cute.arch.cp_async_commit_group()
 
@@ -195,14 +208,17 @@ def _helion_native_grouped_rna(offsets, a_packed, b_grouped, bias, out, tcgen05_
             word_offset = (load_offset ^ ((packet // 2) * 16448)) // 4 + (packet % 2) * 512
             source = cute.make_tensor((cp + word_offset).align(16), cute.make_layout((4,)))
             cute.copy(vector_copy, source, loads[None, packet])
+        first_row = offset + t // 16
+        destination = out.iterator + (start + cutlass.Int64(first_row)) * out.layout.stride[0] + cutlass.Int64({output_column}) * out.layout.stride[1]
+        out_step = out.layout.stride[0] * 32
         for packet in cutlass.range_constexpr(4):
-            row = offset + t // 16 + packet * 32
+            row = first_row + packet * 32
             if {store_valid}:
                 for item in cutlass.range_constexpr(4):
                     packed[item] = loads[item % 2 + (packet // 2) * 2, (packet % 2) + (item // 2) * 2]
-                destination = out.iterator + (start + cutlass.Int64(row)) * out.layout.stride[0] + cutlass.Int64({output_column}) * out.layout.stride[1]
                 output_target = cute.make_tensor(destination.align(16), cute.make_layout((4,)))
                 cute.copy(vector_copy, packed, output_target)
+            destination = destination + out_step
         offset = offset + cutlass.Int32(128)
         _grouped_warp_copy_ab(a, b, a_packed, b_grouped, start, length, group, offset, t{first_copy_args})
     cute.arch.cp_async_wait_group(0)

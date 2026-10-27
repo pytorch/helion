@@ -42,6 +42,7 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .pdl_release import generic_release_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -50,6 +51,7 @@ from .thread_budget import check_thread_limit
 from .thread_budget import thread_idx_axis
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Mapping
 
@@ -1615,6 +1617,35 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    @classmethod
+    def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
+        """A kernel that renders the generic early release of its programmatic
+        dependents (``cute_pdl`` on the generic path, released at entry or
+        from the last wave) ranks ahead of one that does not, among finalists
+        the autotuner's final verification cannot tell apart.
+
+        The knob's own cost or gain is invisible to the kernel's isolated
+        timing whenever a plain launch separates its back-to-back calls (the
+        zero fill of an output: the calls are then not dependents of each
+        other), while the kernel's successor in the real call sequence
+        launches 0.3-1 us earlier behind a releasing primary (mamba2_ssd
+        backward: dqkg alone reads 3.65 us with the knob on or off; the
+        sequence reads 10.3 us per call with it on against 11.2 off).
+
+        Whether a config renders that release is read off its generated
+        module (``generic_release_rendered``), not off its keys: the tcgen05,
+        warp-MMA, collective and block-scaled families own their wait and
+        release (``DeviceFunction._cute_pdl_applies``), so on them the knob
+        and its placement are inert and every config ranks alike; a ranking
+        by keys there would break ties between unrelated knobs (matmul
+        backward s2: a clc-persistent finalist 0.5% behind in the autotuner's
+        regime, 7% behind in the catalogue's).  A config without the knob
+        ranks last without a render.
+        """
+        if config.config.get("cute_pdl") is not True:
+            return 1
+        return 0 if generic_release_rendered(source()) else 1
+
     def build_standalone_code(
         self,
         bound: BoundKernel[Any],
@@ -2168,6 +2199,7 @@ class CuteBackend(Backend):
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_pdl_release"
             or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
@@ -2547,6 +2579,8 @@ class CuteBackend(Backend):
             "_cute_resident_sums_disjoint": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_sums_disjoint",
             "_cute_try_paired_sum_cast": "from helion.runtime.cute.paired_sum import try_paired_sum_cast as _cute_try_paired_sum_cast",
             "_cute_try_single_sum_cast": "from helion.runtime.cute.single_sum import try_single_sum_cast as _cute_try_single_sum_cast",
+            "_cute_try_full_sum": "from helion.runtime.cute.full_sum import try_full_sum as _cute_try_full_sum",
+            "_cute_remainder_fill": "from helion._compiler.cute.remainder_fill_runtime import _cute_remainder_fill",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_complete_row_tensor_copy": "from helion._compiler.cute.tensor_copy_helpers import _cute_complete_row_tensor_copy",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
@@ -2709,9 +2743,25 @@ class CuteBackend(Backend):
 
                 from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_EXPR
                 from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
+                from .scalar_recipe_rounding import NARROW_MULTIPLY_ROUNDING_EXPR
+                from .scalar_recipe_rounding import NARROW_MULTIPLY_ROUNDING_META_KEY
 
                 node = V.current_node
                 expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    not HelionCuteDSLOpOverrides._fastmath_on()
+                    and isinstance(node, torch.fx.Node)
+                    and node.meta.get(NARROW_MULTIPLY_ROUNDING_META_KEY)
+                    and expected is not None
+                    and expected.dtype in NARROW_MULTIPLY_ROUNDING_EXPR
+                ):
+                    # The 16-bit product ``narrow_exact_products`` made of an
+                    # explicitly rounded FP32 product and its cast: ``mul.rn``
+                    # in the dtype keeps the single rounding and, like the
+                    # FP32 form, cannot be contracted into an FMA.
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, NARROW_MULTIPLY_ROUNDING_EXPR[expected.dtype]
+                    )
                 if (
                     not HelionCuteDSLOpOverrides._fastmath_on()
                     and isinstance(node, torch.fx.Node)
@@ -3551,6 +3601,19 @@ class CuteBackend(Backend):
                         f"shared reductions were sized for block={sized_for} "
                         f"but the kernel launches with {block_arg}",
                     )
+            # Record the static launch shape for the kernel definition's
+            # codegen (``_implicit_pdl_release`` sizes the resident CTAs per
+            # SM from it); an argument-sized axis leaves it unknown.
+            static_block = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
+            device_function.cute_state.launch_block = (
+                (
+                    int(static_block.group(1)),
+                    int(static_block.group(2)),
+                    int(static_block.group(3)),
+                )
+                if static_block is not None
+                else None
+            )
             launcher_args = [block_arg]
             compile_options: list[str] = []
             # One --ptxas-options flag carries them all (a second would

@@ -38,7 +38,7 @@ from .cute.persistent_branch_vec import PACKET_STORE_BYTES
 from .cute.register_tile_admission import RegisterTileOptions
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
-from .cute.scalar_recipe import is_rounded_fp32_multiply
+from .cute.scalar_recipe import is_rounded_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -5755,9 +5755,10 @@ def _is_proven_relocatable_call(
             return allow_load
         if call.func.attr == "bitcast":
             return True
-    if is_rounded_fp32_multiply(call):
-        # ``mul.rn.f32`` over two registers: a product kept separately rounded
-        # (``scalar_recipe_rounding``), as pure as the ``*`` it replaces.
+    if is_rounded_multiply(call):
+        # ``mul.rn.{f32,f16,bf16}`` over two registers: a product kept
+        # separately rounded (``scalar_recipe_rounding``), as pure as the
+        # ``*`` it replaces.
         return True
     name = _qualified_name(call.func)
     if name is None:

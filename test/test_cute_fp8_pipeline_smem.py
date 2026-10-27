@@ -154,7 +154,7 @@ def test_fp8_ab13_is_native_and_survives_search(placement: str) -> None:
     (
         {"tcgen05_ab_stages": 14},
         {"tcgen05_c_stages": 4},
-        {"tcgen05_cluster_n": 2},
+        {"tcgen05_cluster_n": 4},
         {"tcgen05_warp_spec_scheduler_warps": 1},
         {"tcgen05_warp_spec_c_input_warps": 1},
         {"tcgen05_warp_spec_store_warps": 1},
@@ -168,9 +168,22 @@ def test_fp8_rejects_overfull_and_unmodelled_protocols(
 ) -> None:
     bound = vector_scaled_mm._bind_isolated(_args())
     with pytest.raises(
-        helion.exc.InvalidConfig, match=r"cta_group='two'|per-CTA shared memory"
+        helion.exc.InvalidConfig,
+        match=r"cta_group='two'|per-CTA shared memory|tcgen05_cluster_n",
     ):
         bound.to_code(_config(**overrides))
+
+
+def test_fp8_pair_cluster_n2_is_modelled() -> None:
+    # The 2x2 cluster of fp8 CTA pairs keeps the per-CTA SMEM model.
+    bound = vector_scaled_mm._bind_isolated(_args())
+    with bound.env:
+        paired = bound.config_spec.normalized_config(
+            _config(tcgen05_cluster_n=2, tcgen05_ab_stages=2)
+        )
+    assert paired.config["tcgen05_cta_group"] == "two"
+    assert paired.config["tcgen05_cluster_n"] == 2
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in bound.to_code(paired)
 
 
 @pytest.mark.parametrize(

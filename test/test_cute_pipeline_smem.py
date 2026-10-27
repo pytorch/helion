@@ -247,12 +247,33 @@ def test_rejects_unmodelled_or_overfull_configs(invalid: str) -> None:
     overrides = {
         "overfull_ab": {"tcgen05_ab_stages": 14},
         "overfull_c": {"tcgen05_c_stages": 4},
-        "cluster": {"tcgen05_cluster_n": 2},
+        "cluster": {"tcgen05_cluster_n": 4},
         "layout": {"tcgen05_layout_strategy": "explicit_epi_tile"},
         "clc": {"tcgen05_persistence_model": "clc_persistent"},
     }[invalid]
-    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA"):
+    with pytest.raises(helion.exc.InvalidConfig, match="shared memory|two-CTA|cluster"):
         bound.to_code(_config(**overrides))
+
+
+def test_pair_cluster_n2_is_a_modelled_paired_configuration() -> None:
+    # The 2x2 cluster of CTA pairs (A multicast across the N neighbours) only
+    # shapes the mainloop and the scheduler; the per-CTA SMEM model is the
+    # same, so the paired family admits it at the same ring depths.
+    bound = _gemm._bind_isolated(_args())
+    with bound.env:
+        spec = bound.config_spec
+        limit = spec._cute_tcgen05_config._paired_pipeline_stage_limit(
+            spec.normalized_config(_config(tcgen05_ab_stages=2)).config
+        )
+        paired = spec.normalized_config(
+            _config(tcgen05_cluster_n=2, tcgen05_ab_stages=2)
+        )
+    assert limit is not None and limit >= 2
+    assert paired.config["tcgen05_cta_group"] == "two"
+    assert paired.config["tcgen05_cluster_n"] == 2
+    source = bound.to_code(paired)
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in source
+    assert "CtaGroup.TWO" in source
 
 
 @pytest.mark.parametrize("other", ("bias", "fanout", "no_capacity"))

@@ -1154,15 +1154,23 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # pipeline (nvjet's 64x6 staging), once for the CLC cluster_n=1 seed
         # and once each for the static-persistent 2x2 multicast seed and its
         # 2x1 twin.
-        deep_seeds = [seed for seed in cluster_m2_seeds if seed["block_sizes"][2] == 64]
+        deep_seeds = [
+            seed
+            for seed in cluster_m2_seeds
+            if seed["block_sizes"][2] == 64
+            and seed["block_sizes"][0] == TCGEN05_TWO_CTA_BLOCK_M
+        ]
         self.assertEqual(
             sorted(seed.get("tcgen05_cluster_n", 1) for seed in deep_seeds), [1, 1, 2]
         )
         for seed in deep_seeds:
             self.assertEqual(seed["tcgen05_ab_stages"], 6)
             self.assertEqual(seed["tcgen05_c_stages"], 2)
-        # M-paired block_m=512 seeds keep the baseline ab=2: the doubled A
-        # staging leaves no headroom for a deeper AB pipeline at bk=128.
+        # M-paired block_m=512 seeds keep the baseline ab=2 at bk=128: the
+        # doubled A staging leaves no headroom for a deeper AB pipeline
+        # there. The 64-wide deep ring of the same tile (nvjet's 64x6 class)
+        # halves the per-stage staging: three AB stages next to a four-deep
+        # C ring, on the 2x2 super-tile and the 2x1 pair.
         m_pair_seeds = [
             seed
             for seed in cluster_m2_seeds
@@ -1170,7 +1178,20 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         ]
         self.assertGreaterEqual(len(m_pair_seeds), 1)
         for seed in m_pair_seeds:
-            self.assertEqual(seed["tcgen05_ab_stages"], 2)
+            if seed["block_sizes"][2] == 128:
+                self.assertEqual(seed["tcgen05_ab_stages"], 2)
+            else:
+                self.assertEqual(seed["block_sizes"][2], 64)
+                self.assertEqual(seed["tcgen05_ab_stages"], 3)
+                self.assertEqual(seed["tcgen05_c_stages"], 4)
+        self.assertEqual(
+            sorted(
+                seed.get("tcgen05_cluster_n", 1)
+                for seed in m_pair_seeds
+                if seed["block_sizes"][2] == 64
+            ),
+            [1, 2],
+        )
 
     @onlyBackends(["cute"])
     def test_cute_universal_matmul_lane_loop_correctness(self) -> None:

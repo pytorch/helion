@@ -55,6 +55,7 @@ from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .kernel_args import _clone_args
+from .kernel_args import make_portable_args
 from .kernel_args import release_private_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
@@ -1424,23 +1425,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             or self._subprocess_benchmark_enabled()
         ):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
-            try:
-                torch.save(self.args, args_path)
-            except (pickle.PicklingError, AttributeError, TypeError) as e:
-                # Kernel args holding lambdas/closures (e.g. an epilogue
-                # callable) cannot cross a spawn boundary. Fall back to the
-                # in-process benchmark/accuracy path instead of failing the
-                # whole autotune; spawn-mode precompile keeps its hard error
-                # since it cannot run at all without the args file.
-                if self.settings.autotune_precompile == "spawn":
-                    raise
-                self._args_unpicklable = True
-                self.log.warning(
-                    f"Autotune args are not picklable ({e}); benchmarking "
-                    "in-process instead of in a killable subprocess."
-                )
-            else:
+            error = self._save_kernel_args(self.args, args_path)
+            if error is None:
                 self._precompile_args_path = args_path
+            else:
+                # Spawn-mode precompile keeps its hard error since it cannot
+                # run at all without the args file.
+                if self.settings.autotune_precompile == "spawn":
+                    raise error
+                self._benchmark_in_process(error)
         if self._subprocess_accuracy_check_enabled():
             baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
             torch.save(self._baseline_output, baseline_path)
@@ -1448,12 +1441,62 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             if len(self.mutated_arg_indices) > 0:
                 # The worker compares a candidate's post-call mutated
                 # arguments against the baseline's, as the in-process path
-                # does with ``self._baseline_post_args``.
+                # does with ``self._baseline_post_args``.  They are the
+                # whole argument tree with the mutated tensors cloned, so a
+                # callable argument is in them too and takes the same
+                # serialization (and the same fallback) as the arguments.
                 post_args_path = os.path.join(
                     self._precompile_tmpdir.name, "baseline_post_args.pt"
                 )
-                torch.save(self._baseline_post_args, post_args_path)
-                self._precompile_baseline_post_args_path = post_args_path
+                assert self._baseline_post_args is not None
+                error = self._save_kernel_args(self._baseline_post_args, post_args_path)
+                if error is None:
+                    self._precompile_baseline_post_args_path = post_args_path
+                else:
+                    self._benchmark_in_process(error)
+
+    def _benchmark_in_process(self, error: Exception) -> None:
+        """Keep the benchmark and accuracy check in this process (the
+        arguments cannot cross the spawn boundary) instead of failing the
+        whole autotune."""
+        self._args_unpicklable = True
+        self.log.warning(
+            f"Autotune args are not picklable ({error}); benchmarking "
+            "in-process instead of in a killable subprocess."
+        )
+
+    def _save_kernel_args(self, args: Sequence[object], path: str) -> Exception | None:
+        """Write an argument tree for the benchmark subprocess; the pickling
+        error when it cannot be written.
+
+        Kernel args holding lambdas/closures (e.g. an epilogue callable)
+        cannot cross a spawn boundary as they are.  The worker rebuilds such
+        functions from their code (``PortableFunction``): benchmarking must
+        stay out of this process, because an in-process cuda-graph benchmark
+        leaves the process in a state where every later CUDA graph runs each
+        kernel node of a Helion-launched kernel ~0.35 us slower (measured on
+        B200: a 2.8 us two-kernel call reads 3.5 us afterwards, for the cute
+        and the triton backends alike).  Only when that fails too (a function
+        that cannot be serialized by code, or another argument that still
+        refuses to pickle) does the caller fall back to the in-process
+        benchmark/accuracy path.
+        """
+        try:
+            torch.save(args, path)
+            return None
+        except (pickle.PicklingError, AttributeError, TypeError) as error:
+            portable = make_portable_args(args)
+            if portable is None:
+                return error
+            try:
+                torch.save(portable, path)
+            except (pickle.PicklingError, AttributeError, TypeError):
+                return error
+            self.log.debug(
+                f"Autotune args hold functions standard pickling refuses ({error}); "
+                "serialized them by code for the benchmark subprocess."
+            )
+            return None
 
     def _next_precompile_result_path(self) -> str:
         """Return a fresh path for a precompile result file."""

@@ -107,6 +107,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
+from .._compiler.cute.cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
@@ -143,6 +144,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
 from .._compiler.cute.cute_mma_dag import apply_mma_dag_cluster
+from .._compiler.cute.cute_mma_dag import epilogue_knob_admitted
 from .._compiler.cute.cute_mma_dag import fixup_admitted
 from .._compiler.cute.cute_mma_dag import mma_dag_aux_reason
 from .._compiler.cute.cute_mma_dag import mma_dag_epilogue_reason
@@ -154,6 +156,8 @@ from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
 from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
@@ -225,6 +229,7 @@ from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from .._compiler.cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .._utils import indexing_uses_tensor_descriptor
+from .._utils import prev_power_of_2
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -1064,6 +1069,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_simt_mma",
         "cute_simt_mma_layout",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_min_blocks_per_mp",
         "cute_tiles_per_block",
         "epilogue_subtile",
@@ -1219,6 +1225,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1373,6 +1380,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1552,6 +1560,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -3503,7 +3512,17 @@ class ConfigSpec:
         if facts.aux_candidates:
             self.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
         self.cute_mma_dag_derived = EnumFragment(choices=MMA_DAG_DERIVED_CHOICES)
-        self.cute_mma_dag_epilogue = EnumFragment(choices=MMA_DAG_EPILOGUE_CHOICES)
+        # ``streamed`` is offered only where a root block without derived
+        # values stores fragments; elsewhere the knob keeps row / split.
+        self.cute_mma_dag_epilogue = EnumFragment(
+            choices=MMA_DAG_EPILOGUE_CHOICES
+            if epilogue_knob_admitted(facts)
+            else tuple(
+                choice
+                for choice in MMA_DAG_EPILOGUE_CHOICES
+                if choice != MMA_DAG_EPILOGUE_STREAMED
+            )
+        )
         self.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
         if facts.tcgen05 is not None and (
             not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
@@ -3557,9 +3576,14 @@ class ConfigSpec:
             (MMA_DAG_LOOKAHEAD_KEY, self.cute_mma_dag_lookahead),
         ):
             if fragment is None:
-                # The aux knob has no subject here: inert, no choices.
-                assert key == MMA_DAG_AUX_KEY
-                config[key] = MMA_DAG_AUX_CHOICES[0]
+                # The aux / epilogue knob has no subject here: inert, no
+                # choices.
+                assert key in (MMA_DAG_AUX_KEY, MMA_DAG_EPILOGUE_KEY)
+                config[key] = (
+                    MMA_DAG_AUX_CHOICES[0]
+                    if key == MMA_DAG_AUX_KEY
+                    else MMA_DAG_EPILOGUE_ROW
+                )
                 continue
             value = config.setdefault(key, fragment.default())
             if value not in fragment.choices or type(value) is bool:
@@ -3943,6 +3967,9 @@ class ConfigSpec:
             config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
         if config[MMA_DAG_KEY] == MMA_DAG_TCGEN05:
             config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
+        else:
+            # The epilogue form is the tensor-memory region renderer's.
+            config[MMA_DAG_EPILOGUE_KEY] = MMA_DAG_EPILOGUE_ROW
         # Inert knobs: the body is replaced, so equal kernels share one
         # autotune identity (the occupancy hint stays searchable).  The
         # persistent tcgen05 launch is the generic persistent_interleaved
@@ -4586,6 +4613,8 @@ class ConfigSpec:
         cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        ab_stages_three_output_dtype_bytes: int | None = None,
+        ab_stages_three_output_stores: int = 1,
         reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
@@ -4598,6 +4627,8 @@ class ConfigSpec:
             cluster_m2_one_wave_only=cluster_m2_one_wave_only,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+            ab_stages_three_output_dtype_bytes=ab_stages_three_output_dtype_bytes,
+            ab_stages_three_output_stores=ab_stages_three_output_stores,
         )
         _record_restriction(
             self.restriction_reasons,
@@ -5385,7 +5416,8 @@ class ConfigSpec:
         if not self.cute_host_paired_sum_available:
             if value != "off" and not fix_invalid:
                 raise InvalidConfig(
-                    "host sums require a typed independent pair or terminal sum/cast"
+                    "host sums require a typed independent pair, terminal sum/cast "
+                    "or a 1-D sum/mean after the launch"
                 )
             config.pop(key, None)
             return
@@ -5751,7 +5783,20 @@ class ConfigSpec:
     def _normalize_cute_pdl(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """``cute_pdl`` is a boolean (programmatic dependent launch)."""
+        """``cute_pdl`` is a boolean (programmatic dependent launch);
+        ``cute_pdl_release`` names where the kernel releases its dependents
+        (``auto`` unless given: ``entry`` or ``none`` by the grid, resolved at
+        codegen so a flat configuration, which always carries the value, and
+        a dict without the key render alike) and only acts when ``cute_pdl``
+        is on.  With the knob off a non-default placement stays in the config
+        (inert, like every other knob the kernel does not read) so a flat
+        configuration survives the unflatten/flatten round trip the search
+        relies on; the default placement is dropped there, so the default
+        config and every knob-off config without a placement read alike.
+        Config identity is therefore not canonical for this key: a knob-off
+        config with ``none`` and one without the key, or a knob-on config
+        with ``auto`` and one without the key, hash and compare as different
+        configs while generating the same code."""
         pdl = config.get("cute_pdl", False)
         if type(pdl) is not bool:
             if not fix_invalid:
@@ -5759,6 +5804,18 @@ class ConfigSpec:
             pdl = False
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
+        release = config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        if release not in CUTE_PDL_RELEASE_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_pdl_release must be one of {CUTE_PDL_RELEASE_CHOICES!r}, "
+                    f"got {release!r}"
+                )
+            release = CUTE_PDL_RELEASE_DEFAULT
+        if not pdl and release == CUTE_PDL_RELEASE_DEFAULT:
+            config.pop("cute_pdl_release", None)
+        elif "cute_pdl_release" in config:
+            config["cute_pdl_release"] = release
 
     def _normalize_cute_tiles_per_block(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -6817,44 +6874,28 @@ class ConfigSpec:
         # live reduction thread threshold to decide when a persistent reduction
         # must be rolled.
         if self.max_reduction_threads is not None and self.reduction_loops:
-            force_threshold = self.reduction_loop_force_threshold
-            max_loop = self.max_reduction_loop
             reduction_loops = config.get("reduction_loops", [])
-            if force_threshold is not None and isinstance(reduction_loops, list):
+            if isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    # Indexed reductions (argmin/argmax) on CuTe must keep
-                    # the persistent thread count or rolled chunk within a
-                    # single warp, since cute.arch.warp_reduction only
-                    # supports threads_in_group<=32.
-                    block_threshold = force_threshold
-                    if (
-                        self.backend_name == "cute"
-                        and spec.block_id in self.cute_indexed_reduction_block_ids
-                    ):
-                        block_threshold = min(block_threshold, 32)
+                    block_threshold, max_chunk = spec._limits(self)
+                    if block_threshold is None:
+                        continue
                     if new_loops[i] is None and spec.size_hint > block_threshold:
                         new_loops[i] = min(spec.size_hint, block_threshold)
                         changed = True
                     elif (
                         new_loops[i] is not None
-                        and max_loop is not None
-                        and (
-                            new_loops[i] > max_loop
-                            or (
-                                self.backend_name == "cute"
-                                and spec.block_id
-                                in self.cute_indexed_reduction_block_ids
-                                and new_loops[i] > 32
-                            )
-                        )
+                        and max_chunk is not None
+                        and new_loops[i] > max_chunk
                     ):
-                        new_loops[i] = min(
-                            new_loops[i] if max_loop is None else max_loop,
-                            block_threshold,
+                        new_loops[i] = (
+                            prev_power_of_2(max_chunk)
+                            if self.backend_name == "cute"
+                            else min(max_chunk, block_threshold)
                         )
                         changed = True
                 if changed:
@@ -8730,6 +8771,31 @@ class ConfigSpec:
                         (False, True),
                         search_choices=(False, True) if pdl_searched else (False,),
                     )
+                    # Where a ``cute_pdl`` kernel releases its own dependents:
+                    # ``auto`` (the default) resolves at codegen to ``entry``
+                    # while the launch grid fits in one wave of resident CTAs
+                    # and to ``last_wave`` past it, ``entry`` right after the
+                    # wait, so the dependents launch while this kernel runs
+                    # (their CTAs sit resident at their own wait), ``exit``
+                    # after the body's last statement, ``none`` leaves the
+                    # implicit trigger at grid completion, ``last_wave``
+                    # releases at entry in the last wave's CTAs only (plain
+                    # entry for a one-wave grid).  Inert when ``cute_pdl`` is
+                    # off (the default value is then normalized away).  The
+                    # search leaves the placement at ``auto``: a kernel whose
+                    # back-to-back calls are separated by a plain launch (the
+                    # zero fill of an output) cannot observe its own placement
+                    # in isolation, so a searched placement is a coin flip
+                    # there, while the kernel's dependent in the real call
+                    # sequence pays for a non-releasing pick (mamba2_ssd
+                    # backward: dqkg alone reads 3.66 us under every
+                    # placement; the sequence reads 11.2 us per call with dqkg
+                    # at ``none`` and 10.3 at ``entry``).  The explicit values
+                    # stay valid for pins, seeds and users.
+                    fields["cute_pdl_release"] = EnumFragment(
+                        CUTE_PDL_RELEASE_CHOICES,
+                        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
+                    )
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
@@ -9633,6 +9699,19 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             return next_power_of_2(self.size_hint)
         return None
 
+    def _limits(self, base: ConfigSpec) -> tuple[int | None, int | None]:
+        """Persistent thread threshold and rolled chunk limit for this axis."""
+        threshold = base.reduction_loop_force_threshold
+        max_chunk = base.max_reduction_loop
+        if (
+            base.backend_name == "cute"
+            and self.block_id in base.cute_indexed_reduction_block_ids
+        ):
+            # CuTe argmin/argmax uses warp_reduction (threads_in_group <= 32).
+            threshold = 32 if threshold is None else min(threshold, 32)
+            max_chunk = 32 if max_chunk is None else min(max_chunk, 32)
+        return threshold, max_chunk
+
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
         # - unflatten: flat integer -> Config value via _flat_config()
@@ -9642,10 +9721,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         default = min(high, 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
-        if base.max_reduction_loop is not None:
-            force_threshold = base.reduction_loop_force_threshold
+        force_threshold, max_chunk = self._limits(base)
+        if max_chunk is not None:
             if force_threshold is not None and self.size_hint > force_threshold:
-                default = min(default, base.max_reduction_loop)
+                default = prev_power_of_2(default, max_chunk)
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.
             # Reserve the next power of two for None, retaining the old default
@@ -9687,6 +9766,21 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
+        # CuTe flattening repairs search/cache/seed budgets before decoding.
+        if base.backend_name == "cute" and type(value) is int and value > 0:
+            _, max_chunk = self._limits(base)
+            explicit_chunk = value == self._full_extent_chunk() or (
+                self.allow_non_power_of_two
+                and 8 <= value <= self.size_hint
+                and self.size_hint % value == 0
+                and value & (value - 1) != 0
+            )
+            if value >= self.size_hint and not explicit_chunk:
+                value = None
+            elif not explicit_chunk or (max_chunk is not None and value > max_chunk):
+                value = max(
+                    self._flat_fragment(base).low, prev_power_of_2(value, max_chunk)
+                )
         if value is None:
             return self._flat_fragment(base).high
         return value

@@ -70,6 +70,12 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/paired_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
+    "full_host_sum": (
+        "runtime/cute/full_sum.py",
+        "runtime/cute/paired_sum.py",
+        "_compiler/cute/full_sum_runtime.py",
+        "_compiler/cute/resident_reduction_runtime.py",
+    ),
     "block_scaled_mma": (
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",

@@ -117,6 +117,26 @@ tls: _TLS = cast("_TLS", threading.local())
 log = logging.getLogger(__name__)
 
 
+def _cute_tcgen05_output_store_facts(
+    device_ir: DeviceIR, node: torch.fx.Node
+) -> tuple[int | None, int]:
+    """``(output dtype width, store count)`` of one MMA, for the SMEM fit estimate."""
+    from .cute.cute_mma import _trace_mma_to_stores
+
+    stores = _trace_mma_to_stores(node, device_ir.graphs)
+    if not stores:
+        return None, 1
+    widths: list[int] = []
+    for store in stores:
+        source = store.args[0] if store.args else None
+        value = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+        if isinstance(value, torch.Tensor):
+            widths.append(value.dtype.itemsize)
+    if not widths:
+        return None, 1
+    return max(widths), len(stores)
+
+
 def _finalize_cute_tcgen05_search_planning(
     env: CompileEnvironment,
     planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
@@ -3896,6 +3916,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     analysis_keys,
                 ):
                     candidate, lhs, search_plan = search_candidates[0]
+                    output_store_facts = _cute_tcgen05_output_store_facts(
+                        device_ir,
+                        next(
+                            node
+                            for item, _lhs, _rhs, node in mma_candidates
+                            if item is candidate
+                        ),
+                    )
                     config_spec._cute_tcgen05_config.fission_bundle = (
                         env.cute_fission_plan is not None
                     )
@@ -3920,6 +3948,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         # body of ONE GEMM (its root tile loop around its K
                         # loop); kernels with several matmuls keep tcgen05.
                         warp_mma_plain_kernel=len(mma_candidates) == 1,
+                        output_dtype_bytes=output_store_facts[0],
+                        output_stores=output_store_facts[1],
                     )
                     if (
                         len(mma_candidates) == 1
@@ -3943,6 +3973,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate,
                                 mma_candidates[0][3],
                                 allocation_graphs,
+                                # A leading batch axis (bmm) rides the same
+                                # static persistent two-CTA schedule: the
+                                # batch coordinate only selects the TMA
+                                # tensors' leading mode and the scheduler's
+                                # extra axis.
+                                allow_leading_passthrough=(
+                                    candidate.operands.has_leading_passthrough
+                                ),
                                 allow_fp8_broadcasts=(
                                     len(device_ir.root_ids) == 1
                                     and env.cute_fission_plan is None

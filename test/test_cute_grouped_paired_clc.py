@@ -26,6 +26,7 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import skipUnlessBackends
@@ -105,14 +106,29 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
         for n in fn.body
         if isinstance(n, ast.If) and "tcgen05_prefill_state =" in ast.unparse(n)
     )
+    # The prologue publication is a named barrier the TMA-load warp skips
+    # (the startup prefill above runs ahead of it on that warp anyway).
     publish = next(
         n
         for n in fn.body
-        if isinstance(n, ast.Expr) and ast.unparse(n) == "cute.arch.sync_threads()"
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "not tcgen05_tma_warp"
+        and "tcgen05_row_union_publication_barrier.arrive_and_wait()"
+        in ast.unparse(n.body[0])
+    )
+    assert not any(
+        isinstance(n, ast.Expr) and ast.unparse(n) == "cute.arch.sync_threads()"
+        for n in fn.body
     )
     assert fn.body.index(prefix) < fn.body.index(publish)
     assert "griddepcontrol_wait" in ast.unparse(prefix.body[0])
-    assert ast.unparse(prefix.body[1]).endswith("tcgen05_ab_producer_state.clone()")
+    # The throttled CLC scheduler's credit for the prefilled first tile follows
+    # the dependent-launch wait; the private prefill state comes after it.
+    assert ast.unparse(prefix.body[1]) == (
+        "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):"
+        "\n    tcgen05_clc_throttle_barrier.arrive()"
+    )
+    assert ast.unparse(prefix.body[2]).endswith("tcgen05_ab_producer_state.clone()")
     writes = {
         n.id
         for n in ast.walk(prefix)
@@ -134,12 +150,18 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
     resumed = next(n for n in producer.body if isinstance(n, ast.For))
     assert "range(7, unroll_full=True)" in ast.unparse(resumed.iter)
     work = next(n for n in producer.body if isinstance(n, ast.While))
-    first = next(
+    gated = [
         n
         for n in work.body
         if isinstance(n, ast.If)
         and ast.unparse(n.test) == "not tcgen05_prefilled_first_record"
+    ]
+    # The throttled scheduler's per-tile credit, then the resumed prefetch.
+    assert len(gated) == 2
+    assert ast.unparse(gated[0].body[0]).endswith(
+        "tcgen05_clc_throttle_barrier.arrive()"
     )
+    first = gated[1]
     assert len(first.body) == 1 and isinstance(first.body[0], ast.For)
     latch = work.body[work.body.index(first) + 1]
     assert (
@@ -341,3 +363,91 @@ def test_full_population_keeps_both_profile_siblings(case):
     assert outcomes[0].effective in configs
     assert outcomes[0].effective[STARTUP_PREFILL_KEY] is True
     assert bound.config_spec.compiler_seed_configs == seeds
+
+
+def _clc_throttle_markers(source: str) -> tuple[int, int, int]:
+    """(barrier objects, TMA-load credits, scheduler waits) in ``source``."""
+    return (
+        source.count(
+            "tcgen05_clc_throttle_barrier = cutlass.pipeline.NamedBarrier("
+            "barrier_id=5, num_threads=64)"
+        ),
+        source.count("tcgen05_clc_throttle_barrier.arrive()"),
+        source.count("tcgen05_clc_throttle_barrier.arrive_and_wait()"),
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_clc_query_pacing_throttles_the_scheduler_to_tile_starts(case):
+    bound, _, config, source = case
+    # Default pacing ("tile"): one barrier, the leader TMA-load warp's credit
+    # for the prefilled first tile and one per later tile, the scheduler's
+    # wait right before its single query.
+    assert _clc_throttle_markers(source) == (1, 2, 1)
+    fn = device(source)
+    credit = (
+        "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):"
+        "\n    tcgen05_clc_throttle_barrier.arrive()"
+    )
+    per_tile = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "not tcgen05_prefilled_first_record"
+        and ast.unparse(n.body[0]) == credit
+    ]
+    assert len(per_tile) == 1
+    # The per-tile credit leads the tile's AB prefetch (so the next tile's
+    # query overlaps these loads) and the wait leads the query.
+    rendered = ast.unparse(fn)
+    prologue_credit = rendered.index("tcgen05_clc_throttle_barrier.arrive()")
+    assert prologue_credit < rendered.index("tcgen05_prefill_state =")
+    assert rendered.index(
+        "tcgen05_clc_throttle_barrier.arrive()", prologue_credit + 1
+    ) < rendered.index("tcgen05_initial_k in cutlass.range(")
+    wait = rendered.index("tcgen05_clc_throttle_barrier.arrive_and_wait()")
+    assert wait < rendered.index("_cute_issue_clc_query_nomulticast(")
+    assert rendered.rindex("cute.arch.sync_warp()", 0, wait) > rendered.rindex(
+        "tcgen05_sched_pipeline_producer_state.advance()", 0, wait
+    )
+    # The default pacing is implied: normalization never carries it, so a
+    # config spelling it out and one leaving it implicit read alike.
+    normalized = bound.config_spec.normalized_config(config)
+    assert TCGEN05_CLC_QUERY_PACING_CONFIG_KEY not in normalized
+    spelled = deepcopy(config)
+    spelled.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "tile"
+    assert bound.config_spec.normalized_config(spelled) == normalized
+    assert bound.to_code(spelled) == source
+    # Eager pacing: no barrier, no credits, no wait; the knob survives.
+    eager = deepcopy(config)
+    eager.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "eager"
+    eager_source = bound.to_code(eager)
+    assert _clc_throttle_markers(eager_source) == (0, 0, 0)
+    assert eager_source.count("_cute_issue_clc_query_nomulticast(") == 1
+    assert (
+        bound.config_spec.normalized_config(eager)[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY]
+        == "eager"
+    )
+
+
+@skipUnlessBackends(["cute"])
+def test_clc_query_pacing_needs_a_clc_scheduler(case):
+    bound, _, config, _ = case
+    # The transposed profile has no scheduler warp: the inert default pacing
+    # leaves the config silently, a requested non-default pacing is rejected
+    # strictly and repaired by the search normalization.
+    other = deepcopy(config)
+    other.config[SCHEDULE_KEY] = TRANSPOSED.name
+    other.config.pop(STARTUP_PREFILL_KEY)
+    other.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "tile"
+    assert (
+        TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
+        not in bound.config_spec.normalized_config(other)
+    )
+    other.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "eager"
+    with pytest.raises(InvalidConfig, match="tcgen05_clc_query_pacing"):
+        bound.config_spec.normalized_config(other)
+    repaired = deepcopy(other)
+    bound.config_spec.normalize(repaired, _fix_invalid=True)
+    assert TCGEN05_CLC_QUERY_PACING_CONFIG_KEY not in repaired.config
+    assert "tcgen05_clc_throttle_barrier" not in bound.to_code(repaired)
