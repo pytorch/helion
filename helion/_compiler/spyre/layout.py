@@ -138,7 +138,21 @@ def stick_dim_of(tensor: torch.Tensor) -> int:
 
     eps = device_size[-1]
     middle = device_size[1:-1]
-    for candidate in range(len(host_size)):
+    # Search from the trailing dim inwards. When two host dims both fit the
+    # device layout the tensor is square-ish and the layout alone cannot say
+    # which axis is the stick -- e.g. a 128x128 fp16 tensor has
+    # device_size [2, 128, 64], and ceil(128/64) == 2 holds for *either* dim
+    # with the other left as the middle extent. Taking the first match then
+    # reports dim 0, which swaps c0/c1 in every coordinate the operand
+    # contributes: the kernel computes correctly and writes its result
+    # transposed, with nothing in the stack raising
+    # (repros/square_pointwise_transposed.py).
+    #
+    # The trailing dim is the right tie-break: it is torch-spyre's own default
+    # tiled layout and the same choice made above when there is no layout to
+    # read at all, so an ambiguous tensor is treated exactly like an
+    # unannotated one.
+    for candidate in reversed(range(len(host_size))):
         others = [host_size[i] for i in range(len(host_size)) if i != candidate]
         if others != middle:
             continue
