@@ -1,0 +1,133 @@
+{
+  "created_utc": "2026-10-23T21:09:31.637221+00:00",
+  "python": "3.12.14",
+  "architecture": "aarch64",
+  "gpu": "NVIDIA GB300",
+  "shape": {
+    "batch": 4,
+    "heads": 16,
+    "head_dim": 64,
+    "sequences": [
+      2048,
+      4096,
+      8192
+    ],
+    "dtype": "bfloat16"
+  },
+  "sources": {
+    "forward": {
+      "commit": "a16ffc60cd6397f3b2bee6895a2609c7b0a7d094",
+      "archive": "sources/helion-forward.tar.gz",
+      "sha256": "02cc25b5cc916e35ad99da78ea54a91e5f6c375cb683243850d3d33483f7e140"
+    },
+    "backward": {
+      "commit": "61c840f3963a0d98ae15321d03ccdb977be81698",
+      "archive": "sources/helion-backward.tar.gz",
+      "sha256": "2ccf58633c8299d4d4eea9248bcf56c748630edd30530f95b72e6864def7b1e9"
+    }
+  },
+  "software_versions": {
+    "forward": {
+      "python": "3.12.14",
+      "torch": "2.15.0.dev20260829+cu130",
+      "triton": "3.8.0+gitb252c7c4",
+      "cudnn": "9.24.0.43",
+      "cuda": "13.0",
+      "cutlass": "4.7.0",
+      "flash-attn-4": "4.0.0b19",
+      "quack-kernels": "0.6.4",
+      "cuda-python": "13.3.1",
+      "cuda-bindings": "13.3.1",
+      "cuda-core": "1.0.1"
+    },
+    "backward": {
+      "python": "3.12.14",
+      "torch": "2.16.0.dev20261014+cu130",
+      "triton": "3.9.0+gitfc8d31a5",
+      "cudnn": "9.26.0.51",
+      "cuda": "13.0",
+      "cutlass": "4.7.0",
+      "flash-attn-4": "4.0.0b19",
+      "quack-kernels": "0.6.4",
+      "cuda-python": "13.3.1",
+      "cuda-bindings": "13.3.1",
+      "cuda-core": "1.0.1"
+    }
+  },
+  "reference_results": {
+    "forward": [
+      {
+        "shape": "b4h16s2048d64",
+        "median_ms": 0.04915200173854828,
+        "median_tflops": 699.3919752619078,
+        "physical_gpu": "1",
+        "accuracy": "PASS"
+      },
+      {
+        "shape": "b4h16s4096d64",
+        "median_ms": 0.13315199315547943,
+        "median_tflops": 1032.4479915480917,
+        "physical_gpu": "1",
+        "accuracy": "PASS"
+      },
+      {
+        "shape": "b4h16s8192d64",
+        "median_ms": 0.45947200059890747,
+        "median_tflops": 1196.6407572938567,
+        "physical_gpu": "1",
+        "accuracy": "PASS"
+      }
+    ],
+    "backward": [
+      {
+        "shape": "b4h16s2048d64",
+        "median_ms": 0.16860799491405487,
+        "median_tflops": 509.71063978198157,
+        "physical_gpu": "3",
+        "accuracy": "PASS"
+      },
+      {
+        "shape": "b4h16s4096d64",
+        "median_ms": 0.34095999598503113,
+        "median_tflops": 1007.9812113063502,
+        "physical_gpu": "3",
+        "accuracy": "PASS"
+      },
+      {
+        "shape": "b4h16s8192d64",
+        "median_ms": 1.2113919854164124,
+        "median_tflops": 1134.6924227895563,
+        "physical_gpu": "3",
+        "accuracy": "PASS"
+      }
+    ]
+  },
+  "configs": {
+    "configs/forward/causal.b4h16s2048d64.helion-cute.json": "45de69b45c8f1b9d40e7fe69b622c92cfbe68fe776587254c83dc2870de230cf",
+    "configs/forward/causal.b4h16s4096d64.helion-cute.json": "7f6dc8ff5c70106e12aab7ab1c85a4ce9404be03e65ae5024ee220c70f73aa4e",
+    "configs/forward/causal.b4h16s8192d64.helion-cute.json": "8417d1dff43f3f2e6e295ba6231e185369c4e02623d81c7be6a14ad788885f72",
+    "configs/backward/causal.b4h16s2048d64.helion-cute.json": "5c027155f6c59f1fc9e6a4a1be165a26a3a95fdde2f1d845142aa19c5fe7c861",
+    "configs/backward/causal.b4h16s2048d64.helion-cute.main.json": "c97b9e28cb4944313646cc5066ab1266a5f504bb66a012003cf4eee97a6878e4",
+    "configs/backward/causal.b4h16s2048d64.helion-cute.preprocess.json": "e6fe3327987caf3e22ef0669e6b84417d8d3643bc378b8615edd26d74f1abbcb",
+    "configs/backward/causal.b4h16s4096d64.helion-cute.json": "e6b05ff31ec308da9d0a62f5d614530aef577d08e05dccdf1d44a9326b07ca8f",
+    "configs/backward/causal.b4h16s4096d64.helion-cute.main.json": "22f2ba12c81e50c5bde60d4bd63f953cb25c3744114c036228e4050e513b8d8d",
+    "configs/backward/causal.b4h16s4096d64.helion-cute.preprocess.json": "2610e428d80351b44c0a51baedbd425753e4d7bbfb467c91d8f1b1666593ff60",
+    "configs/backward/causal.b4h16s8192d64.helion-cute.json": "7d9530c6f5b902e01d53bd45a2ee0fc0824324fb64c4cd2059d8471d4dd91dcb",
+    "configs/backward/causal.b4h16s8192d64.helion-cute.main.json": "519c2d6e6c821e49c613eec51392508fdd6fea4ed80d150977cafae8acac141d",
+    "configs/backward/causal.b4h16s8192d64.helion-cute.preprocess.json": "6be780522a62affab74a2eda098e69e19e53c38910d3f5dfd77fcc613f437240"
+  },
+  "kernel_bodies": {
+    "attn_stage": {
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/attention-gym-forward-fused/benchmarks/helion_attn/kernels.py",
+      "source_sha256": "d4cf40671518ca601d966d07b6da1d4df0fa5838259f755b754da91c3a5f478f"
+    },
+    "_flex_attention_bwd_preprocess": {
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/helion-backward/examples/flex_attention.py",
+      "source_sha256": "4bb35cf37ea758ee27ea09154cfe3c7fd77d3bf3f9cfe958facb4499e7fb8425"
+    },
+    "helion_flex_attention_backward_kernel": {
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/helion-backward/examples/flex_attention.py",
+      "source_sha256": "6854330f096e6c8ebc2e389ad3beb43b3c6c077b349e4b8d7468485c92e015fc"
+    }
+  }
+}
