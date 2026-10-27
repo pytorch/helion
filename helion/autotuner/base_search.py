@@ -134,6 +134,16 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
 # margin; ``inf`` keeps the whole ``top_k``.
 _FINAL_REBENCHMARK_MAX_SPREAD_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD"
 _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT = 1.5
+# Among the finalists the final verification cannot tell apart (within this
+# fraction of the fastest one's steady reading) the backend's preference
+# decides (``Backend.finalist_preference``): what a config costs or saves
+# outside the kernel's own isolated timing, such as the dependent launch a
+# CuTe kernel's successor overlaps with its tail.  The final selection's
+# alternating steady windows read identical configs ~0.3-0.5% apart.
+_FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV = (
+    "HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE"
+)
+_FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT = 0.005
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 # The only env override of the harness-grade final selection (full effort):
@@ -2928,23 +2938,29 @@ class PopulationBasedSearch(BaseSearch):
             return default
 
     def _final_rebenchmark_pinned_tolerance(self) -> float:
-        raw = os.getenv(_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV)
+        return self._tolerance_from_env(
+            _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV,
+            _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT,
+        )
+
+    def _final_selection_preference_tolerance(self) -> float:
+        return self._tolerance_from_env(
+            _FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV,
+            _FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT,
+        )
+
+    def _tolerance_from_env(self, name: str, default: float) -> float:
+        raw = os.getenv(name)
         if raw is None:
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            return default
         try:
             tolerance = float(raw)
         except ValueError:
-            self.log.warning(
-                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
-            )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
+            return default
         if not math.isfinite(tolerance) or tolerance < 0:
-            self.log.warning(
-                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
-            )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
+            return default
         return tolerance
 
     def _final_rebenchmark_max_spread(self) -> float:
@@ -2994,6 +3010,69 @@ class PopulationBasedSearch(BaseSearch):
                 f"({self.format_performance(best)}); the rest are not re-timed."
             )
         return kept
+
+    def _prefer_backend_preference_within_tolerance(
+        self, after: PopulationMember, live: Sequence[PopulationMember]
+    ) -> PopulationMember:
+        """Among the live finalists within the preference tolerance of the
+        fastest one, the config the backend ranks first wins
+        (``Backend.finalist_preference``: lower is better, the fastest of
+        equal rank keeps its place).
+
+        The isolated timing of a kernel cannot see everything a config
+        costs or saves in the sequence it will run in: a CuTe kernel whose
+        back-to-back calls are separated by a plain launch (a host zero fill)
+        reads the same with and without dependent launch, while its
+        successor in the real call sequence launches 0.3-1 us earlier when
+        the kernel releases its dependents.  Finalists that tie within the
+        steady windows' resolution are therefore ranked by the backend's
+        preference instead of by noise.
+
+        The backend is reached through its registered name in the kernel's
+        settings (``Settings.backend`` is validated against the registry):
+        the hook is a class method, so no backend instance is needed, and a
+        search built around a stand-in spec ranks by the real backend's rule.
+        The hook reads a finalist's lowering off its rendered module, which
+        it asks for on demand (``BoundKernel.to_code``, once per finalist).
+        """
+        from .._compiler.backend_registry import get_backend_class
+
+        hook = get_backend_class(self.settings.backend).finalist_preference
+        sources: dict[Config, str] = {}
+        ranks: dict[Config, int] = {}
+
+        def preference(member: PopulationMember) -> int:
+            config = member.config
+            if config not in ranks:
+
+                def source() -> str:
+                    if config not in sources:
+                        sources[config] = self.kernel.to_code(config) or ""
+                    return sources[config]
+
+                ranks[config] = hook(config, source)
+            return ranks[config]
+
+        best_rank = preference(after)
+        if best_rank == 0:
+            return after
+        tolerance = self._final_selection_preference_tolerance()
+        band = [
+            member
+            for member in live
+            if member is not after and member.perf <= after.perf * (1.0 + tolerance)
+        ]
+        preferred = [member for member in band if preference(member) < best_rank]
+        if not preferred:
+            return after
+        chosen = min(preferred, key=lambda m: (preference(m), m.perf))
+        self.log(
+            "Final selection preferred a config the backend ranks ahead within "
+            f"{tolerance:.2%} of the fastest finalist: "
+            f"{self.format_performance(chosen.perf)} vs "
+            f"{self.format_performance(after.perf)}"
+        )
+        return chosen
 
     @staticmethod
     def _repeat_for_target_ms(target_ms: float, best_perf_so_far: float) -> int:
@@ -3155,7 +3234,11 @@ class PopulationBasedSearch(BaseSearch):
             if not live_finalists:
                 raise exc.NoConfigFound
             after = self._prefer_pinned_within_tolerance(
-                min(live_finalists, key=performance), live_finalists, pinned_configs
+                self._prefer_backend_preference_within_tolerance(
+                    min(live_finalists, key=performance), live_finalists
+                ),
+                live_finalists,
+                pinned_configs,
             )
         if after.config != before.config:
             self.log(
@@ -3393,7 +3476,11 @@ class PopulationBasedSearch(BaseSearch):
         if not live:
             raise exc.NoConfigFound
         after = self._prefer_pinned_within_tolerance(
-            min(live, key=performance), live, pinned_configs
+            self._prefer_backend_preference_within_tolerance(
+                min(live, key=performance), live
+            ),
+            live,
+            pinned_configs,
         )
         self._log_final_selection(
             finalists,

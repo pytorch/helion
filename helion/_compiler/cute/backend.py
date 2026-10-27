@@ -42,6 +42,7 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
+from .pdl_release import generic_release_rendered
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -50,6 +51,7 @@ from .thread_budget import check_thread_limit
 from .thread_budget import thread_idx_axis
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Mapping
 
@@ -1615,6 +1617,35 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    @classmethod
+    def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
+        """A kernel that renders the generic early release of its programmatic
+        dependents (``cute_pdl`` on the generic path, released at entry or
+        from the last wave) ranks ahead of one that does not, among finalists
+        the autotuner's final verification cannot tell apart.
+
+        The knob's own cost or gain is invisible to the kernel's isolated
+        timing whenever a plain launch separates its back-to-back calls (the
+        zero fill of an output: the calls are then not dependents of each
+        other), while the kernel's successor in the real call sequence
+        launches 0.3-1 us earlier behind a releasing primary (mamba2_ssd
+        backward: dqkg alone reads 3.65 us with the knob on or off; the
+        sequence reads 10.3 us per call with it on against 11.2 off).
+
+        Whether a config renders that release is read off its generated
+        module (``generic_release_rendered``), not off its keys: the tcgen05,
+        warp-MMA, collective and block-scaled families own their wait and
+        release (``DeviceFunction._cute_pdl_applies``), so on them the knob
+        and its placement are inert and every config ranks alike; a ranking
+        by keys there would break ties between unrelated knobs (matmul
+        backward s2: a clc-persistent finalist 0.5% behind in the autotuner's
+        regime, 7% behind in the catalogue's).  A config without the knob
+        ranks last without a render.
+        """
+        if config.config.get("cute_pdl") is not True:
+            return 1
+        return 0 if generic_release_rendered(source()) else 1
+
     def build_standalone_code(
         self,
         bound: BoundKernel[Any],
@@ -2168,6 +2199,7 @@ class CuteBackend(Backend):
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_pdl_release"
             or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
@@ -3551,6 +3583,19 @@ class CuteBackend(Backend):
                         f"shared reductions were sized for block={sized_for} "
                         f"but the kernel launches with {block_arg}",
                     )
+            # Record the static launch shape for the kernel definition's
+            # codegen (``_implicit_pdl_release`` sizes the resident CTAs per
+            # SM from it); an argument-sized axis leaves it unknown.
+            static_block = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
+            device_function.cute_state.launch_block = (
+                (
+                    int(static_block.group(1)),
+                    int(static_block.group(2)),
+                    int(static_block.group(3)),
+                )
+                if static_block is not None
+                else None
+            )
             launcher_args = [block_arg]
             compile_options: list[str] = []
             # One --ptxas-options flag carries them all (a second would

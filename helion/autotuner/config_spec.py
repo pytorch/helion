@@ -154,6 +154,8 @@ from .._compiler.cute.cute_mma_dag import mma_dag_seed_configs
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.cutedsl_compat import hinted_cp_async_available
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
+from .._compiler.cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
 from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
 from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
@@ -1065,6 +1067,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "cute_simt_mma",
         "cute_simt_mma_layout",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_min_blocks_per_mp",
         "cute_tiles_per_block",
         "epilogue_subtile",
@@ -1220,6 +1223,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1374,6 +1378,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
@@ -1553,6 +1558,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_pdl_release",
         "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -5752,7 +5758,20 @@ class ConfigSpec:
     def _normalize_cute_pdl(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """``cute_pdl`` is a boolean (programmatic dependent launch)."""
+        """``cute_pdl`` is a boolean (programmatic dependent launch);
+        ``cute_pdl_release`` names where the kernel releases its dependents
+        (``auto`` unless given: ``entry`` or ``none`` by the grid, resolved at
+        codegen so a flat configuration, which always carries the value, and
+        a dict without the key render alike) and only acts when ``cute_pdl``
+        is on.  With the knob off a non-default placement stays in the config
+        (inert, like every other knob the kernel does not read) so a flat
+        configuration survives the unflatten/flatten round trip the search
+        relies on; the default placement is dropped there, so the default
+        config and every knob-off config without a placement read alike.
+        Config identity is therefore not canonical for this key: a knob-off
+        config with ``none`` and one without the key, or a knob-on config
+        with ``auto`` and one without the key, hash and compare as different
+        configs while generating the same code."""
         pdl = config.get("cute_pdl", False)
         if type(pdl) is not bool:
             if not fix_invalid:
@@ -5760,6 +5779,18 @@ class ConfigSpec:
             pdl = False
         if "cute_pdl" in config or pdl:
             config["cute_pdl"] = pdl
+        release = config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        if release not in CUTE_PDL_RELEASE_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_pdl_release must be one of {CUTE_PDL_RELEASE_CHOICES!r}, "
+                    f"got {release!r}"
+                )
+            release = CUTE_PDL_RELEASE_DEFAULT
+        if not pdl and release == CUTE_PDL_RELEASE_DEFAULT:
+            config.pop("cute_pdl_release", None)
+        elif "cute_pdl_release" in config:
+            config["cute_pdl_release"] = release
 
     def _normalize_cute_tiles_per_block(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -8714,6 +8745,31 @@ class ConfigSpec:
                     fields["cute_pdl"] = EnumFragment(
                         (False, True),
                         search_choices=(False, True) if pdl_searched else (False,),
+                    )
+                    # Where a ``cute_pdl`` kernel releases its own dependents:
+                    # ``auto`` (the default) resolves at codegen to ``entry``
+                    # while the launch grid fits in one wave of resident CTAs
+                    # and to ``last_wave`` past it, ``entry`` right after the
+                    # wait, so the dependents launch while this kernel runs
+                    # (their CTAs sit resident at their own wait), ``exit``
+                    # after the body's last statement, ``none`` leaves the
+                    # implicit trigger at grid completion, ``last_wave``
+                    # releases at entry in the last wave's CTAs only (plain
+                    # entry for a one-wave grid).  Inert when ``cute_pdl`` is
+                    # off (the default value is then normalized away).  The
+                    # search leaves the placement at ``auto``: a kernel whose
+                    # back-to-back calls are separated by a plain launch (the
+                    # zero fill of an output) cannot observe its own placement
+                    # in isolation, so a searched placement is a coin flip
+                    # there, while the kernel's dependent in the real call
+                    # sequence pays for a non-releasing pick (mamba2_ssd
+                    # backward: dqkg alone reads 3.66 us under every
+                    # placement; the sequence reads 11.2 us per call with dqkg
+                    # at ``none`` and 10.3 at ``entry``).  The explicit values
+                    # stay valid for pins, seeds and users.
+                    fields["cute_pdl_release"] = EnumFragment(
+                        CUTE_PDL_RELEASE_CHOICES,
+                        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
                     )
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()

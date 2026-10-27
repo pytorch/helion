@@ -912,6 +912,12 @@ class CuteDeviceFunctionState:
         # cross-warp reductions for (None when it rewrote nothing); the
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
+        # The static ``block=`` the launcher call was emitted with
+        # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
+        # kernel definition's codegen); None before that call, and for a
+        # launch with an argument-sized axis.  ``_implicit_pdl_release``
+        # estimates the resident CTAs per SM from it.
+        self.launch_block: tuple[int, int, int] | None = None
         self.owned_root_block_dims: tuple[int, int, int] | None = None
         # ``(needed, capacity)`` when the computed-fragment owner declined the
         # current root because its shared memory exceeds the CTA capacity; a

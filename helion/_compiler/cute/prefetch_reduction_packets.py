@@ -53,6 +53,7 @@ _COLLECTIVES = {
 }
 _PREAMBLE_SYNC = {
     "cute.arch.griddepcontrol_wait",
+    "cute.arch.griddepcontrol_launch_dependents",
     "cute.arch.mbarrier_init",
     "cute.arch.mbarrier_init_fence",
     "cute.arch.cluster_arrive_relaxed",
@@ -64,6 +65,7 @@ _PURE = _CASTS | {
     "cute.arch.thread_idx",
     "cute.arch.block_idx",
     "cute.arch.block_dim",
+    "cute.arch.grid_dim",
     "ir.VectorType.get",
     "cute.math.rsqrt",
     "cute.math.sqrt",
