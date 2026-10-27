@@ -3342,8 +3342,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 "role-local scheduler codegen"
             )
             plan = self._tcgen05_plan()
-            assert plan is not None and plan.is_clc_persistent and plan.cluster_m > 1, (
-                "staged work-tile mailbox is only validated for clustered CLC"
+            assert plan is not None and (
+                (plan.is_clc_persistent and plan.cluster_m > 1)
+                or self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
+            ), (
+                "staged work-tile mailbox is only validated for clustered CLC "
+                "and the grouped N,M worklist scheduler"
             )
             stage_count = self._tcgen05_sched_stage_count()
             alloc_extent = f"cutlass.Int32({field_count * stage_count})"
