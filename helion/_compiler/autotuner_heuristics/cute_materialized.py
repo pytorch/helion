@@ -76,6 +76,12 @@ class CuteMaterializedMmaHeuristic(AutotunerHeuristic):
                         ),
                     )
                 )
+        # An ordered barrier chain's GEMM launches may run the two-CTA
+        # persistent pipeline (``tcgen05_region_pid_types``): per K tile, the
+        # all-persistent recipe and one launch left flat, each launch on its
+        # geometry-chosen CTA-pair tile.  Appended after the flat seeds, so
+        # the promoted default stays the flat one.
+        configurations.extend(spec._cute_tcgen05_config.region_two_cta_seed_configs())
         for config in configurations:
             # Apply the same tail/pipeline projections used by search before
             # promoting a seed, so its measured schedule stays reachable.

@@ -48,6 +48,7 @@ from ._warp_mma_runtime import lds_bf16_as_f32  # noqa: F401
 from ._warp_mma_runtime import lds_f16_as_f32  # noqa: F401
 from ._warp_mma_runtime import lds_s32  # noqa: F401
 from ._warp_mma_runtime import mma_tf32  # noqa: F401
+from ._warp_mma_runtime import round_bf16_f32  # noqa: F401
 from ._warp_mma_runtime import stg_b32  # noqa: F401
 from ._warp_mma_runtime import stg_bf16  # noqa: F401
 from ._warp_mma_runtime import stg_f16  # noqa: F401
@@ -96,6 +97,188 @@ def ldg_s32(
 
 
 @dsl_user_op
+def ldg_s64(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Int64:
+    """``ld.global.s64``: one int64 value (a loop bound read from a table of
+    chunk offsets)."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.s64 $0, [$1];",
+        "=l,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
+# -- predicated global accesses of a ragged root tile ---------------------------
+#
+# A root tile larger than its axis extent (``M = 8`` rows under a 16-row MMA
+# atom) reads and writes rows that do not exist.  The operand staging zero-
+# fills them (``cp_async_16_zfill`` with ``src_bytes`` 0: nothing is read),
+# the side loads read zero under a false predicate (the frontend's masked-
+# value model: a padded element loads as 0) and the stores are guarded by
+# the emitter.  ``pred`` is an Int32 (0: out of bounds).
+
+
+@dsl_user_op
+def cp_async_16_zfill(
+    smem_address: object,
+    gmem_address: object,
+    src_bytes: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp.async.cg.shared.global [dst], [src], 16, src_bytes``: one 16-byte
+    packet whose bytes past ``src_bytes`` (0 or 16 here) are zero-filled; at
+    0 the source is not read."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+        "r,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def ldg_f32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``ld.global.f32`` under ``pred`` (0.0 when it is 0)."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.f32 $0, 0f00000000; "
+        "@p ld.global.f32 $0, [$1]; }",
+        "=f,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def ldg_s32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> cutlass.Int32:
+    """``ld.global.s32`` under ``pred`` (0 when it is 0)."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.s32 $0, 0; "
+        "@p ld.global.s32 $0, [$1]; }",
+        "=r,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def ldg_b32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> cutlass.Uint32:
+    """``ld.global.b32`` under ``pred`` (0 when it is 0: a pair of 16-bit
+    zeros)."""
+    result = llvm.inline_asm(
+        T.i32(),
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; "
+        "@p ld.global.b32 $0, [$1]; }",
+        "=r,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Uint32(result)
+
+
+@dsl_user_op
+def ldg_v2_f32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v2.f32`` under ``pred`` (two zeros when it is 0)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.s32 p, $3, 0; mov.f32 $0, 0f00000000; "
+        "mov.f32 $1, 0f00000000; @p ld.global.v2.f32 {$0, $1}, [$2]; }",
+        "=f,=f,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return _floats(result, 2, loc=loc, ip=ip)
+
+
+def _ldg_b16_as_f32_pred(
+    kind: str, gmem_address: object, pred: object, *, loc: object, ip: object
+) -> cutlass.Float32:
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; .reg .b16 h; setp.ne.s32 p, $2, 0; mov.b16 h, 0; "
+        f"@p ld.global.b16 h, [$1]; cvt.f32.{kind} $0, h; }}",
+        "=f,l,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def ldg_f16_as_f32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """One fp16 element widened to fp32 under ``pred`` (0.0 when it is 0)."""
+    return _ldg_b16_as_f32_pred("f16", gmem_address, pred, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_bf16_as_f32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """One bf16 element widened to fp32 under ``pred`` (0.0 when it is 0)."""
+    return _ldg_b16_as_f32_pred("bf16", gmem_address, pred, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def f32_bits(value: object, *, loc: object = None, ip: object = None) -> object:
     """``mov.b32``: the bit pattern of an fp32 value (an operand word the
     tensor core truncates to tf32)."""
@@ -121,6 +304,56 @@ def bits_f32(word: object, *, loc: object = None, ip: object = None) -> object:
         "mov.b32 $0, $1;",
         "=f,r",
         has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def shfl_up_add_f32(
+    value: object, delta: object, *, loc: object = None, ip: object = None
+) -> object:
+    """``value + value_of(lane - delta)``, the lanes below ``delta`` keeping
+    ``value`` (``shfl.sync.up`` and an add under its in-range predicate):
+    one step of an inclusive prefix sum over the lanes ``delta`` apart.
+    Every lane must take part."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(delta).ir_value(loc=loc, ip=ip),
+        ],
+        "{.reg .f32 t; .reg .pred p; "
+        "shfl.sync.up.b32 t|p, $1, $2, 0x0, 0xffffffff; "
+        "@p add.f32 $0, $1, t; @!p mov.f32 $0, $1;}",
+        "=f,f,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def shfl_down_add_f32(
+    value: object, delta: object, *, loc: object = None, ip: object = None
+) -> object:
+    """``value + value_of(lane + delta)``, the lanes within ``delta`` of the
+    top keeping ``value``: one step of a reversed inclusive prefix sum."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(delta).ir_value(loc=loc, ip=ip),
+        ],
+        "{.reg .f32 t; .reg .pred p; "
+        "shfl.sync.down.b32 t|p, $1, $2, 0x1f, 0xffffffff; "
+        "@p add.f32 $0, $1, t; @!p mov.f32 $0, $1;}",
+        "=f,f,r",
+        has_side_effects=True,
         loc=loc,
         ip=ip,
         **_ASM_KW,
@@ -335,6 +568,107 @@ def sts_v2_b32(
         ],
         "st.shared.v2.b32 [$0], {$1, $2};",
         "r,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def l2_policy_evict_last(*, loc: object = None, ip: object = None) -> cutlass.Int64:
+    """``createpolicy.fractional.L2::evict_last``: the cache-policy word of
+    the hinted operand packets (``cp_async_16_l2``), created once per
+    kernel."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [],
+        "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+        "=l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
+@dsl_user_op
+def l2_policy_evict_first(*, loc: object = None, ip: object = None) -> cutlass.Int64:
+    """``createpolicy.fractional.L2::evict_first``: the cache-policy word of
+    streamed operand packets read once."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [],
+        "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+        "=l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Int64(result)
+
+
+# The hinted packet forms below are the ones ``helion.runtime.cute.sass_check``
+# verifies after assembly: the CuTe DSL's assembler (cutlass-dsl 4.7.0) has
+# encoded a hinted LDGSTS whose shared address it split into the
+# ``[R + UR + imm]`` form with the descriptor and address-offset fields
+# colliding (an illegal instruction at launch), so a kernel that emits them
+# declares the check and the launcher refuses the kernel when its SASS shows
+# that form (see ``emit_issue_tile``).
+
+
+@dsl_user_op
+def cp_async_16_l2(
+    smem_address: object,
+    gmem_address: object,
+    policy: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp.async.cg.shared.global.L2::cache_hint`` of one 16-byte packet
+    under the L2 cache policy ``policy`` (``l2_policy_evict_last`` /
+    ``l2_policy_evict_first``)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2;",
+        "r,l,l,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def cp_async_16_l2_zfill(
+    smem_address: object,
+    gmem_address: object,
+    src_bytes: object,
+    policy: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``cp_async_16_zfill`` under the L2 cache policy ``policy``: the bytes
+    past ``src_bytes`` (0 or 16) are zero-filled; at 0 nothing is read."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(src_bytes).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;",
+        "r,l,r,l,~{memory}",
         has_side_effects=True,
         loc=loc,
         ip=ip,

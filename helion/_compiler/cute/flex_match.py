@@ -845,6 +845,44 @@ class _Body(NamedTuple):
     role_placeholders: tuple[int, int, int]
 
 
+def flex_dense_plan(
+    *,
+    trivial: bool,
+    score_region: bool,
+    mask_region: bool,
+    scale_peeled: bool,
+    q_seq: int,
+    kv_seq: int,
+    head_dim: int,
+    head_dim_v: int,
+    contiguous_operands: bool,
+) -> bool:
+    """Whether a flex envelope is dense attention on the dense surface's
+    geometry (``AttentionScorePlan.flex_dense``).
+
+    The walk must be trivial (one KV block covering the sequence: the
+    tables are never read) with neither region (a constant-true mask
+    predicate and the identity ``score_mod``, the scale peeled), so every
+    query row attends every key; and the geometry must be the dense
+    surface's own -- equal Q and K/V lengths that are a multiple of the
+    128-row tile (the dense bodies have no ragged last tile), symmetric
+    head dims (the asymmetric pair is the plain fa4 body's alone) and
+    contiguous operands (the rank-3 TMA maps; strided operands take the
+    rank-4 maps of the flex body).  Anything else keeps the flex body,
+    which hosts it today: fail closed.
+    """
+    return (
+        trivial
+        and not score_region
+        and not mask_region
+        and scale_peeled
+        and q_seq == kv_seq
+        and q_seq % FLEX_KV_BLOCK == 0
+        and head_dim == head_dim_v
+        and contiguous_operands
+    )
+
+
 def single_tile_pair_walk_decline(match: FlexMatch) -> str | None:
     """Why the single-tile body's cooperative pair cannot host this flex
     envelope, or ``None``.
@@ -856,11 +894,15 @@ def single_tile_pair_walk_decline(match: FlexMatch) -> str | None:
     -- ragged lengths, grouped-query heads, the score region, the host
     words table's cursor walk (long KV lengths) and strided operands
     (rank-4 TMA maps) included; the trivial (table-less) walk and the
-    asymmetric widths still take the generic lowering.
+    asymmetric widths still take the generic lowering.  A dense flex plan
+    (``flex_dense``) walks nothing: it takes the dense surface's families at
+    every width the fused flash bodies host.
     """
     plan = match.plan
     walk = plan.kv_walk
     assert walk is not None
+    if plan.flex_dense:
+        return None
     if flash_pair_head_dims_supported(match.head_dim, match.head_dim_v):
         return None
     if match.head_dim != match.head_dim_v:
@@ -2314,6 +2356,25 @@ def _assemble(
         host_scalars=regions.host_scalars,
         scale_arg=part_body.scale_symbol,
         scale_peeled=part_body.scale_peeled,
+        flex_dense=flex_dense_plan(
+            trivial=trivial,
+            score_region=score_region is not None,
+            mask_region=mask_region is not None,
+            scale_peeled=part_body.scale_peeled,
+            q_seq=q_seq,
+            kv_seq=kv_seq,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            contiguous_operands=all(
+                strides == contiguous_strides(shape)
+                for strides, shape in (
+                    (q_strides, (batch, heads, q_seq, head_dim)),
+                    (k_strides, (batch, kv_heads, kv_seq, head_dim)),
+                    (v_strides, (batch, kv_heads, kv_seq, head_dim_v)),
+                    (o_strides, (batch, heads, q_seq, head_dim_v)),
+                )
+            ),
+        ),
     )
     match = FlexMatch(
         plan=plan,

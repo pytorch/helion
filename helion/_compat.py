@@ -257,6 +257,8 @@ if triton_is_available():
             or hasattr(triton.language, "_experimental_make_tensor_descriptor")
         ):
             return False
+        if torch.xpu.is_available():
+            return False
         try:
             module = importlib.import_module("triton.tools.tensor_descriptor")
         except ImportError:

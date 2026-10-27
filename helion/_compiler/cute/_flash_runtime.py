@@ -203,8 +203,17 @@ def flash_fa4_shared_storage(
     flex_aux_bytes: int = 0,
     flex_coop_bytes: int = 0,
     o_stage: int = 2,
+    bias_elems: int = 0,
+    bias_stages: int = 0,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
+
+    ``bias_elems`` / ``bias_stages`` (``cute_flash_bias_stage='tma'``) add the
+    staged score-bias ring: ``sBias`` holds ``bias_elems`` elements of
+    ``dtype`` (``bias_stages`` stages of both query tiles' 128 x kv_tile_n
+    bias box, TMA-swizzled like the epilogue tile) behind the K/V ring, and
+    ``bias_mbar_ptr`` its full (TMA transaction) / empty (softmax release)
+    barriers, ``bias_stages`` of each.
 
     16-warp / 512-thread layout: 2 softmax warpgroups (128 threads each), a
     correction warpgroup, and single MMA/load/epilogue/empty warps. The raw
@@ -276,6 +285,7 @@ def flash_fa4_shared_storage(
             q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
             k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
             v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, bias_stages * 2]
             s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -310,6 +320,7 @@ def flash_fa4_shared_storage(
             ]
             sK: cute.struct.Align[cute.struct.MemRange[dtype, k_elements], 1024]
             sV: cute.struct.Align[cute.struct.MemRange[dtype, v_elements], 1024]
+            sBias: cute.struct.Align[cute.struct.MemRange[dtype, bias_elems], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
@@ -320,6 +331,7 @@ def flash_fa4_shared_storage(
         class SharedStorage:
             q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
             kv_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, bias_stages * 2]
             # Raw mbarriers (FA4-style). s_full / o_full are tcgen05.commit (cnt 1);
             # pfor = softmax(P[0:96]) + correction (cnt 2*128); pfor2 = softmax(P[96:128]) (cnt 128).
             s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -358,6 +370,7 @@ def flash_fa4_shared_storage(
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
             sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
+            sBias: cute.struct.Align[cute.struct.MemRange[dtype, bias_elems], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
@@ -366,6 +379,7 @@ def flash_fa4_shared_storage(
     class SharedStorage:
         q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
         kv_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+        bias_mbar_ptr: cute.struct.MemRange[cutlass.Int64, bias_stages * 2]
         # Raw mbarriers (FA4-style). s_full / o_full are tcgen05.commit (cnt 1);
         # pfor = softmax(P[0:96]) + correction (cnt 2*128); pfor2 = softmax(P[96:128]) (cnt 128).
         s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -403,6 +417,7 @@ def flash_fa4_shared_storage(
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
         sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
+        sBias: cute.struct.Align[cute.struct.MemRange[dtype, bias_elems], 1024]
 
     return SharedStorage
 
@@ -1729,6 +1744,34 @@ def add_score_bias_t2r_contiguous(
             score[i + j] = (
                 cutlass.Float32(score[i + j]) + cutlass.Float32(bias_val) * bias_scale
             )
+
+
+def add_score_bias_smem_t2r(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    sBiasBox: cute.Tensor,
+    col_in_box: int,
+    bias_scale: Float32,
+) -> None:
+    """Add a TMA-staged score bias to a loaded chunk of one score row.
+
+    ``sBiasBox`` is the (128 rows, 64 columns) swizzled shared-memory box the
+    load warp filled for this query tile and KV tile half
+    (``cute_flash_bias_stage='tma'``); the chunk's ``cute.size(tLDrS)``
+    contiguous columns start at ``col_in_box`` inside it. The thread's row is
+    the chunk coordinate's row, as on the global-memory path; the per-element
+    arithmetic (``score + f32(bias) * bias_scale``) is the same expression, so
+    the two paths round identically.
+    """
+    row = cast("Any", tLDcS)[0][0]
+    cols = cute.size(tLDrS)
+    src = cute.local_tile(sBiasBox, (128, cols), (0, col_in_box // cols))[row, None]
+    frg = cute.make_fragment_like(src)
+    cute.autovec_copy(src, frg)
+    score = cast("Any", tLDrS)
+    bias = cast("Any", frg)
+    for i in range(cols):
+        score[i] = cutlass.Float32(score[i]) + cutlass.Float32(bias[i]) * bias_scale
 
 
 def _add_affine_bias_t2r_hoisted(

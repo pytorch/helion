@@ -20,10 +20,13 @@ from test.test_cute_mma_dag_gpu import _M4_ARGS
 from test.test_cute_mma_dag_gpu import _assert_close
 from test.test_cute_mma_dag_gpu import _bwd_args
 from test.test_cute_mma_dag_gpu import _dqk_args
+from test.test_cute_mma_dag_gpu import _dqkg_args
 from test.test_cute_mma_dag_gpu import _dstate_args
 from test.test_cute_mma_dag_gpu import _dv_args
+from test.test_cute_mma_dag_gpu import _engine
 from test.test_cute_mma_dag_gpu import _fwd_args
 from test.test_cute_mma_dag_gpu import _fwd_h_delta_args
+from test.test_cute_mma_dag_gpu import _fwd_h_delta_varlen_args
 from test.test_cute_mma_dag_gpu import _fwd_o_args
 from test.test_cute_mma_dag_gpu import _head_sum_args
 from test.test_cute_mma_dag_gpu import _inputs
@@ -31,14 +34,19 @@ from test.test_cute_mma_dag_gpu import _inputs3
 from test.test_cute_mma_dag_gpu import _inputs4
 from test.test_cute_mma_dag_gpu import _inputs_kda
 from test.test_cute_mma_dag_gpu import _inputs_m4
+from test.test_cute_mma_dag_gpu import _inputs_varlen4
+from test.test_cute_mma_dag_gpu import _inputs_varlen_tokens
 from test.test_cute_mma_dag_gpu import _kda_args
 from test.test_cute_mma_dag_gpu import _kernel_fn
 from test.test_cute_mma_dag_gpu import _probe_kernels
 from test.test_cute_mma_dag_gpu import _randn
+from test.test_cute_mma_dag_gpu import _run_backend
 from test.test_cute_mma_dag_gpu import _run_triton
 from test.test_cute_mma_dag_gpu import _tensors
 from test.test_cute_mma_dag_tcgen05 import _bind_fwd_o_anch_f32  # noqa: F401
 from test.test_cute_mma_dag_tcgen05 import _matmul_layernorm
+from test.test_cute_mma_dag_tcgen05 import _probe_batch_rescale
+from test.test_cute_mma_dag_tcgen05 import _probe_batch_rewrite
 from test.test_cute_mma_dag_tcgen05 import _probe_carry2
 from test.test_cute_mma_dag_tcgen05 import _probe_dotless_store
 from test.test_cute_mma_dag_tcgen05 import _probe_drainrace
@@ -52,6 +60,7 @@ from test.test_cute_mma_dag_tcgen05 import _probe_rawlate
 from test.test_cute_mma_dag_tcgen05 import _probe_recompute
 from test.test_cute_mma_dag_tcgen05 import _probe_register_carry
 from test.test_cute_mma_dag_tcgen05 import _probe_register_carry_budget
+from test.test_cute_mma_dag_tcgen05 import _probe_update_first
 from test.test_cute_mma_dag_tcgen05 import _rmw_scalar_first
 from test.test_cute_mma_dag_tcgen05 import _snap_reread
 from test.test_cute_mma_dag_tcgen05 import _snap_reread2
@@ -115,6 +124,26 @@ def _run_cute(
         for lhs, rhs in zip(outputs[0], other, strict=True):
             assert torch.equal(lhs, rhs)
     return source, outputs[0]
+
+
+@pytest.mark.parametrize(
+    ("bdv", "warps", "stages"), ((64, 4, 2), (32, 8, 4), (16, 4, 1))
+)
+def test_varlen_state_pass_matches_the_triton_backend(
+    bdv: int, warps: int, stages: int
+) -> None:
+    # The varlen state pass under the tcgen05 mode: the loop bounds are
+    # tensor elements (a dynamic trip count), so the TMA prologue, the
+    # lookahead issues and the drain are guarded by them.
+    chunks = (5, 1, 3)
+    t = _inputs_varlen4(h=2, chunks=chunks, d=128, dv=64, dtype=torch.bfloat16)
+    args = _fwd_h_delta_varlen_args(t, chunks, 2)
+    fn = _kernel_fn("fwd_h_delta_varlen")
+    source, out = _run_cute(fn, args, _config([bdv], warps, stages))
+    assert source.count("_helion_mma_dag.ldg_s64(") == 2
+    assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in source
+    assert "if md_scalar_1 > md_scalar:" in source
+    _assert_close(out, _run_triton(fn, args, [bdv]), scaled=True)
 
 
 # kernel, mode, has_h0, (n, d, dv), dtype, bm, bn, warps, stages
@@ -745,10 +774,17 @@ _M4_CASES = (
     ("fwd_o_anch", False, [1, 16, 16], 4, 4),
     ("fwd_o_anch", False, [1, 64, 64], 4, 2),
     ("fwd_o_anch", False, [1, 32, 128], 8, 1),
+    # dwk's masked epilogue store reads the column sum of its own fragment
+    # (relaid through the scratch into the thread rows); the anchored WY
+    # seeds its TMEM carries from pointwise values over the loaded gram.
+    ("state_dwk_kda", False, [1, 64, 64], 4, 2),
+    ("state_dwk_kda", False, [1, 64, 32], 4, 1),
+    ("wy_anch", False, [32, 64], 4, 1),
+    ("wy_anch", False, [64, 64], 4, 2),
 )
 
 
-_KDA_KERNELS = ("bwd_o_kda", "state_du_kda", "fwd_o_anch")
+_KDA_KERNELS = ("bwd_o_kda", "state_du_kda", "fwd_o_anch", "state_dwk_kda", "wy_anch")
 
 
 def _assert_region_outputs(
@@ -1661,3 +1697,787 @@ def test_the_full_slice_gemm_default_runs_on_a_cluster() -> None:
         (x @ y).float(), [n], weight.float(), bias.float()
     )
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_a_non_finite_fill_beside_a_fragment_matches_the_triton_backend() -> None:
+    # ``where(mask, acc, hl.full(..., float("-inf")))`` stored from tensor
+    # memory: the fill renders as a ``float('-inf')`` call.
+    from test.test_cute_mma_dag_gpu import _masked_neg_inf_args
+
+    fn = _probe_kernels()._masked_neg_inf_stored
+    source, (out,) = _run_cute(fn, _masked_neg_inf_args(), _config([64], 4, 2))
+    assert "cutlass.Float32(float('-inf'))" in source
+    (ref,) = _run_triton(fn, _masked_neg_inf_args(), [64])
+    assert torch.isinf(ref).any() and torch.isfinite(ref).any()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("derived", "warps"), (("exchange", 4), ("pass", 4), ("pass", 8))
+)
+def test_se_block_dx_derived_operand_routes_match_the_triton_backend(
+    derived: str, warps: int
+) -> None:
+    # se_block dx's tf32 A operand ``2 * g * x * s * (1 - s)`` on the region
+    # renderer: through the derived fragment's tensor-memory round trip and
+    # exchange tile (``exchange``), or written by the derived pass from the
+    # chain's aux tiles into a ring tile (``pass``: no ``tcgen05_st`` of the
+    # chain, the A descriptor reads the ring slot).  Bit-equal to Triton.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block("se_block_bwd_dx")
+    args = (t["grad"], t["x"], t["w"], t["s"])
+    source, (out,) = _run_cute(
+        fn, args, _config([128, 64, 64], warps, 2, cute_mma_dag_derived=derived)
+    )
+    loop = source[source.index("for md_i in cutlass.range(") :]
+    if derived == "pass":
+        assert f"{RT}.prims.tcgen05_st(" not in loop
+    else:
+        assert f"{RT}.prims.tcgen05_st(" in loop
+    (ref,) = _run_triton(fn, args, [128, 64, 64])
+    assert torch.equal(out, ref)
+
+
+# --------------------------------------------------------------------------
+# The split epilogue (``cute_mma_dag_epilogue='split'``)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "stages"),
+    (([128, 128], 2), ([64, 128], 2), ([128, 64], 2), ([64, 64], 2), ([64, 32], 2)),
+    ids=["128x128", "64x128", "128x64", "64x64", "64x32"],
+)
+def test_the_split_epilogue_matches_the_triton_backend(
+    block_sizes: list[int], stages: int
+) -> None:
+    # ``cute_mma_dag_epilogue='split'``: eight warps, warp w + 4 over the
+    # second half of warp w's rows' columns (the row layout's register budget
+    # refuses 128 x 128 and 64 x 128 over this derived carry).  The indexer's
+    # logits with integer inputs: bit-equal to Triton over eight launches.
+    fn = _probe_kernels()._head_sum_logits
+    args = _head_sum_args()
+    source, (out,) = _run_cute(
+        fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
+    )
+    assert "md_epi = md_warp < 8" in source and "block=(256, 1, 1)" in source
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.equal(out, ref)
+
+
+def test_the_split_epilogue_keeps_the_row_layouts_bits() -> None:
+    # The example's prefill shape with random bf16 inputs: the per-column
+    # carry update runs in the same order under both layouts, so the split
+    # renders (128 x 128 at eight warps, the tile the row budget refuses)
+    # are bitwise the row render's (the campaign's 64 x 64 at four).
+    from examples.sparse_attn_indexer import indexer_inputs
+    from examples.sparse_attn_indexer import mqa_logits
+
+    torch.manual_seed(20260913)
+    args = indexer_inputs(512, 4096)
+    _source, (row,) = _run_cute(mqa_logits.fn, args, _config([64, 64], 4, 2))
+    for block_sizes in ([128, 128], [64, 128]):
+        _source, (split,) = _run_cute(
+            mqa_logits.fn,
+            args,
+            _config(block_sizes, 8, 2, cute_mma_dag_epilogue="split"),
+        )
+        assert torch.equal(split, row), block_sizes
+
+
+_SPLIT_PROBES = (
+    ("hoist", _probe_hoist, ("q", "k", "s", "x64"), [64, 128], 2),
+    ("hoist_loop", _probe_hoist_loop, ("s", "u", "w", "x128"), [64, 64], 2),
+    ("rawlate", _probe_rawlate, ("q", "k", "x64", "q2"), [64, 64], 2),
+    ("carry2", _probe_carry2, ("s", "t", "q", "x64"), [64, 64], 2),
+    ("kk", _probe_kk, ("q", "k"), [64, 128], 2),
+    (
+        "recompute",
+        _probe_recompute,
+        ("q", "k", "s", "t", "x64", "x64b", "x64c", "s"),
+        [64, 128],
+        2,
+    ),
+    ("drainrace", _probe_drainrace, ("q", "k", "s", "t"), [64, 64], 2),
+    ("dotless_store", _probe_dotless_store, ("q", "k", "x512", "y512"), [64, 64], 2),
+    ("register_carry", _probe_register_carry, ("q", "k", "s", "x64"), [64, 64], 2),
+    ("register_carry_budget", _probe_register_carry_budget, ("k",), [64], 2),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "fn", "keys", "block_sizes", "stages"),
+    _SPLIT_PROBES,
+    ids=[f"{p[0]}-{'x'.join(map(str, p[3]))}s{p[4]}" for p in _SPLIT_PROBES],
+)
+def test_region_probes_match_the_triton_backend_under_the_split(
+    name: str,
+    fn: Callable[..., object],
+    keys: tuple[str, ...],
+    block_sizes: list[int],
+    stages: int,
+) -> None:
+    # The region probes without reductions under the split epilogue at eight
+    # warps: hoisted and per-iteration exchange tiles written by the warp
+    # pair, derived values and register carries over half rows (the budget
+    # probe's T turns resident: four 16-column half rows), staged and TMA
+    # stores drained from every thread -- bit-equal to Triton (the register
+    # carry's fused FMA aside, as in the row layout's test).
+    t = _regions_probe_inputs()
+    args = tuple(t[key] for key in keys)
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
+    )
+    assert "md_epi = md_warp < 8" in source
+    ref = _run_triton(fn, args, block_sizes)
+    for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
+        if name == "register_carry_budget" and index == 0:
+            atol = 1e-6 * rhs.abs().max().item()
+            torch.testing.assert_close(lhs, rhs, atol=atol, rtol=1e-5)
+        else:
+            assert torch.equal(lhs, rhs), (name, index)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "gated", "block_sizes", "stages"),
+    (
+        ("dqkw", False, [64, 64, 64], 2),
+        ("wy", False, [64, 64, 64], 2),
+        ("wy", True, [64, 32, 128], 1),
+        ("bwd_o_kda", False, [64, 64, 64], 2),
+        ("state_du_kda", False, [64], 2),
+    ),
+    ids=[
+        "dqkw-64x64x64",
+        "wy-64x64x64",
+        "wy-gated-64x32x128",
+        "bwd_o_kda",
+        "state_du_kda",
+    ],
+)
+def test_region_programs_match_the_triton_backend_under_the_split(
+    kernel: str, gated: bool, block_sizes: list[int], stages: int
+) -> None:
+    # The delta-rule / kda region programs under the split epilogue: wy's
+    # fp32 exchange tiles (the rotated packet stores) written by the warp
+    # pair, carries copied and seeded over half rows, dqkw's register carry.
+    # Fragment outputs bit-equal to Triton as under the row layout.
+    args = _m4_args(kernel, gated)
+    fn = _kernel_fn(kernel)
+    source, out = _run_cute(
+        fn, args, _config(block_sizes, 8, stages, cute_mma_dag_epilogue="split")
+    )
+    assert "md_epi = md_warp < 8" in source
+    _assert_region_outputs(kernel, out, _run_triton(fn, args, block_sizes))
+
+
+# --------------------------------------------------------------------------
+# The lookahead schedule (``cute_mma_dag_lookahead='on'``)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages", "epilogue", "h"),
+    (
+        ([64, 64], 4, 2, "row", 4),
+        ([64, 64], 4, 4, "row", 32),
+        ([128, 64], 8, 2, "split", 32),
+        ([128, 128], 8, 2, "split", 3),
+        ([128, 128], 8, 3, "split", 32),
+        ([64, 128], 8, 3, "split", 1),
+    ),
+    ids=[
+        "64x64w4s2-h4",
+        "64x64w4s4-h32",
+        "128x64w8s2-h32",
+        "128x128w8s2-h3",
+        "128x128w8s3-h32",
+        "64x128w8s3-h1",
+    ],
+)
+def test_the_lookahead_schedule_matches_the_triton_backend(
+    block_sizes: list[int], warps: int, stages: int, epilogue: str, h: int
+) -> None:
+    # ``cute_mma_dag_lookahead='on'``: head i + 1's dot issued ahead of head
+    # i's epilogue into the other half of the dot's slot, two commit
+    # barriers by iteration parity, the ring refilled two tiles ahead.  Even
+    # and odd head counts (the parities and the loop of one trip) with
+    # integer inputs: bit-equal to Triton over eight launches.
+    fn = _probe_kernels()._head_sum_logits
+    args = _head_sum_args(h=h)
+    source, (out,) = _run_cute(
+        fn,
+        args,
+        _config(
+            block_sizes,
+            warps,
+            stages,
+            cute_mma_dag_epilogue=epilogue,
+            cute_mma_dag_lookahead="on",
+        ),
+    )
+    assert "md_lkb = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in source
+    assert source.count(f"{RT}.prims.tcgen05_commit(md_lkb + ") == 2
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.equal(out, ref)
+
+
+def test_the_lookahead_schedule_keeps_the_program_orders_bits() -> None:
+    # The example's prefill shape with random bf16 inputs: the schedule
+    # moves the dot, not the carry's per-column update order, so every
+    # lookahead render is bitwise the campaign's row render.
+    from examples.sparse_attn_indexer import indexer_inputs
+    from examples.sparse_attn_indexer import mqa_logits
+
+    torch.manual_seed(20260913)
+    args = indexer_inputs(512, 4096)
+    _source, (row,) = _run_cute(mqa_logits.fn, args, _config([64, 64], 4, 2))
+    for block_sizes, warps, stages, epilogue in (
+        ([64, 64], 4, 2, "row"),
+        ([128, 64], 8, 2, "split"),
+        ([128, 128], 8, 2, "split"),
+        ([128, 128], 8, 3, "split"),
+        ([64, 128], 8, 2, "split"),
+    ):
+        _source, (ahead,) = _run_cute(
+            mqa_logits.fn,
+            args,
+            _config(
+                block_sizes,
+                warps,
+                stages,
+                cute_mma_dag_epilogue=epilogue,
+                cute_mma_dag_lookahead="on",
+            ),
+        )
+        assert torch.equal(ahead, row), (block_sizes, stages)
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps", "stages"),
+    (
+        ([64, 64, 64], 4, 2),
+        ([64, 64, 64], 8, 3),
+        ([64, 64, 64], 8, 4),
+        ([128, 64, 64], 8, 2),
+        ([64, 64, 32], 4, 4),
+    ),
+    ids=lambda v: "x".join(map(str, v)) if isinstance(v, list) else str(v),
+)
+def test_se_block_dx_streamed_ring_matches_the_triton_backend(
+    block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # The K loop under ``pass`` streams (``streamed_ring_loops``): the slot
+    # barriers order the passes and refills against the batches that read
+    # the slots, the previous batch is never waited inside the loop, and the
+    # carry seed's tiles are staged with the root group.  Bit-equal to
+    # Triton at every ring depth, and launch to launch.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block("se_block_bwd_dx")
+    args = (t["grad"], t["x"], t["w"], t["s"])
+    source, (out,) = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_derived="pass")
+    )
+    loop = source[source.index("for md_i in cutlass.range(") :]
+    assert (
+        f"md_empty0 = cute.arch.alloc_smem(cutlass.Int64, {stages}, alignment=8)"
+        in source
+    )
+    assert f"{RT}.mbar_wait(md_cb" not in loop.split("md_rk0 = md_rk0 + 1")[0]
+    assert f"{RT}.prims.tcgen05_commit(md_empty0 + md_st0" in loop
+    assert "_helion_mma_dag.ldg_b32(" not in source
+    assert ", md_sfr)" in source
+    (ref,) = _run_triton(fn, args, block_sizes)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("derived", "warps", "stages"),
+    (("exchange", 4, 2), ("pass", 4, 2), ("pass", 8, 4)),
+)
+def test_se_block_dw_mn_major_tf32_a_matches_the_triton_backend(
+    derived: str, warps: int, stages: int
+) -> None:
+    # se_block dw's A operand is ``x[tile_m, tile_n1].to(f32).T``: a half
+    # tile widened to tf32 with K along its rows, read MN-major under the
+    # 32-byte-unit swizzle (``a_major=1``), the route the fp32 B tiles took
+    # already; its B is the chain ``2 * g * x * s * (1 - s)``.  The loop
+    # streams.  Bit-equal to Triton.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block("se_block_bwd_dw")
+    args = (t["grad"], t["x"], t["s"])
+    source, (out,) = _run_cute(
+        fn,
+        args,
+        _config([64, 64, 64], warps, stages, cute_mma_dag_derived=derived),
+    )
+    assert "a_major=1, b_major=1)" in source
+    assert f"{RT}.prims.Tcgen05MMAKind.TF32" in source
+    assert "SWIZZLE_128B_ATOM_32B" in source
+    if derived == "pass":
+        assert "md_empty0 = cute.arch.alloc_smem(cutlass.Int64" in source
+    (ref,) = _run_triton(fn, args, [64, 64, 64])
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    ("gated", "c", "block_sizes", "warps", "stages"),
+    (
+        (False, 64, [64, 64, 64], 4, 1),
+        (True, 64, [64, 64, 64], 4, 2),
+        (False, 128, [64, 64, 64], 4, 1),
+        (True, 128, [64, 64, 64], 4, 2),
+    ),
+    ids=["c64", "gated-c64", "c128", "gated-c128"],
+)
+def test_tensor_memory_a_operands_are_bit_equal_to_the_exchange_tiles(
+    gated: bool, c: int, block_sizes: list[int], warps: int, stages: int
+) -> None:
+    # ``cute_mma_dag_exchange='auto'`` has wy's accumulate read the squared
+    # Apow and the w / u dots read T straight from tensor memory (eight
+    # fp32 columns a K step) and the squaring read its one exchange tile
+    # K-major and MN-major alike; the MMAs truncate the same fp32 words to
+    # tf32 either way, so the outputs are bit-equal to the exchange
+    # schedule (``smem``) and to Triton at the 64- and the 128-row
+    # accumulator layouts (C = 64 / 128).
+    g = torch.Generator(device=DEVICE).manual_seed(5)
+    bhn, d = 4, 64
+    scale = 0.3 if c == 64 else 0.1
+    k = _randn(g, bhn, c, d, scale=scale, dtype=torch.bfloat16)
+    v = _randn(g, bhn, c, d, dtype=torch.bfloat16)
+    beta = _randn(g, bhn, c, scale=0.5, dtype=torch.bfloat16)
+    gcs = -_randn(g, bhn, c, scale=0.1, dtype=torch.float32).abs() if gated else None
+    args = (k, v, beta, gcs, None, None, gated, False)
+    fn = _kernel_fn("wy")
+    sources = {}
+    outs = {}
+    for mode in ("auto", "smem"):
+        sources[mode], outs[mode] = _run_cute(
+            fn, args, _config(block_sizes, warps, stages, cute_mma_dag_exchange=mode)
+        )
+    tmem_a = f"{RT}.prims.CTAGroup.CTA_1, md_acc"
+    pattern = re.compile(rf"{re.escape(tmem_a)}\d, cutlass\.inttoptr\(md_tmem \+ \d+,")
+    assert len(pattern.findall(sources["auto"])) == 3 * (c // 8)
+    assert not pattern.findall(sources["smem"])
+    assert (
+        sources["auto"].count("SWIZZLE_128B_ATOM_32B")
+        == sources["smem"].count("SWIZZLE_128B_ATOM_32B") + 1
+    )
+    for lhs, rhs in zip(outs["auto"], outs["smem"], strict=True):
+        assert torch.equal(lhs, rhs)
+        assert torch.isfinite(lhs).all()
+    _assert_region_outputs("wy", outs["auto"], _run_triton(fn, args, block_sizes))
+
+
+_STATE_READ_PROBES = {
+    "batch_rewrite": _probe_batch_rewrite,
+    "batch_rescale": _probe_batch_rescale,
+    "update_first": _probe_update_first,
+}
+
+
+def _state_read_reference(
+    probe: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    p: torch.Tensor,
+    r: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q32, k32, w32, p32, r32 = (t.float() for t in (q, k, w, p, r))
+    s = p32 @ r32.transpose(-2, -1)
+    outs = []
+    for d0 in range(0, q.size(2), 64):
+        qk = q32[:, :, d0 : d0 + 64] @ k32[:, :, d0 : d0 + 64].transpose(-2, -1)
+        if probe == "update_first":
+            s = s + qk
+            outs.append(s @ w32[:, :, d0 : d0 + 64])
+        else:
+            outs.append(s @ w32[:, :, d0 : d0 + 64])
+            s = (s * 0.5 if probe == "batch_rescale" else s) + qk
+    return torch.cat(outs, dim=-1), s
+
+
+@pytest.mark.parametrize("probe", sorted(_STATE_READ_PROBES))
+def test_a_state_rewritten_behind_its_read_keeps_the_exchange_tile(probe: str) -> None:
+    # ``o = dot(s, w); s = dot(q, k^T, acc=s)`` (plain, and ``acc=s * 0.5``):
+    # the two dots share one MMA batch and the second rewrites ``s`` --
+    # read from tensor memory, the first dot would see the rescaled words
+    # (the epilogue store lands ahead of the batch) or race the in-place
+    # accumulate.  ``tmem_a_candidates`` refuses the operand, so ``auto``
+    # renders the exchange schedule (bit-equal to ``smem``, tf32-close to
+    # the fp32 reference).  Updated ahead of the read (``update_first``)
+    # the state is read from tensor memory: same words, same result.
+    g = torch.Generator(device=DEVICE).manual_seed(7)
+    bhn, c, d, e = 4, 64, 256, 128
+    q = _randn(g, bhn, c, d, scale=0.5, dtype=torch.bfloat16)
+    k = _randn(g, bhn, c, d, scale=0.5, dtype=torch.bfloat16)
+    w = _randn(g, bhn, c, d, scale=0.5, dtype=torch.float32)
+    p = _randn(g, bhn, c, e, scale=0.5, dtype=torch.bfloat16)
+    r = _randn(g, bhn, c, e, scale=0.5, dtype=torch.bfloat16)
+    args = (q, k, w, p, r)
+    fn = _STATE_READ_PROBES[probe]
+    sources = {}
+    outs = {}
+    for mode in ("auto", "smem"):
+        sources[mode], outs[mode] = _run_cute(
+            fn, args, _config([64, 64], 4, 2, cute_mma_dag_exchange=mode)
+        )
+    pattern = re.compile(
+        rf"tcgen05_mma\([^\n]*cutlass\.inttoptr\(md_tmem \+ \d+, {RT}\.TMEM_SPACE"
+    )
+    assert len(pattern.findall(sources["auto"])) == (
+        8 if probe == "update_first" else 0
+    )
+    assert not pattern.findall(sources["smem"])
+    assert (sources["auto"] == sources["smem"]) == (probe != "update_first")
+    for lhs, rhs in zip(outs["auto"], outs["smem"], strict=True):
+        assert torch.equal(lhs, rhs)
+        assert torch.isfinite(lhs).all()
+    ref_o, ref_s = _state_read_reference(probe, *args)
+    out_o, out_s = outs["auto"]
+    # ``o``: tf32 products of fp32 operands; ``s``: exact bf16 products
+    # summed in fp32.
+    assert (out_o - ref_o).abs().max() <= 4e-3 * ref_o.abs().max()
+    torch.testing.assert_close(
+        out_s, ref_s, atol=1e-4 * ref_s.abs().max().item(), rtol=1e-5
+    )
+
+
+# (d, dv), block sizes (lead, tile_d, tile_dv), warps, stages, derived route
+_DQKG_ANCHORED_CASES = (
+    ((128, 128), [1, 32, 64], 4, 3, "exchange"),
+    ((128, 128), [1, 32, 64], 4, 2, "exchange"),
+    ((128, 128), [1, 64, 64], 8, 4, "pass"),
+    ((64, 64), [1, 32, 64], 4, 3, "exchange"),
+)
+
+
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "warps", "stages", "derived"),
+    _DQKG_ANCHORED_CASES,
+    ids=[
+        f"d{s[0]}dv{s[1]}-{'x'.join(map(str, bs))}w{w}s{st}-{dr}"
+        for s, bs, w, st, dr in _DQKG_ANCHORED_CASES
+    ],
+)
+def test_dqkg_anchored_dk_reads_the_shared_da_tile_mn_major(
+    shape: tuple[int, int],
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+    derived: str,
+) -> None:
+    # full_gla's training backward without the gate gradient
+    # (``chunk_bwd_dqkg_scalar_helion(diag_anchored=True, compute_dg=False)``):
+    # the fp32 dA tile is the K-major A of the dq dot and, transposed, the
+    # MN-major A of the dk dot.  Under the first reader's 16-byte-unit
+    # swizzle the dk dot read zeros (the examples14 campaign's wrong dk at
+    # 9534981b9: relative error 0.997 at this very config, the autotuner's
+    # promoted default included); the shared tile now takes the 32-byte-unit
+    # swizzle (``tile_mn_major``).  dq is bit-equal to Triton; dk differs by
+    # one bf16 ulp on a few elements at d=128 (``dot * scale + dk_state`` is
+    # one FMA there) and is bit-equal at d=64.
+    d, dv = shape
+    t = _inputs3(bhn=6, d=d, dv=dv, dtype=torch.bfloat16)
+    args = _dqkg_args(t, diag=True, compute_dg=False)
+    fn = _kernel_fn("dqkg")
+    source, (dq, dk, dg) = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, cute_mma_dag_derived=derived)
+    )
+    assert "a_major=1, b_major=1)" in source
+    # The two TF32 dots' A descriptors (the loop's bf16 dots keep their own)
+    # name the same bytes under the 32-byte-unit swizzle.
+    tf32 = re.findall(r"md_idesc(\d+) = [^\n]*a_dtype=cutlass\.Float32", source)
+    assert len(tf32) == 2, tf32
+    descs = []
+    for index in tf32:
+        match = re.search(rf"md_da{index} = ([^\n]*)", source)
+        assert match is not None, index
+        descs.append(match.group(1))
+    assert len({desc.split("build(")[1].split(",")[0] for desc in descs}) == 1
+    assert all("SWIZZLE_128B_ATOM_32B" in desc for desc in descs), descs
+    rq, rk, rg = _run_triton(fn, args, block_sizes)
+    assert torch.equal(dq, rq)
+    assert torch.equal(dg, rg)
+    relative_l2 = (dk.float() - rk.float()).norm() / rk.float().norm()
+    assert relative_l2 <= 1e-2, relative_l2
+    if d == 64:
+        assert torch.equal(dk, rk)
+    else:
+        _assert_close((dk,), (rk,), scaled=True)
+
+
+@pytest.mark.parametrize(
+    ("d", "warps", "stages", "block"),
+    (
+        (64, 4, 2, 64),
+        (128, 4, 1, 64),
+        (128, 8, 2, 32),
+        (128, 4, 2, 128),
+    ),
+)
+def test_varlen_window_tiles_match_the_triton_backend(
+    d: int, warps: int, stages: int, block: int
+) -> None:
+    # The varlen wy kernel's k / v windows (rows at token_base[j], live
+    # below valid_len[j]) on the tcgen05 region renderer: the TMA boxes land
+    # at the runtime row offset and the convert passes zero the rows at and
+    # past the limit.  Sequences of 200, 64 and 150 tokens: ragged last
+    # chunks of 8, 64 and 22 live rows, and a last chunk reaching past the
+    # tensor's end through its masked rows (TMA zero-fills them).
+    import functools
+
+    engine = _engine()
+    t = _inputs_varlen_tokens(
+        h=2, lens=(200, 64, 150), d=d, dv=64, dtype=torch.bfloat16
+    )
+    hnt = cast("int", t["hnt"])
+    e = functools.partial(torch.empty, dtype=torch.bfloat16, device=DEVICE)
+    args = (
+        t["k"],
+        t["v"],
+        t["beta"],
+        t["g_cs"],
+        t["Akk"],
+        t["token_base"],
+        t["valid_len"],
+        e((hnt, 64, d)),
+        e((hnt, 64, 64)),
+        e((hnt, 64, d)),
+    )
+    outputs = (7, 8, 9)
+    # (D == DV rides the value loop on the key loop; else two loops, the
+    # value loop's block within DV = 64.)
+    block_sizes = [block] if d == 64 else [block, min(block, 64)]
+    source, outs = _run_backend(
+        engine.chunk_fwd_wy_delta_varlen_helion.fn,
+        "cute",
+        args,
+        outputs,
+        _config(block_sizes, warps, stages),
+    )
+    assert f"{RT}.prims.tcgen05_mma(" in source
+    assert "cutlass.Int32(md_scalar_1)]" in source  # the window's box row
+    assert re.search(
+        r"if md_pr\w+ < md_scalar and md_scalar_1 \+ md_pr\w+ < 414 else", source
+    )
+    _source, refs = _run_backend(
+        engine.chunk_fwd_wy_delta_varlen_helion.fn,
+        "triton",
+        args,
+        outputs,
+        helion.Config(block_sizes=block_sizes),
+    )
+    _assert_close(outs, refs, scaled=True)
+
+
+# kernel, decay mode, (bhn, d, dv), block sizes, warps, stages, CTAs per SM,
+# extra knobs: the region programs (dqkg) and the single-loop program (dv)
+# as persistent launches against their flat launches.
+_PERSISTENT_CASES = (
+    ("dqkg", "scalar", (1024, 64, 64), [1, 64, 64], 4, 1, 2, {}),
+    (
+        "dqkg",
+        "scalar",
+        (1024, 64, 64),
+        [1, 64, 64],
+        8,
+        1,
+        2,
+        {"cute_mma_dag_epilogue": "split"},
+    ),
+    ("dqkg", "scalar", (1024, 64, 64), [1, 64, 32], 4, 2, 2, {}),
+    ("dqkg", "anchored", (1024, 64, 64), [1, 32, 32], 4, 2, 2, {}),
+    # A four-trip ring loop (two slots; the next tile's prologue is one
+    # slot) and a grid below the CTA count (every next-tile issue guarded).
+    ("dqkg", "scalar", (512, 64, 256), [1, 64, 64], 4, 2, 2, {}),
+    ("dqkg", "scalar", (16, 64, 64), [1, 64, 64], 4, 1, 2, {}),
+    ("dv", "scalar", (1024, 64, 64), [1, 64, 64], 4, 1, 3, {}),
+    ("dv", "vanilla", (1024, 64, 64), [1, 64, 64], 4, 1, 3, {}),
+    ("dv", "diag", (1024, 64, 64), [1, 64, 64], 4, 1, 2, {}),
+    ("dv", "scalar", (16, 64, 64), [1, 64, 64], 4, 1, 1, {}),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "mode", "shape", "block_sizes", "warps", "stages", "ctas", "extra"),
+    _PERSISTENT_CASES,
+    ids=[
+        f"{k}-{m}-bhn{s[0]}d{s[1]}dv{s[2]}-{'x'.join(map(str, bs))}w{w}s{st}-p{c}"
+        + ("-split" if e else "")
+        for k, m, s, bs, w, st, c, e in _PERSISTENT_CASES
+    ],
+)
+def test_persistent_launches_match_the_flat_launch_bitwise(
+    kernel: str,
+    mode: str,
+    shape: tuple[int, int, int],
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+    ctas: int,
+    extra: dict[str, object],
+) -> None:
+    # cute_mma_dag_persistent on the tensor-memory region programs (dqkg):
+    # the CTA walks the tiles of the generic persistent_interleaved program
+    # ids with its ring / commit counters running on, issues the next
+    # tile's ring prologue at each root loop's exit and its root group
+    # once this tile's last reader of the root tiles is done; the
+    # single-loop program (dv) issues the next tile's epilogue tiles too
+    # and keeps its staging tile beside the ring.  Same per-tile
+    # arithmetic: bitwise equal to the flat launch.
+    bhn, d, dv = shape
+    t = _inputs3(bhn=bhn, d=d, dv=dv, dtype=torch.bfloat16)
+    if kernel == "dqkg":
+        args = _dqkg_args(t, diag=mode == "anchored", compute_dg=False)
+    else:
+        args = _dv_args(t, mode)
+    fn = _kernel_fn(kernel)
+    _flat_source, base = _run_cute(
+        fn, args, _config(block_sizes, warps, stages, **extra)
+    )
+    source, out = _run_cute(
+        fn,
+        args,
+        _config(
+            block_sizes,
+            warps,
+            stages,
+            cute_mma_dag_persistent=ctas,
+            pid_type="persistent_interleaved",
+            num_sm_multiplier=ctas,
+            **extra,
+        ),
+    )
+    assert "for virtual_pid in range(" in source
+    assert source.count(f"{RT}.prims.tcgen05_alloc(") == 1
+    assert source.count(f"{RT}.prims.tcgen05_dealloc(") == 1
+    assert "if md_npid < total_pids:" in source
+    if kernel == "dqkg":
+        assert "md_tn = md_tn + 1" in source
+        assert "if md_tn == 0:" in source
+    else:
+        assert "md_ib = md_ib + " in source
+    for lhs, rhs in zip(out, base, strict=True):
+        assert torch.equal(lhs, rhs)
+        assert torch.isfinite(lhs.float()).all()
+
+
+# kernel, gated, block sizes, warps, stages, CTAs per SM: region programs
+# with several top-level loops (dqkw: a ring loop, then a loop over a nested
+# ring; wy_dL: three ring loops; wy: four top-level loops; bwd_o_kda and
+# wy_anch: the kda family's) as persistent launches against their flat
+# launches.
+_SIBLING_PERSISTENT_CASES = (
+    ("dqkw", False, [64, 64, 64], 4, 2, 1),
+    ("dqkw", True, [64, 32, 64, 128, 32], 4, 1, 2),
+    ("wy_dL", False, [64, 64, 64], 4, 2, 1),
+    ("wy_dL", False, [64, 32, 128], 4, 2, 1),
+    ("wy", False, [64, 64, 64], 4, 2, 1),
+    ("bwd_o_kda", False, [64, 64, 64], 4, 2, 1),
+    ("bwd_o_kda", False, [64, 64, 16], 4, 4, 2),
+    ("wy_anch", False, [32, 64], 4, 1, 2),
+)
+
+
+@pytest.mark.parametrize(
+    ("kernel", "gated", "block_sizes", "warps", "stages", "ctas"),
+    _SIBLING_PERSISTENT_CASES,
+    ids=[
+        f"{k}{'-gated' if g else ''}-{'x'.join(map(str, bs))}w{w}s{st}-p{c}"
+        for k, g, bs, w, st, c in _SIBLING_PERSISTENT_CASES
+    ],
+)
+def test_persistent_launches_with_sibling_root_loops_match_the_flat_launch_bitwise(
+    kernel: str,
+    gated: bool,
+    block_sizes: list[int],
+    warps: int,
+    stages: int,
+    ctas: int,
+) -> None:
+    # The one-tile layout lets the top-level loops share one frame extent
+    # (each is dead while another runs).  The persistent launch issues a
+    # root ring loop's next-tile prologue at the loop's exit -- while the
+    # tile's later loops run and ahead of the next tile's earlier ones --
+    # so its layout keeps the top-level frames apart
+    # (``region_layout(persistent=True)``): every ring's slots start at a
+    # base of their own, and the outputs are bitwise the flat launch's.
+    if kernel in ("bwd_o_kda", "wy_anch"):
+        bh = 8
+        args = _kda_args(kernel, _inputs_kda(bh=bh, n=64, d=128, dv=128, seed=3), bh)
+    else:
+        t = _inputs_m4(bhn=512, d=128, dv=128, dtype=torch.bfloat16, seed=3)
+        args = _M4_ARGS[kernel](t, gated)
+    fn = _kernel_fn(kernel)
+    _flat_source, base = _run_cute(fn, args, _config(block_sizes, warps, stages))
+    source, out = _run_cute(
+        fn,
+        args,
+        _config(
+            block_sizes,
+            warps,
+            stages,
+            cute_mma_dag_persistent=ctas,
+            pid_type="persistent_interleaved",
+            num_sm_multiplier=ctas,
+        ),
+    )
+    assert "for virtual_pid in range(" in source
+    assert "if md_npid < total_pids:" in source
+    assert "md_tn = md_tn + 1" in source
+    rings = {
+        loop: int(start)
+        for start, loop in re.findall(
+            r"cp_async_bulk_tensor_shared_cta_global\(md_smem \+ \((\d+) \+ "
+            r"md_rk(\d+) % \d+ \* \d+",
+            source,
+        )
+    }
+    assert len(rings) >= 2 and len(set(rings.values())) == len(rings), rings
+    for lhs, rhs in zip(out, base, strict=True):
+        assert torch.equal(lhs, rhs)
+        assert torch.isfinite(lhs.float()).all()
+
+
+def test_the_streamed_ring_runs_as_a_persistent_launch_bitwise() -> None:
+    # A streamed region loop (se_block dx under ``pass``): its slot
+    # barriers' phases run on the loop counter like the ring's, so the
+    # persistent tile loop needs no re-arm there either; the next tile's
+    # prologue waits for the slots it refills.
+    from test.test_cute_mma_dag_gpu import _se_block
+    from test.test_cute_mma_dag_gpu import _se_block_inputs
+
+    t = _se_block_inputs()
+    fn = _se_block("se_block_bwd_dx")
+    args = (t["grad"], t["x"], t["w"], t["s"])
+    _source, (base,) = _run_cute(
+        fn, args, _config([64, 64, 64], 4, 2, cute_mma_dag_derived="pass")
+    )
+    source, (out,) = _run_cute(
+        fn,
+        args,
+        _config(
+            [64, 64, 64],
+            4,
+            2,
+            cute_mma_dag_derived="pass",
+            cute_mma_dag_persistent=2,
+            pid_type="persistent_interleaved",
+            num_sm_multiplier=2,
+        ),
+    )
+    assert "md_empty0 = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)" in source
+    assert "for virtual_pid in range(" in source
+    assert "md_tn = md_tn + 1" in source
+    assert torch.equal(out, base)

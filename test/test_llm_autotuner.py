@@ -398,6 +398,12 @@ class TestLLMGuidedSearch(TestCase):
             def take_effective_source_repairs(self):
                 return {}
 
+            def set_config_roles(self, roles) -> None:
+                pass
+
+            def unmeasured_config_values(self) -> list:
+                return []
+
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
@@ -1641,6 +1647,12 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def set_compiler_seed_configs(self, configs) -> None:
                 pass
 
+            def set_config_roles(self, roles) -> None:
+                pass
+
+            def unmeasured_config_values(self) -> list:
+                return []
+
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass
 
@@ -1799,6 +1811,12 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass
 
+            def set_config_roles(self, roles) -> None:
+                pass
+
+            def unmeasured_config_values(self) -> list:
+                return []
+
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
@@ -1915,6 +1933,12 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
             def set_compiler_seed_configs(self, configs) -> None:
                 pass
+
+            def set_config_roles(self, roles) -> None:
+                pass
+
+            def unmeasured_config_values(self) -> list:
+                return []
 
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass

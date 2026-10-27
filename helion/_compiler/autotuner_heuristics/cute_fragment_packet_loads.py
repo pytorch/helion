@@ -32,6 +32,7 @@ class CuteFragmentPacketLoadsHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         from ..cute.computed_fragment import computed_fragment_supported
+        from ..cute.packet_loads import PACKET_DTYPES
         from ..cute.register_loads import host_load_is_readonly
 
         host = device_ir.host_function
@@ -52,7 +53,7 @@ class CuteFragmentPacketLoadsHeuristic(AutotunerHeuristic):
                             and source.target is _tracing_ops._host_tensor
                             and isinstance(value, torch.Tensor)
                             and value.ndim
-                            and value.dtype == torch.float32
+                            and value.dtype in PACKET_DTYPES
                             and host_load_is_readonly(
                                 node, env, graphs, allow_unbound=True
                             )

@@ -375,26 +375,41 @@ def _is_fp32_cache_read(value: ast.expr, cache_names: set[str]) -> bool:
         isinstance(value, ast.Subscript)
         and isinstance(value.value, ast.Name)
         and value.value.id in cache_names
-        and all(
-            isinstance(
-                node,
-                (
-                    ast.Name,
-                    ast.Load,
-                    ast.Constant,
-                    ast.BinOp,
-                    ast.Add,
-                    ast.Sub,
-                    ast.Mult,
-                    ast.UnaryOp,
-                    ast.USub,
-                    ast.UAdd,
-                ),
-            )
-            and (not isinstance(node, ast.Constant) or type(node.value) is int)
-            for node in ast.walk(value.slice)
-        )
+        and _is_pure_index(value.slice)
     )
+
+
+def _is_pure_index(node: ast.expr) -> bool:
+    """A register-cache slot index built only from names, integer literals,
+    integer arithmetic, ``cutlass.Int32`` casts and the launch coordinates
+    (``cute.arch.block_idx()[k]`` / ``thread_idx()[k]``): the shape of both
+    the explicit two-pass slot and the rolled ``reduction_loops`` slot
+    (``((roffset - base) // chunk * lanes + lane) * vec + k``)."""
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int
+    if isinstance(node, ast.BinOp):
+        return isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)
+        ) and (_is_pure_index(node.left) and _is_pure_index(node.right))
+    if isinstance(node, ast.UnaryOp):
+        return isinstance(node.op, (ast.USub, ast.UAdd)) and _is_pure_index(
+            node.operand
+        )
+    if isinstance(node, ast.Call) and not node.keywords:
+        func = ast.unparse(node.func)
+        if func == "cutlass.Int32" and len(node.args) == 1:
+            return _is_pure_index(node.args[0])
+        return func in ("cute.arch.block_idx", "cute.arch.thread_idx") and not node.args
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Call)
+            and _is_pure_index(node.value)
+            and isinstance(node.slice, ast.Constant)
+            and type(node.slice.value) is int
+        )
+    return False
 
 
 def _find_vec_exp(
@@ -1176,12 +1191,23 @@ def _max_variable(
     intermediates = {site_a.target} | {t for t in chain_targets if canon(t) != mi_name}
 
     # ``mi`` must start at -inf (single trip => mi ends as a cast of the
-    # site-A result).
-    init_found = False
+    # site-A result), or have no definition at all before sweep A: the
+    # rolled ``reduction_loops`` form first defines the maximum as the cast
+    # of the finalized reduce, so the chain above is its only pre-exchange
+    # value.
+    init_found: bool | None = None
     for top in body[: site_a.top_idx]:
         if _is_name_assign(top) and canon(top.targets[0].id) == mi_name:  # type: ignore[attr-defined]
             init_found = "-inf" in ast.unparse(top.value)
-    if not init_found:
+    if init_found is None and any(
+        isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and canon(node.id) == mi_name
+        for top in body[: site_a.top_idx]
+        for node in ast.walk(top)
+    ):
+        return None
+    if init_found is False:
         return None
 
     # No escape of the local-valued intermediates past sweep A.
@@ -1322,21 +1348,48 @@ def _try_rewrite_pair(
             return False
 
     # The accumulator update in the same vec body must add exactly this
-    # exp2 to the site-B input.
+    # exp2 to the site-B input: the exp2 call itself (the explicit two-pass
+    # emitter duplicates it into the update) or the name it was assigned
+    # to (the rolled ``reduction_loops`` emitter adds ``Float32(name)``).
     exp_src = ast.unparse(match_b.exp_call)
     acc_name = None
     if isinstance(site_b.call.args[0], ast.Name):
         acc_name = site_b.call.args[0].id
     if acc_name is None:
         return False
+    exp_names: set[str] = set()
+    if _is_name_assign(match_b.exp_stmt) and match_b.exp_stmt.value is match_b.exp_call:
+        exp_names.add(canon(match_b.exp_stmt.targets[0].id))  # type: ignore[attr-defined]
+
+    def adds_exp_name(value: ast.expr) -> bool:
+        if not (
+            isinstance(value, ast.BinOp)
+            and isinstance(value.op, ast.Add)
+            and isinstance(value.left, ast.Name)
+            and canon(value.left.id) == canon(acc_name)
+        ):
+            return False
+        term = value.right
+        if (
+            isinstance(term, ast.Call)
+            and ast.unparse(term.func) == "cutlass.Float32"
+            and len(term.args) == 1
+            and not term.keywords
+        ):
+            term = term.args[0]
+        return isinstance(term, ast.Name) and canon(term.id) in exp_names
+
     acc_stmt = None
     for stmt in match_b.vec_for.body:
         if (
             _is_name_assign(stmt)
             and canon(stmt.targets[0].id) == canon(acc_name)  # type: ignore[attr-defined]
-            and any(
-                _is_exp2(node) and ast.unparse(node) == exp_src
-                for node in ast.walk(stmt.value)
+            and (
+                any(
+                    _is_exp2(node) and ast.unparse(node) == exp_src
+                    for node in ast.walk(stmt.value)
+                )
+                or adds_exp_name(stmt.value)
             )
         ):
             acc_stmt = stmt
