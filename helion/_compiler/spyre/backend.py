@@ -10,6 +10,8 @@ reaches Inductor's own pointwise fallback is a bug and must fail loudly.
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -19,6 +21,8 @@ import torch
 from ... import exc
 from ..backend import Backend
 from .emitter import SpyreEmitter
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import ast
@@ -82,6 +86,174 @@ def _drained(fn: object, batch: int = _BENCH_BATCH) -> float:
         fn()
     torch.accelerator.synchronize()
     return (time.perf_counter() - start) * 1e3 / batch
+
+
+def _spyre_activity() -> object | None:
+    """``ProfilerActivity`` for the Spyre device, by whichever name exists.
+
+    ``PrivateUse1`` and ``SPYRE`` are the **same enum value** here (verified:
+    they compare equal), so the order is only about which attribute a given
+    torch build exposes.
+    """
+    import torch
+
+    activity = torch.profiler.ProfilerActivity
+    return getattr(activity, "PrivateUse1", None) or getattr(
+        activity, "SPYRE", None
+    )
+
+
+def _device_time_ms(prof: object) -> float:
+    """Total device time in a profile, 0.0 when the profiler reports none.
+
+    Aggregated over ``key_averages()``, which is per-operator totals, so this
+    is **device work**, not elapsed device time. For ranking autotuner configs
+    that is the right quantity -- see ``_device_timed``.
+    """
+    total = 0.0
+    for event in prof.key_averages():
+        for attr in ("device_time_total", "self_device_time_total"):
+            total += abs(getattr(event, attr, 0.0) or 0.0)
+    return total / 1e3  # torch reports microseconds
+
+
+def _device_span_ms(prof: object) -> float:
+    """Elapsed device time: the union of ``CONCURRENT_KERNEL`` intervals.
+
+    The runtime owns many streams per device -- stream 0 default, 1-32 low
+    priority, 33-64 high priority, 65+ host compute
+    (``spyre_stream.cpp:95-104``) -- and ``handleKernelActivity`` stamps each
+    activity with its ``stream_id`` (``AiuptiActivityHandlers.cpp:343``). So
+    activities **can overlap**, and summing their durations would over-count
+    the time actually spent. Merging the intervals gives the span the device
+    was busy regardless of how the work was spread across streams.
+
+    Returns 0.0 when no device activities are present.
+    """
+    spans: list[tuple[float, float]] = []
+    for event in getattr(prof, "events", lambda: [])():
+        kind = str(getattr(event, "device_type", ""))
+        if "CPU" in kind:
+            continue
+        start = getattr(event, "time_range", None)
+        if start is None:
+            continue
+        spans.append((float(start.start), float(start.end)))
+    if not spans:
+        return 0.0
+    spans.sort()
+    merged = 0.0
+    lo, hi = spans[0]
+    for start, end in spans[1:]:
+        if start > hi:
+            merged += hi - lo
+            lo, hi = start, end
+        else:
+            hi = max(hi, end)
+    merged += hi - lo
+    return merged / 1e3
+
+
+@functools.cache
+def _device_profiler_available() -> bool:
+    """Whether torch-spyre was built with its AIUPTI/Kineto device profiler.
+
+    torch-spyre ships a real device profiler (``torch_spyre/csrc/profiler/``,
+    ``handleKernelActivity`` at ``AiuptiActivityHandlers.cpp:328`` emits
+    ``CONCURRENT_KERNEL`` with device ``start``/``end`` timestamps), gated at
+    build time by ``USE_SPYRE_PROFILER`` -- which defaults to 1
+    (``torch-spyre/setup.py:83``) but was **off** for the wheel installed here.
+
+    Detection is a real profile of a trivial launch, because nothing cheaper is
+    trustworthy. Measured on this build:
+
+    * ``torch.autograd._supported_activities()`` contains ``SPYRE`` **even
+      when no profiler is registered** -- it reflects torch's Kineto support,
+      not torch-spyre's. Useless as a probe.
+    * every profiled event is ``DeviceType.CPU`` and the summed device time is
+      exactly ``0.0``.
+
+    So: non-zero device time is the signal. ~4 ms, once per process, and the
+    result cannot change within one.
+
+    Any failure means no usable device timing, so the answer is False and the
+    caller falls back -- a benchmark must never raise.
+    """
+    activity = _spyre_activity()
+    if activity is None:
+        return False
+    try:
+        import torch
+
+        x = torch.zeros(64, 64, dtype=torch.float16).to("spyre")
+        probe = torch.compile(lambda t: t + t)
+        probe(x)  # warm, so compilation is outside the profile
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, activity]
+        ) as prof:
+            probe(x)
+        return _device_time_ms(prof) > 0.0
+    except Exception:
+        return False
+
+
+def _device_timed(fn: object, batch: int = _BENCH_BATCH) -> float | None:
+    """Milliseconds of **device** time per launch of ``fn``, or None.
+
+    Prefers the **elapsed** device span (``_device_span_ms``) over summed
+    per-op device work. The runtime has up to 64 compute streams plus
+    host-compute streams (``spyre_stream.cpp:95-104``) and each activity
+    carries a ``stream_id``, so activities can overlap and a plain sum would
+    over-count time the device spent. Merging the intervals measures how long
+    the device was busy, which is what a config should be ranked on, and the
+    two coincide when everything runs on one stream.
+
+    Falls back to the summed form when the profile exposes no usable
+    ``time_range`` -- still device time, just work rather than span.
+
+    Returns None if the profile yields no device time at all, so a caller can
+    fall back rather than silently report 0.0 and make every config look equal.
+
+    **UNVERIFIED ON HARDWARE.** The wheel installed here was built
+    ``USE_SPYRE_PROFILER=0``, so this path has never run against a real
+    profiler. Its arithmetic is checked against a stubbed profile, and the
+    selection logic is checked by the detector returning False -- but nothing
+    here is evidence that AIUPTI reports what this assumes. In particular the
+    span-vs-sum choice is untested: on a single-stream kernel they are equal.
+    """
+    activity = _spyre_activity()
+    if activity is None:
+        return None
+    import torch
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, activity]
+    ) as prof:
+        for _ in range(batch):
+            fn()
+        torch.accelerator.synchronize()
+    total = _device_span_ms(prof) or _device_time_ms(prof)
+    return total / batch if total > 0.0 else None
+
+
+def _bench_once(fn: object) -> float:
+    """One timing sample in milliseconds, device time when it is available.
+
+    The selection is logged once per process so a reviewer, or a future
+    session reading an autotune log, can tell which path produced a number.
+    """
+    if _device_profiler_available():
+        sample = _device_timed(fn)
+        if sample is not None:
+            _log_bench_source("device (AIUPTI/Kineto CONCURRENT_KERNEL)")
+            return sample
+    _log_bench_source("drained wall clock (no device profiler in this build)")
+    return _drained(fn)
+
+
+@functools.cache
+def _log_bench_source(what: str) -> None:
+    log.info("spyre benchmark source: %s", what)
 
 
 def _sencores() -> int:
@@ -190,9 +362,11 @@ class SpyreBackend(Backend):
 
         Interleaving exists to cancel slow drift between candidates, so the
         sweeps are round-robin over the candidate functions rather than
-        candidate-at-a-time. Each candidate's turn is a *drained* batch (see
-        ``_BENCH_BATCH``): without the synchronize this timed the submission
-        queue and ranked candidates backwards.
+        candidate-at-a-time. Each candidate's turn goes through
+        ``_bench_once``: real device time when torch-spyre carries its
+        profiler, otherwise a *drained* batch (see ``_BENCH_BATCH``). Without
+        the synchronize this timed the submission queue and ranked candidates
+        backwards.
         """
 
         def spyre_interleaved_bench(
@@ -211,22 +385,25 @@ class SpyreBackend(Backend):
             sweeps = max(1, min(int(repeat), _BENCH_REPS))
             for _ in range(sweeps):
                 for i, fn in enumerate(fns):
-                    totals[i] += _drained(fn)
+                    totals[i] += _bench_once(fn)
             return [t / sweeps for t in totals]
 
         return spyre_interleaved_bench
 
     def get_do_bench(self) -> object:
-        """Wall-clock timing with the device queue drained.
+        """Device time when the profiler is built in, drained wall clock if not.
 
         ``autotuner/benchmarking.py`` times with CUDA events and streams
-        (`:105-114`), which do not exist for the ``spyre`` device, and there is
-        no device-side timer to read instead.
+        (`:105-114`), which do not exist for the ``spyre`` device.
 
-        A Spyre launch is asynchronous, so the naive form of this -- a clock
-        around one call -- measures submission and is flat in the problem size.
-        Each sample is a drained batch instead; see ``_BENCH_BATCH`` for the
-        measurements that forced it.
+        ``_bench_once`` prefers torch-spyre's AIUPTI/Kineto device activity,
+        which is real device time rather than a host clock. That profiler is
+        gated by ``USE_SPYRE_PROFILER`` (default 1) and is **absent from the
+        wheel installed here**, so the fallback is what runs today: a Spyre
+        launch is asynchronous, so a clock around one call measures submission
+        and is flat in the problem size, and each sample is a drained batch
+        instead. See ``_BENCH_BATCH`` for the measurements that forced it, and
+        ``_device_profiler_available`` for how the two are told apart.
         """
 
         def spyre_do_bench(
@@ -242,9 +419,9 @@ class SpyreBackend(Backend):
             import statistics
 
             for _ in range(_BENCH_WARMUP):
-                _drained(fn)
+                _bench_once(fn)
 
-            samples: list[float] = [_drained(fn) for _ in range(_BENCH_REPS)]
+            samples: list[float] = [_bench_once(fn) for _ in range(_BENCH_REPS)]
 
             if return_mode == "all":
                 return tuple(samples)

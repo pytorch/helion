@@ -80,6 +80,31 @@ def stickify(
     """
     import sympy
 
+    # Every operand's device_size funnels through here, so this is the one
+    # place that sees a non-integer extent. Under ``static_shapes=False``
+    # Helion keeps the host sizes symbolic (s27, s77, ...), and the two layers
+    # then disagree: ``tile_space`` forces a concrete extent through
+    # ``size_hint`` (compute_ops.py:82,:97) while these sizes stay symbolic, so
+    # the emitted literal is ``device_size=[-(-s27 // 64), s77, 64]`` against
+    # ``iteration_space={c0: (128, 2), ...}``. The spec literal is module-level,
+    # so importing the generated kernel dies with a bare
+    # ``NameError: name 's27' is not defined`` from inside
+    # ``kernel.py:compile_config`` -- a message that names neither the backend
+    # nor the cause. Say what is wrong instead.
+    unresolved = [
+        (dim, size)
+        for dim, size in enumerate(sizes)
+        if not isinstance(size, (int, sympy.Integer))
+    ]
+    if unresolved:
+        raise exc.BackendUnsupported(
+            "spyre",
+            "dynamic shapes: host extent "
+            + ", ".join(f"dim {d} = {s}" for d, s in unresolved)
+            + " is symbolic, but an OpSpec device_size must be concrete"
+            " integers. Use @helion.kernel(..., static_shapes=True)",
+        )
+
     eps = elems_per_stick(dtype)
     stick_sym = symbols[stick_dim]
     n_sticks = -(-sizes[stick_dim] // eps)
