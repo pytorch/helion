@@ -34,6 +34,8 @@ from typing import Any
 
 import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _forbid_native_compile
@@ -1770,6 +1772,7 @@ def _float_from_parts(
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@instantiate_parametrized_tests
 class TestExactDivisionCuda(TestCase):
     def _check_rows(self, x: torch.Tensor, s: torch.Tensor) -> None:
         code, out = code_and_output(rows_div, (x, s), **ROWS_CONFIG)
@@ -2246,32 +2249,52 @@ class TestExactDivisionCuda(TestCase):
                     assert fired == list(range(len(configs))), fired
 
     def _several_rows_configs_match_the_plain_render(
-        self, shape: tuple[int, int]
+        self,
+        shape: tuple[int, int],
+        kernel: helion.Kernel,
+        plain: helion.Kernel,
+        config: dict[str, Any],
     ) -> None:
         args = _hard_rows(DEVICE, *shape)
-        for kernel, plain in ROWS_KERNELS:
-            with self.subTest(kernel=kernel.fn.__name__, shape=shape):
-                fired = self._forms_match_the_plain_render(
-                    kernel,
-                    plain,
-                    args,
-                    SEVERAL_ROWS_CONFIGS,
-                    redo_markers=("cutlass.range_constexpr", "_helion_exdiv_save_"),
-                )
-                if shape == (64, 4096):
-                    assert fired == list(range(len(SEVERAL_ROWS_CONFIGS))), fired
+        fired = self._forms_match_the_plain_render(
+            kernel,
+            plain,
+            args,
+            [config],
+            redo_markers=("cutlass.range_constexpr", "_helion_exdiv_save_"),
+        )
+        if shape == (64, 4096):
+            assert fired == [0], fired
 
-    def test_several_rows_per_thread_configs_match_the_plain_render(self) -> None:
+    # Each case compiles both the plain and redo kernels. Give every pair its
+    # own test timeout instead of sharing one across all 24 compilations.
+    @parametrize(
+        "kernel,plain", ROWS_KERNELS, name_fn=lambda kernel, plain: kernel.fn.__name__
+    )
+    @parametrize("config", SEVERAL_ROWS_CONFIGS)
+    def test_several_rows_per_thread_configs_match_the_plain_render(
+        self, kernel: helion.Kernel, plain: helion.Kernel, config: dict[str, Any]
+    ) -> None:
         """The rows kernels under the several-rows configs (the sweeps inside
         a ``cutlass.range_constexpr`` lane loop, the accumulator defined in
         the lane body) on the hard rows: the redo render snapshots the lane
         accumulator and equals the plain render bit for bit, the rows whose
         dividends leave the window included."""
-        self._several_rows_configs_match_the_plain_render((64, 4096))
+        self._several_rows_configs_match_the_plain_render(
+            (64, 4096), kernel, plain, config
+        )
 
-    def test_several_rows_per_thread_configs_on_a_ragged_shape(self) -> None:
+    @parametrize(
+        "kernel,plain", ROWS_KERNELS, name_fn=lambda kernel, plain: kernel.fn.__name__
+    )
+    @parametrize("config", SEVERAL_ROWS_CONFIGS)
+    def test_several_rows_per_thread_configs_on_a_ragged_shape(
+        self, kernel: helion.Kernel, plain: helion.Kernel, config: dict[str, Any]
+    ) -> None:
         """The same on a ragged shape (a partial row block, a reduction axis
         the lanes do not divide): the masked operand loads keep the plain
         division (the render is the plain render; were a sweep to take the
         redo form it would have to equal the plain render bit for bit)."""
-        self._several_rows_configs_match_the_plain_render((RAGGED_ROWS, RAGGED_COLS))
+        self._several_rows_configs_match_the_plain_render(
+            (RAGGED_ROWS, RAGGED_COLS), kernel, plain, config
+        )
