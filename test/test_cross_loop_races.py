@@ -533,7 +533,7 @@ def _edges(bound: Any) -> set[tuple[int, int]]:
 def _early_descriptor_copies(ttgir: str, names: tuple[str, ...]) -> dict[str, int]:
     """TMA copies of each named descriptor that read ahead of a readiness poll:
     copies hoisted above the entry's first ``ld.acquire`` (outside any
-    warp_specialize partition), plus copies a warp-specialized ring's producer
+    warp_specialize partition), plus copies a warp_specialize producer
     partition issues before any poll of its own (the partition runs ahead of
     the consumer's poll).  A partition sees a descriptor as the block argument
     at the descriptor's position in the warp_specialize capture list."""
@@ -635,13 +635,10 @@ class TestStorageClasses(TestCase):
 
         seen: list[object] = []
 
-        rings: list[bool] = []
-
         def enabled(
-            alias_classes: object = (), ring: bool = False
+            alias_classes: object = (),
         ) -> contextlib.AbstractContextManager[None]:
             seen.append(alias_classes)
-            rings.append(ring)
             return contextlib.nullcontext()
 
         def launch(*args: object, aliases: tuple[tuple[int, ...], ...]) -> object:
@@ -661,8 +658,6 @@ class TestStorageClasses(TestCase):
             self.assertEqual(launch(x, w, desc, aliases=()), "ran")
             self.assertEqual(launch(x, w, apart, aliases=()), "ran")
             self.assertEqual(seen, [(("x", "x_desc"),), ()])
-            # No ``_ttgir_weight_ring`` in the launch: the hoist alone.
-            self.assertEqual(rings, [False, False])
 
     def test_fused_roots_without_launch_state_check_storage_sharing(self) -> None:
         x = torch.zeros(8, 4)

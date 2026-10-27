@@ -681,6 +681,10 @@ class TritonBackend(Backend):
         env = CompileEnvironment.current()
         if (
             env.settings.ttgir_weight_prefetch
+            # Only megakernels whose roots poll each other (static or dynamic
+            # cross-loop pipelines) get the pass and its TTGIR parsing; barrier
+            # phases have no readiness spins to prefetch across.
+            and device_fn.config.cross_loop_pipeline != "barrier"
             and device_fn.triton_persistent_state_specs
             and not any(spec[3] for spec in device_fn.triton_persistent_state_specs)
             and not device_fn.triton_remote_copy_signal_slots
@@ -694,12 +698,6 @@ class TritonBackend(Backend):
             # together; the launcher runs the pass only on launches whose
             # sharing stays within those classes.
             out.append("_ttgir_weight_prefetch=True")
-            if env.settings.ttgir_weight_ring:
-                # The pass tries its warp-specialized weight ring first.  The
-                # decision travels with the launch (and so into the compile
-                # key): a process that also runs kernels with the setting off
-                # compiles each kernel the way its own settings ask.
-                out.append("_ttgir_weight_ring=True")
         if env.pdl_entry or env.pdl_exit:
             out.append("launch_pdl=True")
         if device_fn.triton_minimum_resident_programs is not None:

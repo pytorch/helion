@@ -3,13 +3,11 @@ from __future__ import annotations
 import ast
 import contextlib
 import importlib
-import os
 from pathlib import Path
 import re
 import sys
 import textwrap
 import threading
-from typing import TYPE_CHECKING
 from typing import cast
 import unittest
 from unittest import mock
@@ -24,15 +22,15 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
+from helion.runtime.triton import ttgir_tree
 from helion.runtime.triton import ttgir_weight_prefetch as prefetch
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 _HEADER = """\
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 """
@@ -164,7 +162,7 @@ def _line(text: str, pattern: str) -> int:
 
 
 def _poll_line(text: str, name: str = "poll") -> int:
-    return _line(text, rf"_{name} = tt\.elementwise_inline_asm")
+    return _line(text, rf"%{name} = tt\.elementwise_inline_asm")
 
 
 class TestTtgirWeightPrefetchRewrite(TestCase):
@@ -182,11 +180,11 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         poll = _poll_line(out)
         # The weight copy and its address and slot computation precede the wait.
         for name in ("w0_ptrs", "w0_addr", "w0_slot", "w0_copy"):
-            self.assertLess(_line(out, rf"_{name} = "), poll, name)
+            self.assertLess(_line(out, rf"%{name} = "), poll, name)
         # The copy of the written tensor and every commit stay after it, in order.
-        sync = _line(out, r"_poll_sync = ")
-        groups = [_line(out, r"_w0_group = "), _line(out, r"_y0_group = ")]
-        self.assertGreater(_line(out, r"_y0_copy = "), sync)
+        sync = _line(out, r"%poll_sync = ")
+        groups = [_line(out, r"%w0_group = "), _line(out, r"%y0_group = ")]
+        self.assertGreater(_line(out, r"%y0_copy = "), sync)
         self.assertGreater(groups[0], sync)
         self.assertLess(groups[0], groups[1])
 
@@ -194,7 +192,23 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         text = _module(_CONSTANTS + _copy("w0", "%w", 0) + _LOOP)
         out, report = prefetch.rewrite(text)
         self.assertEqual(report.hoisted, 0)
-        self.assertEqual(out, prefetch._uniquify(text))
+        self.assertEqual(out, text)
+
+    def test_module_whose_tree_disagrees_with_triton_is_unchanged(self) -> None:
+        text = _module(_CONSTANTS + _wait() + _copy("w0", "%w", 0) + _LOOP)
+        self.assertEqual(prefetch.rewrite(text)[1].hoisted, 1)
+        mod = ttgir_tree.triton_parse(text)
+        self.assertEqual(prefetch.rewrite(text, mod=mod)[1].hoisted, 1)
+        # Triton's module of another text: the tree's ops are not Triton's.
+        other = ttgir_tree.triton_parse(
+            text.replace(
+                "%c16_i32 = arith.constant 16 : i32",
+                "%c16_i32 = arith.constant 16 : i32\n%x = arith.constant 7 : i32",
+            )
+        )
+        out, report = prefetch.rewrite(text, mod=other)
+        self.assertEqual((out, report.hoisted), (text, 0))
+        self.assertTrue(report.skipped[0].startswith("module: "), report.skipped)
 
     def test_resolves_names_reused_in_sibling_regions(self) -> None:
         # MLIR prints the same name in sibling regions; ``%p`` stores through
@@ -219,8 +233,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         out, report = prefetch.rewrite(_module(body))
         self.assertEqual(report.hoisted, 1)
         poll = _poll_line(out)
-        self.assertLess(_line(out, r"_w0_copy = "), poll)
-        self.assertGreater(_line(out, r"_y0_copy = "), poll)
+        self.assertLess(_line(out, r"%w0_copy = "), poll)
+        self.assertGreater(_line(out, r"%y0_copy = "), poll)
 
     def test_unattributed_store_writes_every_argument(self) -> None:
         params = _PARAMS + ", %table: !tt.ptr<!tt.ptr<bf16>>"
@@ -234,7 +248,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         )
         out, report = prefetch.rewrite(_module(body, params))
         self.assertEqual(report.hoisted, 0)
-        self.assertGreater(_line(out, r"_w0_copy = "), _poll_line(out))
+        self.assertGreater(_line(out, r"%w0_copy = "), _poll_line(out))
 
     def _asm_writer(self, op: str, after: str = "") -> str:
         """``op`` (an inline assembly or external call) on an integer address
@@ -453,9 +467,11 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         )
         self.assertEqual(self._hoisted(asm.replace("SELF", "true")), 1)
         self.assertEqual(self._hoisted(asm.replace("SELF", "false")), 0)
+        # (Triton's verifier rejects the op without its purity: unchanged.)
         self.assertEqual(self._hoisted(asm.replace(", pure = SELF", "")), 0)
+        # Purity is Triton's reading of the attribute, not text in a string.
         self.assertEqual(
-            self._hoisted(asm.replace("SELF", 'true, tag = "pure = true"')), 0
+            self._hoisted(asm.replace("SELF", 'false, tag = "pure = true"')), 0
         )
         call = (
             '%st = tt.extern_elementwise %wi {libname = "", libpath = "", '
@@ -467,6 +483,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         self.assertEqual(
             self._hoisted(call.replace("OTHER", "true").replace("SELF", "false")), 0
         )
+        # (Triton's verifier rejects the op without its purity: unchanged.)
         self.assertEqual(self._hoisted(call.replace("pure = SELF, ", "")), 0)
 
     def test_labels_and_predicates_do_not_hide_instructions(self) -> None:
@@ -554,8 +571,17 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         self.assertEqual(self._hoisted(store_through_cast("%w")), 0)
 
     def test_call_outside_the_module_writes_every_argument(self) -> None:
-        call = "tt.call @elsewhere(%y) : (!tt.ptr<bf16>) -> ()\n"
-        self.assertEqual(self._hoisted(call), 0)
+        # A function only declared in the module (it may also wait on the
+        # predecessor: a PDL wait comes first).
+        call = _GDC_WAIT + "tt.call @elsewhere(%y) : (!tt.ptr<bf16>) -> ()\n"
+        declared = "  tt.func private @elsewhere(!tt.ptr<bf16>)\n"
+        text = self._asm_writer(call).replace(
+            "  tt.func public", declared + "  tt.func public"
+        )
+        _, report = prefetch.rewrite(text)
+        self.assertEqual(report.hoisted, 0)
+        self.assertEqual(report.written, ["%w", "%y", "%state"])
+        self.assertEqual(self._hoisted(_GDC_WAIT), 1)
 
     def test_called_function_gets_no_hoists(self) -> None:
         # A caller may pass one pointer for two parameters: %w and %y of a
@@ -592,7 +618,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         )
         out, report = prefetch.rewrite(self._asm_writer("", after=later))
         self.assertEqual(report.hoisted, 0)
-        self.assertGreater(_line(out, r"_w0_copy = "), _poll_line(out))
+        self.assertGreater(_line(out, r"%w0_copy = "), _poll_line(out))
         # Through a pointer bitcast too.
         cast = later.replace(
             "%wv_i = tt.ptr_to_int %wv_at",
@@ -612,8 +638,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         stamp_y = stamp_w.replace("%wv = tt.splat %w", "%wv = tt.splat %y")
         _, report = prefetch.rewrite(self._asm_writer("", after=stamp_y))
         self.assertEqual(report.hoisted, 1)
-        self.assertTrue(any(w.endswith("_y") for w in report.written))
-        self.assertFalse(any(w.endswith("_w") for w in report.written))
+        self.assertIn("%y", report.written)
+        self.assertNotIn("%w", report.written)
         # The same assembly reading (ld) is off the allowlist: it writes.
         load = later.replace("st.global.b16 [$1], 0;", "ld.global.b16 %rs1, [$1];")
         _, report = prefetch.rewrite(self._asm_writer("", after=load))
@@ -643,26 +669,27 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         self.assertEqual(self._hoisted(through_y), 1)
 
     def test_allowlist_entries_match_exactly(self) -> None:
-        # Every entry is recognized as printed, and nothing else is: not
-        # another template, constraint string, purity, packing or operand
-        # count, nor another attribute or the generic op form.
-        def line(
-            template: str,
-            constraints: str,
-            pure: bool,
-            operands: int,
-            packed: int,
-            extra: str = "",
+        # Every entry is recognized as Triton prints and reads it back, and
+        # nothing else is: not another template, constraint string, purity,
+        # packing or operand count.
+        def module(
+            template: str, constraints: str, pure: bool, operands: int, packed: int
         ) -> str:
+            outs = sum(1 for c in constraints.split(",") if c.startswith("="))
             names = ", ".join(f"%a{k}" for k in range(operands))
-            types = ", ".join("i32" for _ in range(operands))
-            tail = f" {names} : {types} -> i32" if operands else "  -> i32"
-            return (
-                f'%r = tt.elementwise_inline_asm "{_mlir_escape(template)}" '
-                f'{{constraints = "{_mlir_escape(constraints)}", packed_element = '
-                f"{packed} : i32, pure = {str(pure).lower()}{extra}}}{tail}"
-                ' loc("x")'
+            results = ", ".join(["i32"] * outs)
+            tail = (
+                f" {names} : {', '.join(['i32'] * operands)} -> {results}"
+                if operands
+                else f"  -> {results}"
             )
+            op = (
+                f"{'%r' if outs == 1 else f'%r:{outs}'} = tt.elementwise_inline_asm "
+                f'"{_mlir_escape(template)}" {{constraints = "{_mlir_escape(constraints)}", '
+                f"packed_element = {packed} : i32, pure = {str(pure).lower()}}}{tail}\n"
+            )
+            params = ", ".join(f"%a{k}: i32" for k in range(operands))
+            return _module(op, params)
 
         self.assertGreater(len(prefetch._ALLOWLIST), 10)
         for entry in prefetch._ALLOWLIST:
@@ -675,7 +702,9 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
                 entry.packed,
             )
             with self.subTest(entry.source, template=template[:40]):
-                self.assertIs(prefetch._asm_entry(line(*args)), entry)
+                self.assertEqual(
+                    prefetch.inline_assembly(module(*args)), [(template, entry)]
+                )
                 for changed in (
                     (template + " ", *args[1:]),
                     (" " + template, *args[1:]),
@@ -686,13 +715,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
                 ):
                     # Off the allowlist, or exactly another entry (smid is
                     # listed with both purities).
-                    found = prefetch._asm_entry(line(*changed))
+                    found = prefetch._allowlist_entry(*changed)
                     self.assertTrue(found is None or found.key() == changed)
-                self.assertIsNone(prefetch._asm_entry(line(*args, extra=', tag = "x"')))
-                generic = line(*args).replace(
-                    "tt.elementwise_inline_asm", '"tt.elementwise_inline_asm"'
-                )
-                self.assertIsNone(prefetch._asm_entry(generic))
             if entry.kind == "writes":
                 self.assertIsNotNone(entry.written_operand)
                 self.assertLess(entry.written_operand, entry.operands)
@@ -757,7 +781,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         callee = (
             "  tt.func private @helper(%dst: !tt.ptr<bf16>) attributes {noinline = true} {\n"
             "    %zero = arith.constant dense<0.000000e+00> : tensor<16x128xbf16, #blocked>\n"
-            + textwrap.indent(_store("%dst"), "    ")
+            + textwrap.indent(_store("%dst", name="dsts"), "    ")
             + "    tt.return\n  }\n"
         )
         body = (
@@ -784,8 +808,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         out, report = prefetch.rewrite(text)
         self.assertEqual(report.hoisted, 1)
         poll = _poll_line(out)
-        self.assertLess(_line(out, r"_w0_copy = "), poll)
-        self.assertGreater(_line(out, r"_w1_copy = "), _line(out, r"_gdc = "))
+        self.assertLess(_line(out, r"%w0_copy = "), poll)
+        self.assertGreater(_line(out, r"%w1_copy = "), _line(out, r"%gdc = "))
 
     def test_spin_without_a_dominating_pdl_wait_keeps_copies(self) -> None:
         # The module waits on its PDL predecessor, but not before this spin (only
@@ -805,7 +829,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         self.assertEqual(report.hoisted, 0)
         self.assertTrue(any("griddepcontrol" in s for s in report.skipped))
         # A wait at function entry dominates the spin.
-        _, report = prefetch.rewrite(_module(_CONSTANTS + _GDC_WAIT + body))
+        entry = _GDC_WAIT.replace("%gdc", "%gdc_entry")
+        _, report = prefetch.rewrite(_module(entry + body))
         self.assertEqual(report.hoisted, 1)
 
     def test_only_an_unconditional_pdl_wait_dominates(self) -> None:
@@ -919,7 +944,11 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
             prefetch.rewrite(with_helper(extern.replace("PURE", "true")))[1].hoisted, 1
         )
         call = "tt.call @elsewhere() : () -> ()\n"
-        self.assertEqual(prefetch.rewrite(with_helper(call))[1].hoisted, 0)
+        declared = with_helper(call).replace(
+            "  tt.func private @helper",
+            "  tt.func private @elsewhere()\n  tt.func private @helper",
+        )
+        self.assertEqual(prefetch.rewrite(declared)[1].hoisted, 0)
         # And so may any assembly off the allowlist (a wait spelled with a
         # space, or a load), while allowlisted assembly that does not wait
         # leaves the module waitless.
@@ -940,7 +969,6 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
             '{constraints = "=l", packed_element = 1 : i32, pure = false}  -> i64'
         )
         delay = _wait().replace(_ACQUIRE, timer).replace("(i32)", "(i64)")
-        delay = delay.replace(": i32\n  scf.condition", ": i64\n  scf.condition")
         delay = delay.replace("%c16_i32 : i32", "%c16_i64 : i64").replace(
             "scf.yield %poll_again : i32", "scf.yield %poll_again : i64"
         )
@@ -973,8 +1001,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         out, report = prefetch.rewrite(text)
         self.assertEqual(report.hoisted, 2)
         poll = _poll_line(out)
-        self.assertLess(_line(out, r"_w1_copy = "), poll)
-        self.assertGreater(_line(out, r"_w2_copy = "), _line(out, r"_a = "))
+        self.assertLess(_line(out, r"%w1_copy = "), poll)
+        self.assertGreater(_line(out, r"%w2_copy = "), _line(out, r"%a = "))
 
     def test_copy_depending_on_wait_stays(self) -> None:
         dependent = """\
@@ -993,7 +1021,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         )
         out, report = prefetch.rewrite(text)
         self.assertEqual((report.hoisted, report.sites), (1, 1))
-        self.assertLess(_line(out, r"_w0_copy = "), _poll_line(out, "first"))
+        self.assertLess(_line(out, r"%w0_copy = "), _poll_line(out, "first"))
 
     def test_spin_polling_several_counters_is_one_site(self) -> None:
         for relaxed in (True, False):
@@ -1007,8 +1035,8 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
                 out, report = prefetch.rewrite(text)
                 self.assertEqual((report.hoisted, report.sites), (1, 1))
                 self.assertLess(
-                    _line(out, r"_w0_copy = "),
-                    _line(out, r"_pa = tt\.elementwise_inline_asm"),
+                    _line(out, r"%w0_copy = "),
+                    _line(out, r"%pa = tt\.elementwise_inline_asm"),
                 )
 
     def test_system_scope_function_is_skipped(self) -> None:
@@ -1036,10 +1064,10 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         out, report = prefetch.rewrite(_module(body, _TMA_PARAMS))
         self.assertEqual(report.hoisted, 2)
         poll = _poll_line(out)
-        sync = _line(out, r"_poll_sync = ")
+        sync = _line(out, r"%poll_sync = ")
         for stage in (0, 1):
-            init = _line(out, rf"init_barrier %u\d+_bar{stage},")
-            expect = _line(out, rf"barrier_expect %u\d+_bar{stage},")
+            init = _line(out, rf"init_barrier %bar{stage},")
+            expect = _line(out, rf"barrier_expect %bar{stage},")
             copy = _tma_line(out, "w_desc", stage)
             self.assertLess(init, expect)
             self.assertLess(expect, copy)
@@ -1066,7 +1094,12 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
     def test_copy_through_written_descriptor_stays(self) -> None:
         body = (
             _TMA_SETUP.replace(
-                "%x_desc[%c0_i32, %c0_i32], %xval", "%w_desc[%c0_i32, %c0_i32], %xval"
+                "tt.descriptor_store %x_desc[%c0_i32, %c0_i32], %xval : "
+                "!tt.tensordesc<16x128xbf16, #nvmma>, tensor<16x128xbf16, #blocked>",
+                "%wval = arith.constant dense<0.000000e+00> : "
+                "tensor<128x128xbf16, #blocked>\n"
+                "tt.descriptor_store %w_desc[%c0_i32, %c0_i32], %wval : "
+                "!tt.tensordesc<128x128xbf16, #nvmma>, tensor<128x128xbf16, #blocked>",
             )
             + _wait()
             + _tma_buffers()
@@ -1075,7 +1108,7 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         )
         out, report = prefetch.rewrite(_module(body, _TMA_PARAMS))
         self.assertEqual(report.hoisted, 1)
-        self.assertGreater(_tma_line(out, "w_desc", 0), _line(out, r"_poll_sync = "))
+        self.assertGreater(_tma_line(out, "w_desc", 0), _line(out, r"%poll_sync = "))
         self.assertLess(_tma_line(out, "x_desc", 0), _poll_line(out))
 
     def test_stages_hook_keys_both_caches_with_the_pass_version(self) -> None:
@@ -1112,22 +1145,10 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
             self.assertNotEqual(aliased_key, key)
             self.assertNotEqual(aliased_digest, digest)
             self.assertEqual(hook(), (key, digest))
-            # The kernel's ring setting (as its launch passes it) is too.
-            with prefetch.enabled(ring=True):
-                ring_key, ring_digest = cast("tuple[str, str]", hook())
-                ring_stages: dict[str, object] = {
-                    "ttgir": make_ttgir,
-                    "llir": make_ttgir,
-                    "ptx": make_ttgir,
-                    "cubin": make_ttgir,
-                }
-                hook(None, ring_stages, None, None, None)
-                self.assertIsInstance(
-                    getattr(ring_stages["llir"], "__self__", None), prefetch._Fallback
-                )
-            self.assertTrue(key.endswith("-ring0"))
-            self.assertTrue(ring_key.endswith("-ring1"))
-            self.assertNotEqual(ring_digest, digest)
+            # Only the ttgir stage is wrapped: the hoist needs no later stage.
+            later: dict[str, object] = {"ttgir": make_ttgir, "llir": make_ttgir}
+            hook(None, later, None, None, None)
+            self.assertIs(later["llir"], make_ttgir)
             elsewhere: list[object] = []
             thread = threading.Thread(target=lambda: elsewhere.append(hook()))
             thread.start()
@@ -1138,19 +1159,20 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         # %x (stored through as a pointer) and %x_desc (read by TMA) view one
         # tensor when the launch says they share a storage.
         params = (
-            '%w_desc: !tt.tensordesc<128x128xbf16, #shared> loc("w_desc"(#loc)), '
+            '%w_desc: !tt.tensordesc<128x128xbf16, #nvmma> loc("w_desc"(#loc)), '
             '%x: !tt.ptr<bf16> {tt.divisibility = 16 : i32} loc("x"(#loc)), '
-            "%x_desc: !tt.tensordesc<16x128xbf16, #shared> loc(#loc7), "
+            "%x_desc: !tt.tensordesc<16x128xbf16, #nvmma> loc(#loc7), "
             '%state: !tt.ptr<i32> loc("state"(#loc))'
         )
         setup = _TMA_SETUP.replace(
             "tt.descriptor_store %x_desc[%c0_i32, %c0_i32], %xval : "
-            "!tt.tensordesc<16x128xbf16, #shared>, tensor<16x128xbf16, #blocked>",
+            "!tt.tensordesc<16x128xbf16, #nvmma>, tensor<16x128xbf16, #blocked>",
             "%xs = tt.splat %x : !tt.ptr<bf16> -> tensor<16x128x!tt.ptr<bf16>, #blocked>\n"
             "tt.store %xs, %xval : tensor<16x128x!tt.ptr<bf16>, #blocked>",
         )
         body = setup + _wait() + _tma_buffers() + _tma_stage(0, 0, "%bar0") + _LOOP
-        text = '#loc7 = loc("x_desc"(#loc))\n' + _module(body, params)
+        locs = '#loc = loc("k.py":1:1)\n#loc7 = loc("x_desc"(#loc))\n'
+        text = locs + _module(body, params)
         _, report = prefetch.rewrite(text)
         self.assertEqual(report.hoisted, 2)
         self.assertEqual(report.written, ["x"])
@@ -1158,34 +1180,22 @@ class TestTtgirWeightPrefetchRewrite(TestCase):
         self.assertEqual(report.hoisted, 1)
         self.assertEqual(report.written, ["x", "x_desc"])
         self.assertLess(_tma_line(out, "w_desc", 0), _poll_line(out))
-        self.assertGreater(_tma_line(out, "x_desc", 0), _line(out, r"_poll_sync = "))
+        self.assertGreater(_tma_line(out, "x_desc", 0), _line(out, r"%poll_sync = "))
         # A class naming an argument the function does not have: no hoists.
         _, report = prefetch.rewrite(text, (("x", "nowhere"),))
         self.assertEqual(report.hoisted, 0)
         self.assertTrue(any("storage classes" in r for r in report.skipped))
         # Without source names the classes cannot be resolved either.
         _, report = prefetch.rewrite(
-            _module(body, params.replace(' loc("x"(#loc))', "")), (("x", "x_desc"),)
+            locs + _module(body, params.replace(' loc("x"(#loc))', "")),
+            (("x", "x_desc"),),
         )
         self.assertEqual(report.hoisted, 0)
 
-    def test_uniquify_names_every_value_once(self) -> None:
-        body = (
-            _CONSTANTS
-            + "%c = arith.cmpi eq, %c0_i32, %c1_i32 : i32\n"
-            + "scf.if %c {\n  %v = arith.addi %c0_i32, %c1_i32 : i32\n}\n"
-            + "scf.if %c {\n  %v = arith.muli %c0_i32, %c1_i32 : i32\n}\n"
-        )
-        out = prefetch._uniquify(_module(body))
-        defs = [prefetch._results(line) for line in out.splitlines()]
-        names = [n for d in defs for n in d]
-        self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(sum(1 for n in names if n.endswith("_v")), 2)
-
 
 _TMA_PARAMS = (
-    "%w_desc: !tt.tensordesc<128x128xbf16, #shared>, "
-    "%x_desc: !tt.tensordesc<16x128xbf16, #shared>, %state: !tt.ptr<i32>"
+    "%w_desc: !tt.tensordesc<128x128xbf16, #nvmma>, "
+    "%x_desc: !tt.tensordesc<16x128xbf16, #nvmma>, %state: !tt.ptr<i32>"
 )
 _BAR = "!ttg.memdesc<1xi64, #shared1, #smem, mutable>"
 _TMA_SETUP = """\
@@ -1195,7 +1205,7 @@ _TMA_SETUP = """\
 %c128_i32 = arith.constant 128 : i32
 %true = arith.constant true
 %xval = arith.constant dense<0.000000e+00> : tensor<16x128xbf16, #blocked>
-tt.descriptor_store %x_desc[%c0_i32, %c0_i32], %xval : !tt.tensordesc<16x128xbf16, #shared>, tensor<16x128xbf16, #blocked>
+tt.descriptor_store %x_desc[%c0_i32, %c0_i32], %xval : !tt.tensordesc<16x128xbf16, #nvmma>, tensor<16x128xbf16, #blocked>
 """
 
 
@@ -1206,32 +1216,32 @@ def _tma_buffers() -> str:
 ttng.init_barrier %bar0, 1 : {_BAR}
 %bar1 = ttg.memdesc_index %bars[%c1_i32] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> {_BAR}
 ttng.init_barrier %bar1, 1 : {_BAR}
-%wring = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xbf16, #shared, #smem, mutable>
-%xring = ttg.local_alloc : () -> !ttg.memdesc<2x16x128xbf16, #shared, #smem, mutable>
+%wring = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xbf16, #nvmma, #smem, mutable>
+%xring = ttg.local_alloc : () -> !ttg.memdesc<2x16x128xbf16, #nvmma, #smem, mutable>
 """
 
 
 def _tma_stage(stage: int, slot: int, barrier: str) -> str:
     return f"""\
-%w{stage} = ttg.memdesc_index %wring[%c{slot}_i32] : !ttg.memdesc<2x128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
-%x{stage} = ttg.memdesc_index %xring[%c{slot}_i32] : !ttg.memdesc<2x16x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<16x128xbf16, #shared, #smem, mutable>
+%w{stage} = ttg.memdesc_index %wring[%c{slot}_i32] : !ttg.memdesc<2x128x128xbf16, #nvmma, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #nvmma, #smem, mutable>
+%x{stage} = ttg.memdesc_index %xring[%c{slot}_i32] : !ttg.memdesc<2x16x128xbf16, #nvmma, #smem, mutable> -> !ttg.memdesc<16x128xbf16, #nvmma, #smem, mutable>
 ttng.barrier_expect {barrier}, 36864, %true : {_BAR}
-ttng.async_tma_copy_global_to_local %w_desc[%c0_i32, %c{slot}_i32] %w{stage}, {barrier}, %true : !tt.tensordesc<128x128xbf16, #shared>, {_BAR} -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
-ttng.async_tma_copy_global_to_local %x_desc[%c0_i32, %c{slot}_i32] %x{stage}, {barrier}, %true : !tt.tensordesc<16x128xbf16, #shared>, {_BAR} -> !ttg.memdesc<16x128xbf16, #shared, #smem, mutable>
+ttng.async_tma_copy_global_to_local %w_desc[%c0_i32, %c{slot}_i32] %w{stage}, {barrier}, %true : !tt.tensordesc<128x128xbf16, #nvmma>, {_BAR} -> !ttg.memdesc<128x128xbf16, #nvmma, #smem, mutable>
+ttng.async_tma_copy_global_to_local %x_desc[%c0_i32, %c{slot}_i32] %x{stage}, {barrier}, %true : !tt.tensordesc<16x128xbf16, #nvmma>, {_BAR} -> !ttg.memdesc<16x128xbf16, #nvmma, #smem, mutable>
 """
 
 
 def _peeled(barrier: str, slot_value: str) -> str:
     return f"""\
 ttng.wait_barrier {barrier}, %c0_i32, %true : {_BAR}
-%a = ttg.local_load {slot_value} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> tensor<128x128xbf16, #blocked>
+%a = ttg.local_load {slot_value} : !ttg.memdesc<128x128xbf16, #nvmma, #smem, mutable> -> tensor<128x128xbf16, #blocked>
 """
 
 
 def _tma_line(text: str, desc: str, stage: int) -> int:
     return _line(
         text,
-        rf"async_tma_copy_global_to_local %u\d+_{desc}\[.*%u\d+_{['w', 'x'][desc == 'x_desc']}{stage},",
+        rf"async_tma_copy_global_to_local %{desc}\[.*%{['w', 'x'][desc == 'x_desc']}{stage},",
     )
 
 
@@ -1246,8 +1256,6 @@ def _norm_gemv(x: torch.Tensor, gamma: torch.Tensor, w: torch.Tensor) -> torch.T
         y[t, :] = (row * torch.rsqrt(ms + 1e-6) * gamma[None, :].to(torch.float32)).to(
             torch.bfloat16
         )
-    # N block 64: the warp-specialized ring keeps the hoist's two CTAs per SM
-    # (at 16 the 4-warp hoist runs 9 per SM, the 8-warp ring 6: refused)
     for n_t in hl.tile(n_dim, block_size=64):
         acc = hl.zeros([n_t, t_rows], dtype=torch.float32)
         for k_t in hl.tile(k_dim, block_size=128):
@@ -1388,37 +1396,6 @@ def _two_norm_gemv(
     return out
 
 
-# A 20 us delay of allowlisted assembly only (the pass stays engaged).
-_SPIN_20US = """
-t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
-t1 = t0
-while t1 - t0 < 20000:
-    t1 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
-0
-"""
-
-
-def _late_act_gemv(
-    x: torch.Tensor, gamma: torch.Tensor, w: torch.Tensor, y: torch.Tensor
-) -> torch.Tensor:
-    """The GEMV's activation ``y`` is written 20 us late by the first root:
-    the ring's activation producer must wait for it like the compute warps."""
-    t_rows, k_dim = x.shape
-    n_dim = w.size(0)
-    out = torch.empty([n_dim, t_rows], dtype=torch.bfloat16, device=x.device)
-    for t in hl.tile(t_rows, block_size=1):
-        hl.inline_triton(_SPIN_20US, args={}, output_like=None)
-        y[t, :] = (x[t, :].to(torch.float32) * gamma[None, :].to(torch.float32)).to(
-            torch.bfloat16
-        )
-    for n_t in hl.tile(n_dim, block_size=64):  # as _norm_gemv: the ring keeps 2 CTAs/SM
-        acc = hl.zeros([n_t, t_rows], dtype=torch.float32)
-        for k_t in hl.tile(k_dim, block_size=128):
-            acc = hl.dot(w[n_t, k_t], y[:, k_t].permute(1, 0), acc=acc)
-        out[n_t, :] = acc.to(torch.bfloat16)
-    return out
-
-
 _CONFIG = helion.Config(
     block_sizes=[],
     cross_loop_pipeline="dynamic",
@@ -1450,14 +1427,6 @@ _TWO_PRODUCER_CONFIG = helion.Config(
 )
 
 
-def _ring_parts(ttgir: str) -> tuple[str, list[str]]:
-    """(default region, producer partitions) of the pass-built warp
-    specialization in a compiled module's TTGIR."""
-    body = ttgir[ttgir.index("ttg.warp_specialize") :]
-    parts = re.split(r"\n\s*partition\d+\(", body)
-    return parts[0], parts[1:]
-
-
 def _compiled_ttgir(bound: object) -> list[str]:
     return [compiled.asm["ttgir"] for compiled in _compiled(bound)]
 
@@ -1472,17 +1441,6 @@ def _compiled(bound: object) -> list[object]:
     ]
 
 
-def _is_ring_binary(compiled: object) -> bool:
-    """The binary is the ring's, not a fallback's: Triton keeps the first
-    candidate's TTGIR in ``asm`` even when a later stage fell back, so only
-    the binary's warp count and PTX tell."""
-    md = compiled.metadata  # pyrefly: ignore[missing-attribute]
-    ptx = compiled.asm["ptx"]  # pyrefly: ignore[missing-attribute]
-    return md.num_warps > 4 and (
-        "cp.async.mbarrier.arrive" in ptx or "mbarrier.arrive.expect_tx" in ptx
-    )
-
-
 @onlyBackends(["triton"])
 class TestTtgirWeightPrefetchCompile(TestCase):
     def _inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1492,13 +1450,12 @@ class TestTtgirWeightPrefetchCompile(TestCase):
         w = (0.05 * torch.randn(256, 512, device=DEVICE)).bfloat16()
         return x, gamma, w
 
-    def _kernel(self, enabled: bool, ring: bool = True) -> helion.Kernel:
+    def _kernel(self, enabled: bool) -> helion.Kernel:
         return helion.kernel(
             _norm_gemv,
             config=_CONFIG,
             static_shapes=True,
             ttgir_weight_prefetch=enabled,
-            ttgir_weight_ring=ring,
             ignore_warnings=[helion.exc.TensorOperationInWrapper],
         )
 
@@ -1506,16 +1463,14 @@ class TestTtgirWeightPrefetchCompile(TestCase):
     @skipIfCudaCapabilityLessThan((8, 0))
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_megakernel_issues_weight_copies_before_wait(self) -> None:
-        # The hoist (the ring's fallback, and the pass with the ring setting
-        # off): the weight copies move above the readiness spin.
+        # The weight copies move above the readiness spin.
         args = self._inputs()
         outputs = {}
         for enabled in (True, False):
-            kernel = self._kernel(enabled, ring=False)
+            kernel = self._kernel(enabled)
             bound = kernel.bind(args)
             code = bound.to_triton_code(_CONFIG)
             self.assertEqual("_ttgir_weight_prefetch=True" in code, enabled)
-            self.assertNotIn("_ttgir_weight_ring", code)
             outputs[enabled] = kernel(*args)
             (ttgir,) = _compiled_ttgir(bound)
             lines = ttgir.splitlines()
@@ -1538,41 +1493,24 @@ class TestTtgirWeightPrefetchCompile(TestCase):
         self.assertTrue(torch.equal(outputs[True], outputs[False]))
 
     @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((10, 0))
+    @skipIfCudaCapabilityLessThan((8, 0))
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_megakernel_streams_weight_copies_through_the_ring(self) -> None:
-        # Default settings: the pass builds the warp-specialized ring, whose
-        # weight producer issues the weight copies without waiting on any
-        # readiness counter; the compute warps wait per stage on mbarriers.
-        args = self._inputs()
-        outputs = {}
-        for prefetch_on, ring in ((True, True), (True, False), (False, True)):
-            kernel = self._kernel(prefetch_on, ring=ring)
-            bound = kernel.bind(args)
-            code = bound.to_triton_code(_CONFIG)
-            self.assertEqual("_ttgir_weight_prefetch=True" in code, prefetch_on)
-            self.assertEqual("_ttgir_weight_ring=True" in code, prefetch_on and ring)
-            outputs[prefetch_on, ring] = kernel(*args)
-            (compiled,) = _compiled(bound)
-            ttgir = compiled.asm["ttgir"]  # pyrefly: ignore[missing-attribute]
-            self.assertEqual("ttg.warp_specialize" in ttgir, prefetch_on and ring)
-            self.assertEqual(_is_ring_binary(compiled), prefetch_on and ring)
-            if not (prefetch_on and ring):
-                continue
-            default, producers = _ring_parts(ttgir)
-            weights = producers[0]
-            self.assertIn("async_copy_global_to_local", weights)
-            self.assertIn("async_copy_mbarrier_arrive", weights)
-            self.assertNotIn("ld.acquire", weights)
-            self.assertNotIn("ld.relaxed", weights)
-            self.assertIn("ttng.wait_barrier", default)
-        x, gamma, w = (a.float() for a in args)
-        y = (x * torch.rsqrt((x * x).mean(-1, keepdim=True) + 1e-6) * gamma).bfloat16()
-        torch.testing.assert_close(
-            outputs[True, True].float(), w @ y.float().T, rtol=2e-2, atol=2e-2
+    def test_barrier_pipeline_gets_no_pass(self) -> None:
+        # Barrier phases have no readiness spins to prefetch across: the launch
+        # asks for neither the pass nor its TTGIR parsing.
+        bound = self._kernel(True).bind(self._inputs())
+        barrier = helion.Config(
+            block_sizes=[],
+            cross_loop_pipeline="barrier",
+            num_warps=4,
+            num_stages=2,
+            pid_type="persistent_blocked",
+            indexing="pointer",
+            range_num_stages=[0, 0, 4],
         )
-        self.assertTrue(torch.equal(outputs[True, True], outputs[True, False]))
-        self.assertTrue(torch.equal(outputs[True, True], outputs[False, True]))
+        code = bound.to_triton_code(barrier)
+        self.assertNotIn("_ttgir_weight_prefetch=", code)
+        self.assertIn("_ttgir_weight_prefetch=True", bound.to_triton_code(_CONFIG))
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((8, 0))
@@ -1640,16 +1578,12 @@ class TestTtgirWeightPrefetchCompile(TestCase):
             range_num_stages=[0, 0, 4],
         )
         outputs = {}
-        ring_on = torch.cuda.get_device_capability() >= (10, 0)
-        for enabled, ring in ((True, False), (False, False), (True, True)):
-            if ring and not ring_on:
-                continue
+        for enabled in (True, False):
             kernel = helion.kernel(
                 _norm_gemv_masked,
                 config=config,
                 static_shapes=True,
                 ttgir_weight_prefetch=enabled,
-                ttgir_weight_ring=ring,
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )
             bound = kernel.bind((x, gamma, w, y))
@@ -1666,22 +1600,13 @@ class TestTtgirWeightPrefetchCompile(TestCase):
                 len(lines[wait]) - len(lines[wait].lstrip()),
                 len(lines[loop]) - len(lines[loop].lstrip()),
             )
-            outputs[enabled, ring] = kernel(x, gamma, w, y)
+            outputs[enabled] = kernel(x, gamma, w, y)
             module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
             (ttgir,) = [
                 compiled.asm["ttgir"]
                 for caches in module._helion__norm_gemv_masked.device_caches.values()
                 for compiled in caches[0].values()
             ]
-            if ring:
-                # The ring: the weight producer streams the GEMV's weight
-                # tiles without waiting; the wait stays in the compute warps'
-                # task, in front of the K loop.
-                default, producers = _ring_parts(ttgir)
-                self.assertIn("async_copy_global_to_local", producers[0])
-                self.assertNotIn("ld.acquire", producers[0])
-                self.assertIn("ld.acquire", default)
-                continue
             poll = ttgir.index("ld.acquire", ttgir.index("tt.func public"))
             early = ttgir[:poll].count("async_copy_global_to_local")
             self.assertEqual(early > 0, enabled)
@@ -1690,13 +1615,12 @@ class TestTtgirWeightPrefetchCompile(TestCase):
             xf * torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6) * gamma.float()
         ).bfloat16()
         torch.testing.assert_close(
-            outputs[True, False][:, :6].float(),
+            outputs[True][:, :6].float(),
             w.float() @ ref.float().T,
             rtol=2e-2,
             atol=2e-2,
         )
-        for out in outputs.values():
-            self.assertTrue(torch.equal(out, outputs[False, False]))
+        self.assertTrue(torch.equal(outputs[True], outputs[False]))
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((10, 0))
@@ -1750,54 +1674,37 @@ class TestTtgirWeightPrefetchCompile(TestCase):
         from helion.runtime.precompile_shim import make_precompiler
 
         args = self._inputs()
-        ring_on = torch.cuda.get_device_capability() >= (10, 0)
-        for ring in (True, False) if ring_on else (False,):
-            kernel = self._kernel(True, ring=ring)
-            bound = kernel.bind(args)
-            bound.set_config(_CONFIG)
-            extracted: dict[str, object] = {}
+        kernel = self._kernel(True)
+        bound = kernel.bind(args)
+        bound.set_config(_CONFIG)
+        extracted: dict[str, object] = {}
 
-            def extract(
-                triton_kernel: object,
-                grid: object,
-                *a: object,
-                _sink: dict[str, object] = extracted,
-                **kw: object,
-            ) -> None:
-                _sink.update(kernel=triton_kernel, args=a, kwargs=kw)
+        def extract(
+            triton_kernel: object, grid: object, *a: object, **kw: object
+        ) -> None:
+            extracted.update(kernel=triton_kernel, args=a, kwargs=kw)
 
-            bound._run(*args, _launcher=extract)  # pyrefly: ignore[missing-attribute]
-            self.assertTrue(extracted["kwargs"]["_ttgir_weight_prefetch"])
-            self.assertEqual(bool(extracted["kwargs"].get("_ttgir_weight_ring")), ring)
-            jit = extracted["kernel"]
-            compile_fn = make_precompiler(jit, _CONFIG, bound)(
-                *extracted["args"], **extracted["kwargs"]
-            )
-            self.assertTrue(compile_fn(False))
-            ((key, compiled),) = (
-                item
-                for caches in jit.device_caches.values()
-                for item in caches[0].items()
-            )
-            ttgir = compiled.asm["ttgir"]
-            if ring:
-                # Precompile ran the ring: its weight producer issues the
-                # copies, without waiting.
-                _, producers = _ring_parts(ttgir)
-                self.assertIn("async_copy_global_to_local", producers[0])
-                self.assertNotIn("ld.acquire", producers[0])
-            else:
-                poll = ttgir.index("ld.acquire")
-                self.assertIn("async_copy_global_to_local", ttgir[:poll])
-            kernel(*args)
-            keys = [k for caches in jit.device_caches.values() for k in caches[0]]
-            pipeline = re.compile(r"\(\"custom_pipeline\", \w+\)")
-            # Both keys name the same pass; the rest of the precompile key may
-            # differ.
-            self.assertEqual(
-                {pipeline.search(k).group(0) for k in keys},
-                {pipeline.search(key).group(0)},
-            )
+        bound._run(*args, _launcher=extract)  # pyrefly: ignore[missing-attribute]
+        self.assertTrue(extracted["kwargs"]["_ttgir_weight_prefetch"])
+        jit = extracted["kernel"]
+        compile_fn = make_precompiler(jit, _CONFIG, bound)(
+            *extracted["args"], **extracted["kwargs"]
+        )
+        self.assertTrue(compile_fn(False))
+        ((key, compiled),) = (
+            item for caches in jit.device_caches.values() for item in caches[0].items()
+        )
+        ttgir = compiled.asm["ttgir"]
+        poll = ttgir.index("ld.acquire")
+        self.assertIn("async_copy_global_to_local", ttgir[:poll])
+        kernel(*args)
+        keys = [k for caches in jit.device_caches.values() for k in caches[0]]
+        pipeline = re.compile(r"\(\"custom_pipeline\", \w+\)")
+        # Both keys name the same pass; the rest of the precompile key may
+        # differ.
+        self.assertEqual(
+            {pipeline.search(k).group(0) for k in keys}, {pipeline.search(key).group(0)}
+        )
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((8, 0))
@@ -1884,37 +1791,17 @@ class TestTtgirWeightPrefetchCompile(TestCase):
                 jit = getattr(module, f"_helion_{fn.__name__}")
                 for caches in jit.device_caches.values():
                     for compiled in caches[0].values():
-                        for line in compiled.asm["ttgir"].splitlines():
-                            if "tt.elementwise_inline_asm" not in line:
-                                continue
-                            entry = prefetch._asm_entry(line.strip())
+                        ttgir = compiled.asm["ttgir"]
+                        for template, entry in prefetch.inline_assembly(ttgir):
                             assert entry is not None, (
-                                f"Helion emitted inline assembly off the allowlist: {line.strip()[:300]}"
+                                f"Helion emitted inline assembly off the allowlist: {template[:300]!r}"
                             )
                             kinds.add(entry.kind)
         self.assertEqual(kinds, {"poll", "sync", "pdl_wait", "quiet"})
 
 
 @onlyBackends(["triton"])
-class TestTtgirWeightRingSetting(TestCase):
-    """The ring is a Helion setting (``ttgir_weight_ring``, default on): it
-    reaches the pass through the launch, never through the process
-    environment at compile or launch time."""
-
-    def test_setting_defaults_on_and_reads_its_environment_variable(self) -> None:
-        with mock.patch.dict(os.environ):
-            os.environ.pop("HELION_TTGIR_WEIGHT_RING", None)
-            self.assertTrue(helion.Settings().ttgir_weight_ring)
-            os.environ["HELION_TTGIR_WEIGHT_RING"] = "0"
-            self.assertFalse(helion.Settings().ttgir_weight_ring)
-            os.environ["HELION_TTGIR_WEIGHT_RING"] = "1"
-            self.assertTrue(helion.Settings().ttgir_weight_ring)
-            self.assertFalse(helion.Settings(ttgir_weight_ring=False).ttgir_weight_ring)
-        # Documented like every setting (help(Settings)).
-        self.assertIn(
-            "HELION_TTGIR_WEIGHT_RING", helion.Settings.__slots__["ttgir_weight_ring"]
-        )
-
+class TestTtgirWeightPrefetchLaunch(TestCase):
     def test_launcher_passes_the_launch_flag_to_the_pass(self) -> None:
         from triton import knobs
 
@@ -1937,271 +1824,25 @@ class TestTtgirWeightRingSetting(TestCase):
         saved = knobs.runtime.add_stages_inspection_hook
         knobs.runtime.add_stages_inspection_hook = None
         try:
-            for env in ("0", "1"):
-                with mock.patch.dict(os.environ, {"HELION_TTGIR_WEIGHT_RING": env}):
-                    for pass_on, ring in ((True, True), (True, False), (False, True)):
-                        seen.clear()
-                        default_launcher(
-                            FakeJit(),
-                            (1,),
-                            num_warps=4,
-                            num_stages=1,
-                            _ttgir_weight_prefetch=pass_on,
-                            _ttgir_weight_ring=ring,
-                        )
-                        ((facts, key),) = seen
-                        if not pass_on:  # no pass, so no ring either
-                            self.assertIsNone(facts)
-                            self.assertIsNone(key)
-                            continue
-                        assert isinstance(facts, prefetch._Facts)
-                        self.assertEqual(facts.ring, ring)
-                        assert isinstance(key, str)
-                        self.assertTrue(key.endswith("-ring1" if ring else "-ring0"))
-                    # Generated code from before the setting has no ring flag:
-                    # the hoist alone.
-                    seen.clear()
-                    default_launcher(
-                        FakeJit(),
-                        (1,),
-                        num_warps=4,
-                        num_stages=1,
-                        _ttgir_weight_prefetch=True,
-                    )
-                    self.assertFalse(cast("prefetch._Facts", seen[0][0]).ring)
+            for pass_on in (True, False):
+                seen.clear()
+                default_launcher(
+                    FakeJit(),
+                    (1,),
+                    num_warps=4,
+                    num_stages=1,
+                    _ttgir_weight_prefetch=pass_on,
+                )
+                ((facts, key),) = seen
+                if not pass_on:
+                    self.assertIsNone(facts)
+                    self.assertIsNone(key)
+                    continue
+                self.assertEqual(facts, prefetch._Facts())
+                assert isinstance(key, str)
+                self.assertIn(f"helion-ttgir-weight-prefetch-{prefetch._DIGEST}", key)
         finally:
             knobs.runtime.add_stages_inspection_hook = saved
-
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((8, 0))
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_generated_launch_carries_the_setting(self) -> None:
-        args = TestTtgirWeightPrefetchCompile._inputs(self)  # pyrefly: ignore[bad-argument-type]
-        for prefetch_on, ring, flags in (
-            (True, True, ("_ttgir_weight_prefetch=True", "_ttgir_weight_ring=True")),
-            (True, False, ("_ttgir_weight_prefetch=True",)),
-            (False, True, ()),
-            (False, False, ()),
-        ):
-            kernel = helion.kernel(
-                _norm_gemv,
-                config=_CONFIG,
-                static_shapes=True,
-                ttgir_weight_prefetch=prefetch_on,
-                ttgir_weight_ring=ring,
-                ignore_warnings=[helion.exc.TensorOperationInWrapper],
-            )
-            code = kernel.bind(args).to_triton_code(_CONFIG)
-            present = tuple(
-                f
-                for f in ("_ttgir_weight_prefetch=True", "_ttgir_weight_ring=True")
-                if f in code
-            )
-            self.assertEqual(present, flags)
-        # The environment variable is read when the kernel's settings are
-        # made, not at launch.
-        with mock.patch.dict(os.environ, {"HELION_TTGIR_WEIGHT_RING": "0"}):
-            off = helion.kernel(
-                _norm_gemv,
-                config=_CONFIG,
-                static_shapes=True,
-                ignore_warnings=[helion.exc.TensorOperationInWrapper],
-            )
-        self.assertNotIn("_ttgir_weight_ring", off.bind(args).to_triton_code(_CONFIG))
-
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((10, 0))
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_kernels_with_either_setting_share_a_process(self) -> None:
-        # Triton keys every launch with the stages hook again; the key comes
-        # from each kernel's own launch flag, so flipping the environment
-        # between launches neither recompiles a kernel nor swaps its binary.
-        args = TestTtgirWeightPrefetchCompile._inputs(self)  # pyrefly: ignore[bad-argument-type]
-        kernels = {
-            ring: helion.kernel(
-                _norm_gemv,
-                config=_CONFIG,
-                static_shapes=True,
-                ttgir_weight_ring=ring,
-                ignore_warnings=[helion.exc.TensorOperationInWrapper],
-            )
-            for ring in (True, False)
-        }
-        outputs: dict[bool, list[torch.Tensor]] = {True: [], False: []}
-        for env in ("0", "1", "0", None):
-            for ring, kernel in kernels.items():
-                with mock.patch.dict(os.environ):
-                    if env is None:
-                        os.environ.pop("HELION_TTGIR_WEIGHT_RING", None)
-                    else:
-                        os.environ["HELION_TTGIR_WEIGHT_RING"] = env
-                    outputs[ring].append(kernel(*args))
-        for ring, kernel in kernels.items():
-            bound = kernel.bind(args)
-            (ttgir,) = _compiled_ttgir(bound)
-            self.assertEqual("ttg.warp_specialize" in ttgir, ring)
-        reference = outputs[False][0]
-        for out in outputs[True] + outputs[False]:
-            self.assertTrue(torch.equal(out, reference))
-
-
-@onlyBackends(["triton"])
-class TestTtgirWeightRingRace(TestCase):
-    """The ring on GPU against a late producer of the activation it streams,
-    with the private negative control that drops the activation producer's
-    readiness spin (HELION_TTGIR_RING_NEG=nospin): that one must race."""
-
-    def _run(
-        self, ring: bool, neg: str | None, launches: int
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], str, bool]:
-        torch.manual_seed(0)
-        x = torch.randn(16, 512, device=DEVICE, dtype=torch.bfloat16)
-        gamma = (1 + 0.1 * torch.randn(512, device=DEVICE)).bfloat16()
-        w = (0.05 * torch.randn(256, 512, device=DEVICE)).bfloat16()
-        y = torch.empty_like(x)
-        outs: list[torch.Tensor] = []
-        ys: list[torch.Tensor] = []
-        with mock.patch.dict(os.environ):
-            # the hook is read at compile time and in every launch's key
-            os.environ.pop("HELION_TTGIR_RING_NEG", None)
-            if neg is not None:
-                os.environ["HELION_TTGIR_RING_NEG"] = neg
-            kernel = helion.kernel(
-                _late_act_gemv,
-                config=_CONFIG,
-                static_shapes=True,
-                ttgir_weight_ring=ring,
-                ignore_warnings=[helion.exc.TensorOperationInWrapper],
-            )
-            bound = kernel.bind((x, gamma, w, y))
-            bound.set_config(_CONFIG)
-            module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
-
-            def compiled() -> dict[object, object]:
-                # Kernels with equal generated code share one JIT function;
-                # the hook keys its binaries apart (ring0 / ring1 / ring1[neg]).
-                return {
-                    key: c
-                    for caches in module._helion__late_act_gemv.device_caches.values()
-                    for key, c in caches[0].items()
-                }
-
-            before = compiled()
-            for _ in range(launches):
-                y.fill_(float("nan"))  # poisoned until the late root writes it
-                outs.append(kernel(x, gamma, w, y).clone())
-                ys.append(y.clone())
-            torch.cuda.synchronize()
-        # one new binary, compiled once for all the launches
-        (binary,) = [c for key, c in compiled().items() if key not in before]
-        ttgir = binary.asm["ttgir"]  # pyrefly: ignore[missing-attribute]
-        return outs, ys, ttgir, _is_ring_binary(binary)
-
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((10, 0))
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_activation_producer_waits_for_a_late_writer(self) -> None:
-        (reference,), (y_reference,), hoisted, ring = self._run(False, None, 1)
-        self.assertNotIn("ttg.warp_specialize", hoisted)
-        self.assertFalse(ring)
-        self.assertFalse(reference.isnan().any())
-        outs, ys, ttgir, ring = self._run(True, None, 10)
-        self.assertTrue(ring)  # the ring binary ran, not a fallback
-        # The ring streams the weight and the activation: the activation
-        # producer polls the readiness counter (its cloned spin), the weight
-        # producer polls nothing.
-        _, (weights, activation) = _ring_parts(ttgir)
-        for producer in (weights, activation):
-            self.assertIn("async_copy_mbarrier_arrive", producer)
-        self.assertNotIn("ld.acquire", weights)
-        self.assertIn("ld.acquire", activation)
-        for out, y in zip(outs, ys, strict=True):
-            self.assertTrue(torch.equal(y, y_reference))
-            self.assertTrue(torch.equal(out, reference))
-        # Negative control: without its spin the activation producer copies
-        # the poisoned rows before the late root writes them.
-        outs, _, ttgir, ring = self._run(True, "nospin", 5)
-        self.assertTrue(ring)
-        _, (weights, activation) = _ring_parts(ttgir)
-        self.assertNotIn("ld.acquire", activation)
-        self.assertIn("async_copy_mbarrier_arrive", activation)
-        wrong = sum(not torch.equal(out, reference) for out in outs)
-        self.assertGreater(wrong, 0)
-
-
-@onlyBackends(["triton"])
-class TestTtgirWeightRingDefaultPath(TestCase):
-    """The ring's fallback chain on the default path (helion.kernel with
-    default settings, through the launcher)."""
-
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((10, 0))
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_default_path_falls_back_when_the_ring_fails_to_lower(self) -> None:
-        from triton import knobs
-
-        args = TestTtgirWeightPrefetchCompile._inputs(self)  # pyrefly: ignore[bad-argument-type]
-        off = helion.kernel(
-            _norm_gemv,
-            config=_CONFIG,
-            static_shapes=True,
-            ttgir_weight_ring=False,
-            ignore_warnings=[helion.exc.TensorOperationInWrapper],
-        )
-        reference = off(*args)
-        failed: list[str] = []
-
-        def refuse_warp_specialized(*hook_args: object) -> object:
-            # A previously installed hook (chained by the pass) whose
-            # make_llir rejects every warp-specialized module.
-            if not hook_args:
-                return "ringdef-test-refuse-ws", "ringdef-test-refuse-ws"
-            stages = cast("dict[str, object]", hook_args[1])
-            inner = cast("Callable[[object, object], object]", stages["llir"])
-
-            def llir(src: object, md: object) -> object:
-                if "ttg.warp_specialize" in src.str():  # pyrefly: ignore[missing-attribute]
-                    failed.append("ring")
-                    raise RuntimeError("injected make_llir failure")
-                return inner(src, md)
-
-            stages["llir"] = llir
-            return None
-
-        with mock.patch.dict(os.environ):
-            # the default settings, whatever the suite's environment says
-            os.environ.pop("HELION_TTGIR_WEIGHT_RING", None)
-            kernel = helion.kernel(
-                _norm_gemv,
-                config=_CONFIG,
-                static_shapes=True,
-                ignore_warnings=[helion.exc.TensorOperationInWrapper],
-            )
-        bound = kernel.bind(args)
-        self.assertIn("_ttgir_weight_ring=True", bound.to_triton_code(_CONFIG))
-        bound.set_config(_CONFIG)
-        module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
-
-        def compiled_by_key() -> dict[object, object]:
-            return {
-                k: c
-                for caches in module._helion__norm_gemv.device_caches.values()
-                for k, c in caches[0].items()
-            }
-
-        before = compiled_by_key()
-        saved = knobs.runtime.add_stages_inspection_hook
-        knobs.runtime.add_stages_inspection_hook = refuse_warp_specialized  # pyrefly: ignore[bad-assignment]
-        try:
-            out = kernel(*args)
-        finally:
-            knobs.runtime.add_stages_inspection_hook = saved
-        # every ring form failed to lower; the binary is the hoist
-        self.assertTrue(failed)
-        (compiled,) = [c for k, c in compiled_by_key().items() if k not in before]
-        self.assertEqual(compiled.metadata.num_warps, 4)
-        self.assertNotIn("cp.async.mbarrier.arrive", compiled.asm["ptx"])
-        self.assertTrue(torch.equal(out, reference))
 
 
 def _asm_calls(source: str) -> list[tuple[str, str, bool, int, int]]:
@@ -2267,21 +1908,6 @@ def _rendered(node: ast.Constant | ast.JoinedStr) -> list[str | None]:
     return list(variants)
 
 
-def _ttgir_asm(
-    template: str, constraints: str, pure: bool, operands: int, pack: int
-) -> str:
-    """An inline assembly op as Triton prints it in TTGIR."""
-    names = ", ".join(f"%a{k}" for k in range(operands))
-    tail = (
-        f" {names} : {', '.join(['i32'] * operands)} -> i32" if operands else "  -> i32"
-    )
-    return (
-        f'%r = tt.elementwise_inline_asm "{_mlir_escape(template)}" '
-        f'{{constraints = "{_mlir_escape(constraints)}", packed_element = {pack} : i32, '
-        f"pure = {str(pure).lower()}}}{tail}"
-    )
-
-
 # Every site in Helion that emits inline assembly into Triton kernels, by file:
 # how many ``inline_asm_elementwise`` calls (or Triton gdc helper calls) its
 # source spells.  A new site fails this census: put its template(s) on
@@ -2309,13 +1935,12 @@ class TestAllowlistCoversCodegen(TestCase):
         for call in calls:
             with self.subTest(template=call[0][:60]):
                 self.assertIsNotNone(
-                    prefetch._asm_entry(_ttgir_asm(*call)),
+                    prefetch._allowlist_entry(*call),
                     f"Helion emits inline assembly that is not on the allowlist: {call}",
                 )
 
     def test_cross_loop_waits_and_fences_are_allowlisted(self) -> None:
         from types import SimpleNamespace
-        from unittest import mock
 
         from helion._compiler import cross_loop_codegen
         from helion._compiler.device_function import DeviceFunction
@@ -2406,7 +2031,7 @@ class TestAllowlistCoversCodegen(TestCase):
                     continue
                 with self.subTest(name, template=call[0][:60]):
                     self.assertIsNotNone(
-                        prefetch._asm_entry(_ttgir_asm(*call)),
+                        prefetch._allowlist_entry(*call),
                         f"{name} emits inline assembly off the allowlist: {call}",
                     )
         templates = {c[0] for calls in found.values() for c in calls}
@@ -2448,7 +2073,7 @@ class TestAllowlistCoversCodegen(TestCase):
             )
             (call,) = _asm_calls(source)
             with self.subTest(fn.__name__):
-                entry = prefetch._asm_entry(_ttgir_asm(*call))
+                entry = prefetch._allowlist_entry(*call)
                 assert entry is not None, (
                     f"{fn.__name__} is not on the allowlist: {call}"
                 )

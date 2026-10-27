@@ -432,11 +432,6 @@ class _Settings:
             _env_get_bool, "HELION_TTGIR_WEIGHT_PREFETCH", True
         )
     )
-    ttgir_weight_ring: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_TTGIR_WEIGHT_RING", True
-        )
-    )
     cross_loop_transitive_waits: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CROSS_LOOP_TRANSITIVE_WAITS", True
@@ -775,16 +770,6 @@ class Settings(_Settings):
             "pipelined prologue copies of tensors they never write before readiness "
             "waits instead of after them (helion.runtime.triton.ttgir_weight_prefetch). "
             "Set HELION_TTGIR_WEIGHT_PREFETCH=0 to disable."
-        ),
-        "ttgir_weight_ring": (
-            "If True (and ttgir_weight_prefetch is on), the TTGIR pass first builds a "
-            "warp-specialized shared-memory ring for those kernels "
-            "(helion.runtime.triton.ttgir_weight_ring): producer warps stream the pipelined "
-            "copies of weights, and of activations behind clones of the readiness waits, "
-            "across task and root boundaries, and the compute warps wait per stage on "
-            "mbarriers.  A module the ring does not apply to, or whose ring fails to lower or "
-            "spills, gets the weight-only ring, then the prefetch hoist, then no change.  "
-            "Set HELION_TTGIR_WEIGHT_RING=0 to disable."
         ),
         "cross_loop_transitive_waits": (
             "If True, a cross-loop root does not wait on a producer root whose data its "

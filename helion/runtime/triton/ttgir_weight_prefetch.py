@@ -56,27 +56,19 @@ Copies move only when it is safe without knowing the schedule:
   it waits for did wait, and a read moved above the spin could run before
   the predecessor finished.
 
-The pass reads the printed module and re-parses it.  Anything it does not
-recognize leaves the module unchanged.
-
-With the kernel's ``ttgir_weight_ring`` setting (on by default; the launch
-passes it as ``_ttgir_weight_ring``, so it is part of the compile key), the
-warp-specialized weight ring of :mod:`.ttgir_weight_ring` comes first: each
-compile tries the two-producer ring, the weight-only ring, this hoist and the
-module unchanged, in that order (:func:`_candidates`); a candidate that a
-later stage rejects (``make_llir``, ``ptxas``) or whose binary spills falls
-back to the next one (:class:`_Fallback`), and a ring binary whose code
-exceeds the instruction-cache budget moves on to its smaller twins.  The ring
-reuses this module's analyses (written arguments with their storage classes,
-the assembly allowlist, the PDL rule), so it is never less conservative than
-the hoist.
+The pass reads the printed module as a tree of ops, blocks and SSA values
+(:mod:`.ttgir_tree`), checked op by op and use by use against Triton's own
+parse of it; operand order, types and attributes (assembly templates,
+purity, callees, argument names) come from Triton's parse, not from the
+printed syntax.  It moves ops in that tree, prints it and has Triton re-parse
+and verify the result.  A module whose tree disagrees with Triton's parse,
+and anything else the pass does not recognize, is left unchanged.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import hashlib
 import logging
 import os
@@ -88,6 +80,8 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from . import ttgir_tree
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
@@ -95,15 +89,7 @@ if TYPE_CHECKING:
 
 log: logging.Logger = logging.getLogger(__name__)
 
-_VALUE = re.compile(r"%[A-Za-z0-9_$.#-]+")
-_RESULTS = re.compile(r"^\s*((?:%[A-Za-z0-9_$.#-]+(?::\d+)?(?:,\s*)?)+)\s*=")
-_OP_NAME = re.compile(r"=\s*\"?([a-z_]+\.[a-z_.0-9]+)")
-_BARE_OP = re.compile(r"^\s*\"?([a-z_]+\.[a-z_.0-9]+)")
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
-_TYPED_ARG = re.compile(r"(%[A-Za-z0-9_$.-]+)\s*:(?!\d)")
-_BOUND_ARG = re.compile(r"(%[A-Za-z0-9_$.-]+)\s*=(?!=)")
-_FUNC = re.compile(r"^\s*tt\.func\b")
-_FUNC_NAME = re.compile(r"@(\"[^\"]+\"|[A-Za-z0-9_$.]+)")
 
 # Ops without side effects or memory access; they may move with a copy.
 _PURE = frozenset(
@@ -216,25 +202,14 @@ _WRITES = frozenset(
 )
 _COPY = "ttg.async_copy_global_to_local"
 _TMA_COPY = "ttng.async_tma_copy_global_to_local"
-_TMA_OPERANDS = re.compile(
-    r"async_tma_copy_global_to_local (%[\w$.-]+)\[[^\]]*\]\s+(%[\w$.-]+),\s*(%[\w$.-]+),"
-)
 _ASM = "tt.elementwise_inline_asm"
 _EXTERN = "tt.extern_elementwise"
 _ASM_ESCAPE = re.compile(r"\\([0-9A-Fa-f]{2})")
-_PURE_ATTRIBUTE = re.compile(r"\bpure\s*=\s*(true|false)\b")
 
 
 def _decoded(text: str) -> str:
     # MLIR prints other characters (quote, newline, tab) as two hex digits.
     return _ASM_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
-
-
-def _is_pure(line: str) -> bool:
-    """Whether an op declares ``pure = true`` (in its attributes, not in a
-    string); an op that does not say is not."""
-    attribute = _PURE_ATTRIBUTE.search(_code(line))
-    return attribute is not None and attribute.group(1) == "true"
 
 
 # --- Inline assembly: an exact-template allowlist -------------------------
@@ -630,118 +605,21 @@ def _mlir_string(text: str) -> str | None:
     return "".join(out)
 
 
-@dataclasses.dataclass(frozen=True)
-class _InlineAsm:
-    template: str
-    constraints: str
-    pure: bool
-    packed: int
-    operands: tuple[str, ...]
-
-
-_ASM_HEAD = re.compile(
-    r"^\s*(?:%[\w$.#-]+(?::\d+)?(?:\s*,\s*%[\w$.#-]+(?::\d+)?)*\s*=\s*)?"
-    r'tt\.elementwise_inline_asm\s+"((?:[^"\\]|\\.)*)"\s*\{'
-)
-_ASM_ATTRIBUTES = {
-    "constraints": re.compile(r'"((?:[^"\\]|\\.)*)"'),
-    "packed_element": re.compile(r"(\d+)\s*:\s*i32"),
-    "pure": re.compile(r"(true|false)"),
-}
-_ASM_OPERANDS = re.compile(r"\s*((?:%[\w$.#-]+)(?:\s*,\s*%[\w$.#-]+)*)?\s*(?::|->)")
-
-
-def _parse_asm(line: str) -> _InlineAsm | None:
-    """An inline assembly op printed in Triton's custom form, or None if
-    ``line`` is not exactly that (generic form, other attributes, ...)."""
-    head = _ASM_HEAD.match(line)
-    if head is None:
-        return None
-    template = _mlir_string(head.group(1))
-    # The attribute dictionary, up to its closing brace (outside strings).
-    body, k, quoted = [], head.end(), False
-    while k < len(line) and (quoted or line[k] != "}"):
-        if line[k] == "\\" and quoted:
-            body.append(line[k : k + 2])
-            k += 2
-            continue
-        quoted ^= line[k] == '"'
-        body.append(line[k])
-        k += 1
-    if k == len(line):
-        return None
-    attributes: dict[str, str] = {}
-    for item in re.split(r",\s*(?=[a-z_]+\s*=)", "".join(body).strip()):
-        name, sep, value = item.partition("=")
-        name, value = name.strip(), value.strip()
-        pattern = _ASM_ATTRIBUTES.get(name)
-        found = pattern.fullmatch(value) if sep and pattern else None
-        if found is None or name in attributes:
-            return None
-        attributes[name] = found.group(1)
-    operands = _ASM_OPERANDS.match(line, k + 1)
-    constraints = _mlir_string(attributes.get("constraints", "\\"))
-    if (
-        template is None
-        or constraints is None
-        or operands is None
-        or set(attributes) != set(_ASM_ATTRIBUTES)
-    ):
-        return None
-    return _InlineAsm(
-        template,
-        constraints,
-        attributes["pure"] == "true",
-        int(attributes["packed_element"]),
-        tuple(re.split(r"\s*,\s*", operands.group(1))) if operands.group(1) else (),
-    )
-
-
-def _allowlisted(asm: _InlineAsm) -> _AsmTemplate | None:
-    entry = _EXACT.get(
-        (asm.template, asm.constraints, asm.pure, len(asm.operands), asm.packed)
-    )
+def _allowlist_entry(
+    template: str, constraints: str, pure: bool, operands: int, packed: int
+) -> _AsmTemplate | None:
+    """The allowlist entry an inline assembly op with these attributes and
+    operand count is, or None."""
+    entry = _EXACT.get((template, constraints, pure, operands, packed))
     if entry is not None:
         return entry
     for pattern, family in _FAMILIES:
         if (
-            pattern.fullmatch(asm.template)
-            and (asm.constraints, asm.pure, len(asm.operands), asm.packed)
-            == family.key()[1:]
+            pattern.fullmatch(template)
+            and (constraints, pure, operands, packed) == family.key()[1:]
         ):
             return family
     return None
-
-
-@functools.lru_cache(maxsize=1 << 14)
-def _asm_entry(line: str) -> _AsmTemplate | None:
-    """The allowlist entry an inline assembly op is, or None."""
-    asm = _parse_asm(line)
-    return None if asm is None else _allowlisted(asm)
-
-
-def _asm_kind(line: str) -> str | None:
-    entry = _asm_entry(line) if _op(line) == _ASM else None
-    return entry.kind if entry is not None else None
-
-
-def _asm_may_write(line: str) -> bool:
-    """Whether an inline assembly op may write memory: any op off the
-    allowlist (which writes every argument), or an allowlisted stamp."""
-    entry = _asm_entry(line)
-    return entry is None or entry.kind == "writes"
-
-
-def _asm_targets(line: str) -> list[str] | None:
-    """The values an inline assembly op writes through, or None if it may
-    write through any address (an op off the allowlist)."""
-    asm = _parse_asm(line)
-    entry = None if asm is None else _allowlisted(asm)
-    if asm is None or entry is None:
-        return None
-    if entry.written_operand is None:
-        return []
-    return [asm.operands[entry.written_operand].split("#")[0]]
 
 
 @dataclasses.dataclass
@@ -772,634 +650,8 @@ def _code(line: str) -> str:
     return body
 
 
-def _results(line: str) -> list[str]:
-    m = _RESULTS.match(line)
-    if not m:
-        return []
-    return [tok.strip().split(":")[0] for tok in m.group(1).split(",") if tok.strip()]
-
-
-def _op(line: str) -> str | None:
-    code = _code(line)
-    m = _OP_NAME.search(code) if _RESULTS.match(code) else None
-    if m is None:
-        m = _BARE_OP.match(code)
-    return m.group(1) if m else None
-
-
-def _uses(line: str) -> list[str]:
-    code = _code(line)
-    if _RESULTS.match(code):
-        code = code.split("=", 1)[1]
-    return [v.split("#")[0] for v in _VALUE.findall(code)]
-
-
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _uniquify(text: str) -> str:
-    """Give every SSA value a unique name.
-
-    The MLIR printer reuses names across sibling regions (the bodies of two
-    ``scf.if`` ops may both define ``%18``), so each use resolves through the
-    stack of enclosing regions.
-    """
-    scopes: list[dict[str, str]] = [{}]
-    counter = 0
-    out = []
-
-    def define(name: str, scope: dict[str, str]) -> str:
-        nonlocal counter
-        counter += 1
-        scope[name] = f"%u{counter}_{name[1:]}"
-        return scope[name]
-
-    def resolve(name: str) -> str:
-        base, _, index = name.partition("#")
-        for scope in reversed(scopes):
-            if base in scope:
-                return scope[base] + (f"#{index}" if index else "")
-        return name
-
-    for line in text.splitlines():
-        code = _code(line)
-        stripped = code.strip()
-        closes = stripped.startswith("}")
-        opens = stripped.endswith("{")
-        if closes:
-            scopes.pop()
-        results = _RESULTS.match(code)
-        head_at = results.end() if results else 0
-        head = code[head_at:]
-        # Values a line binds for the region it opens: loop induction variables
-        # and iter_args, while-loop arguments, function and partition
-        # parameters.  Block labels bind their arguments in the current region.
-        region_args: list[re.Match[str]] = []
-        block_args: list[re.Match[str]] = []
-        if stripped.startswith("^"):
-            block_args = list(_TYPED_ARG.finditer(head))
-        elif opens:
-            region_args = list(_BOUND_ARG.finditer(head))
-            if _FUNC.match(code) or "partition" in head:
-                region_args += _TYPED_ARG.finditer(head)
-        bound = {(m.start(1), m.end(1)) for m in region_args + block_args}
-        renames: dict[tuple[int, int], str] = {}
-        for m in _VALUE.finditer(head):
-            if (m.start(), m.end()) not in bound:
-                renames[(head_at + m.start(), head_at + m.end())] = resolve(m.group(0))
-        for m in block_args:
-            renames[(head_at + m.start(1), head_at + m.end(1))] = define(
-                m.group(1), scopes[-1]
-            )
-        if results:
-            for m in _VALUE.finditer(results.group(1)):
-                at = results.start(1)
-                renames[(at + m.start(), at + m.end())] = define(m.group(0), scopes[-1])
-        if opens:
-            scopes.append({})
-        for m in region_args:
-            renames[(head_at + m.start(1), head_at + m.end(1))] = define(
-                m.group(1), scopes[-1]
-            )
-        new = line
-        for (a, b), name in sorted(renames.items(), reverse=True):
-            new = new[:a] + name + new[b:]
-        out.append(new)
-    if len(scopes) != 1:
-        raise ValueError("unbalanced regions")
-    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
-
-
-@dataclasses.dataclass
-class _Function:
-    name: str
-    start: int
-    end: int  # exclusive
-    params: list[str]
-    # Each parameter's source name (its ``loc("name")``), None if unknown.
-    param_names: list[str | None]
-    roots: dict[str, frozenset[str]]
-    defs: dict[str, int]  # value -> line defining it
-    # Parameters that are not pointers or descriptors (integers, floats): an
-    # address carried in one names no argument's storage.
-    scalars: frozenset[str] = frozenset()
-
-
-_LOC_NAME = re.compile(r'loc\("((?:[^"\\]|\\.)*)"')
-_LOC_ALIAS = re.compile(r"loc\((#[\w$.-]+)\)")
-_LOC_DEFINITION = re.compile(r'^\s*(#[\w$.-]+)\s*=\s*loc\("((?:[^"\\]|\\.)*)"')
-
-
-def _param_names(
-    line: str, code: str, aliases: dict[str, str]
-) -> tuple[list[str], list[str | None]]:
-    """The parameters of the function a ``tt.func`` line opens, and the
-    source name each carries in its location (``%x: ... loc("x")``, directly
-    or through a ``#loc`` alias)."""
-    start = code.index("(", code.index("@"))
-    depth, close = 0, len(code)
-    for k in range(start, len(code)):
-        depth += {"(": 1, ")": -1}.get(code[k], 0)
-        if depth == 0:
-            close = k
-            break
-    found = list(_TYPED_ARG.finditer(code, start, close))
-    params, names = [], []
-    _param_names.scalars = {  # type: ignore[attr-defined]
-        m.group(1)
-        for m in found
-        if re.match(r"\s*(i\d+|f\d+|bf16|f16|index)\b", code[m.end() :])
-    }
-    for k, m in enumerate(found):
-        # ``code`` blanks strings in place, so positions index ``line`` too.
-        segment = line[m.end() : found[k + 1].start() if k + 1 < len(found) else close]
-        name = _LOC_NAME.search(segment)
-        alias = _LOC_ALIAS.search(segment)
-        params.append(m.group(1))
-        names.append(
-            _decoded(name.group(1))
-            if name
-            else aliases.get(alias.group(1))
-            if alias
-            else None
-        )
-    return params, names
-
-
-def _functions(lines: list[str]) -> list[_Function]:
-    aliases = {
-        m.group(1): _decoded(m.group(2))
-        for line in lines
-        if line.startswith("#")
-        for m in [_LOC_DEFINITION.match(line)]
-        if m
-    }
-    funcs = []
-    for i, line in enumerate(lines):
-        if not _FUNC.match(line):
-            continue
-        code = _code(line)
-        name = _FUNC_NAME.search(code)
-        assert name is not None
-        params, param_names = _param_names(line, code, aliases)
-        scalars = frozenset(_param_names.scalars)  # type: ignore[attr-defined]
-        depth, j = 0, i
-        while j < len(lines):
-            stripped = _code(lines[j]).strip()
-            depth += stripped.endswith("{") - stripped.startswith("}")
-            if depth == 0:
-                break
-            j += 1
-        body = lines[i + 1 : j]
-        defs = {r: n for n in range(i + 1, j) for r in _results(lines[n])}
-        funcs.append(
-            _Function(
-                name.group(1).strip('"'),
-                i,
-                j + 1,
-                params,
-                param_names,
-                _pointer_roots(body),
-                defs,
-                scalars,
-            )
-        )
-    return funcs
-
-
-def _pointer_roots(body: list[str]) -> dict[str, frozenset[str]]:
-    """Value -> the values its pointer derives from.
-
-    A value produced by anything but pointer arithmetic is its own root, so a
-    pointer whose roots are all parameters points into those arguments.
-    """
-    roots: dict[str, frozenset[str]] = {}
-    # Integers derived from a pointer's address (tt.ptr_to_int, then arithmetic):
-    # an offset made of them may reach another argument's storage.
-    tainted: set[str] = set()
-    # Device-built TMA descriptors: tensormap_create writes a tensormap of its
-    # base pointer into kernel-private scratch, which reinterpret_tensor_descriptor
-    # turns into the descriptor.
-    described: dict[str, frozenset[str]] = {}
-    for line in body:
-        results = _results(line)
-        op, uses = _op(line), _uses(line)
-        if op == "ttng.tensormap_create" and len(uses) >= 2:
-            described[uses[0]] = roots.get(uses[1], frozenset({uses[1]}))
-        if not results:
-            continue
-        if op == "tt.ptr_to_int" or (op != "tt.addptr" and any(u in tainted for u in uses)):
-            tainted.update(results)
-        if op == "tt.addptr" and any(u in tainted for u in uses[1:]):
-            src = frozenset({results[0]})
-        elif op == "ttng.reinterpret_tensor_descriptor" and uses:
-            src = described.get(uses[0], frozenset({results[0]}))
-        elif op in _POINTER_FLOW and uses:
-            src = roots.get(uses[0], frozenset({uses[0]}))
-        else:
-            src = frozenset({results[0]})
-        for r in results:
-            roots[r] = src
-    return roots
-
-
-def _op_write_hits(
-    line: str,
-    f: _Function,
-    by_name: dict[str, _Function],
-    written: dict[str, set[int]],
-    wild: set[str],
-) -> set[int] | None:
-    """Indices of ``f``'s parameters one op of ``f`` may write through (before
-    storage classes), or None if it may write any argument.  ``written`` and
-    ``wild``: the callee summaries of :func:`_write_analysis`."""
-    op = _op(line)
-    targets: list[str] = []
-    if op in _WRITES:
-        targets = _uses(line)[:1]
-    elif op == "tt.call":
-        callee = _FUNC_NAME.search(_code(line))
-        name = callee.group(1).strip('"') if callee else ""
-        if name not in by_name or name in wild:
-            # A function outside the module may write anything; so may one
-            # that writes through an address it builds.
-            return None
-        args = _uses(line)
-        targets = [a for k, a in enumerate(args) if k in written[name]]
-    elif op == _ASM:
-        asm_targets = _asm_targets(line)
-        if asm_targets is None:
-            # Assembly off the allowlist may load or build the address it
-            # stores through: it may write any argument.
-            return None
-        targets = asm_targets
-    elif op == _EXTERN and not _is_pure(line):
-        # So may an external function with side effects.
-        return None
-    hit: set[int] = set()
-    for t in targets:
-        roots = f.roots.get(t, frozenset({t}))
-        if not all(r in f.params and r not in f.scalars for r in roots):
-            # An unattributable target may be any argument.
-            return None
-        hit |= {f.params.index(r) for r in roots}
-    return hit
-
-
-def _write_analysis(
-    lines: list[str],
-    funcs: list[_Function],
-    classes: dict[str, list[set[int]]] | None = None,
-) -> tuple[dict[str, set[int]], set[str]]:
-    """(:func:`_written_params`, the functions that may write any argument).
-
-    ``classes``: per function, sets of parameters that may share a storage;
-    writing one member writes them all.
-    """
-    by_name = {f.name: f for f in funcs}
-    written: dict[str, set[int]] = {f.name: set() for f in funcs}
-    # Functions that may write memory no parameter of theirs names.
-    wild: set[str] = {
-        f.name
-        for f in funcs
-        if any(_op(line) == "tt.int_to_ptr" for line in lines[f.start + 1 : f.end])
-    }
-    changed = True
-    while changed:
-        changed = False
-        for f in funcs:
-            everything = set(range(len(f.params)))
-            hit: set[int] = set()
-            for line in lines[f.start + 1 : f.end]:
-                op_hit = _op_write_hits(line, f, by_name, written, wild)
-                if op_hit is None:
-                    hit = everything
-                    break
-                hit |= op_hit
-                if hit == everything:
-                    break
-            if hit == everything and f.name not in wild:
-                wild.add(f.name)
-                changed = True
-            for members in (classes or {}).get(f.name, ()):
-                if hit & members:
-                    hit |= members
-            if not hit <= written[f.name]:
-                written[f.name] |= hit
-                changed = True
-    return written, wild
-
-
-def _written_params(
-    lines: list[str],
-    funcs: list[_Function],
-    classes: dict[str, list[set[int]]] | None = None,
-) -> dict[str, set[int]]:
-    """Function name -> indices of the pointer parameters it may write through.
-
-    ``classes``: per function, sets of parameters that may share a storage;
-    writing one member writes them all.
-    """
-    return _write_analysis(lines, funcs, classes)[0]
-
-
-def _unsupported(lines: list[str], f: _Function) -> str | None:
-    for line in lines[f.start + 1 : f.end]:
-        op = _op(line)
-        if op == "tt.int_to_ptr":
-            return "integer-to-pointer cast"
-        if (
-            op == _ASM
-            and ".sys" in line
-            or (
-                op in ("tt.atomic_rmw", "tt.atomic_cas")
-                and re.search(r",\s*sys\b", _code(line))
-            )
-        ):
-            return "system-scope operation"
-    return None
-
-
-def _is_seed(line: str) -> bool:
-    return _asm_kind(line) == "poll" and len(_results(line)) == 1
-
-
-def _is_sync(line: str) -> bool:
-    return _asm_kind(line) == "sync"
-
-
-def _region_end(lines: list[str], i: int, end: int) -> int:
-    """Index of the line closing the region opened on line ``i``."""
-    depth, j = 0, i
-    while j < end:
-        stripped = _code(lines[j]).strip()
-        depth += stripped.endswith("{") - stripped.startswith("}")
-        if depth == 0:
-            return j
-        j += 1
-    raise ValueError("unbalanced regions")
-
-
-def _wait_at(lines: list[str], i: int, end: int) -> int | None:
-    """If line ``i`` seeds a readiness spin, the index just past its sync."""
-    if not _is_seed(lines[i]):
-        return None
-    ind = _indent(lines[i])
-    # One spin may poll several counters: seeds (and their targets) then a
-    # single scf.while carrying the polled values.
-    seeds = {_results(lines[i])[0]}
-    j = i + 1
-    while j < end and _indent(lines[j]) == ind:
-        if _is_seed(lines[j]):
-            seeds.add(_results(lines[j])[0])
-        elif _op(lines[j]) not in _PURE:
-            break
-        j += 1
-    if not (
-        j < end
-        and _indent(lines[j]) == ind
-        and re.match(r"^\s*(%\S+\s*=\s*)?scf\.while\b", lines[j])
-        and seeds <= set(_uses(lines[j]))
-    ):
-        return None
-    close = _region_end(lines, j, end)
-    if not any(_is_seed(lines[k]) for k in range(j + 1, close)):
-        return None
-    k, synced = close + 1, None
-    while k < end and _indent(lines[k]) == ind:
-        if _is_sync(lines[k]):
-            synced = k = k + 1
-        elif _op(lines[k]) in ("tt.make_range", "arith.constant"):
-            k += 1
-        else:
-            break
-    return synced
-
-
-_UNKNOWN = ("?", None)
-
-
-def _slot(
-    lines: list[str], defs: dict[str, int], value: str
-) -> tuple[str, int | None] | None:
-    """(buffer, constant slot or None for any) a memory descriptor names, None
-    for a value that is not one, ``_UNKNOWN`` if that cannot be told."""
-    d = defs.get(value)
-    if d is None:
-        return _UNKNOWN
-    op, uses = _op(lines[d]), _uses(lines[d])
-    if op in ("ttg.local_alloc", "ttng.tmem_alloc"):
-        return (value, None)
-    if op in _VIEWS:
-        return _slot(lines, defs, uses[0])
-    if op == "ttg.memdesc_index":
-        base = _slot(lines, defs, uses[0])
-        if base is None or base is _UNKNOWN or base[1] is not None:
-            return _UNKNOWN
-        index = defs.get(uses[1])
-        m = (
-            re.search(r"arith\.constant (-?\d+) :", lines[index])
-            if index is not None
-            else None
-        )
-        return (base[0], int(m.group(1)) if m else None)
-    if op is not None and op.startswith(("ttg.", "ttng.")) and "memdesc" in lines[d]:
-        return _UNKNOWN
-    return None
-
-
-def _conflicts(
-    used: tuple[str, int | None] | None, written: tuple[str, int | None] | None
-) -> bool:
-    if used is None:
-        return False
-    if used is _UNKNOWN or written is None or written is _UNKNOWN:
-        return True
-    return used[0] == written[0] and (
-        used[1] is None or written[1] is None or used[1] == written[1]
-    )
-
-
-def _tma_stage(
-    lines: list[str], f: _Function, window: list[int], copy: int, barrier: str
-) -> list[int] | None:
-    """The ``barrier_expect`` (and any ``init_barrier``) of a TMA copy's stage
-    barrier, which move with the copy; None if anything else before the expect
-    uses that barrier (an earlier phase of a reused barrier)."""
-    slot = _slot(lines, f.defs, barrier)
-    if slot is None or slot is _UNKNOWN or slot[1] is None:
-        return None
-
-    def on_barrier(i: int) -> bool:
-        return any(_conflicts(_slot(lines, f.defs, u), slot) for u in _uses(lines[i]))
-
-    expects = [
-        i
-        for i in window
-        if i < copy and _op(lines[i]) == "ttng.barrier_expect" and on_barrier(i)
-    ]
-    if not expects:
-        return None
-    inits = [
-        i
-        for i in window
-        if i < expects[-1] and _op(lines[i]) == "ttng.init_barrier" and on_barrier(i)
-    ]
-    if any(
-        on_barrier(i)
-        for i in window
-        if i < expects[-1]
-        and i not in inits
-        and _op(lines[i]) in _SLOT_USERS | {"ttng.init_barrier"}
-    ):
-        return None
-    return [expects[-1], *inits]
-
-
-def _hoist_site(
-    lines: list[str],
-    f: _Function,
-    read_only: set[str],
-    w0: int,
-    k: int,
-    rep: Report,
-) -> list[int]:
-    """Lines to move from the prologue after the wait ``[w0, k)`` to ``w0``."""
-    ind = _indent(lines[w0])
-    window: list[int] = []
-    j = k
-    while (
-        j < f.end
-        and _indent(lines[j]) == ind
-        and _op(lines[j]) in _PASSABLE | _SLOT_USERS
-    ):
-        window.append(j)
-        j += 1
-    copies = [i for i in window if _op(lines[i]) in (_COPY, _TMA_COPY)]
-    if not copies:
-        return []
-    # Pure ops of the wait itself (CSE shares index ranges with the warp sync)
-    # may move with a copy; the poll, the spin and the sync may not.
-    defs = {
-        r: i
-        for i in range(w0, j)
-        if _indent(lines[i]) == ind
-        for r in _results(lines[i])
-    }
-    chosen: set[int] = set()
-    for copy in copies:
-        seeds = [copy]
-        if _op(lines[copy]) == _COPY:
-            src, dst = _uses(lines[copy])[:2]
-        else:
-            tma = _TMA_OPERANDS.search(_code(lines[copy]))
-            if tma is None:
-                rep.skipped.append(f"{f.name}: unrecognized TMA copy")
-                continue
-            src, dst, barrier = tma.groups()
-            stage = _tma_stage(lines, f, window, copy, barrier)
-            if stage is None:
-                rep.skipped.append(f"{f.name}: TMA copy's barrier is in use before it")
-                continue
-            seeds += stage
-        roots = f.roots.get(src, frozenset({src}))
-        if not roots <= read_only:
-            rep.skipped.append(f"{f.name}: copy of {sorted(roots)} (written)")
-            continue
-        slot = _slot(lines, f.defs, dst)
-        if any(
-            _conflicts(_slot(lines, f.defs, u), slot)
-            for i in window
-            if i < copy and _op(lines[i]) in _SLOT_USERS
-            for u in _uses(lines[i])
-        ):
-            rep.skipped.append(f"{f.name}: copy's slot is in use before it")
-            continue
-        stack, cone, ok = list(seeds), set(), True
-        while stack and ok:
-            cur = stack.pop()
-            if cur in cone:
-                continue
-            cone.add(cur)
-            for u in _uses(lines[cur]):
-                d = defs.get(u)
-                if d is None or d in cone:
-                    continue
-                if _op(lines[d]) not in _PURE | _BUFFER:
-                    ok = False
-                    break
-                stack.append(d)
-        if ok:
-            chosen |= cone
-            rep.hoisted += 1
-        else:
-            rep.skipped.append(f"{f.name}: copy depends on the wait or an effect")
-    if chosen:
-        rep.sites += 1
-    return sorted(chosen)
-
-
-def _may_wait_for_predecessor(line: str) -> bool:
-    """Whether an op may wait on the PDL predecessor: Triton's ``gdc_wait``,
-    any inline assembly off the allowlist, an external function with side
-    effects, or any other op whose text mentions ``griddepcontrol.wait``."""
-    op = _op(line)
-    if op == _ASM:
-        entry = _asm_entry(line)
-        return entry is None or entry.kind == "pdl_wait"
-    if op == _EXTERN and not _is_pure(line):
-        return True
-    return "griddepcontrol.wait" in line or "griddepcontrol.wait" in _decoded(line)
-
-
-def _waits_for_predecessor(line: str) -> bool:
-    """Whether an op is Triton's ``gdc_wait``, exactly: it waits on the PDL
-    predecessor wherever control reaches it (a function holding other
-    assembly is ruled out by :func:`_pdl_wait_dominates`)."""
-    return _asm_kind(line) == "pdl_wait"
-
-
-def _foreign_asm(lines: list[str], f: _Function | None = None) -> list[str]:
-    """The inline assembly ops of ``f`` (default: of the module) that are not
-    on the allowlist."""
-    span = lines[f.start + 1 : f.end] if f is not None else lines
-    return [line for line in span if _op(line) == _ASM and _asm_entry(line) is None]
-
-
-def _pdl_wait_dominates(lines: list[str], f: _Function, at: int) -> bool:
-    """Whether Triton's ``gdc_wait`` precedes line ``at`` in its block or an
-    enclosing block of the function (structured control flow: dominance).
-    Never in a module holding assembly off the allowlist: control may leave
-    one assembly block for a label in another (also once LLVM inlines a
-    callee), around the wait."""
-    if _foreign_asm(lines):
-        return False
-    if any(_op(line) in ("cf.br", "cf.cond_br", "cf.switch") for line in lines[f.start + 1 : f.end]):
-        # Several blocks (cf branches, e.g. an early return): a wait in a
-        # sibling block does not dominate.
-        return False
-    level = _indent(lines[at])
-    for j in range(at - 1, f.start, -1):
-        ind = _indent(lines[j])
-        if ind > level or not _code(lines[j]).strip():
-            continue
-        if ind < level:
-            # Leaving the block: only the line that opened it encloses ``at``.
-            if not _code(lines[j]).strip().endswith("{"):
-                continue
-            level = ind
-            if _code(lines[j]).strip().startswith("}"):
-                # ``} else {`` / ``} do {``: the region's sibling arm does not
-                # dominate; continue from the op that owns both arms.
-                continue
-        if _waits_for_predecessor(lines[j]):
-            return True
-    return False
-
-
 def _resolved_classes(
-    f: _Function, alias_classes: tuple[tuple[str, ...], ...]
+    f: _Kernel, alias_classes: tuple[tuple[str, ...], ...]
 ) -> list[set[int]] | None:
     """``alias_classes`` (argument names) as sets of ``f``'s parameters, or
     None if a member names no parameter of ``f``."""
@@ -1409,28 +661,564 @@ def _resolved_classes(
     return [{index[name] for name in members} for members in alias_classes]
 
 
+# --- The hoist ---------------------------------------------------------------
+#
+# The hoist reads the module through :mod:`.ttgir_tree`: ops, blocks and
+# use-def chains from the tree, operand order, types and attributes from
+# Triton's own parse of the same text (:func:`ttgir_tree.cross_check`).
+
+_UNKNOWN = ("?", None)
+_SCALAR = re.compile(r"i\d+|f\d+|bf16|f16|index")
+_BARRIER = re.compile(r"!ttg\.memdesc<(?:\d+x)*i64\b")
+_NAME_LOC = re.compile(r'loc\("((?:[^"\\]|\\.)*)"[()]')
+
+Value = ttgir_tree.Value
+Op = ttgir_tree.Op
+
+
+def _conflicts(
+    used: tuple[object, int | None] | None, written: tuple[object, int | None] | None
+) -> bool:
+    if used is None:
+        return False
+    if used is _UNKNOWN or written is None or written is _UNKNOWN:
+        return True
+    return used[0] is written[0] and (
+        used[1] is None or written[1] is None or used[1] == written[1]
+    )
+
+
+def _location_name(value: Any) -> str | None:  # noqa: ANN401 - a Triton ir.value
+    """The name of a Triton value's location (``loc("x")``), None if it has
+    none."""
+    loc = value.get_loc()
+    if hasattr(loc, "get_name"):
+        return loc.get_name() or None
+    # Triton 3.7 has no getter; a name location prints ``loc("x")`` or
+    # ``loc("x"(<child>))``, a file location ``loc("file":line:col)``.
+    m = _NAME_LOC.match(str(loc))
+    return _mlir_string(m.group(1)) if m else None
+
+
+@dataclasses.dataclass(eq=False)
+class _Kernel:
+    """A function of the module (a ``tt.func`` with a body)."""
+
+    op: Op
+    name: str
+    params: list[Value]
+    # Each parameter's source name (its location's), None if unknown.
+    param_names: list[str | None]
+    # Parameters that are not pointers or descriptors (integers, floats): an
+    # address carried in one names no argument's storage.
+    scalars: frozenset[Value]
+    body: list[Op]
+    roots: dict[Value, frozenset[Value]] = dataclasses.field(default_factory=dict)
+
+    def position(self, v: Value) -> int | None:
+        return next((k for k, p in enumerate(self.params) if p is v), None)
+
+
+class _Hoist:
+    """The hoist's analyses of one module."""
+
+    def __init__(self, m: ttgir_tree.Module, al: ttgir_tree.Alignment) -> None:
+        self.m = m
+        self.al = al
+        self._operands: dict[Op, list[Value]] = {}
+        self._asm: dict[Op, _AsmTemplate | None] = {}
+        self.funcs = [
+            self._kernel(op) for op in m.walk() if op.name == "tt.func" and op.regions
+        ]
+        # Inline assembly off the allowlist, anywhere in the module.
+        self.foreign = [
+            op for op in m.walk() if op.name == _ASM and self.asm(op) is None
+        ]
+
+    def operands(self, op: Op) -> list[Value]:
+        """``op``'s operand values, in Triton's operand order."""
+        found = self._operands.get(op)
+        if found is None:
+            found = self._operands[op] = [u.value for u in self.al.operands(op)]
+        return found
+
+    def attr(self, op: Op, kind: str, name: str) -> Any:  # noqa: ANN401
+        return getattr(self.al.triton(op), f"get_{kind}_attr")(name)
+
+    def asm(self, op: Op) -> _AsmTemplate | None:
+        """The allowlist entry an inline assembly op is (its attributes as
+        Triton reads them), or None."""
+        if op not in self._asm:
+            template = self.attr(op, "str", "asm_string")
+            constraints = self.attr(op, "str", "constraints")
+            pure = self.attr(op, "bool", "pure")
+            packed = self.attr(op, "int", "packed_element")
+            self._asm[op] = (
+                None
+                if None in (template, constraints, pure, packed)
+                else _allowlist_entry(
+                    template, constraints, pure, len(self.operands(op)), packed
+                )
+            )
+        return self._asm[op]
+
+    def asm_kind(self, op: Op) -> str | None:
+        entry = self.asm(op) if op.name == _ASM else None
+        return entry.kind if entry is not None else None
+
+    def pure(self, op: Op) -> bool:
+        return self.attr(op, "bool", "pure") is True
+
+    def callee(self, op: Op) -> str:
+        return self.attr(op, "flat_symbol_ref", "callee") or ""
+
+    def type(self, v: Value) -> str:
+        return self.al.type(v)
+
+    # -- functions and the arguments they write ---------------------------------
+    def _kernel(self, op: Op) -> _Kernel:
+        entry = op.regions[0]
+        params = [*entry.header_arguments, *entry.blocks[0].arguments]
+        k = _Kernel(
+            op,
+            self.attr(op, "str", "sym_name") or "",
+            params,
+            [_location_name(self.al.value(p)) for p in params],
+            frozenset(p for p in params if _SCALAR.fullmatch(self.type(p))),
+            list(op.walk())[1:],
+        )
+        k.roots = self._roots(k.body)
+        return k
+
+    def _tainted(self, body: list[Op]) -> set[Value]:
+        """Integers derived from a pointer's address (``tt.ptr_to_int``, then
+        arithmetic): an offset made of them may reach another argument's
+        storage.  Ops with regions pass them on to their results and region
+        arguments (as initial or yielded values)."""
+        tainted: set[Value] = set()
+        changed = True
+        while changed:
+            changed = False
+            for op in body:
+                uses = self.operands(op)
+                hit = op.name == "tt.ptr_to_int" or (
+                    op.name != "tt.addptr" and any(u in tainted for u in uses)
+                )
+                if op.regions and not hit:
+                    hit = any(
+                        u in tainted
+                        for r in op.regions
+                        for b in r.blocks
+                        if b.ops
+                        for u in self.operands(b.ops[-1])
+                    )
+                if not hit:
+                    continue
+                new = set(op.results)
+                for r in op.regions:
+                    for b in r.blocks:
+                        new.update(r.header_arguments if b is r.blocks[0] else ())
+                        new.update(b.arguments)
+                if not new <= tainted:
+                    tainted |= new
+                    changed = True
+        return tainted
+
+    def _roots(self, body: list[Op]) -> dict[Value, frozenset[Value]]:
+        """Value -> the values its pointer derives from.
+
+        A value produced by anything but pointer arithmetic is its own root,
+        so a pointer whose roots are all parameters points into those
+        arguments.
+        """
+        tainted = self._tainted(body)
+        roots: dict[Value, frozenset[Value]] = {}
+        # Device-built TMA descriptors: tensormap_create writes a tensormap of
+        # its base pointer into kernel-private scratch, which
+        # reinterpret_tensor_descriptor turns into the descriptor.
+        described: dict[Value, frozenset[Value]] = {}
+        for op in body:
+            uses = self.operands(op)
+            if op.name == "ttng.tensormap_create" and len(uses) >= 2:
+                described[uses[0]] = roots.get(uses[1], frozenset({uses[1]}))
+            if not op.results:
+                continue
+            own = frozenset({op.results[0]})
+            if op.name == "tt.addptr" and any(u in tainted for u in uses[1:]):
+                src = own
+            elif op.name == "ttng.reinterpret_tensor_descriptor" and uses:
+                src = described.get(uses[0], own)
+            elif op.name in _POINTER_FLOW and uses:
+                src = roots.get(uses[0], frozenset({uses[0]}))
+            else:
+                src = own
+            for r in op.results:
+                roots[r] = src
+        return roots
+
+    def _write_hits(
+        self,
+        op: Op,
+        f: _Kernel,
+        by_name: dict[str, _Kernel],
+        written: dict[str, set[int]],
+        wild: set[str],
+    ) -> set[int] | None:
+        """Indices of ``f``'s parameters ``op`` may write through (before
+        storage classes), or None if it may write any argument."""
+        targets: list[Value] = []
+        if op.name in _WRITES:
+            targets = self.operands(op)[:1]
+        elif op.name == "tt.call":
+            callee = self.callee(op)
+            if callee not in by_name or callee in wild:
+                # A function outside the module (or only declared in it) may
+                # write anything; so may one that writes through an address it
+                # builds.
+                return None
+            targets = [
+                a for k, a in enumerate(self.operands(op)) if k in written[callee]
+            ]
+        elif op.name == _ASM:
+            entry = self.asm(op)
+            if entry is None:
+                # Assembly off the allowlist may load or build the address it
+                # stores through: it may write any argument.
+                return None
+            if entry.written_operand is not None:
+                targets = [self.operands(op)[entry.written_operand]]
+        elif op.name == _EXTERN and not self.pure(op):
+            # So may an external function with side effects.
+            return None
+        hit: set[int] = set()
+        for t in targets:
+            for r in f.roots.get(t, frozenset({t})):
+                k = f.position(r)
+                if k is None or r in f.scalars:
+                    # An unattributable target may be any argument.
+                    return None
+                hit.add(k)
+        return hit
+
+    def write_analysis(
+        self, classes: dict[str, list[set[int]]]
+    ) -> tuple[dict[str, set[int]], set[str]]:
+        """(Function name -> indices of the pointer parameters it may write
+        through, the functions that may write any argument).  ``classes``:
+        per function, sets of parameters that may share a storage; writing
+        one member writes them all."""
+        by_name = {f.name: f for f in self.funcs}
+        written: dict[str, set[int]] = {f.name: set() for f in self.funcs}
+        # Functions that may write memory no parameter of theirs names.
+        wild = {
+            f.name
+            for f in self.funcs
+            if any(op.name == "tt.int_to_ptr" for op in f.body)
+        }
+        changed = True
+        while changed:
+            changed = False
+            for f in self.funcs:
+                everything = set(range(len(f.params)))
+                hit: set[int] = set()
+                for op in f.body:
+                    op_hit = self._write_hits(op, f, by_name, written, wild)
+                    if op_hit is None:
+                        hit = everything
+                        break
+                    hit |= op_hit
+                    if hit == everything:
+                        break
+                if hit == everything and f.name not in wild:
+                    wild.add(f.name)
+                    changed = True
+                for members in classes.get(f.name, ()):
+                    if hit & members:
+                        hit |= members
+                if not hit <= written[f.name]:
+                    written[f.name] |= hit
+                    changed = True
+        return written, wild
+
+    def unsupported(self, f: _Kernel) -> str | None:
+        for op in f.body:
+            if op.name == "tt.int_to_ptr":
+                return "integer-to-pointer cast"
+            if (
+                op.name == _ASM
+                and ".sys" in (self.attr(op, "str", "asm_string") or "")
+                or (
+                    op.name in ("tt.atomic_rmw", "tt.atomic_cas")
+                    and re.search(r",\s*sys\b", _code(op.first_line))
+                )
+            ):
+                return "system-scope operation"
+        return None
+
+    def may_wait_for_predecessor(self, op: Op) -> bool:
+        """Whether an op may wait on the PDL predecessor: Triton's
+        ``gdc_wait``, any inline assembly off the allowlist, an external
+        function with side effects, or any other op whose text mentions
+        ``griddepcontrol.wait``."""
+        if op.name == _ASM:
+            entry = self.asm(op)
+            return entry is None or entry.kind == "pdl_wait"
+        if op.name == _EXTERN and not self.pure(op):
+            return True
+        own = "".join(
+            line for p in op.parts if isinstance(p, ttgir_tree.Text) for line in p.lines
+        )
+        return "griddepcontrol.wait" in own or "griddepcontrol.wait" in _decoded(own)
+
+    def pdl_wait_dominates(self, f: _Kernel, op: Op) -> bool:
+        """Whether Triton's ``gdc_wait`` precedes ``op`` in its block or an
+        enclosing block of the function (structured control flow:
+        dominance).  Never in a module holding assembly off the allowlist:
+        control may leave one assembly block for a label in another (also
+        once LLVM inlines a callee), around the wait."""
+        if self.foreign:
+            return False
+        if any(x.name in ("cf.br", "cf.cond_br", "cf.switch") for x in f.body):
+            # Several blocks (cf branches, e.g. an early return): a wait in a
+            # sibling block does not dominate.
+            return False
+        cur: Op | None = op
+        while cur is not None and cur is not f.op and cur.parent is not None:
+            ops = cur.parent.ops
+            if any(self.asm_kind(x) == "pdl_wait" for x in ops[: ops.index(cur)]):
+                return True
+            cur = cur.parent_op
+        return False
+
+    # -- readiness spins --------------------------------------------------------
+    def is_seed(self, op: Op) -> bool:
+        return self.asm_kind(op) == "poll" and sum(v.count for v in op.results) == 1
+
+    def wait_at(self, ops: list[Op], i: int) -> int | None:
+        """If ``ops[i]`` seeds a readiness spin, the index just past its
+        sync."""
+        if not self.is_seed(ops[i]):
+            return None
+        # One spin may poll several counters: seeds (and their targets) then a
+        # single scf.while carrying the polled values.
+        seeds = {ops[i].results[0]}
+        j = i + 1
+        while j < len(ops):
+            if self.is_seed(ops[j]):
+                seeds.add(ops[j].results[0])
+            elif ops[j].name not in _PURE:
+                break
+            j += 1
+        if not (
+            j < len(ops)
+            and ops[j].name == "scf.while"
+            and seeds <= set(self.operands(ops[j]))
+            and any(self.is_seed(x) for x in list(ops[j].walk())[1:])
+        ):
+            return None
+        k, synced = j + 1, None
+        while k < len(ops):
+            if self.asm_kind(ops[k]) == "sync":
+                synced = k = k + 1
+            elif ops[k].name in ("tt.make_range", "arith.constant"):
+                k += 1
+            else:
+                break
+        return synced
+
+    # -- shared memory slots ----------------------------------------------------
+    def slot(self, v: Value) -> tuple[object, int | None] | None:
+        """(buffer, constant slot or None for any) a memory descriptor names,
+        None for a value that is not one, ``_UNKNOWN`` if that cannot be
+        told."""
+        d = v.owner_op
+        if d is None:
+            return _UNKNOWN
+        uses = self.operands(d)
+        if d.name in ("ttg.local_alloc", "ttng.tmem_alloc"):
+            return (v, None)
+        if d.name in _VIEWS:
+            return self.slot(uses[0])
+        if d.name == "ttg.memdesc_index":
+            base = self.slot(uses[0])
+            if base is None or base is _UNKNOWN or base[1] is not None:
+                return _UNKNOWN
+            index = uses[1].owner_op
+            constant = (
+                self.attr(index, "int", "value")
+                if index is not None and index.name == "arith.constant"
+                else None
+            )
+            return (base[0], constant)
+        if self.type(v).startswith("!ttg.memdesc<"):
+            return _UNKNOWN
+        return None
+
+    def copy_roles(self, op: Op) -> tuple[Value, Value, Value | None] | None:
+        """(source pointer or descriptor, destination buffer, TMA barrier or
+        None) of a copy, told apart by their types; None if they are not
+        what a copy has."""
+        uses = self.operands(op)
+        types = [self.type(u) for u in uses]
+        if op.name == _COPY:
+            if (
+                len(uses) >= 2
+                and "!tt.ptr<" in types[0]
+                and types[1].startswith("!ttg.memdesc<")
+            ):
+                return uses[0], uses[1], None
+            return None
+        buffers = [k for k, t in enumerate(types) if t.startswith("!ttg.memdesc<")]
+        barriers = [k for k in buffers if _BARRIER.match(types[k])]
+        if (
+            not uses
+            or not types[0].startswith("!tt.tensordesc<")
+            or len(buffers) != 2
+            or len(barriers) != 1
+        ):
+            return None
+        (dst,) = (k for k in buffers if k != barriers[0])
+        return uses[0], uses[dst], uses[barriers[0]]
+
+    def tma_stage(
+        self, ops: list[Op], window: list[int], copy: int, barrier: Value
+    ) -> list[int] | None:
+        """The ``barrier_expect`` (and any ``init_barrier``) of a TMA copy's
+        stage barrier, which move with the copy; None if anything else before
+        the expect uses that barrier (an earlier phase of a reused barrier)."""
+        slot = self.slot(barrier)
+        if slot is None or slot is _UNKNOWN or slot[1] is None:
+            return None
+
+        def on_barrier(i: int) -> bool:
+            return any(_conflicts(self.slot(u), slot) for u in self.operands(ops[i]))
+
+        expects = [
+            i
+            for i in window
+            if i < copy and ops[i].name == "ttng.barrier_expect" and on_barrier(i)
+        ]
+        if not expects:
+            return None
+        inits = [
+            i
+            for i in window
+            if i < expects[-1] and ops[i].name == "ttng.init_barrier" and on_barrier(i)
+        ]
+        if any(
+            on_barrier(i)
+            for i in window
+            if i < expects[-1]
+            and i not in inits
+            and ops[i].name in _SLOT_USERS | {"ttng.init_barrier"}
+        ):
+            return None
+        return [expects[-1], *inits]
+
+    def hoist_site(
+        self,
+        f: _Kernel,
+        read_only: set[Value],
+        ops: list[Op],
+        w0: int,
+        k: int,
+        rep: Report,
+    ) -> list[int]:
+        """Indices of the ops to move from after the wait ``ops[w0:k]`` to
+        before it."""
+        window: list[int] = []
+        j = k
+        while j < len(ops) and ops[j].name in _PASSABLE | _SLOT_USERS:
+            window.append(j)
+            j += 1
+        copies = [i for i in window if ops[i].name in (_COPY, _TMA_COPY)]
+        if not copies:
+            return []
+        # Pure ops of the wait itself (CSE shares index ranges with the warp
+        # sync) may move with a copy; the poll, the spin and the sync may not.
+        defs = {r: i for i in range(w0, j) for r in ops[i].results}
+        chosen: set[int] = set()
+        for copy in copies:
+            seeds = [copy]
+            roles = self.copy_roles(ops[copy])
+            if roles is None:
+                rep.skipped.append(f"{f.name}: unrecognized copy")
+                continue
+            src, dst, barrier = roles
+            if barrier is not None:
+                stage = self.tma_stage(ops, window, copy, barrier)
+                if stage is None:
+                    rep.skipped.append(
+                        f"{f.name}: TMA copy's barrier is in use before it"
+                    )
+                    continue
+                seeds += stage
+            roots = f.roots.get(src, frozenset({src}))
+            if not roots <= read_only:
+                names = sorted(f"%{r.name}" for r in roots)
+                rep.skipped.append(f"{f.name}: copy of {names} (written)")
+                continue
+            slot = self.slot(dst)
+            if any(
+                _conflicts(self.slot(u), slot)
+                for i in window
+                if i < copy and ops[i].name in _SLOT_USERS
+                for u in self.operands(ops[i])
+            ):
+                rep.skipped.append(f"{f.name}: copy's slot is in use before it")
+                continue
+            stack, cone, ok = list(seeds), set(), True
+            while stack and ok:
+                cur = stack.pop()
+                if cur in cone:
+                    continue
+                cone.add(cur)
+                for u in self.operands(ops[cur]):
+                    d = defs.get(u)
+                    if d is None or d in cone:
+                        continue
+                    if ops[d].name not in _PURE | _BUFFER:
+                        ok = False
+                        break
+                    stack.append(d)
+            if ok:
+                chosen |= cone
+                rep.hoisted += 1
+            else:
+                rep.skipped.append(f"{f.name}: copy depends on the wait or an effect")
+        if chosen:
+            rep.sites += 1
+        return sorted(chosen)
+
+
 def rewrite(
-    text: str, alias_classes: tuple[tuple[str, ...], ...] = ()
+    text: str,
+    alias_classes: tuple[tuple[str, ...], ...] = (),
+    mod: object = None,
 ) -> tuple[str, Report]:
     """Hoist read-only prologue copies above readiness spins in ``text``.
 
     ``alias_classes``: kernel arguments (by name) that may share a storage at
     launch, e.g. a tensor passed as a pointer and as a TMA descriptor; an op
-    writing one of them writes all.
+    writing one of them writes all.  ``mod``: Triton's parse of ``text`` (the
+    stages hook's module), parsed here if not given.  A module whose tree
+    disagrees with it (:func:`ttgir_tree.cross_check`) is left unchanged.
     """
     rep = Report()
-    text = _uniquify(text)
-    lines = text.splitlines()
-    funcs = _functions(lines)
-    called = set()
-    for line in lines:
-        if _op(line) == "tt.call":
-            callee = _FUNC_NAME.search(_code(line))
-            called.add(callee.group(1).strip('"') if callee else "")
-    eligible: list[_Function] = []
+    try:
+        m = ttgir_tree.parse(text)
+        al = ttgir_tree.cross_check(
+            m, mod if mod is not None else ttgir_tree.triton_parse(text)
+        )
+    except ttgir_tree.ParseError as e:
+        rep.skipped.append(f"module: {e}")
+        return text, rep
+    h = _Hoist(m, al)
+    called = {h.callee(op) for op in m.walk() if op.name == "tt.call"}
+    eligible: list[_Kernel] = []
     classes: dict[str, list[set[int]]] = {}
-    for f in funcs:
-        reason = _unsupported(lines, f)
+    for f in h.funcs:
+        reason = h.unsupported(f)
         resolved = _resolved_classes(f, alias_classes)
         if f.name in called:
             # A caller may pass one pointer for several parameters.
@@ -1442,61 +1230,83 @@ def rewrite(
             continue
         eligible.append(f)
         classes[f.name] = resolved or []
-    written = _written_params(lines, funcs, classes)
-    known = {f.name for f in funcs}
+    written, _ = h.write_analysis(classes)
     # A function outside the module may wait on the predecessor too.
-    waits_on_predecessor = bool(called - known) or any(
-        _may_wait_for_predecessor(line) for line in lines
+    waits_on_predecessor = bool(called - {f.name for f in h.funcs}) or any(
+        h.may_wait_for_predecessor(op) for op in m.walk()
     )
-    for f in funcs:
-        for line in _foreign_asm(lines, f):
-            asm = _parse_asm(line)
-            rep.foreign_asm.append(
-                f"{f.name}: {asm.template[:80]!r}" if asm else f"{f.name}: unparsed"
-            )
-    moves: dict[int, list[int]] = {}
-    for f in eligible:
-        rep.written += [
-            f.param_names[k] or f.params[k] for k in sorted(written[f.name])
+    for f in h.funcs:
+        rep.foreign_asm += [
+            f"{f.name}: {(h.attr(op, 'str', 'asm_string') or '')[:80]!r}"
+            for op in f.body
+            if op in h.foreign
         ]
-        read_only = {p for k, p in enumerate(f.params) if k not in written[f.name]}
-        i = f.start + 1
-        while i < f.end:
-            k = _wait_at(lines, i, f.end)
+    moves: list[tuple[Op, list[Op]]] = []
+
+    def scan(f: _Kernel, read_only: set[Value], block: ttgir_tree.Block) -> None:
+        ops = block.ops
+        i = 0
+        while i < len(ops):
+            k = h.wait_at(ops, i)
             if k is None:
+                for r in ops[i].regions:
+                    for b in r.blocks:
+                        scan(f, read_only, b)
                 i += 1
                 continue
             # Back-to-back waits (one per producer) form one site.
             while True:
                 j = k
-                while j < f.end and _op(lines[j]) in _PURE:
+                while j < len(ops) and ops[j].name in _PURE:
                     j += 1
-                nxt = _wait_at(lines, j, f.end) if j < f.end else None
+                nxt = h.wait_at(ops, j) if j < len(ops) else None
                 if nxt is None:
                     break
                 k = nxt
-            if waits_on_predecessor and not _pdl_wait_dominates(lines, f, i):
+            if waits_on_predecessor and not h.pdl_wait_dominates(f, ops[i]):
                 rep.skipped.append(
                     f"{f.name}: no griddepcontrol.wait before the wait"
-                    + (" (assembly off the allowlist)" if _foreign_asm(lines) else "")
+                    + (" (assembly off the allowlist)" if h.foreign else "")
                 )
                 i = k
                 continue
-            moved = _hoist_site(lines, f, read_only, i, k, rep)
+            moved = h.hoist_site(f, read_only, ops, i, k, rep)
             if moved:
-                moves[i] = moved
+                moves.append((ops[i], [ops[x] for x in moved]))
             i = k
+
+    for f in eligible:
+        rep.written += [
+            f.param_names[k] or f"%{f.params[k].name}" for k in sorted(written[f.name])
+        ]
+        read_only = {p for k, p in enumerate(f.params) if k not in written[f.name]}
+        for r in f.op.regions:
+            for b in r.blocks:
+                scan(f, read_only, b)
     if not moves:
         return text, rep
-    moved_lines = {m for ms in moves.values() for m in ms}
-    out = []
-    for idx, line in enumerate(lines):
-        if idx in moves:
-            pad = " " * _indent(line)
-            out.extend(pad + lines[m].lstrip(" ") for m in moves[idx])
-        if idx not in moved_lines:
-            out.append(line)
-    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), rep
+    for anchor, ops in moves:
+        for op in ops:
+            op.move_before(anchor)
+    m.analyze()
+    if m.unresolved:
+        op, name = m.unresolved[0]
+        rep.skipped.append(f"module: moving {op.name} left %{name} undefined")
+        rep.hoisted = rep.sites = 0
+        return text, rep
+    return m.text(), rep
+
+
+def inline_assembly(text: str) -> list[tuple[str, _AsmTemplate | None]]:
+    """Each inline assembly op of a module, as the hoist reads it: (its
+    template, its allowlist entry or None)."""
+    m = ttgir_tree.parse(text)
+    h = _Hoist(m, ttgir_tree.cross_check(m, ttgir_tree.triton_parse(text)))
+    return [
+        (h.attr(op, "str", "asm_string") or "", h.asm(op))
+        for op in m.walk()
+        if op.name == _ASM
+    ]
 
 
 def _reparse(mod: object, text: str) -> object:
@@ -1517,10 +1327,12 @@ def _reparse(mod: object, text: str) -> object:
         os.unlink(path)
 
 
-def _hoisted(text: str, alias_classes: tuple[tuple[str, ...], ...]) -> str | None:
+def _hoisted(
+    text: str, alias_classes: tuple[tuple[str, ...], ...], mod: object = None
+) -> str | None:
     """:func:`rewrite`'s text if it moved a copy, else None (logged)."""
     try:
-        hoisted, rep = rewrite(text, alias_classes)
+        hoisted, rep = rewrite(text, alias_classes, mod)
     except Exception as e:
         log.debug("ttgir weight prefetch: analysis failed (%r)", e)
         return None
@@ -1541,470 +1353,31 @@ def _hoisted(text: str, alias_classes: tuple[tuple[str, ...], ...]) -> str | Non
     return hoisted
 
 
-def _code_budget() -> int:
-    """SASS code bytes above which a ring form moves on to its next smaller
-    twin (:data:`ttgir_weight_ring.CODE_BUDGET`)."""
-    from . import ttgir_weight_ring
+def transform_module(
+    mod: object, alias_classes: tuple[tuple[str, ...], ...] | None = None
+) -> object:
+    """Apply :func:`rewrite` to a TritonGPU module; unchanged on any failure.
 
-    return ttgir_weight_ring.CODE_BUDGET
-
-
-def _size_twin_suffixes() -> tuple[str, ...]:
-    """Label suffixes of a ring form's smaller twins, longest first
-    (:data:`ttgir_weight_ring.SIZE_LADDER`)."""
-    from . import ttgir_weight_ring
-
-    return tuple(
-        sorted((s for s, _ in ttgir_weight_ring.SIZE_LADDER if s), key=len)[::-1]
-    )
-
-
-def _ring_form(label: str) -> str:
-    """The ring form a candidate label belongs to (its size twins share it)."""
-    for suffix in _size_twin_suffixes():
-        if label.endswith(suffix):
-            return label[: -len(suffix)]
-    return label
-
-
-def _candidates(
-    text: str,
-    alias_classes: tuple[tuple[str, ...], ...],
-    ring: bool = False,
-    resident_ctas: int = 0,
-    facts: dict[str, dict[str, object]] | None = None,
-) -> list[tuple[str, str | None]]:
-    """The fallback chain of one compile: (label, TTGIR text, or None for the
-    module as is).  ``facts``, if given, receives each ring candidate's
-    rewrite facts by label (e.g. ``spin_gated``, read by :class:`_Fallback`).
-
-    With ``ring`` (the kernel's ``ttgir_weight_ring`` setting): the
-    two-producer ring, the weight-only ring, the hoist, the module unchanged.
-    A later stage (``make_llir``, ``ptxas``) that fails on one candidate, or a
-    ring binary that spills, falls back to the next (:class:`_Fallback`).
-    Each ring form is followed by its smaller twins
-    (:data:`ttgir_weight_ring.SIZE_LADDER`: ``<label>_roll``, rolled
-    producers; ``<label>_roll_u0``, also without the consumer unroll) where
-    they change it: the trial ``ptxas`` of a ring form moves on to its next
-    twin while the binary's code exceeds
-    :data:`ttgir_weight_ring.CODE_BUDGET` (automatic, size-aware; no
-    per-kernel switch).  ``resident_ctas``: CTAs per SM the launch requires
-    to be co-resident (a polling schedule's cohort, see :class:`_Facts`); a
-    ring keeps that occupancy (:func:`ttgir_weight_ring.rewrite_budgeted`)."""
-    out: list[tuple[str, str | None]] = []
-    if ring:
-        from . import ttgir_weight_ring
-
-        def with_twins(label: str, **opts: object) -> dict[str, object]:
-            info: dict[str, object] = {}
-            texts: list[str] = []
-            for suffix, twin in ttgir_weight_ring.SIZE_LADDER:
-                kwargs: dict[str, Any] = {"roll": False, **opts, **twin}
-                if resident_ctas > 1:
-                    kwargs["resident_ctas"] = resident_ctas
-                try:
-                    ring_text, twin_info = ttgir_weight_ring.rewrite_budgeted(
-                        text, alias_classes=alias_classes, **kwargs
-                    )
-                except Exception as e:
-                    if not suffix:
-                        raise
-                    log.debug("ttgir weight ring: no %s%s (%r)", label, suffix, e)
-                    continue
-                if not suffix:
-                    info = twin_info
-                    coverage = ttgir_weight_ring.copy_coverage(ring_text)
-                    if coverage < ttgir_weight_ring.MIN_COPY_COVERAGE:
-                        # Profitability: the ring would stream too little of
-                        # the kernel's copy traffic to pay for its warp
-                        # specialization.
-                        log.debug(
-                            "ttgir weight ring: %s moves %.1f%% of the copy bytes; "
-                            "not a candidate",
-                            label,
-                            100 * coverage,
-                        )
-                        return info
-                elif ring_text in texts:
-                    continue
-                texts.append(ring_text)
-                out.append((label + suffix, ring_text))
-                if facts is not None:
-                    facts[label + suffix] = twin_info
-            return info
-
-        try:
-            info = with_twins("ring")
-            log.debug(
-                "ttgir weight ring: %s", {k: v for k, v in info.items() if k != "rings"}
-            )
-            if info.get("act"):
-                # If the two-producer ring fails later (make_llir, ptxas,
-                # spills), the weight-only ring comes before the hoist.
-                with_twins("ring_wonly", act=False)
-        except Exception as e:
-            log.debug("ttgir weight ring: not applied (%r)", e)
-    hoisted = _hoisted(text, alias_classes)
-    if hoisted is not None:
-        out.append(("hoist", hoisted))
-    out.append(("unchanged", None))
-    return out
-
-
-def _alias_classes_of_context(
-    alias_classes: tuple[tuple[str, ...], ...] | None,
-) -> tuple[tuple[str, ...], ...]:
+    ``alias_classes`` defaults to that of the :func:`enabled` context this
+    thread compiles in.
+    """
     if alias_classes is None:
         facts = _current_facts()
         alias_classes = facts.alias_classes if facts is not None else ()
-    return alias_classes
-
-
-def transform_module(
-    mod: object,
-    alias_classes: tuple[tuple[str, ...], ...] | None = None,
-    ring: bool | None = None,
-) -> object:
-    """Apply :func:`rewrite` to a TritonGPU module (with ``ring``, the first
-    candidate of :func:`_candidates` that re-parses and verifies); unchanged
-    on any failure.
-
-    ``alias_classes`` and ``ring`` default to those of the :func:`enabled`
-    context this thread compiles in.
-    """
-    alias_classes = _alias_classes_of_context(alias_classes)
-    if ring is None:
-        facts = _current_facts()
-        ring = facts.ring if facts is not None else False
     text = mod.str()  # pyrefly: ignore[missing-attribute]
-    if not ring:
-        hoisted = _hoisted(text, alias_classes)
-        if hoisted is None:
-            return mod
-        try:
-            return _reparse(mod, hoisted)
-        except Exception as e:
-            log.debug("ttgir weight prefetch: re-parse failed (%r)", e)
-            return mod
-    resident = facts.resident_ctas if (facts := _current_facts()) is not None else 0
-    for label, candidate in _candidates(
-        text, alias_classes, ring=True, resident_ctas=resident
-    ):
-        if candidate is None:
-            return mod
-        try:
-            return _reparse(mod, candidate)
-        except Exception as e:
-            log.debug("ttgir weight prefetch: %s re-parse failed (%r)", label, e)
-    return mod
-
-
-def _ptxas_spills(ptx: str, arch: int, options: object) -> int:
-    """Spill-store bytes ptxas reports for ``ptx`` (the tool and register
-    allocator options of Triton's ``make_cubin``)."""
-    return _ptxas_trial(ptx, arch, options)[0]
-
-
-def _code_bytes(cubin: bytes) -> int:
-    """Total size of the ``.text.*`` (SASS) sections of an ELF64 cubin."""
-    import struct
-
-    shoff = struct.unpack_from("<Q", cubin, 0x28)[0]
-    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", cubin, 0x3A)
-    hdrs = [
-        struct.unpack_from("<IIQQQQIIQQ", cubin, shoff + i * shentsize)
-        for i in range(shnum)
-    ]
-    strtab = hdrs[shstrndx][4]
-
-    def name(off: int) -> bytes:
-        return cubin[strtab + off : cubin.index(b"\0", strtab + off)]
-
-    return sum(h[5] for h in hdrs if name(h[0]).startswith(b".text."))
-
-
-def _ptxas_trial(ptx: str, arch: int, options: object) -> tuple[int, int, int | None]:
-    """(spill-store bytes, SASS code bytes, registers per thread of the entry
-    function or None) of ``ptx`` compiled by ptxas with the tool and register
-    allocator options of Triton's ``make_cubin``."""
-    import subprocess
-
-    from triton.backends.nvidia.compiler import get_ptxas
-    from triton.backends.nvidia.compiler import sm_arch_from_capability
-
-    ptxas = get_ptxas(arch).path
-    extra = getattr(options, "ptx_options", None)
-    with tempfile.TemporaryDirectory() as d:
-        src = os.path.join(d, "k.ptx")
-        Path(src).write_text(ptx)
-        cmd = [
-            ptxas,
-            "-v",
-            "--regAllocOptLevel=2",
-            *(extra.split(" ") if extra else []),
-            f"--gpu-name={sm_arch_from_capability(arch)}",
-            src,
-            "-o",
-            src + ".o",
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        code = _code_bytes(Path(src + ".o").read_bytes())
-    spills = sum(int(x) for x in re.findall(r"(\d+) bytes spill stores", r.stderr))
-    return spills, code, _entry_registers(r.stderr)
-
-
-def _entry_registers(ptxas_log: str) -> int | None:
-    """Registers per thread ptxas -v reports for the entry function(s) (the
-    largest), None if the log names none."""
-    regs, in_entry = [], False
-    for line in ptxas_log.splitlines():
-        if "Compiling entry function" in line:
-            in_entry = True
-        elif "Compiling function" in line:
-            in_entry = False
-        m = re.search(r"Used (\d+) registers", line)
-        if m and in_entry:
-            regs.append(int(m.group(1)))
-            in_entry = False
-    return max(regs) if regs else None
-
-
-def ctas_per_sm(shared: int, regs: int, warps: int, tmem_columns: int = 0) -> int:
-    """CTAs one SM (sm_100) holds of a binary: the minimum over shared memory
-    (with the driver's per-CTA reservation), the register file (registers are
-    allocated per warp in 256-register units), threads, the CTA limit and
-    tensor-memory columns."""
-    from . import ttgir_weight_ring as ring
-
-    per_warp = -(-regs * 32 // 256) * 256
-    limits = [
-        ring.SMEM_PER_SM // (shared + ring.SMEM_RESERVED),
-        ring.REGS_PER_SM // max(1, per_warp * warps),
-        2048 // (32 * warps),
-        32,
-    ]
-    if tmem_columns:
-        limits.append(512 // tmem_columns)
-    return max(0, min(limits))
-
-
-def _md_ctas_per_sm(md: dict[str, object], regs: int) -> int:
-    """:func:`ctas_per_sm` of the binary a stage's metadata describes."""
-    return ctas_per_sm(
-        int(cast("int", md.get("shared", 0) or 0)),
-        regs,
-        int(cast("int", md.get("num_warps", 4) or 4)),
-        int(cast("int", md.get("tmem_size", 0) or 0)),
-    )
-
-
-class _Fallback:
-    """Per-compile state of the candidate chain across Triton's later stages
-    (installed only for kernels that ask for the ring)."""
-
-    def __init__(
-        self,
-        stages: dict[str, Callable[..., object]],
-        options: object,
-        capability: object,
-        alias_classes: tuple[tuple[str, ...], ...] = (),
-        resident_ctas: int = 0,
-    ) -> None:
-        self.make_ttgir = stages.get("ttgir")
-        self.make_llir = stages.get("llir")
-        self.make_ptx = stages.get("ptx")
-        self.make_cubin = stages.get("cubin")
-        self.options = options
-        self.capability = capability
-        self.alias_classes = alias_classes
-        self.resident_ctas = resident_ctas
-        self._fallback_occ: int | None = None
-        self.cands: list[tuple[str, str | None]] = []
-        self.cand_facts: dict[str, dict[str, object]] = {}
-        self.k = 0
-        self.original: object = None
-        self.original_text = ""
-        self.num_warps: object = None
-
-    @property
-    def label(self) -> str:
-        return self.cands[self.k][0] if self.cands else "unchanged"
-
-    def _module(self, md: dict[str, object]) -> object:
-        """Module of the current candidate, advancing past any that fails to
-        re-parse."""
-        while True:
-            label, text = self.cands[self.k]
-            if text is None:
-                return _reparse(self.original, self.original_text)
-            try:
-                return _reparse(self.original, text)
-            except Exception as e:
-                log.debug("ttgir weight prefetch: %s re-parse failed (%r)", label, e)
-                self.k += 1
-
-    def advance(self, md: dict[str, object], why: BaseException) -> object:
-        """Move to the next candidate and return its freshly parsed module
-        (``make_llir`` mutates its input); re-raises ``why`` if none is left."""
-        if self.k + 1 >= len(self.cands):
-            raise why
-        log.debug(
-            "ttgir weight prefetch: %s failed after TTGIR (%r); falling back",
-            self.label,
-            why,
-        )
-        self.k += 1
-        # make_llir overwrites it only for warp-specialized modules.
-        md["num_warps"] = self.num_warps
-        return self._module(md)
-
-    def ttgir(self, src: object, md: dict[str, object]) -> object:
-        mod = self.make_ttgir(src, md)  # pyrefly: ignore[not-callable]
-        self.original = mod
-        self.original_text = mod.str()  # pyrefly: ignore[missing-attribute]
-        self.num_warps = md.get("num_warps")
-        self.cand_facts = {}
-        self.cands = _candidates(
-            self.original_text,
-            self.alias_classes,
-            ring=True,
-            resident_ctas=self.resident_ctas,
-            facts=self.cand_facts,
-        )
-        self.k = 0
-        if self.cands[0][1] is None:
-            return mod
-        return self._module(md)
-
-    def llir(self, src: object, md: dict[str, object]) -> object:
-        while True:
-            try:
-                return self.make_llir(src, md)  # pyrefly: ignore[not-callable]
-            except Exception as e:
-                src = self.advance(md, e)
-
-    def ptx(self, src: object, md: dict[str, object]) -> object:
-        """For a ring candidate, a trial ``ptxas`` here (not only in the cubin
-        stage) keeps the PTX Triton stores consistent with the binary on
-        fallback."""
-        while True:
-            out = self.make_ptx(src, md)  # pyrefly: ignore[not-callable]
-            if not self.label.startswith("ring"):
-                return out
-            try:
-                trial = _ptxas_trial(
-                    cast("str", out), cast("int", self.capability), self.options
-                )
-                spills, code = trial[0], trial[1]
-                if spills > self._spill_allowance():
-                    raise RuntimeError(f"ring binary spills {spills} bytes")
-                regs = trial[2] if len(trial) > 2 else None
-                if regs is not None:
-                    occ = _md_ctas_per_sm(md, regs)
-                    floor = self._occupancy_floor(md, occ)
-                    if occ < floor:
-                        raise RuntimeError(
-                            f"ring binary runs {occ} CTA(s) per SM ({regs} "
-                            f"registers x {md.get('num_warps')} warps), its "
-                            f"fallback {floor}"
-                        )
-                if code > _code_budget() and self._smaller_twin_next():
-                    raise RuntimeError(
-                        f"ring binary code {code} B exceeds the code-offset "
-                        "knee (CODE_BUDGET)"
-                    )
-                return out
-            except Exception as e:
-                src = self.llir(self.advance(md, e), md)
-
-    def _occupancy_floor(self, md: dict[str, object], occ: int) -> int:
-        """CTAs per SM the current ring binary must keep: its fallback's
-        (:meth:`_fallback_ctas_per_sm`), except for a spin-gated ring (the
-        consumer waits on a readiness spin before the first stage while the
-        weight producer streams; ``spin_gated`` of
-        :func:`ttgir_weight_ring.rewrite`), which keeps ``min(fallback, SPIN_GATED_KEPT)``:
-        the fallback's extra CTAs would spin as well (build5 R6-8).  One CTA
-        per SM below a fallback of two or more is refused in every case."""
-        from . import ttgir_weight_ring as ring
-
-        gated = bool(self.cand_facts.get(self.label, {}).get("spin_gated"))
-        if gated and occ >= ring.SPIN_GATED_KEPT:
-            return ring.SPIN_GATED_KEPT
-        floor = self._fallback_ctas_per_sm(md, occ)
-        return min(floor, ring.SPIN_GATED_KEPT) if gated else floor
-
-    def _fallback_ctas_per_sm(self, md: dict[str, object], occ: int) -> int:
-        """CTAs per SM of the binary the chain falls back to (its first
-        non-ring candidate: the hoist or the module as is), on its real
-        resources.  A ring binary must not run fewer (verify5 V4/V7: an 8-warp
-        ring of a 4-warp, 182-register kernel ran 1 CTA/SM instead of 2, +13%).
-        The fallback's shared memory and thread count bound it from above; only
-        a ring below that bound pays for lowering the fallback to PTX once (for
-        its registers)."""
-        if self._fallback_occ is not None:
-            return self._fallback_occ
-        from . import ttgir_weight_ring as ring
-
-        label, text = next(
-            ((lab, t) for lab, t in self.cands if not lab.startswith("ring")),
-            ("unchanged", None),
-        )
-        warps = int(cast("int", self.num_warps))
-        try:
-            shared = ring.smem_of(text if text is not None else self.original_text)
-        except Exception:  # an unparsable fallback bounds nothing
-            return 0
-        bound = ctas_per_sm(shared, 0, warps)
-        if occ >= bound:
-            return bound
-        md2 = dict(md)
-        md2["num_warps"] = self.num_warps
-        mod = _reparse(self.original, text if text is not None else self.original_text)
-        llir = self.make_llir(mod, md2)  # pyrefly: ignore[not-callable]
-        ptx = self.make_ptx(llir, md2)  # pyrefly: ignore[not-callable]
-        trial = _ptxas_trial(
-            cast("str", ptx), cast("int", self.capability), self.options
-        )
-        regs = trial[2] if len(trial) > 2 else None
-        self._fallback_occ = bound if regs is None else _md_ctas_per_sm(md2, regs)
-        log.debug(
-            "ttgir weight prefetch: fallback %s runs %d CTA(s) per SM",
-            label,
-            self._fallback_occ,
-        )
-        return self._fallback_occ
-
-    def _spill_allowance(self) -> int:
-        """Spill-store bytes a ring binary may carry: none, except a ring with
-        the launch's resident register budget (its warp-group dispatch spills a
-        few entry values, :data:`ttgir_weight_ring.RESIDENT_SPILL_BYTES`)."""
-        if self.resident_ctas <= 1:
-            return 0
-        from . import ttgir_weight_ring
-
-        return ttgir_weight_ring.RESIDENT_SPILL_BYTES
-
-    def _next_label(self) -> str | None:
-        return self.cands[self.k + 1][0] if self.k + 1 < len(self.cands) else None
-
-    def _smaller_twin_next(self) -> bool:
-        """The next candidate is a smaller twin of the current ring form
-        (:data:`ttgir_weight_ring.SIZE_LADDER`; :func:`_candidates` lists a
-        form's twins right after it, smallest last)."""
-        nxt = self._next_label()
-        return nxt is not None and _ring_form(nxt) == _ring_form(self.label)
-
-    def cubin(self, src: object, md: dict[str, object]) -> object:
-        while True:
-            try:
-                return self.make_cubin(src, md)  # pyrefly: ignore[not-callable]
-            except Exception as e:
-                src = self.ptx(self.llir(self.advance(md, e), md), md)
+    hoisted = _hoisted(text, alias_classes, mod)
+    if hoisted is None:
+        return mod
+    try:
+        return _reparse(mod, hoisted)
+    except Exception as e:
+        log.debug("ttgir weight prefetch: re-parse failed (%r)", e)
+        return mod
 
 
 def _pass_sources() -> list[Path]:
-    """The pass and every module of its family (``ttgir_*.py`` next to it:
-    the ring and any submodule either imports), by name."""
+    """The pass and every module of its family (``ttgir_*.py`` next to it),
+    by name."""
     return sorted(Path(__file__).parent.glob("ttgir_*.py"))
 
 
@@ -2013,50 +1386,18 @@ _DIGEST: str = hashlib.sha256(
 ).hexdigest()
 
 
-def _decisions_key(ring: bool) -> str:
-    """The current values of the ring's automatic decisions
-    (:func:`ttgir_weight_ring.decisions_key`) for a kernel with the ring: a
-    binary depends on them, and the source digest does not see a module
-    constant changed at run time."""
-    if not ring:
-        return ""
-    from . import ttgir_weight_ring
-
-    return f"-d{ttgir_weight_ring.decisions_key()}"
-
-
-def _ring_key(ring: bool) -> str:
-    """The ring's part of the cache key: off, or on (with the private
-    negative-control test hook when it is set)."""
-    if not ring:
-        return "ring0"
-    from . import ttgir_weight_ring
-
-    options = ttgir_weight_ring.options_key()
-    return f"ring1[{options}]" if options else "ring1"
-
-
 @dataclasses.dataclass(frozen=True)
 class _Facts:
     """What the launch tells the pass about the kernel it compiles."""
 
     # Kernel arguments (by name) that may share a storage, per storage.
     alias_classes: tuple[tuple[str, ...], ...] = ()
-    # The kernel's ``ttgir_weight_ring`` setting: try the ring first.
-    ring: bool = False
-    # CTAs per SM the launch needs co-resident (a schedule whose programs poll
-    # each other launches ``_minimum_resident_programs``; 0 or 1: no
-    # requirement beyond one CTA per SM).  A ring must keep that occupancy.
-    resident_ctas: int = 0
 
     def key(self) -> str:
-        out = ""
-        if self.alias_classes:
-            digest = hashlib.sha256(repr(self.alias_classes).encode()).hexdigest()
-            out = f"-aliases-{digest[:16]}"
-        if self.ring and self.resident_ctas > 1:
-            out += f"-resident{self.resident_ctas}"
-        return out
+        if not self.alias_classes:
+            return ""
+        digest = hashlib.sha256(repr(self.alias_classes).encode()).hexdigest()
+        return f"-aliases-{digest[:16]}"
 
 
 def normalize_alias_classes(
@@ -2102,10 +1443,7 @@ class _StagesHook:
             )
             if facts is None:
                 return key, digest
-            version = (
-                f"{_DIGEST}{_decisions_key(facts.ring)}{facts.key()}"
-                f"-{_ring_key(facts.ring)}"
-            )
+            version = f"{_DIGEST}{facts.key()}"
             combined = hashlib.sha256(f"{digest}:{version}".encode()).hexdigest()
             # Triton keys its on-disk cache with the first value and its
             # in-memory cache with the second: both name this version.
@@ -2117,27 +1455,9 @@ class _StagesHook:
         make_ttgir = stages.get("ttgir")
         if make_ttgir is None or facts is None:
             return None
-        if not facts.ring or not all(k in stages for k in ("llir", "ptx", "cubin")):
-            # The hoist alone; a ring needs the fallback through the later
-            # stages (a backend without them gets no ring).
-            stages["ttgir"] = lambda src, metadata: transform_module(
-                make_ttgir(src, metadata), ring=False
-            )
-            return None
-        # ring -> weight-only ring -> hoist -> unchanged, decided again by
-        # every later stage that fails (make_llir, ptxas) or, for a ring,
-        # spills.
-        fb = _Fallback(
-            stages,
-            args[2] if len(args) > 2 else None,
-            args[4] if len(args) > 4 else None,
-            facts.alias_classes,
-            facts.resident_ctas,
+        stages["ttgir"] = lambda src, metadata: transform_module(
+            make_ttgir(src, metadata)
         )
-        stages["ttgir"] = fb.ttgir
-        stages["llir"] = fb.llir
-        stages["ptx"] = fb.ptx
-        stages["cubin"] = fb.cubin
         return None
 
 
@@ -2147,28 +1467,17 @@ _saved: Callable[..., object] | None = None
 
 
 @contextlib.contextmanager
-def enabled(
-    alias_classes: Iterable[Iterable[str]] = (),
-    ring: bool = False,
-    resident_ctas: int = 0,
-) -> Iterator[None]:
+def enabled(alias_classes: Iterable[Iterable[str]] = ()) -> Iterator[None]:
     """Run the pass on kernels this thread compiles (and keys) inside this
     context.  ``alias_classes``: kernel arguments (by name) that may share a
-    storage at launch; ``ring``: try the warp-specialized weight ring first
-    (the kernel's ``ttgir_weight_ring`` setting); ``resident_ctas``: CTAs per
-    SM the launch requires co-resident (the ring keeps that occupancy).  All
-    are part of the key."""
+    storage at launch; part of the key."""
     global _depth, _saved
     from triton import knobs
 
     if not hasattr(knobs.runtime, "add_stages_inspection_hook"):
         yield
         return
-    facts = _Facts(
-        normalize_alias_classes(alias_classes),
-        ring=bool(ring),
-        resident_ctas=int(resident_ctas),
-    )
+    facts = _Facts(normalize_alias_classes(alias_classes))
     with _lock:
         if _depth == 0:
             _saved = knobs.runtime.add_stages_inspection_hook
