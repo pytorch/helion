@@ -225,6 +225,7 @@ from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ...autotuner.config_spec import ConfigSpec
@@ -4784,12 +4785,15 @@ def _grouped_row_union_metadata(
     specialize: bool = True,
     schedule: RowUnionSchedule | None = None,
     blocks: tuple[int, int, int] = LEGACY_ROW_UNION_BLOCKS,
+    index_domain: Callable[[int, int, int, int], bool] | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Retain every grouped purity/alias/offset proof before rescheduling.
 
     Full-allocation dense loads additionally require contiguous rank-two
     sources and a fresh contiguous destination. No runtime offset values are
     inspected: the generated epilogue reloads and normalizes them each call.
+    ``index_domain`` replaces the row-union tile domain for a consumer with
+    its own tiles (the register-MMA family): it receives ``(groups, m, n, k)``.
     """
     from ..compile_environment import CompileEnvironment
 
@@ -4820,7 +4824,9 @@ def _grouped_row_union_metadata(
     m, k = map(size, lhs.shape)
     n = size(rhs.shape[1])
     if size(proof.layout_tensor.shape[0]) != groups + 1 or not (
-        row_union_index_domain(groups, m, n, k, blocks)
+        index_domain(groups, m, n, k)
+        if index_domain is not None
+        else row_union_index_domain(groups, m, n, k, blocks)
         if schedule is None
         else schedule.index_domain(groups, m, n, k)
     ):

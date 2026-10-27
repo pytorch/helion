@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable
+import contextlib
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -687,6 +688,11 @@ class CuteTcgen05Config:
         # floors, which ``_normalize_warp_mma_family`` clamps back to the
         # recorded tcgen05 floors for tcgen05-family configs.
         self.warp_mma_admitted: bool = False
+        # The grouped row-union kernel (``static_shapes=False``) has no
+        # compile-time extents: the family is admitted on the first binding's
+        # (m, n, k) hints, which codegen specializes under shape guards like
+        # the row-union carrier does (``register_grouped_row_union_warp_mma``).
+        self.warp_mma_grouped_extents: tuple[int, int, int] | None = None
         # False when an operand is an in-register integer cast only the
         # register-MMA family lowers (``_MmaOperandInfo.cast_dtype``): the
         # search offers ``cute_matmul_family="warp_mma"`` alone and a
@@ -2103,6 +2109,8 @@ class CuteTcgen05Config:
     ) -> tuple[int, int, int, torch.dtype] | None:
         """``(m, n, k, dtype)`` of the admitted register-MMA GEMM, or None."""
         extents = self.matmul_compile_time_static_extents
+        if extents is None or any(value is None for value in extents):
+            extents = self.warp_mma_grouped_extents
         dtype = self.matmul_input_dtype
         if (
             not self.search_enabled
@@ -2114,6 +2122,81 @@ class CuteTcgen05Config:
             return None
         m, n, k = cast("tuple[int, int, int]", extents)
         return m, n, k, dtype
+
+    def register_grouped_row_union_warp_mma(
+        self,
+        env: CompileEnvironment,
+        *,
+        groups: int,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        b_major: str,
+    ) -> None:
+        """Admit the register-MMA family to the proved grouped row-union kernel.
+
+        The shared-RHS grouped GEMM (``out[rows of group g] = A_packed[rows]
+        @ B``) is one dense GEMM over the union of the group rows, with a
+        per-row membership predicate on the stores; the family lowers it like
+        a plain GEMM when the first binding's extents are in its latency-bound
+        regime (``detect_warp_mma_gemm`` re-proves the semantics and
+        specializes the extents at codegen).  Its 16x8 tiles widen the M / N
+        search floors the way the static-shape admission does.
+        """
+        from .cute_warp_mma_gemm import WARP_MMA_GROUPED_MAX_GROUPS
+        from .cute_warp_mma_gemm import WARP_MMA_MIN_BM
+        from .cute_warp_mma_gemm import WARP_MMA_MIN_BN
+        from .cute_warp_mma_gemm import warp_mma_admission_reason
+
+        if (
+            not self.search_enabled
+            or not self.grouped_row_union_supported
+            or self.matmul_block_ids is None
+            or self.matmul_input_dtype != dtype
+            # The body's per-thread interval setup and membership chains
+            # grow with the group count (``detect_warp_mma_grouped_gemm``
+            # declines above the cap).
+            or not 0 < groups <= WARP_MMA_GROUPED_MAX_GROUPS
+        ):
+            return
+        reason = warp_mma_admission_reason(
+            static_m=m,
+            static_n=n,
+            static_k=k,
+            leading=1,
+            dtype=dtype,
+            lhs_major="row",
+            rhs_major=b_major,
+            num_sms=self.device_sm_count,
+            lhs_strides=(k, 1),
+            rhs_strides=(n, 1) if b_major == "row" else (1, k),
+        )
+        if reason is not None:
+            return
+        self.warp_mma_admitted = True
+        self.warp_mma_grouped_extents = (m, n, k)
+        m_block_id, n_block_id, _k_block_id = self.matmul_block_ids
+        for block_id, min_size in (
+            (m_block_id, WARP_MMA_MIN_BM),
+            (n_block_id, WARP_MMA_MIN_BN),
+        ):
+            # The tcgen05 search already raised the block floor to its own
+            # (``enable_cute_tcgen05_search`` ran before this heuristic);
+            # lower it to the family's atom and keep the default
+            # (non-autotuned) block where it was, as the static-shape
+            # admission does -- tcgen05-family configs are clamped back to
+            # ``tcgen05_min_search_m`` / ``_n`` by the family normalizer.
+            with contextlib.suppress(KeyError):
+                block_spec = self.config_spec.block_sizes.block_id_lookup(block_id)
+                if min_size >= block_spec.min_size:
+                    continue
+                if block_spec.default_size is None:
+                    block_spec.default_size = block_spec._fragment(
+                        self.config_spec
+                    ).default()
+                block_spec.min_size = min_size
+                block_spec.autotuner_min = min(block_spec.autotuner_min, min_size)
 
     def _warp_mma_seed_bk(self, k: int, dtype: torch.dtype) -> int | None:
         """The widest K chunk the K fragment admits that divides K."""
@@ -2185,6 +2268,16 @@ class CuteTcgen05Config:
                 continue
             if key in config:
                 config[key] = fragment.default()
+        for key in (
+            # The grouped row-union carrier's coverage coordinates select the
+            # tcgen05 lowering of the same dense union; the family lowers it
+            # itself, so they are inert here.
+            GROUPED_ROW_UNION_KEY,
+            GROUPED_ROW_UNION_SCHEDULE_KEY,
+            GROUPED_RESIDENT_CTAS_KEY,
+            STARTUP_PREFILL_KEY,
+        ):
+            config.pop(key, None)
         spec = self.config_spec
         if "l2_groupings" in config:
             config["l2_groupings"] = [1 for _ in spec.l2_groupings]
@@ -2259,8 +2352,10 @@ class CuteTcgen05Config:
                 if not fix_invalid:
                     raise InvalidConfig(
                         f"{WARP_MMA_FAMILY_KEY}={family!r} is not admitted for this "
-                        "kernel (the register-MMA family needs one static, "
-                        "latency-bound dense GEMM with K-contiguous A)"
+                        "kernel (the register-MMA family needs one latency-bound "
+                        "dense GEMM with K- or M-contiguous A: static shapes, or "
+                        "the proved grouped row union at a binding whose extents "
+                        "the family runs)"
                     )
                 config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_TCGEN05
                 family = MATMUL_FAMILY_TCGEN05
