@@ -2741,9 +2741,25 @@ class CuteBackend(Backend):
 
                 from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_EXPR
                 from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
+                from .scalar_recipe_rounding import NARROW_MULTIPLY_ROUNDING_EXPR
+                from .scalar_recipe_rounding import NARROW_MULTIPLY_ROUNDING_META_KEY
 
                 node = V.current_node
                 expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    not HelionCuteDSLOpOverrides._fastmath_on()
+                    and isinstance(node, torch.fx.Node)
+                    and node.meta.get(NARROW_MULTIPLY_ROUNDING_META_KEY)
+                    and expected is not None
+                    and expected.dtype in NARROW_MULTIPLY_ROUNDING_EXPR
+                ):
+                    # The 16-bit product ``narrow_exact_products`` made of an
+                    # explicitly rounded FP32 product and its cast: ``mul.rn``
+                    # in the dtype keeps the single rounding and, like the
+                    # FP32 form, cannot be contracted into an FMA.
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, NARROW_MULTIPLY_ROUNDING_EXPR[expected.dtype]
+                    )
                 if (
                     not HelionCuteDSLOpOverrides._fastmath_on()
                     and isinstance(node, torch.fx.Node)

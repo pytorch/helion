@@ -75,20 +75,27 @@ def sigmoid_approx_ftz_f32(
     )
 
 
-def _gelu_erf_exact_expr(x: Float32 | cute.TensorSSA) -> Float32 | cute.TensorSSA:
-    return 0.5 * x * (1.0 + cute.math.erf(x * GELU_ERF_INV_SQRT2))
+def _gelu_erf_exact_expr(
+    x: Float32 | cute.TensorSSA, fastmath: bool = False
+) -> Float32 | cute.TensorSSA:
+    return 0.5 * x * (1.0 + cute.math.erf(x * GELU_ERF_INV_SQRT2, fastmath=fastmath))
 
 
 @dsl_user_op
 def gelu_erf_exact_f32x2(
     x: Float32 | cute.TensorSSA,
+    fastmath: bool = False,
     *,
     loc: ir.Location | None = None,
     ip: ir.InsertionPoint | None = None,
 ) -> Float32 | cute.TensorSSA:
-    """Exact GELU with packed f32x2 arithmetic for fp32 TensorSSA inputs."""
+    """GELU (erf form) with packed f32x2 arithmetic for fp32 TensorSSA inputs.
+
+    ``fastmath`` selects the DSL's approximate ``erf`` (the ``fast_math``
+    setting); the default keeps the exact libdevice form.
+    """
     if const_expr(not isinstance(x, cute.TensorSSA)):
-        return _gelu_erf_exact_expr(x)
+        return _gelu_erf_exact_expr(x, fastmath)
 
     # pyrefly does not narrow through ``const_expr``; the runtime guard
     # above keeps the generated path on TensorSSA values only.
@@ -100,7 +107,7 @@ def gelu_erf_exact_f32x2(
         or element_count % 2 != 0
         or element_count > _GELU_ERF_PACKED_MAX_UNROLLED_ELEMENTS
     ):
-        return _gelu_erf_exact_expr(x_tensor)
+        return _gelu_erf_exact_expr(x_tensor, fastmath)
 
     values = []
     for i in range(element_count // 2):
@@ -108,7 +115,10 @@ def gelu_erf_exact_f32x2(
         scaled = cute.arch.mul_packed_f32x2(
             x_pair, (GELU_ERF_INV_SQRT2, GELU_ERF_INV_SQRT2)
         )
-        erf_scaled = (cute.math.erf(scaled[0]), cute.math.erf(scaled[1]))
+        erf_scaled = (
+            cute.math.erf(scaled[0], fastmath=fastmath),
+            cute.math.erf(scaled[1], fastmath=fastmath),
+        )
         fused = cute.arch.fma_packed_f32x2(erf_scaled, x_pair, x_pair)
         out_pair = cute.arch.mul_packed_f32x2((0.5, 0.5), fused)
         values.extend((out_pair[0], out_pair[1]))

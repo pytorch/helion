@@ -511,6 +511,46 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
+    def _vector_lane_loop_var(self) -> str | None:
+        """The lane variable of the VECTORIZED device lane loop that
+        distributes this reduction block, or ``None``.
+
+        Such a loop walks several packets per thread per trip, and the
+        two-pass lane marker declines it (``_device_lane_loop_marker_expr``),
+        so the strided reduce below is emitted once per lane and reduces one
+        lane's packet.  ``cute/fold_lane_reductions.py`` folds those per-lane
+        partials across the unrolled lanes; it finds the sites through
+        ``cute_state.lane_fold_reduce_sites`` (``_record_lane_fold_site``).
+        """
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None or CompileEnvironment.current().backend_name != "cute":
+            return None
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceLoopState)
+                    and self.block_index in loop_state.lane_loop_blocks
+                    and isinstance(loop_state.strategy, PerThreadNDTileStrategy)
+                    and loop_state.strategy._cute_lane_vec_width_by_block.get(
+                        self.block_index, 1
+                    )
+                    != 1
+                ):
+                    return loop_state.strategy._lane_var_by_block.get(self.block_index)
+        return None
+
+    def _record_lane_fold_site(self, call_text: str) -> None:
+        """Register a cross-thread reduce emitted inside a vectorized lane
+        loop over its own block (see ``_vector_lane_loop_var``): the grouped
+        strided helpers and the direct single-warp ``warp_reduction_*``."""
+        lane_var = self._vector_lane_loop_var()
+        if lane_var is None:
+            return
+        from .cute.fold_lane_reductions import fold_site_key
+
+        sites = self.fn.cute_state.lane_fold_reduce_sites
+        sites.setdefault(lane_var, set()).add(fold_site_key(call_text))
+
     def _lane_reduce_cluster_n(self) -> int:
         """Thread-block-cluster width of the lane-looped strategy that
         distributes this reduction block, or 1 when not cluster-split."""
@@ -4196,11 +4236,13 @@ class BlockReductionStrategy(ReductionStrategy):
             value: str, combine: str, identity: str, value_dtype: torch.dtype
         ) -> str:
             if group_span <= 32:
-                return (
+                call = (
                     "_cute_grouped_reduce_warp("
                     f"{value}, {combine!r}, {identity}, {lane_expr}, "
                     f"pre={pre}, group_span={group_span})"
                 )
+                self._record_lane_fold_site(call)
+                return call
             smem_budget_bytes = _cute_shared_memory_budget_bytes()
             if group_span % 32 == 0:
                 warps_per_group = group_span // 32
@@ -4544,19 +4586,23 @@ class BlockReductionStrategy(ReductionStrategy):
             buf_var, mbar_var = _cute_cluster_reduce_smem_vars(
                 self.fn, group_span, cluster_n
             )
-            state.add_statement(
-                f"{result_var} = _cute_grouped_reduce_cluster("
+            call = (
+                "_cute_grouped_reduce_cluster("
                 f"{input_name}, {reduction_type!r}, {identity_expr}, "
                 f"{lane_var}, {buf_var}, {mbar_var}, "
                 f"group_span={group_span}, cluster_n={cluster_n})"
             )
+            self._record_lane_fold_site(call)
+            state.add_statement(f"{result_var} = {call}")
             return result_var
-        state.add_statement(
-            f"{result_var} = _cute_grouped_reduce_shared_two_stage("
+        call = (
+            "_cute_grouped_reduce_shared_two_stage("
             f"{input_name}, {reduction_type!r}, {identity_expr}, "
             f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
             f"pre={pre}, group_span={group_span}, group_count={group_count})"
         )
+        self._record_lane_fold_site(call)
+        state.add_statement(f"{result_var} = {call}")
         return result_var
 
     def _strided_thread_reduction_expr_shared_tree(
@@ -4576,13 +4622,15 @@ class BlockReductionStrategy(ReductionStrategy):
         group_count: int,
     ) -> str:
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
-        state.add_statement(
-            f"{result_var} = _cute_grouped_reduce_shared_tree("
+        call = (
+            "_cute_grouped_reduce_shared_tree("
             f"{input_name}, {reduction_type!r}, {identity_expr}, "
             f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
             f"pre={pre}, group_span={group_span}, "
             f"num_threads={num_threads}, group_count={group_count})"
         )
+        self._record_lane_fold_site(call)
+        state.add_statement(f"{result_var} = {call}")
         return result_var
 
     def codegen_reduction(
@@ -4734,4 +4782,9 @@ class BlockReductionStrategy(ReductionStrategy):
                 fake_input,
                 fake_output,
             )
+            # The direct single-warp ``cute.arch.warp_reduction_*`` (the
+            # strided path's "skip small direct"): inside a vectorized lane
+            # loop it reduces one lane's packet like the strided forms, so
+            # it is a fold site too.
+            self._record_lane_fold_site(expr)
         return expr_from_string(self.maybe_reshape(expr, dim, fake_input, fake_output))
