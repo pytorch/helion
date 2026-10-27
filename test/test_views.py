@@ -1237,7 +1237,7 @@ class TestViews(RefEagerTestBase, TestCase):
                 out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
             return out
 
-        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(1024, dtype=torch.float32, device=DEVICE)
         code, result = code_and_output(foo, (x,))
         self.assertEqual(result.numel(), x.numel() // 2)
         if _get_backend() == "triton":
