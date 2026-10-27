@@ -462,6 +462,26 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )(full)
 
     @onlyBackends(["triton"])
+    @skipIfRefEager("checks compiled reduction padding")
+    def test_flattened_padded_reduction_dims(self):
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def flat_amax(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = x[row, :, :].flatten(1).amax(1)
+            return out
+
+        # Flattening padded dims would reduce over the padding lanes too.
+        x = -torch.rand(4, 3, 5, device=DEVICE) - 1
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "derived tensor shapes.*padded"
+        ):
+            code_and_output(flat_amax, (x,), block_sizes=[2])
+        x = -torch.rand(4, 4, 8, device=DEVICE) - 1
+        _, output = code_and_output(flat_amax, (x,), block_sizes=[2])
+        torch.testing.assert_close(output, x.flatten(1).amax(1))
+
+    @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
         @helion.kernel(autotune_effort="none")
         def reduce(x: torch.Tensor) -> torch.Tensor:
