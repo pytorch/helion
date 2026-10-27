@@ -225,6 +225,7 @@ from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from .._compiler.cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .._utils import indexing_uses_tensor_descriptor
+from .._utils import prev_power_of_2
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -6817,44 +6818,28 @@ class ConfigSpec:
         # live reduction thread threshold to decide when a persistent reduction
         # must be rolled.
         if self.max_reduction_threads is not None and self.reduction_loops:
-            force_threshold = self.reduction_loop_force_threshold
-            max_loop = self.max_reduction_loop
             reduction_loops = config.get("reduction_loops", [])
-            if force_threshold is not None and isinstance(reduction_loops, list):
+            if isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    # Indexed reductions (argmin/argmax) on CuTe must keep
-                    # the persistent thread count or rolled chunk within a
-                    # single warp, since cute.arch.warp_reduction only
-                    # supports threads_in_group<=32.
-                    block_threshold = force_threshold
-                    if (
-                        self.backend_name == "cute"
-                        and spec.block_id in self.cute_indexed_reduction_block_ids
-                    ):
-                        block_threshold = min(block_threshold, 32)
+                    block_threshold, max_chunk = spec._limits(self)
+                    if block_threshold is None:
+                        continue
                     if new_loops[i] is None and spec.size_hint > block_threshold:
                         new_loops[i] = min(spec.size_hint, block_threshold)
                         changed = True
                     elif (
                         new_loops[i] is not None
-                        and max_loop is not None
-                        and (
-                            new_loops[i] > max_loop
-                            or (
-                                self.backend_name == "cute"
-                                and spec.block_id
-                                in self.cute_indexed_reduction_block_ids
-                                and new_loops[i] > 32
-                            )
-                        )
+                        and max_chunk is not None
+                        and new_loops[i] > max_chunk
                     ):
-                        new_loops[i] = min(
-                            new_loops[i] if max_loop is None else max_loop,
-                            block_threshold,
+                        new_loops[i] = (
+                            prev_power_of_2(max_chunk)
+                            if self.backend_name == "cute"
+                            else min(max_chunk, block_threshold)
                         )
                         changed = True
                 if changed:
@@ -9633,6 +9618,19 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             return next_power_of_2(self.size_hint)
         return None
 
+    def _limits(self, base: ConfigSpec) -> tuple[int | None, int | None]:
+        """Persistent thread threshold and rolled chunk limit for this axis."""
+        threshold = base.reduction_loop_force_threshold
+        max_chunk = base.max_reduction_loop
+        if (
+            base.backend_name == "cute"
+            and self.block_id in base.cute_indexed_reduction_block_ids
+        ):
+            # CuTe argmin/argmax uses warp_reduction (threads_in_group <= 32).
+            threshold = 32 if threshold is None else min(threshold, 32)
+            max_chunk = 32 if max_chunk is None else min(max_chunk, 32)
+        return threshold, max_chunk
+
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
         # - unflatten: flat integer -> Config value via _flat_config()
@@ -9642,10 +9640,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         default = min(high, 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
-        if base.max_reduction_loop is not None:
-            force_threshold = base.reduction_loop_force_threshold
+        force_threshold, max_chunk = self._limits(base)
+        if max_chunk is not None:
             if force_threshold is not None and self.size_hint > force_threshold:
-                default = min(default, base.max_reduction_loop)
+                default = prev_power_of_2(default, max_chunk)
         if high == self._full_extent_chunk():
             # The full padded chunk now denotes an explicit rolled loop.
             # Reserve the next power of two for None, retaining the old default
@@ -9687,6 +9685,21 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
+        # CuTe flattening repairs search/cache/seed budgets before decoding.
+        if base.backend_name == "cute" and type(value) is int and value > 0:
+            _, max_chunk = self._limits(base)
+            explicit_chunk = value == self._full_extent_chunk() or (
+                self.allow_non_power_of_two
+                and 8 <= value <= self.size_hint
+                and self.size_hint % value == 0
+                and value & (value - 1) != 0
+            )
+            if value >= self.size_hint and not explicit_chunk:
+                value = None
+            elif not explicit_chunk or (max_chunk is not None and value > max_chunk):
+                value = max(
+                    self._flat_fragment(base).low, prev_power_of_2(value, max_chunk)
+                )
         if value is None:
             return self._flat_fragment(base).high
         return value
