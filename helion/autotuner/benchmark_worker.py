@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import TypeVar
 
+from .benchmarking import steady_graph_dispatch
 from .logger import _UNRECOVERABLE_RUNTIME_ERROR_RE
 from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
@@ -59,6 +60,10 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
         if job is None:
             return
         try:
+            # The first job's graphs would otherwise be captured in the fast
+            # dispatch state of a fresh process and ranked against later
+            # candidates captured in the steady one.
+            steady_graph_dispatch()
             if isinstance(job, PhasedJob):
                 result: object = job(functools.partial(_report_phase, connection))
             else:
