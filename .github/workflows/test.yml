@@ -237,7 +237,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.11.2' 'jaxlib==0.11.2' 'absl-py'
+          uv pip install 'jax==0.12.0.1' 'jaxlib==0.12.0.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
