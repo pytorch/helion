@@ -2647,7 +2647,10 @@ class TestBudgetedInitialPopulation(TestCase):
         )
 
     def test_differential_evolution_random_population_is_cut(self) -> None:
-        bound, args = self._make_bound(autotune_budget_seconds=100)
+        # Half of 112 s pays for four 12 s configs (48 s) and not five (60 s);
+        # the 8 s between them absorbs the real wall time the stub clock also
+        # counts (a 100 s budget left under 2 s, which a loaded CI run exceeded).
+        bound, args = self._make_bound(autotune_budget_seconds=112)
         search = DifferentialEvolutionSearch(
             bound,
             args,

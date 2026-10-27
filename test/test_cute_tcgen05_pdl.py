@@ -11,6 +11,7 @@ MMA warp has issued its last MMA.
 from __future__ import annotations
 
 import ast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -92,15 +93,31 @@ def test_knob_is_searched_on_sm100_matmul_kernels() -> None:
     assert tuple(fragment.choices) == (False, True)  # pyrefly: ignore[missing-attribute]
 
 
-def test_seeds_are_not_doubled_and_normalization_carries_the_knob() -> None:
+def test_seeds_carry_the_knob_without_twins_and_normalization_carries_it() -> None:
     # The knob is a searched field, not a seed family: no seed list grows a
-    # twin, and a normalized config carries ``cute_pdl`` like every other
-    # optional knob (so a flat transfer round-trips exactly).
+    # twin.  Where it is searched every seed carries it (a seed without the
+    # dependent launch is screened out of the final selection by that
+    # handicap alone), and a normalized config carries ``cute_pdl`` like
+    # every other optional knob (so a flat transfer round-trips exactly).
     bound = _bind_gemm((1024, 1024, 1024), torch.float16)
     with bound.env:
         spec = bound.config_spec
-        seeds = spec._cute_tcgen05_config.autotune_seed_configs()
-        assert seeds and all(s.config.get("cute_pdl") is not True for s in seeds)
+        tcgen05 = spec._cute_tcgen05_config
+        seeds = tcgen05.autotune_seed_configs()
+        assert seeds and all(s.config.get("cute_pdl") is True for s in seeds)
+        schedules = [
+            {k: v for k, v in s.config.items() if k != "cute_pdl"} for s in seeds
+        ]
+        assert len(schedules) == len(seeds)
+        assert all(schedules.count(schedule) == 1 for schedule in schedules), (
+            "a seed list must not grow a cute_pdl twin"
+        )
+        with patch.object(tcgen05, "_pdl_searched", return_value=False):
+            unsearched = tcgen05.autotune_seed_configs()
+        assert [
+            {k: v for k, v in s.config.items() if k != "cute_pdl"} for s in unsearched
+        ] == schedules
+        assert all("cute_pdl" not in s.config for s in unsearched)
         normalized = spec.normalized_config(
             _persistent_config(loop_orders=[[0, 1]], l2_groupings=[1])
         )

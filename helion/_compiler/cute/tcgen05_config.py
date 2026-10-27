@@ -3564,6 +3564,82 @@ class CuteTcgen05Config:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
 
+    def _m_pair_deep_seed_configs(self) -> list[Config]:
+        """nvjet's 64-wide deep ring on the M-paired (block_m=512) tile.
+
+        The bk=128 M-pair seed stages 96 KiB per K step, so it fits two AB
+        stages bare and only one next to the TMA-store C ring; a search
+        rarely follows a seed that shallow.  Halving the K step halves the
+        staging: three AB stages (3 x 48 KiB) plus a four-deep (128, 32) C
+        ring fit the B200 budget, and that ring is what wins where the
+        512x256 pair grid is the one-wave tile of the problem (fp16
+        2048x4096x2048 gradient GEMMs: 34.5 us per GEMM on the 2x2 super-tile
+        vs 35.3-36.2 for the 256x256 pairs, 36.9 for the bk=128 M-pair seed,
+        36.4 on the 2x1 pair, 35.1 with a two-deep C ring).  Seeded on the
+        2x2 super-tile and the 2x1 pair in the static-persistent monolithic
+        schedule: the deepest AB ring that fits next to a two-deep C ring,
+        and the four-deep C ring where it fits as well.  Nothing here reads
+        the problem's extents beyond what ``_m_pair_block_m_is_valid`` and
+        the K-step validity already require.
+        """
+        if not self._m_pair_block_m_is_valid():
+            return []
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.one_wave_only:
+            return []
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return []
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return []
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        pair_bm = 2 * TCGEN05_TWO_CTA_BLOCK_M
+        bn = TCGEN05_TWO_CTA_BLOCK_N
+        bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+        if not (
+            bm_fragment.low <= pair_bm <= bm_fragment.high
+            and bn_fragment.low <= bn <= bn_fragment.high
+            and bk_fragment.low <= bk <= bk_fragment.high
+        ):
+            return []
+        if not self.cluster_m2_bk_is_valid(bk, constraints):
+            return []
+
+        def fits(ab_stages: int, c_stages: int) -> bool:
+            return self.c_stages_fits(
+                bm=pair_bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=2,
+                ab_stages=ab_stages,
+                c_stages=c_stages,
+                has_source_c=False,
+            )
+
+        ab_stages = self.max_ab_stages_that_fit(bm=pair_bm, bn=bn, bk=bk, cluster_m=2)
+        while ab_stages > 1 and not fits(ab_stages, 2):
+            ab_stages -= 1
+        if ab_stages < 2:
+            return []
+        c_stages = 4 if fits(ab_stages, 4) else 2
+        seeds: list[Config] = []
+        for cluster_n in (2, 1):
+            seed_config: dict[str, Any] = {
+                "block_sizes": [pair_bm, bn, bk],
+                "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                "l2_groupings": [1],
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cluster_n": cluster_n,
+                "tcgen05_num_epi_warps": 4,
+                "tcgen05_ab_stages": ab_stages,
+                "tcgen05_acc_stages": 2,
+                "tcgen05_c_stages": c_stages,
+            }
+            if self.config_spec.indexing.length == 3:
+                seed_config["indexing"] = ["tensor_descriptor"] * 3
+            seeds.append(Config(**seed_config))
+        return seeds
+
     def _plain_edge_deep_ab_stages(self, bk: int) -> int:
         """Deepest AB pipeline that leaves room for the TMA-store epilogue's
         C ring on the 256x256 cluster_m=2 tile.
@@ -4100,6 +4176,8 @@ class CuteTcgen05Config:
             m_pair_cn2_seed_config: dict[str, Any] = dict(plain_m_pair_seed.config)
             m_pair_cn2_seed_config["tcgen05_cluster_n"] = 2
             seeds.append(Config(**m_pair_cn2_seed_config))
+            # The same pair tile on nvjet's 64-wide deep ring (2x2 and 2x1).
+            seeds.extend(self._m_pair_deep_seed_configs())
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -4120,6 +4198,19 @@ class CuteTcgen05Config:
                     )
                     if clc_aux_tma_narrow_n_seed is not None:
                         seeds.append(clc_aux_tma_narrow_n_seed)
+        if self._pdl_searched():
+            # Every seed launches as a programmatic dependent where the knob
+            # is searched.  The catalogue times a kernel back to back with
+            # its neighbours, where the dependent launch is worth 1.5% (two
+            # 2048x4096x2048 GEMMs: 72.7 vs 73.8 us) to 5% (8192x1024x768:
+            # 15.6 vs 16.4 us), and every tcgen05 winner of the sweeps
+            # carries it.  A seed without it is screened out of the final
+            # selection by its own handicap before its schedule is compared
+            # with the search's best, so the seeds carry the knob; the
+            # search still mutates it, and no seed list grows a twin.
+            seeds = [
+                Config.from_dict({**seed.config, "cute_pdl": True}) for seed in seeds
+            ]
         return seeds
 
     def _pdl_searched(self) -> bool:

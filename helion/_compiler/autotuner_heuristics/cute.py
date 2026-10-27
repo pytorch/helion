@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+import functools
 from functools import partial
 from itertools import zip_longest
 import math
+import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -133,6 +135,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import MemoryOpFact
+    from ...autotuner.config_spec import PointwiseElementwiseFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
@@ -7570,6 +7573,104 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+# L2 capacity when the device cannot be queried (CPU code generation,
+# mocked devices): a conservative value below every current data-center part.
+_FALLBACK_L2_BYTES = 64 << 20
+
+
+def _device_l2_bytes(env: CompileEnvironment) -> int:
+    device = env.device
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        return _cuda_l2_bytes(device.index if device.index is not None else -1)
+    return _FALLBACK_L2_BYTES
+
+
+@functools.cache
+def _cuda_l2_bytes(index: int) -> int:
+    # Queried once per device: seed generation runs inside budgeted searches
+    # whose wall clock must not pay a driver round trip per search.
+    with contextlib.suppress(Exception):
+        return int(
+            torch.cuda.get_device_properties(
+                torch.device("cuda", index) if index >= 0 else "cuda"
+            ).L2_cache_size
+        )
+    return _FALLBACK_L2_BYTES
+
+
+def _resident_input_eviction_policies(env: CompileEnvironment) -> list[str] | None:
+    """``l2_last`` on the loads of inputs that fit in L2, default on the big streams.
+
+    Back-to-back calls of a bandwidth-bound kernel re-read the same inputs; an
+    input whose distinct bytes (``accessed_numel`` x itemsize) fit in a quarter
+    of L2 stays resident across calls when its loads carry L2::evict_last while
+    the large streams keep the default policy (rope backward s2: the 17 MB
+    key-gradient and the 2 MB cos/sin tables resident, the 67 MB query
+    gradient streaming, 29.5 -> 28.0 us per call; evict_last on every load
+    reads 29.8). Resident inputs are admitted smallest first up to half of L2.
+    ``None`` when no load qualifies or the policy is unavailable.
+    """
+    spec = env.config_spec
+    if not spec.supports_config_key("load_eviction_policies"):
+        return None
+    if "l2_last" not in get_valid_eviction_policies(env.backend_name):
+        return None
+    length = spec.load_eviction_policies.length
+    if length <= 0:
+        return None
+    l2_bytes = _device_l2_bytes(env)
+    by_tensor: dict[str, tuple[int, list[int]]] = {}
+    for fact in spec.memory_op_facts:
+        if (
+            fact.kind != "load"
+            or fact.eviction_index is None
+            or not 0 <= fact.eviction_index < length
+            or fact.dtype is None
+            or fact.accessed_numel <= 0
+        ):
+            continue
+        key = fact.tensor_name or f"#{fact.eviction_index}"
+        size, slots = by_tensor.setdefault(
+            key, (fact.accessed_numel * fact.dtype.itemsize, [])
+        )
+        slots.append(fact.eviction_index)
+    resident: list[int] = []
+    budget = l2_bytes // 2
+    for size, slots in sorted(by_tensor.values(), key=operator.itemgetter(0)):
+        if size > l2_bytes // 4 or size > budget:
+            break
+        budget -= size
+        resident.extend(slots)
+    if not resident or len(resident) == sum(len(s) for _, s in by_tensor.values()):
+        # Nothing to keep, or nothing streams past it: the all-``l2_last``
+        # and plain seeds already cover those programs.
+        return None
+    policies = [""] * length
+    for slot in resident:
+        policies[slot] = "l2_last"
+    return policies
+
+
+def _reversed_root_loop_orders(env: CompileEnvironment) -> list[object] | None:
+    """The last grid axis as the fastest CTA axis, for every multi-axis root.
+
+    Row-major tiles make the last tile axis the one with the smallest stride;
+    walking it fastest keeps consecutive CTAs on nearby DRAM pages (rope
+    backward s2: 29.5 -> 29.0 us per call).
+    """
+    spec = env.config_spec
+    if not spec.supports_config_key("loop_orders"):
+        return None
+    overrides = {
+        item.block_id: list(reversed(range(len(item.block_ids))))
+        for item in spec.loop_orders
+        if len(item.block_ids) > 1
+    }
+    if not overrides:
+        return None
+    return _seq_config_list(spec.loop_orders, overrides)
+
+
 class CutePointwiseVecHeuristic(AutotunerHeuristic):
     """Seed config for PURE pointwise kernels (add, gelu, cast, ...).
 
@@ -7763,6 +7864,16 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             plain_seed.pop("load_eviction_policies", None)
             with contextlib.suppress(Exception):
                 seeds.append(Config(**plain_seed))
+        # Resident-input alternate: l2_last only on the inputs that fit in L2
+        # (a quarter each, half in total), default on the large streams.
+        resident = _resident_input_eviction_policies(env)
+        if resident is not None and resident != primary.config.get(
+            "load_eviction_policies"
+        ):
+            resident_seed: dict[str, Any] = deepcopy(primary.config)
+            resident_seed["load_eviction_policies"] = list(resident)
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**resident_seed))
         # Wide-thread sibling (NT*2, one vector per thread): kernels whose
         # per-element pipeline is ALU-heavier (e.g. a broadcast gather's
         # per-element div/mod) prefer more threads over per-thread unroll
@@ -7791,6 +7902,7 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                     spec.cute_vector_widths, {vec_block: packet_width}
                 )
                 seeds.append(Config.from_dict(packet))
+        seeds.extend(cls._wide_row_packet_seeds(env, fact, candidates, vec_block))
         if spec.cute_proven_bounds_enabled:
             # Keep the complete existing family and its order. Add independent
             # true counterparts so ordinary cold search can compare the proof
@@ -7845,6 +7957,99 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 for seed in list(seeds)
                 if not seed.config.get("cute_rng_packet", False)
             )
+        return seeds
+
+    # Wide row packets: bytes per lane load, lanes across the contiguous axis,
+    # packet loads hoisted per thread, and the CTA's thread budget.
+    WIDE_PACKET_BYTES = 32
+    WIDE_PACKET_LANES = 8
+    WIDE_PACKET_LOADS = 4
+    WIDE_PACKET_THREADS = 256
+
+    @classmethod
+    def _wide_row_packet_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+    ) -> list[Config]:
+        """Rows of 32-byte packets with the register budget to keep them in flight.
+
+        A two-axis pointwise kernel whose rows are gathered or streamed
+        (embedding: ``weight[idx, tile_e]``) is bandwidth-bound on the row
+        reads. Eight lanes of 32-byte packets cover a 256-byte row segment
+        per load, four such loads are hoisted per thread, and the rest of the
+        CTA's 256 threads take rows, one each (32 rows per CTA at eight
+        lanes). The seed carries ``cute_min_blocks_per_mp=1`` so ptxas keeps
+        the four packets in registers instead of capping them for occupancy
+        (embedding s1 on B200: 4.44 us with the hint, 5.51 without), and a
+        ``cute_pdl`` twin (another 0.2 us back to back). Every cold search of
+        embedding s1 that reached parity with Triton found this class; the
+        16-byte packet seeds start 30-80% away from it.
+        """
+        spec = env.config_spec
+        if len(candidates) != 2 or vec_block != candidates[-1]:
+            return []
+        outer_block = candidates[0]
+        if (
+            fact.storage_itemsize <= 0
+            or vec_block not in spec.cute_vector_widths.valid_block_ids()
+            or vec_block not in spec.num_threads.valid_block_ids()
+            or outer_block not in spec.num_threads.valid_block_ids()
+            or not spec.supports_config_key("cute_min_blocks_per_mp")
+        ):
+            return []
+        vec = cls.WIDE_PACKET_BYTES // fact.storage_itemsize
+        choices = {
+            cast("int", value)
+            for value in spec.cute_vector_widths.block_id_lookup(vec_block)
+            ._fragment(spec)
+            .choices
+        }
+        inner = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        if vec not in choices or inner % vec:
+            return []
+        lanes = min(cls.WIDE_PACKET_LANES, inner // vec)
+        inner_tile = min(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
+        rows = cls.WIDE_PACKET_THREADS // lanes
+        fragments = {
+            bid: spec.block_sizes.block_id_lookup(bid)._fragment(spec)
+            for bid in candidates
+        }
+        rows = max(fragments[outer_block].low, min(rows, fragments[outer_block].high))
+        if not fragments[vec_block].low <= inner_tile <= fragments[vec_block].high:
+            return []
+        base: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block: rows, vec_block: inner_tile}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {outer_block: rows, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+            "cute_min_blocks_per_mp": 1,
+        }
+        if vec_block in spec.cute_lane_layouts.valid_block_ids():
+            base["cute_lane_layouts"] = _seq_config_list(
+                spec.cute_lane_layouts, {vec_block: "strided"}
+            )
+        # Rows in memory order: the contiguous axis is the fastest CTA axis
+        # (embedding s1: 5.7 us with the default order, 4.5 reversed).
+        reversed_orders = _reversed_root_loop_orders(env)
+        if reversed_orders is not None:
+            base["loop_orders"] = reversed_orders
+        variants = [base]
+        dependent = _dependent_launch(spec)
+        if dependent:
+            # The twin owns its lists (seeds must not alias each other).
+            variants.append(deepcopy(base) | dependent)
+        seeds: list[Config] = []
+        for values in variants:
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**values))
         return seeds
 
     # Per-CTA thread budgets and thread counts on the widest other full-slice
@@ -7913,6 +8118,13 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             if vec_block in {item.block_id for item in spec.reduction_loops}
             else None
         )
+        # Siblings of every geometry: the inputs that fit in L2 kept resident
+        # with l2_last, and that plus the last grid axis as the fastest CTA
+        # axis. Back-to-back calls re-read the small inputs from L2 and the
+        # large streams walk DRAM in memory order (rope backward s2: 29.5 ->
+        # 27.1 us per call against 28.3 for the Triton winner).
+        resident = _resident_input_eviction_policies(env)
+        reversed_orders = _reversed_root_loop_orders(env)
         seeds: list[Config] = []
         for budget in cls.PERSISTENT_THREAD_BUDGETS:
             for slice_threads in cls.PERSISTENT_SLICE_THREADS:
@@ -7956,12 +8168,25 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 }
                 if reduction_loops is not None:
                     seed["reduction_loops"] = reduction_loops
-                try:
-                    config = Config(**seed)
-                except Exception:
-                    continue
-                if config not in seeds:
-                    seeds.append(config)
+                # Every sibling owns its lists: the search mutates configs in
+                # place, so seeds must not alias each other's values.
+                variants: list[dict[str, Any]] = [seed]
+                if resident is not None:
+                    with_resident = deepcopy(seed)
+                    with_resident["load_eviction_policies"] = list(resident)
+                    variants.append(with_resident)
+                    if reversed_orders is not None:
+                        variants.append(
+                            deepcopy(with_resident)
+                            | {"loop_orders": deepcopy(reversed_orders)}
+                        )
+                for values in variants:
+                    try:
+                        config = Config(**values)
+                    except Exception:
+                        continue
+                    if config not in seeds:
+                        seeds.append(config)
         return seeds
 
     @classmethod
