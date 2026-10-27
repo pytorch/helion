@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from math import gcd
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import cast
 
@@ -156,6 +157,48 @@ def _transpose_sf_stage_inplace(
                     + lane * 4
                     + segment
                 ] = words_b[chunk, n_chunk, segment]
+
+
+@dsl_user_op
+def _spin_wait(
+    address: cutlass.Int32,
+    phase: cutlass.Int32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> None:
+    """Spin on ``mbarrier.test_wait.parity`` until the barrier at shared
+    address ``address`` completes ``phase``.
+
+    The pipelines' ``mbarrier_wait`` is a ``try_wait`` with a 10 ms suspend
+    hint, which lowers to a ``NANOSLEEP``-backed retry loop.  The fused
+    consumer's transform warps hand off every K stage twice (TMA to
+    transform, transform to MMA) on a chain that is a few hundred
+    nanoseconds long, and ptxas's schedule of that loop around the
+    suspending wait made the whole kernel 25% slower (nvfp4_gemm W4A4
+    1024x2048x1024: 8.0 us against 6.3 us with this spin in front of the
+    waits; a dead store at the same point produced the same fast schedule).
+    ``test_wait`` never suspends, so the wake-up is immediate and the
+    schedule does not depend on compiler heuristics.  The pipeline's own
+    wait follows and returns at once, keeping its acquire semantics."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(loc=loc, ip=ip), phase.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT:\n\t"
+        "mbarrier.test_wait.parity.shared::cta.b64 P1, [$0], $1;\n\t"
+        "@P1 bra DONE;\n\t"
+        "bra LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -495,8 +538,13 @@ def _transform_stage(
     every load, then the stores, then commit it.  ``tail`` is ``(k step,
     last k step, valid groups of the last quad)`` for the padding-scale mask.
     Returns the advanced states: the caller's loop carries them only through
-    an assignment."""
+    an assignment.  Both waits are preceded by a non-suspending spin
+    (``_spin_wait``)."""
+    raw_full = cast("Any", raw_pipe.sync_object_full).get_barrier(raw_state.index)
+    _spin_wait(cutlass.Int32(raw_full.toint()), cutlass.Int32(raw_state.phase))
     raw_pipe.consumer_wait(raw_state)
+    ab_empty = cast("Any", ab_pipe.sync_object_empty).get_barrier(ab_state.index)
+    _spin_wait(cutlass.Int32(ab_empty.toint()), cutlass.Int32(ab_state.phase))
     ab_pipe.producer_acquire(ab_state)
     stage = raw_state.index
     transposed: list[list[_LdsmUnit]] = []
@@ -618,8 +666,14 @@ class Sm100BlockScaledGemm:
         rhs_scale_column_stride: int = 0,
         pdl: bool = False,
         fused: dict[str, tuple[str, int]] | None = None,
+        epilogue_n: int = 64,
     ) -> None:
         assert operand_format in ("nvfp4", "mxfp8")
+        # NVFP4 epilogue chunk width (``cute_scaled_epilogue_n``); the MXFP8
+        # epilogue modes choose their own below.
+        assert epilogue_n in (32, 64) and (
+            epilogue_n == 64 or operand_format == "nvfp4"
+        )
         self.operand_format = operand_format
         self.fused_scales = fused_scales
         self.sf_tma = sf_tma
@@ -694,7 +748,7 @@ class Sm100BlockScaledGemm:
             if tma_output
             else gcd(bn, 64)
             if accumulator_stages > 1 or prefetch_output_registers
-            else min(bn, 64)
+            else min(bn, epilogue_n)
         )
         required_tmem = (
             bn * accumulator_stages
@@ -1467,6 +1521,28 @@ class Sm100BlockScaledGemm:
             f"SFB columns {tcgen05.find_tmem_tensor_col_offset(tsb)} != {sb_columns}"
         )
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster)
+        if cutlass.const_expr(self.pdl and self.fused):
+            # Let the next grid in the stream launch now so its launch and
+            # prologue overlap this kernel's mainloop and tail.  Measured
+            # back to back against a release after the MMA warp's last MMA
+            # (nvfp4_gemm W4A4, graph of 16+ calls): 1024x2048x1024 5.66 vs
+            # 5.95 us, 512x1024x512 3.94 vs 4.00, a six-CTAs-per-SM tile at
+            # 1024x2048x1024 8.48 vs 8.55; only the four-CTA 128x256x128
+            # grid prefers the late release (2.68 vs 2.62).  Safe for the
+            # fused form: it has no workspace, and a dependent's global
+            # accesses (TMA source reads behind warp 5's griddepcontrol_wait,
+            # output stores behind the pipelines that follow it) all come
+            # after this grid's completion.  The trigger must stay after
+            # ``allocator.allocate`` / ``wait_for_alloc`` above: released
+            # earlier, a grid N+2 CTA could take the TMEM columns a grid N+1
+            # CTA on the same SM has not allocated yet while N+1 waits for
+            # N, and the chain would hang.  The two-kernel form keeps the
+            # implicit release at grid completion: its own chain gains
+            # nothing (the preparation kernel launches without the PDL
+            # attribute, so the stream serializes behind this grid either
+            # way) and a release ahead of foreign dependents is unmeasured
+            # there.
+            cute.arch.griddepcontrol_launch_dependents()
         if warp == 5:
             cpasync.prefetch_descriptor(a_atom)
             cpasync.prefetch_descriptor(b_atom)
@@ -1737,6 +1813,20 @@ class Sm100BlockScaledGemm:
                 # the K-major stage with its signs folded and cleared on the
                 # way.  Every load of a stage is issued before its first
                 # store.
+                if cutlass.const_expr(self.pdl):
+                    # The first raw stage fills only after warp 5's
+                    # griddepcontrol_wait returns (the preceding grid's
+                    # completion), and ``_transform_stage``'s spin never
+                    # suspends: under PDL these CTAs are resident while the
+                    # predecessor still runs, so park the transform warps on
+                    # the same hardware wait instead of spinning through its
+                    # remaining runtime.  The per-stage spins that follow are
+                    # bounded by the pipeline's own handoffs.  (Back to back
+                    # this costs 0.05-0.12 us per launch against the spin,
+                    # which kept otherwise idle SMs busy; a time-budgeted
+                    # spin, a suspending mbarrier wait and a named barrier
+                    # measured the same or worse.)
+                    cute.arch.griddepcontrol_wait()
                 ttid = tid - 192
                 raw_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.stages
