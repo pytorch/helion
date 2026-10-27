@@ -22,6 +22,8 @@ import torch
 
 from test._cute_binding import _mock_cuda_unavailable
 
+from helion._testing import skipUnlessCuteAvailable
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -480,6 +482,7 @@ def _sdk_method(cls: type[object], name: str) -> ast.FunctionDef:
     return function
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_actual_sdk_release_keeps_hardware_umma_completion_on_original_empty_ring() -> (
     None
 ):
@@ -671,6 +674,7 @@ def _record_phases(
         output[tile * 9 + 8] = consumer.count
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("stages", (1, 2, 3, 6))
 def test_actual_helion_sdk_states_keep_phase_across_zero_k_and_wrap(
     stages: int,

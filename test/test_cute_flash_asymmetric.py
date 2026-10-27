@@ -24,6 +24,7 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
 from helion._compiler.cute.attention_plan import flash_pair_head_dims_supported
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -185,14 +186,17 @@ def test_score_plan_value_head_dim() -> None:
     ).asymmetric_head_dims
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_admits_the_mla_pair_on_cpu() -> None:
     assert _cpu_surface(192, 128, 512) == (True, 192, 128)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_keeps_the_symmetric_surface_unchanged() -> None:
     assert _cpu_surface(128, 128, 512) == (True, 128, None)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     ("head_dim", "head_dim_v", "seq"),
     (
@@ -204,6 +208,7 @@ def test_detector_rejects_other_pairs(head_dim: int, head_dim_v: int, seq: int) 
     assert _cpu_surface(head_dim, head_dim_v, seq) == (False, None, None)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_admits_symmetric_192_on_the_single_tile_body() -> None:
     """Two 192-wide accumulators do not fit the pair body's TMEM; the width
     is hosted by the single-query-tile body instead (one score buffer per

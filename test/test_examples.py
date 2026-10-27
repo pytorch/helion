@@ -2313,13 +2313,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         teacher_logits = student_logits.clone()
         args = (beta, ignore_index, temperature, student_logits, teacher_logits)
 
+        # One row per CTA covers the subnormal regression without the slow
+        # fbtriton lowering of sixteen 1024-element rows in a single CTA.
         check_example(
             "fused_linear_jsd",
             args,
             torch.zeros((), device=DEVICE),
             fn_name="fused_linear_jsd_kernel",
             emit_code=False,
-            block_sizes=[16],
+            block_sizes=[1],
             atol=1e-6,
             rtol=0,
         )
@@ -2329,7 +2331,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             (torch.zeros(16, device=DEVICE), torch.zeros_like(student_logits)),
             fn_name="jsd_kernel",
             emit_code=False,
-            block_sizes=[16],
+            block_sizes=[1],
             atol=1e-6,
             rtol=0,
         )

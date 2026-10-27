@@ -58,6 +58,18 @@
       "backend": "triton"
     },
     {
+      "runner": "mt-l-x86iamx-22-225-h100",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
+      "runtime-version": "cu130",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "h100",
+      "backend": "triton",
+      "triton-package": "fbtriton"
+    },
+    {
       "runner": "mt-l-x86iamx-88-900-h100-4",
       "python-version": "3.12",
       "ref-eager": false,

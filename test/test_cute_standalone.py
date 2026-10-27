@@ -15,6 +15,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -62,7 +63,10 @@ def _run_without_helion(tmp_path: Path, body: str) -> None:
     )
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    skipUnlessBackends(["cute"]),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+]
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "offset", "transposed"])

@@ -18,6 +18,7 @@ from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 
@@ -201,6 +202,7 @@ def test_guard_covers_positive_divisible_equal_contiguous_int32_domain(
     assert value is expected
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_guard_stays_linear_through_the_sdk_boolean_expansion():
     """The CuTe DSL preprocessor rewrites ``a and b`` into an expression that
     repeats ``a`` four times, so a flat chain of guards grows exponentially

@@ -12,6 +12,7 @@ import torch
 from test._cute_binding import _mock_cuda_unavailable
 
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_FLAGS
+from helion._testing import skipUnlessCuteAvailable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -115,6 +116,7 @@ _DTYPES = (
 )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(("head_dim", "kv_tile_n"), _LAYOUT_CASES)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("stages", (2, 3, 6))
@@ -135,6 +137,7 @@ def test_sdk_cooperative_kv_partition_preserves_q_and_o(
         assert _layout_bytes(layout, dtype) == stages * _layout_bytes(stage, dtype)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(("head_dim", "kv_tile_n"), _LAYOUT_CASES)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("stages", (2, 3, 6))
@@ -167,6 +170,7 @@ def test_runtime_storage_matches_sdk_operand_spans(
         assert "sO" not in storage._annotations
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("head_dim", (64, 128))
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("epi_tma", (False, True))
@@ -186,6 +190,7 @@ def test_six_cooperative_stages_fit_three_full_stages(
     assert two.size_in_bytes() == one.size_in_bytes()
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("head_dim", (64, 128))
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("family", ("fa4_cga2_local", "fa4_cga2_local_tma_4d"))
@@ -205,6 +210,7 @@ def test_cluster_of_local_ctas_keeps_full_kv_allocation(
     assert explicit.size_in_bytes() == default.size_in_bytes()
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("head_dim", (64, 128))
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("epi_tma", (False, True))
@@ -221,6 +227,7 @@ def test_separate_one_cta_rings_keep_both_operand_allocations(
     assert _member_bytes(storage, "sO") == (_layout_bytes(o, dtype) if epi_tma else 0)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("head_dim", (64, 128, 192))
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_one_stage_layout_has_no_stage_stride(head_dim: int, dtype: Any) -> None:
