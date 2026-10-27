@@ -329,7 +329,12 @@ def test_prefix_coverage_completed_by_a_host_fill() -> None:
         _prefix_rows_with_host_fill, torch.empty((65, 32), dtype=torch.bfloat16)
     )
     assert "out = torch.empty_like(x)" in code
-    assert "out[:, -1, :]" not in code and "out[-1, :] = 0" in code
+    # The remainder fill itself moves into the kernel (host_remainder_fills):
+    # the host statement is gone and the kernel writes the last row.
+    assert "out[-1, :] = 0" not in code
+    assert (
+        "_cute_remainder_fill(out, dim=0, remainder=1, value=0, is_float=True)" in code
+    )
 
 
 @pytest.mark.parametrize(
