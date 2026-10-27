@@ -102,6 +102,27 @@ The CSV/JSON/PDF reproduction bundle is under
 `artifacts/attngym-gb300-results-20261023T193337Z/`; its README describes
 regenerating the two PDFs from the exported data.
 
+## Paper harness source
+
+`attention-gym.bundle` is the archived attention-gym harness repository
+(branch `flex-template`), the same history as the prepared runtime's
+`repos/attention-gym.git`. It holds the forward fused harness `b530d94` (11
+variants) and sparse harness `f7844a4` (18 variants); their
+`benchmarks/helion_attn/variants.py` hashes match `sources` in
+`reference_cases.json`. Read a variant's definition without the prepared
+runtime:
+
+```bash
+git clone -b flex-template benchmarks/cute/paper_attention_repro/attention-gym.bundle /tmp/attention-gym
+git -C /tmp/attention-gym checkout b530d94   # or f7844a4 for sparse variants
+```
+
+In `benchmarks/helion_attn/variants.py`, `VARIANTS["<name>"]` gives shapes,
+parameters and the Helion template, `_mods_<name>` the FlexAttention
+`score_mod`/`mask_mod`, `STAGE_<NAME>` the Helion stage body, and
+`variant_flops` the useful FLOPs. `kernels.py` maps templates to kernels
+(`TEMPLATES`) and formats stages (`stage_for`).
+
 ## CPU checks
 
 ```bash
