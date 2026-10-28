@@ -2998,8 +2998,19 @@ def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
         cute_mma_dag_loads="tma",
         cute_mma_dag_derived=derived,
     )
-    kernel = helion.kernel(_half_addmm_db, backend="cute", static_shapes=True)  # type: ignore[arg-type]
+    # At 256 output rows the operand-materialization rewrite takes the
+    # binding (the B recipe is derived once per 128-row tile, twice, from
+    # three same-width sources), which has no fused owner: this test pins
+    # the fused emitters, so the rewrite is off; the materialized route's
+    # numerics are pinned below.
+    kernel = helion.kernel(
+        _half_addmm_db,  # type: ignore[arg-type]
+        backend="cute",
+        static_shapes=True,
+        cute_materialize_transformed_operands=False,
+    )
     bound = kernel.bind(args)
+    assert bound.env.cute_fission_plan is None
     with bound.env:
         normalized = bound.config_spec.normalized_config(config)
     source = bound.to_code(normalized)
@@ -3020,6 +3031,40 @@ def test_a_half_addmm_into_an_fp32_accumulator_matches_the_references(
     assert rel_l2 < 1e-3, rel_l2
     (triton,) = _run_triton(_half_addmm_db, args, block_sizes)
     _assert_close((out,), (triton,))
+
+
+def test_a_half_addmm_whose_recipe_is_reused_materializes_and_matches() -> None:
+    # The same program with the operand materialization rewrite on (the
+    # autotuning efforts' structural policy switches it on; it is asked for
+    # here since ``autotune_effort="none"`` leaves every structural setting
+    # at its False default): the rewrite admits the transposed direct
+    # operand and the three-source B recipe reused across two 128-row output
+    # tiles, so the binding runs as a producer launch plus a plain-load
+    # tcgen05 consumer and matches the fp32 reference as the fused emitters
+    # do.
+    g = torch.Generator(device=DEVICE).manual_seed(29)
+    m, k, n = 1024, 256, 512
+    grad_out = _randn(g, m, n, dtype=torch.float16)
+    x = _randn(g, m, n, dtype=torch.float16)
+    d = torch.sigmoid(_randn(g, m, n, dtype=torch.float16))
+    c = torch.relu(_randn(g, m, k, dtype=torch.float16))
+    args = (grad_out, x, d, c)
+    kernel = helion.kernel(
+        _half_addmm_db,  # type: ignore[arg-type]
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_materialize_transformed_operands=True,
+    )
+    bound = kernel.bind(args)
+    assert bound.env.cute_fission_plan is not None
+    assert bound.config_spec.cute_mma_dag is None
+    out = cast_tensor(bound(*args))
+    torch.cuda.synchronize()
+    grad_d = grad_out.float() * x.float() * d.float() * (1.0 - d.float())
+    ref = (c.float().T @ grad_d).to(torch.float16)
+    rel_l2 = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel_l2 < 1e-3, rel_l2
 
 
 # --------------------------------------------------------------------------

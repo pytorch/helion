@@ -2117,8 +2117,8 @@ def _lossy_cast_recurrence(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return h_all
 
 
-def _bind_fn(fn: object, args: tuple[object, ...]) -> BoundKernel:
-    return helion.kernel(fn, backend="cute", static_shapes=True).bind(args)  # type: ignore[arg-type]
+def _bind_fn(fn: object, args: tuple[object, ...], **settings: object) -> BoundKernel:
+    return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # type: ignore[arg-type]
 
 
 def test_sync_tiles_ring_with_the_stages_or_add_a_trailing_barrier() -> None:
@@ -8234,10 +8234,10 @@ def _half_accumulating_addmm(
     return grad_b
 
 
-def _accumulating_addmm_inputs() -> tuple[torch.Tensor, ...]:
+def _accumulating_addmm_inputs(k: int = 256) -> tuple[torch.Tensor, ...]:
     f16 = torch.float16
     grad_out = torch.empty((1024, 512), dtype=f16, device=CPU_DEVICE)
-    c = torch.empty((1024, 256), dtype=f16, device=CPU_DEVICE)
+    c = torch.empty((1024, k), dtype=f16, device=CPU_DEVICE)
     return grad_out, grad_out, grad_out, c
 
 
@@ -8247,7 +8247,26 @@ def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
     # accumulator, no rounding -- what ``hl.dot(a16, b16, acc=acc)`` spells.
     # Its operands here are the ones the tensor-core K-loop family declines
     # (a computed B tile), so the kernel ran SIMT or collective warp MMA.
-    bound = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
+    #
+    # At 256 output rows the operand-materialization rewrite takes the bound
+    # kernel instead (``_fused_recompute_pays``: the B recipe reads three
+    # same-width sources and is derived once per 128-row output tile, twice
+    # here), so the binding is a producer launch plus a plain-load consumer
+    # with no fused owner; at 128 rows the fused owner keeps it. The fused
+    # analysis below is pinned on the same program with the rewrite off.
+    materialized = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
+    assert materialized.env.cute_fission_plan is not None
+    assert materialized.config_spec.cute_mma_dag is None
+    assert materialized.config_spec.cute_tcgen05_search_enabled is True
+    one_tile = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs(k=128))
+    assert one_tile.env.cute_fission_plan is None
+    assert one_tile.config_spec.cute_mma_dag is not None
+    bound = _bind_fn(
+        _accumulating_addmm,
+        _accumulating_addmm_inputs(),
+        cute_materialize_transformed_operands=False,
+    )
+    assert bound.env.cute_fission_plan is None
     spec = bound.config_spec
     assert spec.cute_tcgen05_search_enabled is False
     assert spec.cute_mma_dag is not None

@@ -374,10 +374,15 @@ def enable_phase_mma_search(
     launches.  Within the flat chain, ``tcgen05_region_pid_types`` may run
     individual GEMM launches as the static persistent two-CTA pipeline of
     the standalone single-GEMM surface (``CuteTcgen05Config``), each with
-    its own complete allocation proof and ring depth.  Anything unproven
-    declines and the SIMT lowering stays.
+    its own complete allocation proof and ring depth, and the flat launches
+    keep the one-CTA pipeline at the depth their tile fits.  One GEMM phase
+    beside plain phases is a chain of this kind as well: planned per phase
+    it gets the per-launch pid types and the plain phases their layout
+    knobs, which the standalone single-GEMM surface (a flat-only, cluster-
+    less launch of a multi-root kernel) cannot offer.  Anything unproven
+    declines (the caller falls back to that standalone surface) and the SIMT
+    lowering stays.
     """
-    from .aux_tensor import _TCGEN05_AUX_DETECTOR_MMA_TARGETS
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
     from .ordered_phases import ordered_phases_supported
 
@@ -390,7 +395,7 @@ def enable_phase_mma_search(
         or len(device_ir.root_ids) < 2
         or len(device_ir.phases) != len(device_ir.root_ids)
         or "flat" not in spec.allowed_pid_types
-        or len(candidates) < 2
+        or not candidates
         or not all(result.guards_complete for result in planning_results)
         or not ordered_phases_supported(host, device_ir)
     ):
@@ -402,7 +407,7 @@ def enable_phase_mma_search(
     if placement is None:
         return False
     placed, occupied = placement
-    if len(placed) < 2:
+    if not placed:
         return False
     # A GEMM phase holds exactly its admitted matmul and its three axes, every
     # store its result reaches is a chain the tcgen05 epilogue splices, and
@@ -412,23 +417,12 @@ def enable_phase_mma_search(
     # A plain phase holds no matmul at all (an unadmitted one would take the
     # SIMT fallback whose lane-loop suppression the pointwise layout knobs
     # cannot see) and none of the GEMM axes.
-    matmul_targets = (
-        *_TCGEN05_AUX_DETECTOR_MMA_TARGETS,
-        torch.ops.aten.mm.dtype,
-        torch.ops.aten.addmm.dtype,
-        torch.ops.aten.bmm.dtype,
-        torch.ops.aten.baddbmm.dtype,
-    )
+    matmul_targets = _matmul_targets()
     plain_block_ids: set[int] = set()
     plain_grids: list[tuple[int, ...]] = []
     for index, region in enumerate(regions):
         region_graphs = [info for info in device_ir.graphs if info.graph_id in region]
-        matmuls = [
-            node
-            for info in region_graphs
-            for node in info.graph.nodes
-            if node.op == "call_function" and node.target in matmul_targets
-        ]
+        matmuls = _matmul_nodes(region_graphs, matmul_targets)
         active = active_block_ids(region_graphs, device_ir.grid_block_ids[index], env)
         if index in placed:
             candidate, _plan = placed[index]
@@ -471,6 +465,41 @@ def enable_phase_mma_search(
         reason="independent CuTe MMA barrier phases",
         region_pid_types=True,
     )
+    _publish_plain_phases(env, device_ir, plain_block_ids, plain_grids)
+    return True
+
+
+def _matmul_targets() -> tuple[object, ...]:
+    from .aux_tensor import _TCGEN05_AUX_DETECTOR_MMA_TARGETS
+
+    return (
+        *_TCGEN05_AUX_DETECTOR_MMA_TARGETS,
+        torch.ops.aten.mm.dtype,
+        torch.ops.aten.addmm.dtype,
+        torch.ops.aten.bmm.dtype,
+        torch.ops.aten.baddbmm.dtype,
+    )
+
+
+def _matmul_nodes(
+    region_graphs: Sequence[GraphInfo], matmul_targets: tuple[object, ...]
+) -> list[torch.fx.Node]:
+    return [
+        node
+        for info in region_graphs
+        for node in info.graph.nodes
+        if node.op == "call_function" and node.target in matmul_targets
+    ]
+
+
+def _publish_plain_phases(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    plain_block_ids: set[int],
+    plain_grids: Sequence[tuple[int, ...]],
+) -> None:
+    """Keep the SIMT layout knobs of separately launched matmul-free phases."""
+    spec = env.config_spec
     spec.cute_pointwise_region_block_ids = frozenset(plain_block_ids)
     # An axis reused by another phase keeps the shared search floor.
     spec.cute_pointwise_region_grid_groups = tuple(
@@ -481,4 +510,57 @@ def enable_phase_mma_search(
             for block_id in grid
         )
     )
+
+
+def register_plain_barrier_phases(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Publish the matmul-free phases of a native-GEMM barrier chain.
+
+    The single-GEMM tcgen05 surface (``enable_cute_tcgen05_search``) narrows an
+    ``hl.barrier()`` kernel to ``pid_type="flat"``, whose ordered per-phase
+    launches (``generate_ordered_phases``) give every phase its own device
+    function.  A phase without any matmul then runs the ordinary SIMT lowering
+    alone, so its ``num_threads`` / ``cute_vector_widths`` /
+    ``cute_lane_layouts`` knobs apply exactly as they do to a materialized
+    fission plan's pointwise region: the grid vectorizer admits the phase's
+    axes (``cute_pointwise_region_block_ids``) and the knobs join the tcgen05
+    search surface.  Phases that hold a matmul, or share an axis with one,
+    stay as they are.  Returns whether any phase was published.
+    """
+    from .ordered_phases import ordered_phases_supported
+
+    host = device_ir.host_function
+    spec = env.config_spec
+    if (
+        env.cute_fission_plan is not None
+        or host is None
+        or not env.has_barrier
+        or len(device_ir.root_ids) < 2
+        or len(device_ir.phases) != len(device_ir.root_ids)
+        or spec.cute_pointwise_region_block_ids
+        or tuple(spec.allowed_pid_types) != ("flat",)
+        or not ordered_phases_supported(host, device_ir)
+    ):
+        return False
+    regions = [
+        _region_graph_ids(device_ir.graphs, root_id) for root_id in device_ir.root_ids
+    ]
+    matmul_targets = _matmul_targets()
+    phases: list[tuple[frozenset[int], bool]] = []
+    for index, region in enumerate(regions):
+        region_graphs = [info for info in device_ir.graphs if info.graph_id in region]
+        active = active_block_ids(region_graphs, device_ir.grid_block_ids[index], env)
+        phases.append((active, bool(_matmul_nodes(region_graphs, matmul_targets))))
+    occupied = {
+        block_id for active, has_matmul in phases if has_matmul for block_id in active
+    }
+    plain_block_ids: set[int] = set()
+    plain_grids: list[tuple[int, ...]] = []
+    for index, (active, has_matmul) in enumerate(phases):
+        if has_matmul or active & occupied:
+            continue
+        plain_block_ids.update(active)
+        plain_grids.append(tuple(device_ir.grid_block_ids[index]))
+    if not plain_block_ids:
+        return False
+    _publish_plain_phases(env, device_ir, plain_block_ids, plain_grids)
     return True

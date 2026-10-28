@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import deepest_fitting_ab_stages
 from .pipeline_smem import tcgen05_bookkeeping_smem_bytes
@@ -84,6 +85,19 @@ def one_cta_pipeline_supported(
     )
 
 
+def one_cta_pipeline_tile_modeled(
+    *, bm: int, bn: int, bk: int, c_stages: int, acc_stages: int
+) -> bool:
+    """The tiles and ring counts ``one_cta_pipeline_smem_bytes`` prices."""
+    return (
+        bm in (64, 128)
+        and bn in (16, 32, 64, 128, 256)
+        and bk in (32, 64, 128, 256)
+        and c_stages in (2, 4)
+        and acc_stages in (1, 2)
+    )
+
+
 def one_cta_pipeline_smem_bytes(
     facts: Tcgen05PipelineSmemFacts,
     *,
@@ -99,19 +113,28 @@ def one_cta_pipeline_smem_bytes(
     Only post-wait SIMT auxiliary loads are admitted, so scales need no SMEM.
     Direct stores retain the D-ring charge. The shared DEFAULT sizing helper
     follows the same with-source convention as the device/descriptor resolver.
-    This function does not change any legacy one- or two-CTA allocation model.
+    The model prices one- and two-byte operands (the FP8 persistent pipeline
+    and the flat 16-bit launches of an ordered barrier chain run the same
+    role-local CtaGroup.ONE schedule).  This function does not change any
+    legacy one- or two-CTA allocation model.
     """
-    assert bm in (64, 128) and bn in (16, 32, 64, 128, 256)
-    assert bk in (32, 64, 128, 256)
-    assert facts.input_dtype_bytes == 1 and facts.output_dtype_bytes in (2, 4)
-    assert ab_stages > 0 and c_stages in (2, 4) and acc_stages in (1, 2)
+    assert one_cta_pipeline_tile_modeled(
+        bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
+    )
+    assert facts.input_dtype_bytes in (1, 2) and facts.output_dtype_bytes in (2, 4)
+    assert ab_stages > 0
     width = facts.output_dtype_bytes * 8
     epi_m, epi_n = tcgen05_default_epilogue_tile_size(
         bm, bn, elem_width_d=width, elem_width_c=width
     )
     return (
         tcgen05_ab_smem_bytes_per_cta(
-            bm=bm, bn=bn, bk=bk, dtype_bytes=1, ab_stages=ab_stages, cluster_m=1
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            dtype_bytes=facts.input_dtype_bytes,
+            ab_stages=ab_stages,
+            cluster_m=1,
         )
         + tcgen05_c_smem_bytes_per_cta(
             epi_tile_m=epi_m,
@@ -131,7 +154,9 @@ def max_one_cta_pipeline_ab_stages(
     bk: int,
     c_stages: int,
     acc_stages: int,
+    max_stages: int = TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
 ) -> int:
+    """Deepest AB ring in ``1..max_stages`` the one-CTA launch fits, else 0."""
     return deepest_fitting_ab_stages(
         lambda stages: one_cta_pipeline_smem_bytes(
             facts,
@@ -143,6 +168,7 @@ def max_one_cta_pipeline_ab_stages(
             acc_stages=acc_stages,
         ),
         facts.capacity_bytes,
+        max_stages=max_stages,
     )
 
 
