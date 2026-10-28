@@ -29,6 +29,19 @@ primitives:
   iteration overlap the tensor core's work on the previous.  The loop's
   commits on ``md_cb`` go unwaited; the loop exit waits on the last slot's
   ``md_empty`` (one phase outstanding at most) and ``md_cb`` is then exact.
+  Under ``cute_mma_dag_pass_warps='mma'`` a streamed loop with operand
+  passes is warp-specialized (``emit_ws_loop``): the config's warps run the
+  passes alone -- wait ``md_full``, rewrite the slot, fence, arrive on the
+  slot's ``md_ready{L}`` (one arrival per pass thread) -- and one more warp
+  (``md_warp == warps``, the launch adds it) waits ``md_full`` and
+  ``md_ready``, issues the batch, commits ``md_empty`` and refills the ring;
+  no CTA barrier and no ``md_cb`` commit in the loop (the exit's
+  ``md_empty`` wait drains it), so the pass of one iteration overlaps the
+  tensor core's work on the previous.  The MMA warp runs the rest of the
+  render predicated off -- ``md_epi`` is false for it, and every other
+  pass or packet drain over the config's threads runs under
+  ``pass_guard`` (``md_tidx < threads``: the warp owns no packet) -- and
+  takes part in every CTA barrier, which stay outside the guards.
 - Per-loop running counters (``md_rk{L}``: iterations so far, across
   re-entries) give the ring slot, its phase and the staging parity.
 - A fragment chain (a store or reduce value, a derived value, a dot's
@@ -70,6 +83,8 @@ from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
@@ -93,6 +108,7 @@ from .cute_mma_dag import _is_call
 from .cute_mma_dag import async_tile_reason
 from .cute_mma_dag import cluster_split_axis
 from .cute_mma_dag import staged_store_reason
+from .cute_mma_dag import streamed_loop_subject
 from .cute_mma_dag_codegen import _RUNTIME
 from .cute_mma_dag_codegen import _shape
 from .cute_mma_dag_tcgen05 import _PRIMS
@@ -101,6 +117,7 @@ from .cute_mma_dag_tcgen05 import _SWIZZLE_BY_ROW_BYTES
 from .cute_mma_dag_tcgen05 import ATOM_32B_SWIZZLE
 from .cute_mma_dag_tcgen05 import ATOM_MAX_BYTES
 from .cute_mma_dag_tcgen05 import FIXUP_WORKSPACE_PARAM
+from .cute_mma_dag_tcgen05 import PASS_BARRIER_ID
 from .cute_mma_dag_tcgen05 import REGION_EPILOGUE
 from .cute_mma_dag_tcgen05 import REGION_EXCHANGE
 from .cute_mma_dag_tcgen05 import REGION_LOOP
@@ -116,6 +133,7 @@ from .cute_mma_dag_tcgen05 import TMA_STORE_THREAD
 from .cute_mma_dag_tcgen05 import AuxTile
 from .cute_mma_dag_tcgen05 import RegisterCarryFacts
 from .cute_mma_dag_tcgen05 import SlotGeometry
+from .cute_mma_dag_tcgen05 import StreamedLoopFacts
 from .cute_mma_dag_tcgen05 import Tcgen05ExchangeFacts
 from .cute_mma_dag_tcgen05 import Tcgen05Facts
 from .cute_mma_dag_tcgen05 import Tcgen05Plan
@@ -1419,12 +1437,12 @@ def region_aux_skip(
     return frozenset(skip)
 
 
-def region_barrier_bytes(tc: Tcgen05Facts, stages: int) -> int:
+def region_barrier_bytes(tc: Tcgen05Facts, stages: int, mma_warp: bool = False) -> int:
     """The mbarriers (one per ring slot, one more per slot of a streamed
-    loop, one per staged region, the commit barrier) and the TMEM slot."""
-    return (
-        8 * (stages * (tc.ring_loops + tc.streamed_loops) + tc.staged_regions + 1) + 16
-    )
+    loop -- two more under the MMA warp, ``md_ready`` -- one per staged
+    region, the commit barrier) and the TMEM slot."""
+    streamed = tc.streamed_loops * (2 if mma_warp else 1)
+    return 8 * (stages * (tc.ring_loops + streamed) + tc.staged_regions + 1) + 16
 
 
 def region_smem_bytes(
@@ -1434,13 +1452,15 @@ def region_smem_bytes(
     loads: str = MMA_DAG_LOADS_TMA,
     derived: str = MMA_DAG_DERIVED_EXCHANGE,
     persistent: bool = False,
+    mma_warp: bool = False,
 ) -> int:
     """The shared memory of the resolved sizes under ``loads`` (``tma``
     keeps the aux tiles that fit, so the ``lane`` footprint is never
     larger and a config is legal under one mode iff under the other) and
     the ``cute_mma_dag_derived`` route ``derived`` (a pass chain's tile
     is a ring tile under ``pass``); ``persistent``: the persistent launch's
-    layout, whose root items never overlay the frames."""
+    layout, whose root items never overlay the frames; ``mma_warp``: the
+    streamed loops' ``md_ready`` barriers."""
     tc = facts.tcgen05
     assert tc is not None
     items = derived_items(tc.items, derived)
@@ -1455,7 +1475,7 @@ def region_smem_bytes(
         persistent,
     )
     layout = region_layout(items, facts.loops, resolved, stages, skip, persistent)
-    return layout.total + region_barrier_bytes(tc, stages)
+    return layout.total + region_barrier_bytes(tc, stages, mma_warp)
 
 
 def region_tmem_layout(
@@ -2016,6 +2036,7 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
         lookahead_loop=lookahead_loop,
         lookahead_slot=lookahead_slot,
         streamed_loops=len(streamed_loop_candidates(program)),
+        streamed=streamed_loop_facts(program),
         tmem_operands=len(tmem_a_candidates(program))
         + len(shared_operand_dots(program)),
         # The streamed epilogue's subject: root stores of a block without
@@ -2033,6 +2054,34 @@ def region_facts(program: MmaDagProgram) -> Tcgen05Facts | None:
     )
 
 
+def streamed_loop_facts(program: MmaDagProgram) -> tuple[StreamedLoopFacts, ...]:
+    """``StreamedLoopFacts`` of every streamed candidate loop, by index."""
+    result = []
+    for index in sorted(streamed_loop_candidates(program)):
+        loop = next(loop for loop in program.loops if loop.index == index)
+        dots = [step for step in loop.steps if isinstance(step, Dot)]
+        operands = [operand for dot in dots for operand in (dot.a, dot.b)]
+        result.append(
+            StreamedLoopFacts(
+                loop=index,
+                slots=tuple(sorted({dot.slot for dot in dots})),
+                passes=sum(
+                    1
+                    for operand in operands
+                    if operand.load is not None
+                    and (operand.pointwise or operand.load.dtype != operand.dtype)
+                ),
+                chains=sum(
+                    1
+                    for operand in operands
+                    if operand.kind == "frag"
+                    and program.chain_root(operand) is not None
+                ),
+            )
+        )
+    return tuple(result)
+
+
 def region_config_reason(
     facts: CuteMmaDagFacts,
     resolved: Sequence[int],
@@ -2042,18 +2091,36 @@ def region_config_reason(
     split: bool = False,
     lookahead: bool = False,
     persistent: bool = False,
+    mma_warp: bool = False,
 ) -> str | None:
     """The region-specific legality of the resolved sizes (the shared tile
     / fragment rules ran already) under the ``cute_mma_dag_derived`` route
     ``derived`` (``split``: the split epilogue's resident carries;
     ``lookahead``: the doubled dot slot; ``persistent``: the persistent
-    launch's layout and its exclusions, ``region_persistent_reason``)."""
+    launch's layout and its exclusions, ``region_persistent_reason``;
+    ``mma_warp``: ``cute_mma_dag_pass_warps='mma'``, whose streamed loops
+    take ``md_ready`` barriers and must accumulate in tensor memory)."""
     tc = facts.tcgen05
     assert tc is not None
     if persistent:
         reason = region_persistent_reason(facts, lookahead=lookahead)
         if reason is not None:
             return reason
+    if mma_warp:
+        # A streamed loop whose accumulators are register carries at this
+        # tile (``resident_slots``) runs on the chain schedule: the MMA
+        # warp needs one streamed loop with a pass and a tensor-memory
+        # batch.
+        resident = set(resident_slots(tc, resolved, split))
+        if all(
+            all(slot in resident for slot in loop.slots)
+            for loop in tc.streamed
+            if streamed_loop_subject(loop, derived)
+        ):
+            return (
+                f"{MMA_DAG_PASS_WARPS_KEY}={MMA_DAG_PASS_WARPS_MMA!r}: the streamed "
+                "loops' accumulators live in registers at this tile"
+            )
     # 32-bit MN-major tiles live under the 32-byte-unit swizzle, whose rows
     # are 128 bytes: 32 fp32 columns at least (the planner would decline the
     # config at codegen otherwise, after normalization admitted it).
@@ -2076,7 +2143,12 @@ def region_config_reason(
             f"the fragments need {columns} TMEM columns (limit {TCGEN05_MAX_TMEM_COLS})"
         )
     smem = region_smem_bytes(
-        facts, resolved, stages, derived=derived, persistent=persistent
+        facts,
+        resolved,
+        stages,
+        derived=derived,
+        persistent=persistent,
+        mma_warp=mma_warp,
     )
     if facts.smem_capacity and smem > facts.smem_capacity:
         return (
@@ -2128,6 +2200,7 @@ def plan_tcgen05_regions(
     lookahead: str = MMA_DAG_LOOKAHEAD_OFF,
     exchange_mode: str = MMA_DAG_EXCHANGE_AUTO,
     persistent: bool = False,
+    mma_warp: bool = False,
 ) -> Tcgen05Plan:
     env = CompileEnvironment.current()
     tc = facts.tcgen05
@@ -2714,6 +2787,7 @@ def plan_tcgen05_regions(
             else 0
         ),
         tmem_operands=tmem_routes,
+        mma_warp=mma_warp,
     )
 
 
@@ -2892,6 +2966,21 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # warp 0 alone waits for the slot's tile and issues the batch, no
         # per-iteration CTA barrier (the other warps have nothing to publish).
         self.streaming_fast = False
+        # ``cute_mma_dag_pass_warps='mma'``: the streamed loops with operand
+        # passes run warp-specialized (``emit_ws_loop``) -- the config's
+        # warps are the pass warps, warp ``tc.warps`` (the launch's extra
+        # one) the MMA / TMA warp.  The knob fails closed without a subject.
+        self.mma_warp = self.tc.mma_warp
+        self.ws_loops = frozenset(
+            index
+            for index in self.streamed
+            if self.mma_warp and self.has_passes(self.tc.ring_tiles.get(index, ()))
+        )
+        if self.mma_warp and not self.ws_loops:
+            raise _decline(
+                f"{MMA_DAG_PASS_WARPS_KEY}={MMA_DAG_PASS_WARPS_MMA!r}: no streamed "
+                "loop of this config takes an operand pass"
+            )
         # A root aux tile was read since the last CTA barrier: a loop's
         # frame may overlay it, so its tiles are issued behind one.
         self.root_aux_read = False
@@ -5060,15 +5149,18 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
         # staged tiles, staging and exchange tiles): they convert here, with
         # the prologue in flight.
         self.settle_keys({tile.key for tile in self.pending_root_raw()}, region)
-        with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
-            self.values[index] = var
-            if loop.innermost:
-                self.emit_ring_iteration(loop, begin, end, trip)
-            else:
-                self.emit_outer_iteration(loop)
-            if index in self.counted:
-                self.emit(f"{self.counter(index)} = {self.counter(index)} + 1")
-            del self.values[index]
+        if index in self.ws_loops:
+            self.emit_ws_loop(loop, begin, end, var)
+        else:
+            with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
+                self.values[index] = var
+                if loop.innermost:
+                    self.emit_ring_iteration(loop, begin, end, trip)
+                else:
+                    self.emit_outer_iteration(loop)
+                if index in self.counted:
+                    self.emit(f"{self.counter(index)} = {self.counter(index)} + 1")
+                del self.values[index]
         self.forget_iteration_bases(index)
         self.evaluator = _PassEvaluator(self)
         self.waited = False
@@ -5527,6 +5619,110 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 index, {**self.values, index: f"({var} + {ahead})"}, issue
             )
 
+    def emit_ws_loop(self, loop: Loop, begin: str, end: str, var: str) -> None:
+        """A streamed ring loop with operand passes under
+        ``cute_mma_dag_pass_warps='mma'``, as two loops over the same trip
+        count: the pass warps' (``md_warp < warps``: every thread of the
+        config) and the MMA warp's (``else``), each advancing its own copy
+        of the loop's running counter.  Nothing in either loop is a CTA
+        barrier; the slot barriers order the two sides (``md_full``: the
+        TMA landed, ``md_ready{L}``: the passes wrote the slot,
+        ``md_empty``: the batch read it).  The loop exit (the caller) waits
+        the last slot's ``md_empty`` as for every streamed loop."""
+        count = self.counter(loop.index)
+        header = f"for {var} in cutlass.range({begin}, {end}):"
+        with self.nest(f"if md_warp < {self.tc.warps}:"), self.nest(header):
+            self.values[loop.index] = var
+            self.emit_ws_pass_iteration(loop)
+            self.emit(f"{count} = {count} + 1")
+            del self.values[loop.index]
+        with self.nest("else:"), self.nest(header):
+            self.values[loop.index] = var
+            self.emit_ws_mma_iteration(loop, begin, end)
+            self.emit(f"{count} = {count} + 1")
+            del self.values[loop.index]
+
+    def emit_ws_pass_iteration(self, loop: Loop) -> None:
+        """The pass warps' iteration of a warp-specialized streamed loop:
+        wait for the slot's TMA, run the passes over the slot, publish them
+        to the async proxy and arrive on the slot's ``md_ready``.  No
+        ``md_empty`` wait: the slot's refill was issued behind the batch
+        that read it last (``emit_ws_mma_iteration`` waits ``md_empty``
+        ahead of every refill), so the tile's arrival says that batch is
+        done with the slot."""
+        index = loop.index
+        self.enter_iteration(loop)
+        self.ring_waited = set()
+        self.derived_words = {}
+        self.waited = False
+        self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
+        self.ring_waited.add(index)
+        # The passes' barriers span the pass warps alone (no guard: this is
+        # their branch); ``emit_passes`` ends with the generic -> async
+        # proxy fence.
+        sync = self.sync
+        self.sync = (
+            f"cute.arch.barrier(barrier_id={PASS_BARRIER_ID}, "
+            f"number_of_threads={self.plan.threads})"
+        )
+        self.pass_warps_branch = True
+        try:
+            self.emit_passes(
+                self.tc.ring_tiles[index],
+                f"md_st{index}",
+                None,
+                "md_tidx",
+                self.plan.threads,
+            )
+        finally:
+            self.sync = sync
+            self.pass_warps_branch = False
+        self.emit(f"{_PRIMS}.mbarrier_arrive(md_ready{index} + md_st{index})")
+
+    def emit_ws_mma_iteration(self, loop: Loop, begin: str, end: str) -> None:
+        """The MMA warp's iteration of a warp-specialized streamed loop:
+        wait for the slot's TMA and its passes, issue the batch, commit the
+        slot's ``md_empty`` (no ``md_cb`` commit: the loop exit's
+        ``md_empty`` wait drains the loop and ``md_cn`` is untouched), then
+        refill the slot the previous batch read once that batch alone is
+        done (``stages - 1`` iterations ahead)."""
+        tc = self.tc
+        index = loop.index
+        var = self.loop_index_var(index)
+        count = self.counter(index)
+        self.enter_iteration(loop)
+        self.ring_waited = set()
+        self.derived_words = {}
+        self.waited = False
+        blocks = self.region_blocks(loop.steps)
+        assert len(blocks) == 1 and not blocks[0][0], "a streamed loop is one batch"
+        dots = blocks[0][1]
+        self.emit(f"{_RT}.mbar_wait(md_full{index} + md_st{index}, md_rd{index})")
+        self.emit(f"{_RT}.mbar_wait(md_ready{index} + md_st{index}, md_rd{index})")
+        self.ring_waited.add(index)
+        self.emit(f"{_PRIMS}.tcgen05_fence({_PRIMS}.Tcgen05Fence.AFTER_THREAD_SYNC)")
+        for dot in dots:
+            self.emit_dot_mmas(
+                dot, self.stage_expr(dot.loop), accumulate=dot.acc is not None
+            )
+            self.defined.add(dot.node)
+        with self.nest(f"if {_PRIMS}.elect_sync():"):
+            self.emit(
+                f"{_PRIMS}.tcgen05_commit(md_empty{index} + md_st{index}, "
+                f"group={_PRIMS}.CTAGroup.CTA_1)"
+            )
+        ahead = max(tc.stages - 1, 1)
+        offset = var if begin == "0" else f"({var} - {begin})"
+        issue = f"{count} + {ahead}"
+        with (
+            self.nest(f"if {_PRIMS}.elect_sync():"),
+            self.nest(f"if {offset} + {ahead} < {end} - {begin}:"),
+        ):
+            self.emit_slot_free_wait(index, issue)
+            self.emit_ring_issue(
+                index, {**self.values, index: f"({var} + {ahead})"}, issue
+            )
+
     def enter_iteration(self, loop: Loop) -> None:  # type: ignore[override]
         var = self.loop_index_var(loop.index)
         for axis in loop.axes:
@@ -5861,6 +6057,10 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                 self.emit(
                     f"md_empty{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
                 )
+            if loop in self.ws_loops:
+                self.emit(
+                    f"md_ready{loop} = cute.arch.alloc_smem(cutlass.Int64, {tc.stages}, alignment=8)"
+                )
         staged_regions = sorted(region for region, tx in tc.staged_tx.items() if tx)
         for region in staged_regions:
             self.emit(
@@ -5889,6 +6089,14 @@ class _Tcgen05RegionEmitter(_Tcgen05Emitter):
                     for stage in range(tc.stages):
                         self.emit(
                             f"{_PRIMS}.mbarrier_init(md_empty{loop} + {stage}, 1)"
+                        )
+                if loop in self.ws_loops:
+                    # One arrival per pass thread; the MMA warp waits parity
+                    # 0 first (no init arrive: the first tile is not ready).
+                    for stage in range(tc.stages):
+                        self.emit(
+                            f"{_PRIMS}.mbarrier_init(md_ready{loop} + {stage}, "
+                            f"{self.plan.threads})"
                         )
             if cluster_reduces:
                 self.emit(f"{_PRIMS}.mbarrier_init(md_clb, 1)")

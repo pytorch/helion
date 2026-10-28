@@ -3134,6 +3134,41 @@ def test_side_loads_riding_the_ring_match_the_lane_loads_bitwise(
     _assert_close(ring, _run_triton(fn, args, block_sizes))
 
 
+@pytest.mark.parametrize(("warps", "stages"), ((4, 2), (4, 4), (8, 1)))
+def test_side_loads_riding_the_ring_with_hoisted_loads_match_the_lane_loads(
+    warps: int, stages: int
+) -> None:
+    # The scalar-decay dh with a loop-invariant per-channel row in the carry
+    # rescale: the row's loads are hoisted ahead of the loop while the body
+    # renders, after which the pre-loop wait and barrier for the side tile
+    # (read at the top of every iteration, ahead of the operand wait) are
+    # inserted.  Misplaced inside the prologue they wait for nothing and
+    # iteration 0 reads an unlanded tile: the ring form must stay
+    # bit-identical to the register prefetch.
+    t = _inputs(bh=2, n=16, d=64, dv=64, dtype=torch.bfloat16, seed=5)
+    g = torch.Generator(device=DEVICE).manual_seed(6)
+    w = _randn(g, 2, 64, scale=0.5, dtype=torch.float32)
+    args = (t["k"], t["v"], t["g_last_s"], t["dh_init"], t["gc"], w, 0.125)
+    fn = _probe_kernels()._dh_scalar_decay_channel_scale
+    _, register = _run_cute(
+        fn, args, _config([32, 64], warps, stages, cute_mma_dag_aux="register")
+    )
+    ring_source, ring = _run_cute(
+        fn, args, _config([32, 64], warps, stages, cute_mma_dag_aux="ring")
+    )
+    prologue = ring_source[: ring_source.index("for md_i in cutlass.range(")]
+    assert f"{RT}.ldg_f32(" in prologue
+    assert prologue.rstrip().endswith(
+        "cute.arch.cp_async_commit_group()\n"
+        f"    cute.arch.cp_async_wait_group({max(stages - 2, 0)})\n"
+        "    cute.arch.barrier()"
+    )
+    assert f"{RT}.ldg_f32(" not in ring_source[ring_source.index("for md_i in") :]
+    for lhs, rhs in zip(register, ring, strict=True):
+        assert torch.equal(lhs, rhs)
+    _assert_close(ring, _run_triton(fn, args, [32, 64]))
+
+
 def test_side_loads_of_a_loop_whose_ring_stages_nothing_take_the_registers() -> None:
     # k and v sliced [..., 4:68] out of 80-wide rows: 8-byte-aligned bases
     # the packets cannot stage, so both operand tiles take the synchronous
