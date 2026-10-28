@@ -20730,8 +20730,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
         # — only difference is the fan-out kernel shape, which
         # should close the productive-body gate and prevent
-        # the rejection from firing.
+        # the rejection from firing. The K tile is 64: the SMEM
+        # model prices the with-source (128, 64) C subtile an
+        # exact-shape auxiliary epilogue allocates, and two such
+        # rings beside a 256x256x128 ab=3 ring (192 KiB + 64 KiB)
+        # overflow the arena the strict normalizer judges.
         config = self._canonical_c_input_config(ab_stages=3)
+        config.config["block_sizes"] = [256, 256, 64]
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True

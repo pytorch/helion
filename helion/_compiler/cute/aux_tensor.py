@@ -403,6 +403,33 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     return False
 
 
+def host_function_tcgen05_exact_shape_aux_tensors(
+    host_function: HostFunction,
+) -> tuple[torch.Tensor, ...]:
+    """The exact-shape rank-2 auxiliary host tensors of the analyzed stores.
+
+    The operands the staged aux modes bulk-load
+    (``Tcgen05DeviceState.c_input_aux_tensor_descriptors``: a non-broadcast
+    rank-2 leaf of a tcgen05 store chain), each host tensor once; the
+    bind-time aux TMA proof (``cute_mma.host_function_exact_aux_tma_provable``)
+    runs over them.
+    """
+    graphs = host_function.device_ir.graphs
+    tensors: dict[int, torch.Tensor] = {}
+    for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        if analyzed_stores is None:
+            continue
+        for _store_node, chain in analyzed_stores:
+            for leaf in chain.auxiliary_tensor_loads:
+                if leaf.broadcast_axis is not None:
+                    continue
+                host_tensor = _step_host_tensor(leaf)[1]
+                if host_tensor.ndim == 2:
+                    tensors.setdefault(id(host_tensor), host_tensor)
+    return tuple(tensors.values())
+
+
 def host_function_tcgen05_rowvec_aux_facts(
     host_function: HostFunction,
 ) -> Tcgen05RowvecAuxFacts | None:
@@ -422,6 +449,7 @@ def host_function_tcgen05_rowvec_aux_facts(
     output_itemsize: int | None = None
     rows: list[Tcgen05RowvecAuxRow] = []
     output_count = 0
+    exact_aux_count = 0
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
         analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
@@ -434,6 +462,16 @@ def host_function_tcgen05_rowvec_aux_facts(
             ):
                 return None
             output_itemsize = output.dtype.itemsize
+            exact_aux_count = max(
+                exact_aux_count,
+                sum(
+                    1
+                    for leaf in chain.auxiliary_tensor_loads
+                    if leaf.broadcast_axis is None
+                    and _step_host_tensor(leaf)[1].ndim == 2
+                    and _step_host_tensor(leaf)[1].dtype == output.dtype
+                ),
+            )
             for leaf in chain.auxiliary_tensor_loads:
                 if leaf.broadcast_axis != 1:
                     continue
@@ -456,6 +494,7 @@ def host_function_tcgen05_rowvec_aux_facts(
         output_itemsize=output_itemsize,
         rows=tuple(rows),
         output_count=max(output_count, 1),
+        exact_aux_count=exact_aux_count,
     )
 
 

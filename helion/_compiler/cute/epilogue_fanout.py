@@ -496,7 +496,6 @@ def schedule_supported(config: dict[str, object]) -> bool:
         "tcgen05_epilogue_layout": "normal",
         "tcgen05_c_store_mode": "normal",
         "tcgen05_acc_wait_placement": "subtile_loop",
-        "tcgen05_aux_load_mode": "simt",
     }
     return (
         all(
@@ -504,6 +503,10 @@ def schedule_supported(config: dict[str, object]) -> bool:
             and config.get(key, default) == default
             for key, default in expected.items()
         )
+        # The register (SIMT) aux reads and the epilogue-issued aux TMA ring
+        # both live inside the standard store body; the producer-warp ring
+        # (``tma``) needs the scheduler strategy the fanout does not merge.
+        and config.get("tcgen05_aux_load_mode", "simt") in ("simt", "epi_tma")
         and type(config.get("tcgen05_cluster_m", 1)) is int
         and config.get("tcgen05_cluster_m", 1) in (1, 2)
         # The cluster's N multicast only shapes the mainloop and the tile
