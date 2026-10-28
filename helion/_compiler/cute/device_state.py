@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .cute_mma_dag import MmaDagPlan
+    from .cute_register_subblocks import RegisterSubblockPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
@@ -307,12 +308,23 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     bn: int = 0
     bk: int = 0
     thr_mma: str = ""
+    # Epilogue warps per warp group (the four TMEM datapath warps the CUTLASS
+    # partition helpers address through ``epi_tidx``).
     epi_warp_count: int = 0
+    # Epilogue warp groups (``tcgen05_epi_warp_groups``): ``epi_group`` /
+    # ``epi_leader`` are the per-warp group index and leader-warp predicate
+    # the role prefix defines when there are several groups ("" otherwise).
+    epi_warp_groups: int = 1
+    epi_group: str = ""
+    epi_leader: str = ""
     epi_acc_frag_base: str = ""
     epi_tidx: str = ""
     warp_idx: str = ""
     epi_tile: str = ""
+    # Stages of each output's TMA-store C ring: ``c_stages_per_group`` per
+    # epilogue warp group, ``c_stage_count`` in total.
     c_stage_count: int = 0
+    c_stages_per_group: int = 0
     epilog_sync_barrier_id: int = 0
     tmem_load_atom: str = ""
     epilogue_rest_mode: str = ""
@@ -361,6 +373,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
         )
         if self.explicit_d_store_box_n is not None:
             assert self.explicit_epi_tile_n == self.explicit_d_store_box_n
+        if self.c_stages_per_group == 0:
+            object.__setattr__(self, "c_stages_per_group", self.c_stage_count)
+        assert self.epi_warp_groups >= 1
+        assert self.c_stage_count == self.c_stages_per_group * self.epi_warp_groups
+        assert (
+            (self.epi_warp_groups > 1) == bool(self.epi_group) == bool(self.epi_leader)
+        )
 
     @property
     def has_explicit_epilogue_tile(self) -> bool:
@@ -756,6 +775,17 @@ class CuteDeviceFunctionState:
         # (``roffset_N``), the loop target the AST passes see: (size-hint trip
         # count used for profitability decisions, constexpr parameter name).
         self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
+        # Cross-thread reductions over a block that a device loop's VECTORIZED
+        # lane loop distributes (several packets per thread per trip).  The
+        # reduce is emitted once per lane and so reduces one lane's packet;
+        # ``cute/fold_lane_reductions.py`` folds the per-lane partials across
+        # the unrolled lanes and runs the cross-thread combine once per trip.
+        # The lane variable of each such loop, mapped to the keys of the
+        # reduce calls emitted inside it (``fold_site_key``: the call with its
+        # input replaced).  Two loops may emit identical calls (the grouped
+        # warp reduce takes a raw thread-index expression), so the lane
+        # variable is the primary key.
+        self.lane_fold_reduce_sites: dict[str, set[str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
@@ -830,6 +860,11 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # Name of the CLC throttle named barrier once the TMA-load role has
+        # emitted its per-tile credit (``cute_mma``); the scheduler-warp body
+        # (``program_id``) syncs on it before every CLC query only then, so a
+        # producer path without the credit never leaves the scheduler waiting.
+        self.clc_throttle_barrier: str | None = None
         # The materialized-operand dependency wait was emitted inside the
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
@@ -842,6 +877,10 @@ class CuteDeviceFunctionState:
         # statement after which ``program_id`` re-emits the TMA-load warp's
         # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
         self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
+        # Row-union kernels whose TMA-load role is hoisted: the cluster
+        # ``pipeline_init_wait`` the role executes once in its prelude, after
+        # its scheduler setup and ahead of its persistent loop.
+        self.tcgen05_tma_role_prelude_wait: str | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -861,6 +900,12 @@ class CuteDeviceFunctionState:
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
+        # ``min_blocks_per_mp`` the tcgen05 role launch requires (the
+        # epilogue warp groups' 10+-warp block runs without a ``setmaxnreg``
+        # split and needs ptxas to cap the per-thread allocation at
+        # ``65536 / threads``); emitted as ``_helion_cute_min_blocks_per_mp``
+        # by the device function.
+        self.tcgen05_min_blocks_per_mp: int | None = None
         self.suppress_root_lane_loops = False
         # Active block-id remapping for matmul operand re-materialization.
         # Maps a source block_id (e.g. the rhs operand's loop-invariant
@@ -912,6 +957,12 @@ class CuteDeviceFunctionState:
         # cross-warp reductions for (None when it rewrote nothing); the
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
+        # The static ``block=`` the launcher call was emitted with
+        # (``CuteBackend.launcher_keyword_args``, which runs ahead of the
+        # kernel definition's codegen); None before that call, and for a
+        # launch with an argument-sized axis.  ``_implicit_pdl_release``
+        # estimates the resident CTAs per SM from it.
+        self.launch_block: tuple[int, int, int] | None = None
         self.owned_root_block_dims: tuple[int, int, int] | None = None
         # ``(needed, capacity)`` when the computed-fragment owner declined the
         # current root because its shared memory exceeds the CTA capacity; a
@@ -970,6 +1021,12 @@ class CuteDeviceFunctionState:
         # its tile; the dedicated codegen emits the whole device body and
         # the launch runs ``32 * warps`` threads per CTA.
         self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
+        # Set by ``plan_register_subblocks`` (``cute_register_subblocks=
+        # "on"``, cute_register_subblocks.py): the flattened static
+        # sub-block program of the root and its knobs; the dedicated
+        # codegen renders the whole device body as one register program
+        # per warp and the launch runs ``32 * warps`` threads per CTA.
+        self.register_subblocks_plan: RegisterSubblockPlan | None = None
         # Set by ``plan_mma_dag`` (``cute_mma_dag="warp"``, cute_mma_dag.py):
         # the matched serial MMA state recurrence and its tile / warp /
         # stage selection; the dedicated codegen owns the matched root and
@@ -980,6 +1037,12 @@ class CuteDeviceFunctionState:
         # tile element, a widening side load): the pointwise lowering's
         # ``to_dtype(x, float32)`` takes it instead of a cast round trip.
         self.mma_dag_exact_f32: dict[str, str] = {}
+        # SASS-level checks the launcher runs on the compiled kernel before
+        # its first launch (``helion.runtime.cute.sass_check``), declared by
+        # the emitters whose instruction forms the DSL's assembler has
+        # miscompiled (the mma_dag emitter's hinted ``cp.async`` packets);
+        # emitted as the kernel's ``_helion_cute_sass_checks`` attribute.
+        self.sass_checks: tuple[str, ...] = ()
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

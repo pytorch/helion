@@ -30,6 +30,7 @@ from helion._compiler.cute.register_tensor import emit_register_tensor
 from helion._compiler.cute.register_tensor import plan_register_tensor
 from helion._compiler.cute.row_fragment import RowFragment
 from helion._compiler.cute.row_fragment import RowFragmentLayout
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -302,6 +303,7 @@ def test_sdk_keeps_only_live_communication(dtype, tmp_path):
     assert torch.cuda.is_initialized() == initialized
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_sdk_float32_extrema_keep_nan_semantics_and_eliminate_dead_elements(tmp_path):
     cutlass = pytest.importorskip("cutlass")
     from cutlass._mlir import ir

@@ -184,7 +184,11 @@ def test_half_slices_vectorize_through_the_sunk_persistent_lane(
     # the cos/sin prologue, one inside the q head loop, one for the k heads;
     # the cos/sin values cross into them as 8-element register fragments.
     assert len(_loops(code, "synthetic_lane_2")) == 3
-    assert code.count("cute.make_rmem_tensor(8, cutlass.Float32)") == 4
+    # The cos/sin values cross into the head loops as bf16 fragments: their
+    # products with q/k are exact 16-bit multiplies (``narrow_exact_products``).
+    assert code.count("cute.make_rmem_tensor(8, cutlass.BFloat16)") == 4
+    assert code.count("mul.rn.bf16 $0, $1, $2;") == 8
+    assert "mul.rn.f32" not in code
     (head_loop,) = _loops(code, "synthetic_lane_3")
     assert ast.unparse(head_loop.iter) == "range(2)"
     assert len(_loops(ast.unparse(head_loop), "synthetic_lane_2")) == 1
@@ -347,11 +351,13 @@ def test_row_reduction_over_two_tile_axes_gets_the_reduction_tile_seeds(
     row_slot = spec.num_threads.block_id_to_index(2)
     vec_slot = spec.cute_vector_widths.block_id_to_index(2)
     reload_slot = spec.cute_reduction_reloads.block_id_to_index(2)
-    # One row per CTA in every seed; the persistent one-vector rows with 16-
-    # and 32-byte packets (128 x V8, 64 x V16) and the two-packet rolled row
-    # (64 x V8 over the 1024-wide chunk) beside the narrow-chunk seed, the
-    # rows re-reading registers.
-    assert all(seed.config["block_sizes"] == [1, 1] for seed in seeds)
+    # One row per CTA in every seed but the warp-per-row rows-per-CTA pair
+    # ([1, 2] and [1, 4] rows on 32 threads each); the persistent one-vector
+    # rows with 16- and 32-byte packets (128 x V8, 64 x V16) and the
+    # two-packet rolled row (64 x V8 over the 1024-wide chunk) beside the
+    # narrow-chunk seed, the rows re-reading registers.
+    assert all(seed.config["block_sizes"] in ([1, 1], [1, 2], [1, 4]) for seed in seeds)
+    assert [seed.config["block_sizes"] for seed in seeds].count([1, 1]) >= 4
     rows = {
         (
             seed.config["num_threads"][row_slot],

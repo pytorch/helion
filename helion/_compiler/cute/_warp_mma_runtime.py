@@ -439,11 +439,23 @@ def ldg_bf16_as_f32(
 def _unpack_x2(
     kind: str, word: object, *, loc: object, ip: object
 ) -> tuple[object, ...]:
+    if kind == "bf16":
+        # A bf16 is the high half of its fp32: the low element shifts up,
+        # the high element masks (two integer ops; ``cvt.f32.bf16`` of the
+        # halves lowers to a PRMT plus a shift for the high half).  Exact.
+        asm = (
+            "{ .reg .b32 lo, hi; shl.b32 lo, $2, 16; and.b32 hi, $2, 0xffff0000; "
+            "mov.b32 $0, lo; mov.b32 $1, hi; }"
+        )
+    else:
+        asm = (
+            "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
+            f"cvt.f32.{kind} $0, lo; cvt.f32.{kind} $1, hi; }}"
+        )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
         [cutlass.Uint32(word).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
-        f"cvt.f32.{kind} $0, lo; cvt.f32.{kind} $1, hi; }}",
+        asm,
         "=f,=f,r",
         has_side_effects=False,
         loc=loc,
@@ -467,6 +479,31 @@ def unpack_bf16x2(
 ) -> tuple[object, ...]:
     """``(low, high)`` fp32 values of a packed bf16x2 word (exact)."""
     return _unpack_x2("bf16", word, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def round_bf16_f32(
+    value: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``value`` rounded to bf16 (round to nearest even) and widened back to
+    fp32: the bits of ``float32(bfloat16(value))``.  ``cvt.rn.bf16x2.f32``
+    of the value with itself puts the rounded half-word in the high half
+    (``F2FP.BF16.F32.PACK_AB``, an FMA-pipe instruction) and the mask is the
+    exact widening; the scalar ``cvt.rn.bf16.f32`` the DSL's cast emits
+    runs on the conversion unit (``F2F``, the MIO queue) and its widening
+    is a shift behind it."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 w; cvt.rn.bf16x2.f32 w, $1, $1; "
+        "and.b32 w, w, 0xffff0000; mov.b32 $0, w; }",
+        "=f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
 
 
 @dsl_user_op
@@ -547,3 +584,309 @@ def stg_bf16(
 ) -> None:
     """One fp32 value rounded (RN) to bf16 and stored (2-byte aligned)."""
     _stg_f32_as_b16("bf16", gmem_address, value, loc=loc, ip=ip)
+
+
+# ---------------------------------------------------------------------------
+# Register-resident sub-block programs (``cute_register_subblocks``, see
+# ``cute_register_subblocks.py``).  Two flavours of global load: the
+# ``_ro`` helpers have no side effects and no memory clobber (a tensor no
+# store of the launch writes: the compiler may schedule them freely, which
+# is what the explicit prefetch order relies on), the ordered ones keep
+# program order (outputs read back before a read-modify-write).  The
+# predicated loads zero-fill under a false predicate (the varlen window
+# rows past a sequence's end).
+
+
+def _ldg_vector(
+    gmem_address: object,
+    count: int,
+    kind: str,
+    *,
+    ordered: bool,
+    loc: object,
+    ip: object,
+) -> tuple[object, ...]:
+    regs = ", ".join(f"${i}" for i in range(count))
+    constraint = ("=f," if kind == "f32" else "=r,") * count + "l"
+    vec = f".v{count}" if count > 1 else ""
+    braces = f"{{{regs}}}" if count > 1 else regs
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [T.f32() if kind == "f32" else T.i32()] * count
+        )
+        if count > 1
+        else (T.f32() if kind == "f32" else T.i32()),
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        f"ld.global{vec}.{kind} {braces}, [${count}];",
+        constraint + (",~{memory}" if ordered else ""),
+        has_side_effects=ordered,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    if count == 1:
+        return (cutlass.Float32(result) if kind == "f32" else cutlass.Uint32(result),)
+    return (
+        _floats(result, count, loc=loc, ip=ip)
+        if kind == "f32"
+        else _words(result, count, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def ldg_v4_f32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.f32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 4, "f32", ordered=False, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v2_f32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v2.f32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 2, "f32", ordered=False, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_f32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``ld.global.f32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 1, "f32", ordered=False, loc=loc, ip=ip)[0]  # pyrefly: ignore[bad-return]
+
+
+@dsl_user_op
+def ldg_v4_b32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.b32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 4, "b32", ordered=False, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v2_b32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v2.b32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 2, "b32", ordered=False, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_b32_ro(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> cutlass.Uint32:
+    """``ld.global.b32`` of a tensor the launch never writes (pure)."""
+    return _ldg_vector(gmem_address, 1, "b32", ordered=False, loc=loc, ip=ip)[0]  # pyrefly: ignore[bad-return]
+
+
+@dsl_user_op
+def ldg_v4_f32(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.f32`` kept in program order (an output read back)."""
+    return _ldg_vector(gmem_address, 4, "f32", ordered=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v4_b32_ord(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.b32`` kept in program order."""
+    return _ldg_vector(gmem_address, 4, "b32", ordered=True, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v2_b32(
+    gmem_address: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v2.b32`` kept in program order."""
+    return _ldg_vector(gmem_address, 2, "b32", ordered=True, loc=loc, ip=ip)
+
+
+def _ldg_vector_pred(
+    gmem_address: object,
+    pred: object,
+    count: int,
+    kind: str,
+    *,
+    loc: object,
+    ip: object,
+) -> tuple[object, ...]:
+    regs = ", ".join(f"${i}" for i in range(count))
+    zero = "0f00000000" if kind == "f32" else "0"
+    zeros = " ".join(f"mov.{kind} ${i}, {zero};" for i in range(count))
+    vec = f".v{count}" if count > 1 else ""
+    braces = f"{{{regs}}}" if count > 1 else regs
+    constraint = ("=f," if kind == "f32" else "=r,") * count + "l,r,~{memory}"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [T.f32() if kind == "f32" else T.i32()] * count
+        )
+        if count > 1
+        else (T.f32() if kind == "f32" else T.i32()),
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{ .reg .pred p; setp.ne.s32 p, ${count + 1}, 0; {zeros} "
+        f"@p ld.global{vec}.{kind} {braces}, [${count}]; }}",
+        constraint,
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    if count == 1:
+        return (cutlass.Float32(result) if kind == "f32" else cutlass.Uint32(result),)
+    return (
+        _floats(result, count, loc=loc, ip=ip)
+        if kind == "f32"
+        else _words(result, count, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def ldg_v4_f32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.f32`` under ``pred`` (four zeros when it is 0)."""
+    return _ldg_vector_pred(gmem_address, pred, 4, "f32", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v4_b32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v4.b32`` under ``pred`` (four zero words when it is 0)."""
+    return _ldg_vector_pred(gmem_address, pred, 4, "b32", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ldg_v2_b32_pred(
+    gmem_address: object, pred: object, *, loc: object = None, ip: object = None
+) -> tuple[object, ...]:
+    """``ld.global.v2.b32`` under ``pred`` (two zero words when it is 0)."""
+    return _ldg_vector_pred(gmem_address, pred, 2, "b32", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def stg_v4_f32(
+    gmem_address: object,
+    x0: object,
+    x1: object,
+    x2: object,
+    x3: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``st.global.v4.f32``: four consecutive fp32 values (16-byte aligned)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            *[cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (x0, x1, x2, x3)],
+        ],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+@dsl_user_op
+def stg_v2_b32(
+    gmem_address: object,
+    w0: object,
+    w1: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``st.global.v2.b32``: two 4-byte words (8-byte aligned; four 16-bit values)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip),
+            *[cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1)],
+        ],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r,~{memory}",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+
+
+def _sel_cmp(
+    op: str, a: object, b: object, x: object, y: object, *, loc: object, ip: object
+) -> cutlass.Float32:
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            cutlass.Int32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(b).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(x).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(y).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{ .reg .pred p; setp.{op}.s32 p, $1, $2; selp.f32 $0, $3, $4, p; }}",
+        "=f,r,r,f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+        **_ASM_KW,
+    )
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def sel_ge_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a >= b else y`` (``setp`` + ``selp``): the inclusive triangular mask."""
+    return _sel_cmp("ge", a, b, x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sel_gt_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a > b else y``: the strict triangular mask."""
+    return _sel_cmp("gt", a, b, x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sel_le_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a <= b else y``."""
+    return _sel_cmp("le", a, b, x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sel_lt_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a < b else y``."""
+    return _sel_cmp("lt", a, b, x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sel_eq_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a == b else y``."""
+    return _sel_cmp("eq", a, b, x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sel_ne_f32(
+    a: object, b: object, x: object, y: object, *, loc: object = None, ip: object = None
+) -> cutlass.Float32:
+    """``x if a != b else y``."""
+    return _sel_cmp("ne", a, b, x, y, loc=loc, ip=ip)

@@ -185,6 +185,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
 )
@@ -5532,6 +5533,40 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_matmul_clc.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
+            eager = helion.Config(
+                **{**config.config, TCGEN05_CLC_QUERY_PACING_CONFIG_KEY: "eager"}
+            )
+            eager_code = bound.to_triton_code(eager)
+
+        # Default CLC query pacing ("tile"): the leader CTA's TMA-load warp
+        # arrives at the throttle barrier once per tile it starts, right
+        # before the tile's initial AB prefetch, and the scheduler warp syncs
+        # on it before each query; eager pacing emits none of it.
+        self.assertEqual(
+            code.count(
+                "tcgen05_clc_throttle_barrier = cutlass.pipeline.NamedBarrier("
+                "barrier_id=5, num_threads=64)"
+            ),
+            1,
+        )
+        self.assertEqual(code.count("tcgen05_clc_throttle_barrier.arrive()"), 1)
+        credit = re.search(
+            r"if cute\.arch\.make_warp_uniform\(cute\.arch\.block_idx_in_cluster\(\)\) "
+            r"== cutlass\.Int32\(0\):\n +tcgen05_clc_throttle_barrier\.arrive\(\)",
+            code,
+        )
+        self.assertIsNotNone(credit)
+        assert credit is not None
+        self.assertLess(credit.start(), code.index("tma_initial_full_tile ="))
+        self.assertEqual(
+            code.count("tcgen05_clc_throttle_barrier.arrive_and_wait()"), 1
+        )
+        self.assertLess(
+            code.index("tcgen05_clc_throttle_barrier.arrive_and_wait()"),
+            code.index("_cute_issue_clc_query_nomulticast(tcgen05_clc_mbar_smem_ptr"),
+        )
+        self.assertNotIn("tcgen05_clc_throttle_barrier", eager_code)
+        self.assertEqual(eager_code.count("_cute_issue_clc_query_nomulticast"), 2)
 
         # CLC issuance helper: appears exactly twice in the generated
         # module (one import line at the top + one call inside the
@@ -8997,6 +9032,115 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("_cute_gelu_erf_exact_f32x2(", code)
         self.assertNotIn("cute.math.tanh", code)
 
+    def test_tcgen05_fused_gelu_exact_default_keeps_exact_erf(self) -> None:
+        """Without ``fast_math`` the GELU helper call carries no fastmath flag."""
+        code = self._gelu_erf_epilogue_code(fast_math=False)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertNotIn("fastmath", call)
+
+    def test_tcgen05_fused_gelu_fast_math_uses_approximate_erf(self) -> None:
+        """``fast_math`` routes the fused GELU through the DSL's approximate erf,
+        as the pointwise lowering of ``erf`` does under the same setting."""
+        code = self._gelu_erf_epilogue_code(fast_math=True)
+        (call,) = [
+            line for line in code.splitlines() if "_cute_gelu_erf_exact_f32x2(" in line
+        ]
+        self.assertIn("fastmath=True)", call)
+
+    def test_tcgen05_fused_erf_fast_math_template(self) -> None:
+        """A plain ``torch.erf`` epilogue step takes ``fastmath=True`` under ``fast_math``."""
+        for fast_math, expected in (
+            (False, "cute.math.erf("),
+            (True, "fastmath=True)"),
+        ):
+            code = self._unary_epilogue_code("erf", fast_math=fast_math)
+            (call,) = [line for line in code.splitlines() if "cute.math.erf(" in line]
+            self.assertIn(expected, call)
+            if not fast_math:
+                self.assertNotIn("fastmath", call)
+
+    def _gelu_erf_epilogue_code(self, *, fast_math: bool) -> str:
+        return self._unary_epilogue_code("gelu", fast_math=fast_math)
+
+    def _unary_epilogue_code(self, op: str, *, fast_math: bool) -> str:
+        """Rendered source of a tcgen05 GEMM whose epilogue applies ``op``
+        (``"gelu"`` or ``"erf"``; two kernels because a kernel body cannot
+        close over the op)."""
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_gelu_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute", fast_math=fast_math)
+        def cute_matmul_erf_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.erf(acc).to(x.dtype)
+            return out
+
+        kernel = {"gelu": cute_matmul_gelu_epilogue, "erf": cute_matmul_erf_epilogue}[
+            op
+        ]
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with patch_cute_mma_support():
+            bound = kernel.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 32],
+                pid_type="persistent_interleaved",
+            )
+            bound.set_config(cfg)
+            return bound.to_triton_code(cfg)
+
+    def test_tcgen05_fused_gelu_fast_math_runtime_correctness(self) -> None:
+        """The approximate-erf GELU epilogue stays within half-precision tolerance."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", fast_math=True)
+        def cute_matmul_gelu_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_gelu_fast.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(cfg)
+        self.assertIn("fastmath=True)", bound.to_triton_code(cfg))
+        out = bound(x, y)
+        expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_gelu_exact_cute_pointwise_tensor_ssa_numeric_runtime_correctness(
         self,
     ) -> None:
@@ -9354,8 +9498,15 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound.set_config(config)
         code = bound.to_triton_code(config)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
-        self.assertIn("* cutlass.Float32(scale_b.iterator.load())", code)
+        # The rank-0 scales are bound once per output tile (ahead of the
+        # accumulator wait) and the chain multiplies by the bound locals.
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn(
+            "tcgen05_scalar_1 = cutlass.Float32(scale_b.iterator.load())", code
+        )
+        self.assertIn("* tcgen05_scalar\n", code)
+        self.assertIn("* tcgen05_scalar_1\n", code)
+        self.assertNotIn("* cutlass.Float32(scale_a.iterator.load())", code)
         out = bound(x, y, scale_a, scale_b)
         expected = ((x @ y).to(torch.float32) * scale_a * scale_b).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=4e-1, rtol=1e-2)
@@ -9404,7 +9555,8 @@ class TestCuteLowerings(unittest.TestCase):
         bound.set_config(config)
         code = bound.to_triton_code(config)
         self.assertIn("cutlass.Float8E4M3FN", code)
-        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("tcgen05_scalar = cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("* tcgen05_scalar\n", code)
         out = bound(x, y, scale_a, scale_b)
         expected = (x.float() @ y.float() * scale_a * scale_b).to(torch.bfloat16)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
@@ -10776,6 +10928,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -10846,6 +11001,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -11232,6 +11390,8 @@ class TestCuteLowerings(unittest.TestCase):
         - The V-leader gate emits ``% cutlass.Int32(2) == cutlass.Int32(0)``
           for AB consumer-release / MMA issue (instead of the cluster_n=1
           ``== cutlass.Int32(0)`` form).
+        - The persistent grid is capped in whole co-resident 4-CTA
+          clusters (``_MAX_ACTIVE_CLUSTERS``), not the pair's SM slots.
         - The plan persists ``cluster_n=2``.
 
         This is a *codegen* test only — the runtime correctness test is
@@ -11274,6 +11434,7 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_ab_stages=2,
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
+                tcgen05_persistent_grid_cap="resident_clusters",
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -11315,17 +11476,25 @@ class TestCuteLowerings(unittest.TestCase):
         # anchor on the launcher signature so a regression of the
         # cluster_n axis in ``codegen_grid`` fails loudly.
         self.assertRegex(code, r"_launcher\([^,]+,\s*\(2,\s*2,\s*")
-        # Launch-grid persistent-capacity divisor is ``_NUM_SM // 2``
-        # (cluster_m), NOT ``_NUM_SM // 4`` (cluster_size = cluster_m
-        # * cluster_n). The latter caps cluster_n=2 at one wave of
-        # 37 cluster slots × 4 CTAs and starves the GPU of wave-overlap
-        # parallelism; the cluster_m divisor matches the cluster_n=1
-        # baseline so each cluster slot still consumes one SM. Anchor
-        # on the ``max(1, _NUM_SM // 2)`` envelope (the launcher emits
-        # ``min(total_clusters, max(1, _NUM_SM // cluster_m))`` for
-        # this seed) so a regression of either branch (``// 4``
-        # re-introduced or ``// 2`` lost) fails this assertion.
-        self.assertIn("max(1, _NUM_SM // 2)", code)
+        # Under ``tcgen05_persistent_grid_cap="resident_clusters"`` (the
+        # cluster_n=2 seeds' choice) the persistent grid is capped in whole
+        # co-resident clusters: the device's four-CTA cluster count (33 on a
+        # B200, below ``_NUM_SM // 4`` because a cluster lives inside one
+        # GPC), not the pair's ``max(1, _NUM_SM // 2)`` slots, which launched
+        # a second hardware wave of 2x2 clusters that re-ran the prologue.
+        # The cluster count is cdiv(2 * M tiles, 2) * cdiv(N tiles, 2).
+        self.assertIn(
+            "_MAX_ACTIVE_CLUSTERS = helion.runtime.get_max_active_clusters("
+            "x.device, 4)",
+            code,
+        )
+        self.assertIn(
+            "(2, 2, min(((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
+            " // 2 * (((1024 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
+            " * 1, _MAX_ACTIVE_CLUSTERS))",
+            code,
+        )
+        self.assertNotIn("_NUM_SM // 2", code)
         self.assertNotIn("_NUM_SM // 4", code)
         # cluster_n=2 plumbing is exercised end-to-end by the codegen
         # markers above (no plan-field round-trip is asserted here —
@@ -11906,6 +12075,13 @@ class TestCuteLowerings(unittest.TestCase):
         cluster hands its second CTA an out-of-range tile_n marked valid —
         an unmasked out-of-bounds store on the full-tile TMA path (this was
         silently reachable through ``l2_groupings=[1]`` before the gate).
+        Every 2x2 family now fails closed at the config layer, ahead of the
+        render's own ``divisible by cluster_n`` guard, so the search never
+        spends a compile on the sample: strict normalization names the
+        reason and the search repair drops the cluster (cluster_n -> 1).
+        Whether the CTA pair survives the repair is the quarter-wave gate's
+        call (``matmul_ops``: the 256x256 two-CTA grid must fill a quarter
+        of the SMs), pinned here on both sides of the gate at 148 SMs.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -11927,11 +12103,6 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        # N=768 at bn=256 gives 3 N tiles: cluster_n=2 pads a partial cluster.
-        args = (
-            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16),
-        )
         cfg = _make_tcgen05_persistent_config(
             block_sizes=[256, 256, 128],
             l2_groupings=[1],
@@ -11942,13 +12113,53 @@ class TestCuteLowerings(unittest.TestCase):
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaisesRegex(
-                exc.BackendUnsupported, "divisible by cluster_n"
+
+        def repair(m: int, n: int, n_tiles: int) -> tuple[dict[str, object], str]:
+            # K=128 and M a multiple of 256: an odd N tile count at bn=256.
+            args = (
+                torch.randn(m, 128, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16),
+            )
+            with (
+                patch_cute_mma_support(),
+                patch("helion.runtime.get_num_sm", return_value=148),
             ):
-                bound.to_triton_code(cfg)
+                bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    rf"tcgen05_cluster_n=2 pairs N tiles, but cdiv\({n}, 256\) = "
+                    rf"{n_tiles} tiles is odd",
+                ):
+                    bound.to_triton_code(cfg)
+                repaired = dict(cfg.config)
+                bound.env.config_spec.normalize(repaired, _fix_invalid=True)
+                # The repair reaches a strict fixed point.
+                strict = dict(repaired)
+                bound.env.config_spec.normalize(strict)
+                self.assertEqual(strict, repaired)
+                return repaired, bound.to_triton_code(helion.Config(**repaired))
+
+        # N=768 at bn=256 gives 3 N tiles over 4 M tiles: 12 pair tiles sit
+        # under the 37 co-resident clusters of 148 SMs, so only the one-wave
+        # 256x{128,64} tiles are admitted on two CTAs; the 256x256 sample
+        # drops the cluster and lands on one CTA with the 128-row tile.  (A
+        # CPU bind sees no SMs and skips the gate, keeping the pair.)
+        repaired, code = repair(1024, 768, 3)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 1)
+        self.assertEqual(repaired["block_sizes"], [128, 256, 128])
+        self.assertNotIn("_helion_cute_cluster_shape", code)
+        self.assertIn("cute.make_layout((1, 1, 1))", code)
+        # N=1280 gives 5 N tiles over 8 M tiles: 40 pair tiles clear the
+        # gate, so the repair keeps the tile and the CTA pair and drops the
+        # cluster; the repaired config renders the 2x1 pair.
+        repaired, code = repair(2048, 1280, 5)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 2)
+        self.assertEqual(repaired["block_sizes"], [256, 256, 128])
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertNotIn("(2, 2, 1)", code)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
@@ -20578,8 +20789,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
         # — only difference is the fan-out kernel shape, which
         # should close the productive-body gate and prevent
-        # the rejection from firing.
+        # the rejection from firing. The K tile is 64: the SMEM
+        # model prices the with-source (128, 64) C subtile an
+        # exact-shape auxiliary epilogue allocates, and two such
+        # rings beside a 256x256x128 ab=3 ring (192 KiB + 64 KiB)
+        # overflow the arena the strict normalizer judges.
         config = self._canonical_c_input_config(ab_stages=3)
+        config.config["block_sizes"] = [256, 256, 64]
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -24646,8 +24862,8 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
 
     def test_synthetic_lane_k_addmm_of_grid_indexed_loads(self) -> None:
         """K split across synthetic lanes with grid-indexed operand loads: the
-        synthetic-lane fold cannot re-read the rank-reducing loads, the serial
-        load-view lowering folds the full K instead."""
+        synthetic-lane fold re-reads the rank-reducing loads through the grid
+        index's own expression (``_cute_fold_scalar_index``)."""
 
         @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
         def grid_addmm(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor):
@@ -24661,7 +24877,7 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
         c = torch.randn(2, 32, 64, device=DEVICE)
         code, out = code_and_output(grid_addmm, (x, y, c))
         self.assertIn("synthetic_lane", code)
-        self.assertIn("serial_k", code)
+        self.assertIn("_cute_fold_dot", code)
         torch.testing.assert_close(out, c + x @ y, rtol=1e-4, atol=1e-4)
 
     def test_serial_k_mm_stops_at_a_non_power_of_two_k(self) -> None:
@@ -25094,7 +25310,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         # D is split threads x synthetic lanes, so the bmm folds K itself by
         # re-reading both (permuted) operands; tile_kv is the fourth
         # thread-parallel dim and runs as a lane loop, not thread axis 3.
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         self.assertNotIn("thread_idx()[3]", code)
         # The transposes only feed the bmm (the hoisted one through the loop
         # argument), so neither is shuffled through shared memory inside the
@@ -25111,7 +25327,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         code, out = code_and_output(
             _cute_bmm_sliced_k_fold, (q, k), block_sizes=[32, 32]
         )
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         torch.testing.assert_close(
             out,
             torch.einsum("qhd,khd->hqk", q[:, :, 8:40], k[:, :, 8:40]),
@@ -25132,7 +25348,7 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         q.copy_(torch.randn(L, H, D, device=DEVICE))
         k = torch.randn(L, H, D, device=DEVICE, dtype=torch.bfloat16)
         code, out = code_and_output(_cute_bmm_fold_int64, (q, k), block_sizes=[32, 32])
-        self.assertIn("mm_fold_k", code)
+        self.assertIn("_cute_fold_dot", code)
         # The bf16 bmm rounds its result to bf16 before the float cast.
         torch.testing.assert_close(
             out,

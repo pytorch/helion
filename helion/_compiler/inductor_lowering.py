@@ -122,6 +122,18 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                             lowering._check_reduction_broadcast_keepdim(node)
 
 
+def prepare_added_node_lowering(graph: torch.fx.Graph, node: Node) -> None:
+    """``prepare_graph_lowerings`` for one node added to ``graph`` after the
+    graph's lowerings were prepared (its inputs already carry ``meta["val"]``)."""
+    with compile_lock:
+        graph_lowering = GraphLowering(
+            _LazyGraphModule({}, graph),
+            shape_env=CompileEnvironment.current().shape_env,
+        )
+        with V.set_graph_handler(graph_lowering), node.meta["location"]:
+            prepare_node_lowering(graph_lowering, node)
+
+
 @functools.cache
 def _functional_twins() -> dict[OpOverload, OpOverload]:
     """In-place aten overloads Inductor lowers, mapped to the functional

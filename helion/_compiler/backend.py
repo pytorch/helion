@@ -89,6 +89,11 @@ class FlashSearchSurface(NamedTuple):
     score_modifier_kinds: tuple[str, ...]
     tmem_rowmax_compatible: bool = False
     causal_resident_compatible: bool = False
+    # Dense attention whose epilogue is ``O`` plus the LSE row and nothing
+    # else (``flash_attention_graph_dense_lse_output_from_graphs``; any
+    # softmax scale): the lowerings that store the LSE from the final row
+    # statistics are offered on it as on the output-only dense surface.
+    dense_lse_output: bool = False
     # V/O head dim when it differs from the Q/K ``head_dim`` (MLA prefill).
     head_dim_v: int | None = None
     # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain attention).
@@ -123,10 +128,24 @@ class FlashSearchSurface(NamedTuple):
 class AttentionSoftmaxPattern(NamedTuple):
     score_plan: AttentionScorePlan
     io_dtype: torch.dtype
+    # The score tile's rank: 3 for the ``bmm`` form over ``q[tile_b, tile_m, :]``
+    # (the root the fused bodies are generated for), 2 for the ``hl.dot`` form
+    # over ``q[bh, tile_m, :]`` with a scalar batch-head index.
+    score_rank: int = 3
+    # The block the K/V loads' scalar batch index belongs to (the 2-D form:
+    # ``tile.begin`` of a unit tile or an ``hl.grid`` index); None when the
+    # batch index is the inner batch tile itself (the 3-D form). A surface
+    # admits the body only when it is the root batch block the Q tile is
+    # read at (``_attention_pattern_fits_root``).
+    batch_block_id: int | None = None
 
     @property
     def head_dim(self) -> int:
         return self.score_plan.head_dim
+
+    @property
+    def v_k_major(self) -> bool:
+        return self.score_plan.v_k_major
 
     @property
     def head_dim_v(self) -> int:
@@ -318,6 +337,18 @@ class Backend(abc.ABC):
         from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 
         return TRITON_MAX_TENSOR_NUMEL
+
+    @property
+    def pads_small_matmul_dims(self) -> bool:
+        """Whether a matmul output tile may be larger than a small M / N
+        dimension: the lowering masks the rows / columns past the extent, so
+        the autotuner may search output block sizes beyond the dimension
+        (``SMALL_DIM_BLOCK_SIZE_OVERSHOOT``), where a hardware-aligned MMA
+        tile runs faster than the dimension-sized one.  Backends whose
+        lowerings read and write exactly the dimension keep the search
+        ceiling at the extent.
+        """
+        return False
 
     @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
@@ -699,6 +730,20 @@ class Backend(abc.ABC):
         timing should override.
         """
         return None
+
+    @classmethod
+    def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
+        """Rank of ``config`` among the autotuner's finalists it cannot tell
+        apart (``BaseSearch._prefer_backend_preference_within_tolerance``):
+        lower wins, equal ranks keep the faster config.  For what a config
+        costs or saves outside the kernel's own isolated timing; the default
+        prefers nothing.  ``source`` renders the finalist's generated module
+        on demand (the rendered kernel, not the config's keys, says which
+        lowering a config took).  A class method: the search reaches it
+        through the backend's registered name (``Settings.backend``), without
+        an instance.
+        """
+        return 0
 
     def get_paired_device_micros_bench(
         self,
@@ -1769,6 +1814,71 @@ def _attention_is_inner_batch_index(node: torch.fx.Node) -> bool:
     )
 
 
+def _attention_scalar_batch_block_id(node: object) -> int | None:
+    """Block id of a scalar batch index, or None.
+
+    The 2-D attention form (``q[bh, tile_m, :]`` with 2-D ``hl.dot`` scores)
+    indexes the collapsed batch-head axis with a scalar: ``tile.begin`` of a
+    tile (``tile_begin(block_size_<id>)``) or an ``hl.grid`` index (an
+    unbacked symbol whose origin is the grid axis, ``GridOrigin``). The block
+    must be pinned to one element (``_attention_unit_fixed_block``): only
+    then does the scalar address the whole tile, so the fused body's one
+    batch head per program is the kernel's.
+    """
+    from ..language import tile_ops
+    from ..language._tracing_ops import _get_symnode
+    from .host_function import HostFunction
+    from .variable_origin import GridOrigin
+
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return None
+    block_id: int | None = None
+    if node.target is tile_ops.tile_begin:
+        source = node.args[0] if node.args else None
+        if (
+            not isinstance(source, torch.fx.Node)
+            or source.op != "call_function"
+            or source.target is not _get_symnode
+            or not source.args
+            or not isinstance(source.args[0], str)
+            or not source.args[0].startswith("block_size_")
+        ):
+            return None
+        block_id = int(source.args[0][len("block_size_") :])
+    elif node.target is _get_symnode:
+        value = node.meta.get("val")
+        if not isinstance(value, torch.SymInt):
+            return None
+        origin_info = HostFunction.current().expr_to_origin.get(value._sympy_())
+        if origin_info is None or type(origin_info.origin) is not GridOrigin:
+            return None
+        block_id = origin_info.origin.block_id
+    if block_id is None or not _attention_unit_fixed_block(block_id):
+        return None
+    return block_id
+
+
+def _attention_unit_fixed_block(block_id: int) -> bool:
+    """True when ``block_id`` is pinned to one element: ``hl.tile(...,
+    block_size=1)`` or an ``hl.grid`` axis of unit step. An autotuned block's
+    ``tile.begin`` is its first row only, so a scalar index of it does not
+    address the tile.
+    """
+    from .compile_environment import CompileEnvironment
+    from .compile_environment import FixedBlockSizeSource
+
+    source = CompileEnvironment.current().block_sizes[block_id].block_size_source
+    return (
+        isinstance(source, FixedBlockSizeSource)
+        and isinstance(source.value, int)
+        and source.value == 1
+    )
+
+
+def _attention_is_scalar_batch_index(node: object) -> bool:
+    return _attention_scalar_batch_block_id(node) is not None
+
+
 def _attention_arg_is_scaled_q(
     node: torch.fx.Node,
     expected_scale: float,
@@ -2203,7 +2313,7 @@ def _attention_collapsed_batch_index_mode(
 ) -> _AttentionBatchIndex | None:
     if not isinstance(node, torch.fx.Node):
         return None
-    if _attention_is_inner_batch_index(node):
+    if _attention_is_inner_batch_index(node) or _attention_is_scalar_batch_index(node):
         return _AttentionBatchIndex("identity")
     source = _attention_tile_index_source(node)
     if source is not None and _attention_is_inner_batch_index(source):
@@ -2797,12 +2907,20 @@ class _AttentionKVLoadIndices(NamedTuple):
 
     ``kv_group`` is the grouped-query divisor: the batch index is
     ``batch_index // kv_group`` (``1`` for the plain ``tile_b`` form, where
-    ``batch_index`` is the index node itself).
+    ``batch_index`` is the index node itself). ``k_major`` marks the
+    pre-transposed ``[batch, :, tile_n]`` form (V only; see
+    ``AttentionScorePlan.v_k_major``).
     """
 
     batch_index: torch.fx.Node
     kv_tile: torch.fx.Node
     kv_group: int
+    k_major: bool = False
+    # The block of a scalar ``batch_index`` (``_attention_scalar_batch_block_id``,
+    # the 2-D form); None when it is the inner batch tile itself (the 3-D
+    # form, tied to the Q tile by its leading dim). A surface compares it with
+    # the root batch block: nothing else ties a scalar to the Q tile's row.
+    batch_block_id: int | None = None
 
 
 def _attention_kv_batch_index_group(
@@ -2833,6 +2951,7 @@ def _attention_canonical_kv_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
+    allow_k_major: bool = False,
 ) -> _AttentionKVLoadIndices | None:
     from ..language import memory_ops
 
@@ -2843,41 +2962,72 @@ def _attention_canonical_kv_load_indices(
     indices = node.args[1]
     if not isinstance(indices, (list, tuple)) or len(indices) != 3:
         return None
-    if not isinstance(indices[0], torch.fx.Node) or not isinstance(
-        indices[1], torch.fx.Node
-    ):
+    if not isinstance(indices[0], torch.fx.Node):
         return None
-    if not _attention_is_full_slice(indices[2]):
+    # ``[batch, tile_n, :]`` (rows of keys / values, the head dim contiguous)
+    # or, when admitted, the pre-transposed ``[batch, :, tile_n]`` form (the KV
+    # axis contiguous: the K-major layout 8-bit tcgen05 operands need).
+    if isinstance(indices[1], torch.fx.Node) and _attention_is_full_slice(indices[2]):
+        kv_tile = indices[1]
+        k_major = False
+    elif (
+        allow_k_major
+        and _attention_is_full_slice(indices[1])
+        and isinstance(indices[2], torch.fx.Node)
+    ):
+        kv_tile = indices[2]
+        k_major = True
+    else:
         return None
     batch_index = _attention_kv_batch_index_group(indices[0])
     if batch_index is None:
         return None
     if kv_block_id is not None and not _attention_is_block_symnode(
-        indices[1], int(kv_block_id)
+        kv_tile, int(kv_block_id)
     ):
         return None
     dividend, kv_group = batch_index
-    return _AttentionKVLoadIndices(dividend, indices[1], kv_group)
+    return _AttentionKVLoadIndices(
+        dividend,
+        kv_tile,
+        kv_group,
+        k_major,
+        batch_block_id=_attention_scalar_batch_block_id(dividend),
+    )
+
+
+def _attention_transposed_source(
+    node: torch.fx.Node, rank: int
+) -> torch.fx.Node | None:
+    """Source of a swap of the last two dims of a ``rank``-D tensor, or None:
+    ``permute([0, 2, 1])`` / ``transpose(1, 2)`` at rank 3 (the ``bmm`` form),
+    ``permute([1, 0])`` / ``transpose(0, 1)`` / ``t()`` at rank 2 (the 2-D
+    ``hl.dot`` form)."""
+    if node.op != "call_function" or not node.args:
+        return None
+    if node.target is torch.ops.aten.permute.default:
+        if len(node.args) < 2 or node.args[1] != [*range(rank - 2), rank - 1, rank - 2]:
+            return None
+    elif node.target is torch.ops.aten.transpose.int:
+        if len(node.args) < 3 or {node.args[1], node.args[2]} != {rank - 2, rank - 1}:
+            return None
+    elif node.target is torch.ops.aten.t.default:
+        if rank != 2:
+            return None
+    else:
+        return None
+    source = node.args[0]
+    return source if isinstance(source, torch.fx.Node) else None
 
 
 def _attention_k_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
+    rank: int = 3,
 ) -> _AttentionKVLoadIndices | None:
-    if node.op != "call_function":
-        return None
-    if node.target is torch.ops.aten.permute.default:
-        if len(node.args) < 2 or node.args[1] != [0, 2, 1]:
-            return None
-        source = node.args[0]
-    elif node.target is torch.ops.aten.transpose.int:
-        if len(node.args) < 3 or node.args[1] != 1 or node.args[2] != 2:
-            return None
-        source = node.args[0]
-    else:
-        return None
-    if not isinstance(source, torch.fx.Node):
+    source = _attention_transposed_source(node, rank)
+    if source is None:
         return None
     return _attention_canonical_kv_load_indices(source, kv_block_id=kv_block_id)
 
@@ -2924,8 +3074,125 @@ def _attention_v_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
+    rank: int = 3,
 ) -> _AttentionKVLoadIndices | None:
-    return _attention_canonical_kv_load_indices(node, kv_block_id=kv_block_id)
+    """The V operand of the PV matmul: the canonical ``v[b, tile_n, :]`` load,
+    or the transpose of a pre-transposed ``v[b, :, tile_n]`` load (recorded as
+    ``k_major``)."""
+    canonical = _attention_canonical_kv_load_indices(node, kv_block_id=kv_block_id)
+    if canonical is not None:
+        return canonical
+    source = _attention_transposed_source(node, rank)
+    if source is None:
+        return None
+    indices = _attention_canonical_kv_load_indices(
+        source, kv_block_id=kv_block_id, allow_k_major=True
+    )
+    if indices is None or not indices.k_major:
+        return None
+    return indices
+
+
+def _attention_v_load_head_dim(node: torch.fx.Node, rank: int) -> int | None:
+    """V's static head dim from the host tensor behind the PV matmul's V
+    operand (the canonical load's last dim, the K-major load's middle one)."""
+    from ..language import memory_ops
+    from ..language._tracing_ops import _host_tensor
+
+    source = node
+    k_major = False
+    if source.op != "call_function" or source.target is not memory_ops.load:
+        transposed = _attention_transposed_source(node, rank)
+        if transposed is None:
+            return None
+        source = transposed
+        k_major = True
+    if source.op != "call_function" or source.target is not memory_ops.load:
+        return None
+    tensor = source.args[0] if source.args else None
+    if (
+        not isinstance(tensor, torch.fx.Node)
+        or tensor.op != "call_function"
+        or tensor.target is not _host_tensor
+    ):
+        return None
+    value = tensor.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.ndim != 3:
+        return None
+    head_dim = value.shape[1] if k_major else value.shape[2]
+    return head_dim if isinstance(head_dim, int) else None
+
+
+def _attention_matmul_form(node: torch.fx.Node) -> str | None:
+    """``"qk"`` / ``"pv"`` for the two matmul forms the matcher reads: the
+    3-D ``aten.bmm.dtype`` / ``aten.baddbmm.default`` pair and the 2-D
+    ``hl.dot(a, b)`` / ``hl.dot(p, v, acc=acc)`` pair; None otherwise."""
+    from ..language import matmul_ops
+
+    if node.op != "call_function":
+        return None
+    if node.target is torch.ops.aten.bmm.dtype:
+        return "qk"
+    if node.target is torch.ops.aten.baddbmm.default:
+        return "pv"
+    if node.target is matmul_ops.dot and len(node.args) >= 3:
+        return "pv" if isinstance(node.args[2], torch.fx.Node) else "qk"
+    return None
+
+
+def _attention_pv_operands(
+    pv_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None:
+    """``(acc, p, v)`` of a PV matmul: ``baddbmm(acc, p, v)`` or
+    ``dot(p, v, acc)``."""
+    from ..language import matmul_ops
+
+    if pv_node.target is torch.ops.aten.baddbmm.default:
+        if len(pv_node.args) < 3:
+            return None
+        acc, p, v = pv_node.args[:3]
+    elif pv_node.target is matmul_ops.dot:
+        if len(pv_node.args) < 3:
+            return None
+        p, v, acc = pv_node.args[:3]
+    else:
+        return None
+    if not (
+        isinstance(acc, torch.fx.Node)
+        and isinstance(p, torch.fx.Node)
+        and isinstance(v, torch.fx.Node)
+    ):
+        return None
+    return acc, p, v
+
+
+def _attention_post_dot_scale(
+    qk_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, float] | None:
+    """``(qk * scale, scale)`` when the matmul's only user is a scalar
+    multiply: the post-dot form of the softmax scale (the fused body scales
+    the fp32 scores either way)."""
+    users = list(qk_node.users)
+    if len(users) != 1:
+        return None
+    (scaled,) = users
+    if (
+        scaled.op != "call_function"
+        or scaled.target is not torch.ops.aten.mul.Tensor
+        or len(scaled.args) < 2
+    ):
+        return None
+    scale_arg: float | None = None
+    for arg in scaled.args[:2]:
+        if arg is qk_node:
+            continue
+        if isinstance(arg, (int, float)) and not isinstance(arg, bool):
+            scale_arg = float(arg)
+        else:
+            return None
+    if scale_arg is None:
+        return None
+    return scaled, scale_arg
 
 
 def _attention_exact_online_softmax_chain(
@@ -2934,18 +3201,21 @@ def _attention_exact_online_softmax_chain(
     from ..language import view_ops
     from ..language._tracing_ops import _mask_to
 
+    # The score tile's rank: 3 for the ``bmm`` form, 2 for the ``hl.dot`` form.
+    # Row vectors broadcast back over it as ``[:, ..., None]``.
+    score_val = score_node.meta.get("val")
+    score_rank = score_val.ndim if isinstance(score_val, torch.Tensor) else 3
+
     def broadcast_row_vector_source(node: torch.fx.Node) -> torch.fx.Node | None:
         if node.op != "call_function" or node.target is not view_ops.subscript:
             return None
         if not node.args or not isinstance(node.args[0], torch.fx.Node):
             return None
         indices = node.args[1] if len(node.args) > 1 else None
-        if not isinstance(indices, (list, tuple)) or len(indices) != 3:
+        if not isinstance(indices, (list, tuple)) or len(indices) != score_rank:
             return None
-        if (
-            not _attention_is_full_slice(indices[0])
-            or not _attention_is_full_slice(indices[1])
-            or indices[2] is not None
+        if indices[-1] is not None or not all(
+            _attention_is_full_slice(index) for index in indices[:-1]
         ):
             return None
         return node.args[0]
@@ -3198,11 +3468,13 @@ def _attention_exact_online_softmax_chain(
         return False
     acc_rescaled = acc_rescale_candidates[0]
 
-    if len(pv_node.args) < 3 or not isinstance(pv_node.args[1], torch.fx.Node):
+    pv_operands = _attention_pv_operands(pv_node)
+    if pv_operands is None:
         return False
-    if pv_node.args[0] is not acc_rescaled:
+    acc_arg, p_arg, _ = pv_operands
+    if acc_arg is not acc_rescaled:
         return False
-    if _attention_pv_p_arg_base(pv_node.args[1]) is not p_node:
+    if _attention_pv_p_arg_base(p_arg) is not p_node:
         return False
     return loop_body_returns(max_state_node, l_update, pv_node)
 
@@ -3233,13 +3505,25 @@ def _attention_softmax_pattern_head_dim(
 ) -> AttentionSoftmaxPattern | None:
     """Config-independent online-softmax attention detector.
 
-    Returns the head_dim (in {64, 128}) and whether the canonical causal mask is
-    present when ``graph`` is a flash body -- a QK ``bmm`` + PV ``baddbmm``
+    Returns the score plan (head dim, scale, modifiers, operand layout) and the
+    operand dtype when ``graph`` is a flash body: a QK matmul + PV matmul
     feeding an ``amax``/``exp2``/``sum`` online softmax with either no score
-    masking or exactly ``where(tile_m.index >= tile_n.index, qk, -inf)``. Shared
-    by ``_attention_loop_shape`` (the codegen detector) and the autotuner flash
+    masking or exactly ``where(tile_m.index >= tile_n.index, qk, -inf)``. Two
+    source forms are read: the 3-D ``bmm`` + ``baddbmm`` pair over
+    ``q[tile_b, tile_m, :]`` tiles, and the 2-D ``hl.dot`` pair over
+    ``q[bh, tile_m, :]`` tiles with a scalar batch-head index. The softmax
+    scale is either on Q (``(q * scale) @ k^T``) or on the scores
+    (``(q @ k^T) * scale``); V is either the canonical ``v[b, tile_n, :]``
+    tile or the pre-transposed ``v[b, :, tile_n]`` one (recorded as
+    ``AttentionScorePlan.v_k_major``). Operands are fp16, bf16 or fp8 (e4m3);
+    which of these facts a fused body hosts, and whether the 2-D form's
+    scalar batch block is the root's, is the surface's question
+    (``_attention_pattern_fits_root``), not the matcher's. Shared by
+    ``_attention_loop_shape`` (the codegen detector) and the autotuner flash
     seed heuristic so the two never diverge on what counts as a flash kernel.
     """
+    from .cute.cute_flash import FLASH_MATCHED_IO_DTYPES
+
     qk_nodes: list[torch.fx.Node] = []
     pv_nodes: list[torch.fx.Node] = []
     has_amax = has_exp = has_sum = False
@@ -3247,9 +3531,10 @@ def _attention_softmax_pattern_head_dim(
         if node.op != "call_function":
             continue
         target = node.target
-        if target is torch.ops.aten.bmm.dtype:
+        matmul_form = _attention_matmul_form(node)
+        if matmul_form == "qk":
             qk_nodes.append(node)
-        elif target is torch.ops.aten.baddbmm.default:
+        elif matmul_form == "pv":
             pv_nodes.append(node)
         elif target is torch.ops.aten.amax.default:
             has_amax = True
@@ -3261,53 +3546,65 @@ def _attention_softmax_pattern_head_dim(
         return None
     qk_node = qk_nodes[0]
     pv_node = pv_nodes[0]
+    # One source form: both matmuls 3-D aten ops, or both 2-D ``hl.dot``.
+    if (qk_node.target is torch.ops.aten.bmm.dtype) != (
+        pv_node.target is torch.ops.aten.baddbmm.default
+    ):
+        return None
+    score_rank = 3 if qk_node.target is torch.ops.aten.bmm.dtype else 2
     if not (has_amax and has_exp and has_sum):
         return None
     qk_val = qk_node.meta.get("val")
     pv_val = pv_node.meta.get("val")
     if not isinstance(qk_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
         return None
-    # QK score block: (batch, tile_m, tile_n); PV output: (batch, tile_m, head_dim).
-    if qk_val.ndim != 3 or pv_val.ndim != 3:
+    # QK score block: ([batch,] tile_m, tile_n); PV output: ([batch,] tile_m, head_dim).
+    if qk_val.ndim != score_rank or pv_val.ndim != score_rank:
         return None
     if qk_val.dtype != torch.float32 or pv_val.dtype != torch.float32:
         return None
-    # The emitted kernel supports 16-bit floating Q/K/V operands. Checked via FX
+    pv_operands = _attention_pv_operands(pv_node)
+    if pv_operands is None:
+        return None
+    _, p_operand, v_operand = pv_operands
+    # The Q/K/V operands share one dtype (fp16, bf16 or fp8). Checked via FX
     # node metadata (available at detection time, unlike the device-function
     # arguments).
-    operand_nodes = [qk_node.args[0], qk_node.args[1]]
-    if len(pv_node.args) > 2:
-        operand_nodes.append(pv_node.args[2])
+    operand_nodes = [qk_node.args[0], qk_node.args[1], v_operand]
     operand_dtype: torch.dtype | None = None
     for arg in operand_nodes:
         if not isinstance(arg, torch.fx.Node):
             return None
         operand_val = arg.meta.get("val")
-        if not isinstance(operand_val, torch.Tensor) or operand_val.dtype not in (
-            torch.float16,
-            torch.bfloat16,
+        if (
+            not isinstance(operand_val, torch.Tensor)
+            or operand_val.dtype not in FLASH_MATCHED_IO_DTYPES
         ):
             return None
         if operand_dtype is None:
             operand_dtype = operand_val.dtype
         elif operand_val.dtype != operand_dtype:
             return None
-    head_dim_v = pv_val.shape[2]
+    if score_rank == 2:
+        # ``hl.dot`` takes P at whatever dtype the kernel converts it to; the
+        # fused body stages P in the operand dtype, so require that form.
+        p_val = p_operand.meta.get("val")
+        if not isinstance(p_val, torch.Tensor) or p_val.dtype != operand_dtype:
+            return None
+    head_dim_v = pv_val.shape[-1]
     if not isinstance(head_dim_v, int):
         # The loop graph's PV output carries the V/O width as an unbacked
         # symbol for the widths the shape environment does not keep concrete
         # (64 and 128 stay ints, 96 does not); V's host tensor keeps the
         # specialized width, as K's does for the Q/K width below.
-        head_dim_v = (
-            _attention_load_head_dim(pv_node.args[2])
-            if len(pv_node.args) > 2 and isinstance(pv_node.args[2], torch.fx.Node)
-            else None
-        )
+        head_dim_v = _attention_v_load_head_dim(v_operand, score_rank)
         if head_dim_v is None:
             return None
     if not isinstance(qk_node.args[1], torch.fx.Node):
         return None
-    k_indices = _attention_k_load_indices(qk_node.args[1], kv_block_id=kv_block_id)
+    k_indices = _attention_k_load_indices(
+        qk_node.args[1], kv_block_id=kv_block_id, rank=score_rank
+    )
     if k_indices is None:
         return None
     # The Q/K head dim comes from K's host tensor: the loop graph's operand
@@ -3319,9 +3616,9 @@ def _attention_softmax_pattern_head_dim(
         head_dim = head_dim_v
     if not flash_head_dims_supported(head_dim, head_dim_v):
         return None
-    if len(pv_node.args) < 3 or not isinstance(pv_node.args[2], torch.fx.Node):
-        return None
-    v_indices = _attention_v_load_indices(pv_node.args[2], kv_block_id=kv_block_id)
+    v_indices = _attention_v_load_indices(
+        v_operand, kv_block_id=kv_block_id, rank=score_rank
+    )
     if v_indices is None:
         return None
     # K and V must read the same KV tile and the same (grouped) batch head:
@@ -3332,16 +3629,30 @@ def _attention_softmax_pattern_head_dim(
         or k_indices.kv_group != v_indices.kv_group
     ):
         return None
+    # The 2-D form reads K/V at a scalar of one unit block (the surface
+    # checks it is the root batch block, ``_attention_pattern_fits_root``);
+    # the 3-D form at the inner batch tile the Q tile's leading dim is.
+    if score_rank == 2 and k_indices.batch_block_id is None:
+        return None
     q_placeholder = _attention_loop_carried_arg(graph, 0)
     if q_placeholder is None:
         return None
-    if not isinstance(qk_node.args[0], torch.fx.Node):
+    q_arg = qk_node.args[0]
+    if not isinstance(q_arg, torch.fx.Node):
         return None
-    q_scale = _attention_arg_scaled_q_factor(qk_node.args[0], q_placeholder)
+    score_root = qk_node
+    q_scale = _attention_arg_scaled_q_factor(q_arg, q_placeholder)
     if q_scale is None:
-        return None
+        # The post-dot form: an unscaled Q and ``qk * scale`` as the score
+        # root. The fused body scales the fp32 scores in both forms.
+        if not _attention_is_loop_carried_value(q_arg, q_placeholder):
+            return None
+        peeled = _attention_post_dot_scale(qk_node)
+        if peeled is None:
+            return None
+        score_root, q_scale = peeled
     modifiers_result = _attention_score_modifiers(
-        qk_node,
+        score_root,
         q_placeholder,
         kv_block_id=kv_block_id,
     )
@@ -3399,11 +3710,17 @@ def _attention_softmax_pattern_head_dim(
         modifiers=scaled_modifiers,
         kv_group=k_indices.kv_group,
         head_dim_v=None if head_dim_v == head_dim else head_dim_v,
+        v_k_major=v_indices.k_major,
     )
     if not score_plan.has_lowering():
         return None
     assert operand_dtype is not None
-    return AttentionSoftmaxPattern(score_plan=score_plan, io_dtype=operand_dtype)
+    return AttentionSoftmaxPattern(
+        score_plan=score_plan,
+        io_dtype=operand_dtype,
+        score_rank=score_rank,
+        batch_block_id=k_indices.batch_block_id,
+    )
 
 
 def _flash_block_sizes_reachable(
@@ -3434,6 +3751,69 @@ def _flash_block_sizes_reachable(
         if not fragment.low <= target <= high:
             return False
     return True
+
+
+def _attention_flash_block_size_targets(
+    root_block_ids: Sequence[int], kv_block_id: int, *, tile: int
+) -> dict[int, int]:
+    """The block sizes a fused body runs: one batch head per program and
+    ``tile``-row query and KV tiles. A root batch block pinned to one element
+    (the 2-D form's ``hl.tile(..., block_size=1)`` or ``hl.grid`` axis) has no
+    searchable fragment and is left out, as the flex surface leaves out its
+    unit b/h axes; the 3-D form's autotuned batch tile is targeted at 1.
+    """
+    targets: dict[int, int] = {}
+    if not _attention_unit_fixed_block(int(root_block_ids[0])):
+        targets[int(root_block_ids[0])] = 1
+    targets[int(root_block_ids[1])] = tile
+    targets[int(kv_block_id)] = tile
+    return targets
+
+
+def _attention_kv_tile_count(kv_block_id: int) -> int | None:
+    """The 128-row KV tile count of the KV loop's block (None unless static).
+
+    Counted at the default ``cute_flash_kv_tile_n`` whatever width a config
+    picks: the fp8 parity gate (``flash_operand_facts_lowered``) runs on this
+    count, and the other searched width (160 rows) is offered only to extents
+    it divides, so with an even 128-row count (``seq % 256 == 0``) that
+    extent is a multiple of 1280 and its 160-row count is even too.
+    """
+    from .compile_environment import CompileEnvironment
+
+    kv_seq = CompileEnvironment.current().block_sizes[kv_block_id].size
+    if not isinstance(kv_seq, int):
+        return None
+    return (kv_seq + 127) // 128
+
+
+def _attention_pattern_fits_root(
+    pattern: AttentionSoftmaxPattern,
+    root_block_ids: Sequence[int],
+    *,
+    kv_block_id: int | None = None,
+) -> bool:
+    """Whether a matched attention body may lower to a fused flash body under
+    the 2-axis root ``root_block_ids``: its operand facts have a body
+    (``cute_flash.flash_operand_facts_lowered``, which for fp8 operands also
+    needs the KV loop's tile count, read from ``kv_block_id``) and, in the
+    2-D form, the K/V loads' scalar batch block is the root batch block the
+    Q tile is read at (the 3-D form ties them through the Q tile's leading
+    dim). Shared by the search surface and the codegen detector so the two
+    never diverge.
+    """
+    from .cute.cute_flash import flash_operand_facts_lowered
+
+    if not flash_operand_facts_lowered(
+        pattern.io_dtype,
+        v_k_major=pattern.v_k_major,
+        score_rank=pattern.score_rank,
+        num_kv=None if kv_block_id is None else _attention_kv_tile_count(kv_block_id),
+    ):
+        return False
+    return pattern.batch_block_id is None or pattern.batch_block_id == int(
+        root_block_ids[0]
+    )
 
 
 def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
@@ -3481,7 +3861,16 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         )
         if pattern is None:
             continue
+        # Operand facts no fused body hosts (fp8 operands on an odd KV tile
+        # count or with the canonical V) or a K/V batch index off the root:
+        # the generic lowering keeps the kernel, the codegen detector
+        # (``_attention_loop_shape``) declines the same way.
+        if not _attention_pattern_fits_root(
+            pattern, root_grid_ids, kv_block_id=block_ids[0]
+        ):
+            continue
         from .cute.cute_flash import _flash_output_requires_tma
+        from .cute.cute_flash import flash_attention_graph_dense_lse_output_from_graphs
         from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
         from .cute.cute_flash import flash_attention_graph_row_epilogue_from_graphs
         from .cute.cute_flash import (
@@ -3517,6 +3906,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             )
         )
         standard_dense_output = flash_attention_graph_standard_dense_output_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
+        )
+        dense_lse_output = flash_attention_graph_dense_lse_output_from_graphs(
             device_ir.graphs,
             root_block_ids=root_grid_ids,
             kv_block_id=block_ids[0],
@@ -3582,21 +3977,17 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             num_kv % 2 != 0 or pattern.score_plan.requires_ws_overlap
         ):
             generic_fallback_required = True
-            fallback_targets = {
-                root_grid_ids[0]: 1,
-                root_grid_ids[1]: 64,
-                block_ids[0]: 64,
-            }
+            fallback_targets = _attention_flash_block_size_targets(
+                root_grid_ids, block_ids[0], tile=64
+            )
             if generic_fallback_targets is None and block_sizes_reachable(
                 fallback_targets
             ):
                 generic_fallback_targets = fallback_targets
             continue
-        block_size_targets = {
-            root_grid_ids[0]: 1,
-            root_grid_ids[1]: 128,
-            block_ids[0]: 128,
-        }
+        block_size_targets = _attention_flash_block_size_targets(
+            root_grid_ids, block_ids[0], tile=128
+        )
         if not block_sizes_reachable(block_size_targets):
             continue
         if flash_surface is None:
@@ -3616,6 +4007,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
                 small_biased_candidate=small_biased_candidate,
                 standard_dense_output=standard_dense_output,
+                dense_lse_output=dense_lse_output,
                 standard_causal_output=standard_causal_output,
                 output_requires_tma=output_requires_tma,
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
@@ -3695,6 +4087,8 @@ def flex_search_surface(
         env, block_size_targets, overshoot_dimension=True
     ):
         return None
+    if plan.flex_dense:
+        return _flex_dense_search_surface(match, block_size_targets)
     return FlashSearchSurface(
         head_dim=match.head_dim,
         num_kv=match.num_kv,
@@ -3707,6 +4101,7 @@ def flex_search_surface(
         requires_ws_overlap=False,
         small_biased_candidate=False,
         standard_dense_output=False,
+        dense_lse_output=False,
         standard_causal_output=False,
         output_requires_tma=_flash_output_requires_tma(
             num_bh, match.q_seq, match.head_dim_v
@@ -3742,6 +4137,68 @@ def flex_search_surface(
         flex_hook_ops=_flash_flex_hook_ops(
             plan, num_bh, match.heads or num_bh, match.num_kv
         ),
+    )
+
+
+def _flex_dense_search_surface(
+    match: FlexMatch, block_size_targets: dict[int, int]
+) -> FlashSearchSurface:
+    """The surface of a dense flex plan (``AttentionScorePlan.flex_dense``):
+    the dense attention surface over the flex kernel's two tunable tiles.
+
+    The plan is dense attention (the trivial walk, no regions, the dense
+    geometry), so it takes the dense facts the collapsed attention kernels
+    report -- every family and knob of the dense surface, the row programs
+    on small grids, the hardware row max -- and none of the flex envelope's
+    (no list walk, no trivial-walk pins, no hook facts).  The facts the dense
+    bodies cannot prove for the flex operands stay off, like the codegen
+    detector's: the 4-D TMA family (the flex emitter reads its 4-D operands
+    directly), the fused row epilogue and the small biased candidate; the
+    standard output-only lowerings need no LSE and the standard scale
+    (``_standard_dense_score_plan_supported``), the same test the codegen
+    applies; the flex kernel returns the LSE and applies its scale as a
+    scalar argument, so it is the dense LSE surface (``dense_lse_output``,
+    scale-agnostic) the resident value graph is offered on.
+    """
+    from .cute.cute_flash import _flash_output_requires_tma
+    from .cute.cute_flash import _standard_dense_score_plan_supported
+    from .cute.cute_flash import flash_tmem_rowmax_score_plan_supported
+
+    plan = match.plan
+    num_bh = match.num_bh
+    return FlashSearchSurface(
+        head_dim=match.head_dim,
+        num_kv=match.num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=match.heads,
+        io_dtype=match.io_dtype,
+        block_size_targets=block_size_targets,
+        is_causal=False,
+        has_kv_tile_pruning=False,
+        requires_ws_overlap=False,
+        small_biased_candidate=False,
+        standard_dense_output=(
+            match.lse_name is None and _standard_dense_score_plan_supported(plan)
+        ),
+        # The flex kernel applies its scale as a scalar argument, so the
+        # output-only fact's standard-scale test fails here by construction;
+        # the LSE fact asks only for the dense plan and the ``O`` + LSE epilogue.
+        dense_lse_output=match.lse_name is not None,
+        standard_causal_output=False,
+        output_requires_tma=_flash_output_requires_tma(
+            num_bh, match.q_seq, match.head_dim_v
+        ),
+        supports_tensor_4d_tma=False,
+        has_row_epilogue=False,
+        plain_row_body=True,
+        has_score_modifiers=False,
+        causal_resident_compatible=False,
+        tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(plan),
+        score_modifier_kinds=plan.modifier_kinds,
+        head_dim_v=plan.head_dim_v,
+        kv_group=plan.kv_group,
+        q_seq=match.q_seq,
+        kv_seq=match.kv_seq,
     )
 
 

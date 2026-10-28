@@ -1473,6 +1473,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
         self.assertGreater(code.rfind(barrier, 0, code.index(atomic)), -1)
 
+    @skipIfNotCUDA()  # Case checks generated PTX instruction.
     @skipIfNotTriton("checks the drain of a Triton TMA store before a release")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")

@@ -145,7 +145,7 @@ def test_backend_chunk_and_indexed_reduction_caps_still_apply() -> None:
     config = spec.default_config()
     config.config["reduction_loops"] = [4096]
     spec.normalize(config.config)
-    assert config.config["reduction_loops"] == [1024]
+    assert config.config["reduction_loops"] == [2048]
     indexed = make_spec(64, full=True)
     indexed.cute_indexed_reduction_block_ids.add(1)
     config = indexed.default_config()
@@ -385,7 +385,8 @@ def test_padded_chunk_does_not_bypass_live_backend_caps(
         config.config["reduction_loops"] = [requested]
         generation = ConfigGeneration(new)
         flat, effective = generation.strict_config_pair(config)
-        assert effective.config["reduction_loops"] == [threshold]
+        expected = threshold if requested is None else max_loop
+        assert effective.config["reduction_loops"] == [expected]
         assert generation.strict_unflatten(deepcopy(flat)) == effective
 
 

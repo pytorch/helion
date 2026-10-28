@@ -95,6 +95,8 @@ class BlockScaledMmaPlan:
     prepare: str = "tiled"
     pdl: bool = False
     prepare_rows: int = 32
+    # Columns per epilogue chunk of the NVFP4 consumer (32 or 64).
+    epilogue_n: int = 64
     # ``cute_scaled_prepare="fused"``: per-side (mode, stride) of the fused
     # consumer (``block_scaled_fused.fused_geometry``), else None.
     fused: dict[str, tuple[str, int]] | None = None
@@ -599,9 +601,11 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
     persistent = df.config.get("cute_scaled_persistent", True)
     prepare = df.config.get("cute_scaled_prepare", "tiled")
     prepare_rows = df.config.get("cute_scaled_prepare_rows", 32)
+    epilogue_n = df.config.get("cute_scaled_epilogue_n", 64)
     if (
         prepare not in ("tiled", "linear", "fused")
         or prepare_rows not in (16, 32)
+        or epilogue_n not in (32, 64)
         or type(bn) is not int
         or bn not in (64, 128, 256)
         or type(bk) is not int
@@ -661,7 +665,10 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
             for side, rows in (("lhs", 128), ("rhs", bn))
             if fused[side][0] == "transpose"
         )
-    if stage_bytes * stages + 128 * 64 * output.element_size() + 8192 > 232448:
+    # Epilogue staging: 128 rows by one chunk of ``epi_n = min(bn,
+    # epilogue_n)`` columns (``Sm100BlockScaledGemm.epi_n`` for NVFP4).
+    epilogue_bytes = 128 * min(bn, cast("int", epilogue_n)) * output.element_size()
+    if stage_bytes * stages + epilogue_bytes + 8192 > 232448:
         return None
     return BlockScaledMmaPlan(
         root.graph_id,
@@ -682,6 +689,7 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
         prepare=cast("str", prepare),
         pdl=df.config.get("cute_pdl", False) is True,
         prepare_rows=cast("int", prepare_rows),
+        epilogue_n=cast("int", epilogue_n),
         fused=fused,
     )
 
@@ -767,6 +775,7 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         "prepare": plan.prepare,
         "pdl": plan.pdl,
         "prepare_rows": plan.prepare_rows,
+        "epilogue_n": plan.epilogue_n,
         "fused": plan.fused,
     }
     if plan.format == "mxfp8":

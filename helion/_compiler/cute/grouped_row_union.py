@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
@@ -12,6 +14,14 @@ if TYPE_CHECKING:
 CONFIG_KEY = "tcgen05_grouped_dense_row_union"
 RESIDENT_CTAS_KEY = "tcgen05_grouped_ctas_per_sm"
 SCHEDULE_KEY = "tcgen05_grouped_row_union_schedule"
+# Physical AB ring depth of a named profile (``None`` = the profile's own,
+# deepest fitting ring).  The public ``tcgen05_ab_stages`` stays the search
+# carrier's value so recorded configs keep their meaning.
+AB_STAGES_KEY = "tcgen05_grouped_row_union_ab_stages"
+AB_STAGES_CHOICES: tuple[int | None, ...] = (None, 3, 4, 5, 6, 7, 8, 10)
+# The shallowest depth the search offers; a two-deep ring (one stage of
+# look-ahead) is not searched, tested or accepted.
+AB_STAGES_MIN = 3
 LEGACY_SCHEDULE = "legacy"
 TRANSPOSED_SCHEDULE = "nm_m256_n80_k64"
 PAIRED_CLC_SCHEDULE = "nm_m256_n192_k64_clc"
@@ -143,8 +153,32 @@ def schedule_by_name(name: object) -> RowUnionSchedule | None:
     return None
 
 
+def ab_stages_supported(profile: RowUnionSchedule, value: object) -> bool:
+    """Whether ``value`` is a legal physical ring depth for ``profile``:
+    absent, or an integer between ``AB_STAGES_MIN`` and the profile's own
+    (deepest fitting) depth, so the shared-memory bound only shrinks."""
+    return value is None or (
+        type(value) is int and AB_STAGES_MIN <= value <= profile.ab_stages
+    )
+
+
+def with_ab_stages(profile: RowUnionSchedule, value: object) -> RowUnionSchedule:
+    assert ab_stages_supported(profile, value)
+    if value is None or value == profile.ab_stages:
+        return profile
+    return dataclasses.replace(profile, ab_stages=cast("int", value))
+
+
 def physical_schedule(config: Mapping[str, object]) -> RowUnionSchedule | None:
-    return schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
+    profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
+    if profile is None:
+        return None
+    stages = config.get(AB_STAGES_KEY)
+    if not ab_stages_supported(profile, stages):
+        # Normalization rejects or repairs the knob; an unrepaired config
+        # keeps the profile's own depth here so codegen never overruns smem.
+        return profile
+    return with_ab_stages(profile, stages)
 
 
 # Two BF16 AB rings plus a conservative allowance for their four barriers,
@@ -249,6 +283,7 @@ def schedule_supported(
         "tcgen05_diagnostic_invalid_output": False,
     }
     profile = physical_schedule(config)
+    base_profile = schedule_by_name(config.get(SCHEDULE_KEY, LEGACY_SCHEDULE))
     expected_blocks = blocks if legacy_blocks_supported(blocks) else LEGACY_BLOCKS
     allowed_layout_keys: tuple[str, ...] = ()
     if profile is not None:
@@ -285,6 +320,11 @@ def schedule_supported(
         and (
             not config.get(STARTUP_PREFILL_KEY, False)
             or (profile is not None and profile.linear_record_clc)
+        )
+        and (
+            config.get(AB_STAGES_KEY) is None
+            if base_profile is None
+            else ab_stages_supported(base_profile, config.get(AB_STAGES_KEY))
         )
         and (profile is None or config.get(RESIDENT_CTAS_KEY, 1) == 1)
         and type(config.get(RESIDENT_CTAS_KEY, 1)) is int
@@ -376,15 +416,21 @@ for {p}_coverage_group in cutlass.range({self.groups - 1}, unroll_full=True):
     def coverage_flag(self) -> str:
         return f"{self.prefix}_coverage_flag"
 
-    def cooperative_setup(self, *, warp: str, lane: str) -> str:
+    def cooperative_setup(
+        self, *, warp: str, lane: str, dependent_launch: bool = False
+    ) -> str:
         """Immutable CTA-local tables, published by the existing TMEM join.
 
         The linear-record profile reserves warp 7 and proves G+1<=32. All
         lanes execute both shuffles and the vote; only bounded unique lanes
-        publish the flag and the normalized fallback intervals.
+        publish the flag and the normalized fallback intervals.  Under a
+        programmatic dependent launch the coverage warp waits for the
+        previous kernel itself, right ahead of its offsets read, so the
+        kernel needs no entry wait and the rest of the prologue overlaps.
         """
         assert self.paired_protocol is not None and 1 <= self.groups <= 31
         p = self.prefix
+        wait = "    cute.arch.griddepcontrol_wait()\n" if dependent_launch else ""
         return f"""{p}_coverage_ptr = cute.arch.alloc_smem(cutlass.Int32, 1)
 {self.coverage_flag} = cute.make_tensor({p}_coverage_ptr, cute.make_layout((1,)))
 {p}_starts_ptr = cute.arch.alloc_smem(cutlass.Int32, {self.groups})
@@ -392,7 +438,7 @@ for {p}_coverage_group in cutlass.range({self.groups - 1}, unroll_full=True):
 {self.starts} = cute.make_tensor({p}_starts_ptr, cute.make_layout(({self.groups},)))
 {self.ends} = cute.make_tensor({p}_ends_ptr, cute.make_layout(({self.groups},)))
 if {warp} == cutlass.Int32({self.paired_protocol.coverage_warp}):
-    {p}_coop_raw_start = cutlass.Int32(0)
+{wait}    {p}_coop_raw_start = cutlass.Int32(0)
     if {lane} < cutlass.Int32({self.groups + 1}):
         {p}_coop_raw_start = cutlass.Int32(({self.offsets}.iterator + cutlass.Int64({lane}) * cutlass.Int64({self.offsets}.layout.stride[0])).load())
     {p}_coop_next_lane = min({lane} + cutlass.Int32(1), cutlass.Int32({self.groups}))

@@ -53,10 +53,15 @@ PLANS = {
     "s4096": (4096, 4096, 4, 16),
     "s131072": (131072, 131072, 1, 8),
 }
-# The score plan's two surfaces: a mask-only plan (any ``mask_mod``, the
-# BlockMask tables walked) and a plan with a score region (a ``score_mod``
-# other than the identity: softcap / ALiBi run the hook on every tile).
-WALKS = ("mask", "score")
+# The score plan's four surfaces: a mask-only plan (any ``mask_mod``, the
+# BlockMask tables walked), a plan with a score region (a ``score_mod``
+# other than the identity: softcap / ALiBi run the hook on every tile),
+# torch's empty BlockMask under a mask region (the trivial walk: one KV
+# block over the whole sequence, no list walk, the flex body), and torch's
+# empty BlockMask with the identity ``score_mod`` (the dense flex plan,
+# ``AttentionScorePlan.flex_dense``: the dense attention surface over the
+# flex kernel's two tiles, ``_flex_dense_search_surface``).
+WALKS = ("mask", "score", "trivial", "dense")
 
 
 def flex_forward_spec(
@@ -78,6 +83,8 @@ def flex_forward_spec(
     for block_id in (0, 1):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=128))
     score_region = walk == "score"
+    trivial_walk = walk == "trivial"
+    dense = walk == "dense"
     spec.enable_cute_flash_search(
         head_dim=head_dim,
         head_dim_v=None,
@@ -97,16 +104,16 @@ def flex_forward_spec(
         output_requires_tma=False,
         supports_tensor_4d_tma=False,
         has_row_epilogue=False,
-        plain_row_body=False,
+        plain_row_body=dense,
         has_score_modifiers=score_region,
-        score_modifier_kinds=("flex",),
+        score_modifier_kinds=("dense",) if dense else ("flex",),
         device_sm_count=device_sm_count,
         kv_group=kv_group,
         fast_math=True,
-        has_list_walk=True,
+        has_list_walk=not (trivial_walk or dense),
         flex_has_score_region=score_region,
-        flex_has_mask_region=True,
-        flex_trivial_walk=False,
+        flex_has_mask_region=not dense,
+        flex_trivial_walk=trivial_walk,
         q_seq=q_seq,
         kv_seq=kv_seq,
         flex_aux_smem_candidates=(),
@@ -196,6 +203,12 @@ SURFACES = {
     "flex_d64_s4096": (
         lambda: flex_forward_spec(
             64, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1
+        ),
+        [128, 128],
+    ),
+    "flex_dense_s4096": (
+        lambda: flex_forward_spec(
+            128, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1, walk="dense"
         ),
         [128, 128],
     ),
@@ -326,6 +339,39 @@ def test_seed_block_sizes_accept_the_flex_kernels_two_tiles(
     and the flex kernel's (128, 128), whose batch / head axes are fixed
     outside the search."""
     assert cute_flash._flash_seed_block_sizes(targets) == expected
+
+
+def test_dense_flex_surface_seeds_the_dense_families() -> None:
+    """The dense flex plan's surface (``walk="dense"``) seeds the dense
+    attention kernel's families instead of the list-walk bodies: on the
+    campaign's small (1, 4, 256, 64) grid the row programs and the
+    persistent fa4 / ws_overlap bodies, and no seed resolves to a list
+    walk (``has_list_walk``) or carries the hook knobs' searched values."""
+    spec = flex_forward_spec(
+        64, q_seq=256, kv_seq=256, num_bh=4, heads=4, kv_group=1, walk="dense"
+    )
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = recorded_compiler_seeds(spec)
+        assert seeds
+        resolved = [spec._resolve_cute_flash_config(seed.config) for seed in seeds]
+        fragments = spec._cute_flash_autotune_fragments()
+        messages: list[str] = []
+        pairs = ConfigGeneration(spec).seed_flat_config_pairs(messages.append)
+    assert not messages
+    # (Two of the dense surface's 21 seeds fold into one flat config on this
+    # small grid, on the attention example's own surface as well.)
+    assert len(pairs) >= len(seeds) - 1
+    families = {(cfg.pipeline_family, cfg.persistent) for cfg in resolved}
+    assert ("row_mma", False) in families
+    assert ("fa4", True) in families
+    assert ("ws_overlap", True) in families
+    assert all(not cfg.flex_early_qk and cfg.flex_tail_split == 0 for cfg in resolved)
+    family = fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert isinstance(family, EnumFragment)
+    assert "row_mma" in (family.search_choices or family.choices)
+    tail = fragments[cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY]
+    assert isinstance(tail, EnumFragment)
+    assert tuple(tail.search_choices or tail.choices) == (0,)
 
 
 @pytest.mark.parametrize("plan", sorted(PLANS))

@@ -43,6 +43,11 @@ def aggregate(run: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, A
     variants: set[tuple[str, str]] = set()
     inventories: dict[tuple[str, int], dict[str, Any]] = {}
     failures = []
+    # The CUDA graph dispatch state each successful record's readings were
+    # taken in (``graph_state_warmup``; records from before the field existed
+    # count as "unrecorded"), keyed by note.  More than one key means the
+    # run's readings are not all comparable with each other.
+    graph_states: dict[str, int] = defaultdict(int)
     seen: set[tuple[str, str, int, str, str]] = set()
     for row in records:
         module, shape, provider = row["module"], row["shape"], row["provider"]
@@ -85,6 +90,7 @@ def aggregate(run: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, A
             raise ValueError(f"Invalid graph latency: {identity}")
         groups[key][provider].append(row)
         variants.add((module, row["case"]))
+        graph_states[row.get("graph_state_warmup") or "unrecorded"] += 1
 
     coverage = [
         {
@@ -155,7 +161,27 @@ def aggregate(run: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, A
         "variants": type_rows,
         "failures": failures,
         "inventory": coverage,
+        "graph_states": dict(
+            sorted(graph_states.items(), key=lambda item: (-item[1], item[0]))
+        ),
     }
+
+
+def graph_state_lines(graph_states: dict[str, int]) -> list[str]:
+    """Report lines naming the graph dispatch state of the run's readings, a
+    warning when the records disagree (see ``compare_example_backends.
+    graph_state_regime`` for why readings of different states do not
+    compare)."""
+    if len(graph_states) == 1:
+        ((state, count),) = graph_states.items()
+        return [f"Graph dispatch state of all {count} measured records: {state}."]
+    listed = "; ".join(f"{state} ({count})" for state, count in graph_states.items())
+    return [
+        (
+            "WARNING: the measured records disagree on the graph dispatch state "
+            f"their readings were taken in, so they are not all comparable: {listed}."
+        )
+    ]
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -229,6 +255,8 @@ def report_results(input_path: Path, output: Path) -> None:
         f"GPU: {gpu.get('name', 'unknown')} ({gpu.get('uuid', 'unknown')}), power limit {gpu.get('power_limit_w', 'unknown')} W, driver {gpu.get('driver_version', 'unknown')}. Software: {versions}. Run seed: {run.get('autotune_seed', 'unknown')}.",
         "",
         f"All {len(run['modules'])} requested modules are represented. Inventory succeeded for {successful_inventories}/{len(data['inventory'])} requested module/shape pairs; unavailable inventories remain N/A in the table and inventory.csv.",
+        "",
+        *graph_state_lines(data["graph_states"]),
         "",
         "Speedup is Triton/CuTe or min(best baseline, Triton)/CuTe using CUDA-graph latency; higher is better. Each implementation ran in a separate process on the same GPU. These are exploratory comparisons; no interleaved fixed-config qualification is implied.",
         "",

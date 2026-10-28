@@ -529,7 +529,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if lane_fold_k is not None:
         assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
+            ctx.cg,
             lhs_node,
             rhs_node,
             k_block_id=k_block_id,
@@ -645,7 +645,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if lane_fold_k is not None:
         assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
+            ctx.cg,
             lhs_node,
             rhs_node,
             k_block_id=k_block_id,
@@ -926,7 +926,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if lane_fold_k is not None:
         assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
+            ctx.cg,
             lhs_node,
             rhs_node,
             k_block_id=k_block_id,

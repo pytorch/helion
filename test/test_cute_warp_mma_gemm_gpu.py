@@ -15,6 +15,7 @@ from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 from test.test_cute_tcgen05_fixed_chain import _ordinary_gemm
 from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
 from test.test_cute_tcgen05_fixed_cost import _row_bias_gemm
+from test.test_cute_warp_mma_gemm import _bias_gelu_aux_gemm
 from test.test_cute_warp_mma_gemm import _extra_root_store_after
 from test.test_cute_warp_mma_gemm import _extra_root_store_before
 from test.test_cute_warp_mma_gemm import _f32_out_gemm
@@ -108,6 +109,42 @@ def test_dense_gemm_matches_torch(
         b = _k_major(b)
     out, _ = _run(_ordinary_gemm, (a, b), _config(block_sizes, warps))
     _check(out, torch.matmul(a.float(), b.float()))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("k_major", [False, True])
+@pytest.mark.parametrize(("block_sizes", "warps"), TILES)
+def test_m_major_a_gemm_matches_torch(
+    dtype: torch.dtype, k_major: bool, block_sizes: list[int], warps: int
+) -> None:
+    # ``mat1.T @ grad_out``: A is the transposed view of a row-major matrix.
+    torch.manual_seed(0)
+    a = _randn(256, 256, dtype=dtype).T
+    b = _randn(256, 256, dtype=dtype)
+    if k_major:
+        b = _k_major(b)
+    out, source = _run(_ordinary_gemm, (a, b), _config(block_sizes, warps))
+    assert "_helion_warp_mma.ldmatrix_x4_trans(" in source
+    _check(out, torch.matmul(a.float(), b.float()))
+
+
+def test_matmul_backward_pair_runs_on_the_family() -> None:
+    """Both GEMMs of the matmul example's backward (``grad_out @ mat2.T`` and
+    ``mat1.T @ grad_out``) run on the family's measured 16x32 two-warp tile."""
+    import examples.matmul as matmul_mod
+
+    torch.manual_seed(0)
+    mat1 = _randn(256, 256, dtype=torch.float16)
+    mat2 = _randn(256, 256, dtype=torch.float16)
+    grad_out = _randn(256, 256, dtype=torch.float16)
+    matmul = helion.kernel(matmul_mod.matmul.fn, backend="cute", static_shapes=True)
+    for lhs, rhs in ((grad_out, mat2.T), (mat1.T, grad_out)):
+        bound = matmul.bind((lhs, rhs))
+        bound.set_config(_config([16, 32, 64], 2))
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(_config([16, 32, 64], 2))
+        assert "_helion_warp_mma.mma_f16(" in bound.to_code(normalized)
+        _check(bound(lhs, rhs), torch.matmul(lhs.float(), rhs.float()))
 
 
 @pytest.mark.parametrize(("block_sizes", "warps"), TILES)
@@ -259,6 +296,177 @@ def test_campaign_examples_run_on_the_family() -> None:
     bound.set_config(_config([1, 64, 8, 128], 4))
     out = bound(a3, b3)
     _check(out, torch.bmm(a3.float(), b3.float()))
+
+
+def _grouped_reference(
+    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """The jagged kernel's contract: rows of a group hold ``A[rows] @ B``;
+    rows outside every group are left as allocated (NaN here)."""
+    out = torch.full(
+        (a.shape[0], b.shape[1]), float("nan"), dtype=a.dtype, device=a.device
+    )
+    bounds = offsets.tolist()
+    for g in range(len(bounds) - 1):
+        start, end = bounds[g], bounds[g + 1]
+        if end - start > 0:
+            out[start:end] = (a[start:end].float() @ b.float()).to(a.dtype)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "warps"),
+    [([32, 32, 64], 4), ([64, 16, 64], 4), ([16, 32, 64], 2), ([16, 8, 128], 1)],
+)
+def test_grouped_row_union_matches_the_jagged_kernel(
+    block_sizes: list[int], warps: int
+) -> None:
+    """``examples/grouped_gemm.py``'s jagged kernel on the family: the
+    catalogue's shape-0 layout, then (same compiled kernel, ``static_shapes=
+    False``) a layout with an empty group and one that leaves the tail rows
+    outside every group."""
+    import examples.grouped_gemm as grouped_mod
+
+    torch.manual_seed(0)
+    a = _randn(640, 128, dtype=torch.bfloat16)
+    b = _randn(128, 128, dtype=torch.bfloat16)
+    offsets = torch.tensor([0, 64, 192, 384, 640], device=DEVICE, dtype=torch.int32)
+    kernel = helion.kernel(
+        grouped_mod.grouped_gemm_jagged.fn, backend="cute", static_shapes=False
+    )
+    bound = kernel.bind((a, b, offsets))
+    config = _config(block_sizes, warps)
+    bound.set_config(config)
+    with bound.env:
+        assert bound.config_spec._cute_tcgen05_config.warp_mma_admitted
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    assert "_helion_warp_mma.mma_bf16(" in source
+    assert "group_offsets.iterator + cutlass.Int64(" in source
+    assert "tcgen05_tmem_allocator" not in source
+    for layout in (
+        [0, 64, 192, 384, 640],
+        [0, 100, 100, 300, 640],
+        [0, 64, 64, 200, 500],
+    ):
+        offs = torch.tensor(layout, device=DEVICE, dtype=torch.int32)
+        ref = _grouped_reference(a, b, offs)
+        covered = ~torch.isnan(ref)
+        outs = [bound(a, b, offs) for _ in range(3)]
+        torch.cuda.synchronize()
+        for other in outs[1:]:
+            assert torch.equal(outs[0][covered], other[covered])
+        _check(outs[0][covered], ref[covered].float())
+
+
+def test_grouped_row_union_rebinds_per_shape_and_fails_closed_off_the_family() -> None:
+    """``static_shapes=False``: the family is admitted from each binding's
+    hints and codegen specializes ``(total_M, G)`` under shape guards, so a
+    call with another packed size or group count rebinds (fresh heuristic,
+    fresh body) instead of reusing the first binding's clamps.  A shape the
+    family does not run (1000 rows) rejects the pinned family strictly and
+    repairs to the tcgen05 lowering, which stays correct."""
+    import examples.grouped_gemm as grouped_mod
+
+    torch.manual_seed(0)
+    b = _randn(128, 128, dtype=torch.bfloat16)
+    kernel = helion.kernel(
+        grouped_mod.grouped_gemm_jagged.fn, backend="cute", static_shapes=False
+    )
+    config = _config([32, 32, 64], 4)
+    seen: dict[int, int] = {}
+    for total_m, layout in (
+        (640, [0, 64, 192, 384, 640]),
+        (1024, [0, 100, 100, 300, 1024]),
+        (768, [0, 64, 64, 200, 500, 700, 768]),
+        (640, [0, 10, 300, 300, 640]),
+    ):
+        a = _randn(total_m, 128, dtype=torch.bfloat16)
+        offs = torch.tensor(layout, device=DEVICE, dtype=torch.int32)
+        bound = kernel.bind((a, b, offs))
+        # One bound kernel per (total_M, G); the same shape reuses it.
+        assert seen.setdefault(id(bound), total_m) == total_m
+        with bound.env:
+            state = bound.config_spec._cute_tcgen05_config
+            assert state.warp_mma_admitted
+            assert state.warp_mma_grouped_extents == (total_m, 128, 128)
+            normalized = bound.config_spec.normalized_config(config)
+        source = bound.to_code(normalized)
+        assert "_helion_warp_mma.mma_bf16(" in source
+        assert f"cutlass.Int32({total_m})" in source
+        assert source.count("group_offsets.iterator + cutlass.Int64(") == len(layout)
+        bound.set_config(normalized)
+        out = bound(a, b, offs)
+        torch.cuda.synchronize()
+        ref = _grouped_reference(a, b, offs)
+        covered = ~torch.isnan(ref)
+        _check(out[covered], ref[covered].float())
+    assert len(seen) == 3
+
+    a = _randn(1000, 128, dtype=torch.bfloat16)
+    offs = torch.tensor([0, 100, 100, 300, 1000], device=DEVICE, dtype=torch.int32)
+    bound = kernel.bind((a, b, offs))
+    assert id(bound) not in seen
+    with bound.env:
+        assert not bound.config_spec._cute_tcgen05_config.warp_mma_admitted
+        with pytest.raises(helion.exc.InvalidConfig, match="not admitted"):
+            bound.config_spec.normalized_config(config)
+        repaired = dict(config.config)
+        bound.config_spec.normalize(repaired, _fix_invalid=True)
+    assert repaired[FAMILY] == family.MATMUL_FAMILY_TCGEN05
+    bound.set_config(helion.Config(**repaired))
+    assert "_helion_warp_mma" not in bound.to_code(bound._config)
+    out = bound(a, b, offs)
+    torch.cuda.synchronize()
+    ref = _grouped_reference(a, b, offs)
+    covered = ~torch.isnan(ref)
+    _check(out[covered], ref[covered].float())
+
+
+def test_gelu_aux_epilogue_matches_torch() -> None:
+    # The cuBLASLt GELU_AUX pattern (bias prefix, two outputs, the chain's
+    # ``_gelu_erf`` helper) on the family: the exact erf on per-fragment
+    # scalars against torch's gelu of the fp32 pre-activation.
+    torch.manual_seed(0)
+    a = _randn(256, 256, dtype=torch.float16)
+    b = _randn(256, 256, dtype=torch.float16)
+    bias = _randn(256, dtype=torch.float16)
+    pre = torch.matmul(a.float(), b.float()) * 1.25 + bias.float()
+    for block_sizes, warps in (([64, 16, 64], 1), ([32, 32, 128], 4)):
+        (out, aux), source = _run(
+            _bias_gelu_aux_gemm, (a, b, bias), _config(block_sizes, warps)
+        )
+        assert "gelu_erf" in source
+        _check(aux, pre)
+        _check(out, torch.nn.functional.gelu(pre))
+
+
+def test_m_major_int16_cast_operand_matches_torch() -> None:
+    # ``x[tile_m, tile_k].to(bf16)`` of an M-contiguous int16 A: the packets
+    # are loaded as words, converted in registers into the M-major staging
+    # and read by ``ldmatrix.trans``.
+    import examples.bf16xint16_gemm as example
+
+    torch.manual_seed(0)
+    x = torch.randint(-8, 9, (256, 128), device=DEVICE, dtype=torch.int16).T
+    w = _randn(256, 128, dtype=torch.bfloat16)
+    assert x.shape == (128, 256) and x.stride() == (1, 128)
+    kernel = helion.kernel(example._int16xbf16_gemm.fn, backend="cute")
+    bound = kernel.bind((x, w))
+    with bound.env:
+        state = bound.config_spec._cute_tcgen05_config
+        assert state.warp_mma_admitted and not state.tcgen05_family_admitted
+    for block_sizes, warps in (([16, 8, 128], 1), ([32, 16, 64], 2)):
+        config = _config(block_sizes, warps)
+        bound.set_config(config)
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(config)
+        source = bound.to_code(normalized)
+        assert "_helion_warp_mma.cvt_s16x8_bf16_sts(wm_a" in source
+        assert "_helion_warp_mma.ldmatrix_x4_trans(" in source
+        out = bound(x, w)
+        torch.cuda.synchronize()
+        _check(out, torch.matmul(x.float(), w.float()))
 
 
 @pytest.mark.parametrize(

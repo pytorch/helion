@@ -303,8 +303,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
             # Let the autotuner try output block sizes larger than a small matmul
-            # dimension: masked rows/cols can map to a more efficient MMA tile.
-            if is_output_dim and env.backend_name == "triton":
+            # dimension: masked rows/cols can map to a more efficient MMA tile
+            # (on the backends whose lowerings pad such tiles).
+            if is_output_dim and env.backend.pads_small_matmul_dims:
                 try:
                     spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
                 except KeyError:
@@ -760,8 +761,14 @@ def enable_cute_tcgen05_search(
     explicit_epi_tile_compatible: bool,
     leading_block_id: int | None = None,
     warp_mma_plain_kernel: bool = True,
+    output_dtype_bytes: int | None = None,
+    output_stores: int = 1,
 ) -> None:
-    """Apply one preflighted tcgen05 search plan to the shared config."""
+    """Apply one preflighted tcgen05 search plan to the shared config.
+
+    ``output_dtype_bytes`` / ``output_stores`` size the TMA-store rings the
+    AB-stage fit estimate charges (``None``: AB-only estimate).
+    """
     env = CompileEnvironment.current()
     spec = env.config_spec
     spec.register_cute_tcgen05_mma_analysis(
@@ -905,6 +912,8 @@ def enable_cute_tcgen05_search(
         cluster_m2_one_wave_only=one_wave_only_cluster_m2_search,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,
+        ab_stages_three_output_dtype_bytes=output_dtype_bytes,
+        ab_stages_three_output_stores=output_stores,
         reason="matmul kernel with CuTe tcgen05 backend",
     )
     if plan.small_n_requires_role_local_tma:

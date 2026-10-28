@@ -62,6 +62,13 @@ def run_side(
         if pin_from is not None:
             command += ["--pin-from", str(pin_from)]
         env = {k: v for k, v in os.environ.items() if not k.startswith("HELION_")}
+        # The graph dispatch warm-up opt-out is the one HELION_* variable the
+        # readings inherit (both sides alike; the summary reports each side's
+        # recorded state).
+        if "HELION_BENCHMARK_GRAPH_WARMUP" in os.environ:
+            env["HELION_BENCHMARK_GRAPH_WARMUP"] = os.environ[
+                "HELION_BENCHMARK_GRAPH_WARMUP"
+            ]
         env.update(
             CUDA_VISIBLE_DEVICES=args.gpu,
             HELION_CACHE_DIR=str(Path(directory) / "helion"),
@@ -87,6 +94,7 @@ def run_side(
                 graph_calls_ms=data.get("graph_calls_ms"),
                 graph_long_ms=data.get("graph_long_ms"),
                 graph_long_calls=data.get("graph_long_calls"),
+                graph_state_warmup=data.get("graph_state_warmup"),
                 event_ms=data.get("event_ms"),
                 graph_error=data.get("graph_error"),
                 bound_kernels=data.get("bound_kernels"),
@@ -119,6 +127,7 @@ def main() -> None:
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     readings: dict[str, list[float]] = {"a": [], "b": []}
+    graph_states: dict[str, list[str | None]] = {"a": [], "b": []}
     with args.output.open("a") as stream:
         stream.write(
             json.dumps(
@@ -148,6 +157,7 @@ def main() -> None:
                     reading = record.get("graph_calls_ms")
                 if reading is not None:
                     readings[side].append(reading)
+                    graph_states[side].append(record.get("graph_state_warmup"))
                 print(
                     f"{side} {spec}: bench_ms={record.get('bench_ms')} "
                     f"graph_calls_ms={record.get('graph_calls_ms')} "
@@ -160,6 +170,10 @@ def main() -> None:
         if readings["a"] and readings["b"]:
             med_a = statistics.median(readings["a"])
             med_b = statistics.median(readings["b"])
+            states = {
+                side: sorted({str(state) for state in graph_states[side]})
+                for side in ("a", "b")
+            }
             summary.update(
                 field="graph_long_ms (graph_calls_ms where a record lacks it)",
                 median_a_ms=med_a,
@@ -168,7 +182,18 @@ def main() -> None:
                 readings_a=readings["a"],
                 readings_b=readings["b"],
                 balanced=len(readings["a"]) == len(readings["b"]),
+                graph_state_a=states["a"],
+                graph_state_b=states["b"],
             )
+            if states["a"] != states["b"] or len(states["a"]) != 1:
+                # Readings taken in different graph dispatch states are not
+                # comparable (a fresh process's fast state reads Helion
+                # kernels ~0.35 us per node faster than the steady one).
+                print(
+                    "WARNING: the sides' graph dispatch states differ: "
+                    f"a={states['a']} b={states['b']}; the ratio mixes regimes",
+                    file=sys.stderr,
+                )
             if len(readings["a"]) != len(readings["b"]):
                 print(
                     f"WARNING: unbalanced readings ({len(readings['a'])} vs "

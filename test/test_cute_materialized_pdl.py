@@ -147,21 +147,27 @@ def test_cute_pdl_never_reaches_the_stage_that_releases_dependents_at_entry(
     assert WAIT not in producer and "_helion_cute_use_pdl" not in producer
     assert "'use_pdl': True" in consumer and "_helion_cute_use_pdl" not in consumer
     # Without the protocol the producer is an ordinary pointwise stage and
-    # takes the knob like any kernel: the wait ahead of its first access plus
-    # the launch attribute, nothing else.  The consumer keeps its role-local
-    # wait and stays inert.
+    # takes the knob like any kernel: the wait ahead of its first access,
+    # the launch attribute and, when its static grid fits in one wave of
+    # resident CTAs, the release of its own dependents right after the wait
+    # (``cute_pdl_release``'s ``auto`` default), nothing else.  The consumer
+    # keeps its role-local wait and stays inert.
     off = _stage_sources(bound.to_code(serial))
     on = _stage_sources(
         bound.to_code(helion.Config.from_dict(serial.config | {"cute_pdl": True}))
     )
     device = _device(on[0])
     attribute = f"{device.name}._helion_cute_use_pdl = True"
+    release = "cute.arch.griddepcontrol_launch_dependents()"
     assert ast.unparse(device.body[0]) == WAIT
     assert on[0].count(WAIT) == 1 and on[0].count(attribute) == 1
+    assert on[0].count(release) <= 1
+    if release in on[0]:
+        assert ast.unparse(device.body[1]) == release
     assert [
         line
         for line in on[0].splitlines()
-        if WAIT not in line and attribute not in line
+        if WAIT not in line and attribute not in line and release not in line
     ] == off[0].splitlines()
     assert on[1] == off[1]
     # The bundle's search space comes from the tcgen05 branch, which never

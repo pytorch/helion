@@ -157,11 +157,13 @@ def host_load_is_readonly(
         if source_storage == target_storage:
             return False
         # Fake storage inequality alone does not prove that two runtime
-        # arguments are disjoint (including distinct DLPack wrappers). Fresh
-        # compiler allocations or the existing dispatch-keyed alias matrix do.
+        # arguments are disjoint (including distinct DLPack wrappers). A
+        # storage a wrapper factory freshly allocated on this call (a
+        # ``torch.zeros`` output, say) cannot alias any other storage, and
+        # otherwise the dispatch-keyed alias matrix decides.
         if (
-            source_storage not in env._symbolically_exact_layout_storages
-            and target_storage not in env._symbolically_exact_layout_storages
+            not env.tensor_storage_is_compiler_allocated(source)
+            and not env.tensor_storage_is_compiler_allocated(target)
             and not runtime_tensors_are_proven_disjoint(
                 env, source, target, allow_unbound=allow_unbound
             )

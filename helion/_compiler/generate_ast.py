@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.host_remainder_fills import RemainderFill
     from .cute.iota_utils import FreeArangeLanes
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -422,6 +423,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "helion_small_biased_attention",
                     "helion_flash_row_mma",
                     "helion_warp_mma_gemm",
+                    "helion_register_subblocks",
                     "helion_flash",
                     "helion_flash_gated",
                     "chunk_prepare_tma",
@@ -429,6 +431,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_recurrence_warp_dv4",
                     "gdn_recurrence_sm100",
                     "helion_flash_bwd",
+                    "helion_flash_bwd_row_mma",
                     "gathered_mma_tma",
                     "block_scaled_mma",
                     "helion_mma_dag_tma",
@@ -673,7 +676,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         refuses instead (lane restores, repeated block ids), the config, not the
         kernel, failed: the overflow is the actionable message. Callers wrap the
         statement visit and the device function finalization.
+
+        ``RegisterTileUnsupported`` is not a refusal but the register tile's
+        regeneration signal (``generate_ast`` retries with the rolled lane) and
+        passes through unchanged, decline or not.
         """
+        if isinstance(error, RegisterTileUnsupported):
+            return error
         if CompileEnvironment.current().backend_name != "cute":
             return error
         declined = self.device_function.cute_state.fragment_capacity_decline
@@ -690,6 +699,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         return codegen_computed_fragment_root(self)
 
+    def _try_codegen_register_subblocks_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.register_subblocks_plan is None:
+            return False
+        from .cute.cute_register_subblocks import codegen_register_subblocks
+
+        if codegen_register_subblocks(self):
+            return True
+        cute_state.register_subblocks_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "register sub-block family failed late validation"
+        )
+
     def _try_codegen_mma_dag_root(self) -> bool:
         cute_state = self.device_function.cute_state
         if cute_state.mma_dag_plan is None:
@@ -705,6 +727,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         """Try fragment ownership before other schedules when this root needs it."""
         env = CompileEnvironment.current()
         if env.backend_name != "cute":
+            return False
+        if self.device_function.cute_state.register_subblocks_plan is not None:
+            # The register sub-block family replaces the root.
             return False
         if self.device_function.cute_state.mma_dag_plan is not None:
             # The warp-MMA recurrence owner replaces the root (its captured
@@ -1934,7 +1959,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         root_graph_info.graph_id
                     )
                     if (
-                        not self._try_codegen_radix_selection_root()
+                        not self._try_codegen_register_subblocks_root()
+                        and not self._try_codegen_radix_selection_root()
                         and not (
                             requested_fragment
                             and self._try_codegen_computed_fragment_root()
@@ -2220,6 +2246,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         },
                     )
                     validate_lane_reduce_owners(list(self.device_function.body))
+                    from .cute.register_tile_admission import RegisterTileOptions
+
+                    knobs = self.device_function.config.config
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
                         uniform_names=lane_uniform_names,
@@ -2232,6 +2261,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             for name, aliases in self.device_function._variable_renames.items()
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
+                        register_tile_options=RegisterTileOptions(
+                            warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
+                            store_first=knobs.get("cute_register_tile_store_first")
+                            is True,
+                        ),
                     )
                     # Reject any owned marker without a proved lowering, so an
                     # incomplete per-lane input cannot stand in for a reduction.
@@ -2898,6 +2932,11 @@ def _generate_ast(
                     codegen.suppressed_lane_names,
                     codegen.device_function.dce_vars,
                 )
+            remainder_fills: list[RemainderFill] = []
+            if CompileEnvironment.current().backend_name == "cute":
+                from .cute.host_remainder_fills import append_device_remainder_fills
+
+                remainder_fills = append_device_remainder_fills(codegen, func, config)
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()
@@ -3136,6 +3175,11 @@ def _generate_ast(
             if env.backend_name == "cute":
                 from .cute.host_paired_sum import PAIRED_SUM_KEY
                 from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_remainder_fills import lower_host_remainder_fills
+
+                final_host_statements = lower_host_remainder_fills(
+                    final_host_statements, remainder_fills
+                )
                 from .cute.host_single_sum import lower_host_single_sum
 
                 final_host_statements = lower_host_sum_pairs(
@@ -3146,6 +3190,15 @@ def _generate_ast(
                     ),
                 )
                 final_host_statements = lower_host_single_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                from .cute.host_full_sum import lower_host_full_sum
+
+                final_host_statements = lower_host_full_sum(
                     func,
                     final_host_statements,
                     cast(

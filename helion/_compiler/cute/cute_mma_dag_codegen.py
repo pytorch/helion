@@ -57,6 +57,7 @@ import contextlib
 import dataclasses
 import functools
 import itertools
+import math
 import re
 import textwrap
 from typing import TYPE_CHECKING
@@ -73,6 +74,7 @@ from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
 from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import BOUND_ID
+from .cute_mma_dag import MMA_DAG_HINTED_CP_ASYNC_CHECK
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_TCGEN05
 from .cute_mma_dag import MMA_DAG_WARP
@@ -93,6 +95,7 @@ from .cute_mma_dag import Loop
 from .cute_mma_dag import MmaDagPlan
 from .cute_mma_dag import Operand
 from .cute_mma_dag import Reduce
+from .cute_mma_dag import Scan
 from .cute_mma_dag import Step
 from .cute_mma_dag import Store
 from .cute_mma_dag import VecOp
@@ -113,6 +116,7 @@ from .cute_warp_mma_gemm import warp_mma_warp_layout
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -202,7 +206,7 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
             )
         cg.cute_wrapper_plans.append(wrapper)
     cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
-    df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
+    df.cute_state.owned_root_block_dims = (plan.launch_threads, 1, 1)
     return True
 
 
@@ -304,6 +308,35 @@ class _Evaluator:
         # relaid out for the current op resolve to their temporaries.
         self.vec_reg: tuple[int, int] | None = None
         self.vec_overrides: dict[Node, str] = {}
+        # The fragment slot whose registers ``reg`` indexes (set by the
+        # per-register steps: stores, derived values, reductions, rescales,
+        # seeds), and the vector leaves relaid out into that slot's register
+        # positions for the current step (see ``_Emitter.frag_vec``).
+        self.frag_slot: int | None = None
+        self.frag_vecs: dict[tuple[Node, int], dict[tuple[object, ...], str]] = {}
+        # Derived fragments evaluated through their pointwise DAG instead of
+        # their registers: the chain a pass-routed operand absorbs (its
+        # steps never materialize; the pass reads their tile leaves).
+        self.inline: frozenset[Node] = frozenset()
+        # A 16-bit ``convert_element_type`` whose rounding a consumer that
+        # rounds itself (a pack) performs: while ``unrounded_scope`` holds,
+        # the nodes above it (views) are evaluated as their unrounded fp32
+        # values under separate memo keys, and the convert itself as its
+        # input (see ``unrounded_pair``).
+        self.skip_round: Node | None = None
+        self.unrounded_scope = False
+
+    def enter_frag(self, slot: int) -> None:
+        """Begin a step evaluating values register by register over slot
+        ``slot``'s layout."""
+        self.frag_slot = slot
+        self.frag_vecs = {}
+
+    def leave_frag(self) -> None:
+        self.reg = None
+        self.element = None
+        self.frag_slot = None
+        self.frag_vecs = {}
 
     def push(self) -> None:
         self.scopes.append({})
@@ -317,8 +350,17 @@ class _Evaluator:
                 return scope[key]
         return None
 
+    def _key(self, node: Node, coords: Coords) -> tuple[object, Coords]:
+        """The memo key of ``node`` at ``coords``: the nodes above a convert
+        whose rounding the consumer performs (``unrounded_scope``) hold
+        unrounded values and are keyed apart from their rounded ones."""
+        if self.unrounded_scope:
+            return (("unrounded", node), coords)
+        return (node, coords)
+
     def evaluate(self, node: Node, coords: Coords) -> str:
         from ...language import _tracing_ops
+        from ...language import creation_ops
         from ...language import memory_ops
         from ...language import view_ops
 
@@ -327,17 +369,42 @@ class _Evaluator:
             return self.evaluate(cast("Node", node.args[0]), coords)
         if node in self.program.aliases:
             return self.evaluate(self.program.aliases[node], coords)
+        if self.skip_round is not None and node is self.skip_round:
+            # The rounding of this convert belongs to the consumer's pack:
+            # its input's fp32 value, memoized under the ordinary keys.
+            saved = self.unrounded_scope
+            self.unrounded_scope = False
+            try:
+                return self.evaluate(cast("Node", node.args[0]), coords)
+            finally:
+                self.unrounded_scope = saved
         if node.op == "call_function" and node.target is _tracing_ops._mask_to:
-            # An identity on whole tiles (every tile here divides its extent).
-            return self.evaluate(cast("Node", node.args[0]), coords)
-        if node in self.program.frag_slots:
+            # An identity on whole tiles; over a ragged root tile the
+            # elements past the extent take the fill (the frontend inserts
+            # it ahead of the reductions and dots the padded rows would
+            # otherwise feed).
+            source = cast("Node", node.args[0])
+            bounds = em.value_bounds(node, coords)
+            if bounds is None:
+                return self.evaluate(source, coords)
+            key = self._key(node, coords)
+            cached = self._lookup(key)
+            if cached is None:
+                inner = self.evaluate(source, coords)
+                fill = em.constant(node.args[1], node.meta["val"].dtype)
+                cached = em.bind("md_v", f"{inner} if {bounds} else {fill}")
+                self.scopes[-1][key] = cached
+            return cached
+        if node in self.program.frag_slots and node not in self.inline:
             assert self.reg is not None
             register = em.reg(self.program.frag_slots[node], *self.reg)
-            rounded = rounded_dot_dtype(node)
+            rounded = _frag_dtype(node)
             if rounded is None:
                 return register
-            # A 16-bit ``aten.mm``: its fp32 product rounded once, as the
-            # SIMT lowering rounds it.
+            # A 16-bit ``aten.mm`` (its fp32 product rounded once, as the
+            # SIMT lowering rounds it) or a 16-bit-typed derived value (its
+            # rounded elements widened into the registers): the DSL value of
+            # the FX dtype.
             key = ("rounded", node, coords, register)
             cached = self._lookup(key)
             if cached is None:
@@ -348,32 +415,35 @@ class _Evaluator:
             slot = self.program.vec_leaves[node]
             if self.program.vec_slots[slot].axis is None:
                 return em.vreg(slot, 0, 0)
-            # The vector register of the element's row: the warp emitter
-            # sets ``vec_reg`` per (atom, half) while it renders vector
-            # steps; an emitter holding one vector register per thread
-            # (the tensor-memory region renderer, where a fragment chain
-            # may read a row vector too) names its default.
-            vec_reg = self.vec_reg if self.vec_reg is not None else em.vec_reg_default
-            assert vec_reg is not None
+            if self.vec_reg is None:
+                # Read beside a fragment value (``dgc_pos + is_last *
+                # dgc_last[:, None, :]``): the vector's register at the
+                # fragment element's row / column.
+                return em.frag_vec(node, coords)
             if node in self.vec_overrides:
-                return f"{self.vec_overrides[node]}_{vec_reg[0]}_{vec_reg[1]}"
-            return em.vreg(slot, *vec_reg)
+                return f"{self.vec_overrides[node]}_{self.vec_reg[0]}_{self.vec_reg[1]}"
+            return em.vreg(slot, *self.vec_reg)
         # Memoized per element position: values that do not depend on the
         # packet element (a K-vector decay of the packet's row) are shared
         # across the packet; the loaded tile leaves are keyed by element.
-        key = (node, coords)
+        key = self._key(node, coords)
         cached = self._lookup(key)
         if cached is not None:
             return cached
         widened = self.widened_leaf(node, coords)
+        rounded = self.rounded_leaf(node, coords) if widened is None else None
         if widened is not None:
             result = widened
+        elif rounded is not None:
+            result = rounded
         elif node in self.program.tile_index_loads:
             axis = self.program.tile_index_loads[node]
             coord = coords[cast("int", _tile_index_position(node))]
             result = em.bind("md_v", f"cutlass.Int32({em.axis_base(axis)} + {coord})")
         elif node.op == "call_function" and node.target is memory_ops.load:
-            result = self._load(node, coords)
+            # (A uniform scalar read from a tensor -- a window's limit --
+            # was loaded once with the bases.)
+            result = em.scalar_vars.get(node) or self._load(node, coords)
         elif node.op == "call_function" and node.target is _tracing_ops._get_symnode:
             val = node.meta["val"]
             result = em.df.sympy_expr(val._sympy_())
@@ -404,6 +474,18 @@ class _Evaluator:
             if isinstance(val, torch.Tensor) and val.dtype.is_floating_point:
                 fill = float(fill)
             result = constant_repr(fill)
+        elif node.op == "call_function" and node.target is creation_ops.full:
+            # ``hl.zeros`` / ``hl.full`` beside a fragment: the constant
+            # (``hl.full(..., float("-inf"))`` under a ``where`` spelled as
+            # a call: ``repr(-inf)`` is a bare name in the DSL module).
+            fill = cast("float", node.args[1])
+            result = em.bind(
+                "md_v",
+                em.typed(
+                    f"cutlass.Float32({_float_literal(float(fill))})",
+                    node.meta["val"].dtype,
+                ),
+            )
         elif (
             node.op == "call_function" and node.target is torch.ops.aten.expand.default
         ):
@@ -414,6 +496,16 @@ class _Evaluator:
             )
         else:
             result = self._lowered(node, coords)
+            if node in self.inline:
+                rounded = _frag_dtype(node)
+                if rounded is not None:
+                    # A 16-bit-typed step of an inlined chain rounds where
+                    # the register path widened it into the fp32 register
+                    # and re-typed it on the read (the DSL's 16-bit product
+                    # is not rounded by itself).
+                    result = em.bind(
+                        "md_v", em.typed(f"cutlass.Float32({result})", rounded)
+                    )
         self.scopes[-1][key] = result
         return result
 
@@ -447,14 +539,22 @@ class _Evaluator:
             value = self.lane(node, lo)
             return value, value
         resolved = self.program.resolve(node)
+        if self.skip_round is not None and resolved is self.skip_round:
+            # The consumer's pack rounds: the convert's input, as a pair.
+            saved = self.unrounded_scope
+            self.unrounded_scope = False
+            try:
+                return self.pair(cast("Node", resolved.args[0]), lanes)
+            finally:
+                self.unrounded_scope = saved
         if (
             not self.emitter.pairs
-            or resolved in self.program.frag_slots
+            or (resolved in self.program.frag_slots and resolved not in self.inline)
             or resolved in self.program.vec_leaves
             or not _has_packable(resolved, self.emitter.packable_memo)
         ):
             return self.lane(node, lo), self.lane(node, hi)
-        keys = ((resolved, lo.coords), (resolved, hi.coords))
+        keys = (self._key(resolved, lo.coords), self._key(resolved, hi.coords))
         cached = (self._lookup(keys[0]), self._lookup(keys[1]))
         if cached[0] is not None and cached[1] is not None:
             return cast("tuple[str, str]", cached)
@@ -511,15 +611,57 @@ class _Evaluator:
         self.scopes[-1][keys[0]], self.scopes[-1][keys[1]] = names
         return names
 
+    def rounding_root(self, node: Node) -> Node | None:
+        """The 16-bit ``convert_element_type`` that is ``node`` or sits
+        right under ``node``'s views (permute / transpose / subscript /
+        expand -- ``k_i.transpose(-2, -1)`` of ``k_i.to(bf16)``), whose
+        rounding a consumer that rounds itself may perform instead; None
+        when a pointwise op or anything else sits between."""
+        from ...language import view_ops
+
+        source = self.program.resolve(node)
+        while source.op == "call_function":
+            if (
+                source.target is torch.ops.prims.convert_element_type.default
+                and source.args[1] in (torch.bfloat16, torch.float16)
+            ):
+                return source
+            if (
+                source.target
+                in (
+                    torch.ops.aten.permute.default,
+                    torch.ops.aten.transpose.int,
+                    torch.ops.aten.expand.default,
+                )
+                or source.target is view_ops.subscript
+            ):
+                source = self.program.resolve(cast("Node", source.args[0]))
+                continue
+            return None
+        return None
+
+    @contextlib.contextmanager
+    def unrounding(self, root: Node) -> Iterator[None]:
+        """Evaluate with the rounding of convert ``root`` left to the caller."""
+        saved = (self.skip_round, self.unrounded_scope)
+        self.skip_round, self.unrounded_scope = root, True
+        try:
+            yield
+        finally:
+            self.skip_round, self.unrounded_scope = saved
+
     def unrounded_pair(self, node: Node, lanes: tuple[_Lane, ...]) -> tuple[str, str]:
         """``unrounded`` over a pair (see ``pair``)."""
+        root = self.rounding_root(node)
+        if root is not None:
+            if root is self.program.resolve(node):
+                return self.pair(cast("Node", root.args[0]), lanes)
+            # The convert under views: the views map the lanes' coordinates,
+            # the convert yields its input (one rounding, the pack's, instead
+            # of a scalar ``cvt`` to 16 bits widened back and rounded again).
+            with self.unrounding(root):
+                return self.pair(node, lanes)
         source = self.program.resolve(node)
-        if (
-            source.op == "call_function"
-            and source.target is torch.ops.prims.convert_element_type.default
-            and source.args[1] in (torch.bfloat16, torch.float16)
-        ):
-            return self.pair(cast("Node", source.args[0]), lanes)
         if _unrounded_select(self.program, source) is not None:
             values = []
             for lane in lanes:
@@ -577,13 +719,13 @@ class _Evaluator:
         representable constant selects the unrounded value (the mask's
         ``where`` over 16-bit operands cost three scalar converts per
         element), anything else its own value."""
+        root = self.rounding_root(node)
+        if root is not None:
+            if root is self.program.resolve(node):
+                return self.evaluate(cast("Node", root.args[0]), coords)
+            with self.unrounding(root):
+                return self.evaluate(node, coords)
         source = self.program.resolve(node)
-        if (
-            source.op == "call_function"
-            and source.target is torch.ops.prims.convert_element_type.default
-            and source.args[1] in (torch.bfloat16, torch.float16)
-        ):
-            return self.evaluate(cast("Node", source.args[0]), coords)
         selected = _unrounded_select(self.program, source)
         if selected is not None:
             mask, value, constant = selected
@@ -598,6 +740,31 @@ class _Evaluator:
                 ),
             )
         return self.evaluate(node, coords)
+
+    def rounded_leaf(self, node: Node, coords: Coords) -> str | None:
+        """``node`` is ``convert_element_type(frag, float32)`` of a fragment
+        leaf read rounded to bf16 (a 16-bit ``aten.mm``'s fp32 product, or a
+        bf16-typed derived value widened into its fp32 register): the
+        register rounded and widened in one step (``round_bf16_f32``: an
+        FMA-pipe ``cvt.rn.bf16x2.f32`` and a mask) instead of the DSL's
+        scalar ``cvt`` to bf16 on the conversion unit and the widening cast
+        behind it -- the same bits.  (fp16 widens by a conversion either
+        way and keeps the casts.)"""
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.prims.convert_element_type.default
+            or node.args[1] is not torch.float32
+            or self.reg is None
+        ):
+            return None
+        source = self.program.resolve(cast("Node", node.args[0]))
+        if source not in self.program.frag_slots or source in self.inline:
+            return None
+        if _frag_dtype(source) is not torch.bfloat16:
+            return None
+        em = self.emitter
+        register = em.reg(self.program.frag_slots[source], *self.reg)
+        return em.bind("md_v", f"{_RUNTIME}.round_bf16_f32({register})")
 
     def widened_leaf(self, node: Node, coords: Coords) -> str | None:
         """``node`` is ``convert_element_type(load, float32)`` of a 16-bit
@@ -616,7 +783,12 @@ class _Evaluator:
             return None
         if len(access.tile_dims) == 2:
             assert self.element is not None
-            return self.raw_leaves.get((source, self.element))
+            raw = self.raw_leaves.get((source, self.element))
+            if raw is None:
+                return None
+            # (A cast keeps its source's shape: the coordinates are the
+            # source's.)
+            return self.tile_leaf(source, coords, raw, "cutlass.Float32")
         key = (source, coords)
         raw = self._lookup(("raw", key))
         if raw is None:
@@ -625,13 +797,55 @@ class _Evaluator:
             raw = self._lookup(("raw", key))
         return raw
 
+    def tile_leaf(self, node: Node, coords: Coords, leaf: str, dtype: str) -> str:
+        """The staged tile element ``leaf`` of load ``node`` at ``coords``:
+        zero when the element's row lies at or past its window's limit (a
+        TMA box lands the window's whole rows; the warp emitter's packets
+        zero-fill them, so there the guard folds to the same value)."""
+        em = self.emitter
+        access = em.accesses[node]
+        if not access.windows or not em.masked_tile_windows:
+            return leaf
+        guard = em.bounds(access, coords)
+        assert guard is not None
+        # (Both branches typed alike: an unpacked 16-bit half is an fp32
+        # value, exact in its own type again.)
+        return em.bind("md_v", f"{dtype}({leaf}) if {guard} else {dtype}(0)")
+
     def _load(self, node: Node, coords: Coords) -> str:
         em = self.emitter
         access = em.accesses[node]
         if len(access.tile_dims) == 2:
             assert self.element is not None
-            return self.tile_leaves[(node, self.element)]
+            leaf = self.tile_leaves[(node, self.element)]
+            return self.tile_leaf(
+                node, coords, leaf, em.env.backend.dtype_str(access.dtype)
+            )
+        alias = em.ring_aliases.get(node)
+        if alias is not None and alias.loop in em.ring_ready:
+            # A row / column of a tile this iteration's ring slot holds (see
+            # ``_ring_aliases``): the element from shared memory at the
+            # slot's swizzled address, the same bytes the global load reads.
+            tile = alias.tile
+            coord = coords[access.tile_positions[0]]
+            row, col = (
+                (str(alias.fixed), coord)
+                if alias.fixed_row
+                else (coord, str(alias.fixed))
+            )
+            es = access.dtype.itemsize
+            chunk = f"(({col}) * {es} // 16)"
+            swz = _swizzled_chunk(row, chunk, tile.cpr)
+            address = (
+                f"{tile.base(em.stage_var(alias.loop))} + ({row}) * {tile.row_bytes}"
+                f" + {swz} * 16 + (({col}) * {es}) % 16"
+            )
+            op = "lds_f32" if access.dtype == torch.float32 else "lds_b32"
+            return em.bind("md_v", f"{_RUNTIME}.{op}({address})")
         address = em.address(access, coords)
+        # An element past a ragged axis' extent loads as zero (the
+        # frontend's masked-value model), under a predicate.
+        bounds = em.bounds(access, coords)
         hoist = em.hoist_level(access, coords)
         if hoist is not None:
             # A loop-invariant per-thread load goes out once, ahead of the
@@ -639,10 +853,14 @@ class _Evaluator:
             # the registers.
             key = (node, coords)
             if key not in hoist.loads:
+                pred = None
+                if bounds is not None:
+                    pred = em.df.new_var("md_ok")
+                    em.hoist(hoist, f"{pred} = {em.pred_int(bounds)}")
                 value = em.df.new_var("md_sl")
                 em.hoist(
                     hoist,
-                    f"{value} = {em.scalar_load(address, access.dtype, readonly=em.readonly(access))}",
+                    f"{value} = {em.scalar_load(address, access.dtype, pred, readonly=em.readonly(access))}",
                 )
                 typed = value
                 if access.dtype in _WIDENED:
@@ -654,7 +872,23 @@ class _Evaluator:
             if access.dtype in _WIDENED:
                 self.scopes[-1][("raw", key)] = value
             return typed
-        aux = em.aux_level(access, coords)
+        # An element past a ragged axis' extent loads as zero under a
+        # predicate; the aux ring and the register prefetch stage only the
+        # unpredicated loads.
+        pred = None if bounds is None else em.bind("md_ok", em.pred_int(bounds))
+        shared = em.aux_shared_level(access) if pred is None else None
+        if shared is not None:
+            # An fp32 scalar / vector the aux ring copies once per CTA into
+            # the loop's side tile (``AuxRing.shared``: the pass's decay
+            # scalar and gate row, the carry rescale's, a derived value's
+            # row): this iteration's slot holds its block extent, landed and
+            # published by the previous iteration's wait and barrier (the
+            # tile rides one group ahead of the operand tiles), so it is
+            # read at the lane's own coordinate anywhere in the iteration.
+            if not em.aux_synced:
+                em.aux_shared_early.add(shared)
+            return em.bind("md_v", em.aux_shared_read(shared, access, coords))
+        aux = em.aux_level(access, coords) if pred is None else None
         if aux is not None:
             value = None
             ring = em.plan.aux_rings[aux.loop]
@@ -686,7 +920,7 @@ class _Evaluator:
                     return value
                 self.scopes[-1][("raw", (node, coords))] = value
                 return em.retyped(value, access.dtype)
-        prefetch = em.prefetch_level(access, coords)
+        prefetch = em.prefetch_level(access, coords) if pred is None else None
         if prefetch is not None:
             # A loop-variant per-thread load of the innermost loop: its
             # register was loaded one iteration ahead (the first iteration's
@@ -699,7 +933,8 @@ class _Evaluator:
                 self.scopes[-1][("raw", (node, coords))] = value
                 return em.retyped(value, access.dtype)
         value = em.bind(
-            "md_v", em.scalar_load(address, access.dtype, readonly=em.readonly(access))
+            "md_v",
+            em.scalar_load(address, access.dtype, pred, readonly=em.readonly(access)),
         )
         if access.dtype not in _WIDENED:
             return value
@@ -749,6 +984,42 @@ class _Evaluator:
         return em.bind("md_v", ast.unparse(result))
 
 
+def _load_args(address: str, pred: str | None, readonly: bool) -> str:
+    """The argument list of a per-lane global load: the address, the Int32
+    predicate of a ``*_pred`` form, or ``nc=True`` for the read-only
+    (``ld.global.nc``) form of an unpredicated load."""
+    if pred is not None:
+        return f"{address}, {pred}"
+    return f"{address}, nc=True" if readonly else address
+
+
+def _float_literal(value: float) -> str:
+    """Python source for a float constant: ``repr`` for a finite value;
+    ``inf``, ``-inf`` and ``nan`` repr to bare names (undefined in the
+    generated module), so they are spelled as ``float(...)`` calls."""
+    if math.isinf(value):
+        return "float('inf')" if value > 0 else "float('-inf')"
+    if math.isnan(value):
+        return "float('nan')"
+    return repr(value)
+
+
+def _frag_dtype(node: Node) -> torch.dtype | None:
+    """The 16-bit dtype a fragment leaf's FX value has (a rounded ``aten.mm``
+    or a 16-bit-typed derived value): its fp32 register is re-typed on every
+    read.  None for an fp32 fragment."""
+    rounded = rounded_dot_dtype(node)
+    if rounded is not None:
+        return rounded
+    val = node.meta.get("val")
+    if isinstance(val, torch.Tensor) and val.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return val.dtype
+    return None
+
+
 class _Lane(NamedTuple):
     """One element position of a pair: tile-local coordinates, the packet
     element (a 2-D tile leaf) and the fragment register it reads."""
@@ -774,6 +1045,91 @@ _ADDERS = (
     torch.ops.aten.rsub.Scalar,
     torch.ops.aten.addcmul.default,
 )
+
+
+class _RingAlias(NamedTuple):
+    """A vector load served from a ring tile's slot (see
+    ``_Emitter._ring_aliases``): the tile, its loop, whether the vector's
+    constant index is the tile's row (else its column) and that index."""
+
+    tile: _Tile
+    loop: int
+    fixed_row: bool
+    fixed: int
+
+
+def _ring_alias(
+    plan: MmaDagPlan,
+    access: Access,
+    loop: int,
+    tile: _Tile,
+    load: Access,
+    rows_pos: int,
+) -> _RingAlias | None:
+    """``access`` (a vector load) as a row or column of the ring tile
+    ``tile`` staged for ``load`` in loop ``loop``, or None (see
+    ``_Emitter._ring_aliases`` for the conditions)."""
+    if (
+        access.name != load.name
+        or access.strides != load.strides
+        or access.dtype != load.dtype
+        or len(access.subscripts) != len(load.subscripts)
+        or len(load.tile_dims) != 2
+        or plan.program.level(access) != loop
+    ):
+        return None
+    fixed: tuple[int, int] | None = None
+    shared: int | None = None
+    tile_position = 0
+    for own, staged in zip(access.subscripts, load.subscripts, strict=True):
+        if own.window is not None or staged.window is not None:
+            return None
+        if staged.kind == "axis":
+            axis = staged.axis
+            assert axis is not None
+            if staged.offset is not None or own.offset is not None:
+                return None
+            if axis.kind == AXIS_LEAD:
+                if own.kind != "axis" or own.axis is not axis:
+                    return None
+                continue
+            position = tile_position
+            tile_position += 1
+            if own.kind == "axis":
+                if own.axis is not axis or shared is not None or plan.ragged(axis):
+                    return None
+                shared = position
+                continue
+            if (
+                own.loop_dependent
+                or axis.kind != AXIS_RDIM
+                or not isinstance(own.expr, sympy.Integer)
+                or fixed is not None
+            ):
+                return None
+            value = int(own.expr)
+            if not 0 <= value < axis.extent or value >= plan.size(axis):
+                return None
+            fixed = (position, value)
+            continue
+        if (
+            own.kind != "scalar"
+            or own.expr != staged.expr
+            or own.loops != staged.loops
+            or own.loop_dependent != staged.loop_dependent
+        ):
+            return None
+    if fixed is None or shared is None:
+        return None
+    position, value = fixed
+    rows, cols = (tile.rows, tile.cols)
+    if position == rows_pos:
+        if value >= rows:
+            return None
+        return _RingAlias(tile, loop, True, value)
+    if value >= cols:
+        return None
+    return _RingAlias(tile, loop, False, value)
 
 
 def _packable(node: Node) -> bool:
@@ -1049,10 +1405,11 @@ class _Tile:
 
 
 class _Emitter:
-    # The ``(atom, half)`` vector register a chain reads a row vector from
-    # when no vector step set ``_Evaluator.vec_reg`` (None: such chains are
-    # not rendered here).
-    vec_reg_default: tuple[int, int] | None = None
+    # Whether a windowed tile's rows at and past its limit hold memory the
+    # reads must mask (the tcgen05 renderers' TMA boxes land the window's
+    # whole rows); the warp emitter's packets and per-lane loads zero-fill
+    # them as they are staged.
+    masked_tile_windows = False
 
     def __init__(self, cg: GenerateAST, plan: MmaDagPlan) -> None:
         self.cg = cg
@@ -1067,7 +1424,15 @@ class _Emitter:
         }
         self.base_vars: dict[Node, str] = {}
         self.iter_vars: dict[Node, str] = {}
-        self.deferred: list[str] = []
+        # L2 cache policy ("evict_last" / "evict_first") -> the register
+        # holding its policy word (see ``render``).
+        self.policy_vars: dict[str, str] = {}
+        # Loop bounds read from tensors (``program.scalar_loads``) -> the
+        # Int32 holding the value (defined with the root iteration bases).
+        self.scalar_vars: dict[Node, str] = {}
+        # Global stores deferred past the next fragment loads, each under
+        # its row guard (None: unguarded).
+        self.deferred: list[tuple[str | None, str]] = []
         self._defined_tiles: set[str] = set()
         # Lane terms of the shuffle route (see ``emit_shuffle_words``).
         self.quad_terms: dict[str, tuple[str, str]] = {}
@@ -1093,10 +1458,22 @@ class _Emitter:
         self.aux_sites: dict[int, dict[tuple[Node, Coords], int]] = {}
         self.aux_anchors: dict[int, list[tuple[_Hoist, dict[int, str], str]]] = {}
         self.aux_closed: set[int] = set()
+        # The ``for`` lines of the innermost loops being emitted (the pre-loop
+        # wait of a side tile read ahead of the iteration barrier goes right
+        # ahead of the ``for``, once the body is rendered): kept current by
+        # ``insert_line`` like the hoist anchors, since the body's hoisted
+        # lines land ahead of the loop's prologue, above the ``for``.
+        self.loop_entries: list[_Hoist] = []
         # The current iteration of an aux-ring loop waited for its stage /
         # passed the barrier that publishes the stage's vectors.
         self.aux_waited = False
         self.aux_synced = False
+        # Per aux-ring loop being iterated, the side tile slot of the current
+        # iteration (``AuxRing.shared``; bound at the iteration top), and the
+        # loops whose side tile is read ahead of the iteration barrier (the
+        # first iteration then needs the pre-loop wait and barrier).
+        self.aux_shared_stage: dict[int, str] = {}
+        self.aux_shared_early: set[int] = set()
         # The TMA ring (``MMA_DAG_LOADS_TMA`` in the warp mode): (tile name,
         # load node) -> (its tensor map, its loop) -- a tile shared by two
         # loops' operands is fetched by each loop's own access --, the maps,
@@ -1214,6 +1591,8 @@ class _Emitter:
                 elif program.is_ring(dot, operand):
                     buffer = self.stage_var(dot.loop)
                 else:
+                    # (A pass chain's tile among them: one copy, written
+                    # behind the iteration barrier like an exchange tile.)
                     buffer = "0"
                 self.tile_buffers[(dot.node, operand.role)] = buffer
                 self.tiles[(dot.node, operand.role)] = self.shared_tiles[
@@ -1253,6 +1632,77 @@ class _Emitter:
             )
             for node, spec in staging_specs.items()
         }
+        # The fp32 scalars and vectors the aux rings copy once per CTA into
+        # their side tiles and the lanes read by coordinate
+        # (``AuxRing.shared``), by node.
+        self.shared_aux_nodes: set[Node] = {
+            node for ring in plan.aux_rings.values() for node in ring.shared
+        }
+        # Vector loads served from a ring slot (see ``_ring_aliases``) and
+        # the loops whose current slot is landed and published (between the
+        # iteration barrier behind the cp.async wait and the iteration's end).
+        self.ring_ready: set[int] = set()
+        self.ring_aliases = self._ring_aliases()
+
+    def _ring_aliases(self) -> dict[Node, _RingAlias]:
+        """The loop's vector loads that read a row or a column of a tile
+        the same loop stages through its cp.async ring, as the ring slot
+        they alias: ``gc[idx, i_t, C - 1, tile_d]`` beside the staged
+        ``gc[idx, i_t, :, tile_d]`` (the chunk's last decay row, read by
+        the carry rescale and the key's decay pass).  The slot holds the
+        same bytes after the iteration's wait and barrier, so the lanes
+        read them from shared memory (``_load``: ``lds`` at the slot's
+        swizzled address) instead of re-fetching the row from global
+        memory on the chain -- the same values.
+
+        Fail closed: the staged tile must be a plain copy of its source (a
+        derived value's tile or a direct-route operand tile, not a tile a
+        pass rewrites in place, not a transposed fp32 tile), 4-byte
+        elements, the two accesses the same tensor at the same strides and
+        uniform subscripts, the vector's one tile dim the tile's own axis
+        and its other tile dim a constant inside a ``:`` rdim, no windows,
+        offsets or ragged axes.
+        """
+        program, plan = self.program, self.plan
+        stored = {store.access.node for store in program.stores}
+        stored.update(store.access.node for store in program.vec_stores)
+        tiles: list[tuple[int, _Tile, Access, int]] = []
+        for loop in program.loops:
+            if not loop.innermost:
+                continue
+            for dot, operand in plan.ring_operands(loop.index):
+                tile = self.tiles[(dot.node, operand.role)]
+                if (
+                    plan.route(dot, operand) != ROUTE_DIRECT
+                    or operand.transposed_tile
+                    or tile.raw is not None
+                    or operand.load is None
+                ):
+                    continue
+                tiles.append((loop.index, tile, operand.load, operand.rows_pos))
+            for _derived, access in plan.ring_derived(loop.index):
+                tiles.append((loop.index, self.derived_tiles[access.node], access, 0))
+        result: dict[Node, _RingAlias] = {}
+        for access in program.accesses:
+            if access.node in stored or access.node in result:
+                continue
+            if access.node in self.shared_aux_nodes:
+                # Staged in its loop's aux ring's side tile (``cute_mma_dag_
+                # aux='ring'``): read from there; the two routes never share
+                # a load.
+                continue
+            if len(access.tile_dims) != 1 or access.dtype.itemsize != 4:
+                continue
+            if _storage(access) in self.stored_storages:
+                # A tensor the program stores to: the slot's copy could be
+                # older than the global bytes a load would see.
+                continue
+            for loop_index, tile, load, rows_pos in tiles:
+                alias = _ring_alias(plan, access, loop_index, tile, load, rows_pos)
+                if alias is not None:
+                    result[access.node] = alias
+                    break
+        return result
 
     # -- rendering primitives ---------------------------------------------
 
@@ -1317,13 +1767,15 @@ class _Emitter:
         self.insert_line(hoist, line)
 
     def insert_line(self, anchor: _Hoist, line: str) -> None:
-        """Insert ``line`` at ``anchor`` (a loop's hoist point or an aux issue
-        anchor), keeping every later anchor's position current."""
+        """Insert ``line`` at ``anchor`` (a loop's hoist point, an aux issue
+        anchor or a loop's ``for`` line), keeping every later anchor's
+        position current."""
         position = anchor.position
         self.lines.insert(position, f"{anchor.indent}{line}")
         anchors = [
             *self.hoists,
             *(a for v in self.aux_anchors.values() for a, _, _ in v),
+            *self.loop_entries,
         ]
         for later in anchors:
             if later is not anchor and later.position >= position:
@@ -1374,37 +1826,70 @@ class _Emitter:
         return _storage(access) not in self.stored_storages
 
     def scalar_load(
-        self, address: str, dtype: torch.dtype, *, readonly: bool = False
+        self,
+        address: str,
+        dtype: torch.dtype,
+        pred: str | None = None,
+        *,
+        readonly: bool = False,
     ) -> str:
-        nc = ", nc=True" if readonly else ""
+        """One element at ``address`` as an fp32 / int32 scalar; under an
+        Int32 ``pred`` (see ``pred_int``) a zero where it is 0, else the
+        read-only (``ld.global.nc``) form when ``readonly`` (the predicated
+        loads have no ``.nc`` form)."""
+        suffix = "" if pred is None else "_pred"
+        args = _load_args(address, pred, readonly)
         if dtype == torch.float32:
-            return f"{_RUNTIME}.ldg_f32({address}{nc})"
+            return f"{_RUNTIME}.ldg_f32{suffix}({args})"
         if dtype == torch.int32:
-            return f"{_RUNTIME}.ldg_s32({address}{nc})"
+            return f"{_RUNTIME}.ldg_s32{suffix}({args})"
         if dtype == torch.float16:
-            return f"{_RUNTIME}.ldg_f16_as_f32({address}{nc})"
+            return f"{_RUNTIME}.ldg_f16_as_f32{suffix}({args})"
         assert dtype == torch.bfloat16, dtype
-        return f"{_RUNTIME}.ldg_bf16_as_f32({address}{nc})"
+        return f"{_RUNTIME}.ldg_bf16_as_f32{suffix}({args})"
 
     def pair_load(
-        self, address: str, dtype: torch.dtype, paired: bool, *, readonly: bool = False
+        self,
+        address: str,
+        dtype: torch.dtype,
+        paired: bool,
+        pred: str | None = None,
+        *,
+        readonly: bool = False,
     ) -> tuple[str, str]:
-        """Two adjacent elements at ``address`` as fp32 scalars."""
+        """Two adjacent elements at ``address`` as fp32 scalars (zeros
+        under a false Int32 ``pred``)."""
         lo, hi = self.df.new_var("md_lo"), self.df.new_var("md_hi")
-        nc = ", nc=True" if readonly else ""
+        suffix = "" if pred is None else "_pred"
+        args = _load_args(address, pred, readonly)
         if not paired:
-            self.emit(f"{lo} = {self.scalar_load(address, dtype, readonly=readonly)}")
             self.emit(
-                f"{hi} = {self.scalar_load(f'{address} + {dtype.itemsize}', dtype, readonly=readonly)}"
+                f"{lo} = {self.scalar_load(address, dtype, pred, readonly=readonly)}"
+            )
+            self.emit(
+                f"{hi} = {self.scalar_load(f'{address} + {dtype.itemsize}', dtype, pred, readonly=readonly)}"
             )
         elif dtype == torch.float32:
-            self.emit(f"{lo}, {hi} = {_RUNTIME}.ldg_v2_f32({address}{nc})")
+            self.emit(f"{lo}, {hi} = {_RUNTIME}.ldg_v2_f32{suffix}({args})")
         else:
             unpack = "unpack_f16x2" if dtype == torch.float16 else "unpack_bf16x2"
             self.emit(
-                f"{lo}, {hi} = {_RUNTIME}.{unpack}({_RUNTIME}.ldg_b32({address}{nc}))"
+                f"{lo}, {hi} = {_RUNTIME}.{unpack}({_RUNTIME}.ldg_b32{suffix}({args}))"
             )
         return lo, hi
+
+    def constant(self, value: object, dtype: torch.dtype) -> str:
+        """A scalar constant of the DSL type of ``dtype`` (a ``_mask_to``
+        fill)."""
+        if dtype == torch.int32:
+            return f"cutlass.Int32({int(cast('int', value))})"
+        if dtype == torch.bool:
+            return f"cutlass.Boolean({bool(value)})"
+        if not dtype.is_floating_point:
+            raise _decline(f"no {dtype} fill for a masked value")
+        return self.typed(
+            f"cutlass.Float32({_float_literal(float(cast('float', value)))})", dtype
+        )
 
     def pair_store(
         self, address: str, lo: str, hi: str, dtype: torch.dtype, paired: bool
@@ -1510,11 +1995,57 @@ class _Emitter:
 
     def bound(self, value: object) -> str:
         if isinstance(value, torch.fx.Node):
+            if value in self.scalar_vars:
+                return self.scalar_vars[value]
             val = value.meta["val"]
             if isinstance(val, int):
                 return str(val)
             return self.df.sympy_expr(val._sympy_())
         return str(value)
+
+    def define_scalar_load(self, access: Access) -> None:
+        """A uniform scalar read from a tensor (a loop bound, a window's
+        offset or limit) as an Int32: one load at the access's base (its
+        only address: a 0-d access has no tile dims).  Defined with the
+        bases, ahead of the accesses that window on it and of every loop."""
+        if access.node in self.scalar_vars:
+            return
+        base = self.base_vars[access.node]
+        # An int64 table value is narrowed to Int32: the value is a row
+        # index or a row count of a tensor dim (a static extent, below
+        # 2**31), so the narrowing is exact for every in-range value; a
+        # value past 2**31 is not representable and is not guarded here.
+        load = (
+            f"{_RUNTIME}.ldg_s32({base})"
+            if access.dtype == torch.int32
+            else f"cutlass.Int32({_RUNTIME}.ldg_s64({base}))"
+        )
+        self.scalar_vars[access.node] = self.bind("md_scalar", load)
+
+    def window_guard(self, access: Access, position: int, coord: str) -> str | None:
+        """The DSL Boolean saying tile-local ``coord`` of value dim
+        ``position`` of ``access`` is a row of its window: below the limit
+        and inside the tensor dim (None: the dim is not windowed)."""
+        window = access.window_at(position)
+        if window is None:
+            return None
+        limit = self.scalar_vars[window.limit.node]
+        offset = self.scalar_vars[window.offset.node]
+        return f"({coord} < {limit} and {offset} + {coord} < {window.extent})"
+
+    def row_exists(self, access: Access, tile_position: int, coord: str) -> str | None:
+        """The Boolean saying tile-local ``coord`` along fragment dim
+        ``tile_position`` of ``access`` is a row that exists: inside a
+        ragged root axis' extent and inside the dim's window (None: every
+        row does)."""
+        axis = access.tile_dims[tile_position]
+        terms = []
+        if self.plan.ragged(axis):
+            terms.append(self.in_bounds(axis, coord))
+        window = self.window_guard(access, access.tile_positions[tile_position], coord)
+        if window is not None:
+            terms.append(window)
+        return " and ".join(terms) if terms else None
 
     def axis_base(self, axis: Axis) -> str:
         """The CTA's first index along ``axis`` (loop axes: per iteration)."""
@@ -1537,15 +2068,96 @@ class _Emitter:
                 continue
             if axis.kind in (AXIS_LOOP, AXIS_RDIM):
                 continue
-            self.emit(
-                f"{self.axis_base(axis)} = cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})"
+            self.define(
+                self.axis_base(axis),
+                f"cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})",
             )
         self.define_trip_counts()
 
+    # -- ragged root tiles ---------------------------------------------------
+    #
+    # A root tile may overshoot its axis extent (``mma_dag_config_reason``
+    # admits it for the axes ``ragged_root_axes`` names): the rows past the
+    # extent exist in the fragments and the shared tiles but not in memory.
+    # The operand staging zero-fills them, the side loads read zero under a
+    # predicate, ``_mask_to`` takes its fill there and the stores are
+    # guarded -- all keyed by the element's tile-local coordinate along the
+    # axis against the CTA's first index.
+
+    def in_bounds(self, axis: Axis, coord: str) -> str:
+        """The DSL Boolean saying tile-local ``coord`` of ragged ``axis`` is
+        a row the CTA owns: below the block when the fragment is padded
+        past it, inside the extent when the block does not divide it."""
+        block = self.plan.block(axis)
+        terms = []
+        if block < self.plan.size(axis):
+            terms.append(f"{coord} < {block}")
+        if axis.extent % block:
+            terms.append(f"{self.axis_base(axis)} + {coord} < {axis.extent}")
+        assert terms, "in_bounds of an axis that is not ragged"
+        return f"({' and '.join(terms)})"
+
+    def bounds(self, access: Access, coords: Coords) -> str | None:
+        """The Boolean saying the element of ``access`` at ``coords`` exists
+        (None: every element does -- no dim of the access is ragged or
+        windowed)."""
+        terms = [
+            self.in_bounds(axis, coords[position])
+            for position, axis in enumerate(access.dims)
+            if axis.kind != AXIS_LEAD and self.plan.ragged(axis)
+        ]
+        for position, _window in access.windows:
+            terms.append(
+                cast("str", self.window_guard(access, position, coords[position]))
+            )
+        return " and ".join(terms) if terms else None
+
+    def axis_of_dim(self, node: Node, position: int) -> Axis | None:
+        """The program axis behind dim ``position`` of ``node`` (None for a
+        size-1 dim or a dim no axis tiles)."""
+        size = _shape(node)[position]
+        block_id = self.env.resolve_block_id(size)
+        if block_id is None:
+            return None
+        block_id = self.env.canonical_block_id(block_id)
+        return next(
+            (axis for axis in self.program.axes if axis.block_id == block_id), None
+        )
+
+    def value_bounds(self, node: Node, coords: Coords) -> str | None:
+        """The Boolean saying the element of value ``node`` at ``coords``
+        lies inside every ragged axis among its dims (None: no dim is)."""
+        terms = []
+        for position in range(len(_shape(node))):
+            axis = self.axis_of_dim(node, position)
+            if axis is not None and self.plan.ragged(axis):
+                terms.append(self.in_bounds(axis, coords[position]))
+        return " and ".join(terms) if terms else None
+
+    @staticmethod
+    def pred_int(bounds: str) -> str:
+        """``bounds`` (a DSL Boolean) as the Int32 operand of the predicated
+        runtime loads (``ldg_*_pred``)."""
+        return f"cutlass.Int32(1) if {bounds} else cutlass.Int32(0)"
+
+    def bounds_pred(self, access: Access, coords: Coords) -> str | None:
+        """The Int32 predicate of a per-lane load of ``access`` at ``coords``
+        bound at the current site (None: unpredicated)."""
+        bounds = self.bounds(access, coords)
+        if bounds is None:
+            return None
+        return self.bind("md_ok", self.pred_int(bounds))
+
     def define_bases(self) -> None:
         """Per-access byte bases: the tensor pointer plus the loop-invariant
-        scalar subscripts and the root / leading tile offsets (Int64)."""
-        for access in self.program.accesses:
+        scalar subscripts and the root / leading tile offsets (Int64).  The
+        uniform scalar loads come first (their bases are their addresses),
+        so the accesses windowing on them can add the offsets they hold."""
+        scalar_nodes = {access.node for access in self.program.scalar_loads}
+        ordered = sorted(
+            self.program.accesses, key=lambda access: access.node not in scalar_nodes
+        )
+        for access in ordered:
             if access.node in self.base_vars:
                 continue
             name = self.df.tensor_arg(access.fake, prefer_name=access.name).name
@@ -1563,6 +2175,10 @@ class _Emitter:
                         terms.append(
                             f"cutlass.Int64({self.uniform(subscript.offset, {})}) * {scale}"
                         )
+                    if subscript.window is not None:
+                        terms.append(
+                            f"cutlass.Int64({self.scalar_vars[subscript.window.offset.node]}) * {scale}"
+                        )
                     if axis.kind == AXIS_LOOP or (
                         axis.kind == AXIS_RDIM and not self.is_split_axis(axis)
                     ):
@@ -1574,6 +2190,8 @@ class _Emitter:
                         f"cutlass.Int64({self.uniform(subscript.expr, {})}) * {scale}"
                     )
             self.base_vars[access.node] = self.bind("md_base", " + ".join(terms))
+            if access.node in scalar_nodes:
+                self.define_scalar_load(access)
 
     def iteration_base(self, access: Access, values: dict[int, str] | str) -> str:
         """The access base for the iterations whose loop indices are
@@ -1653,6 +2271,10 @@ class _Emitter:
             return None
         if _storage(access) in self.stored_storages:
             return None
+        if access.node in self.ring_aliases:
+            # Served from this iteration's ring slot behind the barrier
+            # (``_ring_aliases``): not loaded ahead as well.
+            return None
         names = {name for text in coords for name in re.findall(_IDENTIFIER, text)}
         if any(
             name not in self.name_depth or self.name_depth[name] > hoist.depth
@@ -1718,6 +2340,7 @@ class _Emitter:
             or hoist.loop not in self.plan.aux_rings
             or hoist.loop in self.aux_closed
             or self.program.level(access) != hoist.loop
+            or access.node in self.shared_aux_nodes
         ):
             return None
         if access.dtype.itemsize not in (2, 4):
@@ -1785,6 +2408,117 @@ class _Emitter:
         op = "lds_f16_as_f32" if dtype == torch.float16 else "lds_bf16_as_f32"
         return f"{_RUNTIME}.{op}({address} + {half})"
 
+    def aux_shared_level(self, access: Access) -> int | None:
+        """The innermost ring loop being iterated whose aux ring copies
+        scalar / vector ``access`` once per CTA into its side tile
+        (``AuxRing.shared``; None: none does): read by coordinate at any
+        site of the iteration (the slot landed and was published an
+        iteration ahead)."""
+        if not self.hoists:
+            return None
+        loop = self.hoists[-1].loop
+        ring = self.plan.aux_rings.get(loop)
+        if (
+            ring is None
+            or access.node not in ring.shared
+            or self.program.level(access) != loop
+            or loop not in self.aux_shared_stage
+        ):
+            return None
+        return loop
+
+    def has_aux_shared(self, loop: int) -> bool:
+        """Whether ``loop``'s aux ring has a side tile."""
+        ring = self.plan.aux_rings.get(loop)
+        return ring is not None and bool(ring.shared)
+
+    def aux_shared_base(self, loop: int, slot: str) -> str:
+        """Shared address of side tile slot ``slot`` of ``loop``'s aux ring
+        (the slots follow the ring's ``stages`` stages of per-thread words
+        and runs)."""
+        ring = self.plan.aux_rings[loop]
+        base = self.aux_base(loop)
+        region = ring.shared_base - ring.offset
+        if region:
+            base = f"{base} + {region}"
+        return f"{base} + {slot} * {ring.shared_bytes}"
+
+    def aux_shared_slot(self, loop: Loop, value: str) -> str:
+        """The side tile slot of ``loop``'s iteration ``value``: the
+        iteration's ordinal modulo the ``stages + 1`` slots."""
+        ring = self.plan.aux_rings[loop.index]
+        begin = self.loop_bounds(loop)[0]
+        offset = f"({value})" if begin == "0" else f"(({value}) - {begin})"
+        return f"{offset} % {ring.shared_slots}"
+
+    def aux_shared_read(self, loop: int, access: Access, coords: Coords) -> str:
+        """The current iteration's element of side tile entry ``access`` at
+        ``coords`` (its one tile coordinate; a scalar has none) from the
+        iteration's slot."""
+        ring = self.plan.aux_rings[loop]
+        _elements, offset = ring.shared[access.node]
+        address = self.aux_shared_base(loop, self.aux_shared_stage[loop])
+        if offset:
+            address = f"{address} + {offset}"
+        if access.tile_dims:
+            coord = coords[access.tile_positions[0]]
+            if coord != "0":
+                address = f"{address} + ({coord}) * 4"
+        return f"{_RUNTIME}.lds_f32({address})"
+
+    def emit_aux_shared(
+        self, loop: Loop, values: dict[int, str], slot: str | None = None
+    ) -> None:
+        """``cp.async`` the side tile of ``loop``'s iteration at ``values``
+        into its slot (``slot``, or the iteration's own): the scalar by
+        thread 0, element ``t`` of each vector by thread ``t`` round robin
+        over the CTA, 4 bytes each (no commit: the tile rides the group
+        being issued)."""
+        ring = self.plan.aux_rings[loop.index]
+        threads = ring.threads
+        if slot is None:
+            slot = self.aux_shared_slot(loop, values[loop.index])
+        slot = self.aux_shared_base(loop.index, slot)
+        for node, (elements, offset) in ring.shared.items():
+            access = self.accesses[node]
+            source = self.iteration_base_expr(access, values)
+            target = f"{slot} + {offset}" if offset else slot
+            if elements == 1:
+                with self.nest("if md_tidx == 0:"):
+                    self.emit(f"{_RUNTIME}.cp_async_4({target}, {source})")
+                continue
+            stride = access.tile_dim_strides[0] * access.dtype.itemsize
+            for first in range(0, elements, threads):
+                idx = f"(md_tidx + {first})" if first else "md_tidx"
+                with (
+                    self.nest(f"if {idx} < {elements}:")
+                    if elements - first < threads
+                    else contextlib.nullcontext()
+                ):
+                    self.emit(
+                        f"{_RUNTIME}.cp_async_4({target} + {idx} * 4,"
+                        f" {source} + cutlass.Int64({idx}) * {stride})"
+                    )
+
+    def emit_aux_shared_ahead(
+        self, loop: Loop, outer: dict[int, str], ahead: int
+    ) -> None:
+        """The side tile of iteration ``begin + ahead`` of ``loop`` (at the
+        enclosing loops' values ``outer``; slot ``ahead`` of the fresh
+        ring), guarded against the trip count where it is not static."""
+        if not self.has_aux_shared(loop.index):
+            return
+        begin, end, trip_static = self.loop_bounds(loop)
+        value = f"({begin} + {ahead})" if ahead else begin
+        values = {**outer, loop.index: value}
+        slot = str(ahead % self.plan.aux_rings[loop.index].shared_slots)
+        if trip_static is not None:
+            if ahead < trip_static:
+                self.emit_aux_shared(loop, values, slot)
+            return
+        with self.nest(f"if {value} < {end}:"):
+            self.emit_aux_shared(loop, values, slot)
+
     def aux_run_values(self, loop: int, access: Access, packet: str) -> list[str]:
         """The fp32 values of the run of ``access`` the packet at chunk
         ``packet`` reads (one 16-byte shared read per 16 bytes), in element
@@ -1834,7 +2568,8 @@ class _Emitter:
     ) -> list[str]:
         """``cp.async`` of each aux site's word (a 16-bit element copies the
         aligned word holding it) and of each run of the iteration at
-        ``values`` into the thread's slots at ``stage``."""
+        ``values`` into the thread's slots at ``stage`` (the side tile of
+        an iteration rides one group ahead: ``emit_aux_shared``)."""
         lines: list[str] = []
         for (node, coords), slot in self.aux_sites.get(loop, {}).items():
             access = self.accesses[node]
@@ -2159,8 +2894,11 @@ class _Emitter:
         an innermost loop's operand or derived tile (not a converted
         operand's raw tile) of at most 256 rows and 1, 2, 4 or 8 chunks per
         row (the box is one swizzle atom wide, so the emitter's XOR swizzle
-        is TMA's), a source ``async_tile_reason`` admits, and ring slots at
-        the swizzle pattern's period.  Other tiles keep their packets."""
+        is TMA's), a source ``async_tile_reason`` admits, no windowed dim
+        (a window's rows at and past its runtime limit load as zero: the
+        packets zero-fill them row by row, a box lands whole;
+        ``tma_tile_source``), and ring slots at the swizzle pattern's
+        period.  Other tiles keep their packets."""
         plan = self.plan
         if plan.compute != MMA_DAG_WARP or plan.loads != MMA_DAG_LOADS_TMA:
             return
@@ -2171,9 +2909,15 @@ class _Emitter:
             if not loop.innermost:
                 continue
             for tile, load, rows_pos in self.ring_items(loop.index):
+                if load.node in plan.load_hints:
+                    # A hinted tile keeps its cp.async packets: the L2 policy
+                    # rides them (``MMA_DAG_L2_HINTS``), the bulk tensor copy
+                    # carries none.
+                    continue
                 if (
                     tile.is_raw
                     or len(load.tile_dims) != 2
+                    or load.windows
                     or tile.rows > 256
                     or tile.cpr not in (1, 2, 4, 8)
                     or tile.slots != plan.stages
@@ -2301,6 +3045,18 @@ class _Emitter:
         tile = self.tiles[(dot.node, operand.role)]
         self.emit_issue_tile(tile.raw or tile, load, operand.rows_pos, self.values, "0")
 
+    def policy_var(self, hint: str) -> str:
+        """The register holding the L2 cache-policy word of ``hint``
+        ("evict_last" / "evict_first"): bound once, in the prologue for the
+        tiles ``render`` knows cp.async stages, at the first packet
+        otherwise."""
+        name = self.policy_vars.get(hint)
+        if name is None:
+            name = self.policy_vars[hint] = self.bind(
+                f"md_pol_{hint}", f"{_RUNTIME}.l2_policy_{hint}()"
+            )
+        return name
+
     def emit_issue_tile(
         self,
         tile: _Tile,
@@ -2313,19 +3069,67 @@ class _Emitter:
         smem = tile.base(stage)
         gbase = self.iteration_base(load, values)
         row_bytes = tile.row_bytes
+        # The rows of a ragged axis past the extent, and of a window past
+        # its limit, are zero-filled (the packet reads nothing: ``src-size``
+        # 0).
+
+        # The packets carry the L2 cache policy of the load's
+        # ``load_eviction_policies`` slot (``MmaDagPlan.load_hints``; the
+        # policy word is created once in the prologue, ``policy_var``) as
+        # ``cp.async.cg.shared.global.L2::cache_hint``.  A pure cache hint:
+        # the bits are the plain packets'.  The CuTe DSL's embedded
+        # assembler (cutlass-dsl 4.7.0: ptxas 13.3.27) has dropped the
+        # uniform-register operand fields of that instruction whenever it
+        # keeps a uniform term of the shared address in a uniform register:
+        # the SASS reads ``[R42+UR0+0xc00], desc[UR1]`` -- registers no
+        # instruction of the kernel writes -- where ptxas 13.4.59 encodes
+        # the same PTX as ``[R42+UR10+0xc00], desc[UR11]`` with both
+        # registers written just before, and the kernel dies with
+        # CUDA_ERROR_ILLEGAL_INSTRUCTION (the kda WY transform's warp
+        # configs did, in the autotuner's initial population).  Which
+        # packets get that encoding is the assembler's register allocation,
+        # not anything the render controls, so a kernel with hinted packets
+        # declares ``MMA_DAG_HINTED_CP_ASYNC_CHECK`` and the launcher
+        # verifies the SASS of every LDGSTS before the kernel may run
+        # (``helion.runtime.cute.sass_check``: an LDGSTS naming a uniform
+        # register the kernel never writes, and -- conservatively, until
+        # the DSL's assembler is validated on it -- the split-address form
+        # itself): a refused kernel never launches, and the autotuner drops
+        # its config.
+        hint = self.plan.load_hints.get(load.node)
+        policy = f", {self.policy_var(hint)}" if hint is not None else ""
+        suffix = "_l2" if hint is not None else ""
+        if hint is not None:
+            self.declare_sass_check()
 
         def body(pk: _Packet) -> None:
             gofs = f" + {pk.row_off * row_stride}" if pk.row_off else ""
-            self.emit(
-                f"{_RUNTIME}.cp_async_16({smem} + {pk.offset(row_bytes)} + {pk.swz} * 16, "
-                f"{gbase} + cutlass.Int64({pk.pr}) * {row_stride} + cutlass.Int64({pk.pch} * 16){gofs})"
-            )
+            dst = f"{smem} + {pk.offset(row_bytes)} + {pk.swz} * 16"
+            src = f"{gbase} + cutlass.Int64({pk.pr}) * {row_stride} + cutlass.Int64({pk.pch} * 16){gofs}"
+            guard = self.row_exists(load, rows_pos, pk.prow)
+            if guard is not None:
+                src_bytes = self.bind(
+                    "md_zf",
+                    f"cutlass.Int32(16) if {guard} else cutlass.Int32(0)",
+                )
+                self.emit(
+                    f"{_RUNTIME}.cp_async_16{suffix}_zfill({dst}, {src}, {src_bytes}{policy})"
+                )
+            else:
+                self.emit(f"{_RUNTIME}.cp_async_16{suffix}({dst}, {src}{policy})")
 
         self.own_packets(tile, body)
 
+    def declare_sass_check(self) -> None:
+        """Record on the device function that the kernel's SASS must pass the
+        hinted ``cp.async`` encoding check before it runs."""
+        state = self.cg.device_function.cute_state
+        if MMA_DAG_HINTED_CP_ASYNC_CHECK not in state.sass_checks:
+            state.sass_checks = (*state.sass_checks, MMA_DAG_HINTED_CP_ASYNC_CHECK)
+
     def hoist_scalars(self, value: Node) -> None:
         """Evaluate the 0-d (uniform) values under ``value`` once."""
-        for node in _scalar_nodes(self.program, value):
+        for node in _scalar_nodes(self.program, value, self.evaluator.inline):
             self.evaluator.evaluate(node, ())
 
     def emit_bound_tail_zero(self, index: int, stage: str) -> None:
@@ -2580,8 +3384,12 @@ class _Emitter:
                 f"{self.iter_vars[load.node]} + cutlass.Int64({prow}) * {row_stride} "
                 f"+ cutlass.Int64({pcol}) * {2 * load_es}"
             )
+            guard = self.row_exists(load, operand.rows_pos, prow)
+            pred = (
+                self.bind("md_ok", self.pred_int(guard)) if guard is not None else None
+            )
             lo, hi = self.pair_load(
-                address, load.dtype, paired, readonly=self.readonly(load)
+                address, load.dtype, paired, pred, readonly=self.readonly(load)
             )
             self.set_tile_leaf(load, 0, lo)
             self.set_tile_leaf(load, 1, hi)
@@ -2614,6 +3422,125 @@ class _Emitter:
             self.evaluator.pop()
             if nest is not None:
                 nest.__exit__(None, None, None)
+
+    def pass_grid(self, operand: Operand) -> tuple[int, int]:
+        """``(rows, cols)`` of a pass chain's source tiles (the chain's
+        fragment shape: every source is loaded at those coordinates)."""
+        root = self.program.chain_root(operand)
+        assert root is not None
+        return self.plan.slot_shape(self.program.frag_slots[root])
+
+    def emit_derived_pass(self, dot: Dot, operand: Operand, stage: str) -> None:
+        """Write a pass chain's operand tile from the chain's staged source
+        tiles (``cute_mma_dag_derived='pass'``): every thread takes
+        eight-element groups of the source rows round-robin over the CTA
+        (one 16-byte packet of a 16-bit source, two of an fp32 one), loads
+        each source's group from its ring slot, evaluates the operand value
+        through the chain's pointwise DAG in fp32 and stores the eight
+        results into the swizzled operand tile -- packed and rounded once
+        for a 16-bit operand, as two fp32 packets for a tf32 one (scattered
+        per element into a transposed tf32 B tile), the way the convert
+        pass widens a single source."""
+        program = self.program
+        root = program.chain_root(operand)
+        assert root is not None
+        tile = self.tiles[(dot.node, operand.role)]
+        smem = tile.base(stage)
+        rows, cols = self.pass_grid(operand)
+        sources = []
+        for access in program.chain_loads(root):
+            source = self.derived_tiles[access.node]
+            assert (source.rows, source.cols) == (rows, cols)
+            sources.append((access, source, source.base(self.stage_var(dot.loop))))
+        inline = frozenset(step.node for step in program.pass_chains[root])
+        saved = self.evaluator.inline
+        self.evaluator.inline = inline
+        self.hoist_scalars(operand.value)
+        # The groups follow a 16-bit tile's packet grid (eight elements each).
+        grid = _Tile("", 0, rows, cols, 2, 1)
+        es = operand.dtype.itemsize
+        cpr, row_bytes = tile.cpr, tile.row_bytes
+
+        def body(pk: _Packet) -> None:
+            prow, pg = pk.prow, pk.pch
+            for access, source, base in sources:
+                if access.dtype == torch.float32:
+                    # Group g of an fp32 row: its chunks 2g and 2g + 1.
+                    for half in range(2):
+                        swz = _swizzled_chunk(
+                            pk.srow, f"({pg} * 2 + {half})", source.cpr
+                        )
+                        names = [self.df.new_var("md_f") for _ in range(4)]
+                        self.emit(
+                            f"{', '.join(names)} = {_RUNTIME}.lds_v4_f32("
+                            f"{base} + {pk.offset(source.row_bytes)} + {swz} * 16)"
+                        )
+                        for e, name in enumerate(names):
+                            self.set_tile_leaf(access, 4 * half + e, name)
+                    continue
+                unpack = (
+                    "unpack_f16x2" if access.dtype == torch.float16 else "unpack_bf16x2"
+                )
+                words = [self.df.new_var("md_w") for _ in range(4)]
+                self.emit(
+                    f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32("
+                    f"{base} + {pk.offset(source.row_bytes)} + {pk.swz} * 16)"
+                )
+                for q, word in enumerate(words):
+                    lo, hi = self.df.new_var("md_lo"), self.df.new_var("md_hi")
+                    self.emit(f"{lo}, {hi} = {_RUNTIME}.{unpack}({word})")
+                    self.set_tile_leaf(access, 2 * q, lo)
+                    self.set_tile_leaf(access, 2 * q + 1, hi)
+            values = []
+            for e in range(0, 8, 2):
+                lanes = tuple(
+                    _Lane(
+                        self.tile_coords(operand, prow, f"({pg} * 8 + {e + bit})"),
+                        e + bit,
+                        None,
+                    )
+                    for bit in range(2)
+                )
+                if es == 4:
+                    values.extend(self.evaluator.pair(operand.value, lanes))
+                else:
+                    values.extend(self.evaluator.unrounded_pair(operand.value, lanes))
+            self.evaluator.element = None
+            if es != 4:
+                packed = [
+                    self.pack(values[2 * q], values[2 * q + 1], operand.dtype)
+                    for q in range(4)
+                ]
+                self.emit(
+                    f"{_RUNTIME}.sts_v4_b32({smem} + {pk.offset(row_bytes)} + {pk.swz} * 16, "
+                    f"{', '.join(packed)})"
+                )
+                return
+            if operand.transposed_tile:
+                # Element (prow, 8g + e) of the source lands at row 8g + e,
+                # column prow of the transposed fp32 tile (see the convert
+                # pass: the rows per round divide 4).
+                col4 = (
+                    f"({pk.pr} // 4 + {pk.row_off // 4})"
+                    if pk.row_off
+                    else f"({pk.pr} // 4)"
+                )
+                for e, value in enumerate(values):
+                    row = f"({pg} * 8 + {e})"
+                    dst = _transposed_swizzle(row, col4, cpr)
+                    self.emit(
+                        f"{_RUNTIME}.sts_f32({smem} + {row} * {row_bytes} + {dst} * 16 + {pk.srow} % 4 * 4, {value})"
+                    )
+                return
+            for half in range(2):
+                dst = _swizzled_chunk(pk.srow, f"({pg} * 2 + {half})", cpr)
+                self.emit(
+                    f"{_RUNTIME}.sts_v4_f32({smem} + {pk.offset(row_bytes)} + {dst} * 16, "
+                    f"{', '.join(values[4 * half : 4 * half + 4])})"
+                )
+
+        self.own_packets(grid, body)
+        self.evaluator.inline = saved
 
     def emit_exchange(self, dot: Dot, operand: Operand) -> None:
         """Write the operand value (a pointwise DAG over a fragment) into its
@@ -2709,6 +3636,9 @@ class _Emitter:
         gbase = self.iteration_base(access, self.values)
         base = tile.base(parity)
         threads = self.plan.threads
+        # The staging rows are the store's first tile dim (``staged_store_
+        # reason``); a ragged axis or a window there drops the packets past
+        # the extent / the limit.
         for rep in range(-(-tile.packets // threads)):
             idx = f"({rep * threads} + md_tidx)" if rep else "md_tidx"
             guard = tile.packets < (rep + 1) * threads
@@ -2726,15 +3656,23 @@ class _Emitter:
                 f"{_RUNTIME}.stg_v4_b32({gbase} + cutlass.Int64({prow}) * {row_stride} "
                 f"+ cutlass.Int64({pch} * 16), {', '.join(words)})"
             )
+            row_guard = self.row_exists(access, 0, prow)
             if nest is not None:
-                self.emit(line)
+                self.emit_guarded(row_guard, line)
                 nest.__exit__(None, None, None)
             else:
-                self.deferred.append(line)
+                self.deferred.append((row_guard, line))
+
+    def emit_guarded(self, guard: str | None, line: str) -> None:
+        if guard is None:
+            self.emit(line)
+            return
+        with self.nest(f"if {guard}:"):
+            self.emit(line)
 
     def flush_deferred(self) -> None:
-        for line in self.deferred:
-            self.emit(line)
+        for guard, line in self.deferred:
+            self.emit_guarded(guard, line)
         self.deferred = []
 
     def emit_store(self, store: Store) -> None:
@@ -2745,6 +3683,7 @@ class _Emitter:
         positions = access.tile_positions
         paired = self.pairs_aligned(access, 1) and not store.swap
         self.hoist_scalars(store.value)
+        self.evaluator.enter_frag(slot)
         for am in range(layout.atoms_m):
             for an in range(layout.atoms_n):
                 for half in range(2):
@@ -2770,11 +3709,18 @@ class _Emitter:
                     first, second = (col, row) if store.swap else (row, col)
                     coords[positions[0]] = first
                     coords[positions[1]] = second
+                    # Elements past a ragged axis' extent are not stored.
                     if paired:
                         address = self.address(access, tuple(coords))
-                        self.pair_store(
-                            address, values[0], values[1], access.dtype, True
-                        )
+                        guard = self.bounds(access, tuple(coords))
+                        with (
+                            self.nest(f"if {guard}:")
+                            if guard is not None
+                            else contextlib.nullcontext()
+                        ):
+                            self.pair_store(
+                                address, values[0], values[1], access.dtype, True
+                            )
                     else:
                         for bit in range(2):
                             element = list(coords)
@@ -2787,17 +3733,94 @@ class _Emitter:
                                 torch.float16: "stg_f16",
                                 torch.bfloat16: "stg_bf16",
                             }[access.dtype]
-                            self.emit(f"{_RUNTIME}.{scalar}({address}, {values[bit]})")
+                            self.emit_guarded(
+                                self.bounds(access, tuple(element)),
+                                f"{_RUNTIME}.{scalar}({address}, {values[bit]})",
+                            )
+        self.evaluator.leave_frag()
 
     # -- fragments ----------------------------------------------------------------
+
+    def frag_vec(self, leaf: Node, coords: Coords) -> str:
+        """The register of vector ``leaf`` at the fragment element the
+        evaluator is at (``evaluator.reg`` of ``evaluator.frag_slot``): the
+        vector's own register when its family follows this fragment's warp
+        grid and it varies along the dim its orientation names (a row
+        vector along the rows: register ``(am, j // 2)``; a column vector
+        along the columns: ``(an, j & 1)``), else a copy relaid through the
+        scratch tile at the element's coordinate, once per step."""
+        evaluator = self.evaluator
+        assert evaluator.reg is not None and evaluator.frag_slot is not None
+        program = self.program
+        frag_slot = evaluator.frag_slot
+        vslot = program.vec_leaves[leaf]
+        vec = program.vec_slots[vslot]
+        rows, cols = program.slots[frag_slot]
+        assert vec.axis is not None
+        # (Over one axis the dim is positional: the matcher recorded the
+        # broadcast the vector was read with.)
+        along_rows = (
+            program.vec_positions[leaf] == 0 if rows is cols else vec.axis is rows
+        )
+        am, an, j = evaluator.reg
+        # Warp grids are interned per fragment shape (``self.layouts``), so
+        # identity here is shape equality: every fragment of the vector's
+        # family shape shares the one ``_Layout`` object.
+        if (
+            self.vec_layouts[vslot] is self.slot_layouts[frag_slot]
+            and (vec.orient == "rows") == along_rows
+        ):
+            if along_rows:
+                return self.vreg(vslot, am, j // 2)
+            return self.vreg(vslot, an, j & 1)
+        key = (leaf, frag_slot)
+        names = evaluator.frag_vecs.get(key)
+        if names is None:
+            names = self.relayout_to_frag(leaf, frag_slot, along_rows)
+            evaluator.frag_vecs[key] = names
+        return names[evaluator.reg]
+
+    def relayout_to_frag(
+        self, leaf: Node, frag_slot: int, along_rows: bool
+    ) -> dict[tuple[object, ...], str]:
+        """Bring vector ``leaf`` to the register positions of fragment slot
+        ``frag_slot`` through the scratch tile: the owning lanes write each
+        element, every lane reads the elements of its registers' rows
+        (``along_rows``) or columns.  Returns register -> temporary."""
+        program = self.program
+        vslot = program.vec_leaves[leaf]
+        base = self.scratch_base()
+        layout = self.slot_layouts[frag_slot]
+        prefix = self.df.new_var("md_fv")
+        with self.nest(f"if {self.vec_owner(vslot)}:"):
+            for atom, half in self.vec_regs(vslot):
+                index = self.vec_index(vslot, atom, half)
+                self.emit(
+                    f"{_RUNTIME}.sts_f32({base} + ({index}) * 4, {self.vreg(vslot, atom, half)})"
+                )
+        self.emit(self.sync)
+        names: dict[tuple[object, ...], str] = {}
+        by_index: dict[str, str] = {}
+        for am, an, j in layout.registers():
+            index = layout.row(am, j // 2) if along_rows else layout.col(an, j & 1)
+            name = by_index.get(index)
+            if name is None:
+                name = f"{prefix}_{len(by_index)}"
+                self.emit(f"{name} = {_RUNTIME}.lds_f32({base} + ({index}) * 4)")
+                by_index[index] = name
+            names[(am, an, j)] = name
+        # The scratch is reused by the next vector operation: every lane read.
+        self.emit(self.sync)
+        return names
 
     def emit_carry_init(self, loop: Loop) -> None:
         for carry in loop.carries:
             layout = self.slot_layouts[carry.slot]
-            if carry.init_value is not None:
+            if carry.init_value is not None and carry.init is None:
                 # A pointwise value over a fragment of the enclosing region,
                 # evaluated per register into the carry's registers.
                 self.hoist_scalars(carry.init_value)
+                self.evaluator.enter_frag(carry.slot)
                 updates = []
                 for am, an, j in layout.registers():
                     self.evaluator.reg = (am, an, j)
@@ -2808,7 +3831,58 @@ class _Emitter:
                             self.evaluator.evaluate(carry.init_value, coords),
                         )
                     )
-                self.evaluator.reg = None
+                self.evaluator.leave_frag()
+                for name, value in updates:
+                    self.emit(f"{name} = {value}")
+                continue
+            if carry.init_value is not None:
+                # A pointwise value over a 2-D load (``A = -(beta * Akk[b])``):
+                # the tile's pairs loaded at the fragment coordinates, the
+                # chain evaluated per register into the carry's registers.
+                init = carry.init
+                assert init is not None
+                self.hoist_scalars(carry.init_value)
+                self.evaluator.enter_frag(carry.slot)
+                paired = self.pairs_aligned(init, 1)
+                positions = init.tile_positions
+                updates = []
+                for am in range(layout.atoms_m):
+                    for an in range(layout.atoms_n):
+                        for half in range(2):
+                            coords = ["0"] * len(init.dims)
+                            coords[positions[0]] = layout.row(am, half)
+                            coords[positions[1]] = layout.col(an)
+                            address = self.address(init, tuple(coords))
+                            lo, hi = self.pair_load(
+                                address,
+                                init.dtype,
+                                paired,
+                                self.bounds_pred(init, tuple(coords)),
+                            )
+                            self.set_tile_leaf(init, 0, lo)
+                            self.set_tile_leaf(init, 1, hi)
+                            lanes = tuple(
+                                _Lane(
+                                    self.frag_coords(
+                                        carry.init_value, layout, am, an, 2 * half + bit
+                                    ),
+                                    bit,
+                                    (am, an, 2 * half + bit),
+                                )
+                                for bit in range(2)
+                            )
+                            for bit, value in enumerate(
+                                self.evaluator.pair(carry.init_value, lanes)
+                            ):
+                                updates.append(
+                                    (
+                                        self.reg(carry.slot, am, an, 2 * half + bit),
+                                        value,
+                                    )
+                                )
+                            self.evaluator.reg = None
+                            self.evaluator.element = None
+                self.evaluator.leave_frag()
                 for name, value in updates:
                     self.emit(f"{name} = {value}")
                 continue
@@ -2845,7 +3919,11 @@ class _Emitter:
                         coords[positions[1]] = layout.col(an)
                         address = self.address(init, tuple(coords))
                         lo, hi = self.pair_load(
-                            address, init.dtype, paired, readonly=self.readonly(init)
+                            address,
+                            init.dtype,
+                            paired,
+                            self.bounds_pred(init, tuple(coords)),
+                            readonly=self.readonly(init),
                         )
                         self.emit(f"{self.reg(carry.slot, am, an, 2 * half)} = {lo}")
                         self.emit(
@@ -2868,6 +3946,8 @@ class _Emitter:
                     )
             return
         self.hoist_scalars(dot.acc)
+        # (The accumulator's slot shares the dot's layout: same shape.)
+        self.evaluator.enter_frag(dot.slot)
         updates = []
         for am, an, j in layout.registers():
             self.evaluator.reg = (am, an, j)
@@ -2878,7 +3958,7 @@ class _Emitter:
                     self.evaluator.evaluate(dot.acc, coords),
                 )
             )
-        self.evaluator.reg = None
+        self.evaluator.leave_frag()
         for name, value in updates:
             self.emit(f"{name} = {value}")
 
@@ -3218,6 +4298,11 @@ class _Emitter:
         cprs = {tile.cpr for tile in self.tiles.values()}
         cprs |= {tile.raw.cpr for tile in self.tiles.values() if tile.raw is not None}
         cprs |= {tile.cpr for tile in self.derived_tiles.values()}
+        # The derived passes walk eight-element groups of their source rows.
+        cprs |= {
+            self.pass_grid(operand)[1] // 8
+            for _dot, operand in self.plan.derived_pairs()
+        }
         for cpr in sorted(cprs):
             if self.plan.threads % cpr:
                 continue
@@ -3288,6 +4373,25 @@ class _Emitter:
             for index, ring in self.plan.aux_rings.items():
                 self.emit(f"{self.aux_base(index)} = md_s0 + {ring.offset}")
         self.define_bases()
+        # The L2 cache-policy words of the hinted tiles cp.async stages (the
+        # asynchronously routed operands and the derived values' ring
+        # tiles), one per policy: ``createpolicy`` once, every packet of the
+        # tile names it (``emit_issue_tile``).
+        used: set[str] = set()
+        for dot in self.program.dots:
+            for operand in (dot.a, dot.b):
+                if operand.load is not None and self.plan.route(dot, operand) in (
+                    ROUTE_DIRECT,
+                    ROUTE_INPLACE,
+                    ROUTE_CONVERT,
+                ):
+                    used.add(self.plan.load_hints.get(operand.load.node, ""))
+        used.update(
+            self.plan.load_hints.get(access.node, "")
+            for _derived, access in self.plan.ring_derived()
+        )
+        for hint in sorted(used - {""}):
+            self.policy_var(hint)
         self.define_iteration_bases(-1)
         self.emit_region(self.program.body, -1, set())
         return "\n".join(self.lines) + "\n"
@@ -3381,12 +4485,17 @@ class _Emitter:
             self.emit_dot(step, "0")
             self.defined.add(step.node)
         elif isinstance(step, Derived):
+            if step.node in plan.absorbed:
+                return
             self.emit_derived(step)
             self.defined.add(step.node)
         elif isinstance(step, Store):
             self.emit_store(step)
         elif isinstance(step, Reduce):
             self.emit_reduce(step)
+        elif isinstance(step, Scan):
+            self.emit_scan(step)
+            self.defined.add(step.node)
         elif isinstance(step, VecOp):
             self.emit_vec_op(step)
         elif isinstance(step, VecStore):
@@ -3693,10 +4802,40 @@ class _Emitter:
                     self.async_pending = True
                 else:
                     self.emit_ring_prologue(loop, self.values)
+            elif ring and self.has_aux_shared(loop.index):
+                # One stage: the first iteration's side tile goes out ahead
+                # of the loop in a group of its own.
+                self.emit_aux_shared_ahead(loop, self.values, 0)
+                self.commit_group()
+                self.async_pending = True
+            # The ``for`` line: the body's loop-invariant side loads and
+            # redirected values are hoisted ahead of the prologue while it
+            # renders, so ``insert_line`` keeps the entry current.
+            entry = _Hoist(len(self.lines), self.indent, len(self.values), loop.index)
+            self.loop_entries.append(entry)
             with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
                 self.values[loop.index] = var
                 self.emit_iteration(loop, begin, end, ring, body_written)
                 del self.values[loop.index]
+            self.aux_shared_stage.pop(loop.index, None)
+            assert self.loop_entries.pop() is entry
+            assert self.lines[entry.position].lstrip().startswith(f"for {var} in ")
+            if ring and loop.index in self.aux_shared_early:
+                # The side tile is read ahead of the iteration barrier (the
+                # carry rescale's scalar at the top, the pass's gate row):
+                # the first iteration's tile rode the first group, so it is
+                # landed, and published to every lane, before the loop
+                # (iteration ``i``'s wait and barrier do the same for the
+                # side tile of ``i + 1``).  Read behind the barrier alone,
+                # the tile needs nothing ahead of the loop: the first
+                # iteration's wait and barrier publish the tiles of
+                # iterations 0 and 1 together, and the group's operand
+                # packets keep landing under the iteration's early work.
+                for line in (
+                    f"cute.arch.cp_async_wait_group({max(self.plan.stages - 2, 0)})",
+                    self.sync,
+                ):
+                    self.insert_line(entry, line)
             if loop.index in self.tma_tx:
                 count = self.tma_count(loop.index)
                 self.emit(f"{count} = {count} + ({end} - {begin})")
@@ -3732,7 +4871,10 @@ class _Emitter:
         ``outer``: the first ``stages - 1`` iterations' tiles, one commit
         group each (an iteration past the end commits an empty group so the
         wait depth stays uniform); iteration ``ahead`` takes ring and raw
-        slot ``ahead`` (below the raw ring's depth of ``stages - 1``)."""
+        slot ``ahead`` (below the raw ring's depth of ``stages - 1``).  The
+        aux ring's side tiles ride one group ahead of their operand tiles:
+        group ``ahead`` carries iteration ``ahead + 1``'s (and the first
+        group iteration ``begin``'s, waited for before the loop)."""
         ring = self.ring_items(loop.index)
         begin, end, trip_static = self.loop_bounds(loop)
         stages = self.plan.stages
@@ -3754,6 +4896,9 @@ class _Emitter:
                 with self.nest(f"if {value} < {end}:"):
                     self.emit_issue(ring, values, slot, str(ahead))
                     self.aux_anchor(loop.index, values, slot)
+            if ahead == 0:
+                self.emit_aux_shared_ahead(loop, outer, 0)
+            self.emit_aux_shared_ahead(loop, outer, ahead + 1)
             self.commit_group()
         self.async_pending = True
 
@@ -3849,11 +4994,20 @@ class _Emitter:
         staged_stores = [store for store in plan.staged_stores if store.loop == index]
         if staged_stores or parity in self.tile_buffers.values():
             self.emit(f"{parity} = {var} % 2")
+        if ring and self.has_aux_shared(index):
+            self.aux_shared_stage[index] = self.bind(
+                "md_sstage", self.aux_shared_slot(loop, var)
+            )
         self.define_iteration_bases(index)
         self.evaluator = _Evaluator(self)
         if ring and stages == 1:
             self.emit_issue(ring, self.values, "0")
             self.aux_anchor(index, self.values, "0")
+            if self.has_aux_shared(index):
+                # The next iteration's side tile, landed with this group and
+                # published by the barrier below.
+                with self.nest(f"if {var} + 1 < {end}:"):
+                    self.emit_aux_shared(loop, {**self.values, index: f"({var} + 1)"})
             self.commit_group()
             self.async_pending = True
         # Work that needs no shared data overlaps the copies in flight.
@@ -3885,6 +5039,9 @@ class _Emitter:
                 (ROUTE_EXCHANGE,),
             )
             if program.early_exchange(dot, operand)
+            # (A chain reading a row of this iteration's ring slot waits for
+            # the slot: its exchange runs in the body, behind its own barrier.)
+            and not any(a.node in self.ring_aliases for a in operand.aux_loads)
         ]
         for dot, operand in early:
             self.emit_exchange(dot, operand)
@@ -3928,11 +5085,18 @@ class _Emitter:
             self.emit_convert_pass(dot, operand, stage)
         self.emit_bound_tail_zero(index, stage)
         self.emit(self.sync)
+        # Every lane's aux copies of this stage are landed and published
+        # (the next iteration's side tile with them).
+        self.aux_synced = True
         # The next iteration's side loads of the passes and the carry
         # rescale land in their registers while the MMAs run (issued after
         # the MMAs instead, fwd_h measured 2.78 / 4.23 us against 2.62 /
         # 3.76 at s1 / s2 shapes).
         self.emit_prefetch_refills(loop, var, end)
+        if ring:
+            # This iteration's slot is landed and published: the vector
+            # loads aliasing its rows read it (``_ring_aliases``).
+            self.ring_ready.add(index)
         if ring and stages > 1:
             # Past the barrier every lane finished the previous iteration's
             # reads of the slot refilled here (``stages - 1`` iterations ahead
@@ -3957,7 +5121,26 @@ class _Emitter:
                 ):
                     self.emit(line)
                 self.aux_closed.add(index)
+            if self.has_aux_shared(index):
+                # The side tile one iteration further: waited for at
+                # iteration ``var + ahead``, published by its barrier, read
+                # at ``var + ahead + 1`` (its slot was last read at ``var +
+                # ahead - stages``, two barriers ago).
+                with self.nest(f"if {var} + {ahead + 1} < {end}:"):
+                    self.emit_aux_shared(
+                        loop, {**self.values, index: f"({var} + {ahead + 1})"}
+                    )
             self.commit_group()
+        derived_passes = plan.derived_pairs(index)
+        if derived_passes:
+            # The derived passes run with the refill in flight (they read
+            # the derived tiles of this iteration's slot and write their own
+            # operand slot, which the refill never touches) and publish
+            # behind a barrier of their own -- where the exchange route
+            # computed the fragment and wrote its tile.
+            for dot, operand in derived_passes:
+                self.emit_derived_pass(dot, operand, stage)
+            self.emit(self.sync)
         # This iteration's snapshots (written into the staging buffer before
         # the barrier) stream out as 16-byte packets; the next iteration
         # writes the other buffer.
@@ -3968,6 +5151,7 @@ class _Emitter:
         # their own barrier) right before it, derived values register by
         # register, stores at their program point.
         written.update(operand.chain_key for _d, operand in early)
+        absorbed = plan.absorbed
         for step in steps:
             if isinstance(step, Dot):
                 pending = [
@@ -3986,6 +5170,9 @@ class _Emitter:
                 self.emit_dot(step, stage)
                 self.defined.add(step.node)
             elif isinstance(step, Derived):
+                if step.node in absorbed:
+                    # Its value went into the pass-routed operand tile.
+                    continue
                 self.emit_derived(step)
                 self.defined.add(step.node)
             elif isinstance(step, Store):
@@ -3993,6 +5180,9 @@ class _Emitter:
                     self.emit_store(step)
             elif isinstance(step, Reduce):
                 self.emit_reduce(step)
+            elif isinstance(step, Scan):
+                self.emit_scan(step)
+                self.defined.add(step.node)
             elif isinstance(step, VecOp):
                 self.emit_vec_op(step)
             elif isinstance(step, VecStore):
@@ -4005,6 +5195,7 @@ class _Emitter:
         # reads of the body) refill here.
         self.emit_prefetch_refills(loop, var, end)
         self.emit_carry_copies(loop)
+        self.ring_ready.discard(index)
         if not (ring and stages > 1):
             # Every lane finished reading the slot the next iteration refills.
             self.emit(self.sync)
@@ -4043,6 +5234,14 @@ class _Emitter:
                 continue
             if step.acc_frag not in loop.carry_placeholders:
                 continue
+            if any(
+                access.node in self.ring_aliases
+                for access in program.acc_loads.get(step.node, ())
+            ):
+                # The rescale reads a row of this iteration's ring slot
+                # (``_ring_aliases``): it runs behind the iteration barrier,
+                # at the dot.
+                continue
             slot = step.slot
             reads_slot = False
             for earlier in steps[:index]:
@@ -4059,6 +5258,8 @@ class _Emitter:
                     leaves = [earlier.frag]
                 elif isinstance(earlier, Reduce):
                     leaves = [earlier.frag] if earlier.frag is not None else []
+                elif isinstance(earlier, Scan):
+                    leaves = [earlier.frag]
                 elif isinstance(earlier, (VecOp, VecStore)):
                     continue
                 else:
@@ -4170,12 +5371,13 @@ class _Emitter:
         layout = self.slot_layouts[frag_slot]
         rows = step.orient == "rows"
         self.hoist_scalars(step.value)
+        self.evaluator.enter_frag(frag_slot)
         values: dict[tuple[int, int, int], str] = {}
         for am, an, j in layout.registers():
             self.evaluator.reg = (am, an, j)
             coords = self.frag_coords(step.value, layout, am, an, j)
             values[(am, an, j)] = self.evaluator.evaluate(step.value, coords)
-        self.evaluator.reg = None
+        self.evaluator.leave_frag()
         partials: dict[tuple[int, int], str] = {}
         for atom, half in self.vec_regs(step.slot):
             if rows:
@@ -4264,6 +5466,95 @@ class _Emitter:
             self.emit(self.sync)
         self.emit(f"{self.vreg(step.slot, 0, 0)} = {total}")
 
+    def emit_scan(self, step: Scan) -> None:
+        """An inclusive prefix sum of a pointwise value over a fragment down
+        (``reverse``: up) every column, into the scan's slot.
+
+        In the mma.sync C layout a column's rows sit in the octet of lanes
+        sharing ``c`` (row ``g`` of each half of each m atom), so per
+        column register: the octet scans its eight rows with three
+        ``shfl.up`` / ``shfl.down`` adds (the lanes past the edge keep
+        their value), the halves and m atoms chain in row order with the
+        segment total broadcast from the edge lane, and the warps along M
+        (``wm > 1``) exchange their column totals through the scratch tile,
+        each adding the totals of the warps before (after) it in a fixed
+        order.  The input registers are all read before the slot is
+        written, so the scan may take over its input's slot."""
+        layout = self.slot_layouts[step.slot]
+        if step.orient != "rows":
+            raise _decline("a scan along the fragment columns")
+        reverse = step.reverse
+        self.hoist_scalars(step.value)
+        # The value is evaluated over the input fragment's registers (the
+        # scan's slot has the same shape); the vectors it reads beside the
+        # fragment resolve at each register's row / column (``frag_vec``).
+        self.evaluator.enter_frag(self.program.frag_slots[step.frag])
+        values: dict[tuple[int, int, int], str] = {}
+        for am, an, j in layout.registers():
+            self.evaluator.reg = (am, an, j)
+            coords = self.frag_coords(step.value, layout, am, an, j)
+            values[(am, an, j)] = self.evaluator.evaluate(step.value, coords)
+        self.evaluator.leave_frag()
+        # Row segments of the warp tile in scan order: (m atom, half).
+        segments = [(am, half) for am in range(layout.atoms_m) for half in range(2)]
+        if reverse:
+            segments.reverse()
+        shuffle = f"{_RUNTIME}.{'shfl_down_add_f32' if reverse else 'shfl_up_add_f32'}"
+        # The lane holding a segment's last scanned row: g == 7 (reverse:
+        # g == 0) of the column's quad.
+        edge = "md_c" if reverse else "28 + md_c"
+        results: dict[tuple[int, int, int], str] = {}
+        totals: dict[tuple[int, int], str] = {}
+        for an in range(layout.atoms_n):
+            for bit in range(2):
+                carry: str | None = None
+                for am, half in segments:
+                    value = values[(am, an, 2 * half + bit)]
+                    for offset in (1, 2, 4):
+                        value = self.bind("md_sc", f"{shuffle}({value}, {4 * offset})")
+                    if carry is not None:
+                        value = self.bind("md_sc", f"{value} + {carry}")
+                    results[(am, an, 2 * half + bit)] = value
+                    carry = self.bind(
+                        "md_sc",
+                        f"cute.arch.shuffle_sync({value}, {edge}, mask=0xffffffff, mask_and_clamp=31)",
+                    )
+                assert carry is not None
+                totals[(an, bit)] = carry
+        if layout.wm > 1:
+            # Every warp's column totals, then the sum of the warps before
+            # (after) this one in a fixed order.
+            base = self.scratch_base()
+            cols = layout.cols
+            warp = f"md_L{layout.index}_wmi"
+            with self.nest("if md_g == 0:"):
+                for (an, bit), total in totals.items():
+                    self.emit(
+                        f"{_RUNTIME}.sts_f32({base} + ({warp} * {cols} + {layout.col(an, bit)}) * 4, {total})"
+                    )
+            self.emit(self.sync)
+            for an in range(layout.atoms_n):
+                for bit in range(2):
+                    prefix = self.bind("md_sc", "cutlass.Float32(0.0)")
+                    for other in range(layout.wm):
+                        condition = (
+                            f"{warp} < {other}" if reverse else f"{warp} > {other}"
+                        )
+                        with self.nest(f"if {condition}:"):
+                            self.emit(
+                                f"{prefix} = {prefix} + {_RUNTIME}.lds_f32({base} + ({other * cols} + {layout.col(an, bit)}) * 4)"
+                            )
+                    for am in range(layout.atoms_m):
+                        for half in range(2):
+                            key = (am, an, 2 * half + bit)
+                            results[key] = self.bind(
+                                "md_sc", f"{results[key]} + {prefix}"
+                            )
+            # The scratch is reused by the next vector operation.
+            self.emit(self.sync)
+        for (am, an, j), value in results.items():
+            self.emit(f"{self.reg(step.slot, am, an, j)} = {value}")
+
     def emit_relayout(self, leaf: Node, target: int) -> str:
         """Bring vector ``leaf`` (a row vector) into the layout of column
         vector slot ``target`` or vice versa through the scratch tile: the
@@ -4337,7 +5628,10 @@ class _Emitter:
                 if positions:
                     element[positions[0]] = self.vec_index(slot, atom, half)
                 address = self.address(access, tuple(element))
-                self.emit(f"{_RUNTIME}.stg_f32({address}, {value})")
+                self.emit_guarded(
+                    self.bounds(access, tuple(element)),
+                    f"{_RUNTIME}.stg_f32({address}, {value})",
+                )
 
     def emit_derived(self, step: Derived) -> None:
         """Materialize a derived fragment: evaluate its pointwise DAG per
@@ -4345,6 +5639,10 @@ class _Emitter:
         inputs loaded as pairs at the fragment coordinates."""
         layout = self.slot_layouts[step.slot]
         self.hoist_scalars(step.node)
+        self.evaluator.enter_frag(step.slot)
+        # A 16-bit-typed value: its rounded elements widened (exactly) into
+        # the fp32 registers; the readers re-type them (``_frag_dtype``).
+        widen = _frag_dtype(step.node) is not None
         updates = []
         for am in range(layout.atoms_m):
             for an in range(layout.atoms_n):
@@ -4391,6 +5689,7 @@ class _Emitter:
                                 address,
                                 access.dtype,
                                 paired,
+                                self.bounds_pred(access, tuple(coords)),
                                 readonly=self.readonly(access),
                             )
                         self.set_tile_leaf(access, 0, lo)
@@ -4406,11 +5705,14 @@ class _Emitter:
                     for bit, value in enumerate(
                         self.evaluator.define_pair(step.node, lanes)
                     ):
+                        if widen:
+                            value = f"cutlass.Float32({value})"
                         updates.append(
                             (self.reg(step.slot, am, an, 2 * half + bit), value)
                         )
                     self.evaluator.reg = None
                     self.evaluator.element = None
+        self.evaluator.leave_frag()
         for name, value in updates:
             self.emit(f"{name} = {value}")
 
@@ -4507,9 +5809,13 @@ def _unrounded_select(program: object, source: Node) -> tuple[Node, Node, float]
     return None
 
 
-def _scalar_nodes(program: object, value: Node) -> list[Node]:
+def _scalar_nodes(
+    program: object, value: Node, inline: Collection[Node] = ()
+) -> list[Node]:
     """The 0-d (uniform) loads and pointwise values under ``value``, in
-    evaluation order (a load's tensor and subscript inputs are not values)."""
+    evaluation order (a load's tensor and subscript inputs are not values);
+    the walk descends into the fragment leaves in ``inline`` (a pass
+    chain's derived values, evaluated through their DAG)."""
     from ...language import _tracing_ops
     from ...language import memory_ops
 
@@ -4526,7 +5832,7 @@ def _scalar_nodes(program: object, value: Node) -> list[Node]:
         if (
             node in seen
             or node.op != "call_function"
-            or node in frag_slots
+            or (node in frag_slots and node not in inline)
             or node in vec_leaves
         ):
             return

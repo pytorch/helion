@@ -56,6 +56,27 @@ class Tcgen05LifecycleContext:
     # MMA warp has issued its last MMA (the two-CTA path always does), so
     # the next kernel's launch and prologue overlap this kernel's drain.
     pdl_release: bool = False
+    # Two-CTA row-union kernels (one tile per CTA at the catalogue shapes, so
+    # the whole teardown is exposed): the store warp's ``cp.async.bulk.wait_group
+    # 0`` is independent of the TMEM handshake, and ``free`` is a cross-CTA
+    # rendezvous on the pair's dealloc mbarrier, so the drain is issued after
+    # the dealloc and the two overlap (grouped_gemm s1: 3.58 -> 3.54 us per
+    # call).  The dense two-CTA persistent kernels keep their validated order
+    # (drain, then dealloc).
+    drain_after_dealloc: bool = False
+    # Two-CTA row-union kernels: the MMA warp owns the TMEM allocation
+    # (``tcgen05.alloc``, relinquish, ``free``; ``tmem_allocator_warp`` is its
+    # warp) and frees it right after its accumulator ``producer_tail``: that
+    # tail waits for the epilogue's release of every accumulator stage, and
+    # each release follows the epilogue's ``fence_view_async_tmem_load``, so
+    # every ``tcgen05.ld`` has completed; the MMA writes completed before the
+    # accumulator barriers flipped.  The epilogue warps never meet the MMA
+    # warp again: they go straight from their last TMEM read to their stores
+    # while the MMA warp, idle since its last commit, runs the cross-CTA
+    # dealloc handshake (grouped_gemm s1, one tile per CTA: 3.33 -> 3.23 us
+    # per call).  ``exec_acc_tmem_ptr`` is the pointer the MMA warp frees.
+    mma_warp_frees_tmem: bool = False
+    exec_acc_tmem_ptr: str = ""
 
     def _allocator_with_columns_line(self) -> str:
         return (
@@ -93,9 +114,17 @@ class Tcgen05LifecycleContext:
 
         post_loop_lines: list[str] = []
         short_teardown = self.use_merged_pipeline_init and not self.is_two_cta
+        # The store warp's ``cp.async.bulk.wait_group 0`` is independent of
+        # the TMEM handshake, so the merged-init one-CTA teardown and the
+        # two-CTA row-union teardown (``drain_after_dealloc``) issue it after
+        # the dealloc and overlap the two drains; every other teardown keeps
+        # its long-validated order (drain, then dealloc).
+        drain_after_dealloc = short_teardown or (
+            self.is_two_cta and self.drain_after_dealloc
+        )
         if (
             tma_store_pipeline_tail
-            and not short_teardown
+            and not drain_after_dealloc
             and not self.free_tmem_in_epilogue
         ):
             post_loop_lines.append(tma_store_pipeline_tail)
@@ -116,6 +145,27 @@ class Tcgen05LifecycleContext:
                 f"if {self.exec_active}:\n"
                 "    cute.arch.griddepcontrol_launch_dependents()"
             )
+        if self.mma_warp_frees_tmem:
+            assert self.is_two_cta and not self.free_tmem_in_epilogue
+            assert self.tmem_permit_released_early
+            post_loop_lines.extend(
+                [
+                    (
+                        f"if {self.exec_active}:\n"
+                        f"    {self.acc_pipeline}.producer_tail({self.acc_producer_state})"
+                    ),
+                    self._allocator_with_columns_line(),
+                    (
+                        f"if {self.exec_active}:\n"
+                        f"    {self.tmem_allocator}.free({self.exec_acc_tmem_ptr})"
+                    ),
+                ]
+            )
+            # The store drain was issued at the top unless it follows the
+            # dealloc (``drain_after_dealloc``); never both.
+            if tma_store_pipeline_tail and drain_after_dealloc:
+                post_loop_lines.append(tma_store_pipeline_tail)
+            return post_loop_lines
         post_loop_lines.extend(
             [
                 (f"if {self.exec_active}:\n    {self.tmem_alloc_barrier}.arrive()"),
@@ -155,7 +205,7 @@ class Tcgen05LifecycleContext:
                 ),
             ]
         )
-        if tma_store_pipeline_tail and short_teardown:
+        if tma_store_pipeline_tail and drain_after_dealloc:
             # ``cp.async.bulk.wait_group 0`` on the store warp: issued after the
             # dealloc so the bulk-store drain and the TMEM handshake overlap.
             post_loop_lines.append(tma_store_pipeline_tail)

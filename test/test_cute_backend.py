@@ -1443,6 +1443,41 @@ def cute_dense_attention(q_in, k_in, v_in):
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def cute_dense_attention_post_dot_scale(q_in, k_in, v_in):
+    """``cute_dense_attention`` with the softmax scale on the scores
+    (``(q @ k^T) * scale``) instead of on Q."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt, kt.transpose(1, 2), torch.float32) * qk_scale
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def cute_dense_attention_with_lse(q_in, k_in, v_in):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
@@ -3597,6 +3632,32 @@ class TestCuteBackend(TestCase):
         self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_STAGED, 5)
         self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_CHOICES, (0, 1, 2, 3, 4, 5))
 
+    def test_flash_attention_post_dot_scale_fires_and_matches_sdpa(self) -> None:
+        """The softmax scale on the scores (``(q @ k^T) * scale``) is the same
+        attention body as the pre-scaled-Q form: the fused tcgen05 flash kernel
+        fires at [1,128,128] and matches SDPA for fp16 and bf16 operands."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with (
+                self.subTest(dtype=dtype),
+                patch(
+                    "helion._compiler.cute.backend._detect_specialized_mma_loop",
+                    return_value=True,
+                ),
+            ):
+                q, k, v = (
+                    torch.randn(2, 8, 256, 64, dtype=dtype, device=DEVICE)
+                    for _ in range(3)
+                )
+                code, out = code_and_output(
+                    cute_dense_attention_post_dot_scale,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("flash_kv_prod", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_fires_and_matches_sdpa(self) -> None:
         """With the gate default-on, square fp16 attention at [1,128,128] lowers
         to the fused tcgen05 flash kernel and matches SDPA for head_dim 64/128."""
@@ -4875,10 +4936,12 @@ class TestCuteBackend(TestCase):
                 )
             env = SimpleNamespace(
                 config_spec=spec,
+                # The fallback targets read the root batch block's source
+                # (``_attention_unit_fixed_block``): an autotuned block here.
                 block_sizes={
-                    0: SimpleNamespace(size=256),
-                    1: SimpleNamespace(size=262_144),
-                    2: SimpleNamespace(size=262_144),
+                    0: SimpleNamespace(size=256, block_size_source=None),
+                    1: SimpleNamespace(size=262_144, block_size_source=None),
+                    2: SimpleNamespace(size=262_144, block_size_source=None),
                 },
             )
             device_ir = DeviceIR()
@@ -4899,6 +4962,9 @@ class TestCuteBackend(TestCase):
                     head_dim=64,
                     head_dim_v=64,
                     io_dtype=torch.float16,
+                    v_k_major=False,
+                    score_rank=3,
+                    batch_block_id=None,
                     is_causal=False,
                     score_plan=SimpleNamespace(
                         has_kv_tile_pruning=False,
@@ -6467,7 +6533,10 @@ class TestCuteBackend(TestCase):
         bound = cute_biased_attention.bind((q, k, v, bias))
         code = bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
         self.assertTrue(_flash_fired(code))
-        self.assertIn("add_score_bias_t2r", code)
+        # The generic modifier body adds the bias in pass 1 -- from the staged
+        # ring by default (``cute_flash_bias_stage='tma'``), from global
+        # memory under ``'direct'``.
+        self.assertIn("_helion_flash_rt.add_score_bias_smem_t2r(", code)
         self.assertIn("_flash_mBias", code)
         self.assertIn("flash_fa4_shared_storage", code)
         _assert_score_modified_reductions(self, code)
@@ -6500,7 +6569,8 @@ class TestCuteBackend(TestCase):
         )
         self.assertTrue(_flash_fired(code))
         self.assertIn("flash_tiled_ld_coord", code)
-        self.assertIn("add_score_bias_t2r", code)
+        # Either bias lowering (the staged ring is the default here).
+        self.assertIn("_helion_flash_rt.add_score_bias_", code)
         self.assertNotIn("helion_small_biased_attention", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
@@ -11679,10 +11749,20 @@ class TestCuteBackend(TestCase):
             fired(cute_dense_attention, nonsq, block_sizes=[1, 128, 128]),
             "non-square must not fire flash",
         )
-        # Non-128 tiles (outside the validated 128x128 envelope).
-        self.assertFalse(
-            fired(cute_dense_attention, sq(256), block_sizes=[1, 64, 64]),
-            "non-128 tiles must not fire flash",
+        # Non-128 tiles: the flash surface pins the tiles to its 128x128
+        # envelope, so a provided 64x64 config is normalized onto the pin
+        # (``BlockSizeSpec.pin_structurally``) and the fused kernel runs
+        # over 128-row tiles rather than the scalar lowering over 64-row ones.
+        sq_args = sq(256)
+        code, out = code_and_output(
+            cute_dense_attention, sq_args, block_sizes=[1, 64, 64]
+        )
+        self.assertTrue(_flash_fired(code), "pinned tiles normalize onto 128x128")
+        torch.testing.assert_close(
+            out,
+            torch.nn.functional.scaled_dot_product_attention(*sq_args),
+            atol=1e-2,
+            rtol=1e-2,
         )
         self.assertFalse(
             fired(
@@ -12664,7 +12744,13 @@ class TestCuteBackend(TestCase):
                 for seed in bound.config_spec.compiler_seed_configs
                 if seed.block_sizes == [1, 256, 256, 64]
             }
-            self.assertEqual(seed_layouts, {None, "explicit_epi_tile"})
+            # The batched GEMM also registers the two-CTA paired-pipeline seeds
+            # (``tcgen05_cta_group="two"``, default layout) since the paired
+            # SMEM facts analyze rank-3 operands.
+            self.assertEqual(seed_layouts, {None, "explicit_epi_tile", "default"})
+            self.assertTrue(
+                bound.config_spec._cute_tcgen05_config.paired_pipeline_search_enabled()
+            )
 
             projected = {
                 "block_sizes": [1, 128, 128, 64],
@@ -12776,10 +12862,13 @@ class TestCuteBackend(TestCase):
                 with self.subTest(kernel=kernel.name):
                     kernel.reset()
                     bound = kernel.bind(args)
+                    # The two-CTA paired schedule's batched seeds spell the
+                    # default layout out; it is the same layout as an absent key.
                     layouts = {
-                        seed.config.get("tcgen05_layout_strategy")
+                        strategy if strategy != "default" else None
                         for seed in bound.config_spec.compiler_seed_configs
                         if seed.block_sizes == [1, 256, 256, 64]
+                        for strategy in (seed.config.get("tcgen05_layout_strategy"),)
                     }
                     self.assertEqual(layouts, expected_layouts)
                     config_generation = bound.config_spec.create_config_generation()
@@ -13201,17 +13290,43 @@ class TestCuteBackend(TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         # One N tile: no whole N-tile pair for the cluster_n=2 A multicast.
+        # Every 2x2 family refuses an odd N tile count at the config layer,
+        # ahead of the render's batched refusal, with the reason, so the
+        # search never spends a compile on the sample.
         args = (
             torch.randn(2, 256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 128, 256, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        with (
+            patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+            patch("helion.runtime.get_num_sm", return_value=148),
+        ):
             bound = cute_batched_baddbmm_tcgen05.bind(args)
             with self.assertRaisesRegex(
-                helion.exc.BackendUnsupported,
-                "supports tcgen05_cluster_n=2 only for whole N-tile pairs",
+                helion.exc.InvalidConfig,
+                r"tcgen05_cluster_n=2 pairs N tiles, but cdiv\(256, 256\) = 1 "
+                r"tiles is odd",
             ):
                 bound.to_triton_code(_batched_tcgen05_two_cta_config(cluster_n=2))
+            # The search repair drops the cluster (cluster_n -> 1).  Whether
+            # the CTA pair survives is the quarter-wave gate's call
+            # (``matmul_ops``: the 256x256 two-CTA grid must fill a quarter
+            # of the SMs): two batched tiles against the 37 clusters of 148
+            # SMs admit no cluster_m=2 search at all, so the sample lands on
+            # one CTA with the 128-row tile.  (A CPU bind sees no SMs and
+            # skips the gate, keeping the pair.)  The repaired config is a
+            # strict fixed point and renders without a cluster.
+            self.assertIsNone(bound.config_spec._tcgen05_cluster_m2_search_constraints)
+            repaired = dict(_batched_tcgen05_two_cta_config(cluster_n=2).config)
+            bound.config_spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+            self.assertEqual(repaired["tcgen05_cluster_m"], 1)
+            self.assertEqual(repaired["block_sizes"], [1, 128, 256, 64])
+            strict = dict(repaired)
+            bound.config_spec.normalize(strict)
+            self.assertEqual(strict, repaired)
+            code = bound.to_triton_code(helion.Config(**repaired))
+            self.assertNotIn("_helion_cute_cluster_shape", code)
             # Two N tiles: the cluster pairs them along the scheduler's dim 1
             # (N moves ahead of M for batched grids) and reads the tile
             # coordinates back in (batch, m, n) PID order.
@@ -13220,6 +13335,18 @@ class TestCuteBackend(TestCase):
                 torch.randn(2, 128, 512, device=DEVICE, dtype=HALF_DTYPE),
             )
             bound = cute_batched_baddbmm_tcgen05.bind(args)
+            # The render's own refusal still guards what the config layer
+            # does not judge: an L2 grouping pairs the cluster lanes on the
+            # (batch, m) grid dims of a batched grid, so the A multicast
+            # refuses it cleanly instead of decoding tiles that do not exist.
+            grouped = _batched_tcgen05_two_cta_config(cluster_n=2)
+            grouped.config["l2_groupings"] = [2]
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported,
+                "supports tcgen05_cluster_n=2 only for whole N-tile pairs without "
+                "an L2 swizzle or L2 grouping",
+            ):
+                bound.to_triton_code(grouped)
             code = bound.to_triton_code(_batched_tcgen05_two_cta_config(cluster_n=2))
             self.assertIn(
                 "PersistentTileSchedulerParams((2 * 2, "
@@ -14311,7 +14438,9 @@ class TestCuteBackend(TestCase):
         loop (2x1 256x256x64 ab6 fp16 at 4096x1024x4096: 29.4 -> 28.1 us).
         Narrower tiles already take (128, 32) from CuTe's default rule, and
         one-CTA tiles, fp8 operands, unstaged aux rows, two-store fanout and
-        bk=128's K loop keep what they had.
+        bk=128's K loop keep what they had. The SMEM model prices the subtile
+        the same way: two stores keep the with-source (128, 64) subtile and
+        its 64 KiB of C rings, so ab=6 is refused there before codegen.
         """
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.float16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
@@ -14393,8 +14522,18 @@ class TestCuteBackend(TestCase):
             )
             self.assertNotIn(narrow, code)
             self.assertNotIn("unroll=1", code)
-            code = render(cute_matmul_mma_two_outputs, (x, y))
+            # Two stores: codegen keeps the with-source (128, 64) subtile
+            # (``tcgen05_plain_narrow_subtile`` wants one output store and no
+            # aux descriptors), and the arena model charges two such C rings
+            # (64 KiB), so the plain kernel's ab=6 overflows at 256x256x64
+            # (NVVM rejected the compiled kernel) and ab=5 is the deepest fit.
+            with self.assertRaisesRegex(
+                InvalidConfig, "2 output stores keep one C ring each"
+            ):
+                render(cute_matmul_mma_two_outputs, (x, y))
+            code = render(cute_matmul_mma_two_outputs, (x, y), tcgen05_ab_stages=5)
             self.assertNotIn(narrow, code)
+            self.assertIn("compute_epilogue_tile_shape(", code)
             self.assertNotIn("unroll=1", code)
             self.assertEqual(code.count("for tile_offset_2 in range("), 2)
 
@@ -14576,18 +14715,23 @@ class TestCuteBackend(TestCase):
                 (x, y, bias)
             ).config_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
-            (seed["block_sizes"][2], seed["tcgen05_ab_stages"]) for seed in seeds
+            (seed["block_sizes"][1], seed["block_sizes"][2], seed["tcgen05_ab_stages"])
+            for seed in seeds
         )
-        self.assertEqual(staged, [(64, 6), (128, 3)])
+        # The 256x256 pairs hold one tile per CTA here (128 CTAs), so the
+        # multi-tile 256x128 pair seed (deepest ring, resident-cluster cap)
+        # joins the 2x2 family.
+        self.assertEqual(staged, [(128, 64, 8), (256, 64, 6), (256, 128, 3)])
         for seed in seeds:
             self.assertEqual(seed["tcgen05_cluster_m"], 2)
             self.assertEqual(seed["tcgen05_aux_load_placement"], "pre_acc_wait")
             self.assertEqual(seed["pid_type"], "persistent_interleaved")
-            self.assertNotIn("tcgen05_strategy", seed)
+            self.assertEqual(
+                seed.get("tcgen05_persistent_grid_cap", "sm_pairs"),
+                "resident_clusters" if seed["block_sizes"][1] == 128 else "sm_pairs",
+            )
 
     def test_matmul_mma_tcgen05_one_wave_seeds_and_projection(self) -> None:
         """GEMMs whose 256x256 grid idles most SMs seed one-wave tiles.
@@ -14681,11 +14825,32 @@ class TestCuteBackend(TestCase):
             constraints = spec._tcgen05_cluster_m2_search_constraints
         assert constraints is not None
         self.assertFalse(constraints.one_wave_only)
-        self.assertTrue(
-            all(
-                seed["block_sizes"][1] == 256
+        # No one-wave seeds, but the 256x256 pairs hold exactly one tile per
+        # CTA (128 CTAs), so the multi-tile 256x128 pair seeds (2x2 on the
+        # resident-cluster cap and 2x1) join the 256x256 two-CTA seeds.
+        pair_widths = {
+            seed["block_sizes"][1]
+            for seed in seeds
+            if seed.get("tcgen05_cluster_m") == 2
+        }
+        self.assertEqual(pair_widths, {128, 256})
+        multi_tile = [
+            seed
+            for seed in seeds
+            if seed.get("tcgen05_cluster_m") == 2 and seed["block_sizes"][1] == 128
+        ]
+        self.assertEqual(
+            [
+                (seed["tcgen05_cluster_n"], seed.get("tcgen05_persistent_grid_cap"))
+                for seed in multi_tile
+            ],
+            [(2, "resident_clusters"), (1, None)],
+        )
+        self.assertTrue(all(seed["block_sizes"][2] == 64 for seed in multi_tile))
+        self.assertFalse(
+            any(
+                seed["block_sizes"][1] == 64 and seed.get("tcgen05_cluster_m") == 2
                 for seed in seeds
-                if seed.get("tcgen05_cluster_m") == 2
             )
         )
 
@@ -15033,18 +15198,27 @@ class TestCuteBackend(TestCase):
             dict(seed.config)
             for seed in spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         ]
         staged = sorted(
             (
+                seed["block_sizes"][1],
                 seed["block_sizes"][2],
                 seed["tcgen05_ab_stages"],
                 seed.get("tcgen05_aux_load_placement"),
             )
             for seed in seeds
         )
-        self.assertEqual(staged, [(64, 5, "pre_acc_wait"), (128, 3, None)])
+        # The multi-tile 256x128 pair seed keeps the stage next to its
+        # 8-deep ring: at bn=128 the row stage and the (128, 64) C ring are
+        # half the 256-wide seeds' and fit beside 8 x 24 KiB of AB stages.
+        self.assertEqual(
+            staged,
+            [
+                (128, 64, 8, "pre_acc_wait"),
+                (256, 64, 5, "pre_acc_wait"),
+                (256, 128, 3, None),
+            ],
+        )
         tcgen05 = spec._cute_tcgen05_config
         facts = tcgen05.rowvec_aux_facts
         assert facts is not None
@@ -15101,11 +15275,15 @@ class TestCuteBackend(TestCase):
             )
             for seed in chain_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
-            # Every seed also has a cute_pdl twin; the schedule is the same.
-            and seed.config.get("cute_pdl") is not True
         )
         self.assertEqual(
-            chain_seeds, [(64, 6, "pre_acc_wait"), (128, 3, "pre_acc_wait")]
+            chain_seeds,
+            # The multi-tile 256x128 pair seed (ab=8) keeps the placement too.
+            [
+                (64, 6, "pre_acc_wait"),
+                (64, 8, "pre_acc_wait"),
+                (128, 3, "pre_acc_wait"),
+            ],
         )
 
     def test_matmul_mma_tcgen05_sampled_pre_acc_wait_keeps_the_row_stage_within_smem(

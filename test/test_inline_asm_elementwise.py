@@ -344,6 +344,81 @@ class TestInlineAsmElementwisePacked(RefEagerTestDisabled, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
+    def test_input_constraint_codes(self) -> None:
+        """Inputs follow the outputs in operand order; a matching constraint
+        takes its output's register class; clobbers bind nothing; GCC's
+        read-write ``+`` is not LLVM syntax and is rejected."""
+        from helion._compiler.cute.inline_asm_helpers import input_constraint_codes
+
+        self.assertEqual(input_constraint_codes("=h,h,h"), ["h", "h"])
+        self.assertEqual(input_constraint_codes("=&r,r,0"), ["r", "r"])
+        self.assertEqual(input_constraint_codes("=h,0,h"), ["h", "h"])
+        self.assertEqual(input_constraint_codes("=r,=h,h,r,~{memory}"), ["h", "r"])
+        self.assertEqual(input_constraint_codes("=f, f, f"), ["f", "f"])
+        for constraints in ("+r,r", "=r,+h,h"):
+            with self.assertRaisesRegex(ValueError, "not an LLVM inline asm"):
+                input_constraint_codes(constraints)
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_read_write_constraint_rejected(self) -> None:
+        """LLVM has no ``+`` constraint prefix (``+r,r`` crashes the DSL
+        compiler; ``=r,+r,r`` silently binds a plain input), so the lowering
+        rejects it up front."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_read_write(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0), block_size=16):
+                result[tile] = hl.inline_asm_elementwise(
+                    "add.s32 $0, $0, $1;",
+                    "+r,r",
+                    [x[tile], y[tile]],
+                    dtype=torch.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return result
+
+        x = torch.arange(16, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, r"'\+' \(read-write\) constraint"
+        ):
+            code_and_output(kernel_read_write, (x, x))
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_tied_half_operand_binds_as_bits(self) -> None:
+        """A half operand tied to an ``=h`` output through a matching
+        constraint is handed over as its 16 bits like a direct ``h`` input,
+        so ``=h,0,h`` multiplies exactly like ``=h,h,h``."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_tied(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(a)
+            for tile in hl.tile(a.size(0), block_size=32):
+                result[tile] = hl.inline_asm_elementwise(
+                    "mul.rn.f16 $0, $1, $2;",
+                    "=h,0,h",
+                    [a[tile], b[tile]],
+                    dtype=torch.float16,
+                    is_pure=True,
+                    pack=1,
+                )
+            return result
+
+        a = torch.randn(256, device=DEVICE, dtype=torch.float16) * 64
+        b = torch.randn(256, device=DEVICE, dtype=torch.float16) / 64
+        _, result = code_and_output(kernel_tied, (a, b))
+        expected = (a.float() * b.float()).to(torch.float16)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     def test_pure_inline_asm_computed_scan_and_reuse(self) -> None:
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def kernel(

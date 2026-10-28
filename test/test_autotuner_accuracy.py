@@ -29,13 +29,18 @@ from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import get_test_float32_matmul_precision
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
+from helion.autotuner.accuracy import accuracy_poison_value
+from helion.autotuner.accuracy import poison_cached_device_memory
+from helion.autotuner.accuracy import relative_l2_disagreement
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
+from helion.autotuner.benchmark_provider import BASELINE_CONSISTENCY_MAX_RELATIVE_L2
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
@@ -65,6 +70,56 @@ class TestAutotunerAccuracy(AutotunerTestCase):
             lambda fn: lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1,
             exact_final_failure_count=True,
         )
+
+    @skipIfNotCUDA()
+    def test_poison_cached_device_memory_fills_free_blocks(self) -> None:
+        # A freed block's next owner reads the poison, in every dtype a
+        # finite value far from any answer.
+        self.assertEqual(accuracy_poison_value(torch.float16).item(), -439.5)
+        for dtype in (torch.bfloat16, torch.float32, torch.int32, torch.int8):
+            self.assertTrue(torch.isfinite(accuracy_poison_value(dtype).float()))
+        shape = [3 * 4096 + 1337]
+        released = torch.zeros(shape, device=DEVICE, dtype=torch.float16)
+        del released
+        poison_cached_device_memory(torch.device(DEVICE))
+        recycled = torch.empty(shape, device=DEVICE, dtype=torch.float16)
+        self.assertTrue(
+            torch.equal(
+                recycled, torch.full(shape, -439.5, device=DEVICE, dtype=torch.float16)
+            )
+        )
+
+    @skipIfNotCUDA()
+    def test_accuracy_check_runs_candidates_on_poisoned_memory(self) -> None:
+        # ``out`` is read before it is written: the kernel is only "correct"
+        # when its fresh buffer already holds the right numbers.  The autotuner
+        # runs every candidate on the same inputs, so a recycled output block
+        # usually does -- unless the accuracy check poisons it first.  With the
+        # baseline pinned to the poisoned answer, the search can only find a
+        # config if candidates really run on poisoned memory (zeroed free
+        # blocks would give ``x`` back instead).
+        poison = accuracy_poison_value(torch.float16).item()
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=4),
+        ]
+
+        @helion.kernel(
+            configs=configs,
+            autotune_log_level=0,
+            autotune_baseline_fn=lambda x: x + poison,
+        )
+        def reads_its_output_first(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = out[tile] + x[tile]
+            return out
+
+        x = torch.arange(256, device=DEVICE, dtype=torch.float16)
+        zeroed = [torch.zeros_like(x) for _ in range(4)]
+        del zeroed
+        search = FiniteSearch(reads_its_output_first.bind((x,)), (x,), configs=configs)
+        self.assertIn(search.autotune(), configs)
 
     def test_autotune_noncontiguous_arg(self) -> None:
         """Autotuning a kernel bound on a non-contiguous arg must succeed.
@@ -389,6 +444,108 @@ class TestAutotunerAccuracy(AutotunerTestCase):
                 # Raised as is: the cause keeps the traceback of where it failed.
                 self.assertIsNotNone(error.__traceback__)
 
+    def test_promoted_default_disagreeing_with_the_reference_refuses_the_search(
+        self,
+    ) -> None:
+        """Both baseline configs run and must agree, or no baseline is trusted.
+
+        The accuracy check judges every candidate against the baseline, so a
+        promoted execution default whose lowering is wrong would reject the
+        right candidates and keep the wrong ones (full_gla's dqkg: the
+        tcgen05 default dropped a term of dk, 58 correct warp configs were
+        rejected and the winner shipped a 0.997 relative error).  The
+        default runs first, then the reference once, and a disagreement
+        beyond the relative-L2 bound names both configs.
+        """
+        attempted: list[int] = []
+        search, _args, reference_block, promoted_block = self._promoted_baseline_search(
+            torch.sub, attempted
+        )
+        with self.assertRaisesRegex(
+            helion.exc.AutotuneError,
+            "disagree on the kernel's outputs .*relative L2 difference",
+        ) as ctx:
+            search._prepare()
+        self.assertEqual(attempted, [promoted_block, reference_block])
+        # Each config's decorator is named (the block size shows in every
+        # backend's config repr).
+        lines = {
+            line.split(":", 1)[0]: line
+            for line in str(ctx.exception).splitlines()
+            if line.startswith(("Execution default:", "Autotuning reference config:"))
+        }
+        self.assertIn(f"[{promoted_block}]", lines["Execution default"])
+        self.assertIn(f"[{reference_block}]", lines["Autotuning reference config"])
+
+    def test_promoted_default_within_the_bound_is_the_baseline(self) -> None:
+        """Accumulation-order noise between the two lowerings passes, and the
+        promoted default's output stays the baseline (its arithmetic is the
+        fast candidates')."""
+        attempted: list[int] = []
+        scale = 1.0 + BASELINE_CONSISTENCY_MAX_RELATIVE_L2 / 10
+        search, args, reference_block, promoted_block = self._promoted_baseline_search(
+            lambda a, b: (a + b) * scale, attempted
+        )
+        search._prepare()
+        self.assertEqual(attempted, [promoted_block, reference_block])
+        torch.testing.assert_close(
+            search.benchmark_provider._baseline_output, (args[0] + args[1]) * scale
+        )
+
+    def test_promoted_default_is_unchecked_when_the_reference_cannot_run(
+        self,
+    ) -> None:
+        """A reference config the device rejects (after the back-off) skips
+        the check with a warning: the default ran, as it did before the
+        check existed."""
+        from torch._inductor.runtime.triton_compat import OutOfResources
+
+        attempted: list[int] = []
+        search, args, reference_block, promoted_block = self._promoted_baseline_search(
+            None,
+            attempted,
+            OutOfResources(406912, 262144, "per-thread scratch space"),
+        )
+        with patch.object(search.log, "warning") as warn:
+            search._prepare()
+        self.assertEqual(attempted[0], promoted_block)
+        self.assertEqual(attempted[1], reference_block)
+        self.assertNotIn(promoted_block, attempted[1:])
+        torch.testing.assert_close(
+            search.benchmark_provider._baseline_output, args[0] + args[1]
+        )
+        self.assertTrue(
+            any(
+                "accuracy baseline unchecked" in str(c.args[0])
+                for c in warn.call_args_list
+            )
+        )
+
+    def test_relative_l2_disagreement(self) -> None:
+        a = torch.randn([256], device=DEVICE)
+        b = a * 1.001
+        self.assertIsNone(relative_l2_disagreement((a, [b]), (a, [a]), 0.05))
+        self.assertIsNone(relative_l2_disagreement((a, 3), (b, 3), 0.05))
+        reason = relative_l2_disagreement((a, [b]), (a, [-a]), 0.05)
+        assert reason is not None
+        self.assertIn("leaf 1: relative L2 difference", reason)
+        # Non-finite elements must sit at the same places; integer leaves
+        # must be equal; the structures must match.
+        nan = a.clone()
+        nan[3] = float("nan")
+        self.assertIsNone(relative_l2_disagreement(nan, nan.clone(), 0.05))
+        self.assertIn("non-finite", relative_l2_disagreement(nan, a, 0.05) or "")
+        ints = torch.arange(8, device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(ints, ints.clone(), 0.05))
+        self.assertIn("differs", relative_l2_disagreement(ints, ints + 1, 0.05) or "")
+        self.assertIn("structure", relative_l2_disagreement((a, a), (a,), 0.05) or "")
+        self.assertIn(
+            "against", relative_l2_disagreement(a, a.to(torch.bfloat16), 0.05) or ""
+        )
+        zeros = torch.zeros([8], device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(zeros, zeros.clone(), 0.05))
+        self.assertIsNotNone(relative_l2_disagreement(zeros, zeros + 1, 0.05))
+
     def test_autotune_baseline_tolerance(self) -> None:
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
         cfg2 = helion.Config(block_sizes=[1], num_warps=8)
@@ -434,14 +591,113 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_autotune_fp8_automatic_tolerance(self) -> None:
-        """Test that fp8 dtypes automatically get 0.0 tolerances."""
+        """fp8 outputs compare dequantized within one ulp by default; the
+        bitwise mode keeps the automatic 0.0 tolerances."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
         cfg2 = helion.Config(block_sizes=[32], num_warps=8)
 
-        # Test with float8_e4m3fn as a representative fp8 dtype. The automatic
-        # tolerance selection under test is parent-side; skip the benchmark
-        # worker subprocess (seconds of startup overhead).
-        @helion.kernel(configs=[cfg1, cfg2], autotune_benchmark_subprocess=False)
+        for mode, expected_tolerance in (("ulp", 1e-2), ("bitwise", 0.0)):
+            # Test with float8_e4m3fn as a representative fp8 dtype. The
+            # automatic tolerance selection under test is parent-side; skip the
+            # benchmark worker subprocess (seconds of startup overhead).
+            @helion.kernel(
+                configs=[cfg1, cfg2],
+                autotune_benchmark_subprocess=False,
+                autotune_fp8_accuracy=mode,
+            )
+            def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+                for t in hl.tile(x.size()):
+                    out[t] = x[t].to(torch.float8_e4m3fn)
+                return out
+
+            x = torch.randn([64], device=DEVICE)
+            bound = cast_to_fp8.bind((x,))
+            search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+            search._prepare()
+
+            self.assertEqual(
+                search.benchmark_provider._effective_atol,
+                expected_tolerance,
+                f"Expected automatic atol={expected_tolerance} for fp8 under "
+                f"{mode}, got {search.benchmark_provider._effective_atol}",
+            )
+            self.assertEqual(
+                search.benchmark_provider._effective_rtol,
+                expected_tolerance,
+                f"Expected automatic rtol={expected_tolerance} for fp8 under "
+                f"{mode}, got {search.benchmark_provider._effective_rtol}",
+            )
+
+            # Should successfully autotune without error
+            winner = search.autotune()
+            self.assertIn(winner, (cfg1, cfg2))
+            self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_autotune_fp8_one_ulp_flips_pass_unless_bitwise(self) -> None:
+        """A baseline that rounds an intermediate differently flips a fraction
+        of fp8 outputs by one bucket in both directions; the default ulp mode
+        admits those configs, the bitwise mode rejects them."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        def flipped_baseline(x: torch.Tensor) -> torch.Tensor:
+            exact = x.to(torch.float8_e4m3fn)
+            values = exact.float()
+            finfo = torch.finfo(torch.float8_e4m3fn)
+            _, exponent = torch.frexp(values.abs().clamp_min(finfo.smallest_normal))
+            ulp = torch.ldexp(torch.full_like(values, finfo.eps), exponent - 1)
+            generator = torch.Generator().manual_seed(0)
+            flip = torch.rand(values.shape, generator=generator) < 0.2
+            direction = torch.where(
+                torch.rand(values.shape, generator=generator) < 0.5, 1.0, -1.0
+            )
+            return torch.where(
+                flip.to(x.device), values + direction.to(x.device) * ulp, values
+            ).to(torch.float8_e4m3fn)
+
+        for mode, expect_failures in (("ulp", 0), ("bitwise", 2)):
+
+            @helion.kernel(
+                configs=[cfg1, cfg2],
+                autotune_baseline_fn=flipped_baseline,
+                autotune_benchmark_subprocess=False,
+                autotune_fp8_accuracy=mode,
+            )
+            def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+                for t in hl.tile(x.size()):
+                    out[t] = x[t].to(torch.float8_e4m3fn)
+                return out
+
+            x = torch.randn([4096], device=DEVICE) * 0.3
+            bound = cast_to_fp8.bind((x,))
+            search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+            if expect_failures:
+                with self.assertRaises(AssertionError):
+                    search.autotune()
+            else:
+                winner = search.autotune()
+                self.assertIn(winner, (cfg1, cfg2))
+            self.assertEqual(
+                search._autotune_metrics.num_accuracy_failures, expect_failures
+            )
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_autotune_fp8_explicit_zero_tolerances_compare_bitwise(self) -> None:
+        """Explicit ``atol=0, rtol=0`` on an fp8 output asks for exact bytes:
+        the provider selects the bitwise comparison under the default 'ulp'
+        setting instead of granting a one-ulp allowance."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        @helion.kernel(
+            configs=[cfg1, cfg2],
+            autotune_baseline_atol=0.0,
+            autotune_baseline_rtol=0.0,
+            autotune_benchmark_subprocess=False,
+        )
         def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
             for t in hl.tile(x.size()):
@@ -450,22 +706,12 @@ class TestAutotunerAccuracy(AutotunerTestCase):
 
         x = torch.randn([64], device=DEVICE)
         bound = cast_to_fp8.bind((x,))
+        self.assertEqual(bound.settings.autotune_fp8_accuracy, "ulp")
         search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
         search._prepare()
-
-        # Verify that effective tolerances were set to 0.0 automatically
-        self.assertEqual(
-            search.benchmark_provider._effective_atol,
-            0.0,
-            f"Expected automatic atol=0.0 for fp8, got {search.benchmark_provider._effective_atol}",
-        )
-        self.assertEqual(
-            search.benchmark_provider._effective_rtol,
-            0.0,
-            f"Expected automatic rtol=0.0 for fp8, got {search.benchmark_provider._effective_rtol}",
-        )
-
-        # Should successfully autotune without error
+        self.assertEqual(search.benchmark_provider._fp8_accuracy, "bitwise")
+        self.assertEqual(search.benchmark_provider._effective_atol, 0.0)
+        self.assertEqual(search.benchmark_provider._effective_rtol, 0.0)
         winner = search.autotune()
         self.assertIn(winner, (cfg1, cfg2))
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
@@ -571,7 +817,13 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         config1 = helion.Config(block_sizes=[32], num_warps=4)
         config2 = helion.Config(block_sizes=[64], num_warps=4)
 
-        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        # The in-process benchmark path's cloning policy (the killable worker
+        # clones a candidate's mutated arguments in its own process).
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
+        )
         def inplace_add(
             a: torch.Tensor,
             b: torch.Tensor,
@@ -585,6 +837,13 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         b = torch.full([128], 2.0, device=DEVICE)
         epsilon = 1e-6
         out = torch.zeros([128], device=DEVICE)
+        # A promoted execution default runs the baseline twice (the default,
+        # then the reference it is checked against): one more clone of every
+        # argument.
+        spec = inplace_add.bind((a, b, epsilon, out)).config_spec
+        promoted = int(
+            spec.default_config().config != spec.autotune_reference_config().config
+        )
 
         # Track clones separately for mutated vs non-mutated tensors
         mutated_ptrs = {out.data_ptr()}
@@ -608,27 +867,24 @@ class TestAutotunerAccuracy(AutotunerTestCase):
             inplace_add(a, b, epsilon, out)
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
-        #   _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 4 total. The benchmark runs happen in the
-        #   killable worker when the subprocess benchmark is enabled, where
-        #   this patch does not reach: the parent then clones it twice.
-        expected_mutated_clones = (
-            2 if inplace_add.settings.autotune_benchmark_subprocess else 4
-        )
+        #   _compute_baseline: 1 (+ 1 per promoted default) + baseline_post_args: 1
+        #   + 2 benchmark runs = 4 total (the kernel pins the in-process
+        #   benchmark path above; in the killable worker the clones happen
+        #   where this patch does not reach).
         self.assertEqual(
             mutated_clones[0],
-            expected_mutated_clones,
-            f"Mutated tensor cloned {mutated_clones[0]} times, "
-            f"expected {expected_mutated_clones}.",
+            4 + promoted,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected {4 + promoted}.",
         )
 
         # Non-mutated tensors (a, b) should only be cloned during baseline:
-        #   _compute_baseline: 2 = 2 total
+        #   _compute_baseline: 2 (+ 2 per promoted default) = 2 total
         self.assertEqual(
             non_mutated_clones[0],
-            2,
-            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 2. "
-            f"Only mutated tensors should be cloned during benchmarking.",
+            2 + 2 * promoted,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected "
+            f"{2 + 2 * promoted}. Only mutated tensors should be cloned during "
+            "benchmarking.",
         )
 
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
@@ -963,6 +1219,58 @@ class TestMismatchTolerance(TestCase):
                 actual, expected, atol=1e-2, rtol=1e-2, scale_atol_by_expected_rms=True
             )
 
+    def test_accuracy_scaled_atol_rms_skips_masked_positions(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        # Masked positions (a causal ``-inf`` column of a large-scale score
+        # output) carry no scale information: the RMS is taken over the finite
+        # elements, so the reduction-noise floor still applies to the rest of
+        # the tensor instead of collapsing to the unscaled atol.
+        torch.manual_seed(0)
+        expected = torch.randn(64, 64, device=DEVICE) * 200.0
+        expected[:, 0] = float("-inf")
+        expected[1, 1] = 0.05  # near-zero element from cancellation
+        actual = expected.clone()
+        actual[1, 1] = -0.05  # reorder-scale wobble on the near-zero element
+        with self.assertRaises(AssertionError):
+            assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+        assert_close(
+            actual, expected, atol=1e-2, rtol=1e-2, scale_atol_by_expected_rms=True
+        )
+        # Masked positions are compared exactly: a finite value where the
+        # baseline is masked, or a mask where the baseline is finite, fails
+        # whatever the scaled floor is.
+        unmasked = expected.clone()
+        unmasked[2, 0] = 0.0
+        with self.assertRaises(AssertionError):
+            assert_close(
+                unmasked,
+                expected,
+                atol=1e-2,
+                rtol=1e-2,
+                scale_atol_by_expected_rms=True,
+            )
+        overmasked = expected.clone()
+        overmasked[2, 2] = float("-inf")
+        with self.assertRaises(AssertionError):
+            assert_close(
+                overmasked,
+                expected,
+                atol=1e-2,
+                rtol=1e-2,
+                scale_atol_by_expected_rms=True,
+            )
+        # An all-masked baseline keeps the unscaled floor (RMS over no
+        # elements is 0, and max(1, 0) == 1).
+        masked = torch.full((16,), float("-inf"), device=DEVICE)
+        assert_close(
+            masked.clone(),
+            masked,
+            atol=1e-2,
+            rtol=1e-2,
+            scale_atol_by_expected_rms=True,
+        )
+
     def test_accuracy_scaled_atol_no_op_for_small_scale_outputs(self) -> None:
         from helion.autotuner.accuracy import assert_close
 
@@ -1009,7 +1317,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
             supports_subprocess_benchmark=lambda: False,
-            env=SimpleNamespace(process_group_name=None),
+            env=SimpleNamespace(process_group_name=None, device=DEVICE),
         )
         search = BaseSearch(kernel, args)
         with patch.object(
@@ -1027,7 +1335,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 autotune_log_level=logging.CRITICAL,
             )
         )
-        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
         search.kernel.compile_config = None
         return search
 
@@ -1217,7 +1525,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             return None
 
         bench_fn = Mock(return_value=None)
-        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
         search.kernel.bench_compile_config = Mock(return_value=bench_fn)
 
         with (
@@ -1336,7 +1644,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             return lambda *a, **kw: None
 
         search.kernel.compile_config = None
-        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
         configs = ["cfg_a", "cfg_b", "cfg_c"]
         with (
             patch.object(search.kernel, "compile_config", side_effect=fail_second),
@@ -1853,6 +2161,145 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Restricted search -> debug CSV written, but no dataset sidecar.
         self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
+
+class TestFp8UlpAccuracy(unittest.TestCase):
+    """``accuracy.assert_close`` on fp8 leaves (CPU; no kernel involved)."""
+
+    DTYPE = torch.float8_e4m3fn
+
+    def _baseline(self, n: int = 4096) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(0)
+        return (torch.randn(n, generator=generator) * 0.3).to(self.DTYPE)
+
+    def _ulp(self, values: torch.Tensor) -> torch.Tensor:
+        from helion.autotuner.accuracy import _fp8_ulp
+
+        return _fp8_ulp(values.abs(), self.DTYPE)
+
+    def _check(self, actual: torch.Tensor, expected: torch.Tensor, mode: str) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        assert_close(
+            actual,
+            expected,
+            atol=1e-2,
+            rtol=1e-2,
+            scale_atol_by_expected_rms=True,
+            fp8_accuracy=mode,
+        )
+
+    def test_effective_mode_explicit_zero_tolerances_are_bitwise(self) -> None:
+        from helion.autotuner.accuracy import effective_fp8_accuracy
+
+        self.assertEqual(effective_fp8_accuracy(helion.Settings()), "ulp")
+        self.assertEqual(
+            effective_fp8_accuracy(
+                helion.Settings(autotune_baseline_atol=0, autotune_baseline_rtol=0)
+            ),
+            "bitwise",
+        )
+        # One explicit zero still carries the other default tolerance.
+        self.assertEqual(
+            effective_fp8_accuracy(helion.Settings(autotune_baseline_atol=0.0)), "ulp"
+        )
+        self.assertEqual(
+            effective_fp8_accuracy(
+                helion.Settings(autotune_baseline_atol=1e-3, autotune_baseline_rtol=0)
+            ),
+            "ulp",
+        )
+        self.assertEqual(
+            effective_fp8_accuracy(helion.Settings(autotune_fp8_accuracy="bitwise")),
+            "bitwise",
+        )
+
+    def test_ulp_spacing(self) -> None:
+        values = torch.tensor([0.0, 0.001, 0.015625, 0.03, 1.0, 1.9, 2.0, 448.0])
+        # Subnormal step 2**-9 below the smallest normal, then eps * 2**e.
+        expected = torch.tensor([2**-9, 2**-9, 2**-9, 2**-9, 0.125, 0.125, 0.25, 32.0])
+        torch.testing.assert_close(self._ulp(values), expected)
+
+    def test_balanced_one_ulp_flips_pass_ulp_but_not_bitwise(self) -> None:
+        expected = self._baseline()
+        values = expected.float()
+        generator = torch.Generator().manual_seed(1)
+        flip = torch.rand(values.shape, generator=generator) < 0.25
+        direction = torch.where(
+            torch.rand(values.shape, generator=generator) < 0.5, 1.0, -1.0
+        )
+        actual = torch.where(flip, values + direction * self._ulp(values), values).to(
+            self.DTYPE
+        )
+        self.assertGreater(
+            (actual.view(torch.uint8) != expected.view(torch.uint8)).float().mean(),
+            0.15,
+        )
+        self._check(actual, expected, "ulp")
+        with self.assertRaisesRegex(AssertionError, "Tensor-likes are not"):
+            self._check(actual, expected, "bitwise")
+
+    def test_two_ulp_differences_fail(self) -> None:
+        expected = self._baseline()
+        values = expected.float()
+        large = values.abs() > 0.5
+        actual = torch.where(
+            large, values + 2 * torch.sign(values) * self._ulp(values), values
+        ).to(self.DTYPE)
+        with self.assertRaisesRegex(AssertionError, "more than one ulp"):
+            self._check(actual, expected, "ulp")
+
+    def test_small_elements_use_the_rms_scaled_floor(self) -> None:
+        # Near-zero elements of a reduction legitimately move by several tiny
+        # ulps: the absolute floor (atol * max(1, rms)) covers them.
+        expected = self._baseline()
+        values = expected.float()
+        tiny = values.abs() < 0.004
+        actual = torch.where(tiny, values + 3 * self._ulp(values), values).to(
+            self.DTYPE
+        )
+        self.assertTrue(bool(tiny.any()))
+        self._check(actual, expected, "ulp")
+
+    def test_one_directional_flips_fail(self) -> None:
+        expected = self._baseline()
+        values = expected.float()
+        generator = torch.Generator().manual_seed(2)
+        flip = torch.rand(values.shape, generator=generator) < 0.5
+        actual = torch.where(flip, values + self._ulp(values), values).to(self.DTYPE)
+        with self.assertRaisesRegex(AssertionError, "one-directional"):
+            self._check(actual, expected, "ulp")
+
+    def test_nan_must_match_nan(self) -> None:
+        expected = torch.tensor([float("nan"), 1.0, -2.0]).to(self.DTYPE)
+        self._check(expected.clone(), expected, "ulp")
+        with self.assertRaisesRegex(AssertionError, "more than one ulp"):
+            self._check(torch.tensor([1.0, 1.0, -2.0]).to(self.DTYPE), expected, "ulp")
+
+    def test_e8m0_one_exponent_step(self) -> None:
+        expected = torch.tensor([1.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu)
+        self._check(
+            torch.tensor([2.0, 2.0, 0.25, 8.0]).to(torch.float8_e8m0fnu),
+            expected,
+            "ulp",
+        )
+        with self.assertRaisesRegex(AssertionError, "more than one ulp"):
+            self._check(
+                torch.tensor([4.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu),
+                expected,
+                "ulp",
+            )
+
+    def test_mixed_leaves_and_mode_validation(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        expected = (self._baseline(), torch.arange(4.0))
+        actual = (expected[0].clone(), torch.arange(4.0) + 1e-3)
+        assert_close(actual, expected, atol=1e-2, rtol=1e-2, fp8_accuracy="ulp")
+        with self.assertRaises(ValueError):
+            assert_close(actual, expected, atol=1e-2, rtol=1e-2, fp8_accuracy="exact")
+        with self.assertRaises(ValueError):
+            helion.Settings(autotune_fp8_accuracy="exact")
 
 
 if __name__ == "__main__":

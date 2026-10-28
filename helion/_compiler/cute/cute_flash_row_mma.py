@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .attention_plan import CAUSAL_MASK_KIND
+from .attention_plan import TENSOR_BIAS_KIND
 from .flash_row_epilogue import emit_row_epilogue
 
 if TYPE_CHECKING:
@@ -52,6 +54,14 @@ if TYPE_CHECKING:
     from .cute_flash import FlashRowEpilogueEmit
 
 ROW_MMA_FAMILY = "row_mma"
+# The score modifiers the row programs host: the square causal mask (a
+# per-element select on the S^T fragment before the row max, with the chunk
+# loop trimmed to the keys a warp can see) and one additive tensor bias (its
+# (rows, keys) tile staged through shared memory with the K/V chunk and read
+# by ``ldmatrix.trans`` straight into the fragment layout).
+ROW_MMA_SCORE_MODIFIER_KINDS: frozenset[str] = frozenset(
+    {CAUSAL_MASK_KIND, TENSOR_BIAS_KIND}
+)
 ROW_MMA_PLAN_KIND = "helion_flash_row_mma"
 ROW_MMA_WARP_CHOICES: tuple[int, ...] = (2, 4, 8)
 ROW_MMA_TILE_M_CHOICES: tuple[int, ...] = (8, 16)
@@ -77,6 +87,18 @@ _ROW_MMA_PREAMBLE = (
 )
 
 
+def row_mma_score_modifiers_supported(
+    *, has_score_modifiers: bool, score_modifier_kinds: Sequence[str]
+) -> bool:
+    """Whether the row programs host the plan's score modifiers: none, or
+    only kinds in ``ROW_MMA_SCORE_MODIFIER_KINDS`` (a surface that reports
+    modifiers without naming them is declined: fail closed)."""
+    if not has_score_modifiers:
+        return True
+    kinds = tuple(score_modifier_kinds)
+    return bool(kinds) and all(kind in ROW_MMA_SCORE_MODIFIER_KINDS for kind in kinds)
+
+
 def row_mma_supported(
     *,
     head_dim: int,
@@ -88,23 +110,30 @@ def row_mma_supported(
     plain_row_body: bool,
     has_row_epilogue: bool,
     has_score_modifiers: bool = False,
+    score_modifier_kinds: Sequence[str] = (),
 ) -> bool:
     """Whether the row-program family can run this attention.
 
-    Dense rows only (the score plan carries no mask, bias or other modifier:
-    ``plain_row_body`` is False for both a modifier and a fused row epilogue,
-    so a row epilogue is admitted only when ``has_score_modifiers`` says the
-    scores themselves are plain), 16-bit inputs, head dims 64 and 128.  A
-    fused row epilogue runs in the combine epilogue (every program the
-    detector accepts fits: its values are per-row, its reductions complete
-    over the lanes sharing a row).  The sequence length does not participate:
-    longer key ranges stream through the chunk loop, so the family is legal
-    in every length class.
+    Plain rows, the square causal mask and/or one additive tensor bias
+    (``ROW_MMA_SCORE_MODIFIER_KINDS``; ``plain_row_body`` is False for both a
+    modifier and a fused row epilogue, so the modifier kinds decide what the
+    scores carry), 16-bit inputs, head dims 64 and 128.  KV-tile-pruned masks
+    (sliding window, prefix-LM, document, per-row bound) and every other
+    modifier stay out.  A fused row epilogue runs in the combine epilogue
+    (every program the detector accepts fits: its values are per-row, its
+    reductions complete over the lanes sharing a row).  The sequence length
+    does not participate: longer key ranges stream through the chunk loop,
+    so the family is legal in every length class.
     """
     return (
-        not has_score_modifiers
-        and (plain_row_body or has_row_epilogue)
-        and not is_causal
+        row_mma_score_modifiers_supported(
+            has_score_modifiers=has_score_modifiers,
+            score_modifier_kinds=score_modifier_kinds,
+        )
+        and (plain_row_body or has_row_epilogue or has_score_modifiers)
+        # The causal plan reports its mask as a modifier kind; a causal flag
+        # without the kind (an unnamed surface) is declined above.
+        and (not is_causal or CAUSAL_MASK_KIND in score_modifier_kinds)
         and not has_kv_tile_pruning
         and not requires_ws_overlap
         and not small_biased_candidate
@@ -162,6 +191,14 @@ def row_mma_aux_smem_bytes(
     return sum(slots * 8 * _row_mma_dtype_bytes(dtype) for dtype in aux_dtypes)
 
 
+def row_mma_bias_row_bytes(chunk: int) -> int:
+    """Shared-memory row stride of a staged tensor-bias chunk: ``chunk``
+    16-bit keys plus one 16-byte pad, so the eight query rows an
+    ``ldmatrix.trans`` reads at once land on distinct bank groups without a
+    swizzle (the stride is an odd multiple of 16 bytes)."""
+    return chunk * 2 + 16
+
+
 def row_mma_smem_bytes(
     *,
     head_dim: int,
@@ -170,12 +207,16 @@ def row_mma_smem_bytes(
     chunk: int,
     stages: int,
     aux_bytes: int = 0,
+    bias_rows: bool = False,
 ) -> int:
-    """Static shared memory of one CTA: per-warp Q tile and K/V stages, the
-    partial-O exchange (padded fp32 rows), the row statistics and the fused
-    row epilogue's aux slots (``aux_bytes``, see ``row_mma_aux_smem_bytes``)."""
+    """Static shared memory of one CTA: per-warp Q tile and K/V stages (plus
+    the tensor-bias tile of each stage when ``bias_rows``), the partial-O
+    exchange (padded fp32 rows), the row statistics and the fused row
+    epilogue's aux slots (``aux_bytes``, see ``row_mma_aux_smem_bytes``)."""
     row_bytes = head_dim * 2
     per_warp = row_tile_m * row_bytes + stages * 2 * chunk * row_bytes
+    if bias_rows:
+        per_warp += stages * row_tile_m * row_mma_bias_row_bytes(chunk)
     partials = row_warps * row_tile_m * (head_dim + 4) * 4
     stats = row_warps * 2 * row_tile_m * 4
     return row_warps * per_warp + partials + stats + aux_bytes
@@ -188,11 +229,13 @@ def row_mma_plan(
     row_warps: int,
     row_tile_m: int,
     aux_bytes: int = 0,
+    bias_rows: bool = False,
 ) -> tuple[int, int] | None:
     """``(chunk keys, stages)`` of the K/V staging, or None when the shape
     cannot be split (every warp needs whole 16-key tiles, every CTA whole
     query octets) or no staging fits the shared-memory budget next to the
-    ``aux_bytes`` of a fused row epilogue.
+    ``aux_bytes`` of a fused row epilogue and the tensor-bias tiles
+    (``bias_rows``) staged with every chunk.
 
     The widest chunk comes first (a key range that fits one chunk needs no
     chunk loop and a single stage: the measured small-grid structure); a
@@ -220,6 +263,7 @@ def row_mma_plan(
                 chunk=chunk,
                 stages=stages,
                 aux_bytes=aux_bytes,
+                bias_rows=bias_rows,
             )
             <= ROW_MMA_SMEM_BUDGET
         )
@@ -255,6 +299,7 @@ def row_mma_shape_supported(
     row_warps: int,
     row_tile_m: int,
     aux_bytes: int = 0,
+    bias_rows: bool = False,
 ) -> bool:
     return (
         row_mma_plan(
@@ -263,6 +308,7 @@ def row_mma_shape_supported(
             row_warps=row_warps,
             row_tile_m=row_tile_m,
             aux_bytes=aux_bytes,
+            bias_rows=bias_rows,
         )
         is not None
     )
@@ -295,6 +341,10 @@ def emit_flash_row_mma_device_body(
     relu_output: bool,
     row_epilogue: FlashRowEpilogueEmit | None = None,
     kv_group: int = 1,
+    causal: bool = False,
+    bias_name: str | None = None,
+    bias_scale: float = 1.0,
+    scale_log2_expr: str | None = None,
 ) -> list[ast.AST]:
     """Render the row-program kernel body for one (batch*heads, seq, head_dim)
     problem with contiguous ``(B, S, D)`` inputs.
@@ -304,6 +354,21 @@ def emit_flash_row_mma_device_body(
     scalar expressions; the program replaces the identity store.
     ``kv_group`` is the grouped-query divisor: K/V carry ``num_bh // kv_group``
     entries and the program reads them at batch head ``rm_bh // kv_group``.
+
+    ``scale_log2_expr`` replaces the literal ``scale_log2`` with a device
+    expression (a dense flex plan's runtime scale read from a kernel scalar,
+    ``cutlass.Float32(<arg>) * log2(e)``); None bakes the literal.
+
+    ``causal`` applies the square causal mask ``key <= query`` to every S^T
+    fragment element before the row max and trims each warp's chunk loop to
+    the chunks holding a visible key (a warp whose whole key range lies past
+    the tile still runs its first chunk, fully masked, and publishes an
+    empty partial).  ``bias_name`` names a contiguous ``(B, S, S)`` additive
+    score bias of the I/O dtype whose ``(rows, chunk)`` tile is staged with
+    every K/V chunk and added in raw QK units as ``bias * bias_scale``
+    (``bias_scale`` converts the source bias into those units, like the
+    tcgen05 bodies' ``_flash_score_bias_scale``).  With either, the row
+    statistics tolerate a partial whose every score is masked (``-inf``).
     """
     aux_dtypes = () if row_epilogue is None else tuple(row_epilogue.aux_dtypes)
     aux_elem_bytes = [_row_mma_dtype_bytes(dtype) for dtype in aux_dtypes]
@@ -319,6 +384,7 @@ def emit_flash_row_mma_device_body(
         row_warps=row_warps,
         row_tile_m=row_tile_m,
         aux_bytes=aux_bytes,
+        bias_rows=bias_name is not None,
     )
     assert plan is not None
     chunk, stages = plan
@@ -335,6 +401,14 @@ def emit_flash_row_mma_device_body(
     m_tiles = chunk // 16  # 16-key tiles per chunk (QK^T M-tiles == PV k-steps)
     part_stride = head_dim + 4  # fp32 row stride of the partial-O exchange
     stage_bytes = 2 * chunk * row_bytes
+    # A masked or biased partial may hold no visible key: its running max
+    # stays -inf and the softmax reads a finite stand-in for it.
+    masked_rows = causal or bias_name is not None
+    # The tensor bias tile of one chunk: ``rows`` padded rows of ``chunk``
+    # keys per stage, ``cprb`` 16-byte packets per row.
+    bias_row_bytes = row_mma_bias_row_bytes(chunk)
+    bias_stage_bytes = rows * bias_row_bytes
+    cprb = chunk // 8
     # Combine-epilogue passes: thread -> (row, 16-byte column packet).
     reps = row_mma_epilogue_reps(
         head_dim=head_dim, row_tile_m=row_tile_m, row_warps=row_warps
@@ -371,8 +445,40 @@ def emit_flash_row_mma_device_body(
                 )
             )
 
+    def issue_bias(
+        out: list[str], indent: str, *, stage: str, chunk_index: str
+    ) -> None:
+        """cp.async the ``(rows, chunk)`` bias tile of chunk ``chunk_index``
+        into ``stage``: ``rows * cprb`` packets over the warp's lanes (the
+        last pass is lane-guarded when the count is not a lane multiple)."""
+        out.extend(
+            (
+                f"{indent}rm_bias_base = rm_bias_w + ({stage}) * {bias_stage_bytes}",
+                f"{indent}rm_bias_off = cutlass.Int64({chunk_index}) * {chunk * 2}",
+            )
+        )
+        packets = rows * cprb
+        for i in range(-(-packets // 32)):
+            out.append(f"{indent}rm_bidx = {i * 32} + rm_lane")
+            inner = indent
+            if packets - i * 32 < 32:
+                out.append(f"{indent}if rm_bidx < {packets}:")
+                inner = indent + "    "
+            out.extend(
+                (
+                    f"{inner}rm_birow = rm_bidx // {cprb}",
+                    f"{inner}rm_bicol = rm_bidx % {cprb}",
+                    (
+                        f"{inner}{rt}.cp_async_16(rm_bias_base + rm_birow * {bias_row_bytes} "
+                        f"+ rm_bicol * 16, rm_bias_tile + rm_bias_off + "
+                        f"cutlass.Int64(rm_birow * {seq * 2} + rm_bicol * 16))"
+                    ),
+                )
+            )
+
     def issue_kv(out: list[str], indent: str, *, stage: str, chunk_index: str) -> None:
-        """cp.async the K and V rows of chunk ``chunk_index`` into ``stage``."""
+        """cp.async the K and V rows of chunk ``chunk_index`` into ``stage``
+        (and its bias tile, when the scores carry one)."""
         out.extend(
             (
                 f"{indent}rm_kv_base = rm_kv_w + ({stage}) * {stage_bytes}",
@@ -393,13 +499,82 @@ def emit_flash_row_mma_device_body(
             gmem_base="(rm_v_slice + rm_kv_off)",
             tile_rows=chunk,
         )
+        if bias_name is not None:
+            issue_bias(out, indent, stage=stage, chunk_index=chunk_index)
 
-    def compute_chunk(out: list[str], indent: str, *, stage: str, first: bool) -> None:
+    def add_bias(out: list[str], indent: str) -> None:
+        """Add the staged bias tile to the S^T fragments: ``ldmatrix.trans``
+        of the (8 queries, 8 keys) tiles yields lane (g, c) the bias of
+        queries 2c, 2c+1 at key g, the fragment's own layout."""
+        for o in range(octets):
+            row = f"rm_bb + ({8 * o} + rm_r) * {bias_row_bytes}"
+            for mt0 in range(0, m_tiles - 1, 2):
+                out.append(
+                    f"{indent}rm_w0, rm_w1, rm_w2, rm_w3 = {rt}.ldmatrix_x4_trans("
+                    f"{row} + ({16 * mt0} + (rm_mi % 2) * 8 + (rm_mi // 2) * 16) * 2)"
+                )
+                for mt, words in (
+                    (mt0, ("rm_w0", "rm_w1")),
+                    (mt0 + 1, ("rm_w2", "rm_w3")),
+                ):
+                    for word, (i0, i1) in zip(words, ((0, 1), (2, 3)), strict=True):
+                        s = f"rm_s_{o}_{mt}"
+                        out.extend(
+                            (
+                                f"{indent}rm_bl, rm_bh2 = {rt}.unpack_{kind}x2({word})",
+                                (
+                                    f"{indent}{s}_{i0}, {s}_{i1} = cute.arch.fma_packed_f32x2("
+                                    f"(rm_bl, rm_bh2), (rm_bscale, rm_bscale), ({s}_{i0}, {s}_{i1}))"
+                                ),
+                            )
+                        )
+            if m_tiles % 2:
+                mt = m_tiles - 1
+                out.append(
+                    f"{indent}rm_w0, rm_w1 = {rt}.ldmatrix_x2_trans("
+                    f"{row} + ({16 * mt} + (rm_mi % 2) * 8) * 2)"
+                )
+                for word, (i0, i1) in (("rm_w0", (0, 1)), ("rm_w1", (2, 3))):
+                    s = f"rm_s_{o}_{mt}"
+                    out.extend(
+                        (
+                            f"{indent}rm_bl, rm_bh2 = {rt}.unpack_{kind}x2({word})",
+                            (
+                                f"{indent}{s}_{i0}, {s}_{i1} = cute.arch.fma_packed_f32x2("
+                                f"(rm_bl, rm_bh2), (rm_bscale, rm_bscale), ({s}_{i0}, {s}_{i1}))"
+                            ),
+                        )
+                    )
+
+    def mask_causal(out: list[str], indent: str, *, key_base: str) -> None:
+        """``key <= query`` on every S^T element: lane (g, c) holds keys
+        ``key_base + 16 mt + g`` (+8 for i = 2, 3) of queries ``rm_qa_o``
+        (i = 0, 2) and ``rm_qb_o`` (i = 1, 3)."""
+        for mt in range(m_tiles):
+            out.append(f"{indent}rm_kk = {key_base} + {16 * mt}")
+            for o in range(octets):
+                s = f"rm_s_{o}_{mt}"
+                out.extend(
+                    f"{indent}{s}_{i} = {rt}.mask_key_after({s}_{i}, rm_kk{key_off}, rm_q{half}_{o})"
+                    for i, (key_off, half) in enumerate(
+                        (("", "a"), ("", "b"), (" + 8", "a"), (" + 8", "b"))
+                    )
+                )
+
+    def compute_chunk(
+        out: list[str],
+        indent: str,
+        *,
+        stage: str,
+        first: bool,
+        key_base: str = "rm_kg",
+    ) -> None:
         """QK^T, softmax (online across chunks) and PV of the chunk in ``stage``.
 
         ``first`` chunks initialise the carried statistics and accumulators as
         SSA values; later chunks read and write the ``rm_m``/``rm_l``/``rm_o``
         register tensors so the carried state survives the dynamic chunk loop.
+        ``key_base`` names the lane's first key index of the chunk (causal).
         """
         out.extend(
             (
@@ -407,6 +582,8 @@ def emit_flash_row_mma_device_body(
                 f"{indent}rm_vb = rm_kb + {chunk * row_bytes}",
             )
         )
+        if bias_name is not None:
+            out.append(f"{indent}rm_bb = rm_bias_w + ({stage}) * {bias_stage_bytes}")
         # S^T tiles: rm_s_{o}_{mt}_{i}; lane (g, c) holds i=0: S[q 2c][key 16mt+g],
         # i=1: S[q 2c+1][key 16mt+g], i=2: S[q 2c][key 16mt+8+g], i=3: S[q 2c+1][..+8+g].
         for mt in range(m_tiles):
@@ -424,6 +601,12 @@ def emit_flash_row_mma_device_body(
                         f"{indent}{s}_0, {s}_1, {s}_2, {s}_3 = {mma}(rm_a0, rm_a1, rm_a2, rm_a3, "
                         f"rm_qb_{o}_{st}_0, rm_qb_{o}_{st}_1, {s}_0, {s}_1, {s}_2, {s}_3)"
                     )
+        # Score modifiers on the raw S^T fragments: the bias first, then the
+        # mask (a masked element is -inf whatever its bias).
+        if bias_name is not None:
+            add_bias(out, indent)
+        if causal:
+            mask_causal(out, indent, key_base=key_base)
         # Row statistics of the chunk for queries A = 2c and B = 2c+1 of every octet.
         for o in range(octets):
             for half, idx in (("a", (0, 2)), ("b", (1, 3))):
@@ -436,22 +619,33 @@ def emit_flash_row_mma_device_body(
                 out.append(
                     f"{indent}rm_cm_{o}_{half} = {rt}.octet_max(rm_cm_{o}_{half})"
                 )
+                # The max the softmax subtracts: the running max itself, or
+                # (masked rows) a finite stand-in while no key is visible, so
+                # a fully masked chunk yields p = 0 and alpha = 0 rather than
+                # ``-inf - (-inf)``.
+                m_sub = f"rm_m{'s' if masked_rows else ''}_{o}_{half}"
                 if first:
                     out.append(f"{indent}rm_m_{o}_{half} = rm_cm_{o}_{half}")
+                    if masked_rows:
+                        out.append(
+                            f"{indent}{m_sub} = {rt}.finite_or_zero(rm_m_{o}_{half})"
+                        )
                 else:
                     out.extend(
                         (
                             f"{indent}rm_mo_{o}_{half} = rm_m[{2 * o + (half == 'b')}]",
                             f"{indent}rm_m_{o}_{half} = cute.arch.fmax(rm_mo_{o}_{half}, rm_cm_{o}_{half})",
-                            (
-                                f"{indent}rm_alpha_{o}_{half} = cute.arch.exp2("
-                                f"(rm_mo_{o}_{half} - rm_m_{o}_{half}) * rm_scale)"
-                            ),
                         )
                     )
-                out.append(
-                    f"{indent}rm_neg_{o}_{half} = rm_zero - rm_m_{o}_{half} * rm_scale"
-                )
+                    if masked_rows:
+                        out.append(
+                            f"{indent}{m_sub} = {rt}.finite_or_zero(rm_m_{o}_{half})"
+                        )
+                    out.append(
+                        f"{indent}rm_alpha_{o}_{half} = cute.arch.exp2("
+                        f"(rm_mo_{o}_{half} - {m_sub}) * rm_scale)"
+                    )
+                out.append(f"{indent}rm_neg_{o}_{half} = rm_zero - {m_sub} * rm_scale")
         # p = exp2(s * scale - m * scale), summed in a fixed order.
         for o in range(octets):
             for mt in range(m_tiles):
@@ -573,9 +767,28 @@ def emit_flash_row_mma_device_body(
             f"rm_bh = rm_pid % {num_bh}",
             f"rm_row0 = (rm_pid // {num_bh}) * {rows}",
             "rm_zero = cutlass.Float32(0.0)",
-            f"rm_scale = cutlass.Float32({scale_log2!r})",
+            (
+                f"rm_scale = cutlass.Float32({scale_log2!r})"
+                if scale_log2_expr is None
+                else f"rm_scale = {scale_log2_expr}"
+            ),
+            *(
+                (f"rm_bscale = cutlass.Float32({bias_scale!r})",)
+                if bias_name is not None
+                else ()
+            ),
             f"rm_s_q = cute.arch.alloc_smem({io_dtype}, {warps * rows * head_dim}, alignment=128)",
             f"rm_s_kv = cute.arch.alloc_smem({io_dtype}, {warps * stages * 2 * chunk * head_dim}, alignment=128)",
+            *(
+                (
+                    (
+                        f"rm_s_bias = cute.arch.alloc_smem({io_dtype}, "
+                        f"{warps * stages * rows * (bias_row_bytes // 2)}, alignment=128)"
+                    ),
+                )
+                if bias_name is not None
+                else ()
+            ),
             f"rm_s_part = cute.arch.alloc_smem(cutlass.Float32, {warps * rows * part_stride}, alignment=128)",
             f"rm_s_stat = cute.arch.alloc_smem(cutlass.Float32, {warps * 2 * rows}, alignment=16)",
             *(
@@ -584,6 +797,16 @@ def emit_flash_row_mma_device_body(
             ),
             f"rm_q_w = cutlass.Int32(rm_s_q.toint()) + rm_warp * {rows * row_bytes}",
             f"rm_kv_w = cutlass.Int32(rm_s_kv.toint()) + rm_warp * {stages * stage_bytes}",
+            *(
+                (
+                    (
+                        f"rm_bias_w = cutlass.Int32(rm_s_bias.toint()) + rm_warp * "
+                        f"{stages * bias_stage_bytes}"
+                    ),
+                )
+                if bias_name is not None
+                else ()
+            ),
             "rm_part = cutlass.Int32(rm_s_part.toint())",
             "rm_stat = cutlass.Int32(rm_s_stat.toint())",
             *(
@@ -591,6 +814,33 @@ def emit_flash_row_mma_device_body(
                 for index in range(len(aux_dtypes))
             ),
             f"rm_key0 = rm_warp * {kpw}",
+            # Causal: the lane's key index within the chunk (its g row of
+            # every 16-key tile), the two query indices it holds per octet,
+            # and the chunks this warp can see (at least the first, which a
+            # fully masked warp still runs to publish an empty partial).
+            *(
+                (
+                    "rm_kg = rm_key0 + rm_g",
+                    *(
+                        line
+                        for o in range(octets)
+                        for line in (
+                            f"rm_qa_{o} = rm_row0 + {8 * o} + 2 * rm_c",
+                            f"rm_qb_{o} = rm_qa_{o} + 1",
+                        )
+                    ),
+                    *(
+                        (
+                            f"rm_vis = cutlass.max(rm_row0 + {rows - 1} - rm_key0, cutlass.Int32(0))",
+                            f"rm_nchunk = cutlass.min(rm_vis // {chunk} + 1, cutlass.Int32({nchunk}))",
+                        )
+                        if nchunk > 1
+                        else ()
+                    ),
+                )
+                if causal
+                else ()
+            ),
             # Byte offsets are formed in Int64 from the start: a head's base
             # passes 2**31 bytes well inside the flash surface's element bound.
             f"rm_bh_off = cutlass.Int64(rm_bh) * {seq * row_bytes}",
@@ -604,6 +854,18 @@ def emit_flash_row_mma_device_body(
             ),
             f"rm_k_slice = {k_name}.iterator.toint() + {'rm_bh_off' if kv_group == 1 else 'rm_kv_bh_off'} + cutlass.Int64(rm_key0) * {row_bytes}",
             f"rm_v_slice = {v_name}.iterator.toint() + {'rm_bh_off' if kv_group == 1 else 'rm_kv_bh_off'} + cutlass.Int64(rm_key0) * {row_bytes}",
+            # The bias tile's corner: (query row 0 of the tile, this warp's
+            # first key) of batch head ``rm_bh`` in the contiguous (B, S, S).
+            *(
+                (
+                    (
+                        f"rm_bias_tile = {bias_name}.iterator.toint() + cutlass.Int64(rm_bh) * {seq * seq * 2} "
+                        f"+ cutlass.Int64(rm_row0) * {seq * 2} + cutlass.Int64(rm_key0) * 2"
+                    ),
+                )
+                if bias_name is not None
+                else ()
+            ),
         )
     )
     # ---- a fused row epilogue's aux rows: every epilogue thread stages the
@@ -634,6 +896,10 @@ def emit_flash_row_mma_device_body(
     # and, when double buffered, the second chunk (group 2) before any MMA.
     issue_tile(lines, "", smem_base="rm_q_w", gmem_base="rm_q_tile", tile_rows=rows)
     issue_tile(lines, "", smem_base="rm_kv_w", gmem_base="rm_k_slice", tile_rows=chunk)
+    if bias_name is not None:
+        # The bias joins K's group: both are consumed by the softmax of the
+        # chunk, before V.
+        issue_bias(lines, "", stage="0", chunk_index="0")
     emit("cute.arch.cp_async_commit_group()")
     issue_tile(
         lines,
@@ -644,8 +910,16 @@ def emit_flash_row_mma_device_body(
     )
     emit("cute.arch.cp_async_commit_group()")
     prefetched = stages == 2 and nchunk > 1
+    # Causal: the chunk loop's trip count is this warp's visible chunk count.
+    chunk_count = "rm_nchunk" if causal else str(nchunk)
     if prefetched:
-        issue_kv(lines, "", stage="1", chunk_index="1")
+        if causal:
+            # A warp with a single visible chunk commits an empty group so
+            # the wait counts below stay uniform.
+            emit(f"if {chunk_count} > 1:")
+            issue_kv(lines, "    ", stage="1", chunk_index="1")
+        else:
+            issue_kv(lines, "", stage="1", chunk_index="1")
         emit("cute.arch.cp_async_commit_group()")
     emit(f"cute.arch.cp_async_wait_group({1 + int(prefetched)})")
     emit("cute.arch.sync_warp()")
@@ -677,15 +951,17 @@ def emit_flash_row_mma_device_body(
     lines.extend(first_chunk)
     if nchunk > 1:
         spill_state(lines, "")
-        emit(f"for rm_chunk in cutlass.range(1, {nchunk}):")
+        emit(f"for rm_chunk in cutlass.range(1, {chunk_count}):")
         body: list[str] = []
         ind = "    "
+        if causal:
+            body.append(f"{ind}rm_kc = rm_kg + rm_chunk * {chunk}")
         # Every lane finished reading the stage about to be refilled (the
         # previous chunk's, or this chunk's own single stage) before the
         # cp.async packets of the next chunk land in it.
         body.append(f"{ind}cute.arch.sync_warp()")
         if stages == 2:
-            body.append(f"{ind}if rm_chunk + 1 < {nchunk}:")
+            body.append(f"{ind}if rm_chunk + 1 < {chunk_count}:")
             issue_kv(
                 body,
                 ind + "    ",
@@ -711,7 +987,7 @@ def emit_flash_row_mma_device_body(
             )
             stage = "0"
         body.append(f"{ind}cute.arch.sync_warp()")
-        compute_chunk(body, ind, stage=stage, first=False)
+        compute_chunk(body, ind, stage=stage, first=False, key_base="rm_kc")
         spill_state(body, ind)
         lines.extend(body)
         reload_state(lines, "")

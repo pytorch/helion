@@ -24,6 +24,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -214,6 +215,7 @@ def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes() -> (
     None
@@ -318,6 +320,7 @@ def _column_lanes_config(lanes: int) -> helion.Config:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -350,6 +353,7 @@ def test_a_stored_accumulator_restarts_in_every_lane_of_the_consume_pass(
     torch.testing.assert_close(tot, x.sum(dim=(1, 2)), rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -466,6 +470,7 @@ def _jagged_rows_config(lanes: int) -> helion.Config:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -492,6 +497,7 @@ def test_a_stored_strided_reduction_totals_the_lanes_shares(
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -629,6 +635,7 @@ def _jagged_kernel(fn: Callable[..., object], *, static_shapes: bool) -> helion.
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -651,6 +658,7 @@ def test_a_running_max_carry_keeps_the_per_lane_restore(
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -672,6 +680,7 @@ def test_an_atomic_add_of_the_row_total_runs_once_on_the_lanes_total(
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shape_modes(
@@ -723,6 +732,7 @@ def _jagged_expectations(
     }
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
 @pytest.mark.parametrize(
@@ -759,6 +769,7 @@ def test_one_row_tiles_take_the_plain_two_pass_split(
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [1, 2])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -811,6 +822,7 @@ def _grid_lane_config(bound: BoundKernel, lanes: int) -> helion.Config:
     return helion.Config.from_dict(config)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [8, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -845,6 +857,7 @@ def _first_column_then_overwrite_beside_row_sums(
     return sums
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("num_threads", "refused"),
@@ -895,6 +908,7 @@ def _column_zeroed_then_copied(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("threads", [64, 128])
 def test_a_column_zeroed_before_its_copy_beside_a_row_sum_rejects_the_config(
@@ -915,6 +929,7 @@ def test_a_column_zeroed_before_its_copy_beside_a_row_sum_rejects_the_config(
         bound.to_code(config)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_a_column_zeroed_before_its_copy_is_never_left_zero() -> None:
     """Without the row sum the same body gets its barrier, and one thread per

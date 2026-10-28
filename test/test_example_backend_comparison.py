@@ -269,6 +269,7 @@ def test_worker_environment_removes_inherited_budget_and_config(monkeypatch, tmp
     monkeypatch.setenv("HELION_AUTOTUNE_BUDGET_SECONDS", "1")
     monkeypatch.setenv("HELION_AUTOTUNE_CONFIG_OVERRIDES", '{"block_sizes": [1]}')
     monkeypatch.setenv("HELION_AUTOTUNE_EFFORT", "none")
+    monkeypatch.delenv("HELION_BENCHMARK_GRAPH_WARMUP", raising=False)
     env = compare.worker_environment("2", "cute", tmp_path, 1234)
     assert env["HELION_AUTOTUNE_EFFORT"] == "full"
     assert env["HELION_FORCE_AUTOTUNE"] == "1"
@@ -276,7 +277,82 @@ def test_worker_environment_removes_inherited_budget_and_config(monkeypatch, tmp
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert "HELION_AUTOTUNE_BUDGET_SECONDS" not in env
     assert "HELION_AUTOTUNE_CONFIG_OVERRIDES" not in env
+    assert "HELION_BENCHMARK_GRAPH_WARMUP" not in env
     assert env["HELION_CACHE_DIR"] == str(tmp_path / "helion")
+    assert compare.graph_state_regime().startswith("steady:")
+    # The documented opt-out of the graph dispatch warm-up is the one HELION_*
+    # variable the workers inherit, and the run record names the regime.
+    monkeypatch.setenv("HELION_BENCHMARK_GRAPH_WARMUP", "0")
+    env = compare.worker_environment("2", "cute", tmp_path, 1234)
+    assert env["HELION_BENCHMARK_GRAPH_WARMUP"] == "0"
+    assert compare.graph_state_regime().startswith("fast:")
+    monkeypatch.setenv("HELION_BENCHMARK_GRAPH_WARMUP", "maybe")
+    with pytest.raises(ValueError, match="HELION_BENCHMARK_GRAPH_WARMUP"):
+        compare.graph_state_regime()  # the driver fails fast, with the name
+
+
+def test_graph_state_warmup_reports_the_first_timed_readings_state(monkeypatch):
+    # The record field describes the state of the process's first timed
+    # reading; a warm-up that failed first and succeeded before a later
+    # measurement is reported as such rather than overwritten.
+    from helion.autotuner import benchmarking
+
+    notes = iter(["failed: RuntimeError: busy", benchmarking._GRAPH_WARMUP_NOTE])
+    monkeypatch.setattr(benchmarking, "steady_graph_dispatch", lambda: next(notes))
+    monkeypatch.setattr(baselines, "_graph_state_note", None)
+    assert baselines.graph_state_warmup() == "failed: RuntimeError: busy"
+    assert baselines.graph_state_warmup() == (
+        f"failed: RuntimeError: busy; then {benchmarking._GRAPH_WARMUP_NOTE}"
+    )
+    monkeypatch.setattr(
+        benchmarking, "steady_graph_dispatch", lambda: benchmarking._GRAPH_WARMUP_NOTE
+    )
+    assert baselines.graph_state_warmup() == (
+        f"failed: RuntimeError: busy; then {benchmarking._GRAPH_WARMUP_NOTE}"
+    )
+    monkeypatch.setattr(baselines, "_graph_state_note", None)
+    assert baselines.graph_state_warmup() == benchmarking._GRAPH_WARMUP_NOTE
+    assert baselines.graph_state_warmup() == benchmarking._GRAPH_WARMUP_NOTE
+
+
+def test_pins_match_a_kernel_recorded_with_a_duplicate_suffix(tmp_path):
+    # ``name@2`` marks a second kernel built from one function; which of the
+    # two gets the suffix depends on the collector's order, so a pin read
+    # from a record that named ``name@2`` must still apply.
+    from benchmarks.cute import example_case_bench as case_bench
+
+    import helion
+
+    record = tmp_path / "record.json"
+    record.write_text(
+        json.dumps(
+            {
+                "bound_kernels": [
+                    {
+                        "kernel": "examples.attention.attention@2",
+                        "configs": ['{"block_sizes": [16]}', None],
+                    }
+                ]
+            }
+        )
+    )
+    kernels = {
+        name: SimpleNamespace(configs=None)
+        for name in (
+            "examples.attention.attention",
+            "examples.attention.attention@2",
+            "examples.attention.other",
+        )
+    }
+    case_bench.pin_configs(SimpleNamespace(pin_from=record, pin=[]), kernels)
+    for name in ("examples.attention.attention", "examples.attention.attention@2"):
+        assert kernels[name].configs == [helion.Config(block_sizes=[16])]
+    assert kernels["examples.attention.other"].configs is None
+    with pytest.raises(ValueError, match="matches nothing"):
+        case_bench.pin_configs(
+            SimpleNamespace(pin_from=None, pin=['missing@2={"block_sizes": [8]}']),
+            kernels,
+        )
 
 
 def fixture_records():
@@ -307,12 +383,37 @@ def fixture_records():
                     "impl": provider,
                     "status": "ok",
                     "graph_ms": latency,
+                    "graph_state_warmup": "16 eager launches on side streams",
                     "eager_correctness": "pass",
                     "graph_correctness": "pass",
                     "post_measurement_correctness": "pass",
                 }
             )
     return run, records
+
+
+def test_report_names_the_graph_dispatch_state_and_marks_disagreement():
+    from benchmarks.cute.example_report import graph_state_lines
+
+    run, records = fixture_records()
+    data = aggregate(run, records)
+    assert data["graph_states"] == {"16 eager launches on side streams": 9}
+    (line,) = graph_state_lines(data["graph_states"])
+    assert line.startswith("Graph dispatch state of all 9 measured records: 16 eager")
+    # A record from before the field existed, and one whose warm-up failed:
+    # the run's readings are no longer all comparable, and the report says so
+    # instead of averaging across regimes.
+    del records[1]["graph_state_warmup"]
+    records[2]["graph_state_warmup"] = "failed: RuntimeError: busy"
+    data = aggregate(run, records)
+    assert data["graph_states"] == {
+        "16 eager launches on side streams": 7,
+        "failed: RuntimeError: busy": 1,
+        "unrecorded": 1,
+    }
+    (line,) = graph_state_lines(data["graph_states"])
+    assert line.startswith("WARNING: the measured records disagree")
+    assert "unrecorded (1)" in line and "failed: RuntimeError: busy (1)" in line
 
 
 def test_higher_is_better_and_incomplete_shapes_are_not_dropped():
@@ -357,7 +458,9 @@ def test_report_reads_pinned_results_and_generates_matplotlib_chart(tmp_path):
     source.write_text(json.dumps(run))
     report_results(source, tmp_path / "report")
     assert (tmp_path / "report/speedups.png").read_bytes().startswith(b"\x89PNG")
-    assert "higher is better" in (tmp_path / "report/report.md").read_text()
+    report = (tmp_path / "report/report.md").read_text()
+    assert "higher is better" in report
+    assert "Graph dispatch state of all 9 measured records: 16 eager" in report
     (tmp_path / "0.json").write_text("{}")
     with pytest.raises(ValueError, match="hash changed"):
         report_results(source, tmp_path / "invalid")
@@ -456,10 +559,13 @@ def test_run_restricts_jobs_to_requested_cases(monkeypatch, tmp_path):
         repetitions=1,
         output=tmp_path / "run",
     )
+    monkeypatch.delenv("HELION_BENCHMARK_GRAPH_WARMUP", raising=False)
     compare.run(args)
     record = json.loads((tmp_path / "run" / "results.json").read_text())
     assert record["status"] == "complete"
     assert record["cases"] == ["01_backward"]
+    assert record["graph_state"].startswith("steady:")
+    assert "graph_state" in record["timer"]
     assert sorted(launched) == [
         ("01_backward", "baselines"),
         ("01_backward", "cute"),

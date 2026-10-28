@@ -57,6 +57,22 @@ def _bind_gemm_k_major_b(
     return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
 
 
+def _bind_gemm_m_major_a(
+    shape: tuple[int, int, int], dtype: torch.dtype, *, k_major_b: bool = False
+) -> helion.runtime.kernel.BoundKernel:
+    """A GEMM whose A is M-contiguous (``mat1.T @ grad_out`` of the matmul
+    example's backward: the transposed view of a row-major matrix)."""
+    m, n, k = shape
+    a = torch.empty((k, m), dtype=dtype, device=CPU_DEVICE).T
+    if k_major_b:
+        b = torch.empty((n, k), dtype=dtype, device=CPU_DEVICE).T
+    else:
+        b = torch.empty((k, n), dtype=dtype, device=CPU_DEVICE)
+    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(
+        (a, b)
+    )
+
+
 def _fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _, n = y.size()
@@ -383,6 +399,41 @@ def test_two_outputs_each_get_their_chain() -> None:
     assert _plan(source)["out_idx"] is not None
 
 
+def _bias_gelu_aux_gemm(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    aux = torch.empty_like(out)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        pre = acc * 1.25 + bias[tile_n]
+        aux[tile_m, tile_n] = pre.to(a.dtype)
+        out[tile_m, tile_n] = torch.nn.functional.gelu(pre).to(a.dtype)
+    return out, aux
+
+
+def test_gelu_aux_epilogue_is_part_of_the_gemm() -> None:
+    # The chain's Python-level elementwise helpers (``_gelu_erf``) are pure:
+    # the root-loop proof admits them like the aten pointwise ops, so the
+    # cuBLASLt GELU_AUX pattern (bias prefix, two outputs) takes the
+    # register-MMA family at small shapes.
+    bound = _bind(
+        _bias_gelu_aux_gemm,
+        torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256,), dtype=torch.float16, device=CPU_DEVICE),
+    )
+    source = _source(bound, _warp_config([64, 16, 64], 1))
+    kernel = _kernel_body(source)
+    assert "wm_o0 = " in kernel and "wm_o1 = " in kernel
+    assert "gelu_erf" in source
+    assert _plan(source)["out_idx"] is not None
+
+
 # --------------------------------------------------------------------------
 # Admission, normalization and seeds
 # --------------------------------------------------------------------------
@@ -392,6 +443,37 @@ def _fragment_low(bound: helion.runtime.kernel.BoundKernel, index: int) -> int:
     with bound.env:
         spec = bound.config_spec
         return spec.block_sizes[index]._fragment(spec).low
+
+
+def test_batched_m_major_a_is_outside_the_search() -> None:
+    # ``bmm(a.transpose(1, 2), b)``: the tcgen05 search records no static
+    # extents for a batched M-contiguous A, so neither family is offered (the
+    # admission's rank-3 M-major stride case is not reachable from a kernel);
+    # the same bmm with a K-contiguous A admits the family.
+    from test.test_cute_tcgen05_fixed_chain import _batched_gemm
+
+    b = torch.empty((4, 128, 128), dtype=torch.float16, device=CPU_DEVICE)
+    m_major = _bind(
+        _batched_gemm,
+        torch.empty((4, 128, 64), dtype=torch.float16, device=CPU_DEVICE).transpose(
+            1, 2
+        ),
+        b,
+    )
+    with m_major.env:
+        state = m_major.config_spec._cute_tcgen05_config
+        assert not state.search_enabled and not state.warp_mma_admitted
+        assert state.matmul_compile_time_static_extents is None
+        with pytest.raises(InvalidConfig, match="tcgen05-enabled"):
+            m_major.config_spec.normalized_config(_warp_config([1, 16, 8, 128], 1))
+    k_major = _bind(
+        _batched_gemm,
+        torch.empty((4, 64, 128), dtype=torch.float16, device=CPU_DEVICE),
+        b,
+    )
+    with k_major.env:
+        state = k_major.config_spec._cute_tcgen05_config
+        assert state.search_enabled and state.warp_mma_admitted
 
 
 def test_admitted_problems_widen_the_block_floors_to_the_mma_atom() -> None:
@@ -559,9 +641,11 @@ def test_seeds_cover_the_measured_tiles() -> None:
     assert tiles == [
         ((16, 8, 128), 1),
         ((16, 16, 128), 1),
+        ((16, 32, 128), 2),
         ((32, 16, 128), 2),
         ((32, 32, 128), 4),
         ((64, 8, 128), 4),
+        ((64, 16, 128), 4),
     ], tiles
     assert all(seed.config[FAMILY] == "warp_mma" for seed in seeds)
     bmm = _bind_bmm((4, 64, 128, 128), torch.float16)
@@ -571,16 +655,18 @@ def test_seeds_cover_the_measured_tiles() -> None:
     assert tiles == [
         (1, 16, 8, 128),
         (1, 16, 16, 128),
+        (1, 16, 32, 128),
         (1, 32, 16, 128),
         (1, 32, 32, 128),
         (1, 64, 8, 128),
+        (1, 64, 16, 128),
     ], tiles
     full = _bind_gemm((2048, 2048, 256), torch.float16)
     with full.env:
         assert full.config_spec._cute_tcgen05_config._warp_mma_seed_configs() == []
     with bound.env:
         all_seeds = bound.config_spec._cute_tcgen05_config.autotune_seed_configs()
-    assert sum(seed.config.get(FAMILY) == "warp_mma" for seed in all_seeds) == 5
+    assert sum(seed.config.get(FAMILY) == "warp_mma" for seed in all_seeds) == 7
 
 
 def test_machine_filling_renders_carry_no_family_key() -> None:
@@ -672,6 +758,95 @@ def test_admission_mirrors_the_detector_gates() -> None:
     )
 
 
+def test_m_major_a_is_staged_transposed_and_read_with_ldmatrix_trans() -> None:
+    # The ``mat1.T @ grad_out`` GEMM of the matmul backward: A is M-contiguous.
+    # Its tile is staged as bk rows of bm elements (packets coalesced along
+    # M, one k column per packet row) and the fragments come from
+    # ``ldmatrix.trans`` like those of an N-contiguous B; the family is
+    # admitted and seeded for it.
+    bound = _bind_gemm_m_major_a((256, 256, 256), torch.float16)
+    with bound.env:
+        spec = bound.config_spec
+        assert spec._cute_tcgen05_config.warp_mma_admitted
+        assert spec._cute_tcgen05_config._warp_mma_seed_configs()
+    body = _kernel_body(_source(bound, _warp_config([16, 32, 64], 2)))
+    # The tile base steps along M by one element; packet rows step along K
+    # by the column stride (256 elements = 512 B).
+    assert "cutlass.Int64(wm_m0) * 2" in body
+    assert (
+        "wm_a_g + cutlass.Int64(0 + wm_prow) * 512 + cutlass.Int64(wm_pch * 16)" in body
+    )
+    assert (
+        "wm_a_g + cutlass.Int64(64 + wm_prow) * 512 + cutlass.Int64(wm_pch * 16)"
+        in body
+    )
+    # Both operands are N-/M-contiguous: every fragment comes through .trans.
+    assert f"{RT}.ldmatrix_x4(" not in body
+    # 4 chunks x 4 steps x (1 A atom + 1 B pair) per warp.
+    assert body.count(f"{RT}.ldmatrix_x4_trans(") == 32
+    assert "wm_arow = wm_l8 + 8 * (wm_lq // 2)" in body
+    assert "wm_achunk = wm_wmi * 2 + wm_lq % 2" in body
+    # Same shared footprint as the K-contiguous staging of the same tile.
+    row_major = _kernel_body(
+        _source(
+            _bind_gemm((256, 256, 256), torch.float16), _warp_config([16, 32, 64], 2)
+        )
+    )
+    smem = re.compile(r"alloc_smem\(cutlass.Uint8, (\d+)")
+    assert smem.search(body).group(1) == smem.search(row_major).group(1) == "24576"
+    # With a K-contiguous B only A goes through .trans.
+    both = _kernel_body(
+        _source(
+            _bind_gemm_m_major_a((256, 256, 256), torch.bfloat16, k_major_b=True),
+            _warp_config([32, 32, 64], 4),
+        )
+    )
+    assert both.count(f"{RT}.ldmatrix_x4_trans(") == 16  # A: 4 chunks x 4 steps
+    assert both.count(f"{RT}.ldmatrix_x4(") == 16  # B pairs
+    assert f"{RT}.mma_bf16(" in both
+
+
+def test_m_major_a_admission_keeps_the_e4m3_and_alignment_gates() -> None:
+    def reason(**overrides: object) -> str | None:
+        values: dict[str, object] = {
+            "static_m": 256,
+            "static_n": 256,
+            "static_k": 256,
+            "leading": 1,
+            "dtype": torch.float16,
+            "lhs_major": "col",
+            "rhs_major": "row",
+            "num_sms": 148,
+            "lhs_strides": (1, 256),
+            "rhs_strides": (256, 1),
+        }
+        values.update(overrides)
+        return family.warp_mma_admission_reason(**values)  # pyrefly: ignore[bad-argument-type]
+
+    assert reason() is None
+    assert reason(rhs_major="col", rhs_strides=(1, 256)) is None
+    assert (
+        reason(dtype=torch.float8_e4m3fn, rhs_major="col", rhs_strides=(1, 256))
+        == "an e4m3 A must be K-contiguous (ldmatrix.trans moves 16-bit elements)"
+    )
+    assert (
+        reason(lhs_strides=(1, 260))
+        == "an M-contiguous A needs 16-byte aligned columns"
+    )
+    assert reason(lhs_major=None) == "A must be K- or M-contiguous"
+    # The strided-view binding of a column-major A with a misaligned column
+    # stride is not admitted (no family keys, no seeds).
+    misaligned = _bind(
+        _ordinary_gemm,
+        torch.empty((256, 260), dtype=torch.float16, device=CPU_DEVICE)[:, :256].T,
+        torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+    )
+    with misaligned.env:
+        spec = misaligned.config_spec
+        assert not spec._cute_tcgen05_config.warp_mma_admitted
+        assert spec._cute_tcgen05_config._warp_mma_seed_configs() == []
+
+
 def test_cast_operand_kernel_stays_fused_and_converts_in_registers() -> None:
     # bf16 x int16 at (128, 256, 128): the matmul reads ``w[k, n].to(bf16)``
     # of an int16 tile.  TMA packets cannot carry that cast to the tensor
@@ -739,7 +914,9 @@ def test_cast_operand_on_the_lhs_converts_a_packets() -> None:
 
 def test_cute_pdl_waits_before_the_packets_and_releases_before_the_stores() -> None:
     bound = _bind_row_bias_gemm((256, 256, 256), torch.float16)
-    plain = _source(bound, _warp_config([64, 8, 256], 4))
+    # (``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface, which
+    # the family shares; the knob-off render pins it off)
+    plain = _source(bound, _warp_config([64, 8, 256], 4, cute_pdl=False))
     assert "griddepcontrol" not in plain and "'use_pdl': True" not in plain
     source = _source(bound, _warp_config([64, 8, 256], 4, cute_pdl=True))
     body = _kernel_body(source)

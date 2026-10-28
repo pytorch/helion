@@ -23,12 +23,14 @@ StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
     "direct_m16n16_v1",
 ]
 CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
+CutePdlReleaseLiteral = Literal["auto", "entry", "none", "exit", "last_wave"]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -59,6 +61,7 @@ class Config(Mapping[str, object]):
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         cute_store_policy: CuteStorePolicyLiteral | None = None,
+        cute_exact_div_form: CuteExactDivFormLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
         cute_async_load_group_rows: int | None = None,
@@ -75,6 +78,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
@@ -125,6 +129,13 @@ class Config(Mapping[str, object]):
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
             cute_async_load_group_rows: Per-thread row iterations in each group.
+            cute_exact_div_form: How CuTe lowers an fp32 division by a
+                loop-invariant divisor (a row sum, a scalar argument); both
+                forms give the IEEE quotient bit for bit. ``"redo"`` (default)
+                speculates the Markstein sequence over the loop and re-runs
+                the loop with ``div.rn`` on a hard case (a loop the redo
+                cannot take keeps its plain division), ``"plain"`` keeps one
+                ``div.rn`` per element.
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
@@ -161,6 +172,30 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_pdl_release: Where a ``cute_pdl`` kernel releases its own
+                dependents (``griddepcontrol.launch_dependents``), which is what
+                lets the next kernel of a sequence launch early too. ``entry``
+                releases right after the wait, so the dependents' CTAs become
+                resident while this kernel runs; ``exit`` releases after the
+                body's last statement; ``none`` leaves the implicit trigger at
+                grid completion, after which a dependent starts later than a
+                plain stream edge would have launched it; ``last_wave`` releases
+                at entry in the CTAs of the launch's last wave only (the CTAs
+                whose dispatch-order index lies within the resident capacity of
+                the grid's end; the earlier CTAs count as released when they
+                exit), so the dependents launch as the last wave starts and
+                fill the slots its tail frees, which is plain ``entry`` for a
+                grid that fits in one wave and keeps the middle waves of a
+                larger grid undisturbed. ``auto`` (the default) picks ``entry``
+                while the launch grid is known to fit in one wave of resident
+                CTAs (the SM count times the CTAs an SM holds, from the launch
+                block or ``cute_min_blocks_per_mp``) and ``last_wave`` past it
+                or when the grid is sized at runtime; the search leaves the
+                placement at ``auto``. Every placement reads the same data: a
+                dependent's own wait blocks until this grid has completed and
+                flushed. Inert when ``cute_pdl`` is off and on the
+                tcgen05 GEMM families, whose lowering places its own release
+                after the last MMA.
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
@@ -244,6 +279,7 @@ class Config(Mapping[str, object]):
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
             "cute_store_policy": cute_store_policy,
+            "cute_exact_div_form": cute_exact_div_form,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
             "cute_async_load_group_rows": cute_async_load_group_rows,
@@ -260,6 +296,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_pdl_release": cute_pdl_release,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
@@ -538,6 +575,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteStorePolicyLiteral",
             self.config.get("cute_store_policy", "default"),
+        )
+
+    @property
+    def cute_exact_div_form(self) -> CuteExactDivFormLiteral:
+        return cast(
+            "CuteExactDivFormLiteral",
+            self.config.get("cute_exact_div_form", "redo"),
         )
 
     @property

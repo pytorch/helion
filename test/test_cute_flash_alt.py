@@ -15,6 +15,10 @@ import ast
 import dataclasses
 import math
 import os
+from pathlib import Path
+import re
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -391,6 +395,7 @@ def test_resolver_pins_the_structure() -> None:
     assert cfg.e2e_offset0 == cfg.e2e_offset == 11
     assert cfg.exp2_packet == "8x2" and cfg.e2e_schedule == "16/6"
     assert cfg.rescale_threshold == 12.0 and cfg.corr_tile_size == 8
+    assert cfg.o_stage == 2
     assert cute_flash.flash_effective_config_values(cfg)[FAMILY_KEY] == "fa4_alt"
 
 
@@ -399,6 +404,34 @@ def test_k_ring_depth_is_two_or_three(requested: int, expected: int) -> None:
     cfg = _resolve({**_ALT, "cute_flash_kv_stage": requested})
     assert cfg.kv_stage == expected
     assert FA4_ALT_V_STAGE == 2
+
+
+def test_shared_output_tile_request_resolves_to_the_two_q_stages() -> None:
+    """The fa4 pair body's shared staged output tile (``cute_flash_o_stage``
+    = 1) has no counterpart here: the body stages each item's output through
+    its own finished Q stage (``sO`` aliases the two Q stages), and the host
+    builds ``_flash_osl`` from the resolved tile count.  An honoured request
+    gave the launcher a one-tile layout under which stage 1 addressed tile 0
+    -- the next item's Q, loaded there meanwhile -- so the third item of every
+    persistent CTA read a clobbered Q (the (2, 16, 2048, 128) campaign
+    winner: 148 wrong tiles, racy).  The request resolves to two tiles on the
+    resolver and on the family's search surface; the pair body keeps it."""
+    cfg = _resolve({**_ALT, cute_flash.FLASH_O_STAGE_KEY: 1})
+    assert cfg.alternating_warpgroups
+    assert cfg.o_stage == 2
+    pair = _resolve({**_ALT, FAMILY_KEY: "fa4", cute_flash.FLASH_O_STAGE_KEY: 1})
+    assert not pair.alternating_warpgroups
+    assert pair.o_stage == 1
+    fragments = cute_flash.flash_autotune_fragments(
+        128,
+        16,
+        num_bh=32,
+        dtype=torch.bfloat16,
+        plain_row_body=True,
+        pipeline_family_override="fa4_alt",
+    )
+    fragment = cast("Any", fragments[cute_flash.FLASH_O_STAGE_KEY])
+    assert tuple(fragment.search_choices or ()) == (2,)
 
 
 def test_fa4_structural_knobs_normalize_to_one_effective_config() -> None:
@@ -413,6 +446,7 @@ def test_fa4_structural_knobs_normalize_to_one_effective_config() -> None:
         {"cute_flash_persistent_loop": "counted"},
         {"cute_flash_other_regs": 48, "cute_flash_softmax_regs": 200},
         {"cute_flash_e2e_offset0": 3},
+        {cute_flash.FLASH_O_STAGE_KEY: 1},
     ):
         assert (
             cute_flash.flash_effective_config_values(_resolve({**_ALT, **overrides}))
@@ -472,7 +506,7 @@ def _assert_partial_sum_consumption_guard(src: str) -> None:
     item lets the even warpgroup arrive twice before one odd sync: the 256-thread
     barrier completes without the reader and the row sums mix items."""
     assert "cute.arch.mbarrier_init(flash_l_consumed_ptr, 128)" in src
-    even_wait = src.index("mbar_spin_wait(flash_l_consumed_ptr, flash_lc_phase")
+    even_wait = src.index("mbar_spin_wait_addr(flash_l_consumed_addr, flash_lc_phase")
     slot_write = src.index("flash_l_t[flash_local_tidx] = flash_part_sum")
     even_arrive = src.index("named_barrier_arrive_unaligned(13, 256)")
     assert even_wait < slot_write < even_arrive
@@ -486,25 +520,90 @@ def _assert_partial_sum_consumption_guard(src: str) -> None:
 
 
 def _assert_row_sum_consumption_guard(src: str) -> None:
-    """The odd warpgroup's alpha slot carries the item's row sum to the
-    correction warps. Its next item's first alpha is written after a P-buffer
-    wait the row-sum publish already passed, so without a guard it could
-    overwrite the slot before the correction warps read it and arrive on the
-    64-thread handoff barrier twice before one correction sync. The warpgroup
-    waits for their ``rowsum_consumed`` arrival at the top of every item."""
+    """The odd warpgroup publishes the item's row sum to the correction warps
+    through its max slot right after computing it (named barrier 14, 256
+    threads: its four warps arrive, the four correction warps sync). The slot
+    is dead then (its last max publication of the item was read by the even
+    warpgroup before the partial-sum handoff), but its next item's first max
+    publication has no order against the correction warps' read, so without a
+    guard it could overwrite the row sum before they read it and arrive on
+    barrier 14 twice before one correction sync. The warpgroup waits for their
+    ``rowsum_consumed`` arrival at the top of every item."""
     assert "cute.arch.mbarrier_init(flash_rowsum_consumed_ptr, 128)" in src
     assert "flash_rsc_phase = cutlass.Int32(1)" in src
-    odd_wait = src.index("mbar_spin_wait(flash_rowsum_consumed_ptr, flash_rsc_phase")
-    odd_first_alpha = src.index("flash_pfor_ptr + 1, flash_pfor2_ptr + 1")
-    assert odd_wait < odd_first_alpha
-    assert src.count("mbar_spin_wait(flash_rowsum_consumed_ptr") == 1
+    odd_wait = src.index(
+        "mbar_spin_wait_addr(flash_rowsum_consumed_addr, flash_rsc_phase"
+    )
+    odd_first_max = src.index("flash_m_t[1, flash_local_tidx] = flash_row_max")
+    assert odd_wait < odd_first_max
+    assert src.count("mbar_spin_wait_addr(flash_rowsum_consumed_addr") == 1
+    # the publish: after the partial sum came in, before the LSE store, no PV wait
+    odd_sync = src.index("named_barrier_wait_unaligned(13, 256)")
+    publish = src.index("flash_m_t[1, flash_local_tidx] = flash_row_sum")
+    odd_arrive = src.index("named_barrier_arrive_unaligned(14, 256)")
+    assert odd_sync < publish < odd_arrive
+    assert src.count("named_barrier_arrive_unaligned(14, 256)") == 1
+    assert "flash_scale_t[1, flash_local_tidx] = flash_row_sum" not in src
+    assert "mbar_spin_wait_addr(flash_pv_done_addr + 8, flash_pvd_phase," not in src
     # the correction warps arrive after the row-sum read, before the epilogue
-    corr_sync = src.rindex("named_barrier_wait_unaligned(7 + warp_idx % 4, 64)")
-    slot_read = src.index("rcp_approx_ftz(flash_scale_t[1, flash_local_tidx])")
+    corr_sync = src.index("named_barrier_wait_unaligned(14, 256)")
+    slot_read = src.index("rcp_approx_ftz(flash_m_t[1, flash_local_tidx])")
     corr_arrive = src.index("mbarrier_arrive(flash_rowsum_consumed_ptr)")
     epilogue = src.index("fa4_correction_epilogue_to_smem_scoped(")
     assert corr_sync < slot_read < corr_arrive < epilogue
+    assert src.count("named_barrier_wait_unaligned(14, 256)") == 1
     assert src.count("mbarrier_arrive(flash_rowsum_consumed_ptr)") == 1
+    # the per-warp alpha barriers carry alphas only: one odd arrive per
+    # correction sync inside the step loop, nothing after it
+    assert src.count("named_barrier_arrive_unaligned(7 + warp_idx % 4, 64)") == 0
+    assert src.count("named_barrier_wait_unaligned(7 + warp_idx % 4, 64)") == 1
+
+
+def _assert_uniform_wait_addresses(src: str) -> None:
+    """Every mbarrier spin wait addresses its barrier through a warp-uniform
+    32-bit shared address computed once next to the pointers (ptxas spilled
+    the per-thread pointer base and reloaded it before every wait); arrives
+    and the barrier inits keep the pointers."""
+    for name in (
+        "s_full",
+        "s_empty",
+        "pfor",
+        "pfor2",
+        "pv_done",
+        "o_full",
+        "corr_epi_full",
+        "l_consumed",
+        "rowsum_consumed",
+    ):
+        derivation = (
+            f"flash_{name}_addr = cute.arch.make_warp_uniform("
+            f"cutlass.Int32(flash_{name}_ptr.toint()))"
+        )
+        assert src.count(derivation) == 1
+        assert src.index(f"flash_{name}_ptr = storage.{name}_mbar.data_ptr()") < (
+            src.index(derivation)
+        )
+    assert "flash_tmem_dealloc_addr" not in src
+    assert src.index("flash_rowsum_consumed_addr = ") < src.index("if tidx == 0:")
+    assert "mbar_spin_wait(" not in src
+    assert src.count("mbar_spin_wait_addr(") == 12
+    # the second stage of a pair is eight bytes on
+    assert "mbar_spin_wait_addr(flash_s_full_addr, flash_s_full_phase" in src
+    assert "mbar_spin_wait_addr(flash_s_full_addr + 8, flash_s_full_phase" in src
+    assert "mbar_spin_wait_addr(flash_s_empty_addr + 8, flash_se_phase" in src
+    assert "mbar_spin_wait_addr(flash_pfor_addr + 8, flash_pfor_phase" in src
+    # (the even step's rescale waits for the odd PV and vice versa)
+    assert "mbar_spin_wait_addr(flash_pv_done_addr + 8, flash_pvd_phase1" in src
+    assert "mbar_spin_wait_addr(flash_pv_done_addr, flash_pvd_phase0" in src
+    # the exp pass waits for its P buffer through the address as well
+    assert ", flash_pv_done_addr, flash_pvd_phase, flash_do_handoff, " in src
+    assert ", flash_pv_done_addr + 8, flash_pvd_phase, flash_do_handoff, " in src
+    assert "flash_pv_done_ptr + 0, flash_pvd_phase" not in src
+    assert "flash_pv_done_ptr + 1, flash_pvd_phase" not in src
+    # arrives, commits and inits stay on the pointers
+    assert "cute_tcgen05_flash.commit(flash_pv_done_ptr + 1)" in src
+    assert "mbarrier_arrive(flash_pfor_ptr + 1)" in src
+    assert "cute.arch.mbarrier_init(flash_pfor_ptr + flash_st, 256)" in src
 
 
 # --------------------------------------------------------------------------
@@ -534,8 +633,12 @@ def test_emitted_body_has_the_alternating_structure() -> None:
     assert "named_barrier_wait_unaligned(12, 256)" in src
     assert "named_barrier_arrive_unaligned(13, 256)" in src
     assert "named_barrier_wait_unaligned(13, 256)" in src
+    # ... and the row sum B -> correction warps once per item
+    assert "named_barrier_arrive_unaligned(14, 256)" in src
+    assert "named_barrier_wait_unaligned(14, 256)" in src
     _assert_partial_sum_consumption_guard(src)
     _assert_row_sum_consumption_guard(src)
+    _assert_uniform_wait_addresses(src)
     # the knobs reach the pass
     assert "pair_batch=8, emu_batch=2" in src
     assert ", 16, 6, 11, " in src
@@ -582,6 +685,7 @@ def test_emitted_body_adapts_to_the_kv_count() -> None:
     assert two_src.count("fa4_alt_exp_pass_held(") == 2
     _assert_partial_sum_consumption_guard(two_src)
     _assert_row_sum_consumption_guard(two_src)
+    _assert_uniform_wait_addresses(two_src)
 
 
 def test_coverage_design_keeps_the_64_row_tile_witness() -> None:
@@ -669,24 +773,36 @@ def test_schedule_models_the_alternating_pipeline() -> None:
     assert [(e.source, e.target, e.iteration_delta) for e in guard] == [
         ("softmax_b", "softmax_a", 1)
     ]
+    # the row sum reaches the epilogue through the odd max slot ...
+    assert barriers["row_sum_r0"].expected_arrivals == 128
+    row_sum = [edge for edge in schedule.edges if edge.barrier == "row_sum_r0"]
+    assert [(e.source, e.target, e.iteration_delta, e.resource) for e in row_sum] == [
+        ("softmax_b", "output_stage_r0_q0", 0, "ROWSUM_r0")
+    ]
+    # ... whose next publication waits for the epilogue's read
     assert barriers["row_sum_consumed_r0"].expected_arrivals == 128
     row_guard = [
         edge for edge in schedule.edges if edge.barrier == "row_sum_consumed_r0"
     ]
     assert [(e.source, e.target, e.iteration_delta) for e in row_guard] == [
-        ("correction_b", "stat_b", 1)
+        ("output_stage_r0_q0", "softmax_b", 1)
     ]
     cycles = {cycle.barrier: cycle for cycle in schedule.phase_cycles}
     assert cycles["s_full_a"].uses_per_work == 8
     assert cycles["k_ready_r0"].uses_per_work == 16
     assert cycles["alpha_a"].uses_per_work == 7
-    assert cycles["alpha_b"].uses_per_work == 9
+    assert cycles["alpha_b"].uses_per_work == 8
     assert cycles["part_sum_r0"].uses_per_work == 1
     assert cycles["part_sum_consumed_r0"].uses_per_work == 1
+    assert cycles["row_sum_r0"].uses_per_work == 1
     assert cycles["row_sum_consumed_r0"].uses_per_work == 1
     regions = {region.name: region for region in schedule.memory_regions}
     assert regions["Q_r0_q0"].offset == regions["O_stage_r0_q0"].offset == 0
     assert regions["P_a"].offset == 384 and regions["P_b"].offset == 448
+    assert regions["ROWSUM_r0"].offset == regions["MAX_b"].offset
+    assert regions["ROWSUM_r0"].alias_group == regions["MAX_b"].alias_group
+    assert regions["MAX_a"].alias_group is None
+    assert regions["STAT_b"].consumers == ("correction_b",)
     shallow = verify_flash_schedule(build_fa4_alt_schedule(_spec(kv_depth=2)))
     assert shallow.schedule.shared_memory_bytes == 199680
     # a two-step item has one even step: no even alpha handoff at all
@@ -697,7 +813,8 @@ def test_schedule_models_the_alternating_pipeline() -> None:
     assert "alpha_a" not in two_barriers and "alpha_b" in two_barriers
     assert "STAT_a" not in {region.name for region in two_step.memory_regions}
     two_cycles = {cycle.barrier: cycle for cycle in two_step.phase_cycles}
-    assert two_cycles["alpha_b"].uses_per_work == 2
+    assert two_cycles["alpha_b"].uses_per_work == 1
+    assert two_cycles["row_sum_r0"].uses_per_work == 1
     assert two_cycles["s_full_a"].uses_per_work == 1
     assert two_cycles["k_ready_r0"].uses_per_work == 2
 
@@ -724,16 +841,17 @@ def test_schedule_rejects_unsupported_shapes(
     "guard,match",
     [
         ("part_sum_consumed_r0", "PARTSUM_r0 needs a consumption guard"),
-        ("row_sum_consumed_r0", "STAT_b needs a consumption guard"),
+        ("row_sum_consumed_r0", "ROWSUM_r0 needs a consumption guard"),
     ],
 )
 def test_schedule_verifier_requires_the_consumption_guards(
     guard: str, match: str
 ) -> None:
-    """The slot handed over named barrier 13 and the odd warpgroup's alpha slot
-    (which carries the row sum across the item boundary) need their reverse
-    barrier edges; reachability through the max handoff or the PV chain is not
-    enough because the reader publishes other values before it reads them."""
+    """The slot handed over named barrier 13 and the odd warpgroup's max slot
+    (which carries the row sum to the epilogue over named barrier 14) need
+    their reverse barrier edges; reachability through the max handoff or the
+    PV chain is not enough because the reader publishes other values before
+    it reads them."""
     schedule = build_fa4_alt_schedule(_spec())
     without_guard = dataclasses.replace(
         schedule,
@@ -954,6 +1072,39 @@ def test_only_alternating_modules_import_the_family_runtime() -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+def test_shared_output_tile_request_runs_the_two_tile_body() -> None:
+    """The (2, 16, 2048, 128) bf16 campaign winner carried
+    ``cute_flash_o_stage`` = 1 on this family: 512 items over 148 CTAs, and
+    the third item of every CTA read a Q tile the previous item's output
+    staging had overwritten (148 wrong tiles, a race).  The request renders
+    the two-tile program -- the same code, no ``o_stage`` in the host plan --
+    and its output is bitwise the two-tile run's, within SDPA's bf16 noise."""
+    torch.manual_seed(1)
+    q, k, v = (
+        torch.randn(2, 16, 2048, 128, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    shared = {**_ALT, cute_flash.FLASH_O_STAGE_KEY: 1}
+
+    def render(config: dict[str, object]) -> str:
+        bound = cast("Any", _kernel(config)).bind((q, k, v))
+        return bound.to_code(
+            bound._normalized_config_copy(helion.Config.from_dict(config))
+        )
+
+    shared_src = render(shared)
+    assert "'o_stage'" not in shared_src
+    assert shared_src == render(_ALT)
+    out_ref, _ = _reference(q, k, v)
+    out_two, lse_two = _run(_ALT, q, k, v)
+    out_one, lse_one = _run(shared, q, k, v, launches=3)
+    assert torch.equal(out_one, out_two)
+    assert torch.equal(lse_one, lse_two)
+    assert (out_one.float() - out_ref.float()).abs().max().item() < 1e-2
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 def test_family_launches_are_deterministic_under_repetition() -> None:
     """Repeated launches cover the barrier parities carried across KV steps and
     work items (three or four items per CTA on this shape); the handoff
@@ -970,3 +1121,92 @@ def test_family_launches_are_deterministic_under_repetition() -> None:
     torch.cuda.synchronize()
     assert torch.equal(out, first_out)
     assert torch.equal(lse, first_lse)
+
+
+def _sass_instructions(sass: str) -> list[str]:
+    """The instruction texts of an ``nvdisasm`` listing (addresses, predicates
+    and encodings stripped), in order."""
+    texts = []
+    for line in sass.splitlines():
+        match = re.match(r"\s*/\*[0-9a-fA-F]+\*/\s+(?:@!?U?P[T0-9]+\s+)?(.*?);", line)
+        if match is not None:
+            texts.append(match.group(1).strip())
+    return texts
+
+
+def _spilled_base_waits(texts: list[str], window: int = 6) -> list[str]:
+    """The mbarrier try-waits whose address was just rebuilt from a local
+    reload: an ``LDL`` and an ``R2UR`` within ``window`` instructions before
+    the ``SYNCS.PHASECHK ... TRYWAIT``."""
+    found = []
+    for index, text in enumerate(texts):
+        if "TRYWAIT" not in text:
+            continue
+        before = texts[max(0, index - window) : index]
+        if any(t.startswith("LDL") for t in before) and any(
+            t.startswith("R2UR") for t in before
+        ):
+            found.append(text)
+    return found
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+def test_spin_waits_address_their_barriers_uniformly_in_the_sass(
+    tmp_path: Path,
+) -> None:
+    """ptxas spills the shared-window base the barrier pointers derive from
+    and, with per-thread pointers, reloaded it in front of every spin wait
+    (``LDL`` + ``R2UR`` + ``TRYWAIT``: on the (2, 16, 2048, 128) winner 79
+    static LDL sites and 21 such waits of 112, 1.0 % of the kernel at equal
+    clock; at this test's (1, 2, 512, 128) shape 67 LDL and 20 of 96). With
+    the warp-uniform addresses only the CUTLASS pipeline waits of the K/V/Q
+    rings (``wait_and_advance``), which still take pointers, keep the
+    pattern (10 of 110 waits and 68 LDL on the winner; 9 of 94 and 56 here).
+    A register-allocation change can bring the spill back silently, so the
+    SASS is checked: a fresh compile with the cubin kept, then the count."""
+    result = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "sass"],
+        cwd=Path(cast("str", helion.__file__)).resolve().parents[1],
+        env={
+            **os.environ,
+            "HELION_BACKEND": "cute",
+            "CUTE_DSL_KEEP": "sass",
+            "CUTE_DSL_DUMP_DIR": str(tmp_path),
+            "CUTE_DSL_NO_CACHE": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    sass_files = sorted(tmp_path.glob("*.sass"))
+    assert len(sass_files) == 1, sass_files
+    texts = _sass_instructions(sass_files[0].read_text())
+    waits = [t for t in texts if "TRYWAIT" in t]
+    spilled = _spilled_base_waits(texts)
+    local_loads = [t for t in texts if t.startswith("LDL")]
+    assert len(waits) >= 90, len(waits)
+    # the pointer form: 20 of 96 waits on a reloaded base and 67 LDL here
+    assert len(spilled) <= 12, (len(spilled), spilled)
+    assert len(local_loads) <= 60, len(local_loads)
+
+
+def _main() -> None:
+    """``python test_cute_flash_alt.py sass``: compile and run the winner
+    knobs' alternating body once (the SASS test's subprocess)."""
+    assert sys.argv[1:] == ["sass"], sys.argv
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 2, 512, 128, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    out, lse = _run(_ALT, q, k, v)
+    out_ref, lse_ref = _reference(q, k, v)
+    assert (out.float() - out_ref.float()).abs().max().item() < 1e-2
+    assert (lse - lse_ref).abs().max().item() < 1e-3
+
+
+if __name__ == "__main__":
+    _main()

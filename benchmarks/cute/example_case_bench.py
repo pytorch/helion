@@ -38,7 +38,12 @@ if __name__ == "__main__":
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", required=True)
-    parser.add_argument("--shape", required=True, type=int, choices=[0, 1, 2])
+    parser.add_argument(
+        "--shape",
+        required=True,
+        type=int,
+        help="Shape index of the module (see example_cases.shape_count)",
+    )
     parser.add_argument("--case", default="00_forward")
     parser.add_argument(
         "--provider", default="cute", choices=["cute", "triton", "baselines"]
@@ -136,11 +141,14 @@ def pin_configs(args: argparse.Namespace, kernels: dict[str, Any]) -> None:
     pinned = 0
     for name, configs in pins.items():
         # ``name@2`` marks a second kernel built from the same function; every
-        # kernel of that function takes the pin.
+        # kernel of that function takes the pin, and a pin read from a record
+        # that named the kernel ``name@2`` (which kernel gets the suffix
+        # depends on the collector's order) applies the same way.
+        base = name.split("@")[0]
         matches = [
             k
             for k in kernels
-            if k.split("@")[0] == name or k.split("@")[0].rsplit(".", 1)[-1] == name
+            if k.split("@")[0] == base or k.split("@")[0].rsplit(".", 1)[-1] == base
         ]
         if not matches:
             raise ValueError(f"Pin {name!r} matches nothing among {list(kernels)}")
@@ -161,9 +169,15 @@ def main() -> None:
     configure_environment(args)
     from benchmarks.cute import example_baselines as baseline
     from benchmarks.cute.example_cases import collect
+    from benchmarks.cute.example_cases import shape_count
     import torch
     from torch.utils._pytree import tree_map_only
 
+    if not 0 <= args.shape < shape_count(args.module):
+        raise SystemExit(
+            f"--shape {args.shape} out of range: {args.module} has "
+            f"{shape_count(args.module)} shapes"
+        )
     torch.cuda.set_device(0)
     cases = collect(args.module, args.shape)
     case = next(c for c in cases if c.name == args.case)
@@ -203,10 +217,17 @@ def main() -> None:
         "eager_correctness": "pass",
     }
     if args.no_graph:
+        # Eager readings only: no graph is timed, so the graph dispatch
+        # warm-up is not run and the record says so.
+        result["graph_state_warmup"] = "not run (--no-graph: eager readings only)"
         torch.cuda.synchronize()
         runs = [baseline._event_ms(call) for _ in range(args.reps)]
         result.update(event_ms=statistics.median(runs), event_runs_ms=runs)
     else:
+        # Every timed reading of this process, the 16-call graph included,
+        # is taken in the steady dispatch state (``graph_state_warmup`` in
+        # the record; HELION_BENCHMARK_GRAPH_WARMUP=0 measures the fast one).
+        result["graph_state_warmup"] = baseline.graph_state_warmup()
         result.update(
             baseline.measure(
                 call,
