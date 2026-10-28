@@ -17,17 +17,19 @@ From the repository root, use idle GPUs and new output directories:
 ```bash
 python3 benchmarks/cute/paper_attention_repro/run.py \
   --mode forward --gpus 0,1 \
-  --config-dir artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward \
+  --config-dir benchmarks/cute/paper_attention_repro/configs/forward \
   --out artifacts/attention-forward-replay
 
 python3 benchmarks/cute/paper_attention_repro/run.py \
   --mode backward --gpus 2,3 \
-  --config-dir artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward \
+  --config-dir benchmarks/cute/paper_attention_repro/configs/backward \
   --out artifacts/attention-backward-replay
 ```
 
 These commands use the final GB300 configs: 87 forward winners and 84
-backward preprocess/main pairs. The three unavailable backward MLA cases
+backward preprocess/main pairs. `configs/` is a copy of the completed run's
+`artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/`; its
+`manifest.json` records the original paths and SHA-256s. The three unavailable backward MLA cases
 produce explicit SKIP records.
 
 All shapes and implementations of a variant stay on one physical GPU.
