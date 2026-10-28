@@ -1460,6 +1460,10 @@ VALID_PID_TYPES = (
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
+# Tunable registered by ``hl.persistent_num_workers()``: workers per SM for persistent
+# kernels that size their worker pool themselves.
+PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY = "persistent_num_workers_multiplier"
+MAX_PERSISTENT_NUM_WORKERS_MULTIPLIER = 16
 EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
@@ -7417,6 +7421,14 @@ class ConfigSpec:
                 config["host_tensor_descriptors"] = False
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        if (
+            fragment := self.user_defined_tunables.get(
+                PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY
+            )
+        ) is not None:
+            # Registered implicitly by hl.persistent_num_workers(), so configs written
+            # without it (or before it existed) omit the key.
+            config.setdefault(PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY, fragment.default())
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
         if self.backend_name == "cute":
             normalize_block_scaled_config(

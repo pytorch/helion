@@ -93,6 +93,9 @@ class ConfigValueExpression:
         if self.operation == "next_power_of_2":
             assert len(args) == 1
             return next_power_of_2(args[0])
+        if self.operation == "mul":
+            assert len(args) == 2
+            return args[0] * args[1]
         raise ValueError(f"unknown config expression operation {self.operation!r}")
 
 

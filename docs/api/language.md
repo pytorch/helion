@@ -252,6 +252,12 @@ under the automatic policy. Other backends retain their existing defaults.
 .. autofunction:: register_tunable
 ```
 
+### persistent_num_workers()
+
+```{eval-rst}
+.. autofunction:: persistent_num_workers
+```
+
 ## Tile Operations
 
 ### Tile Class

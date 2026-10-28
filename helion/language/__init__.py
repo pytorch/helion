@@ -55,6 +55,7 @@ from .tile_ops import tile_end as tile_end
 from .tile_ops import tile_id as tile_id
 from .tile_ops import tile_index as tile_index
 from .tile_proxy import Tile as Tile
+from .tunable_ops import persistent_num_workers as persistent_num_workers
 from .tunable_ops import register_block_size as register_block_size
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import join as join

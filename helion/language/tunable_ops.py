@@ -20,6 +20,8 @@ from .._compiler.type_info import _to_proxy
 from ..autotuner.config_fragment import BaseIntegerFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
+from ..autotuner.config_spec import MAX_PERSISTENT_NUM_WORKERS_MULTIPLIER
+from ..autotuner.config_spec import PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY
 from ..autotuner.config_spec import VALID_KEYS
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     from .._compiler.variable_origin import Origin
 
 __all__ = [
+    "persistent_num_workers",
     "register_block_size",
     "register_tunable",
 ]
@@ -240,3 +243,100 @@ def _(name: str, fragment: ConfigSpecFragment) -> int:
         return value
     # For other types (like float), convert to int
     return int(value)  # type: ignore[arg-type]
+
+
+def tunes_persistent_num_workers(device: torch.device) -> bool:
+    """Whether :func:`persistent_num_workers` registers a tunable multiplier on ``device``.
+
+    On XPU, get_num_sm() is the Xe-core count, but one work-group per Xe-core
+    often leaves hardware threads idle: how many fit depends on num_warps, the
+    GRF mode Triton picks and SLM use.  Elsewhere one program per SM is kept.
+    """
+    return device.type == "xpu"
+
+
+@_decorators.api(is_device_only=False)
+def persistent_num_workers(device: torch.device, *, reserved_sms: int = 0) -> int:
+    """
+    Number of workers for a persistent kernel that loops over ``hl.grid(n)``.
+
+    Equals ``helion.runtime.get_num_sm(device, reserved_sms=reserved_sms)``
+    times the ``persistent_num_workers_multiplier`` config value.  On XPU, where
+    several work-groups can share an Xe-core, the multiplier is autotuned over
+    powers of two from 1 to 16; elsewhere it is fixed at 1.
+
+    Args:
+        device: Device the kernel runs on.
+        reserved_sms: SMs to leave free for other work, as in
+            :func:`helion.runtime.get_num_sm`.
+
+    Returns:
+        int: The worker count for the current configuration.
+    """
+    raise NotInsideKernel
+
+
+@_decorators.type_propagation(persistent_num_workers)
+def _persistent_num_workers_type(
+    device: TypeInfo, *, reserved_sms: TypeInfo | None = None, origin: Origin
+) -> TypeInfo:
+    from .._compiler.type_info import SymIntType
+    from ..autotuner.config_fragment import PowerOfTwoFragment
+    from ..runtime import get_num_sm
+
+    env = CompileEnvironment.current()
+    device_val = device.as_literal()
+    reserved_val = 0 if reserved_sms is None else reserved_sms.as_literal()
+    assert isinstance(device_val, torch.device)
+    assert isinstance(reserved_val, int)
+    num_sm = get_num_sm(device_val, reserved_sms=reserved_val)
+    if not tunes_persistent_num_workers(device_val):
+        return TypeInfo.from_example(num_sm, origin)
+
+    env.config_spec.user_defined_tunables[PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY] = (
+        PowerOfTwoFragment(1, MAX_PERSISTENT_NUM_WORKERS_MULTIPLIER, 1)
+    )
+    result = SymIntType(origin, env.create_unbacked_symint(hint=num_sm))
+    expr = _symint_expr(result.value)
+    assert isinstance(expr, sympy.Symbol)
+    env.tunable_symbols.add(expr)
+    env.config_value_expressions[expr] = ConfigValueExpression(
+        "mul",
+        (
+            num_sm,
+            ConfigValueExpression("config", (PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY,)),
+        ),
+    )
+    return result
+
+
+@_decorators.codegen(persistent_num_workers, "common")
+def _persistent_num_workers_codegen(state: CodegenState) -> ast.AST:
+    # Defaulted arguments are plain constants; only user-written ones need visiting.
+    device, reserved_sms = [
+        state.codegen.visit(arg) if isinstance(arg, ExtendedAST) else arg
+        for arg in (state.ast_arg(0), state.ast_arg(1))
+    ]
+    call = expr_from_string(
+        "helion.runtime.get_num_sm({device}, reserved_sms={reserved_sms})",
+        device=device,
+        reserved_sms=reserved_sms,
+    )
+    multiplier = state.config.get(PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY)
+    if multiplier is None:
+        return call
+    assert isinstance(multiplier, int)
+    return expr_from_string(f"{{call}} * {multiplier}", call=call)
+
+
+@_decorators.ref(persistent_num_workers)
+def _(device: torch.device, reserved_sms: int = 0) -> int:
+    from ..runtime import get_num_sm
+    from ..runtime.ref_mode import RefModeContext
+
+    multiplier = 1
+    config = RefModeContext.current().config
+    if tunes_persistent_num_workers(device) and config is not None:
+        multiplier = config.get(PERSISTENT_NUM_WORKERS_MULTIPLIER_KEY, 1)
+        assert isinstance(multiplier, int)
+    return get_num_sm(device, reserved_sms=reserved_sms) * multiplier
