@@ -408,3 +408,105 @@ def test_sampled_resident_keeps_compatible_fixed_controls(dtype: torch.dtype) ->
         },
     )
     assert config[cute_flash.FLASH_SOFTMAX_LOWERING_KEY] == "resident_value_graph"
+
+
+@pytest.mark.parametrize("fast_math", (False, True))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    ("standard_dense_output", "block_size_targets"),
+    (
+        # the dense-output kernel (``attention_output``)
+        (True, {0: 1, 1: 128, 2: 128}),
+        # an LSE-producing kernel (``attention``): no resident value graph
+        (False, {0: 1, 1: 128, 2: 128}),
+        # the flex forward surface (unit b/h axes fixed)
+        (False, {0: 128, 1: 128}),
+    ),
+)
+def test_two_tile_dense_hd128_seed_follows_the_surface(
+    standard_dense_output: bool,
+    block_size_targets: dict[int, int],
+    dtype: torch.dtype,
+    fast_math: bool,
+) -> None:
+    """The measured two-tile fa4 body of the dense hd128 shape is seeded on
+    every dense hd128 surface, with the softmax lowering the surface offers:
+    the resident value graph on a dense FP16/BF16 output, the auto lowering
+    on an LSE output; the seed survives legalization, normalization and
+    reaches the seeded population (see ``flash_attention_seed_configs``)."""
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, size_hint in enumerate(block_size_targets.values()):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=size_hint))
+    spec.enable_cute_flash_search(
+        head_dim=128,
+        num_kv=16,
+        block_size_targets=block_size_targets,
+        device_sm_count=148,
+        num_bh=32,
+        dtype=dtype,
+        standard_dense_output=standard_dense_output,
+        fast_math=fast_math,
+    )
+    seeds = spec._legalize_cute_flash_compiler_seeds(
+        cute_flash.flash_attention_seed_configs(
+            128,
+            16,
+            block_size_targets=spec._cute_flash_block_size_target_list(),
+            device_sm_count=148,
+            target_device_capability=(10, 3),
+            num_bh=32,
+            dtype=dtype,
+            standard_dense_output=standard_dense_output,
+            fast_math=fast_math,
+        )
+    )
+    spec.compiler_seed_configs = list(seeds)
+
+    def resolve(config: dict[str, object]) -> cute_flash.FlashAttentionConfig:
+        with patch.dict(os.environ, {}, clear=True):
+            return cute_flash.resolve_flash_config(
+                128,
+                16,
+                config,
+                target_device_capability=(10, 3),
+                num_bh=32,
+                dtype=dtype,
+                standard_dense_output=standard_dense_output,
+                fast_math=fast_math,
+            )
+
+    def is_two_tile_body(resolved: cute_flash.FlashAttentionConfig) -> bool:
+        return (
+            resolved.pipeline_family == "fa4"
+            and resolved.q_tile_count == 2
+            and resolved.e2e_schedule == "xu"
+            and resolved.exp2_packet == "1x1"
+            and resolved.stat_transport == "single"
+            and not resolved.softmax_disc
+            and resolved.disc_pipe_depth == 1
+            and resolved.sp_row_sum == "whole"
+            and resolved.kv_stage == 3
+            and (resolved.softmax_regs, resolved.corr_regs, resolved.other_regs)
+            == (200, 64, 48)
+            and resolved.rescale_threshold == 8.0
+            and resolved.row_epilogue_warps == "softmax"
+            and resolved.epi_tma
+        )
+
+    expected_lowering = "resident_value_graph" if standard_dense_output else "auto"
+    matches = [seed for seed in seeds if is_two_tile_body(resolve(seed.config))]
+    assert matches, "the two-tile fa4 body is not seeded"
+    assert {resolve(seed.config).softmax_lowering for seed in matches} == {
+        expected_lowering
+    }
+    assert all(
+        seed.config["block_sizes"] == list(block_size_targets.values())
+        for seed in matches
+    )
+    generation = ConfigGeneration(spec)
+    seeded = [config for _, config in generation.seed_flat_config_pairs()]
+    for seed in matches:
+        normalized = generation.unflatten(generation.flatten(seed))
+        assert is_two_tile_body(resolve(normalized.config))
+        assert resolve(normalized.config).softmax_lowering == expected_lowering
+        assert normalized in seeded

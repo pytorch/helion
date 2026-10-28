@@ -59,14 +59,25 @@ class _FakeMeasurer:
     ``model(member, window_number)`` returns the reading (ms) for the
     finalist ``member`` at the ``window_number``-th steady window of the whole
     phase, or an ``IsolatedBenchmarkFailure``. Windows are recorded as
-    ``(kind, member, warmup_ms, rep_ms)``.
+    ``(kind, member, warmup_ms, rep_ms)``; a window taken in a named L2
+    regime (the second column) is answered by ``second_model(member,
+    window_number)`` and recorded in ``second_windows`` as ``(regime,
+    member, warmup_ms, rep_ms)`` as well. ``regime_label`` names the regime
+    the measurer stands for; unset, the selection labels the phase from the
+    environment as it does for a measurer that does not say.
     """
 
     def __init__(
         self,
         model: Callable[[PopulationMember, int], object],
+        second_model: Callable[[PopulationMember, int], object] | None = None,
+        regime_label: str | None = None,
     ) -> None:
         self.model = model
+        self.second_model = second_model
+        if regime_label is not None:
+            self.regime_label = regime_label
+        self.second_windows: list[tuple[str, PopulationMember, int, int]] = []
         self.finalists: list[PopulationMember] = []
         self.policies: list[FinalSelectionConfig] = []
         self.windows: list[tuple[str, PopulationMember, int, int]] = []
@@ -91,10 +102,20 @@ class _FakeMeasurer:
     def warm(self, index: int, duration_ms: int) -> None:
         self.windows.append(("warm", self.finalists[index], duration_ms, 0))
 
-    def measure(self, index: int, warmup_ms: int, rep_ms: int) -> object:
+    def measure(
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
+    ) -> object:
         member = self.finalists[index]
         self.windows.append(("measure", member, warmup_ms, rep_ms))
         window_number = sum(1 for kind, *_ in self.windows if kind == "measure")
+        if l2_flush_mode is not None:
+            self.second_windows.append((l2_flush_mode, member, warmup_ms, rep_ms))
+            assert self.second_model is not None, "no second column expected"
+            return self.second_model(member, window_number)
         return self.model(member, window_number)
 
     def measured(self) -> list[PopulationMember]:
@@ -123,6 +144,9 @@ def _make_search(
         env=SimpleNamespace(process_group_name=process_group_name)
     )
     search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+    # no family knobs: the family quota admits nothing (``_family_search``
+    # names some)
+    search.config_spec = SimpleNamespace(final_selection_family_keys=())  # type: ignore[misc]
     search._autotune_metrics = AutotuneMetrics()
     search._autotune_budget_start = (
         None if budget_seconds is None else time.perf_counter() - budget_elapsed
@@ -135,6 +159,22 @@ def _make_search(
     search._unkillable_configs = set()
     search.population = list(members)
     return search
+
+
+# test/conftest.py keeps the suite's shortlist at two; the cold tie-break
+# tests shortlist their three finalists
+_SHORTLIST_ALL = {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "4"}
+
+
+def _clear_regime_envs() -> None:
+    """The default regimes (a per-call flushed search and selection, the
+    ``auto`` target); call inside a ``patch.dict(os.environ, ...)``."""
+    for name in (
+        "HELION_AUTOTUNE_L2_FLUSH",
+        "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+        "HELION_AUTOTUNE_TARGET_REGIME",
+    ):
+        os.environ.pop(name, None)
 
 
 def _rows(search: PopulationBasedSearch) -> list[dict[str, object]]:
@@ -151,6 +191,33 @@ def _member(block: int, perf: float) -> PopulationMember:
         helion.Config(block_sizes=[block]),
         status="ok",
     )
+
+
+def _family_member(block: int, family: str, perf: float) -> PopulationMember:
+    """A member whose config carries the family knob ``fam``."""
+    return PopulationMember(
+        lambda: None,
+        [perf],
+        (block,),
+        helion.Config(block_sizes=[block], fam=family),
+        status="ok",
+    )
+
+
+def _family_search(
+    members: list[PopulationMember],
+    *,
+    policy: FinalSelectionConfig | None,
+    pinned: list[PopulationMember] = (),  # type: ignore[assignment]
+    keys: tuple[str, ...] = ("fam",),
+    budget_seconds: int | None = None,
+) -> PopulationBasedSearch:
+    """A search whose config spec names ``keys`` as the family knobs."""
+    search = _make_search(
+        members, policy=policy, pinned=pinned, budget_seconds=budget_seconds
+    )
+    search.config_spec = SimpleNamespace(final_selection_family_keys=keys)  # type: ignore[misc]
+    return search
 
 
 def _mock_kernel(settings: Settings) -> SimpleNamespace:
@@ -308,7 +375,11 @@ class TestFinalSelection(TestCase):
         self.assertTrue(policy.screens(6))
         self.assertEqual(policy.finalists(5), 5)
         self.assertEqual(policy.finalists(6), 6)
-        self.assertEqual(policy.finalists(7), 6)
+        # plus the family quota's representatives (two by default)
+        self.assertEqual(policy.finalists(7), 7)
+        self.assertEqual(policy.finalists(9), 8)
+        no_quota = dataclasses.replace(policy, family_finalists=0)
+        self.assertEqual(no_quota.finalists(7), 6)
         self.assertEqual(policy.finalists(3), 3)
         # Without a screen the search's numbers rank the shortlist; the best
         # top_k go on, plus the best pinned seed when it is not among them.
@@ -668,7 +739,13 @@ class TestFinalSelection(TestCase):
             measurer.policies,
             [
                 dataclasses.replace(
-                    policy, rounds=2, top_k=2, thermal_warmup_ms=0, screen_rep_ms=0
+                    policy,
+                    rounds=2,
+                    top_k=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=0,
+                    family_finalists=0,
                 )
             ],
         )
@@ -704,18 +781,142 @@ class TestFinalSelection(TestCase):
             self.assertIs(legacy.final_rebenchmark_best(noisy), noisy)
         rebenchmark.assert_not_called()
 
+    def test_budget_counts_the_second_column_only_where_it_can_run(self) -> None:
+        """A per-call flushed selection (the default) takes no second
+        column, so the reserve the search keeps for the phase and the plan
+        the phase is sized to leave the column out; a warm selection
+        (HELION_AUTOTUNE_L2_FLUSH=replay) or an explicit target regime
+        reserves it for every finalist, its upper bound. The cache policy
+        keeps the profile's fields in either regime."""
+        members = [_member(32, 1.0), _member(64, 1.1)]
+        # the spec of these searches names no family knob: the sizing
+        # policy drops the family quota as well (see
+        # ``test_budget_counts_the_family_quota_only_with_family_keys``)
+        policy = FinalSelectionConfig(family_finalists=0)
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
+        self.assertGreater(policy.estimated_seconds(4), one_column.estimated_seconds(4))
+        search = _make_search(
+            members, policy=policy, pinned=members[:1], budget_seconds=1000
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}):
+            _clear_regime_envs()
+            self.assertEqual(search._final_selection_sizing_policy(), one_column)
+            self.assertAlmostEqual(
+                search._budget_reserve_seconds(), one_column.estimated_seconds(4)
+            )
+            # the smallest plan (4 finalists x 2 rounds) has no column in
+            # either regime
+            self.assertEqual(search._minimum_final_selection_seconds(), 17.0)
+            default_key = search._final_rebenchmark_cache_policy()
+            for env in (
+                {"HELION_AUTOTUNE_L2_FLUSH": "replay"},
+                {"HELION_AUTOTUNE_L2_FLUSH": "0"},
+                {"HELION_AUTOTUNE_FINAL_L2_FLUSH": "replay"},
+                {"HELION_AUTOTUNE_TARGET_REGIME": "replay"},
+            ):
+                with patch.dict(os.environ, env):
+                    self.assertEqual(search._final_selection_sizing_policy(), policy)
+                    self.assertAlmostEqual(
+                        search._budget_reserve_seconds(), policy.estimated_seconds(4)
+                    )
+                    self.assertEqual(search._minimum_final_selection_seconds(), 17.0)
+                    self.assertEqual(
+                        search._final_rebenchmark_cache_policy(), default_key
+                    )
+            with patch.dict(
+                os.environ,
+                {
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "replay",
+                },
+            ):
+                # the target is the ranking regime already: one column
+                self.assertEqual(search._final_selection_sizing_policy(), one_column)
+
+        # The phase is sized to the time left by the same policy: with room
+        # for the rounds but not the column, the default regime runs the
+        # profile's policy as is (its column cannot run) where a replay
+        # selection sheds the column.
+        noisy = _member(32, 0.9)
+        stable = _member(64, 1.0)
+        readings = {id(noisy): 1.05, id(stable): 1.00}
+        policy = FinalSelectionConfig(top_k=4, family_finalists=0)
+        fits_one_column = dataclasses.replace(
+            policy, screen_rep_ms=0, tiebreak_rounds=0
+        )
+        remaining = (
+            fits_one_column.estimated_seconds(2) + policy.estimated_seconds(2)
+        ) / 2
+        for regime, expected, sized in (
+            ("call", policy, False),
+            ("replay", fits_one_column, True),
+        ):
+            search = _make_search(
+                [noisy, stable],
+                policy=policy,
+                budget_seconds=1000,
+                budget_elapsed=1000.0 - remaining,
+            )
+            measurer = _FakeMeasurer(
+                lambda member, _n: readings[id(member)],
+                lambda member, _n: readings[id(member)],
+                regime_label=regime,
+            )
+            with (
+                patch.dict(
+                    os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": regime}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                search.log.level = logging.INFO
+                self.assertIs(search.final_rebenchmark_best(noisy), stable, regime)
+            self.assertEqual(measurer.policies, [expected], regime)
+            sizing_lines = [
+                line for line in logs.output if "Final selection sized to" in line
+            ]
+            self.assertEqual(len(sizing_lines), 1 if sized else 0, regime)
+            if sized:
+                self.assertIn("one regime", sizing_lines[0])
+            self.assertEqual(measurer.second_windows, [], regime)
+
     def test_fit_to_seconds_sheds_cost_in_order(self) -> None:
         policy = FinalSelectionConfig()
         ladder = policy.budget_ladder()
         self.assertEqual(ladder[0], policy)
         self.assertEqual(ladder[1], dataclasses.replace(policy, screen_rep_ms=0))
         self.assertEqual(
-            ladder[2], dataclasses.replace(policy, screen_rep_ms=0, rounds=2)
+            ladder[2],
+            dataclasses.replace(policy, screen_rep_ms=0, tiebreak_rounds=0),
+        )
+        self.assertEqual(
+            ladder[3],
+            dataclasses.replace(
+                policy, screen_rep_ms=0, tiebreak_rounds=0, family_finalists=0
+            ),
+        )
+        self.assertEqual(
+            ladder[4],
+            dataclasses.replace(
+                policy,
+                screen_rep_ms=0,
+                tiebreak_rounds=0,
+                family_finalists=0,
+                rounds=2,
+            ),
         )
         self.assertEqual(
             ladder[-1],
             dataclasses.replace(
-                policy, screen_rep_ms=0, rounds=2, top_k=2, thermal_warmup_ms=0
+                policy,
+                screen_rep_ms=0,
+                tiebreak_rounds=0,
+                family_finalists=0,
+                rounds=2,
+                top_k=2,
+                thermal_warmup_ms=0,
             ),
         )
         estimates = [plan.estimated_seconds(33) for plan in ladder]
@@ -737,13 +938,16 @@ class TestFinalSelection(TestCase):
         )
         # test/conftest.py shrinks the retained shortlist to 2; the default
         # shortlist of 8 + 1 pinned seed + the incumbent (10 finalists x 4
-        # rounds) estimates ~86 s with the screen (71 s without), capped at a
-        # quarter of the budget.
+        # rounds) estimates ~86 s with the screen (71 s without) in the
+        # default per-call flushed regime, capped at a quarter of the budget.
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
         with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}):
+            _clear_regime_envs()
             self.assertEqual(search._final_selection_shortlist_estimate(), 10)
             self.assertEqual(search._budget_reserve_seconds(), 25.0)
-            self.assertGreater(policy.estimated_seconds(10), 25.0)
+            self.assertGreater(one_column.estimated_seconds(10), 25.0)
         with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}):
+            _clear_regime_envs()
             # 2 + 1 pinned + the incumbent shortlisted: the estimate (~35 s)
             # is below the cap of a 200 s budget
             self.assertEqual(search._final_selection_shortlist_estimate(), 4)
@@ -751,7 +955,7 @@ class TestFinalSelection(TestCase):
                 members, policy=policy, pinned=members[:1], budget_seconds=200
             )
             self.assertAlmostEqual(
-                roomy._budget_reserve_seconds(), policy.estimated_seconds(4)
+                roomy._budget_reserve_seconds(), one_column.estimated_seconds(4)
             )
             self.assertLess(roomy._budget_reserve_seconds(), 50.0)
         search._budget_reserve_seconds = lambda: 25.0  # type: ignore[method-assign]
@@ -782,7 +986,9 @@ class TestFinalSelection(TestCase):
         )
         search.log = Mock()
         search._budget_reserve_seconds = lambda: 25.0  # type: ignore[method-assign]
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False, final_selection_family_keys=()
+        )
         self.assertEqual(search._longest_generation_seconds, 0.0)
 
         generations: list[int] = []
@@ -1164,11 +1370,19 @@ class TestFinalSelection(TestCase):
             thermal_warmup_ms=5000,
             screen_warmup_ms=50,
             screen_rep_ms=200,
+            tiebreak_rounds=0,
+            family_finalists=0,
         )
         # 0.2 s of worker/loader overhead per window; up to ten finalists
         # (top_k, the best pinned seed and the incumbent)
         expected = 1.25 * (5.0 + 40 * 0.45 + 10 * 4 * 0.8) + 5.0
         self.assertAlmostEqual(policy.estimated_seconds(40), expected)
+        # the family quota's representatives are counted too (its upper
+        # bound: every one of them admitted)
+        self.assertAlmostEqual(
+            dataclasses.replace(policy, family_finalists=2).estimated_seconds(40),
+            1.25 * (5.0 + 40 * 0.45 + 12 * 4 * 0.8) + 5.0,
+        )
         # no screen when the shortlist is the finalists already
         self.assertAlmostEqual(
             policy.estimated_seconds(9), 1.25 * (5.0 + 9 * 4 * 0.8) + 5.0
@@ -1180,6 +1394,12 @@ class TestFinalSelection(TestCase):
         self.assertAlmostEqual(
             policy.estimated_seconds(11),
             1.25 * (5.0 + 11 * 0.45 + 10 * 4 * 0.8) + 5.0,
+        )
+        # the second regime's column is counted for every finalist (its
+        # upper bound: all of them tied, or an explicit target regime)
+        self.assertAlmostEqual(
+            dataclasses.replace(policy, tiebreak_rounds=2).estimated_seconds(9),
+            1.25 * (5.0 + 9 * 4 * 0.8 + 9 * 2 * 0.8) + 5.0,
         )
 
     def test_metrics_report_the_phase(self) -> None:
@@ -1317,6 +1537,756 @@ class TestFinalSelection(TestCase):
         assert metrics is not None
         self.assertEqual(metrics["l2_flush_mode"], "backend bench")
         self.assertTrue(any("(L2 backend bench)" in line for line in logs.output))
+
+    def _tied_warm_search(
+        self,
+        *,
+        cold: dict[str, float],
+        warm: dict[str, float] | None = None,
+        tiebreak_rounds: int = 2,
+    ) -> tuple[PopulationBasedSearch, _FakeMeasurer, dict[str, PopulationMember]]:
+        """Three finalists: ``a`` and ``b`` tie in the warm (replay) regime
+        at 3.055 ms, ``c`` trails by 10%; ``cold`` gives their per-call
+        flushed readings by name."""
+        members: dict[str, PopulationMember] = {
+            name: _member(32 * (i + 1), 3.2) for i, name in enumerate("abc")
+        }
+        warm = warm or {"a": 3.055, "b": 3.0551, "c": 3.36}
+        names = {id(member): name for name, member in members.items()}
+        policy = FinalSelectionConfig(
+            top_k=4, rounds=2, screen_rep_ms=0, tiebreak_rounds=tiebreak_rounds
+        )
+        search = _make_search(list(members.values()), policy=policy)
+        measurer = _FakeMeasurer(
+            lambda member, _n: warm[names[id(member)]],
+            lambda member, _n: cold[names[id(member)]],
+            regime_label="replay",
+        )
+        return search, measurer, members
+
+    def test_cold_column_breaks_a_warm_tie(self) -> None:
+        """Finalists tied in the replay regime (one flush, then a burst of
+        back-to-back calls) are timed again per call flushed, and the cold
+        medians break the tie: the pick carries the knob the burst cannot
+        see (the recurrent-step state load's L2 eviction hint read 3.90 vs
+        5.41 us cold behind a 3.055 us tie). Only the tied group pays for
+        the cold rounds, and the finalists keep their replay medians."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        # two cold rounds over the tied pair only, alternating order
+        self.assertEqual(
+            [(w[0], w[1]) for w in measurer.second_windows],
+            [
+                ("call", members["a"]),
+                ("call", members["b"]),
+                ("call", members["b"]),
+                ("call", members["a"]),
+            ],
+        )
+        self.assertEqual(measurer.second_windows[0][2:], (500, 500))
+        # the ranking regime's medians stay the finalists' perf
+        self.assertAlmostEqual(members["b"].perf, 3.0551)
+        self.assertAlmostEqual(members["a"].perf, 3.055)
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        by_name = {
+            name: rows[canonical_config_id(member.config)]
+            for name, member in members.items()
+        }
+        self.assertEqual(by_name["b"]["second_median_ms"], 3.90)
+        self.assertEqual(by_name["b"]["second_rounds_ms"], [3.90, 3.90])
+        self.assertEqual(by_name["a"]["second_median_ms"], 5.41)
+        self.assertNotIn("second_median_ms", by_name["c"])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "replay")
+        self.assertEqual(metrics["second_l2_flush_mode"], "call")
+        self.assertEqual(metrics["selected_by"], "replay")
+        self.assertEqual(metrics["target_regime"], "auto")
+        self.assertEqual(
+            metrics["selected_config_id"], canonical_config_id(members["b"].config)
+        )
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("(L2 replay)", line)
+        self.assertIn("the tie within 1.0% broken by 2 rounds of L2 call", line)
+        self.assertIn("call=3.9[3.9 3.9]", line)
+        self.assertIn("call=5.41[5.41 5.41]", line)
+
+    def test_cold_column_keeps_the_warm_pick_when_cold_ties_too(self) -> None:
+        """The replay ranking stands unless a tied rival is faster cold by
+        more than the tolerance; without a second column (tiebreak_rounds 0)
+        nothing is timed cold and the ranking regime decides alone."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 3.90, "b": 3.905, "c": 3.80}
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(len(measurer.second_windows), 4)
+
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}, tiebreak_rounds=0
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertIsNone(metrics["second_l2_flush_mode"])
+
+    def test_no_tie_means_no_cold_column(self) -> None:
+        """Finalists more than the tolerance apart in the ranking regime are
+        not timed again, and the default per-call flushed selection never
+        takes a second column (a cold reading carries the steady state)."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80},
+            warm={"a": 3.055, "b": 3.20, "c": 3.36},
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("no tie within 1.0% for L2 call windows to break", line)
+
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        measurer.regime_label = "call"
+        with patch.dict(os.environ, _SHORTLIST_ALL):
+            for name in (
+                "HELION_AUTOTUNE_L2_FLUSH",
+                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                "HELION_AUTOTUNE_TARGET_REGIME",
+            ):
+                os.environ.pop(name, None)
+            with patch.object(search, "_final_selection_measurer", new=measurer):
+                self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+
+    def test_target_regime_selects_by_its_column(self) -> None:
+        """HELION_AUTOTUNE_TARGET_REGIME names the regime the kernel is
+        scored in: every complete finalist is timed in it as well and that
+        column selects outright, even against the ranking regime (dh: 10.4
+        vs 15.5 us cold behind a warm ranking the other way); the finalists'
+        perf becomes the target regime's median."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "call",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        self.assertEqual(
+            sorted({id(w[1]) for w in measurer.second_windows}),
+            sorted(id(member) for member in members.values()),
+        )
+        self.assertEqual(len(measurer.second_windows), 6)
+        self.assertEqual(members["b"].perf, 10.4)
+        self.assertEqual(members["a"].perf, 15.5)
+        self.assertEqual(members["b"].perfs, [3.2, 9.0, 10.4])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "call")
+        self.assertEqual(metrics["target_regime"], "call")
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("selected 10.4", line)
+        self.assertIn("by 2 rounds of L2 call windows", line)
+        # the table is ordered by the selecting column
+        table = line.split("\n")[1:]
+        self.assertIn(canonical_config_id(members["b"].config), table[0])
+        self.assertIn(canonical_config_id(members["a"].config), table[-1])
+
+        # a target that is the ranking regime already adds nothing; the
+        # per-call default search can be told to select by the burst
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "replay",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        measurer.regime_label = "call"
+        with (
+            patch.dict(
+                os.environ,
+                {**_SHORTLIST_ALL, "HELION_AUTOTUNE_TARGET_REGIME": "replay"},
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            for name in ("HELION_AUTOTUNE_L2_FLUSH", "HELION_AUTOTUNE_FINAL_L2_FLUSH"):
+                os.environ.pop(name, None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        self.assertEqual({w[0] for w in measurer.second_windows}, {"replay"})
+
+    def test_second_regime_follows_the_target(self) -> None:
+        from helion.autotuner.benchmarking import final_selection_second_regime
+        from helion.autotuner.benchmarking import final_selection_target_regime
+
+        cases = [
+            # (target env, ranking regime) -> (target, second regime)
+            (None, "replay", "auto", "call"),
+            (None, "off", "auto", "call"),
+            (None, "call", "auto", None),
+            ("auto", "replay", "auto", "call"),
+            ("call", "replay", "call", "call"),
+            ("call", "call", "call", None),
+            ("replay", "call", "replay", "replay"),
+            ("replay", "replay", "replay", None),
+            ("0", "replay", "off", "off"),
+            # timers that cannot honour a regime take no second column
+            (None, "backend bench", "auto", None),
+            ("call", "call (wall clock, always flushed)", "call", None),
+        ]
+        for target, regime, expected_target, expected in cases:
+            with patch.dict(os.environ, {}):
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                if target is not None:
+                    os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = target
+                self.assertEqual(
+                    final_selection_second_regime(regime), expected, (target, regime)
+                )
+                self.assertEqual(final_selection_target_regime(), expected_target)
+
+    def test_cold_failure_keeps_the_warm_ranking(self) -> None:
+        """A finalist that fails only in the cold column keeps its replay
+        median and is not timed cold again; the tie-break runs on the rest,
+        and the pinned preference reaches into the cold column."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        failing = members["a"]
+        measurer.second_model = lambda member, _n: (
+            IsolatedBenchmarkFailure("timeout")
+            if member is failing
+            else {"b": 3.90, "c": 3.80}[
+                next(name for name, m in members.items() if m is member)
+            ]
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            # a's cold column failed: no cold evidence against a, so the
+            # replay pick stands
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(
+            [w[1] for w in measurer.second_windows],
+            [members["a"], members["b"], members["b"]],
+        )
+        self.assertAlmostEqual(members["a"].perf, 3.055)
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        self.assertEqual(
+            rows[canonical_config_id(members["a"].config)]["second_disqualified"],
+            "timeout",
+        )
+
+        # The pinned preference reaches into the cold column: with every
+        # finalist tied warm, the cold-best is c, and the pinned b within
+        # the pinned tolerance of it cold keeps the preference; without a
+        # tolerance c wins.
+        for tolerance, winner in (("0.02", "b"), (None, "c")):
+            search, measurer, members = self._tied_warm_search(
+                cold={"a": 5.41, "b": 3.95, "c": 3.90},
+                warm={"a": 3.055, "b": 3.0551, "c": 3.056},
+            )
+            search._pinned_finalist_configs = {members["b"].config}
+            search._pinned_finalist_members = {members["b"].config: members["b"]}
+            env = {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            if tolerance is not None:
+                env["HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"] = tolerance
+            with (
+                patch.dict(os.environ, env),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                if tolerance is None:
+                    os.environ.pop(
+                        "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE", None
+                    )
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                self.assertIs(
+                    search.final_rebenchmark_best(members["a"]),
+                    members[winner],
+                    tolerance,
+                )
+            self.assertEqual(len(measurer.second_windows), 6)
+
+    def test_target_column_without_readings_falls_back_to_the_ranking(self) -> None:
+        """An explicit target regime whose column takes no complete reading
+        (every finalist failed or missed a round there) leaves the ranking
+        regime's pick, and the report says which column selected."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        measurer.second_model = lambda member, _n: IsolatedBenchmarkFailure("timeout")
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "call",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        # every finalist was tried cold once and not again after failing
+        self.assertEqual(len(measurer.second_windows), 3)
+        self.assertEqual(members["a"].perf, 8.0)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "replay")
+        self.assertEqual(metrics["second_l2_flush_mode"], "call")
+        self.assertEqual(metrics["target_regime"], "call")
+        self.assertTrue(
+            any(
+                "no complete readings in the L2 call regime" in message
+                for message in logs.output
+            )
+        )
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("selected 8", line)
+        self.assertIn(
+            "by the L2 replay column (no complete reading in 2 rounds of L2 call "
+            "windows)",
+            line,
+        )
+        # the table is ordered by the column that selected
+        table = line.split("\n")[1:]
+        self.assertIn(canonical_config_id(members["a"].config), table[0])
+        self.assertIn(canonical_config_id(members["c"].config), table[-1])
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        self.assertEqual(
+            {cast("str", row["second_disqualified"]) for row in rows.values()},
+            {"timeout"},
+        )
+
+    def test_tied_group_without_cold_readings_is_reported_as_timed(self) -> None:
+        """When every member of the tied group produced no cold reading
+        (the windows returned nothing, no failure), the windows were still
+        spent: the rows carry the empty column and the header does not
+        claim there was no tie to break; the replay pick stands."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        measurer.second_model = lambda member, _n: None
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        # a and b were tried once each; a finalist without a reading in a
+        # round is not timed again
+        self.assertEqual(
+            sorted(id(w[1]) for w in measurer.second_windows),
+            sorted(id(members[name]) for name in "ab"),
+        )
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        by_name = {
+            name: rows[canonical_config_id(member.config)]
+            for name, member in members.items()
+        }
+        self.assertEqual(by_name["a"]["second_disqualified"], "incomplete")
+        self.assertEqual(by_name["a"]["second_rounds_ms"], [])
+        self.assertNotIn("second_disqualified", by_name["c"])
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn(
+            "the tie within 1.0% unresolved: no complete reading in 2 rounds of "
+            "L2 call windows",
+            line,
+        )
+        self.assertIn("call=incomplete[]", line)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "replay")
+
+    def test_family_quota_admits_the_other_family_at_the_screen(self) -> None:
+        # Six configs of family A and one of family B, shortlisted whole.
+        # The screen (the search's clock regime) ranks A's best 1% ahead of
+        # B and B below the top_k cut; the rounds (the sustained regime)
+        # read B 3% faster. With the quota B runs the rounds and wins; with
+        # the quota off, or without family knobs, A wins and B is never
+        # timed past the screen.
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            warmup_ms=100,
+            rep_ms=500,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+
+        def run(
+            search_policy: FinalSelectionConfig, *, keys: bool
+        ) -> tuple[PopulationBasedSearch, _FakeMeasurer, PopulationMember]:
+            a = [_family_member(16 * (i + 1), "a", 1.00 + 0.002 * i) for i in range(6)]
+            b = _family_member(256, "b", 1.03)
+            members = [*a, b]
+            screen = {id(member): member.perf for member in a}
+            screen[id(b)] = 1.01
+            rounds = {id(member): member.perf for member in a}
+            rounds[id(b)] = 0.97
+            measurer = _FakeMeasurer(lambda member, _n: 0.0)
+
+            def model(member: PopulationMember, _n: int) -> float:
+                window = measurer.windows[-1]
+                if window[2:] == (policy.screen_warmup_ms, policy.screen_rep_ms):
+                    return screen[id(member)]
+                return rounds[id(member)]
+
+            measurer.model = model
+            search = (
+                _family_search(members, policy=search_policy)
+                if keys
+                else _make_search(members, policy=search_policy)
+            )
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                selected = search.final_rebenchmark_best(a[0])
+            search._quota_logs = [  # type: ignore[attr-defined]
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            return search, measurer, selected
+
+        search, measurer, selected = run(policy, keys=True)
+        self.assertEqual(selected.config["fam"], "b")
+        round_windows = [
+            w for w in measurer.windows if w[2:] == (policy.warmup_ms, policy.rep_ms)
+        ]
+        # the two best of A by the screen, plus B (the incumbent A0 is among them)
+        self.assertEqual(len(round_windows), 2 * 3)
+        self.assertEqual({w[1].config["fam"] for w in round_windows}, {"a", "b"})
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["shortlisted"], 7)
+        self.assertEqual(metrics["finalists"], 3)
+        self.assertEqual(metrics["family_keys"], ["fam"])
+        rows = {row["family"]: row for row in _rows(search)}
+        self.assertEqual(set(rows), {"a", "b"})
+        self.assertTrue(rows["b"]["family_quota"])
+        self.assertFalse(rows["a"]["family_quota"])
+        quota_logs = search._quota_logs  # type: ignore[attr-defined]
+        self.assertEqual(len(quota_logs), 1)
+        self.assertIn("family quota (screen)", quota_logs[0])
+        self.assertIn("(fam) within 1.25x", quota_logs[0])
+        self.assertIn("b at", quota_logs[0])
+
+        for search_policy, keys in (
+            (dataclasses.replace(policy, family_finalists=0), True),
+            (policy, False),
+        ):
+            search, measurer, selected = run(search_policy, keys=keys)
+            self.assertEqual(selected.config["fam"], "a")
+            self.assertEqual(selected.perf, 1.00)
+            round_windows = [
+                w
+                for w in measurer.windows
+                if w[2:] == (policy.warmup_ms, policy.rep_ms)
+            ]
+            self.assertEqual(len(round_windows), 2 * 2)
+            self.assertEqual({w[1].config["fam"] for w in round_windows}, {"a"})
+            self.assertEqual(search._quota_logs, [])  # type: ignore[attr-defined]
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["family_keys"], ["fam"] if keys else [])
+            for row in _rows(search):
+                self.assertEqual("family" in row, keys)
+
+    def test_family_quota_counts_the_seed_and_the_incumbent_as_represented(
+        self,
+    ) -> None:
+        # At the screen cut the best pinned seed and the incumbent survive
+        # outside the top_k on their own right; the quota is computed after
+        # them, so its (single) slot goes to a family neither of them
+        # belongs to (C), not to a second config of their family (B).
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            family_finalists=1,
+            thermal_warmup_ms=0,
+            warmup_ms=100,
+            rep_ms=500,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+
+        def check(role: str) -> None:
+            a = [_family_member(16 * (i + 1), "a", 1.00 + 0.002 * i) for i in range(3)]
+            b = [_family_member(128 + 16 * i, "b", 1.05 + 0.01 * i) for i in range(2)]
+            c = _family_member(512, "c", 1.08)
+            members = [*a, *b, c]
+            rounds = {id(member): member.perf for member in members}
+            rounds[id(c)] = 0.97
+            measurer = _FakeMeasurer(lambda member, _n: 0.0)
+
+            def model(member: PopulationMember, _n: int) -> float:
+                window = measurer.windows[-1]
+                if window[2:] == (policy.screen_warmup_ms, policy.screen_rep_ms):
+                    return member.perf
+                return rounds[id(member)]
+
+            measurer.model = model
+            search = _family_search(
+                members, policy=policy, pinned=[b[1]] if role == "pinned" else []
+            )
+            incumbent = b[1] if role == "incumbent" else a[0]
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                selected = search.final_rebenchmark_best(incumbent)
+            self.assertIs(selected, c, role)
+            round_members = {
+                id(w[1])
+                for w in measurer.windows
+                if w[2:] == (policy.warmup_ms, policy.rep_ms)
+            }
+            # the top_k of A, B's representative (the seed / the incumbent,
+            # not its better-screened sibling) and the quota's C
+            self.assertEqual(
+                round_members, {id(m) for m in (a[0], a[1], b[1], c)}, role
+            )
+            rows = {row["family"]: row for row in _rows(search)}
+            self.assertEqual(set(rows), {"a", "b", "c"}, role)
+            self.assertTrue(rows["c"]["family_quota"], role)
+            self.assertFalse(rows["b"]["family_quota"], role)
+            quota_logs = [
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            self.assertEqual(len(quota_logs), 1, role)
+            self.assertIn("1 more family (fam)", quota_logs[0])
+            self.assertIn("c at", quota_logs[0])
+
+        check("incumbent")
+        check("pinned")
+
+    def test_family_quota_reaches_the_shortlist(self) -> None:
+        # The shortlist is cut by the search's own readings
+        # (HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K); B's best, ranked below
+        # the cut, is shortlisted by the quota and screened like the rest,
+        # while a family beyond the spread (C at 1.4x) is not.
+        a = [_family_member(16 * (i + 1), "a", 1.00 + 0.01 * i) for i in range(3)]
+        b = [_family_member(128 + 16 * i, "b", 1.05 + 0.01 * i) for i in range(2)]
+        c = _family_member(512, "c", 1.40)
+        members = [*a, *b, c]
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+        for search_policy, expected in (
+            (policy, [a[0], a[1], b[0]]),
+            (dataclasses.replace(policy, family_finalists=0), [a[0], a[1]]),
+        ):
+            search = _family_search(members, policy=search_policy)
+            measurer = _FakeMeasurer(lambda member, _n: member.perf)
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                self.assertIs(search.final_rebenchmark_best(a[0]), a[0])
+            self.assertEqual(measurer.finalists, expected)
+            quota_logs = [
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            if search_policy.family_finalists:
+                # admitted at the shortlist cut, then again at the rounds'
+                # cut (three shortlisted: no screen, the search's readings
+                # rank them and B is third)
+                self.assertEqual(len(quota_logs), 2)
+                self.assertIn("family quota (shortlist)", quota_logs[0])
+                self.assertIn("family quota (rounds)", quota_logs[1])
+                for line in quota_logs:
+                    self.assertIn("b at", line)
+                    self.assertNotIn("c at", line)
+            else:
+                self.assertEqual(quota_logs, [])
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["shortlisted"], len(expected))
+
+    def test_family_quota_is_capped_and_bounded(self) -> None:
+        # Without a screen the search's readings rank the shortlist; of the
+        # families behind the cut the closest ``family_finalists`` within
+        # the spread join the rounds, one config each, and a family beyond
+        # the spread never does.
+        a = [_family_member(16, "a", 1.00), _family_member(32, "a", 1.005)]
+        b, c, d = (
+            _family_member(64, "b", 1.01),
+            _family_member(80, "c", 1.02),
+            _family_member(96, "d", 1.03),
+        )
+        e = _family_member(112, "e", 1.30)
+        members = [*a, b, c, d, e]
+        base = FinalSelectionConfig(
+            top_k=1, rounds=2, thermal_warmup_ms=0, screen_rep_ms=0, tiebreak_rounds=0
+        )
+        for policy, expected in (
+            (base, [a[0], b, c]),
+            (dataclasses.replace(base, family_finalists=3), [a[0], b, c, d]),
+            (
+                dataclasses.replace(base, family_finalists=3, family_spread=1.015),
+                [a[0], b],
+            ),
+            (dataclasses.replace(base, family_finalists=0), [a[0]]),
+        ):
+            search = _family_search(members, policy=policy)
+            measurer = _FakeMeasurer(lambda member, _n: member.perf)
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                self.assertIs(search.final_rebenchmark_best(a[0]), a[0])
+            timed = []
+            for window in measurer.windows:
+                if window[0] == "measure" and window[1] not in timed:
+                    timed.append(window[1])
+            self.assertEqual(timed, expected, policy)
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(
+                [row["family_quota"] for row in _rows(search)],
+                [member is not a[0] for member in expected],
+            )
+
+    def test_budget_counts_the_family_quota_only_with_family_keys(self) -> None:
+        # The quota's representatives are reserved for (and counted in the
+        # shortlist estimate) only where the spec names family knobs; the
+        # ladder sheds them right after the second regime's column.
+        members = [_member(32, 1.0), _member(64, 1.1)]
+        policy = FinalSelectionConfig()
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
+        self.assertEqual(policy.budget_ladder()[3].family_finalists, 0)
+        self.assertEqual(policy.budget_ladder()[3].rounds, policy.rounds)
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}):
+            _clear_regime_envs()
+            plain = _make_search(
+                members, policy=policy, pinned=members[:1], budget_seconds=1000
+            )
+            self.assertEqual(
+                plain._final_selection_sizing_policy(),
+                dataclasses.replace(one_column, family_finalists=0),
+            )
+            self.assertEqual(plain._final_selection_shortlist_estimate(), 10)
+            self.assertAlmostEqual(
+                plain._budget_reserve_seconds(),
+                dataclasses.replace(one_column, family_finalists=0).estimated_seconds(
+                    10
+                ),
+            )
+            family = _family_search(
+                members, policy=policy, pinned=members[:1], budget_seconds=1000
+            )
+            self.assertEqual(family._final_selection_sizing_policy(), one_column)
+            self.assertEqual(family._final_selection_shortlist_estimate(), 12)
+            self.assertAlmostEqual(
+                family._budget_reserve_seconds(), one_column.estimated_seconds(12)
+            )
+            self.assertGreater(
+                family._budget_reserve_seconds(), plain._budget_reserve_seconds()
+            )
+            # the cache key keeps the profile's fields either way
+            self.assertEqual(
+                family._final_rebenchmark_cache_policy(),
+                plain._final_rebenchmark_cache_policy(),
+            )
 
 
 class TestPrivateKernelArgs(TestCase):

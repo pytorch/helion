@@ -62,6 +62,12 @@ _REPLAY_BATCH_MAX_CALLS = 256
 # the search regime (see ``final_selection_l2_flush_mode``).
 _FINAL_L2_FLUSH_ENV = "HELION_AUTOTUNE_FINAL_L2_FLUSH"
 _L2_FLUSH_MODES = ("call", "off", "replay")
+# The regime the final selection selects by (see
+# ``final_selection_second_regime``): ``auto`` (unset) ranks in the final
+# selection's regime and, when that is a warm one (``replay`` / ``off``),
+# breaks ties within the policy's noise band by a per-call-flushed column;
+# ``call`` / ``replay`` / ``0`` select by that regime's column outright.
+_TARGET_REGIME_ENV = "HELION_AUTOTUNE_TARGET_REGIME"
 
 
 def _l2_flush_mode() -> str:
@@ -125,6 +131,46 @@ def final_selection_l2_flush_mode() -> str:
         return explicit
     search = _l2_flush_mode()
     return "replay" if search == "off" else search
+
+
+def final_selection_target_regime() -> str:
+    """The regime the final selection selects by: ``auto`` or one of
+    ``_L2_FLUSH_MODES`` (``HELION_AUTOTUNE_TARGET_REGIME``)."""
+    raw = os.environ.get(_TARGET_REGIME_ENV)
+    if raw is None or not raw.strip() or raw.strip().lower() == "auto":
+        return "auto"
+    regime = _l2_flush_mode_from_env(_TARGET_REGIME_ENV)
+    assert regime is not None
+    return regime
+
+
+def final_selection_second_regime(regime: str) -> str | None:
+    """The second regime the final selection times its finalists in when it
+    ranks them in ``regime``, ``None`` when one column decides.
+
+    A warm regime (``replay``: one flush, then a burst of back-to-back
+    calls; ``off``: never flushed) dilutes a kernel's cold start to a
+    fraction of a reading, so finalists that differ only in how they
+    treat the first call's operands (an L2 eviction hint on a state load,
+    a prefetch, a pipeline depth) tie there within the steady windows'
+    noise while they differ by 20-40% per call flushed. Under the default
+    target (``auto``) the final selection therefore times the finalists
+    tied within its tie tolerance in the ``call`` regime as well and lets
+    that cold column break the tie; the per-call flushed regime ranks
+    alone (a cold reading already carries the warm one's steady state).
+    An explicit ``HELION_AUTOTUNE_TARGET_REGIME`` names the regime the
+    kernel is scored in: every finalist is timed in it in addition to
+    ``regime`` and that column selects outright. ``regime`` names a timer
+    that cannot honour the regimes (a backend's own steady bench, a
+    wall-clock bench) when it is not one of ``_L2_FLUSH_MODES``: no
+    second column then.
+    """
+    if regime not in _L2_FLUSH_MODES:
+        return None
+    target = final_selection_target_regime()
+    if target == "auto":
+        return "call" if regime in ("replay", "off") else None
+    return None if target == regime else target
 
 
 _MIRRORED_BENCH_MAX_SWEEPS = 64

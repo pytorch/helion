@@ -10555,6 +10555,68 @@ def flash_attention_seed_configs(
                 if hybrid_seed not in seeds:
                     seeds.append(hybrid_seed)
 
+    # The two-tile fa4 body of the dense hd128 shapes (half the K/V traffic
+    # of the single-tile alternating body, so the cheaper one under a power
+    # cap): the fa4 xu seed above with the serial PASS2 (disc_pipe 1), the
+    # whole-row sum and the softmax lowering the surface offers, the resident
+    # value graph on a dense FP16/BF16 output, auto on an LSE output.
+    if (
+        head_dim == 128
+        and not is_causal
+        and not has_kv_tile_pruning
+        and not has_list_walk
+        and _flash_supported_io_dtype(dtype)
+        and "fa4" in families
+    ):
+        two_tile_fragments = flash_autotune_fragments(
+            head_dim,
+            num_kv,
+            pipeline_family_override="fa4",
+            **common,
+            **fragment_facts,
+        )
+        two_tile_lowering_fragment = two_tile_fragments[FLASH_SOFTMAX_LOWERING_KEY]
+        assert isinstance(two_tile_lowering_fragment, EnumFragment)
+        two_tile_lowering = (
+            "resident_value_graph"
+            if "resident_value_graph" in two_tile_lowering_fragment._active_choices()
+            else "auto"
+        )
+        two_tile_values = {
+            key: fragment.default() for key, fragment in two_tile_fragments.items()
+        }
+        if _flash_seed_set_all(
+            two_tile_values,
+            two_tile_fragments,
+            {
+                FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                FLASH_SOFTMAX_LOWERING_KEY: two_tile_lowering,
+                FLASH_E2E_SCHEDULE_KEY: "xu",
+                FLASH_E2E_OFFSET_KEY: 0,
+                FLASH_E2E_OFFSET0_KEY: 0,
+                FLASH_EXP2_PACKET_KEY: "1x1",
+                FLASH_STAT_TRANSPORT_KEY: "single",
+                FLASH_SOFTMAX_DISC_KEY: False,
+                FLASH_DISC_PIPE_KEY: 1,
+                FLASH_SPLIT_P_ARRIVE_KEY: True,
+                FLASH_SP_ROW_SUM_KEY: "whole",
+                FLASH_KV_STAGE_KEY: 3,
+                FLASH_SOFTMAX_REGS_KEY: 200,
+                FLASH_CORR_REGS_KEY: 64,
+                FLASH_OTHER_REGS_KEY: 48,
+                FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+                FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+                FLASH_CORR_TILE_SIZE_KEY: 16,
+                FLASH_ROW_EPILOGUE_WARPS_KEY: "softmax",
+                FLASH_EPI_TMA_KEY: True,
+                FLASH_EPI_STG_KEY: False,
+                FLASH_WAIT_HINT_KEY: 10_000_000,
+            },
+        ):
+            two_tile_seed = _flash_config_with_values(block_sizes, two_tile_values)
+            if two_tile_seed not in seeds:
+                seeds.append(two_tile_seed)
+
     # Seed each emitter-level policy once so quick tuning cannot miss a source
     # variant merely because it is conditionally active with another field.
     source_variants: tuple[tuple[str, object, Mapping[str, object]], ...] = (
