@@ -118,18 +118,12 @@ class HelionTritonOverrides(TritonOverrides):
 
     @staticmethod
     def maximum(a: str, b: str) -> str:
-        """Drop NaN propagation under fast_math, as the amax reduction does.
-
-        Intel GPUs have no NaN-propagating max; Triton emulates it with two
-        compares, an or and a select around the max.
-        """
         if inductor_config.use_fast_math:
             return f"tl.maximum({a}, {b})"
         return TritonOverrides.maximum(a, b)
 
     @staticmethod
     def minimum(a: str, b: str) -> str:
-        """Drop NaN propagation under fast_math, as the amin reduction does."""
         if inductor_config.use_fast_math:
             return f"tl.minimum({a}, {b})"
         return TritonOverrides.minimum(a, b)
