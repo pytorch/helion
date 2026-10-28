@@ -7177,6 +7177,7 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
                 spec._cute_flash_head_dim,
                 spec._cute_flash_num_kv,
                 standard_dense_output=spec._cute_flash_standard_dense_output,
+                dense_lse_output=spec._cute_flash_dense_lse_output,
                 standard_causal_output=spec._cute_flash_standard_causal_output,
                 has_list_walk=spec._cute_flash_has_list_walk,
                 flex_trivial_walk=spec._cute_flash_flex_trivial_walk,

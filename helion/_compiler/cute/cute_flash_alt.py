@@ -12,7 +12,10 @@ One 128-row query tile per persistent work item. Warp roles (16 warps):
   arrivals), hand alpha to the correction warps after the P-buffer wait, and
   fold the chunk sums into a partial row sum rescaled by every alpha (the other
   warpgroup's alpha is recomputed exactly from the two effective maxes). A
-  hands its partial sum to B once per item; B owns the final row sum and LSE.
+  hands its partial sum to B once per item; B owns the final row sum and LSE
+  and publishes the row sum to the correction warps as soon as it has it
+  (through its dead max slot and named barrier 14), so the epilogue starts
+  the moment the item's last PV completes.
   Named-barrier handoffs (bar.arrive by the producer, bar.sync by the consumer)
   are only safe when the producer cannot arrive twice before one sync. The max
   handoffs alternate by construction and the alpha handoffs are ordered by the
@@ -32,6 +35,14 @@ One 128-row query tile per persistent work item. Warp roles (16 warps):
   of V, and the next item's first two K tiles precede this item's last two V
   tiles.
 * warp 15: TMA store of the staged output tile; releases the Q stage.
+
+Named barriers: 2 the TMEM allocation handshake (14 warps), 3-6 / 7-10 the
+per-warp alpha handoffs of A / B to the correction warps, 11 / 12 the running
+max A -> B / B -> A, 13 the partial row sum A -> B, 14 the row sum B ->
+correction warps. Every mbarrier a role spins on is addressed through a
+warp-uniform 32-bit shared address computed once at the top of the kernel
+(``_helion_flash_rt.mbar_spin_wait_addr``): with the per-thread pointers,
+ptxas spilled the shared-window base and reloaded it in front of every wait.
 
 TMEM (512 columns at head_dim 128): S_a [0,128) S_b [128,256) O [256,384)
 P_a [384,448) P_b [448,512). The numerics are the fa4 body's per element; the
@@ -57,6 +68,25 @@ FA4_ALT_HEAD_DIMS = (128,)
 # once the previous item's output store read it; prefetching earlier blocks
 # the K/V stream behind that store).
 _Q_PREFETCH_PAIRS = 4
+# The mbarriers some role spins on; each gets a warp-uniform shared address
+# next to its pointer (``tmem_dealloc`` is only ever arrived on).
+_SPIN_WAIT_BARRIERS = (
+    "s_full",
+    "s_empty",
+    "pfor",
+    "pfor2",
+    "pv_done",
+    "o_full",
+    "corr_epi_full",
+    "l_consumed",
+    "rowsum_consumed",
+)
+
+
+def _bar_addr(name: str, stage: int) -> str:
+    """The uniform address of stage ``stage`` of a two-stage mbarrier pair."""
+    assert name in _SPIN_WAIT_BARRIERS
+    return f"flash_{name}_addr" if stage == 0 else f"flash_{name}_addr + {8 * stage}"
 
 
 def fa4_alt_supported(
@@ -236,6 +266,15 @@ def emit_flash_fa4_alt_device_body(
         "tmem_dealloc",
     ):
         s.line(0, f"flash_{name}_ptr = storage.{name}_mbar.data_ptr()")
+    s.line(
+        0,
+        "# every spin wait addresses its barrier through a warp-uniform shared address computed once (arrives keep the pointers)",
+    )
+    for name in _SPIN_WAIT_BARRIERS:
+        s.line(
+            0,
+            f"flash_{name}_addr = cute.arch.make_warp_uniform(cutlass.Int32(flash_{name}_ptr.toint()))",
+        )
     s.line(0, "if tidx == 0:")
     s.line(4, "for flash_st in cutlass.range_constexpr(2):")
     s.line(8, "cute.arch.mbarrier_init(flash_s_full_ptr + flash_st, 1)")
@@ -334,7 +373,7 @@ def emit_flash_fa4_alt_device_body(
     s.line(8, "flash_q_full = flash_q_cons.wait_and_advance()")
     s.line(
         8,
-        f"_helion_flash_rt.mbar_spin_wait(flash_corr_epi_full_ptr, flash_corr_epi_full_phase, {wait_hint})",
+        f"_helion_flash_rt.mbar_spin_wait_addr(flash_corr_epi_full_addr, flash_corr_epi_full_phase, {wait_hint})",
     )
     s.line(8, "flash_corr_epi_full_phase ^= 1")
     s.line(8, "with cute.arch.elect_one():")
@@ -483,7 +522,7 @@ def emit_flash_fa4_alt_device_body(
         s.line(12, "flash_k_full = flash_k_cons.wait_and_advance()")
         s.line(
             12,
-            f"_helion_flash_rt.mbar_spin_wait(flash_s_empty_ptr + {buf}, flash_se_phase, {wait_hint})",
+            f"_helion_flash_rt.mbar_spin_wait_addr({_bar_addr('s_empty', buf)}, flash_se_phase, {wait_hint})",
         )
         s.line(
             12,
@@ -525,7 +564,7 @@ def emit_flash_fa4_alt_device_body(
         s.line(12, "flash_v_full = flash_v_cons.wait_and_advance()")
         s.line(
             12,
-            f"_helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + {buf}, flash_pfor_phase, {wait_hint})",
+            f"_helion_flash_rt.mbar_spin_wait_addr({_bar_addr('pfor', buf)}, flash_pfor_phase, {wait_hint})",
         )
         s.line(
             12,
@@ -614,11 +653,11 @@ def emit_flash_fa4_alt_device_body(
         if x == 1:
             s.line(
                 8,
-                "# the alpha slot still holds the previous item's row sum until the correction warps read it; the first alpha of this item (written after the P-buffer wait, which the row-sum publish already passed) must not overtake that read or arrive on the handoff barrier twice before one correction sync",
+                "# the max slot still holds the previous item's row sum until the correction warps read it; this item's first max publication must not overtake that read or arrive on the row-sum barrier twice before one correction sync",
             )
             s.line(
                 8,
-                f"_helion_flash_rt.mbar_spin_wait(flash_rowsum_consumed_ptr, flash_rsc_phase, {wait_hint})",
+                f"_helion_flash_rt.mbar_spin_wait_addr(flash_rowsum_consumed_addr, flash_rsc_phase, {wait_hint})",
             )
             s.line(8, "flash_rsc_phase ^= 1")
         s.line(8, "flash_row_max = cutlass.Float32(-cutlass.Float32.inf)")
@@ -628,7 +667,7 @@ def emit_flash_fa4_alt_device_body(
         s.line(12, f"flash_kv = 2 * flash_j + {x}")
         s.line(
             12,
-            f"_helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {x}, flash_s_full_phase, {wait_hint})",
+            f"_helion_flash_rt.mbar_spin_wait_addr({_bar_addr('s_full', x)}, flash_s_full_phase, {wait_hint})",
         )
         s.line(12, "flash_s_full_phase ^= 1")
         s.line(
@@ -685,7 +724,7 @@ def emit_flash_fa4_alt_device_body(
         s.line(12, "flash_do_handoff = flash_kv != 0")
         s.line(
             12,
-            f"flash_p_sum = _helion_flash_alt_rt.fa4_alt_exp_pass_held(flash_frgs, flash_tiled_st, tSTtP, tSTcS, _flash_scale_log2, flash_minus_max_scale, {e2e_freq}, {e2e_res}, {e2e_offset}, flash_pfor_ptr + {x}, flash_pfor2_ptr + {x}, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, {io_dtype}, flash_pv_done_ptr + {x}, flash_pvd_phase, flash_do_handoff, flash_scale_t, {x}, flash_local_tidx, flash_alpha, {3 + 4 * x} + warp_idx % 4{pass_kwargs})",
+            f"flash_p_sum = _helion_flash_alt_rt.fa4_alt_exp_pass_held(flash_frgs, flash_tiled_st, tSTtP, tSTcS, _flash_scale_log2, flash_minus_max_scale, {e2e_freq}, {e2e_res}, {e2e_offset}, flash_pfor_ptr + {x}, flash_pfor2_ptr + {x}, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS, {io_dtype}, {_bar_addr('pv_done', x)}, flash_pvd_phase, flash_do_handoff, flash_scale_t, {x}, flash_local_tidx, flash_alpha, {3 + 4 * x} + warp_idx % 4{pass_kwargs})",
         )
         s.line(12, "flash_pvd_phase ^= 1")
         s.line(
@@ -699,7 +738,7 @@ def emit_flash_fa4_alt_device_body(
             )
             s.line(
                 8,
-                f"_helion_flash_rt.mbar_spin_wait(flash_l_consumed_ptr, flash_lc_phase, {wait_hint})",
+                f"_helion_flash_rt.mbar_spin_wait_addr(flash_l_consumed_addr, flash_lc_phase, {wait_hint})",
             )
             s.line(8, "flash_lc_phase ^= 1")
             s.line(8, "flash_l_t[flash_local_tidx] = flash_part_sum")
@@ -714,17 +753,10 @@ def emit_flash_fa4_alt_device_body(
             s.line(8, "_helion_flash_rt.mbarrier_arrive(flash_l_consumed_ptr)")
             s.line(
                 8,
-                "# the last PV's completion implies the correction consumed the last alpha: slot free, barrier in step",
+                "# the row sum goes to the correction warps at once through this warpgroup's max slot (dead until its next-item publication, which waits for their read) so the epilogue starts the moment the last PV completes",
             )
-            s.line(
-                8,
-                f"_helion_flash_rt.mbar_spin_wait(flash_pv_done_ptr + {x}, flash_pvd_phase, {wait_hint})",
-            )
-            s.line(8, f"flash_scale_t[{x}, flash_local_tidx] = flash_row_sum")
-            s.line(
-                8,
-                f"_helion_flash_rt.named_barrier_arrive_unaligned({3 + 4 * x} + warp_idx % 4, 64)",
-            )
+            s.line(8, f"flash_m_t[{x}, flash_local_tidx] = flash_row_sum")
+            s.line(8, "_helion_flash_rt.named_barrier_arrive_unaligned(14, 256)")
             if has_lse:
                 value = (
                     "flash_row_max * _flash_scale_log2 + cute.math.log2(flash_row_sum)"
@@ -767,7 +799,7 @@ def emit_flash_fa4_alt_device_body(
         )
         s.line(
             ind + 4,
-            f"_helion_flash_rt.mbar_spin_wait(flash_pv_done_ptr + {other}, flash_pvd_phase{other}, {wait_hint})",
+            f"_helion_flash_rt.mbar_spin_wait_addr({_bar_addr('pv_done', other)}, flash_pvd_phase{other}, {wait_hint})",
         )
         s.line(
             ind + 4,
@@ -780,16 +812,16 @@ def emit_flash_fa4_alt_device_body(
     s.line(12, "if flash_j != 0:")
     corr_step(16, 0)
     corr_step(12, 1)
-    s.line(8, "_helion_flash_rt.named_barrier_wait_unaligned(7 + warp_idx % 4, 64)")
+    s.line(8, "_helion_flash_rt.named_barrier_wait_unaligned(14, 256)")
     s.line(
         8,
-        "flash_inv_sum = _helion_flash_rt.rcp_approx_ftz(flash_scale_t[1, flash_local_tidx])",
+        "flash_inv_sum = _helion_flash_rt.rcp_approx_ftz(flash_m_t[1, flash_local_tidx])",
     )
-    # the odd warpgroup may now write its next item's first alpha into the slot
+    # the odd warpgroup may now publish its next item's first max into the slot
     s.line(8, "_helion_flash_rt.mbarrier_arrive(flash_rowsum_consumed_ptr)")
     s.line(
         8,
-        f"_helion_flash_rt.mbar_spin_wait(flash_o_full_ptr, flash_o_full_phase, {wait_hint})",
+        f"_helion_flash_rt.mbar_spin_wait_addr(flash_o_full_addr, flash_o_full_phase, {wait_hint})",
     )
     s.line(8, "flash_o_full_phase ^= 1")
     s.line(
