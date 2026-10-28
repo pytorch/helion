@@ -492,11 +492,45 @@ def test_one_gemm_chain_two_cta_launch_and_deep_flat_ring_at_campaign_shape() ->
             bound.env, host.device_ir
         )
     two_cta = [seed for seed in native if "tcgen05_region_pid_types" in seed.config]
+    # Beside each pair seed, three twins move the masked GEMM onto the
+    # 256-row pair tile the epilogue mechanisms render on and prefetch the
+    # relu mask: the register ring at its deepest depth, the whole-fragment
+    # hoist and the epilogue-issued aux ring, each at the deepest AB ring
+    # the region budget fits beside the launch's rings; the hoist alone
+    # also takes the geometry rule's own 128x256 pair.
     assert [seed.block_sizes[2:] for seed in two_cta] == [
         [128, 256, 64],
+        [256, 128, 64],
+        [256, 128, 64],
+        [128, 256, 64],
+        [256, 128, 64],
         [128, 256, 128],
+        [256, 128, 128],
+        [256, 128, 128],
+        [128, 256, 128],
+        [256, 128, 128],
     ]
     assert two_cta[0].config["tcgen05_region_ab_stages"] == [8]
+    assert [
+        (
+            seed.config.get("tcgen05_aux_prefetch_subtiles", 0),
+            seed.config.get("tcgen05_aux_fragment_hoist", False),
+            seed.config.get("tcgen05_aux_load_mode", "simt"),
+            seed.config["tcgen05_region_ab_stages"],
+        )
+        for seed in two_cta
+    ] == [
+        (0, False, "simt", [8]),
+        (3, False, "simt", [8]),
+        (0, True, "simt", [8]),
+        (0, True, "simt", [8]),
+        (0, False, "epi_tma", [8]),
+        (0, False, "simt", [4]),
+        (3, False, "simt", [4]),
+        (0, True, "simt", [4]),
+        (0, True, "simt", [4]),
+        (0, False, "epi_tma", [4]),
+    ]
     assert all(seed.config["tcgen05_cta_group"] == "two" for seed in two_cta)
     assert native[0].pid_type == "flat"
     assert "tcgen05_region_pid_types" not in native[0].config

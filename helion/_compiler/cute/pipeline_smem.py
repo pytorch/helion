@@ -257,6 +257,8 @@ def pipeline_smem_bytes(
     epi_warps: int = 4,
     aux_load_mode: str = "simt",
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Upper-bound the allocations for the static CtaGroup.TWO schedule.
 
@@ -267,7 +269,12 @@ def pipeline_smem_bytes(
     both families use the destination's actual row- or column-major layout.
     A staged aux load mode adds one ``aux_stages``-deep ring of epilogue
     subtiles per exact-shape auxiliary operand (``facts.exact_aux_count``)
-    plus its full/empty barriers.
+    plus its full/empty barriers.  ``epi_warp_groups`` multiplies the C
+    stages (each epilogue warp group owns ``c_stages`` stages of the ring,
+    ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
+    pair's C subtile to ``(128, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
+    the explicit-tile path; the staged aux rings keep the plan's with-source
+    subtile, as ``cute_mma`` sizes them).
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
@@ -277,6 +284,7 @@ def pipeline_smem_bytes(
     assert facts.input_dtype_bytes in (1, 2)
     assert facts.output_dtype_bytes in (2, 4)
     assert ab_stages > 0 and c_stages in (2, 4) and acc_stages in (1, 2)
+    assert epi_warp_groups >= 1
     two_cta_m128 = bm == 128
     output_width = facts.output_dtype_bytes * 8
     epi_m, epi_n = compute_epilogue_tile_size(
@@ -288,6 +296,12 @@ def pipeline_smem_bytes(
         d_is_m_major=facts.output_column_major,
         c_is_m_major=facts.output_column_major,
     )
+    c_tile_m, c_tile_n = epi_m, epi_n
+    if epi_subtile_n is not None and not two_cta_m128:
+        # The configured subtile of the 256-row pair: one CTA walks whole
+        # 128-lane TMEM datapath tiles of its 128-row half
+        # (``strategies.tcgen05_epilogue_subtile_m``).
+        c_tile_m, c_tile_n = 128, epi_subtile_n
     ab_bytes = tcgen05_ab_smem_bytes_per_cta(
         bm=bm,
         bn=bn,
@@ -297,10 +311,10 @@ def pipeline_smem_bytes(
         cluster_m=2,
     )
     c_bytes = tcgen05_c_smem_bytes_per_cta(
-        epi_tile_m=epi_m,
-        epi_tile_n=epi_n,
+        epi_tile_m=c_tile_m,
+        epi_tile_n=c_tile_n,
         dtype_bytes=facts.output_dtype_bytes,
-        c_stages=c_stages,
+        c_stages=c_stages * epi_warp_groups,
     )
     # Only the M256 normal epilogue stages FP32 N-broadcasts. The M128
     # instruction has a 64-row per-CTA epilogue, below the staging gate.
@@ -344,6 +358,8 @@ def max_pipeline_ab_stages(
     epi_warps: int = 4,
     aux_load_mode: str = "simt",
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Fill shared memory without changing the epilogue or accumulator ring."""
     return deepest_fitting_ab_stages(
@@ -360,6 +376,8 @@ def max_pipeline_ab_stages(
             epi_warps=epi_warps,
             aux_load_mode=aux_load_mode,
             aux_stages=aux_stages,
+            epi_warp_groups=epi_warp_groups,
+            epi_subtile_n=epi_subtile_n,
         ),
         facts.capacity_bytes,
     )

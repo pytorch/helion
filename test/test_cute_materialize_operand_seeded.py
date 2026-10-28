@@ -325,3 +325,42 @@ def test_cpu_reference_matches_the_original_program_bitwise(
             formula = x.float().T @ derived.float()
     assert original.kernel.fn is kernel.fn
     torch.testing.assert_close(actual, formula.to(torch.float16), rtol=0, atol=0)
+
+
+def test_population_cut_holds_a_flat_epi_tma_seed_of_every_tcgen05_tile() -> None:
+    """dx at 4096x1024 has well over 100 compiler seeds; the LFBO population
+    keeps the first 99 of them in list order, so the flat ``epi_tma`` twin of
+    every tcgen05 tile has to sit inside that cut (the persistent-producer
+    twins used to fill it, and a cold search that started on the wrong tile
+    family read one timer tick slower)."""
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    bound = _bind_se(se_block_bwd_dx, _dx_args(_se_args(4096, 1024)))
+    spec = bound.config_spec
+    with bound.env:
+        generation = ConfigGeneration(spec)
+        seeds = [config for _, config in generation.seed_flat_config_pairs()]
+        assert len(seeds) >= 100
+        population = [
+            generation.unflatten(row) for row in generation.random_population_flat(100)
+        ]
+    assert len(population) == 100
+
+    def tile(config: helion.Config) -> tuple[int, ...]:
+        return tuple(config.block_sizes[2:5])
+
+    def epi_tma(config: helion.Config) -> bool:
+        return config.config.get("tcgen05_aux_load_mode") == "epi_tma"
+
+    def flat(config: helion.Config) -> bool:
+        return config.config.get("cute_pointwise_pid_type") == "flat"
+
+    tiles = {tile(seed) for seed in seeds if "tcgen05_ab_stages" in seed.config}
+    # The TMA-staged aux epilogue is seeded on the 256-row tiles only (it is
+    # refused on the bm=128 two-CTA epilogue tile).
+    epi_tma_tiles = {tile(seed) for seed in seeds if epi_tma(seed)}
+    assert len(tiles) >= 8 and epi_tma_tiles
+    in_cut = [config for config in population if flat(config)]
+    assert tiles <= {tile(config) for config in in_cut}
+    assert epi_tma_tiles <= {tile(config) for config in in_cut if epi_tma(config)}
+    assert len(in_cut) >= len(population) // 2
