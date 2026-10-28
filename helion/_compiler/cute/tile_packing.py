@@ -26,6 +26,8 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ...runtime.config import Config
     from ..device_ir import DeviceIR
 
@@ -57,7 +59,7 @@ def tile_pack_counts(env: CompileEnvironment, device_ir: DeviceIR) -> dict[int, 
     return counts
 
 
-def l2_grouped(config: dict[str, object]) -> bool:
+def l2_grouped(config: Mapping[str, object]) -> bool:
     """Whether any grid axis of ``config`` uses an L2 grouping above one."""
     groupings = config.get("l2_groupings", ())
     return isinstance(groupings, (list, tuple)) and any(
@@ -69,14 +71,14 @@ def packed_grid_block(
     env: CompileEnvironment, config: Config
 ) -> tuple[int, int] | None:
     """``(block_id, tiles_per_block)`` of the packed grid axis under ``config``."""
-    pack = config.config.get("cute_tiles_per_block", 1)
+    pack = config.get("cute_tiles_per_block", 1)
     if type(pack) is not int or pack <= 1:
         return None
-    if config.config.get("pid_type", "flat") != "flat":
+    if config.get("pid_type", "flat") != "flat":
         return None
-    if config.config.get("cute_cluster_n", 1) != 1:
+    if config.get("cute_cluster_n", 1) != 1:
         return None
-    if l2_grouped(config.config):
+    if l2_grouped(config):
         return None
     for block_id, count in sorted(env.config_spec.cute_tile_pack_counts.items()):
         if count % pack == 0:

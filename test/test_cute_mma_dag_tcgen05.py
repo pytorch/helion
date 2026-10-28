@@ -5702,6 +5702,58 @@ def test_staged_stores_drain_by_tma() -> None:
     assert rest.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 1
 
 
+def test_root_only_tma_stores_skip_the_in_loop_waits() -> None:
+    # A program whose TMA stores are all root stores (mqa_logits: the fp32
+    # out tile goes out slab by slab after the head loop) has no bulk group
+    # in flight inside the loop, so the store thread's read waits ahead of
+    # the loop, ahead of every commit and at the loop's exit are dead --
+    # yet each blocked the MMA-issuing thread (32 per CTA at [128, 128]:
+    # 31.6 -> 27.1 us on the campaign's prefill shape).  Only the drain
+    # before the kernel ends remains.  A loop store by TMA keeps its waits
+    # (``test_staged_stores_drain_by_tma``); a root store issued ahead of a
+    # later loop keeps the pre-loop wait
+    # (``test_tma_store_groups_finish_reading_before_a_loop_and_a_buffers_reuse``).
+    bound = _bind_head_sum()
+    for extra in ({}, {"cute_mma_dag_lookahead": "on", "cute_mma_dag_loads": "tma"}):
+        body = _kernel_body(
+            _source(
+                bound,
+                _config(
+                    128, 128, warps=8, stages=2, cute_mma_dag_epilogue="split", **extra
+                ),
+            )
+        )
+        loop = _loop(body)
+        assert body.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 4
+        assert loop.count(f"{P}.tcgen05_commit(") >= 1
+        assert f"{P}.cp_async_bulk_wait_group(0, read=True)" not in body
+        assert body.count(f"{P}.cp_async_bulk_wait_group(") == 1
+        tail = body[body.rindex(f"{P}.cp_async_bulk_commit_group()") :]
+        _assert_in_order(
+            tail,
+            [
+                f"if md_tidx == {tc.TMA_STORE_THREAD}:",
+                f"{P}.cp_async_bulk_wait_group(0)",
+                "cute.arch.barrier()",
+                f"{P}.tcgen05_dealloc(",
+            ],
+        )
+    # The loop store of dk (bf16 [64, 64]: one swizzle atom per row) turns
+    # its buffer over per iteration: the wait ahead of the iteration's
+    # commit and the one at the loop's exit stay.
+    body = _kernel_body(_source(_bind_dk(), _config(64, warps=4, stages=2)))
+    loop = _loop(body)
+    iteration = loop[: loop.index("md_rk0 = md_rk0 + 1")]
+    _assert_in_order(
+        iteration,
+        [f"{P}.cp_async_bulk_wait_group(0, read=True)", f"{P}.tcgen05_commit("],
+    )
+    exit_ = loop[loop.index("md_rk0 = md_rk0 + 1") :]
+    _assert_in_order(
+        exit_, [f"{P}.cp_async_bulk_wait_group(0, read=True)", "cute.arch.barrier()"]
+    )
+
+
 def test_aux_reads_share_a_staged_operands_tile() -> None:
     # Gated dqkw's row sums over dq * q and dk_as * k (the tile_d loop's
     # tail, behind the nested loop) read q_d and k_d, the staged B operands

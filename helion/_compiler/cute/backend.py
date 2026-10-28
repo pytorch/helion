@@ -4507,9 +4507,21 @@ class CuteBackend(Backend):
                 else 0
             )
 
+            # ``cute_tiles_per_block``: the packed grid axis is a thread axis
+            # of extent ``pack`` even when the body never distributes over it
+            # (``PerThreadNDTileStrategy`` reactivates it); budget it here.
+            packed_block_id = None
+            if self.name == "cute":
+                from .tile_packing import packed_grid_block
+
+                packed = packed_grid_block(env, config)
+                packed_block_id = None if packed is None else packed[0]
+
             def uses_thread_axis_for(
                 block_id: int, block_size: object, num_threads: int
             ) -> bool:
+                if block_id == packed_block_id:
+                    return True
                 if (
                     block_id in inactive_block_ids
                     or block_id in inactive_grid_block_ids
