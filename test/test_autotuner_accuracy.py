@@ -40,6 +40,7 @@ from helion.autotuner.accuracy import relative_l2_disagreement
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
+from helion.autotuner.benchmark_provider import _MAX_SAMPLED_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import BASELINE_CONSISTENCY_MAX_RELATIVE_L2
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.finite_search import FiniteSearch
@@ -374,9 +375,15 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         ):
             search._prepare()
 
-        shrinking = attempted[len(promoted) :]
+        shrinking = attempted[
+            len(promoted) : len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS
+        ]
         self.assertEqual(attempted[: len(promoted)], promoted)
         self.assertEqual(len(shrinking), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        # After the shrinks, a few configs sampled from the search space are
+        # tried before the refusal is reported.
+        sampled = attempted[len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS :]
+        self.assertLessEqual(len(sampled), _MAX_SAMPLED_BASELINE_ATTEMPTS)
         # Each attempt halves the previous one, starting from the reference
         # config that the error message reports.
         self.assertEqual(shrinking[0], reference_block)
@@ -408,8 +415,15 @@ class TestAutotunerAccuracy(AutotunerTestCase):
                 "Autotuning reference config failed while computing baseline",
             ):
                 search._prepare()
-            self.assertEqual(
+            # The shrinks, then the sampled configs the refusal falls back to.
+            self.assertGreaterEqual(
                 len(attempted), len(promoted) + _MAX_REFERENCE_BASELINE_ATTEMPTS
+            )
+            self.assertLessEqual(
+                len(attempted),
+                len(promoted)
+                + _MAX_REFERENCE_BASELINE_ATTEMPTS
+                + _MAX_SAMPLED_BASELINE_ATTEMPTS,
             )
         else:
             errors.insert(0, RuntimeError("unsupported op"))
