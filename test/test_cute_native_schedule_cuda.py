@@ -162,8 +162,9 @@ def _row_union_bound(
             config.config[RESIDENT_CTAS_KEY] = 2
         if ab_stages is not None:
             config.config[AB_STAGES_KEY] = ab_stages
-        if pdl:
-            config.config["cute_pdl"] = True
+        # ``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface; the
+        # knob-off renders pin it off.
+        config.config["cute_pdl"] = bool(pdl)
         normalized = bound.config_spec.normalized_config(config)
     assert normalized[ROW_UNION_KEY] is True
     assert normalized.config.get(AB_STAGES_KEY) == ab_stages
