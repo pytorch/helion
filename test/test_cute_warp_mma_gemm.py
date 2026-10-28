@@ -914,7 +914,9 @@ def test_cast_operand_on_the_lhs_converts_a_packets() -> None:
 
 def test_cute_pdl_waits_before_the_packets_and_releases_before_the_stores() -> None:
     bound = _bind_row_bias_gemm((256, 256, 256), torch.float16)
-    plain = _source(bound, _warp_config([64, 8, 256], 4))
+    # (``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface, which
+    # the family shares; the knob-off render pins it off)
+    plain = _source(bound, _warp_config([64, 8, 256], 4, cute_pdl=False))
     assert "griddepcontrol" not in plain and "'use_pdl': True" not in plain
     source = _source(bound, _warp_config([64, 8, 256], 4, cute_pdl=True))
     body = _kernel_body(source)

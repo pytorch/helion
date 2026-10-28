@@ -2313,13 +2313,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         teacher_logits = student_logits.clone()
         args = (beta, ignore_index, temperature, student_logits, teacher_logits)
 
+        # One row per CTA covers the subnormal regression without the slow
+        # fbtriton lowering of sixteen 1024-element rows in a single CTA.
         check_example(
             "fused_linear_jsd",
             args,
             torch.zeros((), device=DEVICE),
             fn_name="fused_linear_jsd_kernel",
             emit_code=False,
-            block_sizes=[16],
+            block_sizes=[1],
             atol=1e-6,
             rtol=0,
         )
@@ -2329,7 +2331,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             (torch.zeros(16, device=DEVICE), torch.zeros_like(student_logits)),
             fn_name="jsd_kernel",
             emit_code=False,
-            block_sizes=[16],
+            block_sizes=[1],
             atol=1e-6,
             rtol=0,
         )
@@ -2340,14 +2342,24 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         This is the user-facing API; the existing `test_fused_linear_jsd`
         only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
-        The logits byte budget is shrunk below so the shape runs the chunked
-        path (chunk_size > 1 and more than one chunk).
+        The default budget makes this shape a single chunk; four chunks of
+        32 rows of fp32 [chunk, k] logits exercise the multi-chunk loop.
         """
+        self._check_fused_linear_jsd_fwd(m=128, n=512, k=1024, chunk_rows=32)
+
+    def test_fused_linear_jsd_fwd_ragged_chunks(self):
+        """Chunking whose last chunk is partial (48 rows in chunks of 32 and
+        16): the forward writes grad_input row slices and the weight
+        gradient without zero fills, so every row must be covered exactly
+        once and the first chunk must initialize the accumulators.
+        """
+        self._check_fused_linear_jsd_fwd(m=48, n=256, k=512, chunk_rows=32)
+
+    def _check_fused_linear_jsd_fwd(self, m: int, n: int, k: int, chunk_rows: int):
         beta = 0.5
         ignore_index = -100
         # Use temperature = sqrt(hidden_dim) so logits/temperature has std ~1
         # and softmax stays in fp32 range.
-        m, n, k = 128, 512, 1024
         temperature = float(n) ** 0.5
 
         student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -2369,11 +2381,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         mod.jsd_kernel.settings.static_shapes = True
         mod.jsd_kernel.configs = [helion.Config(block_sizes=[16], num_warps=16)]
-        # The default budget makes this shape a single chunk; four chunks of
-        # 32 rows of fp32 [chunk, k] logits exercise the multi-chunk loop.
+        # Shrink the logits byte budget to chunk_rows rows of fp32 [chunk, k].
         original_budget = mod.LOGITS_CHUNK_BYTES
         self.addCleanup(setattr, mod, "LOGITS_CHUNK_BYTES", original_budget)
-        mod.LOGITS_CHUNK_BYTES = 32 * k * 4
+        mod.LOGITS_CHUNK_BYTES = chunk_rows * k * 4
 
         def loss_and_grads(
             fn: typing.Callable[..., torch.Tensor],
@@ -3186,7 +3197,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
-    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
@@ -3199,10 +3209,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
         out_torch.backward(grad_out)
 
-        # Compute sigmoid values using PyTorch reference
+        # Compute sigmoid values using PyTorch reference, and the shared
+        # matmul operand the example's producer kernel writes
         s = torch.sigmoid(x @ w)
+        g = (2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())).to(
+            x.dtype
+        )
 
-        args = (grad_out, x, w, s)
+        args = (grad_out, g, w, s)
 
         check_example(
             "se_block",
@@ -3210,6 +3224,29 @@ class TestExamples(RefEagerTestBase, TestCase):
             x_torch.grad,
             fn_name="se_block_bwd_dx",
             block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    def test_se_block_bwd_grad_to_w(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        s = torch.sigmoid(x @ w)
+        expected = (
+            2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())
+        ).to(x.dtype)
+
+        check_example(
+            "se_block",
+            (grad_out, x, s),
+            expected,
+            fn_name="se_block_bwd_grad_to_w",
+            block_sizes=[32, 32],
             num_warps=4,
             num_stages=3,
         )
@@ -3229,10 +3266,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
         out_torch.backward(grad_out)
 
-        # Compute sigmoid values using PyTorch reference
+        # Compute sigmoid values using PyTorch reference, and the shared
+        # matmul operand the example's producer kernel writes
         s = torch.sigmoid(x @ w)
+        g = (2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())).to(
+            x.dtype
+        )
 
-        args = (grad_out, x, s)
+        args = (x, g)
 
         check_example(
             "se_block",

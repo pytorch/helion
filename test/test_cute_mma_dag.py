@@ -2117,8 +2117,8 @@ def _lossy_cast_recurrence(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return h_all
 
 
-def _bind_fn(fn: object, args: tuple[object, ...]) -> BoundKernel:
-    return helion.kernel(fn, backend="cute", static_shapes=True).bind(args)  # type: ignore[arg-type]
+def _bind_fn(fn: object, args: tuple[object, ...], **settings: object) -> BoundKernel:
+    return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # type: ignore[arg-type]
 
 
 def test_sync_tiles_ring_with_the_stages_or_add_a_trailing_barrier() -> None:
@@ -4939,36 +4939,69 @@ def test_the_aux_ring_stages_vectors_along_the_contiguous_dim_once_per_cta() -> 
     assert f"alloc_smem(cutlass.Uint8, {plan.smem_bytes}," in body
 
 
-def test_the_aux_ring_gives_per_thread_words_to_scalars_and_row_vectors() -> None:
-    # fwd_h's gated chain: the per-chunk decay scalar and gc's two
-    # packet-row elements ride the ring as this thread's 4-byte slots
-    # (copied and read by the same thread: no barrier), read behind the
-    # stage's wait, which moves ahead of the scalar hoists consuming them.
+def test_the_aux_ring_stages_scalars_and_row_vectors_in_the_side_tile() -> None:
+    # fwd_h's gated chain: the per-chunk decay scalar (the carry rescale)
+    # and the gc row (the k pass's gate, read at the thread's two packet
+    # rows) are fp32 side loads the aux ring stages as one CTA-shared side
+    # tile per iteration -- the scalar's word by thread 0, the row's 64
+    # words by 64 threads -- in ``stages + 1`` slots of 272 bytes, read by
+    # coordinate.  The tile rides one cp.async group ahead of its operand
+    # tiles (eight tiles over the seven prologue groups, the refill one
+    # iteration past the operand refill), so the iteration reads it ahead
+    # of the operand wait, with no barrier before the scalar read.
     bound = _bind_fwd("gated")
     config = _config(16, 16, warps=2, stages=8, cute_mma_dag_aux="ring")
     body = _kernel_body(_source(bound, config))
     loop = _loop_body(body, "md_i")
     assert not _scalar_global_loads(loop)
     copies = re.findall(
-        rf"^ *{RT}\.cp_async_4\(md_aux0 \+ (.*?) \+ md_tidx \* 4, (.*)\)$",
+        rf"^( *){RT}\.cp_async_4\(md_aux0 \+ (.*?) \* 272(.*?), (md_base_\d+) \+ ",
         body,
         re.MULTILINE,
     )
-    # Seven prologue stages and the refill, three slots each.
-    assert len(copies) == 8 * 3
+    row = " + 16 + md_tidx * 4"
+    assert [(slot, entry) for _i, slot, entry, _b in copies] == [
+        *[(str(tile), entry) for tile in range(8) for entry in ("", row)],
+        ("(md_i + 8) % 9", ""),
+        ("(md_i + 8) % 9", row),
+    ]
+    # The scalar's packet sits under thread 0's guard, the row's under none
+    # (64 elements by the 64 threads).
+    assert {indent for indent, _s, entry, _b in copies if entry == ""} == {
+        "        ",
+        "                ",
+    }
+    assert {indent for indent, _s, entry, _b in copies if entry == row} == {
+        "    ",
+        "            ",
+    }
+    assert "md_sstage = md_i % 9" in loop
     reads = re.findall(
-        rf"^ *(\w+) = {RT}\.lds_f32\(md_aux0 \+ md_stage \* 768 \+ (\d+) \+ md_tidx \* 4\)$",
+        rf"^ *(\w+) = {RT}\.lds_f32\(md_aux0 \+ md_sstage \* 272(.*?)\)$",
         loop,
         re.MULTILINE,
     )
-    assert [int(offset) for _n, offset in reads] == [0, 256, 512]
+    assert [entry for _n, entry in reads] == [
+        "",
+        " + 16 + md_pr2 * 4",
+        " + 16 + (32 + md_pr2) * 4",
+    ]
     first = loop.index(f"{reads[0][0]} = ")
-    assert loop.index("cute.arch.cp_async_wait_group(6)") < first
+    assert first < loop.index("cute.arch.cp_async_wait_group(6)")
     assert "cute.arch.barrier()" not in loop[:first]
+    assert (
+        "cute.arch.cp_async_wait_group(6)\n    cute.arch.barrier()\n"
+        "    for md_i in cutlass.range("
+    ) in body
     plan = _plan_of(bound, config)
     ring = plan.aux_rings[0]
-    assert (ring.words, ring.vector_bytes, ring.stage_bytes) == (3, 0, 768)
-    assert plan.aux_bytes == 8 * 768
+    assert (ring.words, ring.vector_bytes, ring.stage_bytes) == (0, 0, 0)
+    assert (ring.shared_bytes, ring.shared_slots, ring.shared_base) == (
+        272,
+        9,
+        ring.offset,
+    )
+    assert plan.aux_bytes == 9 * 272
     assert f"alloc_smem(cutlass.Uint8, {plan.smem_bytes}," in body
 
 
@@ -8234,10 +8267,10 @@ def _half_accumulating_addmm(
     return grad_b
 
 
-def _accumulating_addmm_inputs() -> tuple[torch.Tensor, ...]:
+def _accumulating_addmm_inputs(k: int = 256) -> tuple[torch.Tensor, ...]:
     f16 = torch.float16
     grad_out = torch.empty((1024, 512), dtype=f16, device=CPU_DEVICE)
-    c = torch.empty((1024, 256), dtype=f16, device=CPU_DEVICE)
+    c = torch.empty((1024, k), dtype=f16, device=CPU_DEVICE)
     return grad_out, grad_out, grad_out, c
 
 
@@ -8247,7 +8280,26 @@ def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
     # accumulator, no rounding -- what ``hl.dot(a16, b16, acc=acc)`` spells.
     # Its operands here are the ones the tensor-core K-loop family declines
     # (a computed B tile), so the kernel ran SIMT or collective warp MMA.
-    bound = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
+    #
+    # At 256 output rows the operand-materialization rewrite takes the bound
+    # kernel instead (``_fused_recompute_pays``: the B recipe reads three
+    # same-width sources and is derived once per 128-row output tile, twice
+    # here), so the binding is a producer launch plus a plain-load consumer
+    # with no fused owner; at 128 rows the fused owner keeps it. The fused
+    # analysis below is pinned on the same program with the rewrite off.
+    materialized = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs())
+    assert materialized.env.cute_fission_plan is not None
+    assert materialized.config_spec.cute_mma_dag is None
+    assert materialized.config_spec.cute_tcgen05_search_enabled is True
+    one_tile = _bind_fn(_accumulating_addmm, _accumulating_addmm_inputs(k=128))
+    assert one_tile.env.cute_fission_plan is None
+    assert one_tile.config_spec.cute_mma_dag is not None
+    bound = _bind_fn(
+        _accumulating_addmm,
+        _accumulating_addmm_inputs(),
+        cute_materialize_transformed_operands=False,
+    )
+    assert bound.env.cute_fission_plan is None
     spec = bound.config_spec
     assert spec.cute_tcgen05_search_enabled is False
     assert spec.cute_mma_dag is not None
@@ -8354,13 +8406,22 @@ def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:
     # tensor memory the pass variant leads for this streamed program, the
     # exchange route right behind it; in the warp mode the pass variant
     # follows the first seed.
-    seeds = [
+    all_seeds = [
         c.config
         for c in dx.config_spec.compiler_seed_configs
         if c.config.get("cute_mma_dag") in ("warp", "tcgen05")
     ]
+    # The streamed pass seed's MMA-warp twin (``cute_mma_dag_pass_warps=
+    # 'mma'``) sits right behind it: the same tile and route again.
+    seeds = [c for c in all_seeds if c["cute_mma_dag_pass_warps"] != "mma"]
     routes = [(c["cute_mma_dag"], c["cute_mma_dag_derived"]) for c in seeds]
     first_tc = routes.index(("tcgen05", "pass"))
+    twin = all_seeds[all_seeds.index(seeds[first_tc]) + 1]
+    assert (twin["cute_mma_dag_pass_warps"], twin["cute_mma_dag_derived"]) == (
+        "mma",
+        "pass",
+    )
+    assert twin["block_sizes"] == seeds[first_tc]["block_sizes"]
     assert routes[first_tc + 1] == ("tcgen05", "exchange")
     assert seeds[first_tc]["block_sizes"] == seeds[first_tc + 1]["block_sizes"]
     first_warp = routes.index(("warp", "exchange"))
@@ -9083,15 +9144,29 @@ def _aux_ring_calls(body: str) -> tuple[int, int, int]:
     )
 
 
-def test_side_loads_ride_the_aux_ring_with_the_operand_tiles() -> None:
+def _aux_side_tile_groups(body: str) -> list[list[str]]:
+    """Per cp.async commit group of ``body`` (in order), the side tile slots
+    its 4-byte aux packets write."""
+    groups = body.split("cute.arch.cp_async_commit_group()")[:-1]
+    return [
+        re.findall(rf"{RT}\.cp_async_4\(md_aux0 \+ (.*?) \* \d+", group)
+        for group in groups
+    ]
+
+
+def test_side_loads_ride_the_aux_ring_one_group_ahead_of_the_operand_tiles() -> None:
     # bwd_dh with the scalar decay: the gc row (the q pass's gate, read at
     # the thread's two packet rows) and the g_last scalar (the carry
-    # rescale) vary with the chunk loop.  Under ``ring`` both are 4-byte
-    # cp.async packets into the loop's aux ring -- a word per thread per
-    # site (three), per stage -- issued with their iteration's operand
-    # tiles: the prologue's ``stages - 1`` groups and the refill; the lanes
-    # read this iteration's stage behind its wait, and no per-lane global
-    # load is left in the loop.
+    # rescale) vary with the chunk loop.  Under ``ring`` both are entries
+    # of the loop's side tile (the row's 64 words by 64 threads, the scalar
+    # by thread 0: 272 bytes in ``stages + 1`` slots), issued one cp.async
+    # group ahead of the operand tiles -- the prologue's first group
+    # carries the tiles of iterations 0 and 1, group ``j`` iteration ``j +
+    # 1``'s, the refill of operand ``i + 3`` iteration ``i + 4``'s -- so
+    # iteration ``i``'s wait and barrier publish the tile of ``i + 1``: the
+    # loop reads its own tile ahead of the operand wait (the rescale at the
+    # top), after a pre-loop wait and barrier for the first group.  No
+    # per-lane global load is left in the loop.
     bound = _bind_bwd("scalar")
     spec = bound.config_spec
     facts = spec.cute_mma_dag_facts
@@ -9099,7 +9174,7 @@ def test_side_loads_ride_the_aux_ring_with_the_operand_tiles() -> None:
     assert [
         (r.loop, r.kind, facts.axes[r.axis].kind if r.axis >= 0 else None)
         for r in facts.aux_loads
-    ] == [(0, "across", dag.AXIS_RDIM), (0, "scalar", None)]
+    ] == [(0, "shared", dag.AXIS_RDIM), (0, "shared", None)]
     assert spec.cute_mma_dag_aux is not None
     assert spec.cute_mma_dag_aux.choices == ("register", "ring")
     register = _kernel_body(_source(bound, _config(32, 64, warps=4, stages=4)))
@@ -9108,21 +9183,40 @@ def test_side_loads_ride_the_aux_ring_with_the_operand_tiles() -> None:
     )
     assert "md_aux0" not in register
     assert _aux_ring_calls(register) == (0, 0, 1)
-    # 3 prologue groups x 3 words, plus the refill's 3.
-    assert _aux_ring_calls(ring) == (12, 3, 1)
+    # Five tiles of two packets (the row and the scalar): four in the
+    # prologue's three groups, one in the refill; three reads (the scalar,
+    # the row at two packet rows); the pre-loop wait and the operand wait.
+    assert _aux_ring_calls(ring) == (10, 3, 2)
+    prologue = ring[: ring.index("for md_i in cutlass.range(")]
+    assert _aux_side_tile_groups(prologue) == [
+        ["0", "0", "1", "1"],
+        ["2", "2"],
+        ["3", "3"],
+    ]
+    assert prologue.endswith(
+        "cute.arch.cp_async_commit_group()\n    cute.arch.cp_async_wait_group(2)\n"
+        "    cute.arch.barrier()\n    "
+    )
     loop = _loop_and_after(ring)
-    assert f"{RT}.lds_f32(md_aux0 + md_stage * 1536 + 0 + md_tidx * 4)" in loop
+    assert "md_sstage = md_i % 5" in loop
+    scalar = f"md_v = {RT}.lds_f32(md_aux0 + md_sstage * 272 + 256)"
+    row = f"{RT}.lds_f32(md_aux0 + md_sstage * 272 + md_pr4 * 4)"
+    wait = loop.index("cute.arch.cp_async_wait_group(2)")
+    assert loop.index(scalar) < loop.index("md_c0_0_0_0 = ") < wait < loop.index(row)
+    assert "cute.arch.barrier()" not in loop[:wait]
+    assert _aux_side_tile_groups(loop) == [["(md_i + 4) % 5", "(md_i + 4) % 5"]]
+    refill = loop.index("if md_i + 3 < 8:")
     assert (
-        f"{RT}.cp_async_4(md_aux0 + (md_stage + 3) % 4 * 1536 + 0 + md_tidx * 4, "
-        in loop
+        refill
+        < loop.index("if md_i + 4 < 8:")
+        < loop.index("cute.arch.cp_async_commit_group()")
     )
-    assert loop.index("cute.arch.cp_async_wait_group(2)") < loop.index(
-        f"{RT}.lds_f32(md_aux0"
-    )
+    assert f"{RT}.cp_async_16(" in loop[refill : loop.index("if md_i + 4 < 8:")]
     assert not _scalar_global_loads(loop)
     assert _scalar_global_loads(_loop_and_after(register))
     # The aux ring sits behind the operand rings and the staging buffers;
-    # the planner allocates exactly the estimate.
+    # the planner allocates exactly the estimate: the side tile's five
+    # slots and nothing per thread.
     roots = [axis for axis in facts.axes if axis.kind == dag.AXIS_ROOT]
     sizes: dict[int, object] = {
         axis.block_id: 1 for axis in facts.axes if axis.kind == dag.AXIS_LEAD
@@ -9131,18 +9225,108 @@ def test_side_loads_ride_the_aux_ring_with_the_operand_tiles() -> None:
     resolved = [cast("int", facts.block_size(i, sizes)) for i in range(len(facts.axes))]
     plain = dag.mma_dag_smem_estimate(facts, resolved, 4, 4)
     staged = dag.mma_dag_smem_estimate(facts, resolved, 4, 4, aux="ring")
-    assert staged == plain + 4 * 3 * 128 * 4
+    assert staged == plain + 5 * 272
     assert f"alloc_smem(cutlass.Uint8, {plain}, alignment=128)" in register
     assert f"alloc_smem(cutlass.Uint8, {staged}, alignment=128)" in ring
     assert f"md_aux0 = md_s0 + {plain}" in ring
-    # One stage: the iteration's own group carries its words, waited for in
-    # full ahead of the reads.
+    # One stage: the first iteration's tile goes out ahead of the loop in a
+    # group of its own (waited for in full, published), each iteration
+    # issues the next one's with its operand group.
     one = _kernel_body(
         _source(bound, _config(32, 64, warps=4, stages=1, cute_mma_dag_aux="ring"))
     )
-    assert _aux_ring_calls(one) == (3, 3, 1)
-    assert "cute.arch.cp_async_wait_group(0)" in _loop_and_after(one)
-    assert not _scalar_global_loads(_loop_and_after(one))
+    assert _aux_ring_calls(one) == (4, 3, 2)
+    assert _aux_side_tile_groups(one[: one.index("for md_i in")]) == [["0", "0"]]
+    assert (
+        "cute.arch.cp_async_commit_group()\n    cute.arch.cp_async_wait_group(0)\n"
+        "    cute.arch.barrier()\n    for md_i in"
+    ) in one
+    loop = _loop_and_after(one)
+    assert "md_sstage = md_i % 2" in loop
+    assert _aux_side_tile_groups(loop) == [["(md_i + 1) % 2", "(md_i + 1) % 2"]]
+    assert (
+        loop.index("if md_i + 1 < 8:")
+        < loop.index("cute.arch.cp_async_commit_group()")
+        < loop.index("cute.arch.cp_async_wait_group(0)")
+    )
+    assert not _scalar_global_loads(loop)
+
+
+_RCP_LN2 = 1.4426950408889634
+
+
+def _dh_scalar_decay_channel_scale(
+    q: torch.Tensor,
+    do: torch.Tensor,
+    g_last: torch.Tensor,
+    dh_init: torch.Tensor,
+    gc: torch.Tensor,
+    w: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """bwd_dh with the scalar decay plus a loop-invariant per-channel fp32
+    row (``w[idx, tile_d]``) in the carry rescale: the row is hoisted ahead
+    of the chunk loop while the body renders."""
+    BH = q.size(0)
+    N = q.size(1)
+    hl.specialize(q.size(2))
+    D = q.size(3)
+    DV = do.size(3)
+    dh_all = torch.empty([BH, N, D, DV], dtype=dh_init.dtype, device=dh_init.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        dh_acc = dh_init[idx, tile_d, tile_dv].float()
+        for i_t in hl.grid(N):
+            i = N - 1 - i_t
+            dh_all[idx, i, tile_d, tile_dv] = dh_acc.to(dh_all.dtype)
+            g_i = gc[idx, i, :].float()
+            decay = torch.exp2(g_last[idx, i].float() * _RCP_LN2)
+            dh_acc = decay * dh_acc * w[idx, tile_d][:, None]
+            q_i = (
+                q[idx, i, :, tile_d].float()
+                * (scale * torch.exp2(g_i * _RCP_LN2))[:, None]
+            ).to(q.dtype)
+            do_i = do[idx, i, :, tile_dv]
+            dh_acc = hl.dot(q_i.transpose(-2, -1), do_i, acc=dh_acc)
+    return dh_all
+
+
+def test_the_pre_loop_side_tile_wait_follows_the_hoisted_loads() -> None:
+    # The body's loop-invariant per-lane loads (the per-channel row of the
+    # rescale: two ``ldg_f32`` and their base) are hoisted ahead of the loop
+    # -- above the ring prologue -- while the body renders; the pre-loop
+    # wait and barrier for the side tile (read ahead of the iteration wait
+    # by the rescale) are inserted once it has.  They must land right ahead
+    # of the ``for``, behind the prologue's last commit (an index recorded
+    # before the body rendered would put them inside the prologue, ahead of
+    # the commit the wait is for).
+    t = _tensors()
+    w = torch.empty((2, 64), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind_fn(
+        _dh_scalar_decay_channel_scale,
+        (t["k"], t["v"], t["g_last_s"], t["dh_init"], t["gc"], w, 0.125),
+    )
+    for stages in (2, 4):
+        body = _kernel_body(
+            _source(
+                bound, _config(32, 64, warps=4, stages=stages, cute_mma_dag_aux="ring")
+            )
+        )
+        prologue = body[: body.index("for md_i in cutlass.range(")]
+        hoisted = [name for _i, name, _a in _scalar_global_loads(prologue)]
+        assert hoisted == ["md_sl", "md_sl_1"]
+        assert prologue.index("md_sl_1 = ") < prologue.index(f"{RT}.cp_async_4(md_aux0")
+        assert prologue.endswith(
+            "cute.arch.cp_async_commit_group()\n"
+            f"    cute.arch.cp_async_wait_group({stages - 2})\n"
+            "    cute.arch.barrier()\n    "
+        )
+        assert prologue.count("cute.arch.cp_async_wait_group(") == 1
+        assert prologue.count("cute.arch.cp_async_commit_group()") == max(stages - 1, 1)
+        loop = _loop_and_after(body)
+        scalar = f"md_v = {RT}.lds_f32(md_aux0 + md_sstage * 272 + 256)"
+        assert loop.index(scalar) < loop.index("cute.arch.cp_async_wait_group(")
+        assert not _scalar_global_loads(loop)
 
 
 def test_the_aux_knob_is_pinned_without_a_subject() -> None:
@@ -9348,10 +9532,11 @@ def test_a_row_the_ring_slot_would_serve_rides_the_aux_ring_under_ring() -> None
     # full_gla's anchored forward: ``gc_last = gc[idx, i_t, C - 1, tile_d]``
     # is a row of the staged gc tile, so under ``register`` the ring slot
     # serves it behind the iteration barrier (``_ring_aliases``; the carry
-    # rescale runs there), while under ``ring`` it is an fp32 vector the aux
-    # ring copies once per CTA (``AuxRing.shared``) and the lanes read by
-    # coordinate behind the barrier -- never both routes for one load.  No
-    # scalar bf16 cast on either route.
+    # rescale runs there), while under ``ring`` it is an fp32 vector of the
+    # aux ring's side tile (``AuxRing.shared``, issued one group ahead) the
+    # lanes read by coordinate anywhere in the iteration (the rescale at
+    # the top, ahead of the operand wait) -- never both routes for one
+    # load.  No scalar bf16 cast on either route.
     bound = _bind_fwd("anchored", has_h0=True, d=128, dv=128)
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None
@@ -9381,13 +9566,16 @@ def test_a_row_the_ring_slot_would_serve_rides_the_aux_ring_under_ring() -> None
         assert f"{RT}.cp_async_4(" not in register and "md_aux0" not in register
         assert not alias_read.findall(ring)
         assert ring.count(f"{RT}.cp_async_4(") == 1
-        assert ring.count(f"{RT}.lds_f32(md_aux0 + md_stage * 128 + 0 + ") == row_reads
+        assert "if md_i + 4 < 8:\n            if md_tidx < 32:\n" in ring
+        assert ring.count(f"{RT}.lds_f32(md_aux0 + md_sstage * 128 + ") == row_reads
         assert f"{RT}.ldg_f32(" not in ring
         assert not _bf16_casts_of_computed_values(ring)
-        # The rescale reads the shared row: behind the iteration barrier.
+        # The rescale reads the side tile's row at the iteration top, ahead
+        # of the operand wait and the barrier.
         rescale = re.search(r"\n\s+md_c0_0_0_0 = md_v", ring)
         assert rescale is not None
-        assert rescale.start() > ring.index("cute.arch.barrier()")
+        assert rescale.start() < ring.index("cute.arch.cp_async_wait_group(2)")
+        assert rescale.start() < ring.index("cute.arch.barrier()")
         assert ring.count("cute.arch.barrier()") == 2
 
 

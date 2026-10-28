@@ -140,6 +140,7 @@ def test_numeric_extrema_broadcast_native_promotion():
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("minimum", [True, False])
 @pytest.mark.parametrize("mixed", [False, True])
 def test_numeric_tensor_helper_retains_sdk_contract(tmp_path, minimum, mixed):

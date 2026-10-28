@@ -6,6 +6,12 @@ fixed number of physical rows. Their operations and casts are copied unchanged;
 codegen preserves separate FP32 products unless fast math is enabled. The
 consumer sees a fresh dense tensor and an ordinary logical K tile loop.
 
+The accumulator may be seeded before the contraction by additive pointwise
+terms over the output tile (``acc += 2 * grad[m, n] * s[m, n]``); the consumer
+adds those terms after the contraction instead, because the native K-loop
+pipelines start from a zero accumulator.  The direct operand may be a
+transposed input tile (``x[k, m].T``); the consumer keeps the transposed read.
+
 A temporary compiler proves the original program. Shape specialization inserted
 in that proof is also inserted into the owning compiler, so sample sizes never
 stand in for runtime guards. Rejected programs retain their original source.
@@ -25,6 +31,7 @@ import torch
 
 from ... import language as hl
 from ...language import _tracing_ops
+from ...language import creation_ops
 from ...language import memory_ops
 from ...language.matmul_ops import dot
 from ..ast_extension import ExtendedAST
@@ -36,8 +43,9 @@ from ..kernel_compiler import KernelCompiler
 from ..type_info import TensorType
 from ..type_info import TileIndexType
 from ..variable_origin import ArgumentOrigin
-from .collective_matmul import _is_direct_zero_seed
+from .collective_matmul import _loop_entry
 from .cute_mma import _mma_loop_is_exclusive
+from .cute_mma_dag import match_mma_dag
 from .full_slice_matmul import _bound_names
 from .full_slice_matmul import _global_reference
 from .full_slice_matmul import _global_value
@@ -50,6 +58,7 @@ from .materialized_fission import _exact_tile
 from .materialized_fission import _Ineligible
 from .materialized_fission import _is_contiguous_2d
 from .materialized_fission import _require
+from .matmul_utils import strip_new_vars
 from .packed_matmul import interleaved_matrix_terms
 from .packed_matmul import packed_matmul_axis
 from .promote_output_axis import _access_tensor
@@ -67,11 +76,20 @@ if TYPE_CHECKING:
     from torch.fx import Node
 
     from ...runtime.kernel import Kernel
+    from ..device_ir import GraphInfo
     from ..host_function import HostFunction
 
 
 log = logging.getLogger(__name__)
 _PURE_CALLS = (*_ANALYSIS_CALLS, hl.register_block_size, torch.stack)
+# Per-CTA tcgen05 MMA tile limits (one ``tcgen05.mma`` instruction covers at
+# most 128 accumulator rows per CTA and 256 columns).  A fused kernel derives
+# the recipe once per output tile along the axis the recipe does not depend
+# on, so these bound how often it recomputes the operand: see
+# ``_fused_recompute_pays``.
+_TCGEN05_CTA_TILE_M = 128
+_TCGEN05_CTA_TILE_N = 256
+_TRANSPOSES = (torch.ops.aten.permute.default, torch.ops.aten.t.default)
 
 
 @dataclass
@@ -88,6 +106,21 @@ class _Source:
     rhs: ast.expr
     definitions: dict[str, ast.Assign]
     call: ast.Call
+    # Additive rebindings of the accumulator between its zero initialization
+    # and the contraction loop, in program order (``_additive_seed``).
+    seeds: tuple[ast.stmt, ...]
+
+
+@dataclass(frozen=True)
+class _Proof:
+    factor: int
+    dtype: torch.dtype
+    direct_name: str
+    expressions: tuple[ast.expr, ...]
+    captures: tuple[str, ...]
+    side: str
+    # The direct operand is read as ``name[...].T``.
+    transposed: bool
 
 
 def _callee(node: ast.AST, host: HostFunction) -> object:
@@ -141,7 +174,6 @@ def _safe_source(host: HostFunction) -> bool:
             if isinstance(
                 node,
                 (
-                    ast.AugAssign,
                     ast.AnnAssign,
                     ast.Delete,
                     ast.If,
@@ -154,6 +186,13 @@ def _safe_source(host: HostFunction) -> bool:
                     ast.GeneratorExp,
                     ast.NamedExpr,
                 ),
+            ):
+                return False
+            # ``name op= value`` rebinds a local; a subscript or attribute
+            # target would be an in-place tensor write.  ``_source`` admits
+            # the rebinding only as a pre-contraction accumulator seed.
+            if isinstance(node, ast.AugAssign) and not isinstance(
+                node.target, ast.Name
             ):
                 return False
             if isinstance(node, ast.Assign) and any(
@@ -192,6 +231,48 @@ def _safe_source(host: HostFunction) -> bool:
     return True
 
 
+def _additive_seed(statement: ast.stmt, accumulator: str, k: str) -> bool:
+    """``acc += e``, ``acc -= e``, ``acc = acc + e``, ``acc = e + acc`` or
+    ``acc = acc - e`` with ``e`` free of the accumulator and the K loop variable.
+
+    The accumulator starts at zero, so such a statement makes the value
+    entering the contraction ``0 + e`` (``0 - e``); the same statement after
+    the contraction adds ``e`` to the finished sum instead.  Any other
+    rebinding (``acc = acc * 2 + e``, ``acc = e - acc``, ...) would need the
+    accumulator's value at that point and is refused.
+    """
+    if isinstance(statement, ast.AugAssign):
+        target: ast.expr = statement.target
+        additive = isinstance(statement.op, (ast.Add, ast.Sub))
+        operand = statement.value
+    elif (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.value, ast.BinOp)
+    ):
+        target = statement.targets[0]
+        value = statement.value
+        if isinstance(value.left, ast.Name) and value.left.id == accumulator:
+            additive = isinstance(value.op, (ast.Add, ast.Sub))
+            operand = value.right
+        elif isinstance(value.right, ast.Name) and value.right.id == accumulator:
+            additive = isinstance(value.op, ast.Add)
+            operand = value.left
+        else:
+            return False
+    else:
+        return False
+    return (
+        additive
+        and isinstance(target, ast.Name)
+        and target.id == accumulator
+        and not any(
+            isinstance(node, ast.Name) and node.id in (accumulator, k)
+            for node in ast.walk(operand)
+        )
+    )
+
+
 def _source(host: HostFunction) -> _Source:
     roots = [
         (index, node)
@@ -211,12 +292,24 @@ def _source(host: HostFunction) -> _Source:
         and len(root.target.elts) == 2
         and all(isinstance(item, ast.Name) for item in root.target.elts)
         and not root.orelse
-        and len(root.body) == 3,
+        and len(root.body) >= 3,
         "requires a canonical M,N tile and one contraction",
     )
     assert isinstance(root.target, (ast.Tuple, ast.List))
     m, n = (cast("ast.Name", item).id for item in root.target.elts)
-    initial, loop, store = root.body
+    # ``init, seed*, K loop, store``: the seeds are checked once the
+    # accumulator and K names are known.
+    loops = [
+        position
+        for position, statement in enumerate(root.body)
+        if isinstance(statement, ast.For)
+    ]
+    _require(
+        len(loops) == 1 and loops[0] == len(root.body) - 2,
+        "requires one contraction loop followed by the output store",
+    )
+    initial, loop, store = root.body[0], root.body[loops[0]], root.body[-1]
+    seeds = tuple(root.body[1 : loops[0]])
     _require(
         isinstance(initial, ast.Assign)
         and len(initial.targets) == 1
@@ -241,6 +334,11 @@ def _source(host: HostFunction) -> _Source:
     assert isinstance(store.targets[0].value, ast.Name)
     accumulator = initial.targets[0].id
     output = store.targets[0].value.id
+    for statement in seeds:
+        _require(
+            _additive_seed(statement, accumulator, loop.target.id),
+            "pre-contraction statement is not an additive accumulator seed",
+        )
     tail = host.body[index + 1 :]
     _require(
         len(tail) == 1
@@ -318,6 +416,7 @@ def _source(host: HostFunction) -> _Source:
         rhs,
         definitions,
         call,
+        seeds,
     )
 
 
@@ -371,14 +470,39 @@ def _needed_statements(
     return [statement for name, statement in source.definitions.items() if name in seen]
 
 
-def _direct_input_subscript(value: ast.expr, host: HostFunction) -> str | None:
-    """Return the input binding name when ``value`` is a plain ``name[...]`` load."""
+def _direct_input_load(value: ast.expr, host: HostFunction) -> tuple[str, bool] | None:
+    """``(name, transposed)`` when ``value`` is a plain ``name[...]`` load of an
+    input binding or its transpose ``name[...].T``."""
+    transposed = False
+    if isinstance(value, ast.Attribute) and value.attr == "T":
+        value = value.value
+        transposed = True
     if (
         isinstance(value, ast.Subscript)
         and isinstance(value.value, ast.Name)
         and value.value.id in host.params.arguments
     ):
-        return value.value.id
+        return value.value.id, transposed
+    return None
+
+
+def _direct_operand_load(node: Node) -> tuple[Node, bool] | None:
+    """The load behind a direct operand and whether it is read transposed.
+
+    ``name[a, b].T`` traces to a two-dimensional permute (or ``t``) of the
+    load; the consumer keeps that view and the proof flips the K position.
+    """
+    if node.target is memory_ops.load:
+        return node, False
+    if node.target in _TRANSPOSES and isinstance(node.args[0], torch.fx.Node):
+        dims = node.args[1] if len(node.args) > 1 else [1, 0]
+        source = node.args[0]
+        if (
+            isinstance(dims, (list, tuple))
+            and list(dims) == [1, 0]
+            and source.target is memory_ops.load
+        ):
+            return source, True
     return None
 
 
@@ -389,9 +513,9 @@ def _recipe_side(source: _Source, host: HostFunction) -> str:
     materializes an ``[M, K]`` operand reused across the output columns; the
     RHS must then be the direct input load.
     """
-    if _direct_input_subscript(_resolve(source.lhs, source), host) is not None:
+    if _direct_input_load(_resolve(source.lhs, source), host) is not None:
         return "rhs"
-    if _direct_input_subscript(_resolve(source.rhs, source), host) is not None:
+    if _direct_input_load(_resolve(source.rhs, source), host) is not None:
         return "lhs"
     return "rhs"
 
@@ -511,6 +635,135 @@ def _prove_recipe(
     return visited
 
 
+def _prove_seed(
+    graphs: Sequence[GraphInfo],
+    node: Node,
+    acc: Node,
+    *,
+    m: int,
+    n: int,
+    inputs: set[torch.Tensor],
+    env: CompileEnvironment,
+) -> set[Node]:
+    """The accumulator entering the contraction is the K loop's carry of a root
+    value built from one zero tile, pointwise operations and unmasked loads of
+    complete ``[M, N]`` input tiles.
+
+    ``_source`` fixed the statement shape (additive rebindings of the zero
+    accumulator); this proves the dataflow those statements traced, so the
+    consumer may add the same terms after the contraction.  The K loop is this
+    contraction's own loop (checked by the caller), so the carry restarts from
+    the captured value for every output tile.  Returns the seed's root nodes.
+    """
+    current = strip_new_vars(acc)
+    _require(
+        current.op == "placeholder" and current.graph is node.graph,
+        "requires one exclusive FP32 accumulator carried by the K loop",
+    )
+    entry = _loop_entry(graphs, current)
+    _require(entry is not None, "the accumulator is not captured by the K loop")
+    assert entry is not None
+    shape = (env.block_sizes[m].var, env.block_sizes[n].var)
+    visited: set[Node] = set()
+    zeros = 0
+    pending = [entry[1]]
+    while pending:
+        item = pending.pop()
+        if item in visited:
+            continue
+        visited.add(item)
+        value = item.meta.get("val")
+        _require(
+            isinstance(value, torch.Tensor)
+            and tuple(map(sympy.sympify, value.shape)) == shape,
+            "seed changes coordinates or tile shape",
+        )
+        assert isinstance(value, torch.Tensor)
+        if item.target is creation_ops.full:
+            fill = item.args[1]
+            _require(
+                isinstance(fill, (int, float))
+                and not isinstance(fill, bool)
+                and fill == 0
+                and value.dtype == torch.float32,
+                "requires a local zero accumulator seed",
+            )
+            zeros += 1
+            continue
+        if item.target is memory_ops.load:
+            tensor = _access_tensor(item)
+            indices = item.args[1]
+            _require(
+                tensor in inputs
+                and isinstance(indices, (tuple, list))
+                and len(indices) == 2
+                and _exact_tile(indices[0], m, env)
+                and _exact_tile(indices[1], n, env)
+                and len(item.args) == 4
+                and item.args[2] is None
+                and item.args[3] is None,
+                "seed load is not a canonical read-only M,N tile",
+            )
+            continue
+        target = item.target
+        _require(
+            item.op == "call_function"
+            and isinstance(target, torch._ops.OpOverload)
+            and torch.Tag.pointwise in target.tags
+            and _ordinary_operation(item),
+            "seed contains a reduction, gather or opaque operation",
+        )
+        pending.extend(item.all_input_nodes)
+    _require(zeros == 1, "requires a local zero accumulator seed")
+    return visited
+
+
+def _fused_recompute_pays(
+    host: HostFunction,
+    recipe_nodes: set[Node],
+    *,
+    reused_extent: int,
+    reused_tile: int,
+    operand_dtype: torch.dtype,
+) -> bool:
+    """Whether the fused GEMM derives its operand expensively enough for a
+    producer launch plus an operand round trip to pay off.
+
+    A fused tcgen05 kernel stages every source tile of the recipe beside the
+    plain operand and derives the operand tile on chip, in every CTA of the
+    output axis the recipe does not depend on.  Relative to the plain GEMM the
+    consumer runs, that costs
+
+    * traffic = sum of the distinct source tensors' element bytes / the
+      operand's element bytes (the extra operand-path bytes per element), and
+    * R = extent of the reused output axis / the per-CTA MMA tile along it
+      (how many times each operand element is derived).
+
+    Materialize when both are at least 2: a one-tensor same-width recipe or a
+    reused axis the MMA tile covers twice keeps its single launch.  The gate
+    compares against the fused derived-operand lowering (``cute_mma_dag``), so
+    it applies when that lowering's config-free matcher admits the program
+    (a floating recipe over the operand path); integer casts and bitfield
+    unpacks have no fused native operand path and keep the admission above
+    (``_fused_register_mma_admitted`` covers their register-MMA regime).
+    ``host`` is the planner's temporary compile of the unfissioned program,
+    whose shapes the planner specialized; the fused program only has them
+    when the kernel is static, so the gate is honored for static kernels
+    alone (the matcher refuses the fused dynamic program's symbolic tiles).
+    """
+    env = CompileEnvironment.current()
+    if not env.settings.static_shapes or match_mma_dag(host.device_ir.graphs) is None:
+        return True
+    sources: set[torch.Tensor] = set()
+    for item in recipe_nodes:
+        if item.target is memory_ops.load:
+            tensor = _access_tensor(item)
+            assert tensor is not None
+            sources.add(tensor)
+    traffic = sum(tensor.element_size() for tensor in sources) / operand_dtype.itemsize
+    return traffic >= 2 and reused_extent >= 2 * reused_tile
+
+
 def _strip_zero_padding(node: Node) -> tuple[Node, set[Node]]:
     """A dense materialization reload supplies the same out-of-domain zeros."""
     masks: set[Node] = set()
@@ -529,9 +782,7 @@ def _strip_zero_padding(node: Node) -> tuple[Node, set[Node]]:
     return node, masks
 
 
-def _prove(
-    host: HostFunction, source: _Source, env: CompileEnvironment
-) -> tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...], str]:
+def _prove(host: HostFunction, source: _Source, env: CompileEnvironment) -> _Proof:
     ir = host.device_ir
     _require(len(ir.root_ids) == 1 and len(ir.graphs) == 2, "unexpected nested graphs")
     root_axes = _indices(source.root)
@@ -568,38 +819,48 @@ def _prove(
     assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
     assert isinstance(acc, torch.fx.Node)
     _require(
-        _is_direct_zero_seed(ir.graphs, node, acc, k_id)
-        and _mma_loop_is_exclusive(node)
-        and acc.meta["val"].dtype == torch.float32,
-        "requires one exclusive FP32 accumulator with a local zero seed",
+        _mma_loop_is_exclusive(node) and acc.meta["val"].dtype == torch.float32,
+        "requires one exclusive FP32 accumulator",
     )
     loop_graph = next(graph for graph in ir.graphs if graph.graph is node.graph)
     _require(
         isinstance(loop_graph, ForLoopGraphInfo) and loop_graph.block_ids == [k_id],
         "contraction is not owned by the canonical K loop",
     )
+    inputs = {
+        value
+        for value in host.params.arguments.values()
+        if isinstance(value, torch.Tensor)
+    }
+    seed_nodes = _prove_seed(
+        ir.graphs, node, acc, m=m_id, n=n_id, inputs=inputs, env=env
+    )
     a, b = lhs.meta["val"], rhs.meta["val"]
     side = _recipe_side(source, host)
     # ``direct`` is the operand that stays a plain input load; ``recipe`` is
     # the operand that is materialized.  An RHS recipe is reused across the
     # output rows (M), an LHS recipe across the output columns (N).
-    direct, recipe_root = (lhs, rhs) if side == "rhs" else (rhs, lhs)
+    direct_root, recipe_root = (lhs, rhs) if side == "rhs" else (rhs, lhs)
     direct_expr = source.lhs if side == "rhs" else source.rhs
+    direct_load = _direct_operand_load(direct_root)
     _require(
         isinstance(a, torch.Tensor)
         and isinstance(b, torch.Tensor)
         and a.ndim == b.ndim == 2
         and a.dtype == b.dtype
         and a.dtype in (torch.float16, torch.bfloat16)
-        and direct.target is memory_ops.load,
+        and direct_load is not None,
         "requires one direct half/BF16 operand and a matching recipe",
     )
-    a_name = _direct_input_subscript(_resolve(direct_expr, source), host)
+    assert direct_load is not None
+    direct, transposed = direct_load
+    named = _direct_input_load(_resolve(direct_expr, source), host)
     _require(
-        a_name is not None,
+        named is not None and named[1] == transposed,
         "the direct operand must load from an unchanged input binding",
     )
-    assert a_name is not None
+    assert named is not None
+    a_name = named[0]
     a_tensor = _access_tensor(direct)
     _require(
         a_tensor is host.params.arguments[a_name] and _is_contiguous_2d(a_tensor, env),
@@ -609,6 +870,12 @@ def _prove(
     recipe, padding = _strip_zero_padding(recipe_root)
     packed = packed_matmul_axis(env, lhs, recipe) if side == "rhs" else None
     factor = packed.factor if packed is not None else 1
+    # A direct A operand reads ``[M, K]`` (K in position 1), a direct B operand
+    # ``[K, N]``; a transposed read swaps the two positions.
+    direct_k_position = 1 if side == "rhs" else 0
+    if transposed:
+        direct_k_position = 1 - direct_k_position
+    direct_outer_position = 1 - direct_k_position
     if packed is not None:
         _require(packed.block_id == k_id, "packed K does not own the contraction")
         terms = interleaved_matrix_terms(recipe, lhs=False)
@@ -636,7 +903,6 @@ def _prove(
         expressions = tuple(stack.args[0].elts)
     else:
         indices = direct.args[1]
-        direct_k_position = 1 if side == "rhs" else 0
         _require(
             isinstance(indices, (list, tuple))
             and len(indices) == 2
@@ -647,7 +913,6 @@ def _prove(
         expressions = (source.rhs if side == "rhs" else source.lhs,)
     indices = direct.args[1]
     direct_outer_id = m_id if side == "rhs" else n_id
-    direct_outer_position = 0 if side == "rhs" else 1
     _require(
         isinstance(indices, (list, tuple))
         and len(indices) == 2
@@ -658,26 +923,18 @@ def _prove(
         _static(cast("int | torch.SymInt", env.block_sizes[axis].size), env)
         for axis in (m_id, n_id, k_id)
     ]
-    if side == "rhs":
-        direct_shape_ok = (
-            _static(a_tensor.shape[0], env) == extents[0]
-            and _static(a_tensor.shape[1], env) == cast("int", extents[2]) * factor
-        )
-    else:
-        direct_shape_ok = (
-            _static(a_tensor.shape[0], env) == extents[2]
-            and _static(a_tensor.shape[1], env) == extents[1]
-        )
     _require(
-        all(extent is not None and extent > 0 for extent in extents)
-        and direct_shape_ok,
+        all(extent is not None and extent > 0 for extent in extents),
         "guarded matrix extents do not cover the complete logical K domain",
     )
-    inputs = {
-        value
-        for value in host.params.arguments.values()
-        if isinstance(value, torch.Tensor)
-    }
+    m_extent, n_extent, k_extent = (cast("int", extent) for extent in extents)
+    direct_outer_extent = m_extent if side == "rhs" else n_extent
+    direct_k_extent = k_extent * factor if side == "rhs" else k_extent
+    _require(
+        _static(a_tensor.shape[direct_outer_position], env) == direct_outer_extent
+        and _static(a_tensor.shape[direct_k_position], env) == direct_k_extent,
+        "guarded matrix extents do not cover the complete logical K domain",
+    )
     assert terms is not None
     if side == "rhs":
         recipe_nodes = _prove_recipe(terms, k=k_id, n=n_id, inputs=inputs, env=env)
@@ -688,6 +945,17 @@ def _prove(
         "direct operands are already materialized",
     )
     _needed_statements(expressions, source, forbidden=_recipe_forbidden(source, side))
+    _require(
+        _fused_recompute_pays(
+            host,
+            recipe_nodes,
+            reused_extent=m_extent if side == "rhs" else n_extent,
+            reused_tile=_TCGEN05_CTA_TILE_M if side == "rhs" else _TCGEN05_CTA_TILE_N,
+            operand_dtype=a.dtype,
+        ),
+        "the fused GEMM derives its operand from one same-width source or "
+        "recomputes it fewer than twice per element",
+    )
     recipe_nodes.update(padding)
     stores = [
         item
@@ -715,15 +983,16 @@ def _prove(
         and len(store_indices) == 2
         and _exact_tile(store_indices[0], m_id, env)
         and _exact_tile(store_indices[1], n_id, env)
-        and _static(output.shape[0], env) == extents[0]
-        and _static(output.shape[1], env) == extents[1],
+        and _static(output.shape[0], env) == m_extent
+        and _static(output.shape[1], env) == n_extent,
         "output grid does not overwrite every element exactly once",
     )
     for graph in ir.graphs:
         for item in graph.graph.nodes:
             if item.target is memory_ops.load:
                 _require(
-                    item is direct or item in recipe_nodes, "unexpected memory read"
+                    item is direct or item in recipe_nodes or item in seed_nodes,
+                    "unexpected memory read",
                 )
             _require(
                 item is node or item in recipe_nodes or _ordinary_operation(item),
@@ -744,7 +1013,38 @@ def _prove(
             )
             captures.append(cast("ast.Name", statement.targets[0]).id)
     _require(source.output in captures, "output is not captured by its original name")
-    return factor, b.dtype, a_name, expressions, tuple(captures), side
+    return _Proof(
+        factor, b.dtype, a_name, expressions, tuple(captures), side, transposed
+    )
+
+
+def _epilogue_seed(statement: ast.stmt, accumulator: str) -> ast.stmt:
+    """The consumer's copy of a pre-contraction seed, placed after the loop.
+
+    ``acc += e`` becomes ``acc = acc + e`` (the form the tracer gives both);
+    an ``Assign`` seed is copied as is.  The accumulator now holds the finished
+    sum, so the statement adds the seed to it: the fp32 sum is reassociated
+    (``sum + e`` instead of ``(e + p_0) + p_1 ...``), nothing is approximated.
+    """
+    if isinstance(statement, ast.AugAssign):
+        operator = "+" if isinstance(statement.op, ast.Add) else "-"
+        return statement_from_string(
+            f"{accumulator} = {accumulator} {operator} {{value}}",
+            value=_clone_untyped(statement.value),
+        )
+    return cast("ast.stmt", _clone_untyped(statement))
+
+
+def _consumer_body(
+    consumer: ast.For, contraction: ast.For, source: _Source
+) -> list[ast.stmt]:
+    """``init, contraction over the materialized operand, seed*, store``."""
+    return [
+        consumer.body[0],
+        contraction,
+        *(_epilogue_seed(seed, source.accumulator) for seed in source.seeds),
+        consumer.body[-1],
+    ]
 
 
 def _replacement(
@@ -752,20 +1052,14 @@ def _replacement(
     source: _Source,
     original_body: list[ast.stmt],
     specializations: list[ast.stmt],
-    proof: tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...], str],
+    proof: _Proof,
 ) -> MaterializedFissionPlan:
-    factor, dtype, a_name, expressions, captures, side = proof
-    if side == "lhs":
-        return _replacement_lhs(
-            host,
-            source,
-            original_body,
-            specializations,
-            dtype,
-            a_name,
-            expressions,
-            captures,
-        )
+    if proof.side == "lhs":
+        return _replacement_lhs(host, source, original_body, specializations, proof)
+    factor, dtype, a_name = proof.factor, proof.dtype, proof.direct_name
+    expressions, captures = proof.expressions, proof.captures
+    # The direct A operand is ``a[m, k]`` or ``a[k, m].T``.
+    k_dim = 0 if proof.transposed else 1
     used = _bound_names(host) | set(host.fn.__globals__)
 
     def fresh(name: str) -> str:
@@ -790,7 +1084,7 @@ def _replacement(
         assert isinstance(source.root.iter.args[0], (ast.Tuple, ast.List))
         n_bound = source.root.iter.args[0].elts[1]
         allocation = statement_from_string(
-            f"{matrix} = {{empty}}(({a_name}.size(1), {{n}}), "
+            f"{matrix} = {{empty}}(({a_name}.size({k_dim}), {{n}}), "
             f"dtype={{dtype}}, device={a_name}.device)",
             empty=empty,
             n=n_bound,
@@ -840,7 +1134,12 @@ def _replacement(
         update = cast("ast.Assign", _clone_untyped(original_update))
         assert isinstance(update.value, ast.Call)
         load_a = cast(
-            "ast.expr", expr_from_string(f"{a_name}[{source.m}, {logical_k}]")
+            "ast.expr",
+            expr_from_string(
+                f"{a_name}[{logical_k}, {source.m}].T"
+                if proof.transposed
+                else f"{a_name}[{source.m}, {logical_k}]"
+            ),
         )
         load_b = cast(
             "ast.expr", expr_from_string(f"{matrix}[{logical_k}, {source.n}]")
@@ -850,11 +1149,12 @@ def _replacement(
         else:
             update.value.args[1:] = [load_a, load_b]
         contraction = statement_from_string(
-            f"for {logical_k} in {{tile}}({a_name}.size(1)):\n    pass", tile=tile
+            f"for {logical_k} in {{tile}}({a_name}.size({k_dim})):\n    pass",
+            tile=tile,
         )
         assert isinstance(contraction, ast.For)
         contraction.body = [update]
-        consumer.body[1] = contraction
+        consumer.body = _consumer_body(consumer, contraction, source)
         prefix = _rewritten_prefix(host, source, original_body)
         replacement_body = (
             *specializations,
@@ -914,17 +1214,18 @@ def _replacement_lhs(
     source: _Source,
     original_body: list[ast.stmt],
     specializations: list[ast.stmt],
-    dtype: torch.dtype,
-    b_name: str,
-    expressions: tuple[ast.expr, ...],
-    captures: tuple[str, ...],
+    proof: _Proof,
 ) -> MaterializedFissionPlan:
     """Materialize an ``[M, K]`` LHS recipe reused across the output columns.
 
     The producer tiles ``[M, K]`` and stores the recipe; the consumer keeps the
-    original ``[M, N]`` grid and contracts ``matrix[m, k] @ b[k, n]`` over the
-    direct RHS input's leading extent.
+    original ``[M, N]`` grid and contracts ``matrix[m, k] @ b[k, n]`` (or
+    ``matrix[m, k] @ b[n, k].T``) over the direct RHS input's K extent.
     """
+    dtype, b_name = proof.dtype, proof.direct_name
+    expressions, captures = proof.expressions, proof.captures
+    # The direct B operand is ``b[k, n]`` or ``b[n, k].T``.
+    k_dim = 1 if proof.transposed else 0
     used = _bound_names(host) | set(host.fn.__globals__)
 
     def fresh(name: str) -> str:
@@ -947,7 +1248,7 @@ def _replacement_lhs(
         assert isinstance(source.root.iter.args[0], (ast.Tuple, ast.List))
         m_bound = source.root.iter.args[0].elts[0]
         allocation = statement_from_string(
-            f"{matrix} = {{empty}}(({{m}}, {b_name}.size(0)), "
+            f"{matrix} = {{empty}}(({{m}}, {b_name}.size({k_dim})), "
             f"dtype={{dtype}}, device={b_name}.device)",
             empty=empty,
             m=m_bound,
@@ -992,18 +1293,24 @@ def _replacement_lhs(
             "ast.expr", expr_from_string(f"{matrix}[{source.m}, {logical_k}]")
         )
         load_b = cast(
-            "ast.expr", expr_from_string(f"{b_name}[{logical_k}, {source.n}]")
+            "ast.expr",
+            expr_from_string(
+                f"{b_name}[{source.n}, {logical_k}].T"
+                if proof.transposed
+                else f"{b_name}[{logical_k}, {source.n}]"
+            ),
         )
         if _callee(source.call.func, host) is hl.dot:
             update.value.args = [load_a, load_b]
         else:
             update.value.args[1:] = [load_a, load_b]
         contraction = statement_from_string(
-            f"for {logical_k} in {{tile}}({b_name}.size(0)):\n    pass", tile=tile
+            f"for {logical_k} in {{tile}}({b_name}.size({k_dim})):\n    pass",
+            tile=tile,
         )
         assert isinstance(contraction, ast.For)
         contraction.body = [update]
-        consumer.body[1] = contraction
+        consumer.body = _consumer_body(consumer, contraction, source)
         prefix = _rewritten_prefix(host, source, original_body)
         replacement_body = (
             *specializations,

@@ -606,6 +606,7 @@ def _specialized_mma_root_threads_support_impl(
     root_n_threads: int,
     root_m_threads_explicit: bool,
     root_n_threads_explicit: bool,
+    epi_warp_groups: int = 1,
 ) -> bool:
     from .cute_mma import _mma_active_n_threads
     from .cute_mma import _tcgen05_root_m_threads
@@ -627,7 +628,9 @@ def _specialized_mma_root_threads_support_impl(
         else:
             m_threads_supported = physical_m_threads <= root_m_threads <= bm
         if root_n_threads_explicit:
-            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(bn)
+            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(
+                bn, epi_warp_groups=epi_warp_groups
+            )
         else:
             n_threads_supported = (
                 _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
@@ -708,6 +711,8 @@ def _detect_grouped_rank3_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
+    from .cute_mma import _tcgen05_epi_warp_groups
+
     if not _specialized_mma_root_threads_support_impl(
         "tcgen05",
         bm=bm,
@@ -716,6 +721,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
         root_n_threads=root_n_threads,
         root_m_threads_explicit=root_m_threads_explicit,
         root_n_threads_explicit=root_n_threads_explicit,
+        epi_warp_groups=_tcgen05_epi_warp_groups(config),
     ):
         return False
 
@@ -749,6 +755,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -895,6 +902,7 @@ def _detect_specialized_mma_loop(
             root_n_threads=root_n_threads,
             root_m_threads_explicit=root_m_threads_explicit,
             root_n_threads_explicit=root_n_threads_explicit,
+            epi_warp_groups=_tcgen05_epi_warp_groups(config),
         ):
             if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
@@ -1807,6 +1815,10 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
+        if config_spec is not None and config_spec.cute_register_subblocks is not None:
+            # The register sub-block family is admitted: keep the random
+            # half of the population mostly in-family.
+            priors["cute_register_subblocks"] = weighted_choice({"on": 3.0, "off": 1.0})
         if config_spec is not None and config_spec.cute_mma_dag is not None:
             # The warp-MMA recurrence owner is admitted: keep the random half
             # of the population mostly in-family (tensor-memory mode first
@@ -2041,6 +2053,13 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        from .cute_register_subblocks import plan_register_subblocks
+
+        device_function.cute_state.register_subblocks_plan = plan_register_subblocks(
+            graphs, config
+        )
+        if device_function.cute_state.register_subblocks_plan is not None:
+            return
         plan_block_scaled(graphs)
         if DeviceFunction.current().cute_state.block_scaled_plan is not None:
             return
@@ -2232,6 +2251,12 @@ class CuteBackend(Backend):
             or key == "cute_tiles_per_block"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
+            or key == "cute_register_subblocks"
+            or key == "cute_register_subblocks_warps"
+            or key == "cute_register_subblocks_prefetch"
+            or key == "cute_register_subblocks_mask"
+            or key == "cute_register_subblocks_colside"
+            or key == "cute_register_subblocks_roll"
             or key
             in (
                 "cute_topk_lanes_per_row",
@@ -4507,9 +4532,21 @@ class CuteBackend(Backend):
                 else 0
             )
 
+            # ``cute_tiles_per_block``: the packed grid axis is a thread axis
+            # of extent ``pack`` even when the body never distributes over it
+            # (``PerThreadNDTileStrategy`` reactivates it); budget it here.
+            packed_block_id = None
+            if self.name == "cute":
+                from .tile_packing import packed_grid_block
+
+                packed = packed_grid_block(env, config)
+                packed_block_id = None if packed is None else packed[0]
+
             def uses_thread_axis_for(
                 block_id: int, block_size: object, num_threads: int
             ) -> bool:
+                if block_id == packed_block_id:
+                    return True
                 if (
                     block_id in inactive_block_ids
                     or block_id in inactive_grid_block_ids
@@ -4680,6 +4717,7 @@ class CuteBackend(Backend):
                     specialized_mma_plan is not None
                     and specialized_mma_plan.impl == "tcgen05"
                 ):
+                    from .cute_mma import _tcgen05_epi_warp_groups
                     from .cute_mma import _tcgen05_root_m_threads
                     from .cute_mma import _tcgen05_root_n_threads
 
@@ -4704,7 +4742,10 @@ class CuteBackend(Backend):
                         else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        _tcgen05_root_n_threads(int(n_block_size))
+                        _tcgen05_root_n_threads(
+                            int(n_block_size),
+                            epi_warp_groups=_tcgen05_epi_warp_groups(config),
+                        )
                         if original_num_threads_config[n_axis] == 0
                         and isinstance(n_block_size, int)
                         else num_threads_config[n_axis]

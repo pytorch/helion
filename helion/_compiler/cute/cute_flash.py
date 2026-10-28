@@ -2060,6 +2060,44 @@ def flash_attention_graph_standard_dense_output_from_graphs(
     )
 
 
+def flash_attention_graph_dense_lse_output_from_graphs(
+    graphs: Iterable[GraphInfo],
+    *,
+    root_block_ids: Sequence[int] | None = None,
+    kv_block_id: int | None = None,
+    score_plan: AttentionScorePlan,
+) -> bool:
+    """Return whether the graph is dense attention whose epilogue is the
+    output ``O`` plus the LSE row vector and nothing else.
+
+    The LSE sibling of ``flash_attention_graph_standard_dense_output_from_graphs``
+    for the kernels that also return ``m + log(l)`` (the plan's validated log
+    base): a dense score plan (no modifiers), no bias / ALiBi / document
+    gather, no fused row program on ``O``.  Unlike the output-only fact it does
+    not ask for the standard softmax scale: the lowerings it admits (the
+    resident value graph) take the scale as a runtime operand of the exp2
+    pass exactly as the standard pass does, so a kernel that applies its scale
+    as a scalar argument (the flex kernel) qualifies.  Anything beyond
+    ``out + lse`` keeps them off.
+    """
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
+    )
+    return bool(
+        graph_plan is not None
+        and graph_plan.lse_name is not None
+        and graph_plan.output_epilogue == _FLASH_OUTPUT_EPILOGUE_IDENTITY
+        and not graph_plan.bias_names
+        and not graph_plan.alibi_names
+        and not graph_plan.document_names
+        and not score_plan.modifiers
+        and not score_plan.has_list_walk
+    )
+
+
 def flash_attention_graph_row_epilogue_from_graphs(
     graphs: Iterable[GraphInfo],
     *,
@@ -4735,6 +4773,7 @@ def resolve_flash_config(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    dense_lse_output: bool = False,
     standard_causal_output: bool = False,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -5067,12 +5106,13 @@ def resolve_flash_config(
             fa4=topology == "fa4" and not has_row_epilogue,
             dtype=dtype,
             standard_dense_output=standard_dense_output,
+            dense_lse_output=dense_lse_output,
         )
         and not variable_trip_count
     ):
         raise InvalidConfig(
             "cute_flash_softmax_lowering='resident_value_graph' requires "
-            "FP16/BF16 dense output on an FA4 pipeline"
+            "FP16/BF16 dense output (optionally with the LSE row) on an FA4 pipeline"
         )
     explicit_stateful = softmax_lowering == "resident_stateful"
     if explicit_stateful and not _flash_causal_stateful_workload_supported(
@@ -8181,12 +8221,27 @@ def flash_flex_aux_smem_choices(candidates: Sequence[int]) -> tuple[int, ...]:
 
 
 def _flash_dense_resident_workload_supported(
-    *, fa4: bool, dtype: torch.dtype, standard_dense_output: bool
+    *,
+    fa4: bool,
+    dtype: torch.dtype,
+    standard_dense_output: bool,
+    dense_lse_output: bool = False,
 ) -> bool:
     # The helper keeps FP32 scores and packs P using the 16-bit I/O dtype.
     # Head width, KV count and persistence do not alter its score-row layout
-    # or the surrounding single-slot protocol.
-    return fa4 and _flash_supported_io_dtype(dtype) and standard_dense_output
+    # or the surrounding single-slot protocol.  Its epilogue needs are the
+    # standard body's: the final row statistics stay in the softmax warps'
+    # registers, so the LSE row (``m * scale + log2(l)``) is stored from
+    # them after the row-sum publish exactly as the standard lowering does;
+    # the dense surface with an LSE output is admitted alongside the
+    # output-only one.  A fused row program or any other epilogue tensor
+    # (``has_row_epilogue``, bias / document gathers) is not a dense surface
+    # of either kind.
+    return (
+        fa4
+        and _flash_supported_io_dtype(dtype)
+        and (standard_dense_output or dense_lse_output)
+    )
 
 
 def _flash_causal_stateful_workload_supported(
@@ -8692,6 +8747,7 @@ def _flash_seed_values(
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_dense_output: bool,
+    dense_lse_output: bool = False,
     standard_causal_output: bool,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -8719,6 +8775,7 @@ def _flash_seed_values(
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         standard_causal_output=standard_causal_output,
         tmem_rowmax_compatible=tmem_rowmax_compatible,
         causal_resident_compatible=causal_resident_compatible,
@@ -9442,6 +9499,7 @@ def _flash_target_seed_configs(
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_dense_output: bool,
+    dense_lse_output: bool = False,
     standard_causal_output: bool,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -9488,7 +9546,12 @@ def _flash_target_seed_configs(
         "flex_trivial_walk": flex_trivial_walk,
     }
     families = _flash_legal_autotune_pipeline_families(
-        head_dim, num_kv, output_requires_tma=False, requested_family=None, **common
+        head_dim,
+        num_kv,
+        output_requires_tma=False,
+        requested_family=None,
+        dense_lse_output=dense_lse_output,
+        **common,
     )
     templates = _flash_target_seed_templates(
         head_dim,
@@ -9779,6 +9842,7 @@ class _FlashSeedFacts(TypedDict):
     requires_ws_overlap: bool
     small_biased_candidate: bool
     standard_dense_output: bool
+    dense_lse_output: bool
     standard_causal_output: bool
     tmem_rowmax_compatible: bool | None
     causal_resident_compatible: bool
@@ -9808,6 +9872,7 @@ def flash_attention_seed_configs(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    dense_lse_output: bool = False,
     standard_causal_output: bool = False,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -9872,6 +9937,7 @@ def flash_attention_seed_configs(
         "requires_ws_overlap": requires_ws_overlap,
         "small_biased_candidate": small_biased_candidate,
         "standard_dense_output": standard_dense_output,
+        "dense_lse_output": dense_lse_output,
         "standard_causal_output": standard_causal_output,
         "tmem_rowmax_compatible": tmem_rowmax_compatible,
         "causal_resident_compatible": causal_resident_compatible,
@@ -10555,6 +10621,69 @@ def flash_attention_seed_configs(
                 if hybrid_seed not in seeds:
                     seeds.append(hybrid_seed)
 
+    # The two-tile fa4 body of the dense hd128 shapes (half the K/V traffic
+    # of the single-tile alternating body, so the cheaper one under a power
+    # cap): the fa4 xu seed above with the serial PASS2 (disc_pipe 1), the
+    # whole-row sum and the softmax lowering the surface offers, the resident
+    # value graph on a dense FP16/BF16 surface (output only, or out + lse),
+    # auto where the surface has neither fact.
+    if (
+        head_dim == 128
+        and not is_causal
+        and not has_kv_tile_pruning
+        and not has_list_walk
+        and _flash_supported_io_dtype(dtype)
+        and "fa4" in families
+    ):
+        two_tile_fragments = flash_autotune_fragments(
+            head_dim,
+            num_kv,
+            pipeline_family_override="fa4",
+            **common,
+            **fragment_facts,
+        )
+        two_tile_lowering_fragment = two_tile_fragments[FLASH_SOFTMAX_LOWERING_KEY]
+        assert isinstance(two_tile_lowering_fragment, EnumFragment)
+        two_tile_lowering = (
+            "resident_value_graph"
+            if "resident_value_graph" in two_tile_lowering_fragment._active_choices()
+            else "auto"
+        )
+        two_tile_values = {
+            key: fragment.default() for key, fragment in two_tile_fragments.items()
+        }
+        if _flash_seed_set_all(
+            two_tile_values,
+            two_tile_fragments,
+            {
+                FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                FLASH_SOFTMAX_LOWERING_KEY: two_tile_lowering,
+                FLASH_E2E_SCHEDULE_KEY: "xu",
+                FLASH_E2E_OFFSET_KEY: 0,
+                FLASH_E2E_OFFSET0_KEY: 0,
+                FLASH_EXP2_PACKET_KEY: "1x1",
+                FLASH_STAT_TRANSPORT_KEY: "single",
+                FLASH_SOFTMAX_DISC_KEY: False,
+                FLASH_DISC_PIPE_KEY: 1,
+                FLASH_SPLIT_P_ARRIVE_KEY: True,
+                FLASH_SP_ROW_SUM_KEY: "whole",
+                FLASH_KV_STAGE_KEY: 3,
+                FLASH_SOFTMAX_REGS_KEY: 200,
+                FLASH_CORR_REGS_KEY: 64,
+                FLASH_OTHER_REGS_KEY: 48,
+                FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+                FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+                FLASH_CORR_TILE_SIZE_KEY: 16,
+                FLASH_ROW_EPILOGUE_WARPS_KEY: "softmax",
+                FLASH_EPI_TMA_KEY: True,
+                FLASH_EPI_STG_KEY: False,
+                FLASH_WAIT_HINT_KEY: 10_000_000,
+            },
+        ):
+            two_tile_seed = _flash_config_with_values(block_sizes, two_tile_values)
+            if two_tile_seed not in seeds:
+                seeds.append(two_tile_seed)
+
     # Seed each emitter-level policy once so quick tuning cannot miss a source
     # variant merely because it is conditionally active with another field.
     source_variants: tuple[tuple[str, object, Mapping[str, object]], ...] = (
@@ -11102,6 +11231,7 @@ def flash_attention_seed_configs(
                 requires_ws_overlap=requires_ws_overlap,
                 small_biased_candidate=small_biased_candidate,
                 standard_dense_output=standard_dense_output,
+                dense_lse_output=dense_lse_output,
                 standard_causal_output=standard_causal_output,
                 tmem_rowmax_compatible=tmem_rowmax_compatible,
                 causal_resident_compatible=causal_resident_compatible,
@@ -11232,6 +11362,7 @@ def _flash_legal_autotune_pipeline_families(
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_dense_output: bool,
+    dense_lse_output: bool = False,
     standard_causal_output: bool,
     output_requires_tma: bool,
     supports_tensor_4d_tma: bool,
@@ -11311,6 +11442,7 @@ def _flash_legal_autotune_pipeline_families(
             requires_ws_overlap=requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
             standard_dense_output=standard_dense_output,
+            dense_lse_output=dense_lse_output,
             standard_causal_output=standard_causal_output,
             supports_tensor_4d_tma=supports_tensor_4d_tma,
             plain_row_body=plain_row_body,
@@ -11344,6 +11476,7 @@ def _flash_ws_knob_probe(
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_dense_output: bool,
+    dense_lse_output: bool = False,
     standard_causal_output: bool,
     tmem_rowmax_compatible: bool | None,
     causal_resident_compatible: bool,
@@ -11372,6 +11505,7 @@ def _flash_ws_knob_probe(
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         standard_causal_output=standard_causal_output,
         tmem_rowmax_compatible=tmem_rowmax_compatible,
         causal_resident_compatible=causal_resident_compatible,
@@ -11399,6 +11533,7 @@ def flash_autotune_fragments(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    dense_lse_output: bool = False,
     standard_causal_output: bool = False,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -11520,6 +11655,7 @@ def flash_autotune_fragments(
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         standard_causal_output=standard_causal_output,
         tmem_rowmax_compatible=tmem_rowmax_compatible,
         causal_resident_compatible=causal_resident_compatible,
@@ -11714,6 +11850,7 @@ def flash_autotune_fragments(
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         standard_causal_output=standard_causal_output,
         output_requires_tma=output_requires_tma,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
@@ -12772,6 +12909,7 @@ def flash_autotune_fragments(
                 requires_ws_overlap=requires_ws_overlap,
                 small_biased_candidate=small_biased_candidate,
                 standard_dense_output=standard_dense_output,
+                dense_lse_output=dense_lse_output,
                 standard_causal_output=standard_causal_output,
                 tmem_rowmax_compatible=tmem_rowmax_compatible,
                 causal_resident_compatible=causal_resident_compatible,
@@ -12982,6 +13120,7 @@ def flash_autotune_fragments(
             requires_ws_overlap=requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
             standard_dense_output=standard_dense_output,
+            dense_lse_output=dense_lse_output,
             standard_causal_output=standard_causal_output,
             tmem_rowmax_compatible=tmem_rowmax_compatible,
             causal_resident_compatible=causal_resident_compatible,
@@ -13135,6 +13274,8 @@ def flash_autotune_fragments(
                 dtype=dtype,
                 # The dense value graph has no per-work-item KV interval.
                 standard_dense_output=standard_dense_output
+                and not (is_causal or has_kv_tile_pruning),
+                dense_lse_output=dense_lse_output
                 and not (is_causal or has_kv_tile_pruning),
             )
             else ("auto", "standard", "resident_stateful")
@@ -13346,6 +13487,7 @@ def flash_config_from_config(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    dense_lse_output: bool = False,
     standard_causal_output: bool = False,
     tmem_rowmax_compatible: bool | None = None,
     causal_resident_compatible: bool = False,
@@ -13380,6 +13522,7 @@ def flash_config_from_config(
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        dense_lse_output=dense_lse_output,
         standard_causal_output=standard_causal_output,
         tmem_rowmax_compatible=tmem_rowmax_compatible,
         causal_resident_compatible=causal_resident_compatible,
@@ -20041,7 +20184,10 @@ def emit_flash_fa4_device_body(
         # The full-row load/P-store views and acknowledged statistics graph are
         # shared by all FA4 families, including their persistent wrappers. The
         # helper changes only the per-KV value graph inside that protocol.
-        assert not is_causal and not has_lse
+        # The LSE output needs nothing of it: the final row max and the row
+        # sum the helper returns are the registers the row-sum publish and
+        # the LSE store after it read (``corr_publish_rowsum``).
+        assert not is_causal
         assert io_dtype in ("cutlass.Float16", "cutlass.BFloat16")
         assert score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
         assert cfg.q_tile_count == 2 and not cfg.softmax_disc
@@ -24707,6 +24853,10 @@ if warp_idx == 15:
             )
             + ")"
         )
+        # The LSE store reads the unshifted statistics: the shifted-domain
+        # bodies (the target policy's packed exp2 / resident lowerings) stay
+        # on the output-only surface (``dense_target_lowering_applies``).
+        assert not (has_lse and effective_probability_log2_shift)
         if has_lse and (segment_tiling or ragged_m):
             # Global row of this thread's segment-relative row; the rows past
             # the segment end (or the query length) are not this item's.
@@ -28380,6 +28530,20 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             and not alibi_args
             and not document_args
             and _standard_dense_score_plan_supported(score_plan)
+        ),
+        # The dense plan whose epilogue is ``O`` plus the LSE row and nothing
+        # else (the detector's ``dense_lse_output``): the resident
+        # value graph stores the LSE from the final row statistics.
+        dense_lse_output=(
+            not is_causal
+            and lse_arg is not None
+            and output_epilogue == _FLASH_OUTPUT_EPILOGUE_IDENTITY
+            and row_emit is None
+            and not bias_args
+            and not alibi_args
+            and not document_args
+            and not score_plan.modifiers
+            and not score_plan.has_list_walk
         ),
         standard_causal_output=(
             (is_causal or score_plan.has_kv_tile_pruning)

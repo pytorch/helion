@@ -7,8 +7,11 @@ from typing import NamedTuple
 
 import torch
 
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import Tcgen05RowvecAuxRow
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 
@@ -64,6 +67,11 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     ``has_auxiliary_loads`` records exact-shape (or, for FP8, broadcast)
     auxiliary operands of the epilogue chain: register-resident SIMT loads
     that add no shared memory but offer the aux-placement seeds.
+    ``exact_aux_count`` is the number of exact-shape rank-2 auxiliary
+    operands of the output's dtype: the staged aux load modes
+    (``tcgen05_aux_load_mode`` in ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one
+    ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand, which
+    the AB ring must leave room for.
     """
 
     input_dtype_bytes: int
@@ -72,6 +80,7 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     rows: tuple[Tcgen05RowvecAuxRow, ...] = ()
     has_auxiliary_loads: bool = False
     output_column_major: bool = False
+    exact_aux_count: int = 0
 
 
 def pipeline_region_graphs(
@@ -212,6 +221,17 @@ def analyze_pipeline_smem_facts(
         or (output_major == "col") != candidate.output_column_major
     ):
         return None
+    exact_aux_count = 0
+    for leaf in chain.auxiliary_tensor_loads:
+        source = leaf.load_node.args[0]
+        tensor = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+        if (
+            leaf.broadcast_axis is None
+            and isinstance(tensor, torch.Tensor)
+            and tensor.ndim == 2
+            and tensor.dtype == output.dtype
+        ):
+            exact_aux_count += 1
     return Tcgen05PipelineSmemFacts(
         operands.lhs.source_fake.dtype.itemsize,
         output.dtype.itemsize,
@@ -219,6 +239,7 @@ def analyze_pipeline_smem_facts(
         tuple(rows),
         bool(chain.auxiliary_tensor_loads),
         candidate.output_column_major,
+        exact_aux_count,
     )
 
 
@@ -234,6 +255,10 @@ def pipeline_smem_bytes(
     aux_load_placement: str = "post_acc_wait",
     store_mode: str = "normal",
     epi_warps: int = 4,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Upper-bound the allocations for the static CtaGroup.TWO schedule.
 
@@ -242,6 +267,14 @@ def pipeline_smem_bytes(
     sizing routine chooses the tile used by device and descriptor codegen.
     The 256-row family keeps its existing with-source tile convention, and
     both families use the destination's actual row- or column-major layout.
+    A staged aux load mode adds one ``aux_stages``-deep ring of epilogue
+    subtiles per exact-shape auxiliary operand (``facts.exact_aux_count``)
+    plus its full/empty barriers.  ``epi_warp_groups`` multiplies the C
+    stages (each epilogue warp group owns ``c_stages`` stages of the ring,
+    ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
+    pair's C subtile to ``(128, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
+    the explicit-tile path; the staged aux rings keep the plan's with-source
+    subtile, as ``cute_mma`` sizes them).
     """
     from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
@@ -251,6 +284,7 @@ def pipeline_smem_bytes(
     assert facts.input_dtype_bytes in (1, 2)
     assert facts.output_dtype_bytes in (2, 4)
     assert ab_stages > 0 and c_stages in (2, 4) and acc_stages in (1, 2)
+    assert epi_warp_groups >= 1
     two_cta_m128 = bm == 128
     output_width = facts.output_dtype_bytes * 8
     epi_m, epi_n = compute_epilogue_tile_size(
@@ -262,6 +296,12 @@ def pipeline_smem_bytes(
         d_is_m_major=facts.output_column_major,
         c_is_m_major=facts.output_column_major,
     )
+    c_tile_m, c_tile_n = epi_m, epi_n
+    if epi_subtile_n is not None and not two_cta_m128:
+        # The configured subtile of the 256-row pair: one CTA walks whole
+        # 128-lane TMEM datapath tiles of its 128-row half
+        # (``strategies.tcgen05_epilogue_subtile_m``).
+        c_tile_m, c_tile_n = 128, epi_subtile_n
     ab_bytes = tcgen05_ab_smem_bytes_per_cta(
         bm=bm,
         bn=bn,
@@ -271,10 +311,10 @@ def pipeline_smem_bytes(
         cluster_m=2,
     )
     c_bytes = tcgen05_c_smem_bytes_per_cta(
-        epi_tile_m=epi_m,
-        epi_tile_n=epi_n,
+        epi_tile_m=c_tile_m,
+        epi_tile_n=c_tile_n,
         dtype_bytes=facts.output_dtype_bytes,
-        c_stages=c_stages,
+        c_stages=c_stages * epi_warp_groups,
     )
     # Only the M256 normal epilogue stages FP32 N-broadcasts. The M128
     # instruction has a 64-row per-CTA epilogue, below the staging gate.
@@ -285,10 +325,22 @@ def pipeline_smem_bytes(
         if bm == 256 and store_mode == "normal" and aux_load_placement == "pre_acc_wait"
         else 0
     )
+    aux_ring_bytes = (
+        tcgen05_aux_ring_smem_bytes_per_cta(
+            epi_tile_m=epi_m,
+            epi_tile_n=epi_n,
+            dtype_bytes=facts.output_dtype_bytes,
+            aux_stages=aux_stages,
+            ring_count=facts.exact_aux_count,
+        )
+        if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
+        else 0
+    )
     return (
         ab_bytes
         + c_bytes
         + row_bytes
+        + aux_ring_bytes
         + tcgen05_bookkeeping_smem_bytes(ab_stages=ab_stages, acc_stages=acc_stages)
     )
 
@@ -304,6 +356,10 @@ def max_pipeline_ab_stages(
     aux_load_placement: str = "post_acc_wait",
     store_mode: str = "normal",
     epi_warps: int = 4,
+    aux_load_mode: str = "simt",
+    aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+    epi_warp_groups: int = 1,
+    epi_subtile_n: int | None = None,
 ) -> int:
     """Fill shared memory without changing the epilogue or accumulator ring."""
     return deepest_fitting_ab_stages(
@@ -318,6 +374,10 @@ def max_pipeline_ab_stages(
             aux_load_placement=aux_load_placement,
             store_mode=store_mode,
             epi_warps=epi_warps,
+            aux_load_mode=aux_load_mode,
+            aux_stages=aux_stages,
+            epi_warp_groups=epi_warp_groups,
+            epi_subtile_n=epi_subtile_n,
         ),
         facts.capacity_bytes,
     )

@@ -24,6 +24,7 @@ from typing import Callable
 from typing import Literal
 from typing import NamedTuple
 from typing import Protocol
+from typing import TypeVar
 from typing import cast
 from unittest.mock import patch
 
@@ -57,6 +58,8 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import final_selection_l2_flush_mode
+from .benchmarking import final_selection_second_regime
+from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
 from .effort_profile import get_effort_profile
@@ -74,6 +77,7 @@ from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
@@ -88,6 +92,8 @@ if TYPE_CHECKING:
     from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
     from helion.autotuner.effort_profile import FinalSelectionConfig
+
+_T = TypeVar("_T")
 
 
 @functools.cache
@@ -1545,6 +1551,15 @@ class PopulationMember:
         return self.perfs[-1]
 
 
+def _config_family(config: Config, keys: Sequence[str]) -> tuple[object, ...]:
+    """The kernel body a config selects: its values of the family knobs."""
+    return tuple(config.config.get(key) for key in keys)
+
+
+def _family_label(family: Sequence[object]) -> str:
+    return "/".join(str(value) for value in family)
+
+
 def performance(member: PopulationMember) -> float:
     """
     Retrieve the performance of a population member.  Used as a sort key.
@@ -1587,10 +1602,15 @@ class _FinalSelectionMeasurer(Protocol):
         ...
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
         """Median of one ``warmup_ms``+``rep_ms`` steady window of finalist
-        ``index``; ``None`` when no reading could be taken."""
+        ``index``; ``None`` when no reading could be taken. ``l2_flush_mode``
+        names the window's L2 regime, else the measurer's own."""
         ...
 
 
@@ -1638,15 +1658,37 @@ class _WorkerFinalSelectionMeasurer:
             self.provider.release_private_argument_copies()
 
     def warm(self, index: int, duration_ms: int) -> None:
-        self._window(index, warmup=duration_ms, rep=1, desc=f"{self.desc} warmup")
+        self._window(
+            index,
+            warmup=duration_ms,
+            rep=1,
+            desc=f"{self.desc} warmup",
+            l2_flush_mode=self.l2_flush_mode,
+        )
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
-        return self._window(index, warmup=warmup_ms, rep=rep_ms, desc=self.desc)
+        return self._window(
+            index,
+            warmup=warmup_ms,
+            rep=rep_ms,
+            desc=self.desc,
+            l2_flush_mode=l2_flush_mode or self.l2_flush_mode,
+        )
 
     def _window(
-        self, index: int, *, warmup: int, rep: int, desc: str
+        self,
+        index: int,
+        *,
+        warmup: int,
+        rep: int,
+        desc: str,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
         try:
             results = self.provider.benchmark_isolated(
@@ -1656,7 +1698,7 @@ class _WorkerFinalSelectionMeasurer:
                 desc=desc,
                 args_slots=[self.slots[index]],
                 timeout=self.timeout_s,
-                l2_flush_mode=self.l2_flush_mode,
+                l2_flush_mode=l2_flush_mode,
             )
         except BenchmarkWorkerUnkillable as error:
             # the batch held this one finalist
@@ -1718,15 +1760,26 @@ class _InProcessFinalSelectionMeasurer:
         self._bench(index, duration_ms, 1)
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
-        return self._bench(index, warmup_ms, rep_ms)
+        return self._bench(index, warmup_ms, rep_ms, l2_flush_mode=l2_flush_mode)
 
-    def _bench(self, index: int, warmup_ms: int, rep_ms: int) -> float:
+    def _bench(
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
+    ) -> float:
         run = functools.partial(self.fns[index], *self.args_by_fn[index])
         kwargs: dict[str, object] = {}
+        # a timer that knows the regimes takes the window's, else its own
         if self.l2_flush_mode is not None:
-            kwargs["l2_flush_mode"] = self.l2_flush_mode
+            kwargs["l2_flush_mode"] = l2_flush_mode or self.l2_flush_mode
         try:
             timing = self.steady_bench(
                 run,
@@ -1906,16 +1959,53 @@ class PopulationBasedSearch(BaseSearch):
 
     def _final_selection_shortlist_estimate(self) -> int:
         """Longest shortlist ``final_rebenchmark_best`` can hand the selection:
-        the retained ``top_k``, the pinned seeds and the incumbent (appended
-        when a later phase re-timed it above the shortlist's numbers)."""
-        return self._final_rebenchmark_top_k() + len(self._pinned_finalist_configs) + 1
+        the retained ``top_k``, the pinned seeds, the incumbent (appended
+        when a later phase re-timed it above the shortlist's numbers) and
+        the family quota's representatives where the spec names family
+        knobs."""
+        return (
+            self._final_rebenchmark_top_k()
+            + len(self._pinned_finalist_configs)
+            + 1
+            + self._final_selection_sizing_policy().family_finalists
+        )
+
+    def _final_selection_family_keys(self) -> tuple[str, ...]:
+        """The config knobs whose values pick a distinct kernel body
+        (``ConfigSpec.final_selection_family_keys``); empty when the surface
+        names none, which disables the final selection's family quota."""
+        return tuple(self.config_spec.final_selection_family_keys)
+
+    def _final_selection_sizing_policy(self) -> FinalSelectionConfig:
+        """The policy the phase is sized by under a budget: the profile's,
+        less the second regime's column when the regimes call for none
+        (``final_selection_second_regime``), so a per-call flushed selection
+        (the default) neither reserves search time for a column it never
+        takes nor sheds rounds to fit one, and less the family quota where
+        the spec names no family knob. The cache policy keeps the
+        profile's fields (``_final_rebenchmark_cache_policy``), so the key
+        stays regime-independent. The regime is read from the environment
+        here, a superset of what the measurer will honour: a timer without
+        regimes (a backend's own bench) still reserves the column under
+        ``replay``, an upper bound.
+        """
+        policy = self.final_selection
+        assert policy is not None
+        if (
+            policy.tiebreak_rounds > 0
+            and final_selection_second_regime(final_selection_l2_flush_mode()) is None
+        ):
+            policy = dataclasses.replace(policy, tiebreak_rounds=0)
+        # the family quota admits nothing where the spec names no family knob
+        if policy.family_finalists > 0 and not self._final_selection_family_keys():
+            policy = dataclasses.replace(policy, family_finalists=0)
+        return policy
 
     def _budget_reserve_seconds(self) -> float:
         budget = self.settings.autotune_budget_seconds
         if budget is None or not self._final_selection_enabled():
             return 0.0
-        policy = self.final_selection
-        assert policy is not None
+        policy = self._final_selection_sizing_policy()
         return min(
             policy.estimated_seconds(self._final_selection_shortlist_estimate()),
             _FINAL_SELECTION_RESERVE_FRACTION * budget,
@@ -1924,9 +2014,7 @@ class PopulationBasedSearch(BaseSearch):
     def _minimum_final_selection_seconds(self) -> float:
         if not self._final_selection_enabled():
             return 0.0
-        policy = self.final_selection
-        assert policy is not None
-        smallest = policy.budget_ladder()[-1]
+        smallest = self._final_selection_sizing_policy().budget_ladder()[-1]
         return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
 
     def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
@@ -1940,27 +2028,36 @@ class PopulationBasedSearch(BaseSearch):
         budget = self.settings.autotune_budget_seconds
         if budget is not None and self._autotune_budget_start is not None:
             remaining = budget - (time.perf_counter() - self._autotune_budget_start)
-            plan = policy.fit_to_seconds(remaining, shortlist)
+            sizing = self._final_selection_sizing_policy()
+            plan = sizing.fit_to_seconds(remaining, shortlist)
             if plan is None:
-                smallest = policy.budget_ladder()[-1].estimated_seconds(shortlist)
+                smallest = sizing.budget_ladder()[-1].estimated_seconds(shortlist)
                 self.log(
                     f"Final selection skipped: {remaining:.0f}s of the "
                     f"{budget}s budget remain, less than the {smallest:.0f}s of "
                     "its smallest plan; returning the search's best."
                 )
-            elif plan != policy:
+                policy = None
+            elif plan != sizing:
                 self.log(
                     f"Final selection sized to the {remaining:.0f}s left of the "
                     f"{budget}s budget: up to {plan.finalists(shortlist)} finalists x "
                     f"{plan.rounds} rounds"
-                    + (", no screen" if policy.screens(shortlist) else "")
+                    + (", no screen" if sizing.screens(shortlist) else "")
+                    + (
+                        ", one regime"
+                        if plan.tiebreak_rounds == 0 < sizing.tiebreak_rounds
+                        else ""
+                    )
                     + (
                         ", no thermal warmup"
-                        if plan.thermal_warmup_ms == 0 < policy.thermal_warmup_ms
+                        if plan.thermal_warmup_ms == 0 < sizing.thermal_warmup_ms
                         else ""
                     )
                 )
-            policy = plan
+                policy = plan
+            # else the whole plan fits: the profile's policy runs as is (the
+            # column the sizing left out cannot run in this regime anyway)
         return sync_object(
             policy, process_group_name=self.kernel.env.process_group_name
         )
@@ -3174,15 +3271,39 @@ class PopulationBasedSearch(BaseSearch):
             for member in by_config.values()
             if member.config not in pinned_configs
         ]
-        finalists = [
-            *pinned,
-            *sorted(remaining, key=self._finalist_history_perf)[:top_k],
-        ]
+        ranked = sorted(remaining, key=self._finalist_history_perf)
+        finalists = [*pinned, *ranked[:top_k]]
         # The incumbent defends its title even when later phases re-timed it
         # above the shortlist's search numbers.
         incumbent = by_config.get(best.config)
         if incumbent is not None and incumbent not in finalists:
             finalists.append(incumbent)
+        if use_final_selection:
+            # The family quota: the best config of a body the search's
+            # readings rank below the cut still gets its screen window (and
+            # its rounds when it survives the screen), see
+            # ``FinalSelectionConfig.family_finalists``. The incumbent's
+            # family is represented already.
+            assert self.final_selection is not None
+            finalists.extend(
+                self._family_representatives(
+                    "shortlist",
+                    [member.config for member in finalists],
+                    [
+                        (member, member.config, self._finalist_history_perf(member))
+                        for member in ranked[top_k:]
+                        if member is not incumbent
+                    ],
+                    best=min(
+                        (
+                            self._finalist_history_perf(member)
+                            for member in by_config.values()
+                        ),
+                        default=inf,
+                    ),
+                    policy=self.final_selection,
+                )
+            )
         if len(finalists) < 2:
             live_finalists = [
                 member for member in finalists if math.isfinite(member.perf)
@@ -3248,19 +3369,71 @@ class PopulationBasedSearch(BaseSearch):
             )
         return after
 
+    def _family_representatives(
+        self,
+        stage: str,
+        represented: Iterable[Config],
+        candidates: Sequence[tuple[_T, Config, float]],
+        *,
+        best: float,
+        policy: FinalSelectionConfig,
+    ) -> list[_T]:
+        """The family quota of the final selection at one of its two cuts.
+
+        ``candidates`` are the configs the cut dropped, best first, each with
+        the reading the cut ranked by; ``represented`` the configs it kept.
+        Returns the first candidate of every family (the values of the
+        spec's ``final_selection_family_keys``) no kept config belongs to,
+        closest to ``best`` first, at most ``policy.family_finalists`` of
+        them, each reading within ``policy.family_spread`` of ``best``.
+        """
+        keys = self._final_selection_family_keys()
+        quota = policy.family_finalists
+        if not keys or quota <= 0 or not candidates or not math.isfinite(best):
+            return []
+        families = {_config_family(config, keys) for config in represented}
+        admitted: list[_T] = []
+        notes: list[str] = []
+        for item, config, reading in candidates:
+            family = _config_family(config, keys)
+            if family in families:
+                continue
+            if not math.isfinite(reading) or reading > best * policy.family_spread:
+                # the candidates are ranked, so no later one is closer
+                break
+            families.add(family)
+            admitted.append(item)
+            notes.append(
+                f"{_family_label(family)} at {self.format_performance(reading)} "
+                f"({reading / best - 1.0:+.1%})"
+            )
+            if len(admitted) >= quota:
+                break
+        if admitted:
+            self.log(
+                f"Final selection family quota ({stage}): kept the best config of "
+                f"{len(admitted)} more "
+                f"{'family' if len(admitted) == 1 else 'families'} "
+                f"({'/'.join(keys)}) within {policy.family_spread:g}x of the best "
+                f"{self.format_performance(best)}: " + "; ".join(notes)
+            )
+        return admitted
+
     def _prefer_pinned_within_tolerance(
         self,
         after: PopulationMember,
         live: Sequence[PopulationMember],
         pinned_configs: set[Config],
+        key: Callable[[PopulationMember], float] = performance,
     ) -> PopulationMember:
-        """A pinned seed within the tolerance of the best finalist wins the tie."""
+        """A pinned seed within the tolerance of the best finalist wins the
+        tie; ``key`` reads the timing compared (the member's perf)."""
         live_pinned = [member for member in live if member.config in pinned_configs]
         if not live_pinned:
             return after
-        pinned_after = min(live_pinned, key=performance)
+        pinned_after = min(live_pinned, key=key)
         tolerance = self._final_rebenchmark_pinned_tolerance()
-        if pinned_after.perf <= after.perf * (1.0 + tolerance):
+        if key(pinned_after) <= key(after) * (1.0 + tolerance):
             return pinned_after
         return after
 
@@ -3357,25 +3530,92 @@ class PopulationBasedSearch(BaseSearch):
         is long enough to be worth it), the best ``top_k`` survivors plus the
         best pinned seed and the ``incumbent`` then run ``rounds`` rounds of
         steady windows whose order alternates every round, and the median
-        across rounds decides (see ``FinalSelectionConfig``). Every decision
-        that depends on a reading is taken by rank 0 and broadcast, so
-        distributed ranks time the same finalist in every window.
+        across rounds decides (see ``FinalSelectionConfig``). When the
+        selection's L2 regime calls for a second one
+        (``final_selection_second_regime``), the finalists tied within
+        ``policy.tie_tolerance`` of the best median (every complete finalist
+        under an explicit target regime) run ``policy.tiebreak_rounds`` more
+        rounds in it, and that column breaks the tie (selects outright under
+        the explicit target, whose medians then become the finalists' perf).
+        Every decision that depends on a reading is taken by rank 0 and
+        broadcast, so distributed ranks time the same finalist in every
+        window.
         """
         start = time.perf_counter()
         count = len(finalists)
         screen: list[float | None] = [None] * count
         readings: list[list[float]] = [[] for _ in range(count)]
         failures: list[Literal["error", "timeout"] | None] = [None] * count
+        # The second regime's column keeps its own readings and failures: a
+        # finalist that fails only there keeps its ranking-regime median.
+        second: list[list[float]] = [[] for _ in range(count)]
+        second_failures: list[Literal["error", "timeout"] | None] = [None] * count
+        second_regime: str | None = None
+        select_by_second = False
+        group: list[int] = []
+        family_survivors: list[int] = []
         process_group_name = self.kernel.env.process_group_name
 
-        def take(index: int, warmup_ms: int, rep_ms: int) -> float | None:
-            result = measurer.measure(index, warmup_ms, rep_ms)
+        def take(
+            index: int,
+            warmup_ms: int,
+            rep_ms: int,
+            regime: str | None = None,
+            failed: list[Literal["error", "timeout"] | None] = failures,
+        ) -> float | None:
+            result = measurer.measure(index, warmup_ms, rep_ms, l2_flush_mode=regime)
             if isinstance(result, IsolatedBenchmarkFailure):
-                failures[index] = result.status
+                failed[index] = result.status
                 return None
             if result is None or not math.isfinite(result) or result <= 0:
                 return None
             return float(result)
+
+        def complete_medians(
+            samples: list[list[float]],
+            failed: list[Literal["error", "timeout"] | None],
+            rounds: int,
+        ) -> dict[int, float]:
+            # A finalist competes on the median of a reading from every
+            # round: a round it failed, timed out or produced no reading in
+            # disqualifies it (one lucky reading must not win over
+            # consistently timed rivals).
+            return {
+                index: statistics.median(samples[index])
+                for index in survivors
+                if failed[index] is None and len(samples[index]) == rounds > 0
+            }
+
+        def run_rounds(
+            order_base: list[int],
+            rounds: int,
+            samples: list[list[float]],
+            failed: list[Literal["error", "timeout"] | None],
+            regime: str | None,
+        ) -> None:
+            for round_index in range(rounds):
+                # A finalist that failed, timed out or missed a reading in
+                # an earlier round cannot compete (it needs a reading from
+                # every round), so it is not timed again: a hung finalist
+                # would otherwise cost every remaining round a timeout.
+                disqualified = sync_object(
+                    [
+                        index
+                        for index in order_base
+                        if failed[index] is not None
+                        or len(samples[index]) < round_index
+                    ],
+                    process_group_name=process_group_name,
+                )
+                order = order_base if round_index % 2 == 0 else order_base[::-1]
+                for index in order:
+                    if index in disqualified:
+                        continue
+                    reading = take(
+                        index, policy.warmup_ms, policy.rep_ms, regime, failed
+                    )
+                    if reading is not None:
+                        samples[index].append(reading)
 
         regime_label = final_selection_l2_flush_mode()
         try:
@@ -3413,48 +3653,61 @@ class PopulationBasedSearch(BaseSearch):
                 incumbent_index = finalists.index(incumbent)
                 if incumbent_index in alive and incumbent_index not in survivors:
                     survivors.append(incumbent_index)
+                # The family quota: the best-ranked config of a body the cut
+                # dropped runs the rounds too (the screen is one window, the
+                # rounds a median of four at the sustained clock). The seed
+                # and the incumbent count as represented, so the quota goes
+                # to families neither of them belongs to.
+                family_survivors = self._family_representatives(
+                    "screen" if screened else "rounds",
+                    [finalists[index].config for index in survivors],
+                    [
+                        (index, finalists[index].config, rank_key(index))
+                        for index in ranked[policy.top_k :]
+                        if index not in survivors
+                    ],
+                    best=rank_key(ranked[0]) if ranked else inf,
+                    policy=policy,
+                )
+                survivors.extend(family_survivors)
                 # rank 0 decides who goes on so every rank runs the same windows
                 survivors = sync_object(
                     survivors, process_group_name=process_group_name
                 )
-                for round_index in range(policy.rounds):
-                    # A finalist that failed, timed out or missed a reading in
-                    # an earlier round cannot compete (it needs a reading from
-                    # every round), so it is not timed again: a hung finalist
-                    # would otherwise cost every remaining round a timeout.
-                    disqualified = sync_object(
-                        [
-                            index
-                            for index in survivors
-                            if failures[index] is not None
-                            or len(readings[index]) < round_index
-                        ],
+                run_rounds(survivors, policy.rounds, readings, failures, None)
+
+                if policy.tiebreak_rounds > 0:
+                    second_regime = final_selection_second_regime(regime_label)
+                if second_regime is not None:
+                    select_by_second = final_selection_target_regime() != "auto"
+                    group = sync_object(
+                        self._final_selection_second_group(
+                            complete_medians(readings, failures, policy.rounds),
+                            policy,
+                            select_by_second=select_by_second,
+                        ),
                         process_group_name=process_group_name,
                     )
-                    order = survivors if round_index % 2 == 0 else survivors[::-1]
-                    for index in order:
-                        if index in disqualified:
-                            continue
-                        reading = take(index, policy.warmup_ms, policy.rep_ms)
-                        if reading is not None:
-                            readings[index].append(reading)
+                    run_rounds(
+                        group,
+                        policy.tiebreak_rounds,
+                        second,
+                        second_failures,
+                        second_regime,
+                    )
         except BenchmarkWorkerUnkillable as error:
             self._record_unkillable(finalists, error)
             raise
 
         members = [finalists[index] for index in survivors]
-        # A finalist competes on the median of a reading from every round: a
-        # round it failed, timed out or produced no reading in disqualifies
-        # it (one lucky reading must not win over consistently timed rivals).
         results: list[IsolatedBenchmarkTiming] = []
+        medians = complete_medians(readings, failures, policy.rounds)
         for index in survivors:
             status = failures[index]
             if status is not None:
                 results.append(IsolatedBenchmarkFailure(status))
-            elif len(readings[index]) == policy.rounds:
-                results.append(statistics.median(readings[index]))
             else:
-                results.append(None)
+                results.append(medians.get(index))
         results = sync_object(results, process_group_name=process_group_name)
         timings, failure_statuses = self._resolve_isolated_rebenchmark_results(
             members, results
@@ -3482,6 +3735,66 @@ class PopulationBasedSearch(BaseSearch):
             live,
             pinned_configs,
         )
+
+        # The second column, per survivor: None where it was not timed or
+        # missed a round, the failure where it failed there.
+        second_results: list[IsolatedBenchmarkTiming] = []
+        second_medians = complete_medians(
+            second, second_failures, policy.tiebreak_rounds
+        )
+        for index in survivors:
+            status = second_failures[index]
+            if index not in group:
+                second_results.append(None)
+            elif status is not None:
+                second_results.append(IsolatedBenchmarkFailure(status))
+            else:
+                second_results.append(second_medians.get(index))
+        if second_regime is not None:
+            second_results = sync_object(
+                second_results, process_group_name=process_group_name
+            )
+        second_by_position = {
+            position: result
+            for position, result in enumerate(second_results)
+            if isinstance(result, float)
+        }
+        # the regime whose column selected ``after``
+        selected_by = regime_label
+        if select_by_second:
+            if second_by_position:
+                # The target regime is the one the kernel is scored in, so
+                # its medians are the finalists' perf from here on. A
+                # finalist that failed or missed a round in that column
+                # keeps the ranking regime's median as its perf (the table
+                # names the regime of each column and its
+                # ``second_disqualified`` verdict) and cannot be selected,
+                # as a finalist without a complete ranking median keeps the
+                # search's perf and cannot be.
+                timed = [members[position] for position in second_by_position]
+                self._apply_rebenchmark_timings(
+                    timed, list(second_by_position.values())
+                )
+                live_second = [member for member in timed if math.isfinite(member.perf)]
+                if live_second:
+                    after = self._prefer_pinned_within_tolerance(
+                        self._prefer_backend_preference_within_tolerance(
+                            min(live_second, key=performance), live_second
+                        ),
+                        live_second,
+                        pinned_configs,
+                    )
+                    selected_by = second_regime
+            if selected_by != second_regime:
+                self.log.warning(
+                    f"Final selection took no complete readings in the L2 "
+                    f"{second_regime} regime; selecting by the L2 {regime_label} "
+                    "column."
+                )
+        elif second_by_position:
+            after = self._break_tie_by_second_column(
+                after, members, second_by_position, pinned_configs, policy
+            )
         self._log_final_selection(
             finalists,
             survivors,
@@ -3493,8 +3806,80 @@ class PopulationBasedSearch(BaseSearch):
             policy,
             wall_s=time.perf_counter() - start,
             regime_label=regime_label,
+            second=second,
+            second_results=second_results,
+            second_group=group,
+            second_regime=second_regime,
+            select_by_second=select_by_second,
+            selected_by=selected_by,
+            family_indices=family_survivors,
         )
         return after
+
+    @staticmethod
+    def _final_selection_second_group(
+        medians: dict[int, float],
+        policy: FinalSelectionConfig,
+        *,
+        select_by_second: bool,
+    ) -> list[int]:
+        """The finalists the second regime times, in survivor order: every
+        finalist with a complete median under an explicit target regime,
+        else those tied within ``policy.tie_tolerance`` of the best median
+        (none when the best stands alone: nothing to break)."""
+        if not medians:
+            return []
+        if select_by_second:
+            return list(medians)
+        best = min(medians.values())
+        tied = [
+            index
+            for index, median in medians.items()
+            if median <= best * (1.0 + policy.tie_tolerance)
+        ]
+        return tied if len(tied) > 1 else []
+
+    def _break_tie_by_second_column(
+        self,
+        after: PopulationMember,
+        members: Sequence[PopulationMember],
+        second_by_position: dict[int, float],
+        pinned_configs: set[Config],
+        policy: FinalSelectionConfig,
+    ) -> PopulationMember:
+        """Among the finalists tied in the ranking regime, the fastest in the
+        second regime wins unless ``after`` (the ranking regime's pick) is
+        within ``policy.tie_tolerance`` of it there too; a pinned seed within
+        its tolerance of that fastest keeps its preference."""
+        positions = [
+            position for position in second_by_position if members[position] is after
+        ]
+        if not positions:
+            # ``after`` has no complete median in the second column: either
+            # the pinned preference reached outside the tied group, or the
+            # ranking regime's pick itself failed or missed a round there.
+            # Without cold evidence against it the ranking pick stands (a
+            # rival's cold reading alone is not evidence that ``after`` is
+            # slower cold).
+            return after
+        after_position = positions[0]
+        by_member = {
+            id(members[position]): median
+            for position, median in second_by_position.items()
+        }
+
+        def key(member: PopulationMember) -> float:
+            return by_member[id(member)]
+
+        candidates = [members[position] for position in second_by_position]
+        best = self._prefer_pinned_within_tolerance(
+            min(candidates, key=key), candidates, pinned_configs, key=key
+        )
+        if second_by_position[after_position] <= key(best) * (
+            1.0 + policy.tie_tolerance
+        ):
+            return after
+        return best
 
     def _log_final_selection(
         self,
@@ -3509,11 +3894,30 @@ class PopulationBasedSearch(BaseSearch):
         *,
         wall_s: float,
         regime_label: str,
+        second: Sequence[Sequence[float]] | None = None,
+        second_results: Sequence[IsolatedBenchmarkTiming] | None = None,
+        second_group: Sequence[int] = (),
+        second_regime: str | None = None,
+        select_by_second: bool = False,
+        selected_by: str | None = None,
+        family_indices: Sequence[int] = (),
     ) -> None:
+        if selected_by is None:
+            selected_by = regime_label
+        family_keys = self._final_selection_family_keys()
         result_by_index = dict(zip(survivors, results, strict=True))
+        second_by_index: dict[int, IsolatedBenchmarkTiming] = (
+            {}
+            if second_results is None
+            else dict(zip(survivors, second_results, strict=True))
+        )
+        # the finalists whose windows the second column spent, whether or
+        # not they produced a reading
+        second_timed = {index for index in survivors if index in second_group}
+        # the table is ordered by the column that selected
+        sort_by_second = second_regime is not None and selected_by == second_regime
 
-        def verdict(index: int) -> str | None:
-            result = result_by_index[index]
+        def verdict(result: IsolatedBenchmarkTiming) -> str | None:
             if isinstance(result, IsolatedBenchmarkFailure):
                 return result.status
             if result is None:
@@ -3521,7 +3925,9 @@ class PopulationBasedSearch(BaseSearch):
             return None
 
         def sort_key(index: int) -> float:
-            result = result_by_index[index]
+            result = (
+                second_by_index.get(index) if sort_by_second else result_by_index[index]
+            )
             return result if isinstance(result, float) else inf
 
         rows: list[dict[str, object]] = []
@@ -3532,26 +3938,52 @@ class PopulationBasedSearch(BaseSearch):
             result = result_by_index[index]
             median = result if isinstance(result, float) else None
             config_id = canonical_config_id(member.config)
-            rows.append(
-                {
-                    "config_id": config_id,
-                    "pinned": member.config in pinned_configs,
-                    "search_ms": member.perfs[0] if member.perfs else None,
-                    "screen_ms": screen[index],
-                    "rounds_ms": samples,
-                    "median_ms": median,
-                    "disqualified": verdict(index),
-                }
+            row: dict[str, object] = {
+                "config_id": config_id,
+                "pinned": member.config in pinned_configs,
+                "search_ms": member.perfs[0] if member.perfs else None,
+                "screen_ms": screen[index],
+                "rounds_ms": samples,
+                "median_ms": median,
+                "disqualified": verdict(result),
+            }
+            if family_keys:
+                row["family"] = _family_label(
+                    _config_family(member.config, family_keys)
+                )
+                row["family_quota"] = index in family_indices
+            second_text = ""
+            if index in second_timed:
+                second_result = second_by_index.get(index)
+                second_median = (
+                    second_result if isinstance(second_result, float) else None
+                )
+                second_samples = [] if second is None else list(second[index])
+                row["second_rounds_ms"] = second_samples
+                row["second_median_ms"] = second_median
+                row["second_disqualified"] = verdict(second_result)
+                second_median_text = (
+                    f"{second_median:.4g}"
+                    if second_median is not None
+                    else verdict(second_result) or "n/a"
+                )
+                second_text = (
+                    f" {second_regime}={second_median_text}"
+                    f"[{' '.join(f'{sample:.4g}' for sample in second_samples)}]"
+                )
+            rows.append(row)
+            marks = (
+                ("*" if member is selected else " ")
+                + ("P" if member.config in pinned_configs else " ")
+                + ("F" if index in family_indices else " ")
             )
-            marks = ("*" if member is selected else " ") + (
-                "P" if member.config in pinned_configs else " "
-            )
+            family_text = f" family={row['family']}" if family_keys else ""
             # four significant digits: microsecond kernels differ in the
             # fourth decimal of a millisecond reading
             median_text = (
                 f"{median:.4g}{self.performance_suffix}"
                 if median is not None
-                else verdict(index) or "n/a"
+                else verdict(result) or "n/a"
             )
             rounds_text = " ".join(f"{sample:.4g}" for sample in samples)
             screen_text = "" if screen[index] is None else f"{screen[index]:.4g}"
@@ -3559,19 +3991,52 @@ class PopulationBasedSearch(BaseSearch):
                 self.format_performance(member.perfs[0]) if member.perfs else "n/a"
             )
             lines.append(
-                f"  {marks} {median_text:>10} [{rounds_text}] screen={screen_text} "
-                f"search={search_text} {config_id}"
+                f"  {marks} {median_text:>10} [{rounds_text}]{second_text} "
+                f"screen={screen_text} search={search_text}{family_text} {config_id}"
+            )
+        if second_regime is None:
+            second_clause = ""
+        elif select_by_second and selected_by == second_regime:
+            second_clause = (
+                f" by {policy.tiebreak_rounds} rounds of L2 {second_regime} windows"
+            )
+        elif select_by_second:
+            second_clause = (
+                f" by the L2 {regime_label} column (no complete reading in "
+                f"{policy.tiebreak_rounds} rounds of L2 {second_regime} windows)"
+            )
+        elif any(
+            isinstance(second_by_index.get(index), float) for index in second_timed
+        ):
+            second_clause = (
+                f", the tie within {policy.tie_tolerance:.1%} broken by "
+                f"{policy.tiebreak_rounds} rounds of L2 {second_regime} windows"
+            )
+        elif second_timed:
+            second_clause = (
+                f", the tie within {policy.tie_tolerance:.1%} unresolved: no "
+                f"complete reading in {policy.tiebreak_rounds} rounds of L2 "
+                f"{second_regime} windows"
+            )
+        else:
+            second_clause = (
+                f", no tie within {policy.tie_tolerance:.1%} for L2 "
+                f"{second_regime} windows to break"
             )
         self.log(
             f"Final selection: {len(finalists)} shortlisted, {len(survivors)} "
             f"finalists x {policy.rounds} rounds of {policy.warmup_ms}+{policy.rep_ms} ms "
             f"windows (L2 {regime_label}) in {wall_s:.1f}s; selected "
-            f"{self.format_performance(selected.perf)} (* selected, P pinned seed):\n"
-            + "\n".join(lines)
+            f"{self.format_performance(selected.perf)}{second_clause} "
+            "(* selected, P pinned seed, F family quota):\n" + "\n".join(lines)
         )
         self._autotune_metrics.final_selection = {
             "policy": dataclasses.asdict(policy),
+            "family_keys": list(family_keys),
             "l2_flush_mode": regime_label,
+            "second_l2_flush_mode": second_regime,
+            "target_regime": final_selection_target_regime(),
+            "selected_by": selected_by,
             "shortlisted": len(finalists),
             "finalists": len(survivors),
             "wall_s": wall_s,

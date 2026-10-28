@@ -165,7 +165,7 @@ def fused_linear_jsd_kernel(
 
         loss[tile] = jsd_loss
 
-    return (loss / batch_size).sum()
+    return loss.mean()
 
 
 # %%
@@ -219,10 +219,17 @@ class FusedLinearJSDFunction(torch.autograd.Function):
         chunk_size = min(batch_size, max(1, LOGITS_CHUNK_BYTES // (vocab_size * 4)))
         num_chunks = (batch_size + chunk_size - 1) // chunk_size
 
-        # Allocate outputs
-        total_loss = torch.zeros((), device=student_input.device, dtype=torch.float)
-        grad_student_input = torch.zeros_like(student_input, dtype=torch.float)
-        grad_student_weight = torch.zeros_like(student_weight, dtype=torch.float)
+        # Gradient buffers, written (not accumulated into) by the first chunk:
+        # every row of grad_student_input belongs to exactly one chunk and the
+        # weight gradient starts from the first chunk's GEMM, so neither needs
+        # a zero fill.  Contiguous so the row slices are plain GEMM outputs.
+        grad_student_input = student_input.new_empty(
+            student_input.shape, dtype=torch.float
+        )
+        grad_student_weight = student_weight.new_empty(
+            student_weight.shape, dtype=torch.float
+        )
+        loss_chunks: list[Tensor] = []
 
         for chunk_id in range(num_chunks):
             start_idx = chunk_id * chunk_size
@@ -245,19 +252,34 @@ class FusedLinearJSDFunction(torch.autograd.Function):
                 teacher_logits_chunk,
             )
 
-            # Accumulate loss
-            total_loss = total_loss + loss_chunk.sum()
+            loss_chunks.append(loss_chunk)
 
-            # Convert grad_logits [chunk, vocab] to grad_input [chunk, hidden]
-            # grad_input = grad_logits @ weight
-            grad_student_input[start_idx:end_idx] = grad_logits_chunk @ student_weight
+            # Convert grad_logits [chunk, vocab] to grad_input [chunk, hidden],
+            # grad_input = grad_logits @ weight, written straight into its rows
+            torch.mm(
+                grad_logits_chunk,
+                student_weight,
+                out=grad_student_input[start_idx:end_idx],
+            )
 
-            # Accumulate weight gradient in place so the add rides the GEMM:
-            # grad_weight += grad_logits.T @ input
-            grad_student_weight.addmm_(grad_logits_chunk.T, student_input_chunk.float())
+            # Weight gradient grad_logits.T @ input: the first chunk's GEMM
+            # writes the buffer, later chunks accumulate in place so the add
+            # rides the GEMM.
+            if chunk_id == 0:
+                torch.mm(
+                    grad_logits_chunk.T,
+                    student_input_chunk.float(),
+                    out=grad_student_weight,
+                )
+            else:
+                grad_student_weight.addmm_(
+                    grad_logits_chunk.T, student_input_chunk.float()
+                )
 
-        # Normalize loss by batch size
-        total_loss = total_loss / batch_size
+        # Mean of the per-row losses over the batch: one reduction kernel
+        total_loss = (
+            loss_chunks[0] if num_chunks == 1 else torch.cat(loss_chunks)
+        ).mean()
 
         # Save for backward; the gradients are of the per-row loss sum, the
         # backward applies the mean's 1 / batch_size.

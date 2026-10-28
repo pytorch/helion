@@ -330,3 +330,68 @@ def test_correction_step_chains_two_register_tile_levels(
         assert torch.equal(state, initial)
         q.copy_(torch.rand_like(q).mul_(2).sub_(1))
         v.copy_(torch.rand_like(v).mul_(2).sub_(1))
+
+
+@pytest.mark.parametrize("pack", [2, 4])
+@pytest.mark.parametrize(
+    "reduction_loop", [None, 32], ids=["register-tile", "looped-reduction"]
+)
+def test_tiles_per_block_matches_reference(
+    pack: int, reduction_loop: int | None
+) -> None:
+    # ``cute_tiles_per_block`` on the recurrent step: the one-element BH axis
+    # is only read through ``tile_bh.id`` (no graph distributes over it), yet
+    # packing makes it a thread axis.  Every sub-group must own its own tile
+    # (``test_cute_register_tile_schedule.py`` checks the rendered axes).
+    kernel = helion.kernel(
+        recurrent_step_fused.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    torch.manual_seed(0)
+    q = torch.randn(BH, D, device=DEVICE)
+    k = torch.randn(BH, D, device=DEVICE)
+    v = torch.randn(BH, DV, device=DEVICE)
+    alpha = torch.rand(BH, device=DEVICE)
+    state = torch.randn(BH, D, DV, device=DEVICE)
+    bound = kernel.bind((q, k, v, state, alpha))
+    spec = bound.config_spec
+    if reduction_loop is None:
+        config = _config(
+            bound,
+            dv_block=32,
+            dv_threads=8,
+            reduction_threads=8,
+            **KNOBS,
+            cute_tiles_per_block=pack,
+        )
+    else:
+        (reduction,) = [
+            block.block_id for block in bound.env.block_sizes if block.reduction
+        ]
+        (dv,) = spec.block_sizes.valid_block_ids()
+        threads = {dv: 4, reduction: 8}
+        config = spec.normalized_config(
+            helion.Config(
+                block_sizes=[4],
+                num_threads=[
+                    threads.get(block_id, 0)
+                    for block_id in spec.num_threads.valid_block_ids()
+                ],
+                reduction_loops=[reduction_loop],
+                cute_tiles_per_block=pack,
+            )
+        )
+    assert config.config["cute_tiles_per_block"] == pack
+    code = bound.to_code(config)
+    dv_block = 32 if reduction_loop is None else 4
+    grid = BH // pack * (DV // dv_block)
+    assert f"_launcher(_helion_recurrent_step_fused, ({grid},)" in code
+    out, new_state = bound.compile_config(config)(q, k, v, state, alpha)
+    torch.cuda.synchronize()
+    expected_state = alpha[:, None, None] * state + k[:, :, None] * v[:, None, :]
+    expected_out = (q[:, :, None] * expected_state).sum(1)
+    torch.testing.assert_close(new_state, expected_state, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=1e-3)

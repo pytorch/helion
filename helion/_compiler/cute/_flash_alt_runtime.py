@@ -43,10 +43,11 @@ def flash_fa4_alt_shared_storage(
     sum handed to the odd one once per item (rewritten only after the odd
     warpgroup's ``l_consumed`` arrival for the previous item: with one KV pair
     per item nothing else orders the even warpgroup's next item behind the odd
-    warpgroup's end of the current one). The odd warpgroup's alpha slot also
-    carries the item's row sum to the correction warps; the next item's first
-    alpha is written only after their ``rowsum_consumed`` arrival, since the
-    PV chain that orders the in-item alpha handoffs does not cover that write.
+    warpgroup's end of the current one). The odd warpgroup's max slot also
+    carries the item's row sum to the correction warps (it is dead between the
+    warpgroup's last max publication of an item and its first of the next);
+    that next publication is written only after their ``rowsum_consumed``
+    arrival.
     """
 
     @cute.struct
@@ -134,7 +135,7 @@ def fa4_alt_exp_pass_held(
     p_store_split: int,
     p_store_chunks: int,
     io_dtype: object,
-    p_empty_ptr: object,
+    p_empty_addr: object,
     p_empty_phase: object,
     handoff_enabled: object,
     scale_t: cute.Tensor,
@@ -153,8 +154,9 @@ def fa4_alt_exp_pass_held(
     Same per-chunk numerics as ``fa4_disc_exp_convert_store_pipe`` (scale and
     subtract, exp2 with the pipe split, fp16 convert, r2t store into the P
     buffer, row sum, the 3/4 + 1/4 staged-P arrivals on ``pfor``/``pfor2``),
-    without TMEM loads. Before the first store the pass waits on ``p_empty_ptr``
-    (this warpgroup's previous PV completed, so the P buffer is free). That PV
+    without TMEM loads. Before the first store the pass waits on the barrier at
+    ``p_empty_addr`` (a warp-uniform shared address; this warpgroup's previous
+    PV completed, so the P buffer is free). That PV
     needed the correction warps' arrival for the previous step of this
     warpgroup, which implies they consumed the previous alpha: the handoff of
     this step's alpha (``scale_t[wg, tidx]`` then ``bar.arrive`` on
@@ -162,7 +164,7 @@ def fa4_alt_exp_pass_held(
     the named barrier cannot see two arrivals before one sync.
     """
     p_sum = cutlass.Float32(0.0)
-    _rt.mbar_spin_wait(p_empty_ptr, p_empty_phase, wait_hint)
+    _rt.mbar_spin_wait_addr(p_empty_addr, p_empty_phase, wait_hint)
 
     def _handoff() -> None:
         scale_t[wg, tidx] = alpha

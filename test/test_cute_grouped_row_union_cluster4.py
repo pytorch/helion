@@ -1160,10 +1160,13 @@ def test_dependent_launch_needs_no_entry_wait(case):
     )
     assert 0 < offsets_read < persistent_loop
     # Without the knob the epilogue role carries no wait (the two-CTA TMA-load
-    # role keeps its unconditional one).
+    # role keeps its unconditional one).  (``cute_pdl`` defaults to True on
+    # the sm_90+ tcgen05 surface; the knob-off render pins it off.)
+    without_knob = deepcopy(config)
+    without_knob.config["cute_pdl"] = False
     plain_epilogue = next(
         stmt
-        for stmt in _kernel_body(bound.to_code(config))
+        for stmt in _kernel_body(bound.to_code(without_knob))
         if isinstance(stmt, ast.If)
         and ast.unparse(stmt.test).endswith("< cutlass.Int32(4)")
     )

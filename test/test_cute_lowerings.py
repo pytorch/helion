@@ -10928,6 +10928,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -10998,6 +11001,9 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=[4],
                 pid_type="persistent_blocked",
                 tcgen05_cluster_m=2,
+                # The two-CTA kernel emits its own Quack-aligned wait/release pair; the
+                # ``cute_pdl`` (default True on sm_90+) would add the role waits.
+                cute_pdl=False,
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -11384,6 +11390,8 @@ class TestCuteLowerings(unittest.TestCase):
         - The V-leader gate emits ``% cutlass.Int32(2) == cutlass.Int32(0)``
           for AB consumer-release / MMA issue (instead of the cluster_n=1
           ``== cutlass.Int32(0)`` form).
+        - The persistent grid is capped in whole co-resident 4-CTA
+          clusters (``_MAX_ACTIVE_CLUSTERS``), not the pair's SM slots.
         - The plan persists ``cluster_n=2``.
 
         This is a *codegen* test only — the runtime correctness test is
@@ -11426,6 +11434,7 @@ class TestCuteLowerings(unittest.TestCase):
                 tcgen05_ab_stages=2,
                 tcgen05_acc_stages=2,
                 tcgen05_c_stages=2,
+                tcgen05_persistent_grid_cap="resident_clusters",
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
@@ -11467,17 +11476,25 @@ class TestCuteLowerings(unittest.TestCase):
         # anchor on the launcher signature so a regression of the
         # cluster_n axis in ``codegen_grid`` fails loudly.
         self.assertRegex(code, r"_launcher\([^,]+,\s*\(2,\s*2,\s*")
-        # Launch-grid persistent-capacity divisor is ``_NUM_SM // 2``
-        # (cluster_m), NOT ``_NUM_SM // 4`` (cluster_size = cluster_m
-        # * cluster_n). The latter caps cluster_n=2 at one wave of
-        # 37 cluster slots × 4 CTAs and starves the GPU of wave-overlap
-        # parallelism; the cluster_m divisor matches the cluster_n=1
-        # baseline so each cluster slot still consumes one SM. Anchor
-        # on the ``max(1, _NUM_SM // 2)`` envelope (the launcher emits
-        # ``min(total_clusters, max(1, _NUM_SM // cluster_m))`` for
-        # this seed) so a regression of either branch (``// 4``
-        # re-introduced or ``// 2`` lost) fails this assertion.
-        self.assertIn("max(1, _NUM_SM // 2)", code)
+        # Under ``tcgen05_persistent_grid_cap="resident_clusters"`` (the
+        # cluster_n=2 seeds' choice) the persistent grid is capped in whole
+        # co-resident clusters: the device's four-CTA cluster count (33 on a
+        # B200, below ``_NUM_SM // 4`` because a cluster lives inside one
+        # GPC), not the pair's ``max(1, _NUM_SM // 2)`` slots, which launched
+        # a second hardware wave of 2x2 clusters that re-ran the prologue.
+        # The cluster count is cdiv(2 * M tiles, 2) * cdiv(N tiles, 2).
+        self.assertIn(
+            "_MAX_ACTIVE_CLUSTERS = helion.runtime.get_max_active_clusters("
+            "x.device, 4)",
+            code,
+        )
+        self.assertIn(
+            "(2, 2, min(((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0 * 2 + 2 - 1)"
+            " // 2 * (((1024 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1 + 2 - 1) // 2)"
+            " * 1, _MAX_ACTIVE_CLUSTERS))",
+            code,
+        )
+        self.assertNotIn("_NUM_SM // 2", code)
         self.assertNotIn("_NUM_SM // 4", code)
         # cluster_n=2 plumbing is exercised end-to-end by the codegen
         # markers above (no plan-field round-trip is asserted here —
@@ -12058,6 +12075,13 @@ class TestCuteLowerings(unittest.TestCase):
         cluster hands its second CTA an out-of-range tile_n marked valid —
         an unmasked out-of-bounds store on the full-tile TMA path (this was
         silently reachable through ``l2_groupings=[1]`` before the gate).
+        Every 2x2 family now fails closed at the config layer, ahead of the
+        render's own ``divisible by cluster_n`` guard, so the search never
+        spends a compile on the sample: strict normalization names the
+        reason and the search repair drops the cluster (cluster_n -> 1).
+        Whether the CTA pair survives the repair is the quarter-wave gate's
+        call (``matmul_ops``: the 256x256 two-CTA grid must fill a quarter
+        of the SMs), pinned here on both sides of the gate at 148 SMs.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -12079,11 +12103,6 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        # N=768 at bn=256 gives 3 N tiles: cluster_n=2 pads a partial cluster.
-        args = (
-            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16),
-        )
         cfg = _make_tcgen05_persistent_config(
             block_sizes=[256, 256, 128],
             l2_groupings=[1],
@@ -12094,13 +12113,53 @@ class TestCuteLowerings(unittest.TestCase):
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaisesRegex(
-                exc.BackendUnsupported, "divisible by cluster_n"
+
+        def repair(m: int, n: int, n_tiles: int) -> tuple[dict[str, object], str]:
+            # K=128 and M a multiple of 256: an odd N tile count at bn=256.
+            args = (
+                torch.randn(m, 128, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16),
+            )
+            with (
+                patch_cute_mma_support(),
+                patch("helion.runtime.get_num_sm", return_value=148),
             ):
-                bound.to_triton_code(cfg)
+                bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    rf"tcgen05_cluster_n=2 pairs N tiles, but cdiv\({n}, 256\) = "
+                    rf"{n_tiles} tiles is odd",
+                ):
+                    bound.to_triton_code(cfg)
+                repaired = dict(cfg.config)
+                bound.env.config_spec.normalize(repaired, _fix_invalid=True)
+                # The repair reaches a strict fixed point.
+                strict = dict(repaired)
+                bound.env.config_spec.normalize(strict)
+                self.assertEqual(strict, repaired)
+                return repaired, bound.to_triton_code(helion.Config(**repaired))
+
+        # N=768 at bn=256 gives 3 N tiles over 4 M tiles: 12 pair tiles sit
+        # under the 37 co-resident clusters of 148 SMs, so only the one-wave
+        # 256x{128,64} tiles are admitted on two CTAs; the 256x256 sample
+        # drops the cluster and lands on one CTA with the 128-row tile.  (A
+        # CPU bind sees no SMs and skips the gate, keeping the pair.)
+        repaired, code = repair(1024, 768, 3)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 1)
+        self.assertEqual(repaired["block_sizes"], [128, 256, 128])
+        self.assertNotIn("_helion_cute_cluster_shape", code)
+        self.assertIn("cute.make_layout((1, 1, 1))", code)
+        # N=1280 gives 5 N tiles over 8 M tiles: 40 pair tiles clear the
+        # gate, so the repair keeps the tile and the CTA pair and drops the
+        # cluster; the repaired config renders the 2x1 pair.
+        repaired, code = repair(2048, 1280, 5)
+        self.assertEqual(repaired["tcgen05_cluster_n"], 1)
+        self.assertEqual(repaired["tcgen05_cluster_m"], 2)
+        self.assertEqual(repaired["block_sizes"], [256, 256, 128])
+        self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+        self.assertNotIn("(2, 2, 1)", code)
 
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
@@ -20730,8 +20789,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
         # — only difference is the fan-out kernel shape, which
         # should close the productive-body gate and prevent
-        # the rejection from firing.
+        # the rejection from firing. The K tile is 64: the SMEM
+        # model prices the with-source (128, 64) C subtile an
+        # exact-shape auxiliary epilogue allocates, and two such
+        # rings beside a 256x256x128 ab=3 ring (192 KiB + 64 KiB)
+        # overflow the arena the strict normalizer judges.
         config = self._canonical_c_input_config(ab_stages=3)
+        config.config["block_sizes"] = [256, 256, 64]
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True

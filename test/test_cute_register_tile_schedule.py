@@ -11,6 +11,7 @@ tile cannot honour is ignored (see ``RegisterTileOptions``).
 from __future__ import annotations
 
 import ast
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -442,3 +443,77 @@ def test_rolled_fallback_passes_through_a_fragment_capacity_decline() -> None:
         converted = GenerateAST.fragment_capacity_failure(codegen, refusal)
     assert isinstance(converted, helion.exc.InvalidConfig)
     assert "262144" in str(converted) and "232448" in str(converted)
+
+
+def _packed_pid_axis(code: str) -> tuple[int, int]:
+    """``(axis, pack)`` of the pid that carries the packed sub-group."""
+    (match,) = re.finditer(
+        r"pid_\d+ = .* \* (\d+) \+ cutlass\.Int32\(cute\.arch\.thread_idx\(\)\[(\d)\]\)$",
+        code,
+        flags=re.MULTILINE,
+    )
+    return int(match.group(2)), int(match.group(1))
+
+
+def _launch_block(code: str) -> tuple[int, ...]:
+    (match,) = re.finditer(r"block=\((\d+), (\d+), (\d+)\)", code)
+    return tuple(int(dim) for dim in match.groups())
+
+
+@pytest.mark.parametrize("pack", [2, 4])
+@pytest.mark.parametrize(
+    "reduction_loop", [None, 32], ids=["register-tile", "looped-reduction"]
+)
+def test_tiles_per_block_raises_the_sub_group_axis(
+    pack: int, reduction_loop: int | None
+) -> None:
+    # The BH axis is one element per tile and the body only reads
+    # ``tile_bh.id``: no graph distributes over it, so the strategy marks it
+    # inactive.  Packing still makes it a thread axis (the pid varies per
+    # sub-group): the knob stays on the surface, the pid carries the
+    # sub-group on an axis of its own, and the launch raises that axis.
+    # Before the fix the pid read an axis the launch never raised (or the
+    # axis the DV tile owned), and every sub-group but one wrote garbage.
+    bound, _arguments = _bind()
+    spec = bound.config_spec
+    (bh,) = [block.block_id for block in bound.env.block_sizes if block.size == BH]
+    assert spec.cute_tile_pack_counts == {bh: BH}
+    assert "cute_tiles_per_block" in spec.default_config().config
+    extra: dict[str, Any] = {**KNOBS, "cute_tiles_per_block": pack}
+    if reduction_loop is None:
+        config = _config(bound, dv_threads=8, reduction_threads=8, **extra)
+    else:
+        (reduction,) = [
+            block.block_id for block in bound.env.block_sizes if block.reduction
+        ]
+        (dv,) = spec.block_sizes.valid_block_ids()
+        threads = {dv: 4, reduction: 8}
+        config = spec.normalized_config(
+            helion.Config(
+                block_sizes=[4],
+                num_threads=[
+                    threads.get(block_id, 0)
+                    for block_id in spec.num_threads.valid_block_ids()
+                ],
+                reduction_loops=[reduction_loop],
+                cute_tiles_per_block=pack,
+            )
+        )
+    assert config.config["cute_tiles_per_block"] == pack
+    code = bound.to_code(config)
+    assert ("_lane_stash" in code) == (reduction_loop is None)
+    axis, rendered_pack = _packed_pid_axis(code)
+    assert rendered_pack == pack
+    block = _launch_block(code)
+    assert block[axis] == pack
+    # The DV tile and the D reduction index on axes of their own (a linear
+    # lane of a cross-thread reduction legitimately folds every axis in).
+    other_axes = {
+        int(match)
+        for line in code.splitlines()
+        if re.match(r"\s*(indices|lane_base|rindex)_\d+ = ", line)
+        for match in re.findall(r"cute\.arch\.thread_idx\(\)\[(\d)\]", line)
+    }
+    assert other_axes and axis not in other_axes, (axis, other_axes)
+    dv_block = 32 if reduction_loop is None else 4
+    assert f"({BH // pack * (DV // dv_block)},)" in code

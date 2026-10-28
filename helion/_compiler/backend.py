@@ -89,6 +89,11 @@ class FlashSearchSurface(NamedTuple):
     score_modifier_kinds: tuple[str, ...]
     tmem_rowmax_compatible: bool = False
     causal_resident_compatible: bool = False
+    # Dense attention whose epilogue is ``O`` plus the LSE row and nothing
+    # else (``flash_attention_graph_dense_lse_output_from_graphs``; any
+    # softmax scale): the lowerings that store the LSE from the final row
+    # statistics are offered on it as on the output-only dense surface.
+    dense_lse_output: bool = False
     # V/O head dim when it differs from the Q/K ``head_dim`` (MLA prefill).
     head_dim_v: int | None = None
     # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain attention).
@@ -3865,6 +3870,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         ):
             continue
         from .cute.cute_flash import _flash_output_requires_tma
+        from .cute.cute_flash import flash_attention_graph_dense_lse_output_from_graphs
         from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
         from .cute.cute_flash import flash_attention_graph_row_epilogue_from_graphs
         from .cute.cute_flash import (
@@ -3900,6 +3906,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             )
         )
         standard_dense_output = flash_attention_graph_standard_dense_output_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
+        )
+        dense_lse_output = flash_attention_graph_dense_lse_output_from_graphs(
             device_ir.graphs,
             root_block_ids=root_grid_ids,
             kv_block_id=block_ids[0],
@@ -3995,6 +4007,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
                 small_biased_candidate=small_biased_candidate,
                 standard_dense_output=standard_dense_output,
+                dense_lse_output=dense_lse_output,
                 standard_causal_output=standard_causal_output,
                 output_requires_tma=output_requires_tma,
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
@@ -4088,6 +4101,7 @@ def flex_search_surface(
         requires_ws_overlap=False,
         small_biased_candidate=False,
         standard_dense_output=False,
+        dense_lse_output=False,
         standard_causal_output=False,
         output_requires_tma=_flash_output_requires_tma(
             num_bh, match.q_seq, match.head_dim_v
@@ -4142,7 +4156,9 @@ def _flex_dense_search_surface(
     directly), the fused row epilogue and the small biased candidate; the
     standard output-only lowerings need no LSE and the standard scale
     (``_standard_dense_score_plan_supported``), the same test the codegen
-    applies.
+    applies; the flex kernel returns the LSE and applies its scale as a
+    scalar argument, so it is the dense LSE surface (``dense_lse_output``,
+    scale-agnostic) the resident value graph is offered on.
     """
     from .cute.cute_flash import _flash_output_requires_tma
     from .cute.cute_flash import _standard_dense_score_plan_supported
@@ -4164,6 +4180,10 @@ def _flex_dense_search_surface(
         standard_dense_output=(
             match.lse_name is None and _standard_dense_score_plan_supported(plan)
         ),
+        # The flex kernel applies its scale as a scalar argument, so the
+        # output-only fact's standard-scale test fails here by construction;
+        # the LSE fact asks only for the dense plan and the ``O`` + LSE epilogue.
+        dense_lse_output=match.lse_name is not None,
         standard_causal_output=False,
         output_requires_tma=_flash_output_requires_tma(
             num_bh, match.q_seq, match.head_dim_v

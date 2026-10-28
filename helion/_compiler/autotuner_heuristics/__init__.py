@@ -65,6 +65,7 @@ from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_dot_row_reduction import CuteDotRowReductionHeuristic
 from .cute_epilogue_fanout import register_aux_fragment_hoist_coverage
+from .cute_epilogue_fanout import register_epi_warp_groups_coverage
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_fp32_dot import CuteFp32DotHeuristic
 from .cute_fp32_dot import register_fp32_dot_coverage
@@ -176,6 +177,7 @@ from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_packed_operand import register_packed_operand_coverage
 from .cute_radix_selection import CuteRadixSelectionHeuristic
 from .cute_radix_selection import register_radix_selection_coverage
+from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
@@ -228,6 +230,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteChunkRecurrenceHeuristic,
         CuteGdnRecurrenceHeuristic,
         CuteMmaDagHeuristic,
+        CuteRegisterSubblocksHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,
         CuteTopKHeuristic,
@@ -577,6 +580,7 @@ def register_compiler_coverage_groups(
     register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
     register_aux_fragment_hoist_coverage(env, device_ir)
+    register_epi_warp_groups_coverage(env, device_ir)
     register_l2_row_swizzle_coverage(env, device_ir)
     register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)

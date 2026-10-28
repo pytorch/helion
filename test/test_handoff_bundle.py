@@ -17,7 +17,9 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import _has_cute_dsl
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffPolicy
@@ -208,9 +210,8 @@ class _EquivalentSource(ast.NodeTransformer):
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
+@skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
 def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
-    pytest.importorskip("cutlass.cute")
-
     class Pair(NamedTuple):
         x: torch.Tensor
         scale: float
@@ -241,10 +242,9 @@ def test_namedtuple_bundle_replays_in_fresh_process(tmp_path: Path) -> None:
 @pytest.mark.timeout(300)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipIfRefEager("Native handoff requires compilation")
+@skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
 @pytest.mark.parametrize("scale", [2.0, math.inf, -math.inf, math.nan])
 def test_dlpack_and_nonfinite_bundle_inputs(scale: float, tmp_path: Path) -> None:
-    pytest.importorskip("cutlass.cute")
-
     @helion.kernel(
         backend="cute",
         static_shapes=True,
@@ -279,8 +279,8 @@ def test_dlpack_and_nonfinite_bundle_inputs(scale: float, tmp_path: Path) -> Non
 @pytest.mark.parametrize("backend", ["cute", "triton"])
 @pytest.mark.parametrize("multi_shape", [False, True])
 def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) -> None:
-    if backend == "cute":
-        pytest.importorskip("cutlass.cute")
+    if backend == "cute" and not _has_cute_dsl():
+        pytest.skip("requires the supported CuTe DSL")
 
     @helion.kernel(
         backend=backend,

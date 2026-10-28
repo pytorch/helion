@@ -770,6 +770,18 @@ def tcgen05_explicit_epilogue_tile_supported(
     )
 
 
+def tcgen05_epilogue_subtile_m(*, bm: int, is_two_cta: bool) -> int:
+    """Per-CTA M of a configured epilogue subtile (``tcgen05_epi_subtile_n``).
+
+    The CtaGroup.TWO pair's epilogue owns the 128-row half of the 256-row pair
+    tile; one CTA walks whole 128-lane TMEM datapath tiles of its M tile (a
+    64-row tile is one 64-row subtile).
+    """
+    if is_two_cta:
+        return 128
+    return min(bm, 128)
+
+
 def tcgen05_explicit_epilogue_tile_expr(tile_m: int, tile_n: int) -> str:
     """Return the CuTe expression for a validated explicit epilogue tile."""
 

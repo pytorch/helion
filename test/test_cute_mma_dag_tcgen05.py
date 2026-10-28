@@ -2960,6 +2960,41 @@ def _bind_probe_rawlate(bhn: int = 4, d: int = 128, dv: int = 128) -> BoundKerne
     )
 
 
+def _probe_root_pass(
+    q: torch.Tensor, k: torch.Tensor, A: torch.Tensor, g: torch.Tensor
+) -> torch.Tensor:
+    """A streamed K loop whose operand is a pass chain over two loaded
+    tiles (the MMA warp's subject under the pass route) beside a root
+    fp32 tile converted to bf16 by a pass (rawlate's T) for a root dot
+    behind the loop."""
+    BHN = q.size(0)
+    C = hl.specialize(q.size(1))
+    D = q.size(2)
+    out_r = torch.empty([BHN, C, C], dtype=torch.float32, device=q.device)
+    for tile_bhn in hl.tile(BHN, block_size=1):
+        s0 = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+        for tile_d in hl.tile(D):
+            qg = (
+                q[tile_bhn, :, tile_d].to(torch.float32)
+                * g[tile_bhn, :, tile_d].to(torch.float32)
+            ).to(torch.bfloat16)
+            s0 = hl.dot(qg, k[tile_bhn, :, tile_d].transpose(-2, -1), acc=s0)
+        T = A[tile_bhn, :, :].to(torch.bfloat16)
+        out_r[tile_bhn, :, :] = hl.dot(T, s0.to(torch.bfloat16))
+    return out_r
+
+
+def _bind_probe_root_pass(bhn: int = 4, d: int = 128) -> BoundKernel:
+    bf16, f32, c = torch.bfloat16, torch.float32, 64
+    return _bind_probe(
+        _probe_root_pass,
+        ((bhn, c, d), bf16),
+        ((bhn, c, d), bf16),
+        ((bhn, c, c), f32),
+        ((bhn, c, d), bf16),
+    )
+
+
 def _bind_probe_carry2(bhn: int = 4, d: int = 64, e: int = 128) -> BoundKernel:
     bf16, f32, c = torch.bfloat16, torch.float32, 64
     return _bind_probe(
@@ -3390,6 +3425,7 @@ def _version_checked() -> Iterator[list[str]]:
         "emit_carry_alias",
         "emit_ring_iteration",
         "emit_outer_iteration",
+        "emit_ws_loop",
         "emit_region_loop",
     )
     orig = {name: getattr(emitter, name) for name in names}
@@ -3667,6 +3703,9 @@ def _version_checked() -> Iterator[list[str]]:
         "emit_carry_alias": emit_carry_alias,
         "emit_ring_iteration": iteration("emit_ring_iteration"),
         "emit_outer_iteration": iteration("emit_outer_iteration"),
+        # (The warp-specialized streamed loop renders one iteration as the
+        # pass warps' and the MMA warp's loops: one frame for the pair.)
+        "emit_ws_loop": iteration("emit_ws_loop"),
         "emit_region_loop": emit_region_loop,
     }
     with contextlib.ExitStack() as stack:
@@ -5011,10 +5050,13 @@ def test_an_unaligned_derived_source_keeps_the_lane_loads() -> None:
 def _first_tcgen05_seeds(
     bound: BoundKernel, count: int = 4
 ) -> list[tuple[list[int], int, int]]:
+    # (The MMA-warp twin of a seed, ``cute_mma_dag_pass_warps='mma'``, is
+    # the same tile / warps / stages again: not a rank entry.)
     seeds = [
         c.config
         for c in bound.config_spec.compiler_seed_configs
         if c.config["cute_mma_dag"] == "tcgen05"
+        and c.config["cute_mma_dag_pass_warps"] != "mma"
     ]
     return [
         (c["block_sizes"], c["cute_mma_dag_warps"], c["cute_mma_dag_stages"])
@@ -5700,6 +5742,58 @@ def test_staged_stores_drain_by_tma() -> None:
         [f"{P}.cp_async_bulk_wait_group(0, read=True)", "cute.arch.barrier()"],
     )
     assert rest.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 1
+
+
+def test_root_only_tma_stores_skip_the_in_loop_waits() -> None:
+    # A program whose TMA stores are all root stores (mqa_logits: the fp32
+    # out tile goes out slab by slab after the head loop) has no bulk group
+    # in flight inside the loop, so the store thread's read waits ahead of
+    # the loop, ahead of every commit and at the loop's exit are dead --
+    # yet each blocked the MMA-issuing thread (32 per CTA at [128, 128]:
+    # 31.6 -> 27.1 us on the campaign's prefill shape).  Only the drain
+    # before the kernel ends remains.  A loop store by TMA keeps its waits
+    # (``test_staged_stores_drain_by_tma``); a root store issued ahead of a
+    # later loop keeps the pre-loop wait
+    # (``test_tma_store_groups_finish_reading_before_a_loop_and_a_buffers_reuse``).
+    bound = _bind_head_sum()
+    for extra in ({}, {"cute_mma_dag_lookahead": "on", "cute_mma_dag_loads": "tma"}):
+        body = _kernel_body(
+            _source(
+                bound,
+                _config(
+                    128, 128, warps=8, stages=2, cute_mma_dag_epilogue="split", **extra
+                ),
+            )
+        )
+        loop = _loop(body)
+        assert body.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 4
+        assert loop.count(f"{P}.tcgen05_commit(") >= 1
+        assert f"{P}.cp_async_bulk_wait_group(0, read=True)" not in body
+        assert body.count(f"{P}.cp_async_bulk_wait_group(") == 1
+        tail = body[body.rindex(f"{P}.cp_async_bulk_commit_group()") :]
+        _assert_in_order(
+            tail,
+            [
+                f"if md_tidx == {tc.TMA_STORE_THREAD}:",
+                f"{P}.cp_async_bulk_wait_group(0)",
+                "cute.arch.barrier()",
+                f"{P}.tcgen05_dealloc(",
+            ],
+        )
+    # The loop store of dk (bf16 [64, 64]: one swizzle atom per row) turns
+    # its buffer over per iteration: the wait ahead of the iteration's
+    # commit and the one at the loop's exit stay.
+    body = _kernel_body(_source(_bind_dk(), _config(64, warps=4, stages=2)))
+    loop = _loop(body)
+    iteration = loop[: loop.index("md_rk0 = md_rk0 + 1")]
+    _assert_in_order(
+        iteration,
+        [f"{P}.cp_async_bulk_wait_group(0, read=True)", f"{P}.tcgen05_commit("],
+    )
+    exit_ = loop[loop.index("md_rk0 = md_rk0 + 1") :]
+    _assert_in_order(
+        exit_, [f"{P}.cp_async_bulk_wait_group(0, read=True)", "cute.arch.barrier()"]
+    )
 
 
 def test_aux_reads_share_a_staged_operands_tile() -> None:
@@ -8735,3 +8829,375 @@ def test_the_single_loop_persistent_launch_prefetches_the_epilogue_tiles() -> No
         for s in seeds
         if s.config.get("cute_mma_dag_persistent")
     ] == [3]
+
+
+# --------------------------------------------------------------------------
+# The MMA warp (``cute_mma_dag_pass_warps='mma'``)
+# --------------------------------------------------------------------------
+
+
+def test_the_mma_warp_specializes_a_streamed_loop_with_passes() -> None:
+    # se_block dx under ``pass`` at four warps and three stages with the MMA
+    # warp: the launch adds one warp (160 threads); every ring slot gets a
+    # ``md_ready`` barrier with one arrival per pass thread (no init arrive:
+    # the MMA warp's first wait is for the first pass); the K loop renders
+    # as the pass warps' loop (``md_warp < 4``: wait ``md_full``, the passes
+    # -- the in-place convert pass's barrier spans the pass warps alone --
+    # fence, arrive ``md_ready``) and the MMA warp's (``else``: wait
+    # ``md_full`` and ``md_ready``, the MMAs, commit ``md_empty``, the
+    # refill two slots ahead behind its ``md_empty`` wait), no CTA barrier,
+    # no ``md_empty`` wait ahead of the passes (the refill waited it) and no
+    # ``md_cb`` commit (``md_cn`` is untouched: the exit's ``md_empty`` wait
+    # drains the loop).  The value-version checker and the commit-chain
+    # checker pass the render.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    bound = _bind_se_block("se_block_bwd_dx")
+    config = _config(
+        64,
+        64,
+        64,
+        warps=4,
+        stages=3,
+        cute_mma_dag_derived="pass",
+        cute_mma_dag_pass_warps="mma",
+    )
+    source = _source(bound, config)
+    assert "block=(160, 1, 1)" in source
+    body = _kernel_body(source)
+    assert "md_ready0 = cute.arch.alloc_smem(cutlass.Int64, 3, alignment=8)" in body
+    for stage in range(3):
+        assert f"{P}.mbarrier_init(md_ready0 + {stage}, 128)" in body
+        assert f"{P}.mbarrier_arrive(md_ready0 + {stage})" not in body
+    prologue, rest = body.split("if md_warp < 4:\n", 1)
+    passes, rest = rest.split("    else:\n", 1)
+    mmas, after = rest.split("md_rk0 = md_rk0 + 1", 1)
+    assert "mbarrier_arrive(md_ready" not in prologue
+    assert passes.count("for md_i in cutlass.range(0, 2):") == 1
+    assert mmas.count("for md_i in cutlass.range(0, 2):") == 1
+    _assert_in_order(
+        passes,
+        [
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            "_helion_mma_dag.lds_v4_b32(",
+            "cute.arch.barrier(barrier_id=2, number_of_threads=128)",
+            f"{RT}.sts_v4_f32(",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            f"{P}.mbarrier_arrive(md_ready0 + md_st0)",
+            "md_rk0 = md_rk0 + 1",
+        ],
+    )
+    for absent in (
+        "cute.arch.barrier()",
+        "mbar_wait(md_empty0",
+        "tcgen05_mma(",
+        "tcgen05_commit(",
+        "md_cn",
+        "md_warp == 0",
+    ):
+        assert absent not in passes, absent
+    _assert_in_order(
+        mmas,
+        [
+            f"{RT}.mbar_wait(md_full0 + md_st0, md_rd0)",
+            f"{RT}.mbar_wait(md_ready0 + md_st0, md_rd0)",
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.AFTER_THREAD_SYNC)",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_empty0 + md_st0, group={P}.CTAGroup.CTA_1)",
+            f"if {P}.elect_sync():",
+            "if md_i + 2 < 2 - 0:",
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 + 2) % 3, (md_rk0 + 2) // 3 & 1)",
+            f"{P}.mbarrier_arrive_expect_tx(md_full0 + (md_rk0 + 2) % 3",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(",
+        ],
+    )
+    for absent in (
+        "cute.arch.barrier",
+        "tcgen05_commit(md_cb",
+        "lds_v4",
+        "sts_v4",
+        "md_cn",
+        "md_warp == 0",
+        "cp_async_bulk_wait_group",
+    ):
+        assert absent not in mmas, absent
+    _assert_in_order(
+        after,
+        [
+            f"{RT}.mbar_wait(md_empty0 + (md_rk0 - 1) % 3, (md_rk0 - 1) // 3 + 1 & 1)",
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.AFTER_THREAD_SYNC)",
+            "cute.arch.barrier()",
+            f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
+        ],
+    )
+    assert "md_cn = md_cn + 1" not in body
+    assert _commits_while_one_is_outstanding(body) == []
+    assert _version_errors(bound, config) == []
+    # The chain schedule's render: the same tile with the CTA barrier in the
+    # loop, warp 0 issuing, no ready barriers and no extra warp.
+    plain = _source(
+        bound, _config(64, 64, 64, warps=4, stages=3, cute_mma_dag_derived="pass")
+    )
+    assert "block=(128, 1, 1)" in plain and "md_ready" not in plain
+    assert (
+        "cute.arch.barrier()"
+        in _loop(_kernel_body(plain)).split("md_rk0 = md_rk0 + 1")[0]
+    )
+
+
+def test_the_mma_warp_has_a_subject_in_streamed_loops_with_passes_only() -> None:
+    # ``Tcgen05Facts.streamed`` names the streamed candidates with their
+    # slots, passed load operands and pass chains; ``mma`` has a subject
+    # where one streams (a chain under the pass route only) with a pass:
+    # elsewhere the normalizer pins the knob off (the warp mode, the
+    # single-loop renderer, dx under the exchange route, wy's streamed loop
+    # without a pass).  The MMA warp's ``md_ready`` barriers count in the
+    # shared memory (eight bytes per slot).
+    from test.test_cute_mma_dag import _bind_se_block
+
+    dx = _bind_se_block("se_block_bwd_dx")
+    facts = dx.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None
+    (dot,) = _match(dx).dots
+    assert facts.tcgen05.streamed == (
+        tc.StreamedLoopFacts(loop=0, slots=(dot.slot,), passes=1, chains=1),
+    )
+    reason = dag.mma_dag_pass_warps_reason
+    assert reason(facts, 4, 3, "tcgen05", "mma", "pass") is None
+    assert reason(facts, 8, 1, "tcgen05", "mma", "pass") is None
+    assert "cute_mma_dag_derived='pass' only" in str(
+        reason(facts, 4, 3, "tcgen05", "mma", "exchange")
+    )
+    assert "warp mode" in str(reason(facts, 4, 3, "warp", "mma", "pass"))
+    single = _bind_fwd_h_delta(gated=True).config_spec.cute_mma_dag_facts
+    assert single is not None and single.tcgen05 is not None
+    assert not single.tcgen05.regions
+    assert "region renderer" in str(reason(single, 8, 3, "tcgen05", "mma", "pass"))
+    wy = _bind_wy(gated=True)
+    wy_facts = wy.config_spec.cute_mma_dag_facts
+    assert wy_facts is not None and wy_facts.tcgen05 is not None
+    assert [(s.passes, s.chains) for s in wy_facts.tcgen05.streamed] == [(0, 0)]
+    assert "needs a pass" in str(reason(wy_facts, 4, 2, "tcgen05", "mma", "exchange"))
+    assert (
+        regions.region_barrier_bytes(facts.tcgen05, 3, True)
+        - regions.region_barrier_bytes(facts.tcgen05, 3)
+        == 24
+    )
+    sizes = _sizes_of(dx, [64, 64, 64])
+    assert (
+        dag.mma_dag_config_reason(
+            facts, sizes, 4, 3, "tcgen05", "pass", pass_warps="mma"
+        )
+        is None
+    )
+
+    def pinned(bound: BoundKernel, **extra: object) -> str:
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(
+                helion.Config(cute_mma_dag_pass_warps="mma", **extra)
+            )
+        return cast("str", normalized.config["cute_mma_dag_pass_warps"])
+
+    tcgen05 = {
+        "cute_mma_dag": "tcgen05",
+        "cute_mma_dag_warps": 4,
+        "cute_mma_dag_stages": 3,
+    }
+    assert (
+        pinned(dx, block_sizes=[64, 64, 64], cute_mma_dag_derived="pass", **tcgen05)
+        == "mma"
+    )
+    assert (
+        pinned(dx, block_sizes=[64, 64, 64], cute_mma_dag_derived="exchange", **tcgen05)
+        == "off"
+    )
+    assert (
+        pinned(
+            dx,
+            block_sizes=[64, 64, 64],
+            cute_mma_dag="warp",
+            cute_mma_dag_warps=4,
+            cute_mma_dag_stages=2,
+            cute_mma_dag_derived="pass",
+        )
+        == "off"
+    )
+    assert pinned(wy, block_sizes=[1, 64, 64], **tcgen05) == "off"
+
+
+def test_the_mma_warp_seed_follows_the_streamed_seed() -> None:
+    # The first tensor-memory seed's MMA-warp twin sits right behind the seed
+    # whose route gives it a subject: dx's streamed pass seed (the pass
+    # route leads there), dqkw's first seed under the exchange route (its
+    # streamed loop converts a tile, no chain); wy's streamed loop takes no
+    # pass, so it has none.  The plain seed stays the promoted default and
+    # the twin survives normalization.
+    from test.test_cute_mma_dag import _bind_se_block
+
+    dx = _bind_se_block("se_block_bwd_dx")
+    seeds = [
+        c.config
+        for c in dx.config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "tcgen05"
+    ]
+    first, twin, third = seeds[:3]
+    assert (first["cute_mma_dag_derived"], first["cute_mma_dag_pass_warps"]) == (
+        "pass",
+        "off",
+    )
+    assert (twin["cute_mma_dag_derived"], twin["cute_mma_dag_pass_warps"]) == (
+        "pass",
+        "mma",
+    )
+    assert (third["cute_mma_dag_derived"], third["cute_mma_dag_pass_warps"]) == (
+        "exchange",
+        "off",
+    )
+    key = ("block_sizes", "cute_mma_dag_warps", "cute_mma_dag_stages")
+    assert [twin[k] for k in key] == [first[k] for k in key]
+    assert sum(c["cute_mma_dag_pass_warps"] == "mma" for c in seeds) == 1
+    assert dx.config_spec.default_config().config["cute_mma_dag_pass_warps"] == "off"
+    with dx.env:
+        normalized = dx.config_spec.normalized_config(helion.Config(**twin)).config
+    assert normalized["cute_mma_dag_pass_warps"] == "mma"
+    dqkw = _bind_dqkw()
+    seeds = [
+        c.config
+        for c in dqkw.config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag") == "tcgen05"
+    ]
+    first, twin = seeds[:2]
+    assert (first["cute_mma_dag_derived"], first["cute_mma_dag_pass_warps"]) == (
+        "exchange",
+        "off",
+    )
+    assert (twin["cute_mma_dag_derived"], twin["cute_mma_dag_pass_warps"]) == (
+        "exchange",
+        "mma",
+    )
+    assert [twin[k] for k in key] == [first[k] for k in key]
+    wy = _bind_wy(gated=True)
+    assert all(
+        c.config.get("cute_mma_dag_pass_warps") != "mma"
+        for c in wy.config_spec.compiler_seed_configs
+    )
+
+
+def _enclosing_headers(lines: list[str], index: int) -> tuple[str, ...]:
+    """The headers of the blocks line ``index`` of ``lines`` sits in,
+    innermost first."""
+    indent = len(lines[index]) - len(lines[index].lstrip())
+    headers = []
+    for line in reversed(lines[:index]):
+        if not line.strip():
+            continue
+        depth = len(line) - len(line.lstrip())
+        if depth < indent and line.rstrip().endswith(":"):
+            headers.append(line.strip())
+            indent = depth
+    return tuple(headers)
+
+
+def _guarded_blocks(lines: list[str], guard: str) -> list[list[str]]:
+    """The bodies of every ``guard`` block of ``lines`` (the lines indented
+    past the header, up to the next line at its depth)."""
+    blocks = []
+    for index, line in enumerate(lines):
+        if line.strip() != guard:
+            continue
+        depth = len(line) - len(line.lstrip())
+        body = []
+        for inner in lines[index + 1 :]:
+            if inner.strip() and len(inner) - len(inner.lstrip()) <= depth:
+                break
+            body.append(inner)
+        blocks.append(body)
+    return blocks
+
+
+def _packet_rows_outside(lines: list[str], warps: int) -> list[tuple[str, ...]]:
+    """The enclosing headers of every per-thread packet row / lane
+    definition (``md_pr_*``, ``md_prow*``, ``md_spr_*``, ``md_lr_*``) outside
+    the pass warps' branch of a warp-specialized loop."""
+    rows = []
+    for index, line in enumerate(lines):
+        if re.match(r"\s*(md_pr_|md_prow|md_spr_|md_lr_)", line) is None:
+            continue
+        headers = _enclosing_headers(lines, index)
+        if f"if md_warp < {warps}:" not in headers:
+            rows.append(headers)
+    return rows
+
+
+def test_the_mma_warp_owns_no_packet_outside_its_loop() -> None:
+    # The MMA warp runs every pass and packet drain the program has beside
+    # its warp-specialized loop predicated off (``pass_guard``: the config's
+    # threads partition the packets round-robin, so a full round would
+    # hand thread ``threads + j`` packet ``count + j`` -- rows past the
+    # tile; gated dqkw's seed faulted on its drain).  dqkw (gated) under
+    # its seed: the chain-schedule ring loop's in-place pass of loop 2 and
+    # the two staged stores drained in packets; the root-pass probe: a root
+    # fp32 tile's convert pass behind its staged wait.  Every per-thread
+    # packet row defined outside the ``md_warp < warps`` branch sits under
+    # ``if md_tidx < threads:``, the TMA waits ahead of the passes and the
+    # CTA barriers around them outside it (the warp arrives), and the
+    # chain schedule's render (``off``) has no such guard.
+    dqkw = _bind_dqkw(gated=True)
+    (seed,) = [
+        c.config
+        for c in dqkw.config_spec.compiler_seed_configs
+        if c.config.get("cute_mma_dag_pass_warps") == "mma"
+    ]
+    warps = seed["cute_mma_dag_warps"]
+    threads = 32 * warps
+    guard = f"if md_tidx < {threads}:"
+    source = _source(dqkw, helion.Config(**seed))
+    assert f"block=({threads + 32}, 1, 1)" in source
+    lines = _kernel_body(source).splitlines()
+    outside = _packet_rows_outside(lines, warps)
+    assert outside and all(guard in headers for headers in outside), outside
+    blocks = _guarded_blocks(lines, guard)
+    assert len(blocks) == 3
+    ring, drain_a, drain_b = ["\n".join(block) for block in blocks]
+    assert "md_st2" in ring and "lds_v4_b32(" in ring and "sts_v4_b32(" in ring
+    for drain in (drain_a, drain_b):
+        assert "stg_v4_b32(" in drain and "lds_v4_b32(" in drain
+        assert "md_st" not in drain
+    for block in blocks:
+        assert "cute.arch.barrier" not in "\n".join(block)
+        assert block[-1].strip() in (
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            *(line.strip() for line in block if "stg_v4_b32(" in line),
+        )
+    before = lines.index(f"            {guard}") - 1
+    assert lines[before].strip() == f"{RT}.mbar_wait(md_full2 + md_st2, md_rd2)"
+    assert lines[before + 2 + len(blocks[0])].strip() == "cute.arch.barrier()"
+    for index, line in enumerate(lines):
+        if line.strip() == "cute.arch.barrier()":
+            assert guard not in _enclosing_headers(lines, index)
+    plain = _source(dqkw, helion.Config(**{**seed, "cute_mma_dag_pass_warps": "off"}))
+    assert guard not in plain and "md_ready" not in plain
+    # The root-pass probe: the raw tile's convert pass runs behind the
+    # staged wait under the guard, the CTA barrier that publishes it
+    # outside; the value-version checker passes the render.
+    probe = _bind_probe_root_pass()
+    config = _config(
+        64,
+        warps=4,
+        stages=2,
+        cute_mma_dag_derived="pass",
+        cute_mma_dag_pass_warps="mma",
+    )
+    source = _source(probe, config)
+    assert "block=(160, 1, 1)" in source and "md_ready0" in source
+    lines = _kernel_body(source).splitlines()
+    outside = _packet_rows_outside(lines, 4)
+    assert outside and all("if md_tidx < 128:" in headers for headers in outside)
+    (block,) = _guarded_blocks(lines, "if md_tidx < 128:")
+    text = "\n".join(block)
+    assert "lds_v4_f32(md_s0 + " in text and "sts_v2_b32(" in text
+    assert "cute.arch.barrier" not in text
+    at = lines.index("    if md_tidx < 128:")
+    assert lines[at - 1].strip() == f"{RT}.mbar_wait(md_sfr, 0)"
+    assert lines[at + 1 + len(block)].strip() == "cute.arch.barrier()"
+    assert _version_errors(probe, config) == []
