@@ -514,7 +514,11 @@ def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
 
     with bound.env:
         spec = bound.config_spec
-        with pytest.raises(helion.exc.InvalidConfig, match="cta_group='two'"):
+        # The config layer's odd-N rule (every 2x2 family) names the tile
+        # count ahead of the paired family's own check.
+        with pytest.raises(
+            helion.exc.InvalidConfig, match="cta_group='two'|tiles is odd"
+        ):
             spec.normalized_config(paired(64))
         repaired = dict(paired(64).config)
         spec.normalize(repaired, _fix_invalid=True)
