@@ -41,6 +41,18 @@ def elementwise_min(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+class TestFlydslImports(TestCase):
+    # No GPU or HELION_BACKEND needed: runs wherever flydsl is installed.
+    def test_library_imports_resolve(self) -> None:
+        # Every import line emitted into generated code must resolve against
+        # the installed flydsl, so a flydsl module rename fails here first.
+        from helion._compiler.flydsl.backend import FlyDSLBackend
+
+        for name, stmt in FlyDSLBackend().library_imports.items():
+            with self.subTest(name=name):
+                exec(stmt, {})
+
+
 @onlyBackends(["flydsl"])
 class TestFlydslElementwise(TestCase):
     def test_elementwise_map_no_reduction(self) -> None:
