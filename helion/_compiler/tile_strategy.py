@@ -75,6 +75,10 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+# Set once the missing ``tl.range(data_partition_factor=...)`` was warned about.
+_warned_data_partition_factor: list[bool] = []
+
+
 class ThreadAxisTracker:
     """Tracks thread axis assignments for block dimensions during codegen."""
 
@@ -8298,7 +8302,14 @@ class TileStrategy:
         dpf_value = config.get("_triton_range_value_data_partition_factor", None)
 
         if dpf_range is not None and dpf_value is not None and dpf_range == block_idx:
-            kwargs.append(f"data_partition_factor={dpf_value}")
+            from .._compat import range_supports_data_partition_factor
+            from .compile_environment import warning
+
+            if range_supports_data_partition_factor():
+                kwargs.append(f"data_partition_factor={dpf_value}")
+            elif not _warned_data_partition_factor:
+                _warned_data_partition_factor.append(True)
+                warning(exc.TritonOptionUnavailable("data_partition_factor"))
 
         return kwargs
 

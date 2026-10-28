@@ -509,6 +509,13 @@ class BlockPtrIndexingUnavailable(BaseWarning):
     )
 
 
+class TritonOptionUnavailable(BaseWarning):
+    message = (
+        "The config asks for the Triton option {0!r}, which this Triton build "
+        "does not accept; the kernel runs without it."
+    )
+
+
 class TensorOperationInWrapper(BaseWarning):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "
