@@ -255,8 +255,7 @@ class FlyDSLBackend(Backend):
             "arith": "from flydsl.expr import arith",
             "rocdl": "from flydsl.expr import rocdl",
             "gpu": "from flydsl.expr import gpu",
-            "full": "from flydsl.expr.vector import full",
-            "ReductionOp": "from flydsl.expr.vector import ReductionOp",
+            "ReductionOp": "from flydsl.expr import ReductionOp",
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
