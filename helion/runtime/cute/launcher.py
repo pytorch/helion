@@ -913,6 +913,18 @@ def _append_cute_wrapper_plan(
         call_args.extend(tma_params)
         return
 
+    if kind == "helion_register_subblocks":
+        # Register sub-block programs: ``warps`` consecutive work items
+        # (batch row, channel tile, independent group) per CTA.
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_ctas')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
     if kind == "helion_warp_mma_gemm":
         # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
         # plain tensor arguments, no host-side descriptors.
@@ -6931,6 +6943,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         "helion_small_biased_attention",
         "helion_flash_row_mma",
         "helion_warp_mma_gemm",
+        "helion_register_subblocks",
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
