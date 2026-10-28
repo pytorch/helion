@@ -427,11 +427,6 @@ class _Settings:
     distributed: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
     )
-    ttgir_weight_prefetch: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_TTGIR_WEIGHT_PREFETCH", True
-        )
-    )
     cross_loop_transitive_waits: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CROSS_LOOP_TRANSITIVE_WAITS", True
@@ -764,12 +759,6 @@ class Settings(_Settings):
             "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
             "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
             "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
-        ),
-        "ttgir_weight_prefetch": (
-            "If True, cross-loop Triton kernels with single-device state issue the "
-            "pipelined prologue copies of tensors they never write before readiness "
-            "waits instead of after them (helion.runtime.triton.ttgir_weight_prefetch). "
-            "Set HELION_TTGIR_WEIGHT_PREFETCH=0 to disable."
         ),
         "cross_loop_transitive_waits": (
             "If True, a cross-loop root does not wait on a producer root whose data its "

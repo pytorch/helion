@@ -680,11 +680,10 @@ class TritonBackend(Backend):
                 out.append(f"_tensor_storage_aliases={alias_groups!r}")
         env = CompileEnvironment.current()
         if (
-            env.settings.ttgir_weight_prefetch
             # Only megakernels whose roots poll each other (static or dynamic
             # cross-loop pipelines) get the pass and its TTGIR parsing; barrier
             # phases have no readiness spins to prefetch across.
-            and device_fn.config.cross_loop_pipeline != "barrier"
+            device_fn.config.cross_loop_pipeline != "barrier"
             and device_fn.triton_persistent_state_specs
             and not any(spec[3] for spec in device_fn.triton_persistent_state_specs)
             and not device_fn.triton_remote_copy_signal_slots

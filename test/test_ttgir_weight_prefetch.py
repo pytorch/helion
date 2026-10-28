@@ -1427,8 +1427,18 @@ _TWO_PRODUCER_CONFIG = helion.Config(
 )
 
 
-def _compiled_ttgir(bound: object) -> list[str]:
-    return [compiled.asm["ttgir"] for compiled in _compiled(bound)]
+def _run_without_pass(
+    bound: object, config: helion.Config, *args: object
+) -> torch.Tensor:
+    """``bound`` run with the pass left out of its launch (a baseline): with no
+    launch flag, no hook keys or rewrites the compile."""
+
+    def launch(kernel: object, grid: object, *a: object, **kw: object) -> object:
+        assert kw.pop("_ttgir_weight_prefetch")
+        return helion.runtime.default_launcher(kernel, grid, *a, **kw)  # pyrefly: ignore[bad-argument-type]
+
+    bound.set_config(config)  # pyrefly: ignore[missing-attribute]
+    return cast("torch.Tensor", bound._run(*args, _launcher=launch))  # pyrefly: ignore[missing-attribute]
 
 
 def _compiled(bound: object) -> list[object]:
@@ -1450,12 +1460,11 @@ class TestTtgirWeightPrefetchCompile(TestCase):
         w = (0.05 * torch.randn(256, 512, device=DEVICE)).bfloat16()
         return x, gamma, w
 
-    def _kernel(self, enabled: bool) -> helion.Kernel:
+    def _kernel(self) -> helion.Kernel:
         return helion.kernel(
             _norm_gemv,
             config=_CONFIG,
             static_shapes=True,
-            ttgir_weight_prefetch=enabled,
             ignore_warnings=[helion.exc.TensorOperationInWrapper],
         )
 
@@ -1463,16 +1472,22 @@ class TestTtgirWeightPrefetchCompile(TestCase):
     @skipIfCudaCapabilityLessThan((8, 0))
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_megakernel_issues_weight_copies_before_wait(self) -> None:
-        # The weight copies move above the readiness spin.
+        # The weight copies move above the readiness spin (baseline: the same
+        # kernel launched without the pass).
         args = self._inputs()
         outputs = {}
+        # Kernels with the same code share one module (and Triton cache).
+        seen: set[int] = set()
         for enabled in (True, False):
-            kernel = self._kernel(enabled)
+            kernel = self._kernel()
             bound = kernel.bind(args)
-            code = bound.to_triton_code(_CONFIG)
-            self.assertEqual("_ttgir_weight_prefetch=True" in code, enabled)
-            outputs[enabled] = kernel(*args)
-            (ttgir,) = _compiled_ttgir(bound)
+            self.assertIn("_ttgir_weight_prefetch=True", bound.to_triton_code(_CONFIG))
+            outputs[enabled] = (
+                kernel(*args) if enabled else _run_without_pass(bound, _CONFIG, *args)
+            )
+            (compiled,) = [c for c in _compiled(bound) if id(c) not in seen]
+            seen.add(id(compiled))
+            ttgir = compiled.asm["ttgir"]  # pyrefly: ignore[missing-attribute]
             lines = ttgir.splitlines()
             poll = next(i for i, line in enumerate(lines) if "ld.acquire" in line)
             early = [
@@ -1498,7 +1513,7 @@ class TestTtgirWeightPrefetchCompile(TestCase):
     def test_barrier_pipeline_gets_no_pass(self) -> None:
         # Barrier phases have no readiness spins to prefetch across: the launch
         # asks for neither the pass nor its TTGIR parsing.
-        bound = self._kernel(True).bind(self._inputs())
+        bound = self._kernel().bind(self._inputs())
         barrier = helion.Config(
             block_sizes=[],
             cross_loop_pipeline="barrier",
@@ -1578,12 +1593,13 @@ class TestTtgirWeightPrefetchCompile(TestCase):
             range_num_stages=[0, 0, 4],
         )
         outputs = {}
+        # Kernels with the same code share one module (and Triton cache).
+        seen: set[int] = set()
         for enabled in (True, False):
             kernel = helion.kernel(
                 _norm_gemv_masked,
                 config=config,
                 static_shapes=True,
-                ttgir_weight_prefetch=enabled,
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )
             bound = kernel.bind((x, gamma, w, y))
@@ -1600,13 +1616,20 @@ class TestTtgirWeightPrefetchCompile(TestCase):
                 len(lines[wait]) - len(lines[wait].lstrip()),
                 len(lines[loop]) - len(lines[loop].lstrip()),
             )
-            outputs[enabled] = kernel(x, gamma, w, y)
+            outputs[enabled] = (
+                kernel(x, gamma, w, y)
+                if enabled
+                else _run_without_pass(bound, config, x, gamma, w, y)
+            )
             module = sys.modules[bound._run.__module__]  # pyrefly: ignore[missing-attribute]
-            (ttgir,) = [
-                compiled.asm["ttgir"]
+            (compiled,) = [
+                compiled
                 for caches in module._helion__norm_gemv_masked.device_caches.values()
                 for compiled in caches[0].values()
+                if id(compiled) not in seen
             ]
+            seen.add(id(compiled))
+            ttgir = compiled.asm["ttgir"]
             poll = ttgir.index("ld.acquire", ttgir.index("tt.func public"))
             early = ttgir[:poll].count("async_copy_global_to_local")
             self.assertEqual(early > 0, enabled)
@@ -1674,7 +1697,7 @@ class TestTtgirWeightPrefetchCompile(TestCase):
         from helion.runtime.precompile_shim import make_precompiler
 
         args = self._inputs()
-        kernel = self._kernel(True)
+        kernel = self._kernel()
         bound = kernel.bind(args)
         bound.set_config(_CONFIG)
         extracted: dict[str, object] = {}
