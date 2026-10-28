@@ -858,7 +858,12 @@ def baseline_factories(case: Any) -> dict[str, Callable]:
 
             return call
 
+        # The flash backend has no additive-bias (attn_mask) kernel, so it is
+        # not offered for the biased case (its fourth argument is the bias).
+        biased = len(case.args) == 4
         for kind in ["flash", "cudnn", "efficient"]:
+            if kind == "flash" and biased:
+                continue
             result[f"aten.sdpa.{kind}"] = lambda kind=kind: selected_sdpa(kind)
     if module == "fp8_attention":
 
