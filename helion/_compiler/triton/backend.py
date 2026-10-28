@@ -477,6 +477,11 @@ class TritonBackend(Backend):
         if reduction_type == "sum":
             return f"tl.sum({input_name}, {dim})"
         if reduction_type in {"max", "min"}:
+            from ..compile_environment import CompileEnvironment
+
+            if CompileEnvironment.current().settings.fast_math:
+                return f"tl.{reduction_type}({input_name}, {dim})"
+
             # tl.max/tl.min drop NaN; torch.amax/amin propagate it.
             return (
                 f"helion_triton_helpers.{reduction_type}_propagate_nan"

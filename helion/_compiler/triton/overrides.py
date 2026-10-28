@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from torch._inductor import config as inductor_config
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.codegen.triton import triton_compute_type
 from torch._inductor.virtualized import V
@@ -114,6 +115,18 @@ class HelionTritonOverrides(TritonOverrides):
                 f".to({triton_type}, bitcast=True)"
             )
         return TritonOverrides._shaped_constant(value, dtype, shape)
+
+    @staticmethod
+    def maximum(a: str, b: str) -> str:
+        if inductor_config.use_fast_math:
+            return f"tl.maximum({a}, {b})"
+        return TritonOverrides.maximum(a, b)
+
+    @staticmethod
+    def minimum(a: str, b: str) -> str:
+        if inductor_config.use_fast_math:
+            return f"tl.minimum({a}, {b})"
+        return TritonOverrides.minimum(a, b)
 
     @staticmethod
     def _can_simplify_div() -> bool:
