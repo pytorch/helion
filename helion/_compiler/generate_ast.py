@@ -2920,7 +2920,12 @@ def _generate_ast(
                 except exc.BackendUnsupported as error:
                     # A lane-loop pass after the root dispatch can refuse a
                     # root the fragment owner declined for capacity.
-                    raise codegen.fragment_capacity_failure(error) from error
+                    failure = codegen.fragment_capacity_failure(error)
+                    if failure is error:
+                        # ``raise error from error`` would make the exception
+                        # its own cause and recurse while being printed.
+                        raise
+                    raise failure from error
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             # Re-binding checks deferred from tcgen05 epilogue chains that no
             # store drained (chains ending in an atomic or a specialized
@@ -2947,7 +2952,10 @@ def _generate_ast(
             except exc.BackendUnsupported as error:
                 # Lane-loop finalization can refuse a root the fragment owner
                 # declined for capacity (see ``fragment_capacity_failure``).
-                raise codegen.fragment_capacity_failure(error) from error
+                failure = codegen.fragment_capacity_failure(error)
+                if failure is error:
+                    raise
+                raise failure from error
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
                 or codegen.device_function.cute_state.owned_root_block_dims
