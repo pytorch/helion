@@ -2856,6 +2856,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if not settings.cute_stage_unaligned_operands:
             # Non-default only: the pass changes the host code, not configs.
             parts.append("cute_stage_unaligned_operands=False")
+        if not settings.cute_flat_edge_tma:
+            parts.append("cute_flat_edge_tma=False")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(

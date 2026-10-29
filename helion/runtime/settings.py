@@ -665,6 +665,11 @@ class _Settings:
             _env_get_bool, "HELION_CUTE_STAGE_UNALIGNED_OPERANDS", True
         )
     )
+    cute_flat_edge_tma: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_FLAT_EDGE_TMA", True
+        )
+    )
     cute_exact_division: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
@@ -936,6 +941,13 @@ class Settings(_Settings):
             "producers instead of the scalar shared-memory producers. Set False "
             "(HELION_CUTE_STAGE_UNALIGNED_OPERANDS=0) to run such operands "
             "in place."
+        ),
+        "cute_flat_edge_tma": (
+            "If True (the default), flat one-CTA tcgen05 matmul kernels load "
+            "partial output tiles and the K tail through TMA (zero-filled past "
+            "the extents) and store them with predicated vector copies. Set "
+            "False (HELION_CUTE_FLAT_EDGE_TMA=0) for the scalar shared-memory "
+            "edge staging those tiles used before."
         ),
         "cute_exact_division": (
             "If True (the default), an fp32 division by a loop-invariant scalar "

@@ -755,6 +755,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _ragged_batched_tcgen05_config
     from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -830,11 +831,15 @@ def _detect_specialized_mma_loop(
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
+    # Ragged batched tiles take the flat one-CTA tcgen05 pipeline (TMA
+    # zero-fill, predicated stores); the launch geometry must agree with
+    # ``_emit_mma_pipeline``'s admission or the MMA warp never exists.
     candidates = [
         (node, candidate)
         for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        or _ragged_batched_tcgen05_config(config, bn)
     ]
     if not candidates:
         return False

@@ -25,10 +25,19 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
 # edge-family default.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES = 2
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
-# The double-output-edge + K-tail CtaGroup.TWO search family is validated
-# only for large square-ish GEMMs where persistent clustered scheduling has
-# enough work to amortize its edge handling.
-TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
+# The double-output-edge + K-tail CtaGroup.TWO search family: originally
+# validated on large square-ish GEMMs (5000^3), it holds on every ragged
+# shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
+# 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
+# matching torch within bf16 rounding); the quarter-wave work gate in
+# ``plan_cute_tcgen05_search`` already keeps it off grids too small to fill
+# the SMs, so the floor only needs to exclude the launch-bound regime.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 1024
+# Narrowest N tile of the ragged batched tcgen05 path: at bn <= 16 the
+# lowering emits no MMA body for a partial batched tile (the output stayed
+# unwritten), so those configs keep the generic lowering in every gate, and
+# a batched GEMM whose N admits no wider tile keeps the generic search.
+RAGGED_BATCHED_MIN_BLOCK_N = 32
 # That same family is validated only at this K/stage point. The output-edge
 # full-tile TMA-store epilogue needs an extra SMEM tile, so the edge seed must
 # stay within ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``. Larger explicit

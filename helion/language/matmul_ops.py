@@ -20,6 +20,7 @@ from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
+from .._compiler.cute.tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -546,7 +547,19 @@ def _plan_cute_tcgen05_search_candidate(
             and not is_tf32
         )
         or rhs.dtype != lhs.dtype
-        or m_hint < 64
+        # Fewer than 64 static rows run as one zero-filled 64-row tile on the
+        # flat pipeline (decode GEMMs: bf16 16x14336x4096 27 us against the
+        # SIMT fallback's 358 us); a dynamic M keeps the 64-row floor, and a
+        # single row stays SIMT (a TMA box over an extent-1 dimension ran
+        # 1x4096x4096 at 327 us against 20 us for two rows).
+        or (
+            m_hint < 64
+            if static_m is None
+            # Only the memory-bound decode shapes profit from the padded
+            # tile; a tiny GEMM (33^3) keeps the SIMT lowering, which wins
+            # there (2.8 us against the tile's 13.8).
+            else static_m < 2 or (static_m < 64 and (n_hint < 128 or k_hint < 128))
+        )
         # Size-one tile axes are fixed to block size one before this analysis,
         # so they cannot carry the minimum tcgen05 instruction tile.
         or (static_n is not None and static_n < 2)
@@ -626,15 +639,31 @@ def _plan_cute_tcgen05_search_candidate(
         if static_m is not None and static_n is not None and static_k is not None:
             if static_m % min_search_m != 0:
                 min_search_m = 64
-            max_search_m = min(max_search_m, static_m & -static_m)
-            max_search_n = min(max_search_n, static_n & -static_n)
-            max_search_k = min(max_search_k, static_k & -static_k)
             if (
-                max_search_m < min_search_m
-                or max_search_n < min_search_n
-                or max_search_k < mma_k
+                (lhs.ndim < 3 and rhs.ndim < 3)
+                or max_search_n < RAGGED_BATCHED_MIN_BLOCK_N
+                or not env.settings.cute_flat_edge_tma
             ):
-                return reject()
+                # The passthrough axis is the kernel's, not an operand's (a
+                # grouped GEMM whose group tile selects rows through offsets;
+                # its families register whole native tiles), or N admits no
+                # tile the ragged batched pipeline lowers: the search keeps
+                # the power-of-two divisors of the extents.
+                max_search_m = min(max_search_m, static_m & -static_m)
+                max_search_n = min(max_search_n, static_n & -static_n)
+                max_search_k = min(max_search_k, static_k & -static_k)
+                if (
+                    max_search_m < min_search_m
+                    or max_search_n < min_search_n
+                    or max_search_k < mma_k
+                ):
+                    return reject()
+            # Ragged batched extents keep the plain GEMM's search ceilings:
+            # the flat one-CTA pipeline loads partial tiles and the K tail
+            # through TMA and stores them with predicated SIMT copies, as it
+            # does for a rank-2 GEMM (bf16 16x1000^3 ran the SIMT fallback at
+            # 182 us against cuBLAS's 37 us when the tiles had to divide the
+            # extents).
     if (
         static_m is not None
         and static_n is not None
@@ -788,6 +817,12 @@ def enable_cute_tcgen05_search(
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
     spec.cute_tcgen05_search_enabled = True
+    if static_m is not None and static_m < plan.min_search_m:
+        # The frontend left the M search ceiling at the extent; the tcgen05
+        # tile needs ``min_search_m`` rows (TMA zero-fills the rows past M
+        # and the SIMT epilogue masks their stores). bf16 16x14336x4096 ran
+        # the SIMT fallback at 358 us against cuBLAS's 25 us without it.
+        spec.block_sizes.block_id_lookup(m_block_id).allow_overshoot(plan.min_search_m)
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
     if static_m is None or static_n is None or static_k is None:
         allow_full_tile_persistent_pid_types = False
@@ -898,6 +933,7 @@ def enable_cute_tcgen05_search(
                 work_clusters = max(work_clusters, one_wave_work_clusters)
             if work_clusters < num_sms // 4:
                 allow_cluster_m2_search = False
+                allow_edge_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
                 allow_one_wave_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
