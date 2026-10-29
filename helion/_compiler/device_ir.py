@@ -59,6 +59,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import warning
 from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
@@ -3518,6 +3519,67 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
+# Operations whose lowering has a faster approximate form under the fast_math
+# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
+# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
+# warning reports them under.
+_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.reciprocal.default: "reciprocal",
+    torch.ops.aten.exp.default: "exp",
+    torch.ops.aten.exp2.default: "exp2",
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.rsqrt.default: "rsqrt",
+    torch.ops.aten.erf.default: "erf",
+    torch.ops.aten.gelu.default: "gelu",
+}
+# Triton only: under fast_math the max/min reductions and torch.maximum /
+# torch.minimum lower to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps the NaN-propagating forms either way.
+_FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
+
+
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
+    """Names of the floating-point operations in ``device_ir`` that the
+    ``fast_math`` setting would lower to approximate forms on ``backend``,
+    sorted."""
+    from .inductor_lowering import _is_plain_true_division
+
+    targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
+    if backend == "triton":
+        targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
+    names: set[str] = set()
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            val = node.meta.get("val")
+            if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
+                continue
+            name = targets.get(node.target)
+            if name is None and _is_plain_true_division(node):
+                name = "fp32 division"
+            if name is not None:
+                names.add(name)
+    return sorted(names)
+
+
+def warn_fast_math_unused(device_ir: DeviceIR) -> None:
+    """Warn once per kernel when ``fast_math`` is off and the kernel has
+    operations the setting would speed up (``exc.FastMathUnused``)."""
+    env = CompileEnvironment.current()
+    if env.settings.fast_math or env.backend.name not in ("triton", "cute"):
+        return
+    ops = fast_math_sensitive_ops(device_ir, env.backend.name)
+    if ops:
+        warning(exc.FastMathUnused(", ".join(ops)))
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -3549,6 +3611,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        warn_fast_math_unused(device_ir)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.canonicalize_reductions import canonicalize_reductions
