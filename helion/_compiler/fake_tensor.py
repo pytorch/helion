@@ -26,6 +26,14 @@ def create_fake_tensor_mode(shape_env: ShapeEnv) -> FakeTensorMode:
     rebuild = cast(
         "Callable[..., FakeTensor | None]", mode._get_output_tensor_from_cache_entry
     )
+    # ``dataclasses.replace`` is type-checked against the installed torch's
+    # ``_DispatchCacheEntryOutputInfo``; builds before pytorch/pytorch#192047
+    # (PyTorch 2.13, the 2026-10-14 nightly) have no ``is_canonical_contiguous``
+    # field, although the runtime path below is guarded by the ``getattr``.
+    # Loosen the checker's view of the call, as for ``rebuild`` above.
+    replace_entry = cast(
+        "Callable[..., _DispatchCacheEntryOutputInfo]", dataclasses.replace
+    )
 
     def get_output_tensor_from_cache_entry(
         state: _CacheKeyState,
@@ -41,7 +49,7 @@ def create_fake_tensor_mode(shape_env: ShapeEnv) -> FakeTensorMode:
         if getattr(entry, "is_canonical_contiguous", False):
             assert entry.metadata is not None
             if any(isinstance(dim, _SymIntOutputStub) for dim in entry.metadata.shape):
-                entry = dataclasses.replace(entry, is_canonical_contiguous=False)
+                entry = replace_entry(entry, is_canonical_contiguous=False)
         return rebuild(state, entry, key, *args, **kwargs)
 
     mode._get_output_tensor_from_cache_entry = get_output_tensor_from_cache_entry
