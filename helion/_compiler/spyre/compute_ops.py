@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import dataclasses
 from typing import TYPE_CHECKING
-from typing import cast
 
 import torch
 
@@ -34,6 +33,29 @@ if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
     from .backend import SpyreBackend
     from .emitter import Operand
+    from .emitter import SpyreEmitter
+
+
+def _spyre_backend() -> SpyreBackend:
+    """The active backend, narrowed to ``SpyreBackend``.
+
+    ``CompileEnvironment.backend`` is typed as the base ``Backend``, so every
+    Spyre-specific attribute (``emitter``, ``kernel_stick_dim``,
+    ``input_stick_dim``) is invisible to a type checker through it -- pyrefly
+    reports ``Object of class 'Backend' has no attribute 'emitter'`` at each
+    site. Four other modules in this package already worked around that with
+    an inline ``cast("SpyreBackend", ...)``; this is the same narrowing in one
+    place, so the cast is justified once rather than repeated.
+
+    The cast is sound by construction: these lowerings are only installed by
+    ``SpyreBackend.pre_inductor_lowering``, so reaching them means the Spyre
+    backend is the active one.
+    """
+    from typing import cast
+
+    from ..compile_environment import CompileEnvironment
+
+    return cast("SpyreBackend", CompileEnvironment.current().backend)
 
 
 def _iteration_symbols(n: int) -> list[sympy.Symbol]:
@@ -71,7 +93,7 @@ def tile_space(val: torch.Tensor) -> tuple[list[int], list[int]]:
 
     env = CompileEnvironment.current()
     device_function = DeviceFunction.current()
-    emitter = env.backend.emitter
+    emitter = _spyre_backend().emitter
 
     extents: list[int] = []
     splits: list[int] = []
@@ -95,9 +117,7 @@ def tile_space(val: torch.Tensor) -> tuple[list[int], list[int]]:
         extent = int(info.size_hint())
         value = info.from_config(device_function.config)
         extents.append(extent)
-        splits.append(
-            1 if value is None else _split_from_block(extent, int(value))
-        )
+        splits.append(1 if value is None else _split_from_block(extent, int(value)))
     return extents, splits
 
 
@@ -182,9 +202,7 @@ def _emit_pointwise(
             node.name, sizes, val.dtype, stick_dim, residency="lx"
         )
 
-    iteration_space = _iteration_space(
-        symbols, sizes, splits, stick_dim, val.dtype
-    )
+    iteration_space = _iteration_space(symbols, sizes, splits, stick_dim, val.dtype)
     args = [o.tensor_arg(symbols, is_input=True) for o in inputs]
     args.append(out.tensor_arg(symbols, is_input=False))
 
@@ -209,9 +227,7 @@ def _carried_input(ctx: LoweringContext, node: Node) -> Operand | None:
     """
     import ast as _ast
 
-    from ..compile_environment import CompileEnvironment
-
-    emitter = CompileEnvironment.current().backend.emitter
+    emitter = _spyre_backend().emitter
     for arg in node.all_input_nodes:
         value = ctx.env.get(arg)
         if isinstance(value, _ast.Name):
@@ -258,12 +274,12 @@ def _emit_reduction(
     rejects rather than silently mis-addresses.
 
     Only a stick-axis reduction is emitted. ``_check_stick_all_same``
-    (op_spec_validation.py:657) requires every arg to share one stick symbol,
+    (op_spec_validation.py:675) requires every arg to share one stick symbol,
     and the output's stick coordinate is the constant 0 whose stick symbol is
     the reduced one -- so reducing a *non*-stick dim would leave the output
     sticked on a different symbol than the input and is rejected. torch-spyre's
     own rule is the mirror image for the normalization ops
-    (``_check_stick_norm``, :709: the stick symbol *must* be the reduced one).
+    (``_check_stick_norm``, :727: the stick symbol *must* be the reduced one).
     """
     emitter = backend.emitter
     inputs = _operand_inputs(ctx, node)
@@ -350,7 +366,7 @@ def _emit_reduction(
 
 
 def _stage_reduced_tile(
-    emitter: object,
+    emitter: SpyreEmitter,
     node: Node,
     operand: Operand,
     sizes: list[int],
@@ -448,6 +464,85 @@ class MatmulShape:
     y_sizes: list[int]
 
 
+#: The DF16 stick axis each matmul operand must carry, by role. This is the
+#: rule at propagate_layouts.py:1365-1368 expressed as the *host dim* each 2-D
+#: operand sticks on, and it is the single place the literal lives:
+#: ``_matmul_arg``, ``_k_advance`` and ``_stage_advancing_operand`` all took a
+#: bare ``stick_dim=1`` before, which made the assumption true by construction
+#: rather than by agreement with the operand.
+#:
+#:   x[M, K] sticks on K = its dim 1 (the reduction var, absent from the output)
+#:   y[K, N] sticks on N = its dim 1 (the generated var, present in the output)
+#:   out[M, N] sticks on N = its dim 1
+#:
+#: All three are 1 for a 2-D matmul. They are named rather than inlined because
+#: they are three *different* axes that happen to share an index, and a reader
+#: who sees one ``1`` has no way to tell which rule it came from.
+_MATMUL_STICK_DIM = {"x": 1, "y": 1, "out": 1}
+
+
+def _reconcile_matmul_stick_axes(
+    emitter: SpyreEmitter,
+    shape: MatmulShape,
+    *,
+    x: Operand,
+    y: Operand,
+) -> tuple[Operand, Operand]:
+    """Relayout any matmul operand whose recorded stick axis is not the DF16 one.
+
+    **This must run before staging and before any ``TensorArg`` is built.**
+    ``_matmul_arg`` reshapes an operand with ``stick_dim=_MATMUL_STICK_DIM[...]``
+    and ``_stage_advancing_operand`` does the same, so both *assert* the rule
+    rather than check it. Those assertions are only sound once a disagreeing
+    operand has already been relaid out, which is what this does -- hence the
+    ordering invariant ``reconcile -> stage -> build args``, tested by
+    ``repros/matmul_stick_axis.py``.
+
+    Without this, a dim-0-sticked operand was **silently reinterpreted**: the
+    emitter addressed it as if it sticked on dim 1 and returned a plausible,
+    wrong answer with nothing raised anywhere (measured 19.5% max error on a
+    128x256 @ 256x128 fp16 matmul with x staged ``dim_order=[1, 0]``; G1, the
+    backend compiler and the launch all accepted it). That is the review's
+    finding (a), and it is the same class as bug #6 -- which
+    ``_emit_pointwise`` (:163-169) and ``_emit_reduction`` (:293-294) already
+    guard by comparing and emitting ``ReStickifyOpHBM`` on a mismatch. This is
+    that guard for the matmul quadrant, which was simply never written.
+
+    The relayout is done at the operand's **full** extents, not its registered
+    ones: a buffer registered from a tile-shaped load carries the tile's
+    extents, while the matmul addresses the full ones (the same reason
+    ``_matmul_arg`` takes ``sizes`` explicitly). Relaying out at the tile shape
+    would produce a correctly-sticked buffer of the wrong size.
+
+    The DF16 rule itself is **not** re-decided here. This only detects
+    disagreement; where the sticks must go stays where it was.
+    """
+    c0, c1, c2 = _iteration_symbols(3)
+
+    def reconcile(
+        operand: Operand, role: str, sizes: list[int], symbols: list[sympy.Expr]
+    ) -> Operand:
+        want = _MATMUL_STICK_DIM[role]
+        if operand.stick_dim == want:
+            return operand
+        import dataclasses as _dc
+
+        from .emitter import Operand as _Operand
+
+        assert isinstance(operand, _Operand)
+        # Restickify at the full extents the matmul will address. The source
+        # keeps its own (wrong-for-this-op) axis, which is what makes the
+        # emitted ReStickifyOpHBM non-degenerate -- emit_restickify rejects a
+        # relayout onto the axis the operand already has.
+        at_full = _dc.replace(operand, sizes=list(sizes))
+        return emitter.emit_restickify(at_full, want, symbols)
+
+    return (
+        reconcile(x, "x", shape.x_sizes, [c0, c2]),
+        reconcile(y, "y", shape.y_sizes, [c2, c1]),
+    )
+
+
 def _matmul_shape(node: Node, x_node: Node, y_node: Node) -> MatmulShape:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
@@ -503,7 +598,7 @@ def _full_sizes(node: Node) -> list[int]:
 
 
 def _matmul_op_spec(
-    emitter: object,
+    emitter: SpyreEmitter,
     op: str,
     *,
     x: Operand,
@@ -515,7 +610,7 @@ def _matmul_op_spec(
 ) -> object:
     """Build the ``batchmatmul`` OpSpec under the DF16 stick rule.
 
-    Plan 4.2, verbatim from propagate_layouts.py:1351-1354 -- the rule the
+    Plan 4.2, verbatim from propagate_layouts.py:1365-1368 -- the rule the
     captured reference confirms is *per-operand distinct*:
 
         Input1 (x): stick on reduction_var (loop var absent from output)
@@ -527,7 +622,7 @@ def _matmul_op_spec(
     """
     c0, c1, c2 = _iteration_symbols(3)
     # Plan 4.1's hard constraint: at most one reduction dim may be split across
-    # cores (work_division.py:317-322), and a K-split builds a PSUM chain the
+    # cores (work_division.py:328-331), and a K-split builds a PSUM chain the
     # emitter does not model -- so K is always "not split".
     iteration_space = {
         c0: (_int(shape.m), shape.out_splits[0]),
@@ -540,7 +635,7 @@ def _matmul_op_spec(
     # different axes. Omitting x's advance makes it re-read K-tile 0 forever,
     # which a loose numeric tolerance will not catch.
     # This op's own level symbol: sharing one symbol across the read-copy,
-    # matmul and combine ops collapses their advances (spyre_kernel.py:552-569).
+    # matmul and combine ops collapses their advances (spyre_kernel.py:588-610).
     level = emitter.level_symbol_for(op_key)
 
     # A staged x is already one K-tile wide and does not advance; an unstaged
@@ -550,10 +645,18 @@ def _matmul_op_spec(
         x,
         [c0, c2],
         sizes=x_sizes,
-        stick_dim=1,
+        stick_dim=_MATMUL_STICK_DIM["x"],
         is_input=True,
         tile_advance=(
-            _k_advance(emitter, x, shape.x_sizes, [c0, c2], 1, shape.k, level)
+            _k_advance(
+                emitter,
+                x,
+                shape.x_sizes,
+                [c0, c2],
+                _MATMUL_STICK_DIM["x"],
+                shape.k,
+                level,
+            )
             if x_advances
             else None
         ),
@@ -562,14 +665,24 @@ def _matmul_op_spec(
         y,
         [c2, c1],
         sizes=shape.y_sizes,
-        stick_dim=1,
+        stick_dim=_MATMUL_STICK_DIM["y"],
         is_input=True,
         tile_advance=_k_advance(
-            emitter, y, shape.y_sizes, [c2, c1], 1, shape.k, level
+            emitter,
+            y,
+            shape.y_sizes,
+            [c2, c1],
+            _MATMUL_STICK_DIM["y"],
+            shape.k,
+            level,
         ),
     )
     out_arg = _matmul_arg(
-        out, [c0, c1], sizes=[shape.m, shape.n], stick_dim=1, is_input=False
+        out,
+        [c0, c1],
+        sizes=[shape.m, shape.n],
+        stick_dim=_MATMUL_STICK_DIM["out"],
+        is_input=False,
     )
 
     tiling = emitter.tiling_for(op_key)
@@ -587,7 +700,7 @@ def _matmul_op_spec(
 
 
 def _k_advance(
-    emitter: object,
+    emitter: SpyreEmitter,
     operand: Operand,
     sizes: list[int],
     symbols: list[sympy.Expr],
@@ -641,6 +754,10 @@ def _emit_matmul(
     x_node, y_node = node.all_input_nodes[0], node.all_input_nodes[1]
 
     shape = _matmul_shape(node, x_node, y_node)
+    # Compare each operand's *recorded* stick axis against the DF16 rule before
+    # anything is addressed under that rule. See
+    # _reconcile_matmul_stick_axes for why this ordering is the whole fix.
+    x, y = _reconcile_matmul_stick_axes(emitter, shape, x=x, y=y)
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     out = emitter.add_intermediate(
@@ -652,11 +769,10 @@ def _emit_matmul(
 
 
 def _stage_advancing_operand(
-    emitter: object,
+    emitter: SpyreEmitter,
     operand: Operand,
     shape: MatmulShape,
     node: Node,
-    tiled: object,
     *,
     dtype: torch.dtype,
 ) -> Operand:
@@ -674,7 +790,12 @@ def _stage_advancing_operand(
 
     op_key = f"read_copy_{node.name}"
     level = emitter.level_symbol_for(op_key)
-    source = _dc.replace(operand, sizes=list(shape.x_sizes), stick_dim=1)
+    # ``stick_dim`` here asserts the DF16 rule rather than checking it; that is
+    # sound only because _reconcile_matmul_stick_axes has already relaid out any
+    # operand that disagreed (the reconcile -> stage -> build-args invariant).
+    source = _dc.replace(
+        operand, sizes=list(shape.x_sizes), stick_dim=_MATMUL_STICK_DIM["x"]
+    )
     device_size, coords = layout_stickify(source, [c0, c2])
     advance = emitter.tile_advance_for(
         device_size, coords, c2, k_tile, level_symbol=level
@@ -724,17 +845,15 @@ def _stage_advancing_operand(
     return staged
 
 
-def layout_stickify(operand: Operand, symbols: list[sympy.Expr]):
+def layout_stickify(
+    operand: Operand, symbols: list[sympy.Expr]
+) -> tuple[list[int], list[sympy.Expr]]:
     from . import layout as _layout
 
-    return _layout.stickify(
-        operand.sizes, symbols, operand.stick_dim, operand.dtype
-    )
+    return _layout.stickify(operand.sizes, symbols, operand.stick_dim, operand.dtype)
 
 
-def _emit_addmm(
-    backend: SpyreBackend, ctx: LoweringContext, node: Node
-) -> Operand:
+def _emit_addmm(backend: SpyreBackend, ctx: LoweringContext, node: Node) -> Operand:
     """``addmm(acc, x, y)`` -> a ``batchmatmul`` partial plus an ``add``.
 
     Two OpSpecs, because Spyre's matmul writes its own output buffer rather
@@ -753,10 +872,14 @@ def _emit_addmm(
     y = _as_operand(ctx, y_node, node)
 
     shape = _matmul_shape(node, x_node, y_node)
+    # Before staging, not after: _stage_advancing_operand reshapes x with
+    # ``stick_dim=_MATMUL_STICK_DIM["x"]``, so a disagreeing operand reaching it
+    # unreconciled re-introduces the silent reinterpretation through the staging
+    # path even if the TensorArg construction below is correct. This is the
+    # ordering invariant _reconcile_matmul_stick_axes documents.
+    x, y = _reconcile_matmul_stick_axes(emitter, shape, x=x, y=y)
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
-
-    tiled = emitter.current_tiling()
 
     # Stage the K-advancing operand into a one-tile pool buffer first.
     # golden/ref_matmul_ktiled.py shows the two roles cannot be combined on one
@@ -767,9 +890,7 @@ def _emit_addmm(
     # directly against advancing full-K HBM instead makes every iteration read
     # the same final tile -- a per-stick probe showed only K[384:512] read, and
     # twice over.
-    x_staged = _stage_advancing_operand(
-        emitter, x, shape, node, tiled, dtype=val.dtype
-    )
+    x_staged = _stage_advancing_operand(emitter, x, shape, node, dtype=val.dtype)
     mm_key = f"mm_{node.name}"
     combine_key = f"combine_{node.name}"
 
@@ -824,7 +945,6 @@ def _as_operand(ctx: LoweringContext, arg: Node, node: Node) -> Operand:
     """
     import ast as _ast
 
-    from ..compile_environment import CompileEnvironment
     from .emitter import Operand as _Operand
 
     value = ctx.env.get(arg)
@@ -832,7 +952,7 @@ def _as_operand(ctx: LoweringContext, arg: Node, node: Node) -> Operand:
         return value
 
     if isinstance(value, _ast.Name):
-        emitter = CompileEnvironment.current().backend.emitter
+        emitter = _spyre_backend().emitter
         carried = emitter.carry(value.id)
         if carried is not None:
             return carried
@@ -870,22 +990,20 @@ def _matmul_arg(
 
     assert isinstance(operand, _Operand)
     reshaped = _dc.replace(operand, sizes=list(sizes), stick_dim=stick_dim)
-    return reshaped.tensor_arg(
-        symbols, is_input=is_input, tile_advance=tile_advance
-    )
+    return reshaped.tensor_arg(symbols, is_input=is_input, tile_advance=tile_advance)
 
 
 def _output_stick_dim(rank: int) -> int:
-    """Stick axis of the kernel's output tensor, read from its real layout.
+    """Stick axis of the kernel's output tensor, from the one authority.
 
-    Falls back to the trailing dim -- torch-spyre's default tiled layout -- when
-    no output layout was recorded, which is the common case.
+    Thin wrapper over ``SpyreBackend.kernel_stick_dim`` so this module, the
+    stick-split bound in ``_iteration_space`` and
+    ``autotune_config_is_viable`` cannot drift apart about which axis carries
+    the sticks -- they used to, and the viability check guarded the trailing
+    axis for a dim-0-sticked kernel (review finding (d)).
     """
-    from ..compile_environment import CompileEnvironment
 
-    backend = CompileEnvironment.current().backend
-    recorded = backend.output_stick_dim(rank)
-    return rank - 1 if recorded is None else recorded
+    return _spyre_backend().kernel_stick_dim(rank)
 
 
 def _iteration_space(
@@ -898,24 +1016,49 @@ def _iteration_space(
     """``{sym: (extent, cores)}`` -- the OpSpec field that *is* work division.
 
     The **stick axis** may be divided only down to whole sticks. The rule at
-    opspec_utils.py:515-516 ("a stick is the unit of transfer, so splitting it
-    across cores would split a stick") is usually read as a statement about the
-    trailing axis, but it binds whichever axis actually carries the sticks: a
-    dim-0-sticked op over 128 elements (2 sticks at fp16) accepts splits 1 and 2
-    and is rejected by the backend scheduler at 3, 4 and 8 with
-    "Expect valid lower and upper bound parameters". Clamp rather than fail --
-    the split is a performance choice, and a lower one is always correct.
+    codegen/opspec_utils.py:515-516 ("a stick is the unit of transfer, so
+    splitting it across cores would split a stick") is usually read as a
+    statement about the trailing axis, but it binds whichever axis actually
+    carries the sticks: a dim-0-sticked op over 128 elements (2 sticks at fp16)
+    accepts splits 1 and 2 and is rejected by the backend scheduler at 3, 4 and
+    8 with "Expect valid lower and upper bound parameters".
+
+    **This used to clamp, and now it raises.** The clamp was justified as "a
+    lower split is always correct", which is true numerically and wrong
+    structurally: the autotuner then *benchmarked a work division it did not
+    choose*. Measured on a dim-0-sticked 128x256 fp16 kernel, configs asking
+    for c0 splits of 2, 4 and 8 all emitted a split of **2**, while
+    ``autotune_config_is_viable`` returned ``True`` for all three -- so the
+    search space held three configs that were one kernel, and the autotuner
+    spent real launches distinguishing them. That is §1's governing invariant
+    ("never solved behind their back") bent in the one place the autotuner is
+    meant to be in charge, and it is the review's finding (d) / §9 item 3.
+
+    The bound now lives in ``autotune_config_is_viable``, which reads the same
+    axis through ``SpyreBackend.kernel_stick_dim``, so the search space
+    excludes these configs instead of codegen silently rewriting them. Reaching
+    here with an over-split stick axis therefore means the two disagreed, which
+    is a bug in the backend rather than a bad config -- so it fails loudly
+    rather than papering over itself.
     """
     import sympy
 
-    clamped = list(splits)
     if stick_dim is not None and dtype is not None and stick_dim < len(sizes):
         from . import layout as _layout
 
         sticks = max(1, -(-sizes[stick_dim] // _layout.elems_per_stick(dtype)))
-        clamped[stick_dim] = min(clamped[stick_dim], sticks)
+        if splits[stick_dim] > sticks:
+            raise exc.BackendUnsupported(
+                "spyre",
+                f"work division splits the stick axis (dim {stick_dim},"
+                f" extent {sizes[stick_dim]} = {sticks} stick(s)) into"
+                f" {splits[stick_dim]} parts. autotune_config_is_viable should"
+                " have screened this config; reaching codegen means the"
+                " viability check and this bound disagree about which axis"
+                " carries the sticks",
+            )
 
     return {
         sym: (sympy.Integer(size), split)
-        for sym, size, split in zip(symbols, sizes, clamped, strict=True)
+        for sym, size, split in zip(symbols, sizes, splits, strict=True)
     }

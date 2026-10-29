@@ -1,7 +1,7 @@
 """Render a spec tree as Python source, using torch-spyre's own printer.
 
 Plan 5.1: ``SpyreKernel.codegen_kernel`` already prints exactly such a literal
-via ``_codegen_op_spec_list`` (torch_spyre/_inductor/spyre_kernel.py:1572), and
+via ``_codegen_op_spec_list`` (torch_spyre/_inductor/spyre_kernel.py:1646), and
 ``tests/op_specs/capture.py`` reuses the same printer. "Reuse that printer; do
 not write a second one." -- so this module is only the ``sympy_str`` closure and
 an ``IndentedBuffer``, mirroring capture.py:291-303.
@@ -38,18 +38,3 @@ def spec_source(specs: Sequence[object]) -> str:
         _codegen_op_spec_list(list(specs), buf, sympy_str)
     buf.writeline("]")
     return buf.getvalue()
-
-
-def dedup_key(specs: Sequence[object]) -> str:
-    """Rendered spec with provenance stripped, for golden comparison.
-
-    ``debug_handle`` varies with the *source location* of the traced program, so
-    a Helion-emitted spec can never match a captured one on that field; dropping
-    it is what makes the two comparable. capture.py:306-320 strips it for the
-    same reason.
-    """
-    return "\n".join(
-        line
-        for line in spec_source(specs).splitlines()
-        if not line.lstrip().startswith("debug_handle=")
-    )

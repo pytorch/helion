@@ -314,7 +314,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
         elif dev.type == "spyre":
             hardware = "spyre"
             try:
-                import torch_spyre  # type: ignore[import-not-found]
+                # The *installed distribution* version, not the module's: the
+                # wheel is what runs and what every file:line citation in the
+                # backend is true of, and a cache entry keyed on anything else
+                # would survive a wheel change it should not survive. Reading
+                # it from metadata means ``torch_spyre`` need not be imported
+                # here at all (ruff F401 caught the unused import).
                 from importlib.metadata import version
 
                 runtime_name = version("torch_spyre")

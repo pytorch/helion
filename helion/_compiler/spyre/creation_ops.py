@@ -22,7 +22,6 @@ from ...language.creation_ops import full
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from .backend import SpyreBackend
-    from .emitter import Operand
 
 
 @_decorators.codegen(full, "spyre")

@@ -76,7 +76,7 @@ def _indirect_operand(
     Spyre expresses this as ``IndirectAccess(name)`` in the value tensor's
     ``device_coordinates``, paired by name with an index ``TensorArg`` carrying
     that ``name`` (op_spec.py's ``IndirectAccess`` docstring;
-    codegen/superdsc.py:1216-1217 does the pairing). The index operand must
+    codegen/superdsc.py:1277-1279 does the pairing). The index operand must
     therefore travel with the value operand, which is what ``IndirectOperand``
     records for the consuming OpSpec to emit.
     """
@@ -94,9 +94,7 @@ def _indirect_operand(
             f"indirect index is {type(index_value).__name__}, not a buffer",
         )
     value = host_operand(state, tensor)
-    return IndirectOperand(
-        value=value, index=index_value, indirect_dim=indirect_dim
-    )
+    return IndirectOperand(value=value, index=index_value, indirect_dim=indirect_dim)
 
 
 @_decorators.codegen(store, "spyre")

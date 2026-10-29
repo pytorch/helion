@@ -2,7 +2,7 @@
 
 The decisions plan 4.2/4.3 assigns to Helion. ``device_coordinates[-1]`` is the
 stick axis and ``superdsc._get_device_dim_order`` reads it without recomputing
-(torch_spyre/_inductor/codegen/superdsc.py:367-382), so a layout chosen here is
+(torch_spyre/_inductor/codegen/superdsc.py:384-408), so a layout chosen here is
 final.
 
 The dtype and stick-size mappings are torch-spyre's own (``get_device_dtype`` /
@@ -19,6 +19,7 @@ from ... import exc
 if TYPE_CHECKING:
     import sympy
     import torch
+    from torch_spyre._C import DataFormats
 
 
 #: A stick is a 128-byte aligned chunk, so a pool buffer starting mid-stick
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 STICK_BYTES = 128
 
 
-def device_dtype(dtype: torch.dtype) -> object:
+def device_dtype(dtype: torch.dtype) -> DataFormats:
     """The ``DataFormats`` member torch-spyre uses for a torch dtype.
 
     ``get_device_dtype`` returns ``DataFormats.INVALID`` for an unsupported
@@ -34,7 +35,8 @@ def device_dtype(dtype: torch.dtype) -> object:
     INVALID format would travel all the way into the bundle. Reject it here so
     the failure names the dtype.
     """
-    from torch_spyre._C import DataFormats, get_device_dtype
+    from torch_spyre._C import DataFormats
+    from torch_spyre._C import get_device_dtype
 
     try:
         resolved = get_device_dtype(dtype)
@@ -146,10 +148,20 @@ def stick_dim_of(tensor: torch.Tensor) -> int:
     getter = getattr(tensor, "device_tensor_layout", None)
     if getter is None:
         return tensor.dim() - 1
-    try:
-        stl = getter()
-    except Exception:
-        return tensor.dim() - 1
+    # ``getter()`` is **not** wrapped in a broad ``except``. It used to be, and
+    # that turned any failure at all into "assume the trailing dim" -- which is
+    # bug #11's failure mode re-admitted through the exception handler, and the
+    # same shape as the defensive ``try/except`` §5b records already costing a
+    # bug ("silently accepted every config").
+    #
+    # Checked rather than assumed: the monkey-patch
+    # (``torch_spyre/_monkey_patch.py:130``) returns ``SpyreTensorLayout |
+    # None`` and *returns* ``None`` for a host tensor, a meta tensor and a
+    # ``FakeTensorMode`` tensor alike -- it does not raise on any of them. So
+    # the handler was catching nothing that actually happens, while standing
+    # ready to hide anything that might. ``None`` is handled explicitly just
+    # below, which is the real "no layout to read" case.
+    stl = getter()
     if stl is None:
         return tensor.dim() - 1
 

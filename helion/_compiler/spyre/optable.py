@@ -1,10 +1,10 @@
 """aten target -> Spyre op name.
 
 Plan 7 "Op-name reuse": the table is lifted from torch-spyre's ``SpyreOpFuncs``
-(torch_spyre/_inductor/spyre_kernel.py:237-419), which is the one genuinely
+(torch_spyre/_inductor/spyre_kernel.py:201-423), which is the one genuinely
 reusable asset from the inductor backend -- and it is reused here as what it
 always was, a table. Canonical op-name constants:
-torch_spyre/_inductor/constants.py:19-37.
+torch_spyre/_inductor/constants.py:19-39.
 
 Unmapped targets are not silently dropped: ``spyre_op_name`` returns ``None``
 and the caller raises ``BackendUnsupported``.
@@ -12,12 +12,7 @@ and the caller raises ``BackendUnsupported``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
-
-if TYPE_CHECKING:
-    pass
 
 aten = torch.ops.aten
 
@@ -75,9 +70,9 @@ _ACCUMULATING_MATMUL: dict[object, str] = {
 #: same mathematical meaning: ``maximum``/``minimum`` are elementwise two-input
 #: ops and ``add`` is elementwise addition, all three in POINTWISE_OPS, so
 #: emitting one with ``is_reduction=True`` is rejected by
-#: op_spec_validation.py:930 ("pointwise op must have is_reduction=False").
+#: op_spec_validation.py:945-949 ("pointwise op must have is_reduction=False").
 #: The reduction names are ``sum``/``max``/``min``
-#: (constants.py:259, SINGLE_INPUT_REDUCTION_OPS).
+#: (constants.py:276, SINGLE_INPUT_REDUCTION_OPS).
 #:
 #: ``prod`` cannot reduce along the stick dim
 #: (constants.REDUCTIONS_NON_STICK_DIM_ONLY), so it is deliberately absent.

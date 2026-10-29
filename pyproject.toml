@@ -205,7 +205,17 @@ project-excludes = [
   "benchmarks/cute/tilegym_attention.py",
 ]
 python-version = "3.10"
-search-path = ["../pytorch"]
+search-path = [
+  "../pytorch",
+  # torch-spyre is installed **editable** from a checkout outside site-packages
+  # (the T6.0 profiler-enabled rebuild lives in
+  # /home/senuser/torch-spyre-profiler-build). An editable install is reached
+  # through a .pth import hook, which pyrefly cannot follow, so without this it
+  # reports 19 spurious "Cannot find module torch_spyre._inductor.op_spec"
+  # errors even though the import works at runtime. Harmless if the path is
+  # absent -- pyrefly ignores a missing search-path entry.
+  "/home/senuser/torch-spyre-profiler-build",
+]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"

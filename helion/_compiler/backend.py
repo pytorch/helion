@@ -522,9 +522,7 @@ class Backend(abc.ABC):
         """
         return {}
 
-    def record_input_layout(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ) -> None:
+    def record_input_layout(self, real: torch.Tensor, fake: torch.Tensor) -> None:
         """Note any backend layout metadata of a real input before fakification.
 
         Called from ``CompileEnvironment.to_fake`` with both the real tensor and

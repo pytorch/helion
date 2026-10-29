@@ -13,16 +13,55 @@ and the loop nesting. torch-spyre only serializes them.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from typing import TYPE_CHECKING
 from typing import Any
-from collections.abc import Sequence
 
 from ... import exc
 from . import layout
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import sympy
     import torch
+    from torch_spyre._inductor.op_spec import OpSpec
+    from torch_spyre._inductor.op_spec import TensorArg
+
+
+_BUFFER_SEQ = itertools.count()
+
+
+def _new_buffer_id() -> int:
+    """A fresh buffer identity. Monotonic, so it is never reused."""
+    return next(_BUFFER_SEQ)
+
+
+#: ``id(TensorArg) -> Operand.buffer_id``: which buffer each emitted arg
+#: came from.
+#:
+#: This is the **sound rewrite key** review finding (b) asked for.
+#: ``redirect_output`` used to find the args to rewrite by *matching* on
+#: ``(arg.allocation, arg.arg_index)``, which is not a key: the free path hands
+#: ``{"lx": 0}`` straight back, so the next ``add_intermediate`` mints a second
+#: ``Operand`` carrying the identical pair, and a later ``redirect_output``
+#: rewrites args belonging to the wrong buffer. It worked only because stores
+#: happen to arrive last-in-first-out -- an invariant neither enforced nor
+#: documented.
+#:
+#: The provenance is known at exactly one place, ``Operand.tensor_arg``, so it
+#: is recorded there. A module-level table rather than a field on ``TensorArg``
+#: because that is a torch-spyre dataclass the validator and SDSC codegen both
+#: read, and adding to it would be a change to their type; a table keyed on
+#: ``id`` rather than on the arg itself because ``TensorArg`` is ``eq=True``,
+#: so structurally identical args from *different* buffers compare equal and
+#: would collapse.
+#:
+#: Lifetime: cleared by :meth:`SpyreEmitter.reset`, which runs per kernel, so
+#: this cannot grow without bound. The ids are only ever compared against ids
+#: recorded in the same emission pass, so id reuse after a gc cannot alias
+#: across kernels.
+_ARG_ORIGIN: dict[int, int] = {}
 
 
 @dataclasses.dataclass
@@ -45,6 +84,25 @@ class Operand:
     #: shows arg_index=-1 is what makes a buffer genuinely non-argument).
     arg_index: int
     name: str | None = None
+    #: **Stable identity of the underlying buffer**, independent of this
+    #: ``Operand`` object. Minted once per real buffer by ``_new_buffer_id``.
+    #:
+    #: ``id(self)`` cannot serve as the buffer's identity, and finding that out
+    #: is most of T5. The emitter reshapes operands constantly with
+    #: ``dataclasses.replace`` -- ``_matmul_arg``, ``_k_advance``,
+    #: ``_stage_advancing_operand``, ``_stage_reduced_tile`` and
+    #: ``_reconcile_matmul_stick_axes`` all do, because a buffer registered
+    #: from a tile-shaped load carries the tile's extents while the op needs
+    #: the full ones. Each ``replace`` produces a *new object for the same
+    #: buffer*, so an id-based index silently misses every arg emitted through
+    #: one. Measured: keying on ``id(self)`` made the matmul's own output
+    #: invisible to ``redirect_output`` and the GEMM driver returned **100%**
+    #: error.
+    #:
+    #: ``dataclasses.replace`` copies this field like any other, which is
+    #: exactly the property needed: a reshaped view of a buffer keeps the
+    #: buffer's identity while changing its shape.
+    buffer_id: int = dataclasses.field(default_factory=_new_buffer_id)
 
     def tensor_arg(
         self,
@@ -55,7 +113,7 @@ class Operand:
         spec_name: str | None = None,
         indirect_dim: int | None = None,
         indirect_from: str | None = None,
-    ) -> object:
+    ) -> TensorArg:
         """Realize this buffer as a ``TensorArg`` under a given indexing.
 
         ``symbols[i]`` indexes host dim ``i``. The same buffer yields different
@@ -74,8 +132,10 @@ class Operand:
         from torch_spyre._inductor.op_spec import TensorArg
 
         if tile_advance is not None and "lx" in self.allocation:
-            # scratchpad/allocator.py:628 -- LX addresses cannot be expressed as
-            # affine.apply symbols, so an LX buffer may not advance per tile.
+            # scratchpad/allocator.py:1094-1103 -- LX addresses cannot be
+            # expressed as affine.apply symbols, so an LX buffer may not advance
+            # per tile. torch-spyre's own residency gate returns the exclusion
+            # reason "tiled (advancing)" for exactly this case.
             raise exc.BackendUnsupported(
                 "spyre", "an lx buffer cannot carry a device_tile_advance_expr"
             )
@@ -93,14 +153,14 @@ class Operand:
             # Replace the coordinate for one host dim with a runtime index read
             # from another TensorArg: IndirectAccess(name) resolves by the
             # *spec_name* of the index arg (op_spec.py's IndirectAccess
-            # docstring; the pairing is done in codegen/superdsc.py:1216-1217).
+            # docstring; the pairing is done in codegen/superdsc.py:1277-1279).
             from torch_spyre._inductor.op_spec import IndirectAccess
 
             assert indirect_from is not None
             position = self._device_axis_of(indirect_dim)
             device_coordinates = list(device_coordinates)
             device_coordinates[position] = IndirectAccess(indirect_from)
-        return TensorArg(
+        arg = TensorArg(
             is_input=is_input,
             arg_index=self.arg_index,
             device_dtype=layout.device_dtype(self.dtype),
@@ -110,6 +170,20 @@ class Operand:
             device_tile_advance_expr=tile_advance,
             name=spec_name,
         )
+        # **Record which Operand this arg came from.** ``TensorArg`` is a
+        # torch-spyre dataclass with no operand-identity field, and
+        # ``(allocation, arg_index)`` was the *only* link from an emitted arg
+        # back to its buffer -- which is exactly why ``redirect_output``'s
+        # rewrite key was unsound (review finding (b)). The provenance is known
+        # here and nowhere else, so it is recorded here.
+        #
+        # The side table is keyed on ``id(arg)`` rather than stored on the arg
+        # because ``TensorArg`` is ``eq=True``: two structurally identical args
+        # compare equal, so a dict keyed by the arg *value* would collapse
+        # them, and adding a field would change a type the validator and SDSC
+        # codegen both read. See ``_ARG_ORIGIN``'s own comment.
+        _ARG_ORIGIN[id(arg)] = self.buffer_id
+        return arg
 
     def _device_axis_of(self, host_dim: int) -> int:
         """Device-coordinate position carrying a host dim's whole index.
@@ -169,7 +243,9 @@ class IndirectOperand:
         """
         index_symbols = [symbols[self.indirect_dim]]
         return [
-            self.index.tensor_arg(index_symbols, is_input=True, spec_name=self.spec_name),
+            self.index.tensor_arg(
+                index_symbols, is_input=True, spec_name=self.spec_name
+            ),
             self.value.tensor_arg(
                 symbols,
                 is_input=True,
@@ -191,24 +267,42 @@ class SpyreEmitter:
 
     @staticmethod
     def _lx_budget() -> int:
-        """Concurrent LX intermediates allowed, from the active config.
+        """Concurrent LX intermediates the active config asks for.
 
         ``spyre_lx_buffers`` is a real autotuner knob (see
         ``SpyreBackend.backend_tunables``), so residency is searched rather than
-        hard-coded. Falls back to the measured ceiling when no config is active
+        hard-coded. Falls back to ``_MAX_LX_BUFFERS`` when no config is active
         -- e.g. a direct emit outside a bound kernel.
+
+        This is a **count** of buffers and remains a knob because residency is
+        a performance choice. It is no longer a *correctness* ceiling: that was
+        bug #15, where the count stood in for an addressing rule. The real
+        hardware limit is the byte budget, enforced by :meth:`_lx_fits`.
         """
         from .backend import _MAX_LX_BUFFERS
 
-        try:
-            from ..device_function import DeviceFunction
+        requested = SpyreEmitter._config_int("spyre_lx_buffers", _MAX_LX_BUFFERS)
+        return max(0, requested)
 
-            value = DeviceFunction.current().config.config.get("spyre_lx_buffers")
-        except Exception:
-            return _MAX_LX_BUFFERS
-        if value is None:
-            return _MAX_LX_BUFFERS
-        return max(0, min(int(value), _MAX_LX_BUFFERS))
+    def _lx_fits(self, span: int) -> bool:
+        """Does another ``span``-byte LX buffer fit, by count *and* by bytes?
+
+        Two independent limits, and conflating them was bug #15:
+
+        * ``_lx_budget()`` is the autotuner's residency *preference* -- how many
+          intermediates it wants in LX rather than the pool;
+        * ``_LX_CAPACITY_BYTES`` is the hardware's. LX is a real scratchpad with
+          a real size, and overrunning it is not diagnosed anywhere in the
+          stack -- it fails at launch with
+          ``RAS::RUNTIMESCHEDULER::ComputeHardwareError``, the same opaque
+          error that made bug #8 look like a count limit for so long.
+        """
+        from .backend import _LX_CAPACITY_BYTES
+
+        if self._n_lx >= self._lx_budget():
+            return False
+        stride = layout.STICK_BYTES
+        return self.lx_size + -(-span // stride) * stride <= _LX_CAPACITY_BYTES
 
     def reset(self) -> None:
         #: The spec tree. ``_stack[-1]`` is the list currently being appended
@@ -221,6 +315,14 @@ class SpyreEmitter:
         self.args: list[Operand] = []
         self._n_lx = 0
         self._n_pool = 0
+        #: Next free **byte address** in LX. Like ``pool_size`` this only ever
+        #: grows within a kernel: an LX address handed back and reused would
+        #: alias a buffer another ``Operand`` still refers to (the same hazard
+        #: ``redirect_output`` documents for the pool).
+        self.lx_size = 0
+        #: Next free **byte offset** in the HBM pool, and -- because it only
+        #: ever grows -- also the pool's total size. A true high-water mark:
+        #: see :meth:`redirect_output` for why it must not be decremented.
         self.pool_size = 0
         #: id(Operand) -> (OpSpec, index of its output arg), for the store rule.
         self._producers: dict[int, tuple[Any, int]] = {}
@@ -240,6 +342,10 @@ class SpyreEmitter:
         self._tiled_blocks: list[dict[int, int]] = []
         #: (op_key, level) -> that op's minted tile-advance symbol.
         self._op_level_symbols: dict[tuple[str, int], Any] = {}
+        # The arg-provenance table is per kernel, like everything above: an id
+        # recorded for one kernel's args must never be matched against
+        # another's, and clearing here is what guarantees it.
+        _ARG_ORIGIN.clear()
 
     def mark_accumulator(self, operand: Operand, value: float) -> None:
         self.pending_fills[id(operand)] = (operand, value)
@@ -284,6 +390,24 @@ class SpyreEmitter:
         self.operands[name] = operand
         return operand
 
+    @staticmethod
+    def _device_span_bytes(sizes: list[int], stick_dim: int, dtype: torch.dtype) -> int:
+        """Bytes this buffer actually occupies on the device.
+
+        Derived by calling ``layout.stickify`` rather than by re-deriving the
+        padding rule, so the pool allocator and the emitted ``device_size`` can
+        never disagree about a buffer's footprint -- the same reason
+        ``_k_advance`` builds its advance from the operand's realized layout.
+        """
+        import sympy
+
+        symbols = [sympy.Symbol(f"_span{i}") for i in range(len(sizes))]
+        device_size, _ = layout.stickify(sizes, symbols, stick_dim, dtype)
+        elems = 1
+        for extent in device_size:
+            elems *= int(extent)
+        return elems * dtype.itemsize
+
     def add_intermediate(
         self,
         name: str,
@@ -300,33 +424,57 @@ class SpyreEmitter:
         intermediate is ``allocation={'lx': 0}``, ``arg_index=-1``, pool_size 0).
         ``hbm_pool`` is plan 4.4's alternative and needs ``pool_size`` set.
 
-        LX is a hard-capped resource and asking for too much of it is not
-        diagnosed anywhere in the stack: a chain needing 3 concurrent LX
-        buffers compiles and validates, then fails at launch with
-        ``RAS::RUNTIMESCHEDULER::ComputeHardwareError`` ("Compute CB hardware
-        error detected"). Measured on this device, 2 LX intermediates of
-        128x256 fp16 work and 3 do not, well under the nominal budget of
-        ``_LX_TRACKER_CAPACITY_BYTES * dxp_lx_frac_avail`` (~406 KB, ~6 such
-        buffers; scratchpad/allocator.py:169, :1524). So the request is capped
-        here and anything beyond it spills to ``hbm_pool``, which is the
-        residency plan 4.4 proposed in the first place.
+        **The ``lx`` value is a byte ADDRESS, not a slot index** -- bug #15, and
+        it is bug #5's mechanism in the LX path. ``{"lx": self._n_lx}`` handed
+        out 0, 1, 2, ... as if LX were a slot array; SDSC reads the value as an
+        address, so every buffer after the first landed inside the first one.
+
+        ~~Measured on this device, 2 LX intermediates of 128x256 fp16 work and
+        3 do not~~ -- that was true but misdiagnosed (T7.3). Re-measured
+        2026-10-28: the constraint is ``k % 128 in {0, 1}``, i.e. an address
+        quantised to ``layout.STICK_BYTES``. ``{"lx": 2}`` failed because 2
+        *bytes* is a misaligned address, not because a third slot is missing --
+        and at properly aligned, non-overlapping addresses **6 concurrent LX
+        buffers run**. ``repros/lx_allocation_is_an_address.py`` has the full
+        table.
+
+        So LX is allocated exactly like the pool: a monotonically increasing
+        stick-aligned offset, sized by the buffer's *device* footprint (the
+        same host-vs-device distinction as bug #13). The budget that remains is
+        a real byte budget -- ``_LX_TRACKER_CAPACITY_BYTES * dxp_lx_frac_avail``
+        (~406 KB; scratchpad/allocator.py:209, :2081-2088) -- and anything
+        beyond it spills to ``hbm_pool``, which is the residency plan 4.4
+        proposed in the first place.
         """
-        if residency == "lx" and self._n_lx >= self._lx_budget():
+        span = self._device_span_bytes(sizes, stick_dim, dtype)
+        stride = layout.STICK_BYTES
+        if residency == "lx" and not self._lx_fits(span):
             residency = "hbm_pool"
         if residency == "lx":
-            allocation: dict[str, Any] = {"lx": self._n_lx}
+            allocation: dict[str, Any] = {"lx": self.lx_size}
             self._n_lx += 1
+            self.lx_size += -(-span // stride) * stride
         elif residency == "hbm_pool":
             # The pool value is a **byte offset**, not a slot index: SDSC codegen
             # reads it straight into ``start_addr``
-            # (codegen/superdsc.py:1620-1626). Handing out 0,1,2,3 overlaps every
+            # (codegen/superdsc.py:1683-1689). Handing out 0,1,2,3 overlaps every
             # buffer at nearly the same address -- which validates, compiles and
             # runs, and silently returns ~95% wrong results. Allocate a real
             # offset instead, stick-aligned so no buffer starts mid-stick.
-            n = 1
-            for s in sizes:
-                n *= s
-            span = n * dtype.itemsize
+            #
+            # The span is the **device** footprint, not the host one. Those
+            # differ whenever the stick-axis extent is not a whole number of
+            # sticks: ``stickify`` pads that axis up to ``elems_per_stick``, so
+            # an 8x4 fp16 buffer is 64 host bytes but ``device_size=[1, 8, 64]``
+            # = 1024 device bytes, and a 128x100 one is 25600 against 32768.
+            # Sizing the pool by the host span therefore under-allocates by up
+            # to a stick per non-stick-axis element, and the *next* buffer's
+            # offset lands inside the previous buffer's real extent -- bug #5's
+            # overlap, reached by a different route. Measured on a two-store
+            # 8x4 kernel: host-span accounting gave offsets 0/192/320 for
+            # buffers 1024 device bytes wide (every pair overlapping), against
+            # 0/1024/2048 here.
+            span = self._device_span_bytes(sizes, stick_dim, dtype)
             allocation = {"hbm_pool": self.pool_size}
             self._n_pool += 1
             stride = layout.STICK_BYTES
@@ -393,7 +541,7 @@ class SpyreEmitter:
         reinterpret the buffer -- silently reinterpreting is wrong numerics, not
         a crash. ``RESTICKIFY_OP`` is ``constants.py:21``.
 
-        ``op_spec_validation._check_stick_restickify`` (`:687`) requires the
+        ``op_spec_validation._check_stick_restickify`` (`:705`) requires the
         input and output to have *different* stick symbols, which is exactly the
         condition the caller detected, so a no-op relayout is rejected here
         instead of producing a spec the validator will refuse.
@@ -456,8 +604,8 @@ class SpyreEmitter:
            IndirectAccess-coordinated staged table, writing ``dest``.
         """
         import sympy
-
-        from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
+        from torch_spyre._inductor.op_spec import IndirectAccess
+        from torch_spyre._inductor.op_spec import TensorArg
 
         from . import layout
 
@@ -594,11 +742,23 @@ class SpyreEmitter:
         # upper bound parameters". The captured reference splits its leading
         # non-stick dim (golden/ref_restickify.py: c0 over 2 cores), so split
         # the leading dim that is not the destination's stick axis.
+        #
+        # **That dim is the *source's* stick axis**, and the whole-sticks rule
+        # therefore binds it -- measured, not assumed: at a 2-stick source axis
+        # (128 fp16) splits 1 and 2 compile and run while 4 and 8 fail in the
+        # backend scheduler with "There must be at least one valid candidate.";
+        # at a 4-stick axis (256 fp16) splits 2 and 4 run and 8 fails. So the
+        # bound is the source's stick count, exactly as for a compute op's
+        # stick axis. The frozen ``(2, 4, 1)`` never hit this because 2 is
+        # legal for every source wider than one stick.
         splits = [1] * len(dest.sizes)
         for dim in range(len(dest.sizes)):
             if dim == dest.stick_dim:
                 continue
-            splits[dim] = self._relayout_split(dest.sizes[dim])
+            splits[dim] = self._relayout_split(
+                dest.sizes[dim],
+                max_sticks=self._stick_count(source.sizes[dim], source.dtype),
+            )
             break
 
         import sympy
@@ -620,14 +780,75 @@ class SpyreEmitter:
         )
 
     @staticmethod
-    def _relayout_split(extent: int) -> int:
-        """Cores for a relayout's split dim: the reference uses a small split."""
+    def _stick_count(extent: int, dtype: torch.dtype) -> int:
+        """Whole sticks an extent of ``extent`` elements occupies."""
+        return max(1, -(-extent // layout.elems_per_stick(dtype)))
+
+    @staticmethod
+    def _relayout_split(extent: int, *, max_sticks: int) -> int:
+        """Cores a relayout splits its leading non-stick dim over.
+
+        **This was the frozen literal ``(2, 4, 1)``** -- "the reference uses a
+        small split", first of the three that divides the extent. That made a
+        work-division decision neither user-written nor autotuned, which is the
+        governing invariant (§1: work division is Helion's to choose *and to be
+        asked about*) bent in the way the assessment names as "the clearest
+        next hardening target" (summary deviation 3). It is also what bug #5
+        teaches: a decision hard-coded hides bugs in the path it never takes,
+        and #5 was found only once a frozen constant became a knob.
+
+        It now follows ``spyre_relayout_split`` (see
+        ``SpyreBackend.backend_tunables``), defaulting to 2 so an unspecified
+        config still gets the old behaviour.
+
+        ``max_sticks`` is the hard ceiling: the split dim is the *source's*
+        stick axis, so splitting it past its stick count splits a stick. The
+        caller measures it from the source operand. Exceeding it is not a
+        performance choice -- the backend scheduler rejects the program with
+        "There must be at least one valid candidate." -- so it is clamped here
+        rather than offered.
+
+        A requested split that does not divide the extent cannot be honoured
+        either (Spyre work division is exact), so the largest divisor at or
+        below the ceiling is used. Clamping rather than raising is right for
+        this one: unlike the stick-axis bound moved into
+        ``autotune_config_is_viable`` in T3, the relayout is emitted *inside*
+        the store path for a dim no config names, so there is no candidate the
+        autotuner could have screened instead. The knob is a preference over a
+        legal range; the range itself is hardware.
+        """
         from .backend import _sencores
 
-        for candidate in (2, 4, 1):
-            if candidate <= _sencores() and extent % candidate == 0:
+        requested = SpyreEmitter._config_int("spyre_relayout_split", 2)
+        budget = min(requested, _sencores(), max_sticks)
+        for candidate in range(max(1, budget), 0, -1):
+            if extent % candidate == 0:
                 return candidate
         return 1
+
+    @staticmethod
+    def _config_int(key: str, default: int) -> int:
+        """One backend tunable's value from the active config, or ``default``.
+
+        The ``DeviceFunction.current()`` lookup raises ``NoCurrentFunction``
+        when there is no bound kernel -- a direct emit, or a call from the
+        autotuner's search loop -- and that is the *only* condition this
+        swallows. A bare ``except Exception`` here used to return the default
+        for any failure at all, which is precisely the pattern §5b records
+        already costing a bug: a defensive ``try/except`` in
+        ``autotune_config_is_viable`` "silently accepted every config". For
+        ``spyre_lx_buffers`` that default is ``_MAX_LX_BUFFERS`` -- *the one
+        value the knob exists to stop the backend assuming*.
+        """
+        from ..device_function import DeviceFunction
+        from ..host_function import NoCurrentFunction
+
+        try:
+            current = DeviceFunction.current()
+        except NoCurrentFunction:
+            return default
+        value = current.config.config.get(key)
+        return default if value is None else int(value)
 
     def emit_zero_fill(self, operand: Operand) -> None:
         """Zero an accumulator with an ``identity`` from a scalar constant.
@@ -677,7 +898,7 @@ class SpyreEmitter:
         ``level_symbol`` is this level's tile-advance symbol. torch-spyre mints
         one symbol per level and reuses the *same object* in both
         ``tiled_symbols`` and every ``device_tile_advance_expr``
-        (spyre_kernel.py:552-568, :743) -- that shared identity is what lets
+        (spyre_kernel.py:588-610, :1072) -- that shared identity is what lets
         SDSC codegen recover each level's stride via ``coeff``.
 
         ``block_ids`` are the dims this loop tiles sequentially. Inside the
@@ -701,14 +922,13 @@ class SpyreEmitter:
     def close_loop(self, count: int) -> None:
         """Close the innermost loop, wrapping its body in a ``LoopSpec``."""
         import sympy
-
         from torch_spyre._inductor.op_spec import LoopSpec
 
         body = self._stack.pop()
         self._levels.pop()
         self._tiled_blocks.pop()
         if not body:
-            # op_spec_validation.py:213-233 rejects an empty body; fail here
+            # op_spec_validation.py:220-239 rejects an empty body; fail here
             # with a Helion-level message instead.
             raise exc.BackendUnsupported("spyre", "loop with no emitted ops")
         self.emit(LoopSpec(count=sympy.Integer(count), body=body))
@@ -745,26 +965,6 @@ class SpyreEmitter:
         self._levels.pop()
         self._tiled_blocks.pop()
 
-    def current_tiling(
-        self,
-    ) -> tuple[list[list[Any]], dict[Any, int]] | None:
-        """``(tiled_symbols, tiled_symbol_trip_counts)`` for the open levels.
-
-        ``tiled_symbols`` is innermost-first and must have one entry per
-        enclosing level even when empty (op_spec.py:323-346).
-        """
-        if not self._levels:
-            return None
-        symbols: list[list[Any]] = []
-        trips: dict[Any, int] = {}
-        for symbol, trip in reversed(self._levels):
-            if symbol is None:
-                symbols.append([])
-                continue
-            symbols.append([symbol])
-            trips[symbol] = trip
-        return symbols, trips
-
     @staticmethod
     def device_element_offset(
         device_size: list[int], coords: list[sympy.Expr]
@@ -788,7 +988,7 @@ class SpyreEmitter:
     def level_symbol_for(self, op_key: str) -> sympy.Symbol | None:
         """The innermost level's tile-advance symbol for one op.
 
-        Minted per (op, level), never shared between ops: spyre_kernel.py:552-569
+        Minted per (op, level), never shared between ops: spyre_kernel.py:588-610
         mints it that way specifically to fix a "same-real-symbol-tiled-at-2+-
         levels collapse bug", and sharing one symbol across the read-copy,
         matmul and combine ops makes their advances collapse so every iteration
@@ -808,9 +1008,7 @@ class SpyreEmitter:
             self._op_level_symbols[key] = symbol
         return symbol
 
-    def tiling_for(
-        self, op_key: str
-    ) -> tuple[list[list[Any]], dict[Any, int]] | None:
+    def tiling_for(self, op_key: str) -> tuple[list[list[Any]], dict[Any, int]] | None:
         """``(tiled_symbols, trip_counts)`` for one op, with its own symbols."""
         if not self._levels:
             return None
@@ -844,7 +1042,7 @@ class SpyreEmitter:
         formula: shift the tiled iteration symbol by one coarse tile, subtract,
         and evaluate at the window origin. That is the same reprojection
         ``spyre_kernel._general_tile_advance`` performs
-        (spyre_kernel.py:732-768), and it is why a matmul's two inputs get
+        (spyre_kernel.py:666-735), and it is why a matmul's two inputs get
         different advances when they stick on different axes.
 
         Returns ``None`` when the operand does not move, which is correct for a
@@ -894,6 +1092,25 @@ class SpyreEmitter:
         combine ``add`` has arg0 and arg2 both ``hbm: 3``), so the accumulator
         must *be* the store destination rather than a buffer copied out at the
         end.
+
+        **The rewrite is keyed on operand identity, not on a value match**
+        (review finding (b)). It used to select args by
+        ``arg.allocation == old_alloc and arg.arg_index == old_index``, which is
+        not a key at all: the free path below hands ``{"lx": 0}`` straight back,
+        so the next ``add_intermediate`` mints a *second* ``Operand`` carrying
+        the identical pair, and a later ``redirect_output`` then rewrites args
+        belonging to the wrong buffer. That it worked relied on stores arriving
+        last-in-first-out -- an invariant neither enforced nor documented
+        anywhere, which is precisely the kind of load-bearing accident this
+        stack punishes.
+
+        ``_ARG_ORIGIN`` records the producing ``Operand`` for every emitted arg
+        at the one place that knows it (``Operand.tensor_arg``), so this walks
+        a real index. Note what that does *not* change: the retroactive rewrite
+        itself stays. SuperDSC has no store op, so a store must reach back
+        (opspec plan §2 sanctions this); removing it would mean deferring
+        OpSpec construction until the store is seen, which is a larger redesign
+        and is not justified by anything observed.
         """
         producer = self._producers.get(id(value))
         if producer is None:
@@ -902,34 +1119,69 @@ class SpyreEmitter:
             )
 
         symbols = self._output_symbols[id(value)]
-        old_alloc = dict(value.allocation)
-        old_index = value.arg_index
+        origin = value.buffer_id
 
         def rebind(arg: object) -> object:
-            if arg.allocation != old_alloc or arg.arg_index != old_index:
+            if _ARG_ORIGIN.get(id(arg)) != origin:
                 return arg
-            return dest.tensor_arg(
+            replacement = dest.tensor_arg(
                 symbols,
                 is_input=arg.is_input,
                 tile_advance=arg.device_tile_advance_expr,
             )
+            # Preserve a spec_name: it is how an IndirectAccess coordinate in
+            # another arg resolves to this one (superdsc.py:1277-1279), so
+            # dropping it on a rewrite would break a gather whose staged table
+            # is later redirected.
+            if getattr(arg, "name", None) is not None:
+                replacement.name = arg.name
+            return replacement
 
         for spec in self._iter_op_specs(self._specs):
             spec.args = [rebind(a) for a in spec.args]
 
         if "lx" in value.allocation:
+            # The *count* is returned so a later intermediate can still prefer
+            # LX, but ``lx_size`` is deliberately **not** rewound -- for the
+            # same reason ``pool_size`` is not (see below). An LX address
+            # handed back and reused would alias a buffer that another
+            # ``Operand`` still carries in its ``allocation``, which is review
+            # finding (b)'s hazard; and since bug #15 these are real addresses,
+            # the aliasing would be a wrong answer rather than a harmless
+            # index collision.
             self._n_lx -= 1
         elif "hbm_pool" in value.allocation:
             self._n_pool -= 1
-            n = 1
-            for s in value.sizes:
-                n *= s
-            self.pool_size -= n * value.dtype.itemsize
+            # ``pool_size`` is deliberately **not** decremented. It was, and
+            # the arithmetic was asymmetric: allocation rounds up to a whole
+            # stick (``self.pool_size += -(-span // stride) * stride``) while
+            # the free subtracted the raw byte span. Any redirect therefore
+            # left ``pool_size`` *below* the true high-water mark, and the next
+            # ``allocation = {"hbm_pool": self.pool_size}`` handed out an offset
+            # that was no longer stick-aligned -- the exact condition
+            # ``layout.STICK_BYTES`` exists to prevent.
+            #
+            # Measured: a 200-byte span allocates 256 bytes (2 sticks) at
+            # offset 0, the free leaves ``pool_size`` at **56**, and the next
+            # buffer starts at byte 56 -- mid-stick, with 56 % 128 == 56.
+            # Nothing in the stack catches that. §3 rates G1's evidential
+            # weight as "nearly none" for this, and bug #5 is the precedent:
+            # overlapping ``hbm_pool`` buffers validated, bundled, compiled,
+            # launched, and returned ~95% wrong output.
+            #
+            # Rounding the free symmetrically would fix the alignment but keep
+            # a subtler hazard: the slot is handed back while
+            # ``redirect_output`` has only *rewritten* the args that referred
+            # to it, so a later allocation can reuse an offset another
+            # ``Operand`` still carries in ``allocation`` (review finding (b),
+            # T5). Not reclaiming at all removes both at the cost of some dead
+            # pool bytes, which is the cheap direction: the pool is sized once
+            # per kernel and nothing counts pool slots.
         if value.name:
             self.operands.pop(value.name, None)
 
     @staticmethod
-    def _iter_op_specs(specs: list[object]) -> list[object]:
+    def _iter_op_specs(specs: Sequence[object]) -> list[OpSpec]:
         """Every OpSpec in a spec tree, descending into LoopSpec bodies."""
         out: list[object] = []
         for spec in specs:
@@ -953,17 +1205,17 @@ class SpyreEmitter:
         *,
         is_reduction: bool,
         iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-        args: list[object],
+        args: Sequence[TensorArg],
         op_info: dict[str, Any] | None = None,
         tiled_symbols: list[list[sympy.Symbol]] | None = None,
         tiled_symbol_trip_counts: dict[sympy.Symbol, int] | None = None,
         output: Operand | None = None,
         output_symbols: list[sympy.Expr] | None = None,
-    ) -> object:
+    ) -> OpSpec:
         """Build an ``OpSpec``, deriving the core mapping from the given space.
 
         ``core_id_to_work_slice`` is derived with torch-spyre's own
-        ``derive_operation_mapping``, never hand-rolled: superdsc.py:2059-2060
+        ``derive_operation_mapping``, never hand-rolled: superdsc.py:2131-2132
         hard-errors if it is missing, and codegen "serializes this mapping but
         does not choose or reconstruct it".
 
@@ -982,9 +1234,7 @@ class SpyreEmitter:
             args=list(args),
             tiled_symbols=tiled_symbols if tiled_symbols is not None else [],
             tiled_symbol_trip_counts=(
-                tiled_symbol_trip_counts
-                if tiled_symbol_trip_counts is not None
-                else {}
+                tiled_symbol_trip_counts if tiled_symbol_trip_counts is not None else {}
             ),
         )
         if output is not None:

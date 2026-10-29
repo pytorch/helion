@@ -115,14 +115,22 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
     # Accumulate in float64 so large-magnitude outputs cannot overflow the
     # sum of squares. MPS has no float64; use float32 there — an overflow to
     # inf makes the RMS non-finite, and the caller then keeps the unscaled
-    # atol floor. Spyre likewise has no float64: a .to(torch.float64) there
-    # aborts the process with SIGFPE inside torch-spyre's layout propagation
-    # (torch_spyre/_inductor/propagate_layouts.py:2234), because the dtype maps
-    # to DataFormats.INVALID with a zero element size.
+    # atol floor. Spyre likewise has no float64, so float32 is used there too.
+    #
+    # ~~a .to(torch.float64) there aborts the process with SIGFPE inside
+    # torch-spyre's layout propagation (propagate_layouts.py:2234), because the
+    # dtype maps to DataFormats.INVALID with a zero element size~~ -- **that is
+    # no longer true, re-measured 2026-10-28 on wheel
+    # 0.6.0.dev322+master.gb9daa0c3.** torch-spyre now rejects the dtype by
+    # name: ``RuntimeError: Spyre backend does not support dtype Double``, from
+    # ``SpyreTensorLayout`` construction at
+    # ``torch_spyre/_inductor/propagate_layouts.py:2259``. So bug #4's
+    # process-killing failure mode is fixed upstream and this is now an
+    # ordinary catchable error. Keeping float32 anyway: the dtype is still
+    # unsupported, and a raise inside an accuracy check is no more useful than
+    # a SIGFPE was. Verified by ``repros/float64_cast_sigfpe.py``.
     acc_dtype = (
-        torch.float32
-        if t.device.type in ("mps", "tpu", "spyre")
-        else torch.float64
+        torch.float32 if t.device.type in ("mps", "tpu", "spyre") else torch.float64
     )
     total = 0.0
     for start in range(0, flat.numel(), chunk_size):

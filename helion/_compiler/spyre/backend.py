@@ -13,10 +13,7 @@ from __future__ import annotations
 import functools
 import logging
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import ClassVar
-
-import torch
 
 from ... import exc
 from ..backend import Backend
@@ -28,7 +25,16 @@ if TYPE_CHECKING:
     import ast
     from collections.abc import Sequence
 
+    # ``torch`` is annotations-only in this module. Every runtime use -- the
+    # device-timer probes' ``torch.zeros``/``compile``/``profiler``, and the
+    # generated launcher's own import -- already has a function-scope import.
+    # Sibling ``_compiler`` modules keep ``torch`` at module level and pass
+    # TC002 because they touch it at import time; this one does not.
+    import torch
+
+    from ...autotuner.config_spec import BlockSizeSpec
     from ...runtime.config import Config
+    from ..backend import InductorOpOverrides
     from ..device_ir import GraphInfo
     from ..inductor_lowering import Lowering
     from ..tile_dispatch import TileStrategyDispatch
@@ -39,11 +45,53 @@ if TYPE_CHECKING:
 #: trailing block size so no config can split a stick.
 _MAX_ELEMS_PER_STICK = 64
 
-#: Hard ceiling on concurrent LX intermediates. A **count**, not a byte budget:
-#: 3 concurrent LX buffers fail at launch at both 8 KB each (64x64 fp16) and
-#: 64 KB each (128x256 fp16) -- an 8x footprint difference with the same wall.
-#: The nominal budget (_LX_TRACKER_CAPACITY_BYTES * dxp_lx_frac_avail, ~406 KB,
-#: scratchpad/allocator.py:169,:1524) would allow ~6 and is not a safe guide.
+#: Usable LX scratchpad, in bytes. **A real byte budget, not a buffer count.**
+#:
+#: Taken from torch-spyre's own constants rather than measured, so the two
+#: cannot drift (`scratchpad/allocator.py:207-213`):
+#:
+#:     _LX_PHYSICAL_CAPACITY_BYTES         = 2 << 20   # 2 MiB
+#:     _LX_PROGRAM_DEBUG_RESERVATION_BYTES = 64 << 10  # 64 KiB
+#:     _LX_TRACKER_CAPACITY_BYTES          = 2 MiB - 64 KiB
+#:
+#: scaled by `config.dxp_lx_frac_avail` (default **0.2**, `config.py:164`), the
+#: fraction the frontend may use. 0.2 x (2 MiB - 64 KiB) = **406 KB**, which is
+#: the figure §9 quoted as "the nominal budget" -- and it turns out to have
+#: been the right one all along.
+#:
+#: ~~_MAX_LX_BUFFERS = 2: a count, not a byte budget; 3 concurrent LX buffers
+#: fail at launch at any size.~~ **That was bug #15.** The failures were an
+#: *addressing* bug in this backend, not a hardware ceiling: the emitter handed
+#: out `{"lx": 0}`, `{"lx": 1}`, `{"lx": 2}` as slot indices while SDSC reads
+#: the value as a byte address, so `{"lx": 2}` meant "2 bytes in" -- a
+#: misaligned address, which is what the hardware rejected. At properly
+#: aligned, non-overlapping addresses **6 concurrent LX buffers run**, and
+#: torch-spyre's own softmax uses 4 (`golden/ref_softmax.py`: 0, 256, 1024,
+#: 1280). See `repros/lx_allocation_is_an_address.py` and
+#: state-of-the-world §8.9.
+_LX_CAPACITY_BYTES = int((2 << 20) - (64 << 10)) * 2 // 10
+
+#: Alignment every LX address must satisfy. torch-spyre calls this
+#: `_LX_ALLOCATION_GRANULARITY_BYTES` (`allocator.py:214`) and it is **128** --
+#: which independently confirms the rule measured from the outside
+#: (`k % 128 in {0, 1}` for an accepted `{"lx": k}`). It is the same 128 as
+#: `layout.STICK_BYTES`, so the emitter aligns LX the way it already aligns the
+#: pool.
+_LX_ALIGNMENT_BYTES = 128
+
+#: Upper bound of the ``spyre_lx_buffers`` search. 8 rather than unbounded
+#: because the byte budget is the real limit and a request beyond it simply
+#: spills -- so a larger range would add configs that behave identically.
+#: Measured: 6 concurrent 8 KB buffers run, and 406323 / 65536 = 6 buffers at
+#: the 128x256 fp16 size the drivers use.
+_LX_SEARCH_MAX = 8
+
+#: Default *residency preference*: how many intermediates to keep in LX rather
+#: than spill to `hbm_pool`. A performance knob now, not a correctness ceiling
+#: -- the correctness limit is `_LX_CAPACITY_BYTES`, enforced by
+#: `SpyreEmitter._lx_fits`. Kept at 2 as the default so an unspecified config
+#: reproduces the previously-shipped behaviour; the autotuner may now search
+#: above it.
 _MAX_LX_BUFFERS = 2
 
 #: A Spyre launch costs milliseconds and the device is a shared, serialized
@@ -98,27 +146,84 @@ def _spyre_activity() -> object | None:
     import torch
 
     activity = torch.profiler.ProfilerActivity
-    return getattr(activity, "PrivateUse1", None) or getattr(
-        activity, "SPYRE", None
-    )
+    return getattr(activity, "PrivateUse1", None) or getattr(activity, "SPYRE", None)
+
+
+#: Marker identifying an emitted Spyre kernel among a profile's device
+#: activities. Every kernel torch-spyre launches is named
+#: ``spyre_kernel_v1_...`` (the ``v1`` is the SDSC bundle ABI), so this is the
+#: name torch-spyre itself chose rather than a heuristic.
+_KERNEL_ACTIVITY_MARKER = "spyre_kernel"
+
+
+def _kernel_activities(prof: object) -> list[tuple[float, float]]:
+    """``(start, end)`` of each **emitted kernel** activity, in microseconds.
+
+    **This filter is the whole point, and T6.1 is why it exists.** With the
+    profiler finally compiled in (§8.3), a real profile turned out to contain
+    three kinds of device activity, not one. Measured on a 128x256 fp16 add,
+    batch 8:
+
+    ====================== === =============
+    activity                 n    per launch
+    ====================== === =============
+    ``Memset (Device)``      9      4.84 us
+    ``spyre_kernel_v1_...``  8    **4.23 us**
+    ``Memcpy (HtoD)``        8      3.52 us
+    ====================== === =============
+
+    Only the middle row is the kernel. The other two are the *caller* staging
+    inputs and zeroing the output -- work the harness chose, not work the
+    config under test is responsible for. Counting them made
+    ``_device_span_ms`` report **2.99x** the kernel's time and
+    ``_device_time_ms`` **13.96x** it.
+
+    That is not a constant offset that would cancel in a ranking: staging
+    traffic scales with shape and layout, so including it corrupts the
+    autotuner's comparison in a shape-dependent way. ``repros/
+    device_timer_counts_kernel_only.py`` is the negative control.
+
+    Activities with no ``time_range`` are skipped: AIUPTI leaves
+    ``duration_us`` as ``None`` on these events, so the interval is the only
+    usable source and an event without one carries no timing at all.
+    """
+    spans: list[tuple[float, float]] = []
+    for event in getattr(prof, "events", list)():
+        if "CPU" in str(getattr(event, "device_type", "")):
+            continue
+        if _KERNEL_ACTIVITY_MARKER not in str(getattr(event, "name", "")):
+            continue
+        rng = getattr(event, "time_range", None)
+        if rng is None:
+            continue
+        spans.append((float(rng.start), float(rng.end)))
+    return spans
 
 
 def _device_time_ms(prof: object) -> float:
-    """Total device time in a profile, 0.0 when the profiler reports none.
+    """Summed **kernel** device work in a profile, 0.0 when there is none.
 
-    Aggregated over ``key_averages()``, which is per-operator totals, so this
-    is **device work**, not elapsed device time. For ranking autotuner configs
-    that is the right quantity -- see ``_device_timed``.
+    Device *work* rather than elapsed device time -- the two differ only when
+    activities overlap, which is what ``_device_span_ms`` handles.
+
+    Derived from the kernel activities' own intervals rather than from
+    ``key_averages()``, and T6.1 found two reasons that matters:
+
+    1. ``key_averages()`` aggregates **every** operator, including the
+       harness's ``Memcpy``/``Memset``, which this must not charge to the
+       kernel (see :func:`_kernel_activities`).
+    2. The previous implementation summed **both** ``device_time_total`` and
+       ``self_device_time_total`` for every row. Those overlap by construction
+       for a tree of operators, so it double-counted: measured per launch,
+       ``sum(device_time_total) = 65.75 us``,
+       ``sum(self_device_time_total) = 27.49 us``, and the reported figure was
+       their sum, 93.24 us -- against a true kernel time of 4.21 us.
     """
-    total = 0.0
-    for event in prof.key_averages():
-        for attr in ("device_time_total", "self_device_time_total"):
-            total += abs(getattr(event, attr, 0.0) or 0.0)
-    return total / 1e3  # torch reports microseconds
+    return sum(end - start for start, end in _kernel_activities(prof)) / 1e3
 
 
 def _device_span_ms(prof: object) -> float:
-    """Elapsed device time: the union of ``CONCURRENT_KERNEL`` intervals.
+    """Elapsed device time: the union of the **kernel** activity intervals.
 
     The runtime owns many streams per device -- stream 0 default, 1-32 low
     priority, 33-64 high priority, 65+ host compute
@@ -128,17 +233,24 @@ def _device_span_ms(prof: object) -> float:
     the time actually spent. Merging the intervals gives the span the device
     was busy regardless of how the work was spread across streams.
 
-    Returns 0.0 when no device activities are present.
+    Only kernel activities are merged (:func:`_kernel_activities`). Merging
+    every device activity was worse than merely over-counting: a ``Memcpy``
+    immediately before the kernel merges *with* it, so the gap between the two
+    was charged to the kernel as well. Measured 2.99x the true kernel time
+    before the filter.
+
+    **The span-vs-sum distinction is not yet exercised on hardware.** With the
+    filter in place, every shape in T6.1's sweep reports span == sum, because
+    these kernels put all their activities on one stream (``device_index`` 0
+    throughout). The preference for the span remains right in principle -- a
+    sum would double-count genuinely overlapping streams -- but it is verified
+    only against the stubbed profile in
+    ``repros/bench_source_selection.py`` check 4. Treat it as
+    untested-in-practice rather than validated.
+
+    Returns 0.0 when no kernel activities are present.
     """
-    spans: list[tuple[float, float]] = []
-    for event in getattr(prof, "events", lambda: [])():
-        kind = str(getattr(event, "device_type", ""))
-        if "CPU" in kind:
-            continue
-        start = getattr(event, "time_range", None)
-        if start is None:
-            continue
-        spans.append((float(start.start), float(start.end)))
+    spans = _kernel_activities(prof)
     if not spans:
         return 0.0
     spans.sort()
@@ -178,6 +290,16 @@ def _device_profiler_available() -> bool:
 
     Any failure means no usable device timing, so the answer is False and the
     caller falls back -- a benchmark must never raise.
+
+    **The broad ``except`` below is deliberate and stays.** T4's sweep
+    narrowed the two broad handlers that *swallowed* a decision
+    (``emitter._config_int``'s config lookup and
+    ``record_input_layout``'s layout recording, both of which made the backend
+    silently assume the one value their knob exists to stop it assuming). This
+    one is different in kind: the whole function *is* a feature probe whose
+    contract is a bool, and the thing it probes is an optional build-time
+    feature of torch-spyre that is currently absent (§8.0). Narrowing it would
+    mean enumerating the failure modes of a profiler that is not compiled in.
     """
     activity = _spyre_activity()
     if activity is None:
@@ -214,12 +336,25 @@ def _device_timed(fn: object, batch: int = _BENCH_BATCH) -> float | None:
     Returns None if the profile yields no device time at all, so a caller can
     fall back rather than silently report 0.0 and make every config look equal.
 
-    **UNVERIFIED ON HARDWARE.** The wheel installed here was built
-    ``USE_SPYRE_PROFILER=0``, so this path has never run against a real
-    profiler. Its arithmetic is checked against a stubbed profile, and the
-    selection logic is checked by the detector returning False -- but nothing
-    here is evidence that AIUPTI reports what this assumes. In particular the
-    span-vs-sum choice is untested: on a single-stream kernel they are equal.
+    **VERIFIED ON HARDWARE 2026-10-28** (T6.1), after the rebuild that put the
+    profiler in the wheel (§8.3). ~~UNVERIFIED: the wheel installed here was
+    built USE_SPYRE_PROFILER=0, so this path has never run against a real
+    profiler.~~ What the scale test established, measured on a 256x range of
+    work:
+
+    * device time responds **15.0x** to a 256x change in elements, against the
+      drained wall clock's **2.6x** -- so it is measuring work, which was the
+      open question;
+    * the gap to the drained clock is the launch overhead, directly: **89%** of
+      the wall clock at 64x128 falling to **34%** at 1024x2048;
+    * ``key_averages().device_time_total`` *is* populated, so that was a real
+      data source -- but it aggregates the harness's copies too, which is why
+      ``_device_time_ms`` no longer uses it (see there).
+
+    The span-vs-sum choice is still **untested in practice**: with the kernel
+    filter in place every measured shape reports span == sum, because all
+    activities land on ``device_index`` 0. It is checked only against the
+    stubbed profile in ``repros/bench_source_selection.py`` check 4.
     """
     activity = _spyre_activity()
     if activity is None:
@@ -264,7 +399,7 @@ def _sencores() -> int:
 
 
 #: Device for a synthesized scalar constant in the generated host wrapper.
-_DEVICE_EXPR = '"spyre"' 
+_DEVICE_EXPR = '"spyre"'
 
 
 class SpyreBackend(Backend):
@@ -275,6 +410,7 @@ class SpyreBackend(Backend):
             "block_sizes",
             "range_unroll_factors",
             "spyre_lx_buffers",
+            "spyre_relayout_split",
         }
     )
 
@@ -301,7 +437,8 @@ class SpyreBackend(Backend):
         except ImportError as e:
             raise exc.BackendUnsupported(
                 self.name,
-                "torch-spyre is not installed; install it with: pip install torch-spyre",
+                "torch-spyre is not installed; install it with"
+                " `pip install torch-spyre`",
             ) from e
 
     # -- what Helion must not assume on this backend ----------------------
@@ -333,19 +470,50 @@ class SpyreBackend(Backend):
         device stream for the rest of the process.
 
         The ceiling is a **count, not a byte budget**: measured on this device,
-        3 concurrent LX intermediates fail at both 8 KB each (64x64 fp16) and
-        64 KB each (128x256 fp16), an 8x difference in footprint with the same
-        wall. So the search space is capped at ``_MAX_LX_BUFFERS`` and
-        ``autotune_config_is_viable`` rejects anything above it, rather than
-        letting the autotuner discover the limit as a hardware fault.
+        ~~3 concurrent LX intermediates fail at both 8 KB each and 64 KB each,
+        an 8x difference in footprint with the same wall, so the search space is
+        capped at ``_MAX_LX_BUFFERS``.~~ That wall was bug #15 -- an addressing
+        bug here, not hardware. The search now runs to ``_LX_SEARCH_MAX`` and
+        the emitter spills to ``hbm_pool`` when the LX *byte* budget is
+        exhausted, so no config in the range can fail as a hardware fault.
         """
         from ...autotuner.config_spec import IntegerFragment
 
         return {
-            # low=0 (everything in hbm_pool) .. high=_MAX_LX_BUFFERS, default 2.
-            "spyre_lx_buffers": IntegerFragment(
-                0, _MAX_LX_BUFFERS, _MAX_LX_BUFFERS
-            ),
+            # low=0 (everything in hbm_pool) .. high=_LX_SEARCH_MAX, default
+            # _MAX_LX_BUFFERS (2, the previously-shipped behaviour).
+            #
+            # ~~high was _MAX_LX_BUFFERS, because 3 concurrent LX buffers
+            # failed at launch at any size.~~ That ceiling was bug #15 -- an
+            # addressing bug in this backend, not a hardware limit (see
+            # ``_LX_CAPACITY_BYTES``). torch-spyre's own softmax uses **four**
+            # concurrent LX buffers, so a cap of 2 made the reference kernel
+            # inexpressible. The real limit is now the byte budget, enforced
+            # per allocation by ``SpyreEmitter._lx_fits``, which spills to
+            # ``hbm_pool`` instead of failing.
+            "spyre_lx_buffers": IntegerFragment(0, _LX_SEARCH_MAX, _MAX_LX_BUFFERS),
+            # Cores a ReStickifyOpHBM splits its leading non-stick dim over.
+            #
+            # This was the frozen literal ``(2, 4, 1)`` inside
+            # ``emitter._relayout_split`` -- "the reference uses a small split",
+            # first of the three that divides. That is a work-division decision
+            # neither user-written nor autotuned, i.e. exactly the governing
+            # invariant (§1) bent in the way the assessment calls "the clearest
+            # next hardening target" (summary deviation 3).
+            #
+            # Exposing it as a knob is also the lesson of bug #5, which was
+            # found *only* because a frozen constant was turned into one: a
+            # decision hard-coded hides bugs in the path it never takes. The
+            # default is 2, so the previous behaviour is still what an
+            # unspecified config gets; the difference is that the other values
+            # are now reachable and benchmarked rather than unreachable.
+            #
+            # A relayout needs a real split: with every dim unsplit the backend
+            # scheduler rejects the program ("Expect valid lower and upper
+            # bound parameters"), so low=1 is the floor and
+            # ``_relayout_split`` falls back to a divisor when the requested
+            # value does not divide the extent.
+            "spyre_relayout_split": IntegerFragment(1, 8, 2),
         }
 
     def supports_precompile(self) -> bool:
@@ -453,7 +621,7 @@ class SpyreBackend(Backend):
 
         Plan 4.3: the trailing axis is the within-stick axis and is never
         divided -- "a stick is the unit of transfer, so splitting it across
-        cores would split a stick" (opspec_utils.py:515-516). A sub-stick
+        cores would split a stick" (codegen/opspec_utils.py:515-516). A sub-stick
         trailing block is not caught by ``validate_op_specs``; it surfaces as an
         opaque ``SubprocException`` from the backend compiler, so bound the
         search instead of discovering it late.
@@ -492,7 +660,7 @@ class SpyreBackend(Backend):
         self._raise_floors_for_core_budget(specs)
 
     @staticmethod
-    def _raise_floors_for_core_budget(specs: list[object]) -> None:
+    def _raise_floors_for_core_budget(specs: list[BlockSizeSpec]) -> None:
         """Raise block-size floors until the minimum core count fits sencores.
 
         At each floor the split of a dim is ``extent // min_size``, so the
@@ -525,9 +693,7 @@ class SpyreBackend(Backend):
                 return
             worst.update_min(floor * 2)
 
-    def autotune_config_is_viable(
-        self, config_spec: object, config: Config
-    ) -> bool:
+    def autotune_config_is_viable(self, config_spec: object, config: Config) -> bool:
         """Reject configs Spyre cannot express, before anything is emitted.
 
         Three rules, each one a hard constraint rather than a preference:
@@ -540,19 +706,23 @@ class SpyreBackend(Backend):
         * **Stick alignment.** As in ``adjust_block_size_constraints``: a
           trailing block below one stick splits a stick.
         * **One reduction split.** Plan 4.1: at most one reduction dim may be
-          split across cores (`work_division.py:317-322`), since a K-split
+          split across cores (`work_division.py:328-331`), since a K-split
           builds a PSUM chain the emitter does not model.
         * **Core budget.** The product of the per-dim splits is the number of
           cores the kernel asks for, bounded by ``config.sencores``
-          (`_inductor/config.py:143`, default 32; also the ``max_cores`` the
-          work divider itself uses at `work_division.py:1990`). Overshooting is
+          (`_inductor/config.py:166`, default 32; also the ``max_cores`` the
+          work divider itself uses at `work_division.py:2761`). Overshooting is
           not caught by ``validate_op_specs`` -- it surfaces as an opaque
           ``SubprocException`` from the backend compiler, which an autotune
           sweep hits constantly as it shrinks block sizes.
         """
         lx_buffers = config.config.get("spyre_lx_buffers")
-        if lx_buffers is not None and not (0 <= int(lx_buffers) <= _MAX_LX_BUFFERS):
-            # Above the measured ceiling the kernel fails at launch, not here.
+        if lx_buffers is not None and not (0 <= int(lx_buffers) <= _LX_SEARCH_MAX):
+            # ~~Above the measured ceiling the kernel fails at launch, not
+            # here.~~ There is no such ceiling (bug #15); this now only screens
+            # values outside the searched range. Exceeding the LX *byte* budget
+            # is not a viability question at all, because the emitter spills to
+            # ``hbm_pool`` rather than failing -- see ``_lx_fits``.
             return False
 
         block_sizes = config.block_sizes
@@ -567,9 +737,36 @@ class SpyreBackend(Backend):
         if spec is None:
             return True
         infos = [spec.block_id_lookup(bid) for bid in spec.valid_block_ids()]
+        if len(infos) != len(block_sizes):
+            # A config that does not describe this kernel's block ids is not
+            # viable. ruff's B905 flagged the bare ``zip`` here: it would
+            # silently *truncate* to the shorter list, so a config missing a
+            # trailing block size would be screened against only its leading
+            # dims and pass. Returning False is the honest answer -- and this
+            # hook's contract is a bool, so the ``strict=True`` that B905 wants
+            # cannot raise here; the length check is what makes it safe.
+            return False
+
+        # **Which axis carries the sticks.** Read from the one authority rather
+        # than assumed to be the trailing one. ``_input_stick_dims`` is
+        # populated by ``record_input_layout`` at bind time and persists across
+        # autotuner trials, so it is available here even though there is no
+        # active compile environment -- which is what makes the per-op fact
+        # usable in a per-config check.
+        #
+        # This resolves the tension the plan flagged: the stick axis is an
+        # *op*-level fact while viability is *per config*. A kernel-wide axis is
+        # the conservative reading of it, and it is sound here because every
+        # rank-matching tensor had to agree for ``output_stick_dim`` to return
+        # anything at all -- a mixture gives ``None`` and
+        # ``kernel_stick_dim`` falls back to the trailing dim, which is exactly
+        # the old behaviour. So this is never *weaker* than before, and it is
+        # stronger precisely in the dim-0-sticked case that was wrong.
+        stick_position = self.kernel_stick_dim(len(block_sizes))
+
         reduction_splits = 0
         cores = 1
-        for position, (info, block) in enumerate(zip(infos, block_sizes)):
+        for position, (info, block) in enumerate(zip(infos, block_sizes, strict=True)):
             extent = int(getattr(info, "size_hint", 0) or 0)
             value = int(block)
             if extent <= 0:
@@ -577,13 +774,30 @@ class SpyreBackend(Backend):
             if value <= 0 or extent % value != 0:
                 # Work division must be exact.
                 return False
-            if (
-                position > 0
-                and value < _MAX_ELEMS_PER_STICK
-                and extent > _MAX_ELEMS_PER_STICK
-            ):
-                # A trailing block below one stick splits a stick -- unless the
-                # whole dim is narrower than a stick, where it cannot.
+            if position == stick_position:
+                # **The stick axis may be divided only down to whole sticks.**
+                # This screen is the clamp that used to live in
+                # ``compute_ops._iteration_space``, moved here because a clamp
+                # in codegen makes the autotuner benchmark a work division it
+                # did not choose -- the governing invariant (§1: "never solved
+                # behind their back") bent in the one place the autotuner is
+                # supposed to be in charge.
+                #
+                # Measured before the move, on a dim-0-sticked 128x256 fp16
+                # kernel: configs asking for c0 splits of 2, 4 and 8 all
+                # emitted a split of 2, and ``autotune_config_is_viable``
+                # returned True for all three. So the search space contained
+                # three configs that were the same kernel, and the autotuner
+                # spent launches distinguishing them.
+                sticks = max(1, -(-extent // _MAX_ELEMS_PER_STICK))
+                if extent // value > sticks:
+                    return False
+            elif value < _MAX_ELEMS_PER_STICK and extent > _MAX_ELEMS_PER_STICK:
+                # A block below one stick on a *non*-stick axis splits a stick
+                # too -- unless the whole dim is narrower than a stick, where
+                # it cannot. (This was guarded as ``position > 0``, i.e. with
+                # the trailing axis assumed to be the stick axis; for a
+                # dim-0-sticked kernel that guarded the wrong axis entirely.)
                 return False
             if getattr(info, "reduction", False) and extent // value > 1:
                 reduction_splits += 1
@@ -604,9 +818,7 @@ class SpyreBackend(Backend):
     ) -> None:
         self.emitter.reset()
 
-    def record_input_layout(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ) -> None:
+    def record_input_layout(self, real: torch.Tensor, fake: torch.Tensor) -> None:
         """Remember each real input's stick axis before it is fakified.
 
         Plan 5.3 says input layouts are *read*, not chosen -- but by codegen
@@ -618,12 +830,21 @@ class SpyreBackend(Backend):
         """
         from .layout import stick_dim_of
 
+        # Narrowed to ``BackendUnsupported``, which is the only thing
+        # ``stick_dim_of`` raises by design: an unsupported dtype (via
+        # ``device_dtype``) or a ``device_size`` that cannot be reconciled with
+        # the host shape. Both of those genuinely do fail again later, at the
+        # point where the operand is used and the message can name it.
+        #
+        # A bare ``except Exception`` here was the wrong shape for this hook in
+        # particular: silently not recording a layout makes the backend assume
+        # the default trailing-dim stick axis, which is **bug #6 and #11's
+        # failure mode** -- wrong numerics with nothing raised, not a crash. So
+        # anything that is not a described limitation now propagates.
         try:
             self._input_stick_dims[id(fake)] = stick_dim_of(real)
             self._input_ranks[id(fake)] = real.dim()
-        except Exception:
-            # A dtype or layout the backend cannot describe fails later, at the
-            # point where it is actually used and can be named.
+        except exc.BackendUnsupported:
             pass
 
     def input_stick_dim(self, fake: torch.Tensor) -> int | None:
@@ -638,6 +859,19 @@ class SpyreBackend(Backend):
         output is not known here. When every rank-matching tensor shares one
         stick axis, that axis is unambiguous and is the right target; a mixture
         means a genuine conflict, which the relayout path resolves per operand.
+
+        **The set-resolve is deliberate and `None` is a real answer**, not a
+        fallback. §9 item 3 asked for this to get `stick_dim_of`'s treatment
+        (that was one forward scan, and it gave bug #11). The difference is
+        that `stick_dim_of` had to *choose* between candidates that both fitted
+        one tensor's layout, where guessing was the bug; here a mixture is
+        several tensors genuinely disagreeing, and the per-operand relayout
+        path is the right resolution rather than a tie-break. What this does
+        share with bug #11 is that a *square* shape is the configuration that
+        exposes it -- `stick_dim_of` returns the tie-broken trailing dim for
+        every square tensor, so a square kernel records one axis for all of
+        them and this returns that axis whether or not it is the real one. The
+        gate for that is `repros/output_stick_dim_square.py`.
         """
         axes = {
             dim
@@ -645,6 +879,25 @@ class SpyreBackend(Backend):
             if self._input_ranks.get(key) == rank
         }
         return axes.pop() if len(axes) == 1 else None
+
+    def kernel_stick_dim(self, rank: int) -> int:
+        """**The** stick axis for a rank-``rank`` operand of this kernel.
+
+        One authority, used by every caller that needs "which axis carries the
+        sticks": the pointwise agreement axis (`compute_ops._output_stick_dim`),
+        the stick-split bound in `_iteration_space`, and
+        `autotune_config_is_viable`'s stick-alignment screen. Before this, the
+        first two used the real recorded axis while the third assumed the
+        trailing one (`position > 0`), so for a dim-0-sticked kernel the
+        viability check guarded **the wrong axis entirely** -- review finding
+        (d) and §9 item 3 seen from two sides.
+
+        Falls back to the trailing dim when nothing was recorded, which is
+        torch-spyre's own default tiled layout and the same choice
+        `stick_dim_of` makes for a tensor with no device layout to read.
+        """
+        recorded = self.output_stick_dim(rank)
+        return rank - 1 if recorded is None else recorded
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Install a Spyre lowering for every compute node.
@@ -720,7 +973,7 @@ class SpyreBackend(Backend):
         body has been walked (so the spec tree is complete) and while
         ``module_statements`` is still open (so the literal can be inserted
         without a core edit). The literal itself is printed by torch-spyre's own
-        ``_codegen_op_spec_list`` (spyre_kernel.py:1572); plan 5.1 is explicit
+        ``_codegen_op_spec_list`` (spyre_kernel.py:1646); plan 5.1 is explicit
         that we must not write a second printer.
         """
         from ..ast_extension import statement_from_string
@@ -731,19 +984,13 @@ class SpyreBackend(Backend):
         emitter = self.emitter
         specs = emitter.specs()
         if not specs:
-            raise exc.BackendUnsupported(
-                self.name, "kernel emitted no OpSpecs"
-            )
+            raise exc.BackendUnsupported(self.name, "kernel emitted no OpSpecs")
 
-        name = device_function.name
         statements = device_function.codegen.module_statements
-        statements.append(
-            statement_from_string(f"_SPYRE_SPECS = {spec_source(specs)}")
-        )
+        statements.append(statement_from_string(f"_SPYRE_SPECS = {spec_source(specs)}"))
         statements.append(
             statement_from_string(f"_SPYRE_POOL_SIZE = {emitter.pool_size}")
         )
-        del name
         return ""
 
     @property
@@ -794,7 +1041,7 @@ class SpyreBackend(Backend):
             self.name, "acc_type: Spyre accumulators are buffers, not type strings"
         )
 
-    def inductor_op_overrides(self) -> Any:
+    def inductor_op_overrides(self) -> InductorOpOverrides:
         # Plan 1.1: deliberately unimplemented. Reaching this means a compute
         # node escaped pre_inductor_lowering.
         raise exc.BackendUnsupported(
@@ -849,8 +1096,10 @@ class SpyreBackend(Backend):
                 launch.append(
                     (
                         operand.arg_index,
-                        f"torch.zeros((), dtype={operand.dtype!r},"
-                        f" device={_DEVICE_EXPR})",
+                        (
+                            f"torch.zeros((), dtype={operand.dtype!r},"
+                            f" device={_DEVICE_EXPR})"
+                        ),
                     )
                 )
             elif operand.name:

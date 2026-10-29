@@ -79,7 +79,7 @@ def _(state: CodegenState) -> object:
     _emit_fills(emitter)
 
     # One minted symbol per level, shared by tiled_symbols and every
-    # device_tile_advance_expr at that level (spyre_kernel.py:552-568, :743):
+    # device_tile_advance_expr at that level (spyre_kernel.py:588-610, :1072):
     # the shared identity is what lets SDSC recover each level's stride.
     # integer=True so Mod()/floor() of a shifted coordinate resolve when
     # tile_advance_for derives each operand's own advance.
@@ -102,9 +102,7 @@ def _(state: CodegenState) -> object:
     return results
 
 
-def _loop_tiling(
-    state: CodegenState, graph_info: object
-) -> tuple[int, list[int], int]:
+def _loop_tiling(state: CodegenState, graph_info: object) -> tuple[int, list[int], int]:
     """``(trip count, tiled block ids, per-iteration extent)`` of a device loop."""
     from ..compile_environment import CompileEnvironment
 

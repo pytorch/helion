@@ -295,8 +295,8 @@ def default_spyre_launcher(
     # ("the grid is a fact of the contract" -- codegen/ktir.py:1268-1280).
     # Helion still computes a Triton-style grid from the block sizes, so it is
     # ignored rather than rejected -- rejecting it broke autotuning, which
-    # launches through the ordinary host wrapper.
-    del grid
+    # launches through the ordinary host wrapper. It is simply not read --
+    # `del grid` here violated AGENTS.md's "don't call del on unused args".
 
     # The spec tree is a module-level literal in the generated module, and a
     # function's __globals__ *is* its defining module's namespace -- so the
