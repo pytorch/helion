@@ -22,11 +22,14 @@ import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
 
+_SEED_CODEGEN_SHARDS = 4
+
 
 @pytest.mark.parametrize("columns", [32, 69, 128, 512])
 @pytest.mark.parametrize("static_shapes", [False, True])
+@pytest.mark.parametrize("seed_shard", range(_SEED_CODEGEN_SHARDS))
 def test_nested_jagged_passes_receive_reachable_coherent_seeds(
-    columns: int, static_shapes: bool
+    columns: int, static_shapes: bool, seed_shard: int
 ) -> None:
     kernel = helion.kernel(
         jagged_layer_norm_kernel.fn,
@@ -53,7 +56,9 @@ def test_nested_jagged_passes_receive_reachable_coherent_seeds(
     # view carries a symbolic storage offset, which no bound residue covers.
     sunk = [seed for seed in seeds if seed.config.get("cute_vloop_sink")]
     assert bool(sunk) == (columns % 4 == 0 and static_shapes)
-    for seed in seeds:
+    # The largest case generates 111 sources; split that work across test cases
+    # so CI's per-test timeout does not terminate a worker mid-codegen.
+    for seed in seeds[seed_shard::_SEED_CODEGEN_SHARDS]:
         normalized = seed.config.copy()
         spec.normalize(normalized)
         assert normalized["num_threads"] == seed.config["num_threads"]
