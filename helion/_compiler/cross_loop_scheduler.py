@@ -2201,11 +2201,33 @@ def _build_readiness_events(
             producer_incidence = incidence.coarsen(partition)
             if producer_incidence is None:
                 break
-            event_producers.append(
-                ReadinessProducer(producer_root, producer_incidence, producer_site_id)
+            readiness_producer = ReadinessProducer(
+                producer_root, producer_incidence, producer_site_id
             )
+            if (
+                len(merged_relations) > 1
+                and not _supports_readiness_counter_lowering(readiness_producer)
+                and (
+                    producer_incidence.keys_by_item is None
+                    or KeyPartition.from_fixed_width_publication(
+                        producer_incidence.keys_by_item
+                    )
+                    is None
+                )
+            ):
+                # A fan-out arm (one producer task publishes to keys no fixed-width
+                # quotient groups, e.g. every consumer key reads all of a small
+                # root) cannot lower as a counter and would make the whole merged
+                # event unlowerable, so the other arms' keyed obligations would fall
+                # back to whole-root barriers.  Leave its obligations unrepresented:
+                # the fallback below orders this (producer, consumer) pair by
+                # itself.
+                continue
+            event_producers.append(readiness_producer)
             covered_obligations.update(relation_points)
         else:
+            if not event_producers:
+                continue
             _record_readiness_event(
                 pending_events,
                 readiness_key_domain=readiness_key_domain,

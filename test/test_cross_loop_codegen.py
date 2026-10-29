@@ -24,6 +24,7 @@ from helion._compiler.cross_loop_codegen import (
 )
 from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
+from helion._compiler.cross_loop_codegen import _insert_before_first_use
 from helion._compiler.cross_loop_codegen import _outline_cross_loop_region
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
@@ -47,6 +48,46 @@ from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.benchmark_provider import _triton_compile
 import helion.language as hl
 from helion.runtime.triton.launcher import compile_only_launch_args
+
+# Spins until %globaltimer has advanced by $1 ns, then yields 0.  Declared
+# pure: assembly with side effects makes its root opaque, keeping every wait
+# on it at task entry.
+_GLOBALTIMER_SPIN = (
+    "{ .reg .u64 t0, t1; .reg .pred p; mov.u64 t0, %globaltimer; "
+    "SPIN: mov.u64 t1, %globaltimer; sub.u64 t1, t1, t0; "
+    "setp.lt.u64 p, t1, $1; @p bra SPIN; mov.u32 $0, 0; }"
+)
+
+
+def _war_after_producer_read_impl(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    delay: torch.Tensor,
+    store_through_view: hl.constexpr,
+) -> torch.Tensor:
+    # P reads x late (a spin feeds the load address) and writes y = x + 1.  C
+    # first overwrites its tile of x through `x_store` (x itself, or a host
+    # view of its storage: a write-after-read on P's input), then reads all of
+    # y (C's root barrier on P).  Sequential semantics: y = x0 + 1 everywhere
+    # and x ends -1; a C store that wins the race against a late P read
+    # corrupts y.
+    n = x.size(0)
+    x_store = x.view(n) if store_through_view else x
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=64):
+        spun = hl.inline_asm_elementwise(
+            _GLOBALTIMER_SPIN,
+            "=r,l",
+            [delay[0]],
+            dtype=torch.int32,
+            is_pure=True,
+            pack=1,
+        )
+        y[tile] = x[tile.index + spun] + 1.0
+    for tile_c in hl.tile(n, block_size=64):
+        x_store[tile_c] = hl.zeros([tile_c], dtype=torch.float32) - 1.0
+        out[tile_c] = hl.zeros([tile_c], dtype=torch.float32) + torch.sum(y[:], dim=0)
+    return out
 
 
 def _generated_function(code: str, name: str) -> ast.FunctionDef:
@@ -625,6 +666,30 @@ def coalesced_multi_producer_join(
     static_shapes=True,
     autotune_effort="none",
 )
+def fanout_and_keyed_join(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # A small root every consumer task reads whole (a routing table) and a keyed
+    # root with several tasks per key (FC1 units per expert slot): the consumer
+    # (FC2) must keep its keyed wait on the keyed root.
+    n = x.size(0)
+    rows, width = y.shape
+    quarters = 4
+    small = torch.empty_like(x)
+    keyed = torch.empty_like(y)
+    out = torch.empty_like(y)
+    for tile in hl.tile(n, block_size=1):
+        small[tile] = x[tile] + 1
+    for tile_q, tile_r in hl.tile([quarters, rows], block_size=[1, 1]):
+        cols = tile_q.begin * (width // quarters) + hl.arange(width // quarters)
+        keyed[tile_r, cols] = y[tile_r, cols] * 2 + torch.sum(small[:], dim=0)
+    for tile_r in hl.tile(rows, block_size=1):
+        out[tile_r, :] = keyed[tile_r, :] + torch.sum(small[:], dim=0)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def coalesced_single_producer_fanout(x: torch.Tensor) -> torch.Tensor:
     heads, width = x.shape
     splits = 4
@@ -917,6 +982,45 @@ def specialized_quotient_chain(
 
 
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_sunk_wait_dominates_every_use(self) -> None:
+        def place(source: str) -> str:
+            body = ast.parse(source).body
+            wait = ast.parse("wait()").body
+            if not _insert_before_first_use(body, frozenset({"z", "z_desc"}), wait):
+                return "unused"
+            return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+        # Independent work runs first; the wait enters the one branch that uses z.
+        self.assertEqual(
+            place(
+                "n = tl.load(routes)\n"
+                "if n > 0:\n    e = n + 1\n    a = tl.load(z + e)\n"
+                "else:\n    b = n\n"
+            ),
+            "n = tl.load(routes)\n"
+            "if n > 0:\n    e = n + 1\n    wait()\n    a = tl.load(z + e)\n"
+            "else:\n    b = n",
+        )
+        # A use in the test, in both branches or after the if keeps it outside.
+        for source in (
+            "if tl.load(z) > 0:\n    a = 1\n",
+            "if c:\n    a = tl.load(z)\nelse:\n    b = z_desc.load([0])\n",
+            "if c:\n    a = tl.load(z)\nb = tl.load(z + 1)\n",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(place(source).startswith("wait()\n"))
+        # Loops are never entered.
+        self.assertEqual(
+            place("for i in tl.range(0, 4):\n    a = tl.load(z + i)\n"),
+            "wait()\nfor i in tl.range(0, 4):\n    a = tl.load(z + i)",
+        )
+        # Every name counts, including a descriptor of the same storage.
+        self.assertEqual(
+            place("a = z_desc.load([0])\nb = tl.load(z)\n"),
+            "wait()\na = z_desc.load([0])\nb = tl.load(z)",
+        )
+        self.assertEqual(place("a = tl.load(x)\n"), "unused")
+
     def test_guard_hoisting_preserves_dtype_checks(self) -> None:
         indexing = "pid_0 = virtual_pid\noffset_0 = pid_0\n"
         invariant = (
@@ -1373,6 +1477,51 @@ class TestCrossLoopBarrierPipeline(RefEagerTestBase, TestCase):
 
 @skipIfNotTriton("static/dynamic cross-loop pipelines are Triton-only codegen")
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_sunk_barrier_wait_precedes_write_after_read_store(self) -> None:
+        # A dynamic root that publishes nothing sinks its root-barrier wait to
+        # the first use of what the wait orders.  A store into a tensor its
+        # producer READS (write-after-read), directly or through a host view
+        # of its storage, is such a use.  P reads x 20 us late; C's store of
+        # -1 must not reach x before P's read.
+        n = 1024
+        x0 = (torch.arange(n, device=DEVICE, dtype=torch.float32) % 13) + 0.5
+        delay = torch.full((1,), 20000, device=DEVICE, dtype=torch.int64)
+        expected = torch.full((n,), float((x0 + 1).sum()), device=DEVICE)
+        kernel = helion.kernel(
+            _war_after_producer_read_impl,
+            static_shapes=True,
+            autotune_effort="none",
+        )
+        x = x0.clone()
+        y = torch.empty(n, device=DEVICE)
+        for alias in (False, True):
+            for _launch in range(3):
+                x.copy_(x0)
+                y.fill_(float("nan"))
+                code, out = code_and_output(
+                    kernel,
+                    (x, y, delay, alias),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(out, expected), alias)
+                self.assertTrue(bool((x == -1).all()), alias)
+                # The sunk wait precedes the store.
+                consumer = ast.unparse(
+                    _generated_function(code, "tile_dependency_root_1")
+                )
+                self.assertLess(
+                    consumer.index("tile_dependency_root_barrier_wait"),
+                    consumer.index(f"tl.store({'x_store' if alias else 'x'} + "),
+                    str(alias),
+                )
+
     def assertUsesExactReadiness(self, code: str) -> None:
         self.assertTrue(
             "tile_dependency_continuation_previous" in code
@@ -2593,6 +2742,35 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         for line in publication_lines:
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}, 1", line)
         self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fanout_producer_keeps_keyed_readiness_of_other_producer(self) -> None:
+        # Merging the fan-out producer (every consumer key reads all of it) into
+        # the keyed producer's readiness event must not make the event
+        # unlowerable: the consumer keeps its keyed wait on the keyed producer
+        # and only the fan-out producer gets a root barrier.
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = torch.arange(32 * 64, device=DEVICE, dtype=torch.float32).reshape(32, 64)
+        for pipeline in ("static", "dynamic"):
+            for launch in range(2):
+                code, out = code_and_output(
+                    fanout_and_keyed_join,
+                    (x + launch, y + launch),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline=pipeline,
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                small_sum = (x + launch + 1).sum()
+                torch.testing.assert_close(out, (y + launch) * 2 + 2 * small_sum)
+            self.assertIn("tile_dependency_readiness_wait", code, pipeline)
+            barrier_targets = {
+                line.split("args=[", 1)[1].split("]", 1)[0]
+                for line in code.splitlines()
+                if "tile_dependency_root_barrier_wait" in line and "ld.acquire" in line
+            }
+            self.assertEqual(len(barrier_targets), 1, barrier_targets)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

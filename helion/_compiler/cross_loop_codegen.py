@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .device_function import DeviceFunction
+    from .device_ir import DeviceIR
     from .program_id import ForEachProgramID
     from .program_id import PersistentProgramIDs
     from .program_id import PIDInfo
@@ -464,6 +465,115 @@ def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
         "constraints='=r,r', args=[tl.arange(0, 32)], "
         "dtype=tl.uint32, is_pure=False, pack=1)"
     )
+
+
+def _opaque_roots(
+    device_ir: DeviceIR, *, addresses_only: bool = False
+) -> frozenset[int]:
+    """Roots whose memory effects or synchronization the dependency graph
+    does not record; a wait that involves one must not sink past any access.
+
+    The graph records loads, stores and atomics.  A root is opaque if one of
+    its ops passes a kernel tensor to any other op (``hl.inline_triton``,
+    ``hl.triton_kernel``, ``hl.load_float4_e2m1fn_x16_to_float16``, ...); is
+    an atomic not known to be relaxed or release (an acquire may order the
+    root after a write outside the launch, which its publication passes on);
+    or has side effects: inline assembly not declared pure, or any other
+    such op but ``hl.pdl_launch_dependents``.  Such an op may access memory
+    through an address it is given as a value, or wait on the PDL
+    predecessor.
+
+    With ``addresses_only``, only roots that may access memory through an
+    address no kernel tensor names: an atomic, and the FP4 and BF16 x16
+    loads, access only the tensors they are passed.
+    """
+    from ..language import _tracing_ops
+    from ..language import memory_ops
+    from ..language._decorators import is_api_func
+    from ..language.atomic_ops import ATOMIC_OPS
+    from ..language.inline_asm_ops import inline_asm_elementwise
+    from ..language.pdl_ops import pdl_launch_dependents
+    from ..language.quantized_ops import load_bfloat16_x16_to_float16
+    from ..language.quantized_ops import load_float4_e2m1fn_x16_to_float16
+    from .device_ir_analysis import _TENSOR_ROUTING_OPS
+    from .tile_dependency import owner_roots_by_graph_id
+
+    named_only = (load_float4_e2m1fn_x16_to_float16, load_bfloat16_x16_to_float16)
+
+    def opaque(node: torch.fx.Node) -> bool:
+        if (
+            node.op != "call_function"
+            or node.target in _TENSOR_ROUTING_OPS
+            or node.target is _tracing_ops._host_tensor
+        ):
+            return False
+        if node.target in ATOMIC_OPS:
+            orders = [
+                arg
+                for arg in (*node.args, *node.kwargs.values())
+                if isinstance(arg, str)
+            ]
+            return not addresses_only and orders not in (["relaxed"], ["release"])
+        if node.target in (memory_ops.load, memory_ops.store):
+            return False
+        if any(
+            arg.op == "call_function" and arg.target is _tracing_ops._host_tensor
+            for arg in node.all_input_nodes
+        ):
+            return not (addresses_only and node.target in named_only)
+        if node.target is inline_asm_elementwise:
+            # Not marked side effecting, whatever its purity.
+            is_pure = node.args[4] if len(node.args) > 4 else node.kwargs["is_pure"]
+            return is_pure is not True
+        return (
+            is_api_func(node.target)
+            and node.is_impure(impure_random=False)
+            and node.target is not pdl_launch_dependents
+        )
+
+    owners = owner_roots_by_graph_id(device_ir)
+    return frozenset(
+        root
+        for graph_info in device_ir.graphs
+        if any(opaque(node) for node in graph_info.graph.nodes)
+        for root in owners[graph_info.graph_id]
+    )
+
+
+def _insert_before_first_use(
+    statements: list[ast.stmt],
+    names: frozenset[str],
+    inserted: list[ast.stmt],
+) -> bool:
+    """Insert ``inserted`` right before the first statement that uses ``names``.
+
+    Descends into an ``if`` whose test does not use ``names`` when every
+    later use lies in exactly one of its branches, so the inserted statements
+    dominate every use while the other branch skips them.  Loops are not
+    entered.  Returns False when ``statements`` never use ``names``.
+    """
+
+    def uses_names(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Name) and child.id in names
+            for child in ast.walk(node)
+        )
+
+    uses = [
+        index for index, statement in enumerate(statements) if uses_names(statement)
+    ]
+    if not uses:
+        return False
+    first = statements[uses[0]]
+    if len(uses) == 1 and isinstance(first, ast.If) and not uses_names(first.test):
+        in_body = any(uses_names(statement) for statement in first.body)
+        in_orelse = any(uses_names(statement) for statement in first.orelse)
+        if in_body != in_orelse and _insert_before_first_use(
+            first.body if in_body else first.orelse, names, inserted
+        ):
+            return True
+    statements[uses[0] : uses[0]] = inserted
+    return True
 
 
 def _release_sync(device_function: DeviceFunction) -> list[ast.stmt]:
@@ -1964,6 +2074,119 @@ def emit_cross_loop_schedule(
             readiness_consumers_by_root.setdefault(
                 readiness_consumer.consumer_root, []
             ).append((plan, readiness_consumer))
+
+    def storage_argument_names(tensor_names: set[str]) -> frozenset[str] | None:
+        """Kernel arguments (tensors and descriptors) bound to the storage of
+        any of the named host tensors, with every alias of that storage, or
+        None when some named tensor is bound to no argument.  Device-built
+        tensor descriptors are preamble locals, not arguments, but a body
+        reads through their names too."""
+        origins = HostFunction.current().tensor_to_origin
+        tensor_arguments = [
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorArg)
+        ]
+        bound = [
+            (argument, origin.root_rw_name())
+            for argument in tensor_arguments
+            if (origin := origins.get(argument.fake_value)) is not None
+            and origin.root_rw_name() in tensor_names
+        ]
+        if {name for _argument, name in bound} != tensor_names:
+            return None
+        storages = {
+            argument.fake_value.untyped_storage(): None for argument, _name in bound
+        }
+        return (
+            frozenset(
+                argument.name
+                for argument in (
+                    *tensor_arguments,
+                    *device_function._tensor_descriptor_args.values(),
+                )
+                if argument.fake_value.untyped_storage() in storages
+            )
+            or None
+        )
+
+    device_ir = HostFunction.current().device_ir
+    opaque_roots = _opaque_roots(device_ir)
+    # A wait in a root that may access memory through an address no kernel
+    # tensor names stays at task entry: no guard name precedes that access.
+    address_roots = _opaque_roots(device_ir, addresses_only=True)
+
+    def every_argument_name() -> frozenset[str]:
+        """Every kernel tensor argument, with the descriptors a body reads
+        through: the guard of a wait that involves an opaque root."""
+        return frozenset(
+            argument.name
+            for argument in (
+                *device_function.arguments,
+                *device_function._tensor_descriptor_args.values(),
+            )
+            if isinstance(argument, TensorArg)
+        )
+
+    def root_barrier_ancestors(root: int) -> frozenset[int]:
+        """Roots with a root-barrier path into ``root``.  Its publication
+        follows its waits for them, so it certifies them too, and their edges
+        to ``root``'s consumers were pruned as reachable through ``root``."""
+        found: set[int] = set()
+        frontier = [root]
+        while frontier:
+            target = frontier.pop()
+            for producer, consumer in root_barrier_edges:
+                if consumer == target and producer not in found:
+                    found.add(producer)
+                    frontier.append(producer)
+        return frozenset(found)
+
+    def root_barrier_guarded_names(
+        producer: int, consumer: int
+    ) -> frozenset[str] | None:
+        """Every name through which ``consumer`` may touch memory that only its
+        wait on ``producer`` orders, or None when such memory is not reached
+        through named host tensors only.
+
+        That memory is every allocation that ``producer``, or a root its
+        publication certifies (a pruned edge to ``consumer`` may stand
+        behind it), writes (RAW, WAW) or reads where ``consumer`` writes it
+        (WAR).  Allocations, not names, are compared: views of one storage
+        may carry different names.
+        """
+        roots = {producer, *root_barrier_ancestors(producer)}
+        if consumer in address_roots:
+            return None
+        if consumer in opaque_roots or any(root <= producer for root in opaque_roots):
+            return every_argument_name()
+        accesses = dependency_graph.accesses
+        root_accesses = [access for access in accesses if access.root in roots]
+        consumer_writes = {
+            access.allocation_id
+            for access in accesses
+            if access.root == consumer and access.kind != "load"
+        }
+        guarded = {
+            access.allocation_id
+            for access in root_accesses
+            if access.kind != "load" or access.allocation_id in consumer_writes
+        }
+        # An access of unknown allocation may touch any memory.
+        if (
+            not guarded
+            or any(access.allocation_id < 0 for access in root_accesses)
+            or (root_accesses and any(allocation < 0 for allocation in consumer_writes))
+        ):
+            return None
+        tensor_names: set[str] = set()
+        for access in accesses:
+            if access.allocation_id in guarded:
+                if access.tensor_name is None:
+                    return None
+                tensor_names.add(access.tensor_name)
+        return storage_argument_names(tensor_names)
+
     nested_loop_counters_by_consumer: dict[
         int,
         list[tuple[ReadinessCounterPlan, ReadinessConsumer]],
@@ -2040,6 +2263,29 @@ def emit_cross_loop_schedule(
         for access in dependency_graph.accesses
         if dependency_graph.is_inband(access) and access.kind != "store"
     }
+
+    # Waits sink past accesses that the dependency graph orders by allocation.
+    # Like the rest of the schedule, that relies on the kernel's tensor
+    # arguments sharing only the storage the host code makes them share.
+    sinks_allowed = static_pipeline_plan.dispatch_mode == "dynamic"
+
+    def sinks_dynamic_barrier_waits(root: int) -> bool:
+        """A dynamic root that publishes nothing waits on each root barrier
+        where it first uses that producer's outputs instead of at task entry:
+        work before the use (e.g. its own GEMM) overlaps the producer's tail.
+        Nothing relies on such a root's completion, so a wait that lands in a
+        branch (or that a branch skips) certifies nothing for anyone else."""
+        return (
+            sinks_allowed
+            and bool(root_barrier_incoming.get(root))
+            and not any(device_function.config.range_warp_specializes)
+            and root not in root_barrier_indices
+            and not root_counters_by_producer.get(root)
+            and root not in nested_producer_roots
+            and root not in static_pipeline_plan.continuation_roots
+            and root not in inband_consumer_roots
+            and peer is None
+        )
 
     def waits_on_dependency(root: int) -> bool:
         return bool(
@@ -2857,7 +3103,11 @@ def emit_cross_loop_schedule(
         extra_argument_names: tuple[str, ...],
         *,
         force_noinline: bool = False,
+        barrier_waits: tuple[tuple[frozenset[str] | None, list[ast.stmt]], ...] = (),
     ) -> list[ast.stmt]:
+        """``barrier_waits``: (producer argument names, wait) for root barriers
+        the dynamic task waits on where it first uses those arguments (None:
+        at task entry; see sinks_dynamic_barrier_waits)."""
         body: list[ast.stmt] = []
         extent = guarded_extents.get(root)
         root_body = case_bodies[root] if extent is None else extent.body
@@ -2880,6 +3130,12 @@ def emit_cross_loop_schedule(
                 raise AssertionError("body PID ABI is not total")
             body.append(statement_from_string(f"{pid_task} = {pid_task_expression}"))
             scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
+        sunk_waits: list[tuple[frozenset[str], list[ast.stmt]]] = []
+        for barrier_names, barrier_wait in barrier_waits:
+            if barrier_names is None:
+                body.extend(barrier_wait)
+            else:
+                sunk_waits.append((barrier_names, barrier_wait))
         readiness_tokens: list[str] = []
         for (
             incoming_readiness_counter,
@@ -2973,6 +3229,11 @@ def emit_cross_loop_schedule(
                     scheduled_root_body,
                     scheduled_coordinates,
                 )
+            # Sunk root-barrier waits go in front of the first use after the
+            # nested waits are placed.
+            for sunk_names, wait in sunk_waits:
+                if not _insert_before_first_use(scheduled_root_body, sunk_names, wait):
+                    scheduled_root_body[0:0] = wait
             tile_body = [
                 statement_from_string(
                     f"{owner.shared_pid_var} = {scheduled_logical_pid}"
@@ -2980,17 +3241,21 @@ def emit_cross_loop_schedule(
                 *scheduled_root_body,
             ]
         else:
+            cloned_root_body = _clone_opaque_statements(
+                body_with_nested_loop_publications(
+                    root,
+                    root_body,
+                    scheduled_coordinates,
+                )
+            )
+            for sunk_names, wait in sunk_waits:
+                if not _insert_before_first_use(cloned_root_body, sunk_names, wait):
+                    cloned_root_body[0:0] = wait
             tile_body = [
                 statement_from_string(
                     f"{owner.shared_pid_var} = {scheduled_logical_pid}"
                 ),
-                *_clone_opaque_statements(
-                    body_with_nested_loop_publications(
-                        root,
-                        root_body,
-                        scheduled_coordinates,
-                    )
-                ),
+                *cloned_root_body,
             ]
         if root in kernel_scope_roots:
             body.extend(tile_body)
@@ -3369,11 +3634,26 @@ def emit_cross_loop_schedule(
         packet_branches: list[tuple[int, bool, ast.stmt]] = []
         for root, packet_begin, packet_end in packet_ranges:
             local_task = f"({dispatch_ticket} - {packet_begin})"
-            task_body = _wait_for_dependencies(
-                device_function=device_function,
-                dependencies=root_barrier_input_dependencies(root),
-                prefix="tile_dependency_root_barrier_wait",
-            )
+            barrier_waits: tuple[tuple[frozenset[str] | None, list[ast.stmt]], ...] = ()
+            if sinks_dynamic_barrier_waits(root):
+                barrier_waits = tuple(
+                    (
+                        root_barrier_guarded_names(producer, root),
+                        _wait_for_dependencies(
+                            device_function=device_function,
+                            dependencies=(root_barrier_dependency(producer),),
+                            prefix="tile_dependency_root_barrier_wait",
+                        ),
+                    )
+                    for producer in root_barrier_incoming[root]
+                )
+                task_body = []
+            else:
+                task_body = _wait_for_dependencies(
+                    device_function=device_function,
+                    dependencies=root_barrier_input_dependencies(root),
+                    prefix="tile_dependency_root_barrier_wait",
+                )
             task_body.extend(peer_waits(root))
             task_body.extend(
                 scheduled_root_task_body(
@@ -3381,6 +3661,7 @@ def emit_cross_loop_schedule(
                     local_task,
                     f"{case_offsets[root]} + {local_task}",
                     (dispatch_ticket,),
+                    barrier_waits=barrier_waits,
                 )
             )
             publications = peer_publications(root)
