@@ -17,6 +17,7 @@ from test.test_cute_aux_read_fence import _rank_two_multi_aux
 from helion._compiler.cute.cute_mma import _emit_tcgen05_aux_pipeline_setup
 from helion._compiler.cute.cute_mma import _Tcgen05AuxPerDescriptorRingNames
 from helion._compiler.cute.cute_mma import _Tcgen05AuxPipelinePlan
+from helion._compiler.cute.tcgen05_constants import Tcgen05AuxStagingScope
 from helion._testing import skipUnlessBackends
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -59,6 +60,7 @@ def test_aux_consumer_count_derived_from_epilogue_warps(
         rings=(ring,),
         use_tma_load=tma,
         stage_count=2,
+        staging_scope=Tcgen05AuxStagingScope.EPILOGUE_SUBTILE,
         epi_tile_var="epi_tile",
     )
     code = "\n".join(
@@ -66,7 +68,7 @@ def test_aux_consumer_count_derived_from_epilogue_warps(
         for node in _emit_tcgen05_aux_pipeline_setup(
             plan,
             descriptor_dtype_strs=("cutlass.BFloat16",),
-            tile_shape_expr="epi_tile",
+            tile_shape_exprs=("epi_tile",),
             c_input_warp_thread_count=32,
             epi_warp_count=epi_warps,
             defer_sync=False,
