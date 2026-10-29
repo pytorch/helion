@@ -142,7 +142,10 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
 def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
     # Each child starts with a real cold cache; no process-wide cache is cleared.
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(root), *filter(None, [environment.get("PYTHONPATH")])]
+    )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     result = subprocess.run(

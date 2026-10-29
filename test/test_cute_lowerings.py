@@ -275,6 +275,7 @@ from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -23915,6 +23916,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    @skipUnlessTcgen05RuntimeNPtx
     def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
         def build(input_dtype_str: str) -> ast.stmt:
             return _build_tcgen05_mma_issue_stmt(

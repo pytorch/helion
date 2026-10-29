@@ -52,6 +52,7 @@ from helion._testing import DEVICE
 from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _tcgen05_grouped_runtime_nm_tile_records
@@ -724,6 +725,7 @@ def test_grouped_worklist_nm_unmatched_gb300_uses_generic_default() -> None:
     _assert_output(out, args)
 
 
+@skipUnlessTcgen05RuntimeNPtx
 def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     _require_codegen_cuda()
 
@@ -782,6 +784,7 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     assert plan["sched_params_arg"] not in wrapper_call_args
 
 
+@skipUnlessTcgen05RuntimeNPtx
 def test_grouped_worklist_nm_runtime_direct_clc_uses_exact_record_ids() -> None:
     _require_codegen_cuda()
 
@@ -2010,6 +2013,7 @@ def test_grouped_worklist_nm_zero_token_groups_runtime_and_graph_replay(
     )
 
 
+@skipUnlessTcgen05RuntimeNPtx
 def test_grouped_worklist_nm_zero_valid_tail_runtime_and_graph_replay() -> None:
     _require_runtime_cuda13_sm100_or_newer()
 
