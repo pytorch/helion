@@ -89,6 +89,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -867,6 +868,33 @@ class TestConfigAPI(TestCase):
 
         self.assertEqual(backend.effective_num_warps(config), 4)
 
+    def test_hf32_dot_precision_is_forwarded_verbatim(self) -> None:
+        # 'hf32' is honored only by out-of-tree triton drivers that accept the
+        # value; the base mapping forwards it verbatim so stock CUDA triton
+        # fails loudly instead of silently dropping the setting.
+        helion.Settings(dot_precision="hf32")  # acceptance only: no validation here
+        self.assertEqual(TritonBackend().map_dot_precision("hf32"), "hf32")
+
+    def test_explicit_none_defers_num_warps_and_num_stages(self) -> None:
+        # An explicit None defers the choice to the backend's driver; it must
+        # survive the constructor and the to_json/from_json round-trip the
+        # autotune caches use (a dropped null would silently become the
+        # default and change behavior on cache reload).
+        config = helion.Config(num_warps=None, num_stages=None)
+        self.assertIsNone(config.num_warps)
+        self.assertIsNone(config.num_stages)
+        reloaded = helion.Config.from_json(config.to_json())
+        self.assertIsNone(reloaded.num_warps)
+        self.assertIsNone(reloaded.num_stages)
+
+        # Absence (argument not given) still falls back to the defaults.
+        from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
+        from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+
+        default_config = helion.Config()
+        self.assertEqual(default_config.num_warps, DEFAULT_NUM_WARPS)
+        self.assertEqual(default_config.num_stages, DEFAULT_NUM_STAGES)
+
     def test_mapping_behavior_len_iter_dict_roundtrip(self) -> None:
         data = {
             "block_sizes": [64, 32],
@@ -1357,6 +1385,97 @@ class TestSettingsEnv(TestCase):
             settings.autotune_search_acf,
             ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
         )
+
+
+@onlyBackends(["triton"])
+class TestClampBackendIndexingContract(TestCase):
+    def test_clamp_backend_rejects_non_pointer_explicit_indexing(self) -> None:
+        # The autotune search space is restricted to "pointer" by
+        # valid_indexing_types(); explicit configs spelling out another
+        # strategy must be rejected too, or the clamp contract silently
+        # fails for hand-written Configs.
+
+        @helion.kernel(static_shapes=True)
+        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+            for m, n in hl.tile((a.size(0), b.size(1))):
+                out[m, n] = a[m, :] @ b[:, n]
+            return out
+
+        a = torch.randn((128, 16), dtype=torch.float16)
+        b = torch.randn((32, 16), dtype=torch.float16).T
+        bound = matmul.bind((a, b))
+
+        with patch.object(
+            TritonBackend, "clamp_masked_pointer_offsets", return_value=True
+        ):
+            # Defaults and pointer configs are accepted as-is.
+            config = helion.Config(block_sizes=[128, 32])
+            bound.config_spec.normalize(config)
+            self.assertEqual(set(config.config["indexing"]), {"pointer"})
+
+            # A non-pointer strategy on a clamp backend is rejected...
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "requires the pointer indexing strategy"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(
+                        block_sizes=[128, 32],
+                        indexing=["tensor_descriptor"],
+                    )
+                )
+
+            # ...or coerced during autotune config generation.
+            fixed = helion.Config(
+                block_sizes=[128, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            )
+            bound.config_spec.normalize(fixed, _fix_invalid=True)
+            self.assertEqual(fixed.config["indexing"], ["pointer", "pointer"])
+
+        # Without the clamp flag, descriptor indexing stays accepted.
+        config = helion.Config(block_sizes=[128, 32], indexing=["tensor_descriptor"])
+        bound.config_spec.normalize(config)
+        self.assertIn("tensor_descriptor", config.config["indexing"])
+
+
+@onlyBackends(["triton"])
+class TestDeferredNumThreadsContract(TestCase):
+    def test_non_deferring_backend_rejects_deferred_num_threads(self) -> None:
+        # A non-deferring backend must reject a deferred None at the config
+        # boundary, not just in whichever consumer does arithmetic on it.
+
+        @helion.kernel(static_shapes=True)
+        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((a.size(0), b.size(1)), device=a.device, dtype=a.dtype)
+            for m, n in hl.tile((a.size(0), b.size(1))):
+                out[m, n] = a[m, :] @ b[:, n]
+            return out
+
+        a = torch.randn((128, 16), dtype=torch.float16)
+        b = torch.randn((32, 16), dtype=torch.float16).T
+        bound = matmul.bind((a, b))
+
+        with patch.object(
+            TritonBackend, "supports_num_threads_deferral", return_value=False
+        ):
+            # An explicit None is rejected at normalization...
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "requires an explicit num_warps"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(block_sizes=[128, 32], num_warps=None)
+                )
+
+            # ...and autotune config generation fills the default instead.
+            fixed = helion.Config(block_sizes=[128, 32], num_warps=None)
+            bound.config_spec.normalize(fixed, _fix_invalid=True)
+            self.assertEqual(fixed.config["num_warps"], DEFAULT_NUM_WARPS)
+
+        # Deferring backends (the default) still accept a deferred None.
+        config = helion.Config(block_sizes=[128, 32], num_warps=None)
+        bound.config_spec.normalize(config)
+        self.assertIsNone(config.config["num_warps"])
 
 
 @onlyBackends(["triton", "cute"])
