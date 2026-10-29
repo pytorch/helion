@@ -30,6 +30,7 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import EnumFragment
 
 if TYPE_CHECKING:
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
+
+pytestmark = skipUnlessBackends(["cute"])
 
 
 def _meta_args(shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:

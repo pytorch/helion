@@ -26,7 +26,6 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
-from torch._subclasses import FakeTensorMode
 import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -42,6 +41,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
 from .backend_registry import get_backend_class
+from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -483,7 +483,7 @@ class CompileEnvironment:
             assume_static_by_default=settings.static_shapes,
         )
         # TODO(jansel): check for guards in the shapeenv
-        self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
+        self.fake_mode = create_fake_tensor_mode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self._ambiguous_tensor_input_source_ids: set[int] = set()
         # Positive provenance for host allocations whose layout is fixed by the
