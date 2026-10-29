@@ -9,9 +9,17 @@ from typing import TYPE_CHECKING
 from ...runtime.config import Config
 from ..cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from ..cute.pipeline_smem import max_pipeline_ab_stages
+from ..cute.split_k_workspace_config import PARTITIONS_KEY
 from ..cute.split_k_workspace_config import STAGES_KEY
 from ..cute.split_k_workspace_config import WORKSPACE_KEY
+from ..cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
+from ..cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
+from ..cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
+from ..cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
+from ..cute.strategies import Tcgen05LayoutStrategy
 from ..cute.tcgen05_config import CuteTcgen05Config
+from ..cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -44,9 +52,15 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
 
         if device_ir.host_function is None:
             return frozenset()
+        from ..cute.split_k_workspace import plain_store_partition_choices
+
         with device_ir.host_function:
-            env.config_spec.cute_split_k_workspace_available = (
-                analyze_split_k_workspace(env, device_ir) is not None
+            proof = analyze_split_k_workspace(env, device_ir)
+            env.config_spec.cute_split_k_workspace_available = proof is not None
+            env.config_spec.cute_split_k_partition_choices = (
+                plain_store_partition_choices(proof, env.config_spec.num_sm)
+                if proof is not None
+                else ()
             )
         return frozenset()
 
@@ -79,14 +93,55 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
         if capacity <= 0:
             return []
         base = spec._base_default_config()
+        # The schedule builds its producer's config itself (a persistent
+        # two-CTA GEMM over the partition views), so the pipeline surface a
+        # default config carries is inert here; on a TVM-FFI-eligible shape
+        # that default is the clustered direct-entry seed. Put the seeds on
+        # the one-CTA surface with the promotion off: a seed that keeps the
+        # cluster or requests the promotion is projected onto the 256x256
+        # pair by the search fixers (``_fix_target1_tvm_ffi_search_config``,
+        # ``_fix_cluster_m2_search_config``), which rewrite its tile and so
+        # fail the strict seed transfer. The pid type is flat where the
+        # kernel allows it (a persistent default keeps a one-CTA 256-row
+        # tile off the search surface and the seed would be rewritten) and
+        # stays the default's otherwise (force-persistent kernels).
+        inert = {
+            key: value
+            for key, value in (
+                *((("pid_type", "flat"),) if "flat" in spec.allowed_pid_types else ()),
+                ("tcgen05_cluster_m", 1),
+                ("tcgen05_cluster_n", 1),
+                ("tcgen05_cta_group", "auto"),
+                (TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY, False),
+                (TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False),
+                (
+                    TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                    Tcgen05LayoutStrategy.DEFAULT.value,
+                ),
+                (TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY, None),
+                (TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY, None),
+                (TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY, None),
+            )
+            if key in base.config
+        }
         keys = _config_keys(proof.chunk)
         if len(keys) > 1:
             return []
         variations: list[dict[str, object]] = [{}]
         if keys:
             (key,) = keys
-            fragment = spec.user_defined_tunables.get(key)
-            values = fragment.search_values(limit=32) if fragment is not None else None
+            if key == PARTITIONS_KEY:
+                # The plain store pattern partitions through the schedule's
+                # own knob (every choice cuts K into whole 64-wide tiles).
+                values: list[object] | None = [
+                    split for split in spec.cute_split_k_partition_choices if split > 1
+                ]
+            else:
+                fragment = spec.user_defined_tunables.get(key)
+                searched = (
+                    fragment.search_values(limit=32) if fragment is not None else None
+                )
+                values = list(searched) if searched is not None else None
             if values is None:
                 return []
             variations = [
@@ -138,6 +193,7 @@ class CuteSplitKWorkspaceHeuristic(AutotunerHeuristic):
             for variation in variations:
                 candidate = Config.from_dict(
                     base.config
+                    | inert
                     | variation
                     | {
                         "block_sizes": block_sizes,

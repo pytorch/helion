@@ -7,6 +7,7 @@ import logging
 import operator
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
@@ -8144,6 +8145,20 @@ def _codegen_cute_store_tcgen05_tile(
             # The first pipeline now owns both copies in each commit group.
             # Its existing wait.read0 precedes the original TMEM teardown.
             post_loop_stmts = []
+    if tcgen05_value.split_k_last:
+        # ``tcgen05_split_k``: the pipeline's exchange reduced the other
+        # splits' partials into this CTA's TMEM accumulator when it arrived
+        # last; every other split released the accumulator and skips the
+        # output stores (the predicate is CTA-uniform).
+        # The post-loop pipeline tails and the TMEM teardown run on every CTA.
+        return [
+            ast.If(
+                test=cast("ast.expr", expr_from_string(tcgen05_value.split_k_last)),
+                body=cast("list[ast.stmt]", main_stmts),
+                orelse=[],
+            ),
+            *post_loop_stmts,
+        ]
     return [*main_stmts, *post_loop_stmts]
 
 

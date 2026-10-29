@@ -45,6 +45,7 @@ from .cute.device_state import CuteDeviceFunctionState
 from .cute.pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .cute.pdl_release import DEFAULT_RESIDENT_THREADS_PER_SM
 from .cute.pdl_release import resident_ctas_per_sm
+from .cute.tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
@@ -395,6 +396,18 @@ class DeviceFunction:
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_state = CuteDeviceFunctionState()
+        split_k = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
+        if (
+            CompileEnvironment.current().backend_name == "cute"
+            and isinstance(split_k, int)
+            and split_k > 1
+        ):
+            # ``tcgen05_split_k``: the flat grid holds ``split_k`` CTAs per
+            # output tile (``block_idx // split_k`` is the tile's program id);
+            # the tcgen05 pipeline marks the config applied or the launch
+            # codegen rejects it (``codegen_function_call``).
+            self._cute_state.program_id_divisor = split_k
+            self._cute_state.launch_grid_multiplier = split_k
 
         from .helper_function import HelperFunctionManager
 
@@ -2497,7 +2510,7 @@ class DeviceFunction:
         strategy's static grid (``ProgramIDs.static_grid_size``: the sum
         over the roots of a multi-root kernel, the parent of an L2-grouped
         one, ``num_sm * num_sm_multiplier`` for a persistent one) times the
-        fused-body grid multiplier and the cluster size.  The resident
+        fused-body or split-K grid multiplier and the cluster size.  The resident
         capacity is the SM count times the CTAs an SM holds, estimated from
         the launch block (``resident_ctas_per_sm``: the thread limit, or
         ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
@@ -2514,7 +2527,7 @@ class DeviceFunction:
     def _pdl_launch_ctas(self) -> int | None:
         """The CTA count of this kernel's launch when it is static: the
         program-id strategy's grid (``ProgramIDs.static_grid_size``) times the
-        fused-body grid multiplier and the cluster size; ``None`` for a grid
+        fused-body or split-K grid multiplier and the cluster size; ``None`` for a grid
         the host sizes at runtime."""
         if self.pid is None:
             return None
@@ -2674,6 +2687,14 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        if (
+            self.cute_state.program_id_divisor > 1
+            and not self.cute_state.tcgen05_split_k_applied
+        ):
+            raise exc.InvalidConfig(
+                f"{TCGEN05_SPLIT_K_CONFIG_KEY} > 1 requires the flat one-CTA "
+                "tcgen05 GEMM pipeline, which this kernel did not take"
+            )
         grid_multiplier = self.cute_state.launch_grid_multiplier
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).

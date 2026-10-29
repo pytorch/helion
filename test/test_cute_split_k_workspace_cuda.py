@@ -10,6 +10,8 @@ import torch
 
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_split_k_workspace import _fp32_bias
+from test.test_cute_split_k_workspace import _plain_store_bias_matmul
+from test.test_cute_split_k_workspace import _plain_store_matmul
 from test.test_cute_split_k_workspace_protocol import _matrix_bias
 
 import helion
@@ -48,6 +50,15 @@ WORKSPACE_CASES = (
     ),
     WorkspaceCase("n64-deep", (128, 4096, 256), (128, 64, 64), "split_k", 16, 16),
     WorkspaceCase(
+        "original-bf16",
+        (128, 32768, 256),
+        (128, 128, 64),
+        "split_k",
+        32,
+        12,
+        dtype=torch.bfloat16,
+    ),
+    WorkspaceCase(
         "persistent-multiwave",
         (512, 2048, 512),
         (128, 128, 64),
@@ -67,6 +78,26 @@ WORKSPACE_CASES = (
         bias=True,
         dtype=torch.bfloat16,
         padding=8,
+    ),
+    WorkspaceCase(
+        "plain-store-bf16",
+        (256, 4096, 256),
+        (128, 128, 64),
+        "cute_split_k_partitions",
+        8,
+        4,
+        kind="store",
+        dtype=torch.bfloat16,
+    ),
+    WorkspaceCase(
+        "plain-store-bias-fp16",
+        (128, 8192, 512),
+        (128, 128, 64),
+        "cute_split_k_partitions",
+        16,
+        6,
+        kind="store",
+        bias=True,
     ),
     WorkspaceCase(
         "direct-three-partitions",
@@ -104,6 +135,12 @@ def workspace_case(case: WorkspaceCase, device: str):
         bias = torch.empty((n * 3,), dtype=case.dtype, device=device)[::3]
         if case.kind == "fp32":
             kernel, arguments = _fp32_bias, (a, b, bias)
+        elif case.kind == "store":
+            kernel, arguments = (
+                (_plain_store_bias_matmul, (a, b, bias))
+                if case.bias
+                else (_plain_store_matmul, (a, b))
+            )
         elif case.kind == "direct":
             kernel, arguments = _direct_chunk_matmul, (a, b)
         else:

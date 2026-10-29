@@ -120,6 +120,8 @@ from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from .simt_gemm import mark_simt_gemm
 from .simt_gemm import simt_mma_requested
 from .simt_gemm import simt_owned_loop_declined
+from .split_k_exchange import render_split_k_exchange
+from .split_k_exchange import render_split_k_prologue
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
@@ -226,6 +228,8 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
+from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
@@ -13658,10 +13662,68 @@ def _emit_mma_pipeline(
             f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
         )
 
+    # ``tcgen05_split_k``: the flat grid runs each output tile's K loop on
+    # ``split_k`` CTAs (the program-id decode reads ``block_idx // split_k``
+    # and the launch grid is multiplied, see ``DeviceFunction``); every split
+    # stores an fp32 partial to the launcher's workspace and the last arriver
+    # reduces them into its TMEM accumulator ahead of the unchanged epilogue
+    # (``split_k_exchange.py``). Validated envelope: the flat one-CTA TMA
+    # pipeline (inline producer) over a plain rank-2 MN-oriented GEMM with
+    # full or ragged tiles, one epilogue warp group, and a K loop at least
+    # ``split_k`` tiles deep.
+    tcgen05_split_k_value = _tcgen05_config_int(
+        df.config, TCGEN05_SPLIT_K_CONFIG_KEY, 1
+    )
+    tcgen05_split_k = tcgen05_split_k_value > 1
+    tcgen05_split_k_idx = df.new_var("tcgen05_split_k_idx")
+    tcgen05_split_k_tile = df.new_var("tcgen05_split_k_tile")
+    tcgen05_split_k_tile_begin = df.new_var("tcgen05_split_k_tile_begin")
+    tcgen05_split_k_tile_end = df.new_var("tcgen05_split_k_tile_end")
+    tcgen05_split_k_begin = df.new_var("tcgen05_split_k_begin")
+    tcgen05_split_k_end = df.new_var("tcgen05_split_k_end")
+    tcgen05_split_k_last = df.new_var("tcgen05_split_k_last")
+    tcgen05_split_k_flag = df.new_var("tcgen05_split_k_flag")
+    tcgen05_split_k_workspace = df.new_var("tcgen05_split_k_workspace")
+    tcgen05_split_k_tiles_total = -(-k_total_size // bk)
+    if tcgen05_split_k and not (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_pid_is_persistent
+        and df.config.get("pid_type", "flat") == "flat"
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and not tcgen05_is_two_cta
+        and not tcgen05_use_separate_tma_producer
+        and grouped_mode is None
+        and row_union_plan is None
+        and not rhs_rank3_segment_metadata
+        and not tcgen05_nm_orientation
+        and (tcgen05_static_full_tiles or tcgen05_flat_edge_tma)
+        and (analysis is None or not analysis.has_leading_passthrough)
+        and tcgen05_m_subtile_count == 1
+        and tcgen05_epi_warp_groups_value == 1
+        and tcgen05_epi_warps_per_group_value > 0
+        and tcgen05_split_k_tiles_total >= tcgen05_split_k_value
+        # Only the tcgen05 tile store runs under the last-arriver check.
+        and CompileEnvironment.current().config_spec.cute_tcgen05_split_k_plain_body
+    ):
+        raise exc.InvalidConfig(
+            f"{TCGEN05_SPLIT_K_CONFIG_KEY}={tcgen05_split_k_value} requires the flat "
+            "one-CTA tcgen05 TMA pipeline over a plain rank-2 GEMM (pid_type='flat', "
+            "tcgen05_cluster_m=1, tcgen05_cluster_n=1, one epilogue warp group) "
+            f"with at least {tcgen05_split_k_value} K tiles"
+        )
+    if tcgen05_split_k:
+        df.cute_state.tcgen05_split_k_applied = True
+    split_k_offset = f"{tcgen05_split_k_begin} + " if tcgen05_split_k else ""
+    split_k_tile_offset = f"{tcgen05_split_k_tile_begin} + " if tcgen05_split_k else ""
+    split_k_rel = f" - {tcgen05_split_k_begin}" if tcgen05_split_k else ""
     grouped_plan = tcgen05_grouped_plan
     tcgen05_k_bound_expr: str = (
         cast("str", tcgen05_grouped_problem_k)
         if tcgen05_grouped_k_mask is not None
+        else tcgen05_split_k_end
+        if tcgen05_split_k
         else f"cutlass.Int32({k_total_size})"
     )
 
@@ -15134,11 +15196,46 @@ def _emit_mma_pipeline(
                                 tcgen05_clc_throttle_credit,
                                 tma_load=tcgen05_use_role_local_tma_producer,
                             )
+                        if tcgen05_split_k:
+                            # The flag slot is CTA-wide shared memory (every
+                            # warp reads the last-arriver verdict), so it is
+                            # allocated at the prefix scope like the rings.
+                            prefix.append(
+                                statement_from_string(
+                                    f"{tcgen05_split_k_flag} = "
+                                    "cute.arch.alloc_smem(cutlass.Int32, 1)"
+                                )
+                            )
+                            for line in render_split_k_prologue(
+                                splits=tcgen05_split_k_value,
+                                k_tiles=tcgen05_split_k_tiles_total,
+                                bk=bk,
+                                k_size=k_total_size,
+                                idx=tcgen05_split_k_idx,
+                                tile=tcgen05_split_k_tile,
+                                tile_begin=tcgen05_split_k_tile_begin,
+                                tile_end=tcgen05_split_k_tile_end,
+                                k_begin=tcgen05_split_k_begin,
+                                k_end=tcgen05_split_k_end,
+                            ):
+                                _emit_per_tile(line)
+                            # Both the shared consumer loop and its producer
+                            # clone (``_clone_k_loop_with_body`` unparses this
+                            # header) walk the split's K range.
+                            k_loop_iter = device_loop.for_node.iter
+                            assert isinstance(k_loop_iter, ast.Call)
+                            assert len(k_loop_iter.args) == 3
+                            k_loop_iter.args[0] = cast(
+                                "ast.expr", expr_from_string(tcgen05_split_k_begin)
+                            )
+                            k_loop_iter.args[1] = cast(
+                                "ast.expr", expr_from_string(tcgen05_split_k_end)
+                            )
                         _emit_per_tile(
                             f"{tma_initial_full_tile} = "
                             + _tcgen05_tma_tile_predicate(
-                                k_tile_start_expr="cutlass.Int32(0)",
-                                full_tile_end_expr=f"cutlass.Int32({bk})",
+                                k_tile_start_expr=f"{split_k_offset}cutlass.Int32(0)",
+                                full_tile_end_expr=f"{split_k_offset}cutlass.Int32({bk})",
                             ),
                             tma_load=tcgen05_use_role_local_tma_producer,
                         )
@@ -15149,7 +15246,7 @@ def _emit_mma_pipeline(
                             (
                                 [],
                                 [tma_initial_full_tile],
-                                "cutlass.Int32(0)",
+                                f"{split_k_tile_offset}cutlass.Int32(0)",
                                 bool(
                                     diagnose_skip_ab_producer_acquire
                                     or diagnose_skip_initial_ab_producer_acquire
@@ -15167,8 +15264,8 @@ def _emit_mma_pipeline(
                             stage_gate_sources = [
                                 f"{tma_initial_next_full_tile} = "
                                 + _tcgen05_tma_tile_predicate(
-                                    k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
-                                    full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                    k_tile_start_expr=f"{split_k_offset}cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
+                                    full_tile_end_expr=f"{split_k_offset}cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
                                 )
                             ]
                             for stage_idx in range(1, tcgen05_ab_stage_count_value):
@@ -15184,8 +15281,8 @@ def _emit_mma_pipeline(
                                     stage_gate_sources.append(
                                         f"{stage_gate_var} = "
                                         + _tcgen05_tma_tile_predicate(
-                                            k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
-                                            full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                            k_tile_start_expr=f"{split_k_offset}cutlass.Int32({bk * stage_idx})",
+                                            full_tile_end_expr=f"{split_k_offset}cutlass.Int32({bk * (stage_idx + 1)})",
                                         )
                                     )
                                     stage_gates = [
@@ -15196,7 +15293,7 @@ def _emit_mma_pipeline(
                                     (
                                         stage_gate_sources,
                                         stage_gates,
-                                        f"cutlass.Int32({stage_idx})",
+                                        f"{split_k_tile_offset}cutlass.Int32({stage_idx})",
                                         prefetch_args.skip_producer_acquire,
                                     )
                                 )
@@ -15464,7 +15561,7 @@ def _emit_mma_pipeline(
             else:
                 mma_stage_stmt = statement_from_string(
                     f"{mma_stage} = "
-                    f"({k_offset_var} // cutlass.Int32({bk})) "
+                    f"(({k_offset_var}{split_k_rel}) // cutlass.Int32({bk})) "
                     f"% cutlass.Int32({tcgen05_ab_stage_count_value})"
                 )
             smem_a_mma_stmt = statement_from_string(
@@ -15940,7 +16037,7 @@ def _emit_mma_pipeline(
                         next_full_tile_src = (
                             f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                             f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= {tcgen05_split_k_end if tcgen05_split_k else f'cutlass.Int32({k_total_size})'}"
                         )
                     cg.add_statement(
                         statement_from_string(
@@ -16259,6 +16356,52 @@ def _emit_mma_pipeline(
             sync_stmt = statement_from_string("cute.arch.sync_threads()")
             suffix.append(sync_stmt)
             per_tile_stmts.append(sync_stmt)
+            if tcgen05_split_k:
+                tcgen05_split_k_output_tiles = (-(-m_size // tcgen05_mma_bm)) * (
+                    -(-n_size // tcgen05_mma_bn)
+                )
+                exchange_src = render_split_k_exchange(
+                    splits=tcgen05_split_k_value,
+                    tiles=tcgen05_split_k_output_tiles,
+                    bm=tcgen05_mma_bm,
+                    bn=tcgen05_mma_bn,
+                    bk=bk,
+                    epi_threads=32 * tcgen05_epi_warps_per_group_value,
+                    c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                    c_dtype=epi_elem_dtype_str,
+                    barrier_id=TCGEN05_SPLIT_K_BARRIER_ID,
+                    workspace=tcgen05_split_k_workspace,
+                    idx=tcgen05_split_k_idx,
+                    tile=tcgen05_split_k_tile,
+                    last=tcgen05_split_k_last,
+                    flag=tcgen05_split_k_flag,
+                    epi_active=epi_active,
+                    epi_tidx=epi_tidx,
+                    thr_mma=thr_mma,
+                    epi_acc_frag_base=tcgen05_epi_acc_frag_base,
+                    epi_tile=tcgen05_plan.epi_tile,
+                    epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
+                    acc_pipeline=tcgen05_plan.acc_pipeline,
+                    acc_consumer_state=tcgen05_plan.acc_consumer_state,
+                )
+                for exchange_stmt in ast.parse(exchange_src).body:
+                    suffix.append(exchange_stmt)
+                    per_tile_stmts.append(exchange_stmt)
+                cg.cute_wrapper_plans.append(
+                    {
+                        "kind": "helion_tcgen05_split_k",
+                        "param": tcgen05_split_k_workspace,
+                        "splits": tcgen05_split_k_value,
+                        # The output tile count the exchange baked into its
+                        # counter offsets; the launcher checks the grid.
+                        "tiles": tcgen05_split_k_output_tiles,
+                        "tile_elems": tcgen05_mma_bm * tcgen05_mma_bn,
+                    }
+                )
+                df.wrapper_only_params.append(tcgen05_split_k_workspace)
+                df.wrapper_only_param_annotations[tcgen05_split_k_workspace] = (
+                    "cutlass.Int64"
+                )
 
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
@@ -16440,6 +16583,7 @@ def _emit_mma_pipeline(
                 orientation=tcgen05_matmul_plan.orientation,
                 output_column_major=output_column_major,
                 row_union=row_union_plan,
+                split_k_last=tcgen05_split_k_last if tcgen05_split_k else "",
             ),
         )
         if tcgen05_pure_matmul_object is not None:

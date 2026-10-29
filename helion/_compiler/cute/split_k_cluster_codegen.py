@@ -24,6 +24,8 @@ from .split_k_cluster import checked_cluster_proof
 from .split_k_cluster_config import CLUSTER8_K4
 from .split_k_cluster_config import FINALIZER_KEY
 from .split_k_cluster_config import FINALIZER_WARPS
+from .split_k_workspace import cutlass_dtype_name
+from .split_k_workspace import torch_dtype_name
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -49,12 +51,8 @@ def kernel_source(
 ) -> str:
     assert type(finalizer_warps) is int and finalizer_warps in FINALIZER_WARPS
     s = CLUSTER_K_SCHEDULE
-    dtype = (
-        "cutlass.Float16" if proof.lhs.dtype is torch.float16 else "cutlass.BFloat16"
-    )
-    output_type = (
-        "cutlass.Float16" if proof.output_dtype is torch.float16 else "cutlass.Float32"
-    )
+    dtype = cutlass_dtype_name(proof.lhs.dtype)
+    output_type = cutlass_dtype_name(proof.output_dtype)
     chunk = facts.k // s.cluster_ctas
     warp_chunk = chunk // s.k_warps
     waves = warp_chunk // s.bk
@@ -219,9 +217,7 @@ def generate_split_k_cluster(
             else:
                 shell.add_statement(shell.visit(statement))
     host = func.codegen_function_def(shell.host_statements)
-    output_dtype = (
-        "torch.float16" if proof.output_dtype is torch.float16 else "torch.float32"
-    )
+    output_dtype = torch_dtype_name(proof.output_dtype)
     allocations = 0
     for statement in host.body:
         if (

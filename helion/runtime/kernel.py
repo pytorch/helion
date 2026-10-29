@@ -72,6 +72,7 @@ from .._compiler.cute.aux_tensor import (
 from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
 from .._compiler.cute.aux_tensor import host_function_tcgen05_aux_loads_on_every_store
 from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
+from .._compiler.cute.split_k_exchange import host_function_has_plain_store_body
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
@@ -2682,6 +2683,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # traced host function, not on the runtime arguments.
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
                     host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                # ``tcgen05_split_k`` guards only the tcgen05 tile store with
+                # its last-arriver check; the knob needs a body whose only
+                # side effect is that store.
+                self.env.config_spec.cute_tcgen05_split_k_plain_body = (
+                    host_function_has_plain_store_body(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(

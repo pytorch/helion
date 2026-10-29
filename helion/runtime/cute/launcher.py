@@ -860,6 +860,16 @@ def _append_cute_wrapper_plan(
         # (``_MmaDagAliasGuard``); nothing to prepare on the host.
         return
 
+    if kind == "helion_tcgen05_split_k":
+        # tcgen05 split-K: the partial/counter workspace pointer, a wrapper
+        # host scalar of ``_build_cute_schema_and_args`` passed on to the
+        # kernel after the ordinary arguments (and the tensor maps).
+        param = plan.get("param")
+        if not isinstance(param, str):
+            raise exc.BackendUnsupported("cute", "invalid tcgen05 split-K wrapper plan")
+        call_args.append(param)
+        return
+
     if kind == "helion_mma_dag_fixup":
         # cute_mma_dag fixup split: the exchange workspace's pointer, a
         # wrapper host scalar of ``_build_cute_schema_and_args`` passed on
@@ -4697,6 +4707,13 @@ def _tcgen05_grouped_static_plans(cute_kernel: object) -> list[dict[str, object]
     ]
 
 
+def _tcgen05_split_k_plan_present(cute_kernel: object) -> bool:
+    return any(
+        cast("dict[str, object]", plan).get("kind") == "helion_tcgen05_split_k"
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    )
+
+
 def _tcgen05_grouped_device_split_sizes(plan: dict[str, object]) -> bool:
     return bool(plan.get("device_split_sizes"))
 
@@ -4862,6 +4879,87 @@ def _cuda_stream_capture_context(device: torch.device) -> tuple[int, int | None]
 
 
 _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT = 8
+_TCGEN05_SPLIT_K_WORKSPACE_CACHE_LIMIT = 8
+
+
+def _cached_exchange_workspace(
+    cute_kernel: object,
+    attribute: str,
+    cache_key: tuple[object, ...],
+    *,
+    device: torch.device,
+    nbytes: int,
+    zero_from: int,
+    capture_id: int | None,
+    limit: int,
+) -> torch.Tensor:
+    """A launcher-owned exchange workspace cached on ``cute_kernel`` under
+    ``attribute`` per ``cache_key`` (which ends in the capture id): bytes
+    from ``zero_from`` on are zeroed once at allocation; a captured graph's
+    entry is tracked with the graph, eager entries are bounded by ``limit``.
+    """
+    try:
+        cache = cast(
+            "OrderedDict[tuple[object, ...], torch.Tensor]",
+            getattr(cute_kernel, attribute),
+        )
+    except AttributeError:
+        cache = OrderedDict()
+        setattr(cute_kernel, attribute, cache)
+    workspace = cache.get(cache_key)
+    if workspace is not None:
+        return workspace
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    workspace[zero_from:].zero_()
+    cache[cache_key] = workspace
+    if capture_id is not None:
+        _track_cute_cuda_graph_cache_entry(
+            cute_kernel, attribute, cache_key, workspace, (workspace,)
+        )
+    else:
+        eager_keys = [key for key in cache if key[-1] is None]
+        while len(eager_keys) > limit:
+            cache.pop(eager_keys.pop(0))
+    return workspace
+
+
+def _tcgen05_split_k_workspace(
+    cute_kernel: object,
+    *,
+    device: torch.device,
+    tiles: int,
+    splits: int,
+    tile_elems: int,
+) -> torch.Tensor:
+    """The exchange workspace of a ``tcgen05_split_k`` GEMM: per output tile
+    the ``splits`` fp32 partial slabs of ``tile_elems`` elements, then one
+    u32 arrival counter per tile. The counters are zeroed once (the slabs
+    are written before they are read) and the workspace is kept per
+    (device, geometry, stream, capture): the counters only ever grow (a
+    launch's CTAs derive their base from their ticket's period), so no
+    launch resets them, and the cached pointer stays valid for a captured
+    graph."""
+    partial_bytes = tiles * splits * tile_elems * 4
+    counter_bytes = -(-tiles * 4 // 256) * 256
+    stream_handle, capture_id = _cuda_stream_capture_context(device)
+    return _cached_exchange_workspace(
+        cute_kernel,
+        "_helion_tcgen05_split_k_workspace_cache",
+        (
+            device.type,
+            device.index,
+            tiles,
+            splits,
+            tile_elems,
+            stream_handle,
+            capture_id,
+        ),
+        device=device,
+        nbytes=partial_bytes + counter_bytes,
+        zero_from=partial_bytes,
+        capture_id=capture_id,
+        limit=_TCGEN05_SPLIT_K_WORKSPACE_CACHE_LIMIT,
+    )
 
 
 def _mma_dag_fixup_workspace(
@@ -4883,45 +4981,26 @@ def _mma_dag_fixup_workspace(
     partial_bytes = slabs * tiles * row_tiles * rows * 4
     counter_bytes = -(-row_tiles * 4 // 256) * 256
     stream_handle, capture_id = _cuda_stream_capture_context(device)
-    cache_key = (
-        device.type,
-        device.index,
-        row_tiles,
-        tiles,
-        rounds,
-        slabs,
-        rows,
-        stream_handle,
-        capture_id,
+    return _cached_exchange_workspace(
+        cute_kernel,
+        "_helion_mma_dag_fixup_workspace_cache",
+        (
+            device.type,
+            device.index,
+            row_tiles,
+            tiles,
+            rounds,
+            slabs,
+            rows,
+            stream_handle,
+            capture_id,
+        ),
+        device=device,
+        nbytes=partial_bytes + counter_bytes,
+        zero_from=0,
+        capture_id=capture_id,
+        limit=_MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT,
     )
-    try:
-        cache = cast(
-            "OrderedDict[tuple[object, ...], torch.Tensor]",
-            cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache,
-        )
-    except AttributeError:
-        cache = OrderedDict()
-        cast("Any", cute_kernel)._helion_mma_dag_fixup_workspace_cache = cache
-    workspace = cache.get(cache_key)
-    if workspace is not None:
-        return workspace
-    workspace = torch.zeros(
-        partial_bytes + counter_bytes, dtype=torch.uint8, device=device
-    )
-    cache[cache_key] = workspace
-    if capture_id is not None:
-        _track_cute_cuda_graph_cache_entry(
-            cute_kernel,
-            "_helion_mma_dag_fixup_workspace_cache",
-            cache_key,
-            workspace,
-            (workspace,),
-        )
-    else:
-        eager_keys = [key for key in cache if key[-1] is None]
-        while len(eager_keys) > _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT:
-            cache.pop(eager_keys.pop(0))
-    return workspace
 
 
 def _tcgen05_grouped_dynamic_tensormap_workspace(
@@ -5383,6 +5462,22 @@ def _cute_grouped_launch_contexts(
             continue
         if context not in contexts:
             contexts.append(context)
+    if _tcgen05_split_k_plan_present(cute_kernel):
+        # The split-K workspace is cached per (stream, capture)
+        # (``_tcgen05_split_k_workspace``): the same pointers relaunched on
+        # another stream or under capture must miss the last-launch cache
+        # too, or they would reuse the earlier launch's workspace pointer.
+        device = next(
+            (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
+        )
+        if device is not None:
+            context = (
+                device.type,
+                device.index,
+                *_cuda_stream_capture_context(device),
+            )
+            if context not in contexts:
+                contexts.append(context)
     return tuple(contexts)
 
 
@@ -6789,6 +6884,15 @@ def _cute_launch_arg_cache_key(
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
+    if _tcgen05_split_k_plan_present(cute_kernel):
+        # The split-K workspace pointer in the launch arguments is cached per
+        # (stream, capture) (``_tcgen05_split_k_workspace``); a captured
+        # graph must not reuse the arguments of an eager launch.
+        device = next(
+            (arg.device for arg in args if isinstance(arg, torch.Tensor)), None
+        )
+        if device is not None:
+            key.append(("workspace_context", *_cuda_stream_capture_context(device)))
     if dynamic_tensormap_contexts is None:
         dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     if dynamic_tensormap_contexts:
@@ -7704,6 +7808,43 @@ def _build_cute_schema_and_args(
         schema.append(("wrapper_host_scalar", total_name, "int"))
         launch_args.append(total_clusters)
         owned_tensors.extend(metadata_result.tensors())
+
+    split_k_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "helion_tcgen05_split_k"
+    ]
+    if len(split_k_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple tcgen05 split-K wrapper plans")
+    if split_k_plans:
+        plan = split_k_plans[0]
+        splits, tile_elems = (
+            int(cast("int", plan["splits"])),
+            int(cast("int", plan["tile_elems"])),
+        )
+        param = _plan_str_value(plan, "param")
+        tiles = int(cast("int", plan["tiles"]))
+        tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        # The kernel baked the counter offset from its tile count: the grid
+        # must be exactly that many tiles times the split.
+        if (
+            not tensor_args
+            or splits <= 1
+            or tile_elems <= 0
+            or tiles <= 0
+            or grid[0] != tiles * splits
+        ):
+            raise exc.BackendUnsupported("cute", "invalid tcgen05 split-K launch")
+        workspace = _tcgen05_split_k_workspace(
+            cute_kernel,
+            device=tensor_args[0].device,
+            tiles=tiles,
+            splits=splits,
+            tile_elems=tile_elems,
+        )
+        schema.append(("wrapper_host_scalar", param, "int"))
+        launch_args.append(int(workspace.data_ptr()))
+        owned_tensors.append(workspace)
 
     fixup_plans = [
         cast("dict[str, object]", plan)

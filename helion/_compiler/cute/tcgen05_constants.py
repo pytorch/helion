@@ -512,6 +512,15 @@ TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY = "tcgen05_epi_warp_groups"
 TCGEN05_EPI_WARP_GROUP_CHOICES = (1, 2, 3, 4)
 TCGEN05_EPI_WARPS_PER_GROUP = 4
 TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
+# Named barrier of the split-K partial exchange (the epilogue warps only).
+# It lies in the 6..9 range of the epilogue warp-group barriers below, which
+# the split-K envelope never allocates (it admits one epilogue warp group).
+TCGEN05_SPLIT_K_BARRIER_ID = 7
+# ``tcgen05_split_k``: CTAs per output tile along K (1 = no split). Every
+# split stores an fp32 partial tile to a launcher-owned workspace and the
+# last arriver reduces them into its TMEM accumulator before the epilogue.
+TCGEN05_SPLIT_K_CONFIG_KEY = "tcgen05_split_k"
+TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 # The groups' named barriers: ids 6 .. 9, disjoint from the role-local
 # kernel's TMEM-alloc (1), one-group epilogue (2), pipeline-init (3),
 # row-union publication (4) and CLC throttle (5) barriers (``cute_mma``
