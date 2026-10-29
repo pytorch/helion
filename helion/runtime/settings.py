@@ -660,6 +660,11 @@ class _Settings:
     cute_graph_cse: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_CUTE_GRAPH_CSE", True)
     )
+    cute_stage_unaligned_operands: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_STAGE_UNALIGNED_OPERANDS", True
+        )
+    )
     cute_exact_division: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
@@ -921,6 +926,16 @@ class Settings(_Settings):
             "log_softmax of it). Results are bitwise unchanged; set False "
             "(HELION_CUTE_GRAPH_CSE=0) to bisect a structural-matcher "
             "regression against the traced graph."
+        ),
+        "cute_stage_unaligned_operands": (
+            "If True (the default), the CuTe backend copies a static-shape "
+            "matmul operand whose outer strides are not 16-byte multiples "
+            "(e.g. odd-sized bf16 rows; a misaligned base offset is not "
+            "visible to the pass) into a padded row-major buffer on the host "
+            "before the launch, so the tcgen05 pipeline keeps its TMA "
+            "producers instead of the scalar shared-memory producers. Set False "
+            "(HELION_CUTE_STAGE_UNALIGNED_OPERANDS=0) to run such operands "
+            "in place."
         ),
         "cute_exact_division": (
             "If True (the default), an fp32 division by a loop-invariant scalar "

@@ -2613,8 +2613,17 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         raise TypeError(f"expected BaseWarning, got {type(warning)}")
 
     # Check if this warning type should be ignored
-    if not isinstance(warning, tuple(env.settings.ignore_warnings)):
-        print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
+    if isinstance(warning, tuple(env.settings.ignore_warnings)):
+        return
+    from .ast_extension import ExtendedAST
+
+    if isinstance(warning, exc.TensorOperationInWrapper) and any(
+        node._compiler_inserted for node in ExtendedAST.current()
+    ):
+        # A host tensor operation a backend rewrite inserted (e.g. the CuTe
+        # operand staging copy), not one the user wrote.
+        return
+    print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
 def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:

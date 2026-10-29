@@ -2853,6 +2853,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         if settings.backend == "cute" or settings.cute_rng_stream != "word0":
             parts.append(f"cute_rng_stream={settings.cute_rng_stream!r}")
+        if not settings.cute_stage_unaligned_operands:
+            # Non-default only: the pass changes the host code, not configs.
+            parts.append("cute_stage_unaligned_operands=False")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(

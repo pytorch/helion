@@ -168,7 +168,14 @@ def test_grouped_operand_alignment_uses_physical_strides(
         strides = (k * (n + padding), 1, n + padding)
     storage = torch.empty(groups * strides[0] + offset, dtype=dtype)
     b = storage.as_strided((groups, n, k), strides, offset)
-    bound = grouped._rank3_rhs_grouped_nt._bind_isolated((a, b, layout))
+    # The proof reads the operand as passed: keep the staging pass from
+    # relaying the padded operand out.
+    kernel = helion.kernel(
+        grouped._rank3_rhs_grouped_nt.fn,
+        backend="cute",
+        cute_stage_unaligned_operands=False,
+    )
+    bound = kernel._bind_isolated((a, b, layout))
     host = bound.host_function
     assert host is not None
     ir = host.device_ir

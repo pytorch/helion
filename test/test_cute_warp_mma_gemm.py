@@ -224,8 +224,10 @@ def _permuted_lhs_gemm(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _bind(fn: object, *args: torch.Tensor) -> helion.runtime.kernel.BoundKernel:
-    return helion.kernel(fn, backend="cute", static_shapes=True).bind(args)  # pyrefly: ignore[bad-argument-type]
+def _bind(
+    fn: object, *args: torch.Tensor, **settings: object
+) -> helion.runtime.kernel.BoundKernel:
+    return helion.kernel(fn, backend="cute", static_shapes=True, **settings).bind(args)  # pyrefly: ignore[bad-argument-type]
 
 
 def _warp_config(
@@ -712,10 +714,18 @@ def test_admission_mirrors_the_detector_gates() -> None:
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
     )
+    # 1032-byte rows on an operand above the staging size floor: the staging
+    # pass relays it through an aligned copy, so the family is admitted; with
+    # the pass disabled the detector's alignment gate declines as before.
+    misaligned_args = (
+        torch.empty((512, 516), dtype=torch.float16, device=CPU_DEVICE)[:, :512],
+        torch.empty((512, 64), dtype=torch.float16, device=CPU_DEVICE),
+    )
+    staged_rows = _bind(_ordinary_gemm, *misaligned_args)
+    with staged_rows.env:
+        assert staged_rows.config_spec._cute_tcgen05_config.warp_mma_admitted
     misaligned_rows = _bind(
-        _ordinary_gemm,
-        torch.empty((256, 260), dtype=torch.float16, device=CPU_DEVICE)[:, :256],
-        torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+        _ordinary_gemm, *misaligned_args, cute_stage_unaligned_operands=False
     )
     for bound in (permuted, misaligned_rows):
         with bound.env:
@@ -835,11 +845,13 @@ def test_m_major_a_admission_keeps_the_e4m3_and_alignment_gates() -> None:
     )
     assert reason(lhs_major=None) == "A must be K- or M-contiguous"
     # The strided-view binding of a column-major A with a misaligned column
-    # stride is not admitted (no family keys, no seeds).
+    # stride is not admitted (no family keys, no seeds) once the staging
+    # pass that would relay it through an aligned copy is disabled.
     misaligned = _bind(
         _ordinary_gemm,
         torch.empty((256, 260), dtype=torch.float16, device=CPU_DEVICE)[:, :256].T,
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
+        cute_stage_unaligned_operands=False,
     )
     with misaligned.env:
         spec = misaligned.config_spec
