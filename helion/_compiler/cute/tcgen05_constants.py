@@ -29,10 +29,18 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # validated on large square-ish GEMMs (5000^3), it holds on every ragged
 # shape probed from 1000 to 4160 (bf16 3000^3 45 us against cuBLAS's 45,
 # 1500x2500x3000 47.5 against 118.6, 2048x2048x2050 30.7 against 71.6, all
-# matching torch within bf16 rounding); the quarter-wave work gate in
-# ``plan_cute_tcgen05_search`` already keeps it off grids too small to fill
-# the SMs, so the floor only needs to exclude the launch-bound regime.
-TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 1024
+# matching torch within bf16 rounding) and, through its 128-row CTA pair
+# (``CuteTcgen05Config.plain_edge_pair128_admitted``), down to 1000^3 (the
+# pair 7.2 us burst / 8.2 us sustained against cuBLAS's 6.5 / 7.4 in the
+# interleaved runs; the flat one-CTA winner 8.4 burst). The quarter-wave
+# work gate in ``enable_cute_tcgen05_search`` counts 128x128 tiles for
+# 16-bit operands, so it keeps the family off grids too small to fill a
+# quarter of the SMs even with those pairs; the floor only needs to exclude
+# the launch-bound regime.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
+# The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
+# 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
+TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK = 128
 # Narrowest N tile of the ragged batched tcgen05 path: at bn <= 16 the
 # lowering emits no MMA body for a partial batched tile (the output stayed
 # unwritten), so those configs keep the generic lowering in every gate, and

@@ -223,5 +223,97 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
                 bound.to_code(_flat_config([1, 128, 256, 64]))
 
 
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
+    def test_ragged_gemm_admits_the_two_cta_edge_search(self) -> None:
+        # Ragged GEMMs below the old 1024 floor keep the two-CTA edge family
+        # in the search once its 128x128 tiles fill a quarter of the SMs;
+        # the planner counts those tiles for 16-bit operands, not 256x256
+        # pairs (16 of those at 1000^3).
+        for m, n, k in ((1000, 1000, 1000), (777, 999, 555)):
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = _gemm.bind((a, b))
+            spec = bound.config_spec
+            self.assertTrue(spec.cute_tcgen05_search_enabled)
+            self.assertIn(2, spec._cute_tcgen05_config.cluster_m_search_choices)
+            self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+            config = helion.Config(
+                block_sizes=[128, 128, 64],
+                indexing=["tensor_descriptor"] * 3,
+                pid_type="persistent_interleaved",
+                tcgen05_cta_group="two",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=5,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                l2_groupings=[4],
+            )
+            code = bound.to_code(config)
+            self.assertIn("CtaGroup.TWO", code)
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b), (a.float() @ b.float()).to(a.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_the_wide_k_pair_seed_runs_a_k_tail(self) -> None:
+        # The [128, 128, 128] ab6 twin of the plain edge seed on a shape whose
+        # K (555) is not a multiple of the K tile.
+        a = torch.randn(777, 555, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(555, 999, device=DEVICE, dtype=torch.bfloat16)
+        bound = _gemm.bind((a, b))
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if seed.get("tcgen05_cta_group") == "two"
+            and seed.get("block_sizes") == [128, 128, 128]
+        ]
+        self.assertEqual(len(seeds), 1)
+        code = bound.to_code(seeds[0])
+        self.assertIn("CtaGroup.TWO", code)
+        bound.set_config(seeds[0])
+        torch.testing.assert_close(
+            bound(a, b), (a.float() @ b.float()).to(a.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    def test_bias_epilogue_runs_the_256_row_pair_family(self) -> None:
+        # Auxiliary epilogues are detected after planning, so a bf16 bias GEMM
+        # at 1000^3 is admitted to the edge family on the 128x128 tile count
+        # but runs the family's 256x256 pairs (the 128-row pair excludes aux
+        # kernels): its cluster_m=2 seeds compile and match torch.
+        a = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1000, device=DEVICE, dtype=torch.bfloat16)
+        bound = _bias_gemm.bind((a, b, bias))
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertIn(2, spec._cute_tcgen05_config.cluster_m_search_choices)
+        seeds = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.get("tcgen05_cluster_m") == 2
+        ]
+        self.assertTrue(seeds)
+        expected = (a.float() @ b.float() + bias.float()).to(a.dtype)
+        for seed in seeds:
+            self.assertEqual(seed.get("block_sizes")[:2], [256, 256])
+            bound.set_config(seed)
+            torch.testing.assert_close(
+                bound(a, b, bias), expected, rtol=1e-2, atol=1e-1
+            )
+
+    def test_k_tail_only_gemm_keeps_the_one_cta_search(self) -> None:
+        # Only M and N fringes qualify for the edge family; a K tail alone
+        # stays on the one-CTA surface (its own TMA zero-fill handles it).
+        a = torch.randn(1024, 1000, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bound = _gemm.bind((a, b))
+        self.assertEqual(
+            bound.config_spec._cute_tcgen05_config.cluster_m_search_choices, (1,)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
