@@ -194,7 +194,18 @@ def _epilogue_cells() -> list[Cell]:
     cells.append(Cell("geluaux", "fp16", "nn", (4096, 4096, 4096), "gelu + aux out"))
     # matmul + layernorm.
     for m, n, k in ((512, 1024, 1024), (2048, 2048, 2048), (4096, 1024, 4096)):
-        cells.append(Cell("mmln", "fp16", "nn", (m, n, k), "matmul+layernorm"))
+        cells.extend(
+            (
+                Cell("mmln", "fp16", "nn", (m, n, k), "matmul+layernorm"),
+                Cell(
+                    "mmln2",
+                    "fp16",
+                    "nn",
+                    (m, n, k),
+                    "matmul then layernorm (2 launches)",
+                ),
+            )
+        )
     return cells
 
 
@@ -313,6 +324,10 @@ def _grouped_cells() -> list[Cell]:
         Cell("grouped", "bf16", "g8", (8192, 4096, 4096), "8 groups, mixed rows"),
         Cell("grouped", "bf16", "g16", (16384, 8192, 2048), "16 ragged groups"),
         Cell("groupedp", "bf16", "g8", (8192, 4096, 4096), "persistent, 8 groups"),
+        # The shared-weight formulation (one tile space over the packed rows,
+        # persistence left to the autotuner) of the same problems.
+        Cell("groupedv2", "bf16", "g8", (8192, 4096, 4096), "shared-weight kernel"),
+        Cell("groupedv2", "bf16", "g16", (16384, 8192, 2048), "shared-weight kernel"),
     ]
 
 
@@ -476,7 +491,7 @@ def build(cell: Cell, provider: str) -> Built:
             else:
                 kernels = [matmul_bias_gelu_aux]
                 helion_fn = lambda: matmul_bias_gelu_aux(x, w, bias)  # noqa: E731
-    elif fam == "mmln":
+    elif fam in ("mmln", "mmln2"):
         m, n, k = cell.shape
         dtype = _torch_dtype(cell.dtype)
         x = torch.randn(m, k, device="cuda", dtype=dtype)
@@ -490,10 +505,18 @@ def build(cell: Cell, provider: str) -> Built:
         torch_fn = torch.compile(reference_fn)
         torch_impl = "torch.compile(matmul + layer_norm)"
         if want_helion:
-            from examples.matmul_layernorm import matmul_layernorm
+            if fam == "mmln":
+                from examples.matmul_layernorm import matmul_layernorm
 
-            kernels = [matmul_layernorm]
-            helion_fn = lambda: matmul_layernorm(x, y, weight, bias)  # noqa: E731
+                kernels = [matmul_layernorm]
+                helion_fn = lambda: matmul_layernorm(x, y, weight, bias)  # noqa: E731
+            else:
+                from examples.matmul import matmul
+                from examples.matmul_layernorm import layernorm_rows
+                from examples.matmul_layernorm import matmul_layernorm_unfused
+
+                kernels = [matmul, layernorm_rows]
+                helion_fn = lambda: matmul_layernorm_unfused(x, y, weight, bias)  # noqa: E731
     elif fam == "bmm":
         b, m, n, k = cell.shape
         dtype = _torch_dtype(cell.dtype)
@@ -619,7 +642,7 @@ def build(cell: Cell, provider: str) -> Built:
 
             kernels = [_int16xbf16_gemm if transpose else _bf16xint16_gemm]
             helion_fn = lambda: bf16xint16_gemm(x, w, transpose)  # noqa: E731
-    elif fam in ("grouped", "groupedp"):
+    elif fam in ("grouped", "groupedp", "groupedv2"):
         total_m, n, k = cell.shape
         groups = int(cell.layout[1:])
         rows = _group_rows(total_m, groups, seed=groups)
@@ -638,12 +661,12 @@ def build(cell: Cell, provider: str) -> Built:
         if want_helion:
             from examples.grouped_gemm import grouped_gemm_jagged
             from examples.grouped_gemm import grouped_gemm_jagged_persistent
+            from examples.grouped_gemm import grouped_gemm_shared_weight
 
-            kernel = (
-                grouped_gemm_jagged_persistent
-                if fam == "groupedp"
-                else grouped_gemm_jagged
-            )
+            kernel = {
+                "groupedp": grouped_gemm_jagged_persistent,
+                "groupedv2": grouped_gemm_shared_weight,
+            }.get(fam, grouped_gemm_jagged)
             kernels = [kernel]
             helion_fn = lambda: kernel(A_packed, B, offsets)  # noqa: E731
     else:
@@ -1437,9 +1460,12 @@ def summarize(args: argparse.Namespace) -> None:
                 "torch_status": (torch_rec or {}).get("status", "missing"),
                 "cute_error": ((cute_rec or {}).get("error") or "")[:160],
                 "cute_max_abs_err": (cute_rec or {}).get("max_abs_err"),
-                "cute_config": ((cute_rec or {}).get("bound_kernels") or [{}])[0].get(
-                    "configs"
-                ),
+                # Every bound kernel's configs (a two-launch cell such as
+                # ``mmln2`` records the matmul's and the layernorm's).
+                "cute_config": [
+                    {"kernel": bound.get("kernel"), "configs": bound.get("configs")}
+                    for bound in (cute_rec or {}).get("bound_kernels") or []
+                ],
                 "torch_impl": (torch_rec or {}).get("torch_impl"),
                 "shared_gpu": any(
                     (rec or {}).get("foreign_at_start")
