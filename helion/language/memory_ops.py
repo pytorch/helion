@@ -106,6 +106,8 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
@@ -8333,3 +8335,102 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
+
+
+@has_side_effect
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+def prefetch(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    """Hint that ``tensor[index]`` will be read soon by warming the L2 cache.
+
+    ``index`` and ``extra_mask`` follow :func:`load` (tiles, integers,
+    slices, ``hl.arange`` / integer-tensor gathers).  Nothing is returned and
+    nothing is ordered: a prefetch neither waits for earlier stores nor makes
+    later loads see anything, so dropping it never changes a result.  Unlike
+    :func:`load` it takes no ``indexing``, eviction-policy or cache-modifier
+    config slot, so adding one leaves every load's tunables where they were.
+
+    On NVIDIA GPUs (Triton backend), when the last index is a full slice or a
+    tile of a stride-1 dim and there is no ``extra_mask``, each element of the
+    leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
+    segment (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per
+    element (one 128-byte line each).  Other targets drop it.
+
+    Args:
+        tensor: The tensor to prefetch from
+        index: The indices to use to index into the tensor
+        extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+    Returns:
+        None
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.prepare_args(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, list[object], torch.Tensor | None]:
+    from .tile_proxy import Tile
+
+    if not isinstance(tensor, torch.Tensor):
+        raise NotImplementedError(f"Cannot prefetch from type: {type(tensor)}")
+    index = Tile._tiles_to_sizes_for_index(index)
+    return (tensor, normalize_index_slices(tensor.shape, index), extra_mask)
+
+
+def prefetch_is_bulk(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> bool:
+    """Whether ``hl.prefetch(tensor, index)`` issues one bulk L2 prefetch per
+    element of its leading indices: the last index is a full slice or a tile
+    of a stride-1 dim, there is no extra mask, and the target is sm_90+."""
+    env = CompileEnvironment.current()
+    capability = env.ptx_capability
+    if capability is None or capability < (9, 0) or has_extra_mask:
+        return False
+    if tensor.ndim == 0 or len(index) != tensor.ndim:
+        return False
+    if any(idx is None or idx is Ellipsis for idx in index):
+        return False
+    stride = tensor.stride(-1)
+    if not (isinstance(stride, int) and stride == 1):
+        return False
+    if env.known_equal(tensor.size(-1), 1):
+        return False
+    last = index[-1]
+    if isinstance(last, slice):
+        return last.start is None and last.stop is None and last.step is None
+    return isinstance(last, torch.SymInt) and env.get_block_id(last) is not None
+
+
+@_decorators.register_fake(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    # Allocate the reduction dims of full slices as ``hl.load`` does, except
+    # a bulk prefetch's row segment, which its byte count covers.
+    if prefetch_is_bulk(tensor, index, extra_mask is not None):
+        index = [*index[:-1], 0]
+    SubscriptIndexing.compute_shape(tensor, index)
+    return None
+
+
+@_decorators.codegen(prefetch, "common")
+def _(state: CodegenState) -> None:
+    return None  # a hint: targets without a prefetch drop it
+
+
+@_decorators.ref(prefetch)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    return None
