@@ -650,6 +650,7 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        self.fragment_aux_kernel_detected: bool = False
         # Every analyzed store chain loads an auxiliary operand
         # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
         # proof that ``pre_acc_wait`` renders on the plain (non-fanout)
@@ -4628,6 +4629,7 @@ class CuteTcgen05Config:
         return (
             self._aux_tma_edge_search_enabled()
             or self._aux_tma_full_tile_search_enabled()
+            or self.fragment_aux_kernel_detected
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
@@ -4635,6 +4637,61 @@ class CuteTcgen05Config:
             return None
         seed_config: dict[str, Any] = dict(c_input_seed.config)
         seed_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        return Config(**seed_config)
+
+    def _fragment_aux_tma_seed_config(self) -> Config | None:
+        """Seed the one-CTA producer for a candidate fragment host-load path.
+
+        ``fragment_aux_kernel_detected`` intentionally over-approximates at
+        pre-codegen time. The exact locality proof remains config-specific and
+        rejects this seed later when no rank-2 host tensor is stageable.
+        """
+        if (
+            not self.fragment_aux_kernel_detected
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+
+        def select(fragment: BlockSizeFragment, choices: tuple[int, ...]) -> int | None:
+            return next(
+                (value for value in choices if fragment.low <= value <= fragment.high),
+                None,
+            )
+
+        bm = select(bm_fragment, (128,))
+        bn = select(bn_fragment, (128, 64))
+        bk = select(bk_fragment, (128, 64, 32, 16))
+        if bm is None or bn is None or bk is None:
+            return None
+        block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        if block_sizes is None:
+            return None
+        seed_config: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "l2_groupings": [1],
+            "num_stages": 2,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            ),
+        }
         return Config(**seed_config)
 
     def _clc_persistence_seed_config(self, base_seed: Config) -> Config | None:
@@ -4863,6 +4920,9 @@ class CuteTcgen05Config:
             seeds.append(Config(**m_pair_cn2_seed_config))
             # The same pair tile on nvjet's 64-wide deep ring (2x2 and 2x1).
             seeds.extend(self._m_pair_deep_seed_configs())
+        fragment_aux_tma_seed = self._fragment_aux_tma_seed_config()
+        if fragment_aux_tma_seed is not None:
+            seeds.append(fragment_aux_tma_seed)
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -7438,12 +7498,13 @@ class CuteTcgen05Config:
 
         Mirrors ``memory_ops``: the placement needs per-subtile auxiliary
         loads at every store it reaches -- every analyzed store chain loads
-        an auxiliary operand (``aux_loads_on_every_store``), or the shared
-        fanout epilogue (``tcgen05_epilogue_fanout='shared'``) merges each
+        an auxiliary operand (``aux_loads_on_every_store``), a unique-anchor
+        fragment epilogue reads host tensors, or the shared fanout epilogue
+        (``tcgen05_epilogue_fanout='shared'``) merges each
         proved pair into one chain that does, with the pair's reads provably
         safe ahead of the accumulator wait (``pre_wait_aux_safe``).
         """
-        if self.aux_loads_on_every_store:
+        if self.aux_loads_on_every_store or self.fragment_aux_kernel_detected:
             return True
         return (
             config.get(FANOUT_CONFIG_KEY, "off") == "shared"
@@ -8692,6 +8753,17 @@ class CuteTcgen05Config:
             return
         if not self._aux_tma_search_enabled():
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
+        if self.fragment_aux_kernel_detected and not (
+            self._aux_tma_edge_search_enabled()
+            or self._aux_tma_full_tile_search_enabled()
+        ):
+            if (
+                not self._is_with_scheduler_c_input_config(config)
+                or config.get("tcgen05_cluster_m") != 1
+                or config.get("tcgen05_cluster_n") != 1
+            ):
+                config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
         # Aux-TMA is kept when the projected cluster_m=2 candidate matches either
         # the validated edge+K-tail shape or the cycle-46 full-tile shape, and
@@ -9942,7 +10014,8 @@ class CuteTcgen05Config:
         # transfer (the carriers of other coverage groups are normalized
         # configs and always hold it). ``pre_acc_wait`` is sampled only where
         # some config can render it: every store chain loads an auxiliary
-        # operand, or the shared fanout epilogue (searched) merges an
+        # operand, a unique-anchor fragment epilogue reads host tensors,
+        # or the shared fanout epilogue (searched) merges an
         # aux-free chain with one that does. An aux kernel whose first output
         # is aux-free and has no fanout surface would only sample the
         # placement into a repair, so its coordinate collapses to the
@@ -9950,6 +10023,7 @@ class CuteTcgen05Config:
         if self.aux_kernel_detected or not for_search:
             pre_acc_wait_sampled = (
                 self.aux_loads_on_every_store
+                or self.fragment_aux_kernel_detected
                 or (
                     self.epilogue_fanout_search_enabled
                     and self.pre_acc_wait_admissible_via_fanout()

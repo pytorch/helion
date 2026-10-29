@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 from enum import IntEnum
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -115,6 +116,11 @@ TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 # acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
 # tuning.
 TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
+# Output-tile auxiliary staging also allocates scheduler/TMEM bookkeeping,
+# pipeline barriers, and 128/1024-byte-aligned ring pointers around the data
+# buffers counted below. Keep a small shared reserve so admission does not
+# accept a raw ring total that ptxas later rejects at the device limit.
+TCGEN05_STAGED_PIPELINE_RESERVED_SMEM_BYTES = 4 * 1024
 # Static SMEM model of the DEFAULT-layout role-local GEMM
 # (``CuteTcgen05Config.default_layout_smem_bytes``), measured on B200 from the
 # compiled cubins and the kept PTX. Every ``cute.arch.alloc_smem`` becomes one
@@ -328,6 +334,70 @@ def tcgen05_aux_ring_smem_bytes_per_cta(
     return ring_count * aux_stages * stage_bytes + 2 * aux_stages * (
         TCGEN05_SMEM_MBARRIER_BYTES
     )
+
+
+def tcgen05_aux_smem_bytes_per_cta(
+    *,
+    tiles: tuple[tuple[int, int, int], ...],
+    stages: int,
+) -> int:
+    """Return the data-ring SMEM bytes for staged auxiliary tensors."""
+    assert stages > 0
+    assert tiles and all(
+        tile_m > 0 and tile_n > 0 and dtype_bytes > 0
+        for tile_m, tile_n, dtype_bytes in tiles
+    )
+    return stages * sum(
+        tile_m * tile_n * dtype_bytes for tile_m, tile_n, dtype_bytes in tiles
+    )
+
+
+def tcgen05_staged_smem_bytes_per_cta(
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    input_dtype_bytes: int,
+    ab_stages: int,
+    cluster_m: int,
+    output_epilogue_tile: tuple[int, int] | None = None,
+    output_dtype_bytes: int = 0,
+    c_stages: int = 0,
+    aux_tiles: tuple[tuple[int, int, int], ...] = (),
+    aux_stages: int = 0,
+) -> int:
+    """Return the combined AB, output-store, and auxiliary ring footprint.
+
+    This centralizes the data allocations shared by tcgen05 staging admission
+    and includes a conservative reserve for fixed control allocations and
+    alignment padding that are not naturally attributable to one ring.
+    """
+    total = tcgen05_ab_smem_bytes_per_cta(
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_bytes=input_dtype_bytes,
+        ab_stages=ab_stages,
+        cluster_m=cluster_m,
+    )
+    if output_epilogue_tile is not None:
+        assert output_dtype_bytes > 0 and c_stages > 0
+        total += tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=output_epilogue_tile[0],
+            epi_tile_n=output_epilogue_tile[1],
+            dtype_bytes=output_dtype_bytes,
+            c_stages=c_stages,
+        )
+    else:
+        assert output_dtype_bytes == 0 and c_stages == 0
+    if aux_tiles:
+        total += tcgen05_aux_smem_bytes_per_cta(
+            tiles=aux_tiles,
+            stages=aux_stages,
+        )
+    else:
+        assert aux_stages == 0
+    return total + TCGEN05_STAGED_PIPELINE_RESERVED_SMEM_BYTES
 
 
 # C-store epilogue placement knobs. Keeping these in Config makes generated-code
@@ -680,6 +750,15 @@ TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON = (
     "requires TMA-legal auxiliary tensors (a 16-byte base, 16-byte outer "
     "strides and a contiguous last axis)"
 )
+
+
+class Tcgen05AuxStagingScope(enum.Enum):
+    """Lifetime represented by one stage of an auxiliary SMEM pipeline."""
+
+    EPILOGUE_SUBTILE = "epilogue_subtile"
+    OUTPUT_TILE = "output_tile"
+
+
 TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY = "tcgen05_acc_producer_mode"
 TCGEN05_ACC_PRODUCER_MODE_NORMAL = "normal"
 # Skips UMMA fence/issue while keeping AB and accumulator pipeline handshakes.

@@ -39,6 +39,7 @@ from .cute_epilogue import aux_leaf_promoted_by_f32_root
 from .cute_epilogue import aux_leaf_takes_promoted_f32_stage
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .tcgen05_constants import Tcgen05AuxStagingScope
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import Tcgen05RowvecAuxRow
 
@@ -98,9 +99,10 @@ class Tcgen05AuxTensorDescriptor:
       the host tensor's FX node — the concrete shape / dtype / device
       the producer-body codegen needs at MMA-codegen time (the TMA
       atom and SMEM ring are sized from these).
-    - ``broadcast_axis``: ``None`` for the exact-shape rank-2 form
-      (``residual[tile_m, tile_n]``); ``1`` for the trailing-axis
-      rowvec broadcast form (``bias[tile_n]``). Matches the field on
+    - ``broadcast_axis``: ``None`` for a rank-2 staged source (an ordinary
+      exact-shape ``residual[tile_m, tile_n]`` or a fragment-proven
+      proportional tile); ``1`` for the trailing-axis rowvec broadcast form
+      (``bias[tile_n]``). Matches the field on
       :class:`_AuxiliaryTensorLoadExpr` so the productive body uses the
       same axis convention as the existing per-thread splice.
     - ``store_value_node``: the FX node of the store value whose
@@ -111,6 +113,13 @@ class Tcgen05AuxTensorDescriptor:
       productive-body codegen can use this to pair the aux SMEM
       ring with the right store-splice consumer if a future kernel
       shape produces fan-out.
+    - ``staging_scope``: whether one pipeline stage carries an ordinary
+      epilogue subtile or the complete output tile. The latter is selected only
+      when the fragment proof shows every staged access stays within that tile.
+    - ``staging_tile_shape``: optional descriptor-specific ``(M, N)`` extent
+      for one output-tile stage. Fragment loads may address a proportionally
+      smaller tensor tile (for example separate ``[M, D / 2]`` rotary tables),
+      while ordinary epilogue-subtile descriptors leave this unset.
 
     The descriptor is intentionally minimal — just the fields the
     productive body needs. Per-aux-step splice locals (var names,
@@ -128,6 +137,8 @@ class Tcgen05AuxTensorDescriptor:
     host_tensor_val: torch.Tensor
     broadcast_axis: int | None
     store_value_node: torch.fx.Node
+    staging_scope: Tcgen05AuxStagingScope = Tcgen05AuxStagingScope.EPILOGUE_SUBTILE
+    staging_tile_shape: tuple[int, int] | None = None
 
 
 def _output_global_shape_from_store(
