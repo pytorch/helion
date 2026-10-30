@@ -653,6 +653,81 @@ def test_muse_spark_tp4_megakernels_exchange_without_barriers() -> None:
         dist.destroy_process_group()
 
 
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfNotTriton(
+    "the EP4 MoE megakernel is pinned to backend='triton'; the transport "
+    "assertions inspect its Triton code"
+)
+def test_muse_spark_moe_ep4_exchanges_in_band_without_barriers() -> None:
+    if _current_compute_capability() != "sm100":
+        pytest.skip("the EP4 MoE megakernel is pretuned for SM100")
+    moe = _import_muse_spark_module("moe_ep4")
+    from pretuned_kernels.megakernels.muse_spark._common import ExpertInputs
+
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        group = dist.group.WORLD
+        tokens = moe.TOKENS
+        u8 = {"device": DEVICE, "dtype": torch.uint8}
+        bf16 = {"device": DEVICE, "dtype": torch.bfloat16}
+        e4m3 = torch.float8_e4m3fn
+        experts, inter, hidden = moe.LOCAL_EXPERTS, moe.INTERMEDIATE, moe.HIDDEN
+        weights = moe.moe_ep4_weights(
+            moe.RankWeights(
+                w13=torch.zeros((experts, 2 * inter, hidden // 2), **u8),
+                w13_scale=torch.zeros((experts, 2 * inter, hidden // 16), **u8).view(
+                    e4m3
+                ),
+                w2=torch.zeros((experts, hidden, inter // 2), **u8),
+                w2_scale=torch.zeros((experts, hidden, inter // 16), **u8).view(e4m3),
+            )
+        )
+        inputs = ExpertInputs.zeros(tokens, DEVICE)
+        local_routes = moe.LocalRoutes.zeros(tokens, DEVICE)
+        slots = tokens * moe.TOPK
+        alphas = torch.ones((experts,), device=DEVICE, dtype=torch.float32)
+        args = (
+            weights.w13,
+            weights.w2,
+            weights.s13,
+            weights.s2,
+            inputs.fp4,
+            inputs.scales,
+            inputs.per_token_scale,
+            inputs.packed,
+            inputs.packed.view(-1),
+            alphas,
+            alphas,
+            alphas,
+            torch.zeros((slots, moe.MOE_TOKENS, inter // 2), **u8),
+            torch.zeros((slots, moe.MOE_TOKENS, inter // 16), **u8),
+            torch.zeros((slots, hidden), **bf16),
+            local_routes.route_idx.view(-1),
+            local_routes.route_w.view(-1),
+            torch.ones((hidden,), **bf16),
+            torch.zeros(
+                (slots, hidden // moe.TILE_M), device=DEVICE, dtype=torch.float32
+            ),
+            torch.zeros((tokens, hidden), **bf16),
+            torch.zeros((tokens, hidden), **bf16),
+            group.group_name,
+            0,
+            moe.NORM_EPS,
+        )
+        kernel = moe.muse_spark_moe_ep4
+        code = kernel.bind(args).to_triton_code(kernel.configs[0])
+        # Only the finalize partial crosses ranks, as tagged in-band pushes; the
+        # R1 -> R2 -> FIN handoffs are rank-local readiness waits.
+        assert code.count("st.relaxed.sys.global.v2.u64") == 4
+        assert code.count("while inband_stale != 0:") == 1
+        assert "READY_WAIT" in code
+        assert "PEER_WAIT" not in code
+        assert "_add_on_every_rank" not in code
+        assert "_wait_at_least" not in code
+    finally:
+        dist.destroy_process_group()
+
+
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 @pytest.mark.parametrize(
     "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
@@ -688,13 +763,14 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
         "router",
         "lm_head",
         "moe_tp4",
+        "moe_ep4",
     ],
 )
-def test_muse_spark_tp4_megakernels_check_on_four_ranks(name: str) -> None:
+def test_muse_spark_megakernels_check_on_four_ranks(name: str) -> None:
     _require_four_sm100_gpus()
     if _under_xdist():
         pytest.skip("four-rank runs need every local GPU")
-    if name == "moe_tp4" and not importlib.util.find_spec("flashinfer"):
+    if name.startswith("moe_") and not importlib.util.find_spec("flashinfer"):
         pytest.skip("the MoE check lays its weights out with FlashInfer")
     # --check runs only the FP64 checks, so sglang is not needed.
     subprocess.run(
