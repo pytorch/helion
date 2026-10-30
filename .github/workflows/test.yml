@@ -8,9 +8,9 @@ on:
       - release/*
 
 concurrency:
-  # Also applies to main: a new push cancels the previous main run so bursts of
-  # landed PRs don't queue a full run (including B200 jobs) per commit.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # PRs: cancel previous runs when a new commit is pushed.
+  # Push/main/release: group by sha so a new merge does not cancel an in-flight run.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
