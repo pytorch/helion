@@ -109,16 +109,16 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
     return sys.modules[module_name]
 
 
-@pytest.mark.parametrize(
-    "name",
-    (
-        "kda_decode",
-        "qwen3_decode_layer",
-        "gemma4_a4b_moe",
-        "gpt_oss_moe",
-        "deepseek_v3_moe_nvfp4",
-    ),
+_AOT_MEGAKERNELS = (
+    "kda_decode",
+    "qwen3_decode_layer",
+    "gemma4_a4b_moe",
+    "gpt_oss_moe",
+    "deepseek_v3_moe_nvfp4",
 )
+
+
+@pytest.mark.parametrize("name", _AOT_MEGAKERNELS)
 def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
     heuristic = _import_pretuned_heuristic(name)
     signatures = heuristic._TENSOR_SIGNATURES
@@ -145,6 +145,29 @@ def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
         changed[index] = value + 1
         with pytest.raises(ValueError):
             key(*changed)
+
+
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfCute("megakernel is pinned to backend='triton'")
+@skipIfTileIR("the checked-in configs are for Triton's default lowering")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("name", _AOT_MEGAKERNELS)
+def test_megakernel_aot_config_compiles(name: str) -> None:
+    # The correctness checks need vLLM, so this is what catches a checked-in
+    # config going stale against the compiler's config space.
+    if _current_compute_capability() != "sm100":
+        pytest.skip(f"{name} is pretuned for SM100")
+    heuristic = _import_pretuned_heuristic(name)
+    kernel = getattr(_import_pretuned_kernel_module(name), name)
+    args = (
+        *(
+            torch.empty(shape, dtype=dtype, device=DEVICE)
+            for shape, dtype in heuristic._TENSOR_SIGNATURES
+        ),
+        *heuristic._STATIC_ARGS,
+    )
+    config = getattr(heuristic, f"autotune_{name}")(*args)
+    kernel.bind(args).to_triton_code(helion.Config(**config))
 
 
 @pytest.mark.parametrize(
