@@ -24,6 +24,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
+from .compile_environment import _constrain_unify
 from .compile_environment import warning
 from .output_header import library_imports
 from .source_location import current_location
@@ -737,7 +738,7 @@ class TypePropagation(ast.NodeVisitor):
                 and env.shape_env.replace(left_symbol)
                 != env.shape_env.replace(right_symbol)
             ):
-                env.shape_env._constrain_unify(left.value, right.value)
+                _constrain_unify(env.shape_env, left.value, right.value)
         elif isinstance(left, SequenceType) and isinstance(right, SequenceType):
             if len(left.element_types) == len(right.element_types):
                 for left_element, right_element in zip(
