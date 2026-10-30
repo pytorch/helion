@@ -2239,6 +2239,7 @@ class CuteBackend(Backend):
             in (
                 "cute_split_k_workspace",
                 "cute_split_k_stages",
+                "cute_split_k_partitions",
                 "cute_split_k_schedule",
                 "cute_split_k_finalizer_warps",
             )
@@ -2688,6 +2689,7 @@ class CuteBackend(Backend):
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_tmem_store_atom": "from helion._compiler.cute.split_k_exchange import tmem_store_atom as _cute_tmem_store_atom",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
             "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
             "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
@@ -2699,6 +2701,14 @@ class CuteBackend(Backend):
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        if dim == 0:
+            from ..device_function import DeviceFunction
+
+            divisor = DeviceFunction.current().cute_state.program_id_divisor
+            if divisor > 1:
+                # ``tcgen05_split_k``: ``divisor`` consecutive CTAs share one
+                # output tile (the split index is ``block_idx % divisor``).
+                return f"{index_dtype}(cute.arch.block_idx()[0] // {divisor})"
         return f"{index_dtype}(cute.arch.block_idx()[{dim}])"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:

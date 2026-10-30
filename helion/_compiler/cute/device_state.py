@@ -353,6 +353,9 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     orientation: Tcgen05Orientation = Tcgen05Orientation.MN
     output_column_major: bool = False
     row_union: GroupedRowUnionPlan | None = None
+    # ``tcgen05_split_k``: CTA-uniform predicate naming the tile's last
+    # arriving split (the only CTA that runs the output stores).
+    split_k_last: str = ""
 
     @property
     def d_store_layout(self) -> str:
@@ -1008,6 +1011,13 @@ class CuteDeviceFunctionState:
         # The fused body may run one CTA per (grid index, lane): the launch
         # grid is the PID strategy's grid times this factor.
         self.launch_grid_multiplier: int = 1
+        # ``tcgen05_split_k``: the flat grid carries ``divisor`` CTAs per
+        # output tile, so the program-id decode reads ``block_idx // divisor``
+        # and the launch grid is multiplied by it (``launch_grid_multiplier``).
+        # ``tcgen05_split_k_applied`` records that the tcgen05 pipeline honored
+        # the split; the launch codegen rejects the config otherwise.
+        self.program_id_divisor: int = 1
+        self.tcgen05_split_k_applied: bool = False
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
         self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None

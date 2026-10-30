@@ -75,6 +75,10 @@ from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
+from .split_k_workspace_config import PARTITIONS_KEY
+from .split_k_workspace_config import STAGES_KEY
+from .split_k_workspace_config import WORKSPACE_KEY
+from .split_k_workspace_config import workspace_search_fields
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_BATCH_RASTER_CHOICES
 from .strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
@@ -241,6 +245,8 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from .tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from .tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from .tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SPLIT_K_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -503,6 +509,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_materialized_pdl",
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
+    TCGEN05_SPLIT_K_CONFIG_KEY,
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
     TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
@@ -650,6 +657,12 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # The device program's only side effect is one tile store
+        # (``split_k_exchange.host_function_has_plain_store_body``): the
+        # precondition of ``tcgen05_split_k``, whose last-arriver check
+        # guards that store alone. Set at bind; a spec that never went
+        # through bind keeps the knob off.
+        self.split_k_plain_body: bool = False
         # Every analyzed store chain loads an auxiliary operand
         # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
         # proof that ``pre_acc_wait`` renders on the plain (non-fanout)
@@ -2606,6 +2619,88 @@ class CuteTcgen05Config:
                         TCGEN05_C_STORE_MODE_DIRECT
                     )
                     seeds.append(Config(**direct_seed_config))
+        return seeds
+
+    def _split_k_seed_configs(self) -> list[Config]:
+        """Flat one-CTA split-K seeds for problems whose output tiles cannot
+        fill the machine (``tcgen05_split_k``, ``split_k_exchange.py``).
+
+        A GEMM with fewer output tiles than SMs leaves SMs idle however the
+        tiles are cut; splitting the K loop across CTAs is the cuBLAS answer
+        (its heuristic runs 512x512x65536 as 128x128 tiles x split-K plus a
+        reduction kernel). Per admitted tile the seeds take the two smallest
+        splits that bring the grid to at least one wave while every split
+        keeps at least four K tiles, and the ring depth the SMEM budget
+        admits for the tile.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+            or "flat" not in self.allowed_pid_types
+            or self.matmul_leading_work_multiplier != 1
+            or self.grouped_worklist_smem_facts is not None
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        # Without an SM count (hosts without a device) the knob is searched
+        # and seeded as on a small machine.
+        sm_count = self.device_sm_count
+        if sm_count > 0 and -(-m // 128) * -(-n // 128) >= sm_count:
+            return []
+        choices = self.split_k_search_choices()
+        seeds: list[Config] = []
+        for bm, bn in ((128, 128), (128, 256), (64, 128), (64, 64), (64, 32)):
+            if not (
+                bm_fragment.low <= bm <= bm_fragment.high
+                and bn_fragment.low <= bn <= bn_fragment.high
+            ):
+                continue
+            tiles = -(-m // bm) * -(-n // bn)
+            if sm_count > 0 and tiles >= sm_count:
+                continue
+            for bk in (128, 64):
+                if not bk_fragment.low <= bk <= bk_fragment.high:
+                    continue
+                k_tiles = -(-k // bk)
+                splits = [
+                    split
+                    for split in choices
+                    if k_tiles // split >= 4 and tiles * split >= sm_count
+                ][:2]
+                if not splits:
+                    # No split reaches one wave with four tiles per split:
+                    # the deepest split that keeps four tiles.
+                    splits = [split for split in choices if k_tiles // split >= 4][-1:]
+                fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+                block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                assert block_sizes is not None
+                for split in splits:
+                    stages = max(1, min(k_tiles // split, fit if fit > 0 else 2))
+                    seed_config: dict[str, Any] = {
+                        "block_sizes": block_sizes,
+                        "pid_type": "flat",
+                        "tcgen05_cta_group": "auto",
+                        "tcgen05_cluster_m": 1,
+                        "tcgen05_cluster_n": 1,
+                        "tcgen05_ab_stages": stages,
+                        "tcgen05_c_stages": 2,
+                        "tcgen05_acc_stages": 1,
+                        TCGEN05_SPLIT_K_CONFIG_KEY: split,
+                        "tcgen05_persistence_model": "non_persistent",
+                        "tcgen05_strategy": "role_local_monolithic",
+                        "tcgen05_layout_strategy": "default",
+                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                    }
+                    if bn <= TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN:
+                        seed_config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = (
+                            TCGEN05_C_STORE_MODE_DIRECT
+                        )
+                    seeds.append(Config(**seed_config))
         return seeds
 
     def _warp_mma_problem(
@@ -4766,6 +4861,7 @@ class CuteTcgen05Config:
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
         seeds.extend(self._small_grid_seed_configs())
+        seeds.extend(self._split_k_seed_configs())
         seeds.extend(self._warp_mma_seed_configs())
         seeds.extend(self._one_wave_seed_configs())
         seeds.extend(self._multi_tile_two_cta_seed_configs())
@@ -4914,6 +5010,97 @@ class CuteTcgen05Config:
             and capability is not None
             and capability >= (9, 0)
         )
+
+    def split_k_search_choices(self) -> tuple[int, ...]:
+        """The ``tcgen05_split_k`` values the plain GEMM can take: splits no
+        deeper than the K loop of the smallest K tile the search admits,
+        for an unbatched static-shape GEMM (the pipeline reads the operands
+        through TMA on the flat one-CTA path only)."""
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            # A tile body with an atomic, a second store or a branch would
+            # run that effect once per split.
+            or not self.split_k_plain_body
+            or extents is None
+            or fragments is None
+            or self.matmul_leading_work_multiplier != 1
+            or self.grouped_worklist_smem_facts is not None
+            or any(value is None or value <= 0 for value in extents)
+        ):
+            return ()
+        m, n, k = cast("tuple[int, int, int]", extents)
+        if (
+            self.device_sm_count > 0
+            and -(-m // 128) * -(-n // 128) >= self.device_sm_count
+        ):
+            # Enough output tiles to fill the machine: splitting only adds
+            # the partial exchange. Without an SM count (hosts without a
+            # device) the knob stays searchable and so do its seeds.
+            return ()
+        k_tiles = -(-k // fragments[2].low)
+        return tuple(
+            split for split in TCGEN05_SPLIT_K_SEARCH_CHOICES if 1 < split <= k_tiles
+        )
+
+    def _fix_split_k_search_config(self, config: dict[str, object]) -> None:
+        """Keep ``tcgen05_split_k`` at 1 unless the sampled config is a flat
+        one-CTA GEMM whose K loop has at least ``split`` tiles."""
+        searched = self.search_enabled and bool(self.split_k_search_choices())
+        split = config.get(TCGEN05_SPLIT_K_CONFIG_KEY, 1)
+        if (
+            not isinstance(split, int)
+            or split <= 1
+            # The workspace schedule replaces the whole GEMM launch.
+            or config.get("cute_split_k_workspace")
+        ):
+            # Off the search surface the knob is absent (a coverage witness
+            # or pinned record must round-trip unchanged); on it, it reads 1.
+            if searched:
+                config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
+            else:
+                config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+            return
+        view = self._matmul_config_view(config)
+        extents = self.matmul_compile_time_static_extents
+        valid = (
+            split in self.split_k_search_choices()
+            and view is not None
+            and extents is not None
+            and config.get("pid_type", "flat") == "flat"
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+        )
+        if valid:
+            assert view is not None and extents is not None
+            block_sizes, m_index, _n_index, k_index = view
+            bm, bk = block_sizes[m_index], block_sizes[k_index]
+            k = cast("tuple[int, int, int]", extents)[2]
+            valid = (
+                # The tile must run the one-CTA tcgen05 MMA (a 256-row flat
+                # tile falls off tcgen05 and could not split).
+                bm in (64, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+                and isinstance(bk, int)
+                and bk > 0
+                and -(-k // bk) >= split
+            )
+        if not valid:
+            if searched:
+                config[TCGEN05_SPLIT_K_CONFIG_KEY] = 1
+            else:
+                config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+
+    def _fix_split_k_workspace_search_config(self, config: dict[str, object]) -> None:
+        """With the workspace schedule off, its stage and partition knobs are
+        inert: a sample reads their defaults so the search does not compile
+        one plain kernel per inert value."""
+        if config.get(WORKSPACE_KEY):
+            return
+        if STAGES_KEY in config:
+            config[STAGES_KEY] = 2
+        if PARTITIONS_KEY in config:
+            config[PARTITIONS_KEY] = 1
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
@@ -9740,6 +9927,17 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
+        split_k_choices = self.split_k_search_choices()
+        if not for_search or split_k_choices:
+            # Flat one-CTA kernels run each output tile's K loop on this
+            # many CTAs and reduce the partials in the last arriver's TMEM
+            # (``_fix_split_k_search_config`` keeps the knob at 1 off the
+            # flat one-CTA family). Searched only where the output tiles
+            # cannot fill the machine; otherwise the knob stays off the
+            # surface (explicit configs may still set it).
+            fragments[TCGEN05_SPLIT_K_CONFIG_KEY] = EnumFragment(
+                TCGEN05_SPLIT_K_SEARCH_CHOICES
+            )
         if not for_search or self.grouped_ab_k_fusion_supported:
             fragments[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = EnumFragment((None, 128))
         if not for_search or self.grouped_d_shift_supported:
@@ -11255,6 +11453,16 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        self._fix_search_config_body(config)
+        # These repairs read the repaired pid type, cluster and tile, so they
+        # run last, on every path of the body (its early returns included:
+        # the one-CTA pipeline, the dense-N tile, the materialized chains
+        # and the explicit pair): the split-K knobs apply only on the flat
+        # one-CTA family.
+        self._fix_split_k_search_config(config)
+        self._fix_split_k_workspace_search_config(config)
+
+    def _fix_search_config_body(self, config: dict[str, object]) -> None:
         if config.get(TILE_N_KEY, 0) != 0:
             self._normalize_dense_aligned_n(config, fix_invalid=True)
             config.pop("epilogue_subtile", None)
@@ -11589,6 +11797,10 @@ class CuteTcgen05Config:
         ):
             fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
+        if self.config_spec.cute_split_k_workspace_available:
+            fields.update(
+                workspace_search_fields(self.config_spec.cute_split_k_partition_choices)
+            )
         seeds = self.config_spec.compiler_seed_configs
         if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
             fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(
