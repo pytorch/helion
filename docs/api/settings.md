@@ -76,6 +76,27 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 ### Core Compilation Settings
 
+`cache_level="config"` is the default and preserves the existing autotuned
+configuration cache. `cache_level="code"` (or `HELION_CACHE_LEVEL=code`) also
+enables the opt-in persistent source cache for selected Triton configs.
+Explicit settings take precedence over `HELION_CACHE_LEVEL`.
+An explicit `cache_level="code"` on a non-Triton kernel raises `ValueError`;
+the global environment setting instead logs a warning and uses
+`cache_level="config"` for that kernel. With the default
+`@helion.kernel` and no `config=`, adaptive autotuning still runs frontend
+compilation in every process and the cache only skips source generation.
+With a single explicit config, a custom config selector or disabled autotuning,
+inputs that an earlier process's binding would accept also skip frontend
+compilation.
+In-memory dynamic binding and autotuning keys keep their ordinary behavior.
+Native-source handoff and PyTorch builds without Helion's `torch.compile`
+integration retain frontend compilation. Handoff uses the ordinary backend
+tuning path. Missing or corrupt entries fall back to normal compilation.
+Generated source and binding entries have a shared 1 GiB disk budget; override
+it with `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES` (read once per process).
+Least recently used entries are evicted when a write would exceed the budget. See
+{doc}`../deployment_autotuning` for its scope and cache controls.
+
 ```{eval-rst}
 .. currentmodule:: helion
 
