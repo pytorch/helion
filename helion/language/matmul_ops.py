@@ -24,6 +24,7 @@ from .._compiler.cute.tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -931,6 +932,25 @@ def enable_cute_tcgen05_search(
                     work_clusters < num_sms // 4 <= one_wave_work_clusters
                 )
                 work_clusters = max(work_clusters, one_wave_work_clusters)
+            if allow_edge_cluster_m2_search and input_dtype.itemsize == 2:
+                # The 16-bit edge family also runs 128x128 CTA pairs
+                # (``CuteTcgen05Config.plain_edge_pair128_admitted``: each CTA
+                # owns 64 rows), so its work is counted in 128x128 tiles,
+                # partial ones included: a ragged bf16 1000^3 GEMM has 16
+                # 256x256 pairs but 64 of 128x128, enough to keep the two-CTA
+                # search on (cuBLAS runs it as a 2x1-cluster 64x112 kernel;
+                # the 128x128 pair ran 7.2 us against the flat one-CTA
+                # winner's 8.4). fp8 kernels keep the pair count above.
+                # Auxiliary epilogues are detected after planning
+                # (``cute_tcgen05_aux_kernel_detected``), so a 16-bit kernel
+                # with one is admitted on this count too and runs the
+                # family's 256x256 pairs, which the pair-128 gate excludes.
+                edge_work_clusters = (
+                    plan.leading_work_multiplier
+                    * -(-static_m // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
+                    * -(-static_n // TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK)
+                )
+                work_clusters = max(work_clusters, edge_work_clusters)
             if work_clusters < num_sms // 4:
                 allow_cluster_m2_search = False
                 allow_edge_cluster_m2_search = False
