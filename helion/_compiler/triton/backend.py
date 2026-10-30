@@ -52,6 +52,11 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    # The bundled Triton backend only targets CUDA devices; accelerator
+    # Triton ports (out-of-tree driver backends) can register themselves and
+    # declare their own device types to participate in device routing.
+    device_types = frozenset({"cuda"})
+
     def supports_block_ptr_indexing(self) -> bool:
         from ..._compat import supports_block_ptr
 
@@ -552,12 +557,12 @@ class TritonBackend(Backend):
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
-    def effective_num_warps(self, config: Config) -> int:
+    def effective_num_warps(self, config: Config) -> int | None:
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
         num_warps = config.num_warps
         if any(config.range_warp_specializes):
-            num_warps = max(4, num_warps)
+            num_warps = 4 if num_warps is None else max(4, num_warps)
         return num_warps
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
@@ -693,6 +698,10 @@ class TritonBackend(Backend):
 
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
+
+    # Experimental and ENABLE_TILE-gated: claim no device types so routing
+    # never dispatches to it; only an explicit backend="tileir" reaches it.
+    device_types = frozenset()
 
     @property
     def name(self) -> str:
