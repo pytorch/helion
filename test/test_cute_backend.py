@@ -12768,12 +12768,19 @@ class TestCuteBackend(TestCase):
                 )
                 return cute_batched_dot_tcgen05.bind(operands).config_spec
 
-            # Leading-axis tcgen05 codegen requires full M/N/K tiles. Shapes
-            # without a legal full tile stay on the generic search surface.
-            self.assertFalse(search_spec(160, 256, 128).cute_tcgen05_search_enabled)
+            # Ragged batched extents run the flat one-CTA pipeline (TMA
+            # zero-fills the partial tiles; the SIMT epilogue masks them), so
+            # a shape without a legal full tile still searches tcgen05, with
+            # the two-CTA families withheld.
+            ragged_spec = search_spec(160, 256, 128)
+            self.assertTrue(ragged_spec.cute_tcgen05_search_enabled)
+            self.assertEqual(ragged_spec._tcgen05_cluster_m_search_choices, (1,))
+            # The M ceiling is no longer narrowed to the extent's power-of-two
+            # divisor: a 256-row tile over 320 rows is a legal partial tile.
             divisor_spec = search_spec(320, 256, 128)
             self.assertTrue(divisor_spec.cute_tcgen05_search_enabled)
-            self.assertEqual(divisor_spec.block_sizes[1].max_size, 64)
+            self.assertEqual(divisor_spec.block_sizes[1].max_size, 256)
+            self.assertEqual(divisor_spec.block_sizes[1].min_size, 64)
 
             # BMM's N slot is index 2, not the rank-2 index 1. Clamp against
             # the analyzed axis so a one-cluster N dimension cannot keep 8.
@@ -13206,14 +13213,16 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("cute.gemm(", code)
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
 
-    def test_batched_two_cta_partial_edge_tiles_rejected(self) -> None:
+    def test_batched_two_cta_partial_edge_tiles_projected_onto_one_cta(self) -> None:
         # A batched CtaGroup.TWO matmul with ANY partial tile -- M edge, N
-        # edge, OR a K tail -- must be rejected loudly: the output-edge
-        # scheduler linearizes the virtual pid across the batch axis and the
-        # K-tail reduction is batch-unaware, so both would silently miscompute
-        # (only static full tiles are validated for batched 2-CTA). Each
-        # (M, K) x (K, N) below makes exactly one axis partial vs the
-        # 256x256x64 blocks (plus the combined case).
+        # edge, OR a K tail -- must never emit the two-CTA pipeline: the
+        # output-edge scheduler linearizes the virtual pid across the batch
+        # axis and the K-tail reduction is batch-unaware, so both would
+        # silently miscompute (only static full tiles are validated for
+        # batched 2-CTA). The search admits these shapes on the flat one-CTA
+        # ragged pipeline alone, and an explicit cluster_m=2 config is
+        # projected onto it. Each (M, K) x (K, N) below makes exactly one
+        # axis partial vs the 256x256x64 blocks (plus the combined case).
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
@@ -13239,21 +13248,29 @@ class TestCuteBackend(TestCase):
                 os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
             ):
                 bound = cute_batched_baddbmm_tcgen05.bind(args)
-                self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
-                with self.assertRaisesRegex(
-                    helion.exc.InvalidConfig,
-                    "only supported for tcgen05-enabled CuTe matmul kernels",
-                    msg=f"2-CTA partial M={m} N={n} K={k} not rejected",
-                ):
-                    bound.to_triton_code(config)
+                self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+                self.assertEqual(
+                    bound.config_spec._tcgen05_cluster_m_search_choices, (1,)
+                )
+                code = bound.to_triton_code(config)
+                self.assertNotIn(
+                    "CtaGroup.TWO", code, f"2-CTA partial M={m} N={n} K={k} emitted"
+                )
+                self.assertNotIn("tcgen05_scalar_smem_mbar", code)
+                bound.set_config(config)
+                out = bound(*args)
+                torch.testing.assert_close(
+                    out, torch.bmm(*args).to(out.dtype), rtol=1e-2, atol=1e-1
+                )
 
     def test_batched_one_cta_partial_tiles_fall_back_correctly(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
-        # Leading-passthrough MMA is validated only for static full M/N/K
-        # tiles. Partial configs must use the scalar fallback.
+        # Leading-passthrough MMA runs partial tiles only on the flat ragged
+        # pipeline at bn >= 32; these narrow-N partial configs lower
+        # generically.
         cases = [
             ("N edge", (2, 64, 32), (2, 32, 10)),
             ("K tail", (2, 64, 35), (2, 35, 8)),

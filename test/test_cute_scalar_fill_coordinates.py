@@ -120,7 +120,16 @@ def test_scalar_smem_fill_covers_each_element_once(dtype, order, shape):
         tcgen05_c_store_mode="direct",
         tcgen05_persistence_model="non_persistent",
     )
-    source = vector_scaled_mm._bind_isolated(args).to_code(config)
+    # The scalar SMEM fill is the producer the flat edge TMA path replaces;
+    # pin the legacy path to test its coordinates.
+    kernel = helion.kernel(
+        vector_scaled_mm.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_flat_edge_tma=False,
+    )
+    source = kernel._bind_isolated(args).to_code(config)
     ids, stride = _participant_ids(source)
     assert sorted(ids) == list(range(stride))
     for size in (128 * 128, 64 * 128):

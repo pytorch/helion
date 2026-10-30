@@ -10798,7 +10798,7 @@ class CuteTcgen05Config:
                 # that encode a real tcgen05 strategy still fail loudly — the
                 # config cannot be honored and silently changing strategy
                 # could mask a miscompute (see
-                # ``test_batched_two_cta_partial_edge_tiles_rejected``).
+                # ``test_batched_two_cta_partial_edge_tiles_projected_onto_one_cta``).
                 if fix_invalid or config[key] == fragment.default():
                     config.pop(key, None)
                 else:

@@ -139,6 +139,7 @@ from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_config import CuteTcgen05Config
 from .tcgen05_config import parse_tcgen05_grouped_static_problem_signature
+from .tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
@@ -5716,8 +5717,10 @@ def prepare_cute_collective_lane_loop_suppression(
                 config=cg.device_function.config,
             ):
                 continue
-            if analysis.has_leading_passthrough and not _mma_tiles_are_static_full(
-                analysis, bm=bm, bn=bn, bk=bk
+            if (
+                analysis.has_leading_passthrough
+                and not _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
+                and not _ragged_batched_tcgen05_config(cg.device_function.config, bn)
             ):
                 continue
             if not _operand_infos_exclusive_for_mma(lhs_operand, rhs_operand, node):
@@ -7032,6 +7035,36 @@ def _build_split_initial_prefetch(
         )
         statements.append(statement_from_string(src))
     return statements
+
+
+def _flat_one_cta_tcgen05_config(config: Config) -> bool:
+    """A flat (non-persistent) launch with one CTA per output tile."""
+    return (
+        not _is_persistent_pid_config(config)
+        and _tcgen05_config_int(config, "tcgen05_cluster_m", 1) == 1
+    )
+
+
+def _ragged_batched_tcgen05_config(config: Config, bn: object) -> bool:
+    """Whether a partial-tile batched GEMM may take the flat tcgen05 path.
+
+    Shared by the planning loop, the specialized-MMA thread layout and the
+    emitter: the three must agree, or a tcgen05 launch geometry wraps a
+    generic body (or the reverse) and the kernel deadlocks or stores nothing.
+    Batched partial tiles were validated on the TMA fringe producer, so the
+    admission follows ``cute_flat_edge_tma``; with the setting off they keep
+    the generic lowering they had before. Operands TMA cannot load (an
+    unaligned row stride below the staging floor) take the one-warp scalar
+    SMEM producer on this path, which computes them correctly but slowly
+    (``test_ragged_batched_unaligned_rows_take_the_scalar_producer``); an
+    M-major batched A keeps the tcgen05 search off.
+    """
+    return (
+        CompileEnvironment.current().settings.cute_flat_edge_tma
+        and _flat_one_cta_tcgen05_config(config)
+        and isinstance(bn, int)
+        and bn >= RAGGED_BATCHED_MIN_BLOCK_N
+    )
 
 
 def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
@@ -8743,6 +8776,11 @@ def _emit_mma_pipeline(
         analysis is not None
         and analysis.has_leading_passthrough
         and not mma_tiles_are_static_full
+        # Ragged batched tiles run on the flat one-CTA pipeline, which loads
+        # them through TMA and stores them with predicated copies
+        # (``tcgen05_flat_edge_tma`` below); the persistent and clustered
+        # batched schedules keep requiring whole tiles.
+        and not _ragged_batched_tcgen05_config(df.config, bn)
     ):
         return None
     # A leading-passthrough collective absorbs its serialized K loop. Other
@@ -8980,6 +9018,23 @@ def _emit_mma_pipeline(
         and not tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 1
     )
+    # Flat one-CTA kernels over ragged output tiles or a K tail load every
+    # A/B box through TMA: the TMA unit zero-fills the out-of-bounds rows,
+    # columns and K remainder (the role-local edge families rely on the same
+    # fill), and the SIMT edge epilogue predicates the stores. The scalar
+    # producer fallback this replaces copied every edge tile one element per
+    # lane of one warp: bf16 3000^3 ran 2.56 ms against cuBLAS's 45 us and
+    # 1000^3 0.94 ms against 6.4 us, a K tail alone (3072x3072x3000) 258 us
+    # against 37 us. Grouped and row-union forms keep their own predicates.
+    tcgen05_flat_edge_tma = (
+        tcgen05_mixed_tma_scalar_fallback
+        and env.settings.cute_flat_edge_tma
+        and grouped_mode is None
+        and not row_union_requested
+        and not rhs_rank3_segment_metadata
+    )
+    if tcgen05_flat_edge_tma:
+        tcgen05_mixed_tma_scalar_fallback = False
     tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
         tcgen05_mixed_tma_scalar_fallback
         and bk >= 128
@@ -9058,6 +9113,7 @@ def _emit_mma_pipeline(
         and not tcgen05_static_full_tiles
         and not tcgen05_grouped_worklist_static_full_tiles
         and not tcgen05_mixed_tma_scalar_fallback
+        and not tcgen05_flat_edge_tma
         and not tcgen05_preserve_tma_for_two_cta_k_tail
         and not tcgen05_m_edge_only
         and not tcgen05_n_edge_only
@@ -9327,6 +9383,7 @@ def _emit_mma_pipeline(
     tcgen05_static_full_tma_fast_path = (
         (
             tcgen05_static_full_tiles
+            or tcgen05_flat_edge_tma
             or (
                 tcgen05_is_two_cta
                 and not env.config_spec.cute_tcgen05_aux_kernel_detected
@@ -13570,6 +13627,11 @@ def _emit_mma_pipeline(
                 f"cutlass.Int32({predicate_n_tile}) "
                 f"< {tcgen05_grouped_problem_n} "
             )
+        if tcgen05_flat_edge_tma:
+            # Every flat CTA owns a tile inside the grid; TMA zero-fills the
+            # partial A/B stripes and the SIMT edge epilogue predicates the
+            # aux loads and stores.
+            return None
         if tcgen05_role_local_double_edge_tma:
             # The role-local double-edge path lets TMA handle both partial AB
             # stripes while the SIMT epilogue predicates aux loads and stores.
@@ -13608,6 +13670,7 @@ def _emit_mma_pipeline(
     ) -> str:
         if (
             tcgen05_role_local_uses_k_tail_tma
+            or tcgen05_flat_edge_tma
             or tcgen05_grouped_dynamic_ab_tensormaps
             or tcgen05_grouped_fixed_tensormaps
         ):
@@ -15866,12 +15929,22 @@ def _emit_mma_pipeline(
                     if tcgen05_use_role_local_mma_exec:
                         mma_exec_role_stmts.append(exec_role_stmt)
                 else:
-                    cg.add_statement(
-                        statement_from_string(
-                            f"{tma_next_full_tile} = "
+                    if tcgen05_flat_edge_tma:
+                        # Ragged flat tiles: the next stage exists whenever
+                        # its K offset is inside K (TMA zero-fills the rest).
+                        next_full_tile_src = _tcgen05_tma_tile_predicate(
+                            k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                            full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                        )
+                    else:
+                        next_full_tile_src = (
                             f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                             f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
                             f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                        )
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_next_full_tile} = " + next_full_tile_src
                         )
                     )
                     cg.add_statement(
