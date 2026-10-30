@@ -1734,7 +1734,7 @@ def _make_standalone_call(
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from pretuned_kernels.megakernels.qwen3_decode_layer import _standalone
+    from pretuned_kernels.megakernels.qwen3_8b import _standalone
 
     return _standalone.build(
         tensors,
