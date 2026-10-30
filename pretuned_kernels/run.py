@@ -35,7 +35,8 @@ REPO_ROOT = PRETUNED_KERNELS_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Kernel directory == module file stem == kernel name. Ordered cheap-to-expensive
+# Module file stem == kernel name; the module lives in pretuned_kernels/<name>/,
+# megakernels/<name>/ or a model-family folder megakernels/<family>/. Ordered cheap-to-expensive
 # so a partial run (e.g. timeout) still captures the quick kernels.
 KERNELS = [
     "vector_add",
@@ -62,6 +63,9 @@ KERNELS = [
     # Fixed-shape model regions compiled as one Triton kernel.
     "kda_decode",
     "qwen3_decode_layer",
+    "qwen3_decode_layer_bf16",
+    "qwen3_moe",
+    "llama32_1b_decode_layer_bf16",
     "gemma4_a4b_moe",
     "gpt_oss_moe",
     "flash_mla",
@@ -78,7 +82,11 @@ _HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
 
 def _kernel_directory(name: str) -> Path:
     megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
-    return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
+    if megakernel.is_dir():
+        return megakernel
+    # Model-family folders (megakernels/qwen/) hold several kernels' modules.
+    family = sorted((PRETUNED_KERNELS_DIR / "megakernels").glob(f"*/{name}.py"))
+    return family[0].parent if family else PRETUNED_KERNELS_DIR / name
 
 
 def parse_kernel_names(value: str) -> list[str]:

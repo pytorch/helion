@@ -48,8 +48,15 @@ pretuned_kernels/
 ├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 └── megakernels/
     ├── kda_decode/                   # Kimi-K3 KDA decode sublayer
-    ├── qwen3_decode_layer/          # Qwen3-8B decode layer
-    └── gemma4_a4b_moe/              # Gemma 4 26B-A4B MoE
+    ├── qwen/                         # Qwen3-8B FP8/BF16 decode layers, Qwen3-30B-A3B MoE
+    ├── llama32_1b_decode_layer_bf16/ # Llama-3.2-1B BF16 decode layer
+    ├── gemma4_a4b_moe/               # Gemma 4 26B-A4B MoE
+    ├── gpt_oss_moe/                  # gpt-oss MoE
+    ├── flash_mla/                    # DeepSeek-V3 MLA decode, one request
+    ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE
+    ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4
+    ├── deepseek_v3_attention_nvfp4_tp/
+    └── muse_spark/
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -82,6 +89,11 @@ At runtime Helion picks the file matching the current GPU.
 | `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
 | `kda_decode` | Kimi-K3 BF16/FP32-state decode, hidden 7168, B1/B2/B4/B8/B16, TP8/H12 and TP16/H6 | vLLM native fused decode (H12) and Triton fallback (H6), with matched projections |
 | `qwen3_decode_layer` | Qwen3-8B FP8 batch-1 decode, context 8192, 128 attention splits | compiled vLLM `Qwen3DecoderLayer` with default backends |
+| `qwen3_decode_layer_bf16` | Qwen3-8B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `Qwen3DecoderLayer` with default backends |
+| `llama32_1b_decode_layer_bf16` | Llama-3.2-1B BF16 batch-1 decode, contexts 576 and 1088 (B2/B4 configs checked, not benchmarked) | compiled vLLM `LlamaDecoderLayer` with default backends |
+| `qwen3_moe` | Qwen3-30B-A3B BF16 MoE block (RMSNorm, router, top-8 experts, residual), batch 1 | vLLM's compiled RMSNorm + `Qwen3MoeSparseMoeBlock` with default backend selection (its residual add is fused into the next layer) |
+| `flash_mla` | DeepSeek-V3 MLA decode, one request, 16 heads (TP8), context 1024 (checked up to 64K) | FlashInfer TRT-LLM-gen MLA decode, as vLLM's decode CUDA graph calls it (`max_seq_len` = `max_model_len`) |
+| `deepseek_v3_moe_nvfp4_tp` | DeepSeek-V3 NVFP4 MoE batch-1 decode at TP4, fused all-reduce + residual + RMSNorm | vLLM's router kernel + FlashInfer MoE (PDL) + FlashInfer fused all-reduce/RMSNorm |
 | `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
 
 Most kernels additionally benchmark against `torch.compile` of the listed
