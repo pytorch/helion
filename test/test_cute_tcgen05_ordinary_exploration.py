@@ -223,6 +223,21 @@ def test_unaligned_input_declines_ffi_seed(misalignment: str) -> None:
         ].view(8192, 768)
     args = (lhs, torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE))
     kernel = helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True)
+    if misalignment == "stride":
+        # A statically under-aligned stride is relaid out by the staging pass
+        # (``stage_aligned_operands.py``: the host pads the operand into a
+        # 128-byte-stride copy), so the TMA proof and the FFI seed hold; the
+        # classifier declines only with the pass disabled.
+        staged = kernel.bind(args)
+        with staged.env:
+            assert staged.config_spec._cute_tcgen05_config.matmul_operands_tma_provable
+        assert staged.host_function.backend_rewrote_ast
+        kernel = helion.kernel(
+            _ordinary_gemm,
+            backend="cute",
+            static_shapes=True,
+            cute_stage_unaligned_operands=False,
+        )
     _assert_ffi_seed_declined(kernel.bind(args))
     # The identical GEMM over aligned inputs keeps the validated FFI default.
     bound = _bind(torch.bfloat16, (8192, 1024, 768))

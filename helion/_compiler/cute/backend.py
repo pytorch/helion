@@ -1956,6 +1956,9 @@ class CuteBackend(Backend):
             sum-only, then consume).  The 3-pass form's two reductions
             are independent and compile to a more efficient layout on
             the CuTe backend.
+          * ``stage_unaligned_matmul_operands`` pads matmul operands whose
+            strides fail the TensorMap proof through a host copy so the
+            tcgen05 pipeline keeps its TMA producers.
         """
         from .online_to_3pass import rewrite_online_to_3pass
 
@@ -1980,6 +1983,12 @@ class CuteBackend(Backend):
         from .flatten_nested_reductions import flatten_nested_reductions
 
         rewritten |= flatten_nested_reductions(hf) > 0
+
+        # Last: the staging statements it prepends are not part of the pure
+        # host preludes the passes above analyze.
+        from .stage_aligned_operands import stage_unaligned_matmul_operands
+
+        rewritten |= stage_unaligned_matmul_operands(hf)
         return rewritten
 
     def pre_codegen(

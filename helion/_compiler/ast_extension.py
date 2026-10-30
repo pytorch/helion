@@ -58,6 +58,7 @@ class ExtendedAST:
         _loop_type: LoopType = LoopType.UNSET,
         _is_kernel_call: bool = False,
         _root_id: int | None = None,
+        _compiler_inserted: bool = False,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -66,6 +67,9 @@ class ExtendedAST:
         self._loop_type: LoopType = _loop_type
         self._is_kernel_call: bool = _is_kernel_call
         self._root_id: int | None = _root_id
+        # Set on host statements a backend rewrite added (not user source);
+        # user-facing warnings about host tensor operations skip them.
+        self._compiler_inserted: bool = _compiler_inserted
 
     def new(self, fields: dict[str, object]) -> ExtendedAST:
         result = self.__class__(
@@ -75,6 +79,7 @@ class ExtendedAST:
             _loop_type=self._loop_type,
             _is_kernel_call=self._is_kernel_call,
             _root_id=self._root_id,
+            _compiler_inserted=self._compiler_inserted,
         )
         return self._location.to_ast(result)
 
