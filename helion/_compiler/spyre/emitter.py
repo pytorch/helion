@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import logging
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -28,6 +29,23 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.op_spec import OpSpec
     from torch_spyre._inductor.op_spec import TensorArg
 
+
+#: The emitter's logger, following ``backend.py``'s pattern.
+#:
+#: This is part of Helion's regular log-level infrastructure by construction
+#: rather than by registration:
+#:
+#: * **visible with no configuration.** With ``HELION_LOGS`` unset this logger
+#:   is NOTSET and propagates to the root logger, whose default level is
+#:   WARNING, so a ``log.warning`` here reaches stderr through Python's
+#:   ``lastResort`` handler. That matters because the I/O-layout warning below
+#:   is advice a user never asked for and must not have to opt into.
+#: * **targetable.** ``HELION_LOGS=helion._compiler.spyre.emitter`` attaches
+#:   ``_logging/_internal.py``'s handler at INFO (``+name`` for DEBUG), since
+#:   that machinery attaches handlers to *named* loggers.
+#: * **silenceable.**
+#:   ``logging.getLogger("helion._compiler.spyre.emitter").setLevel(logging.ERROR)``.
+log = logging.getLogger(__name__)
 
 _BUFFER_SEQ = itertools.count()
 
@@ -62,6 +80,168 @@ def _new_buffer_id() -> int:
 #: recorded in the same emission pass, so id reuse after a gc cannot alias
 #: across kernels.
 _ARG_ORIGIN: dict[int, int] = {}
+
+
+#: Warning keys already emitted, process-wide.
+#:
+#: **Never cleared, and deliberately not reset per kernel.** Autotuning re-runs
+#: codegen once per config (``pre_codegen`` -> ``emitter.reset()``,
+#: ``backend.py:819``), so a warning keyed per kernel prints once per *trial*:
+#: tens of identical lines for one autotuned kernel, which is how users learn
+#: to ignore warnings. ``reset`` clears ``_ARG_ORIGIN`` because its ids must
+#: not be matched across kernels; this set has the opposite requirement, so it
+#: is left alone there on purpose. torch-spyre's own ``warn_once``
+#: (``_inductor/logging_utils.py:89-109``) keys a process-wide set the same way.
+#:
+#: The accepted trade-off, stated here rather than discovered later: two
+#: different kernels in one process whose same-named argument takes the same
+#: relayout (or carries the same unparseable layout) share one warning.
+#: Measured in ``stick_authority_example.py``, which compiles two shapes
+#: (128x256 and 256x512) across four knob values -- eight codegen passes, each
+#: emitting a closing relayout of ``'out'`` from dim 0 to dim 1, and **one**
+#: line printed. The remedy is identical for all eight, so the suppressed lines
+#: carry no new advice; what they would have added is the second kernel's
+#: shape, since the one line printed names whichever shape reached the warning
+#: first. That is the cost, and it is the right side of the trade against tens
+#: of identical lines per autotuned kernel.
+_WARNED_IO_LAYOUT: set[tuple[object, ...]] = set()
+
+
+def _warn_once(key: tuple[object, ...], message: str) -> None:
+    """Log ``message`` at WARNING the first time ``key`` is seen."""
+    if key in _WARNED_IO_LAYOUT:
+        return
+    _WARNED_IO_LAYOUT.add(key)
+    log.warning("%s", message)
+
+
+def _is_kernel_arg(operand: Operand) -> bool:
+    """Is this buffer an *input or output of the kernel*, not an intermediate?
+
+    Both conditions are needed and neither implies the other: ``arg_index >= 0``
+    separates arguments from intermediates (``add_intermediate`` passes -1), and
+    ``"hbm" in allocation`` separates a real argument from the ``hbm_pool`` /
+    ``lx`` buffers the emitter mints for itself. Only an argument's layout is
+    the *caller's* to change, which is what makes the warning actionable.
+
+    ``dataclasses.replace`` copies all three fields, so a reshaped view of an
+    argument (``_reconcile_matmul_stick_axes``, ``_stage_*``) still answers
+    True -- the matmul quadrant's warning depends on that.
+    """
+    return "hbm" in operand.allocation and operand.arg_index >= 0
+
+
+def _warn_io_layout(
+    side: str, operand: Operand, from_dim: int, to_dim: int, message: str
+) -> None:
+    """Warn once per ``(side, name, from, to)`` that an I/O relayout was emitted.
+
+    ``side`` is in the key even though it is currently redundant. A collision
+    would need one buffer name to need the *same* ``from -> to`` relayout on
+    both sides, and it cannot: an in-place kernel (``out`` as both input and
+    destination) relays the input ``A -> B`` and the output ``B -> A``, so the
+    pairs are swapped rather than equal. Keying on the side makes that a
+    property of the key instead of a property of an argument nobody will
+    re-derive when the next side is added.
+    """
+    _warn_once(("io_relayout", side, operand.name, from_dim, to_dim), message)
+
+
+def _describe(operand: Operand) -> str:
+    """``'name' ([128, 256] torch.float16)`` -- the warning's subject.
+
+    The name is the kernel-arg name ``memory_ops.host_operand`` read off
+    ``state.device_function.tensor_arg(tensor).name``, i.e. the same name the
+    generated launcher and every raise in ``memory_ops.py`` use, so a warning,
+    a spec and an error all say the same word for the same buffer.
+    """
+    return f"{operand.name!r} ({list(operand.sizes)} {operand.dtype})"
+
+
+def _warn_unparsed_layout(
+    name: str, tensor: torch.Tensor, error: exc.BackendUnsupported
+) -> None:
+    """Warn that an input's device layout did not parse, so the layout is assumed.
+
+    **Why a warning and not a raise, decided by measurement rather than by
+    default.** The plan required characterising on the box which layouts
+    actually fail ``stick_dim_of``, because a raise is the better answer *iff*
+    no legitimately trailing-sticked tensor can reach the failure. Measured at
+    this commit, fp16, host shape 128x256 unless noted:
+
+    | staging | device_size | parses? | kernel error |
+    |---|---|---|---|
+    | contiguous | ``[4, 128, 64]`` | dim 1 | 0.098% |
+    | square 128x128 | ``[2, 128, 64]`` | dim 1 (tie-break) | -- |
+    | ``dim_order=[1, 0]`` | ``[2, 256, 64]`` | dim 0 | -- |
+    | column slice of 128x512 | ``[8, 128, 64]`` | **no** | **0.098%** |
+    | explicit ``device_size=[8, 128, 64]`` | as given | **no** | **0.098%** |
+    | row slice of 256x256 | ``[4, 256, 64]`` | **no** | **50.03%** |
+    | 3-D 4x128x256 | ``[128, 4, 4, 64]`` | **no** | -- |
+    | fp32 / bf16 / int32 contiguous | -- | yes | -- |
+
+    The column slice settles the warn-vs-raise question in the direction the
+    plan expected: it does not parse -- its ``device_size`` reflects the
+    parent's 512-wide allocation, the view hazard torch-spyre records for
+    itself at ``codegen/superdsc.py:1884-1887`` -- and the assumed trailing
+    axis is **right**, confirmed by a read-set probe (one-hot over all 128 rows
+    and 8 representative columns, every slice correct). A raise would reject an
+    input the backend handles correctly, so the assumption stays: documented and
+    gated, the same posture already taken for ``stick_dim_of``'s square
+    tie-break, rather than a raise.
+
+    **The row slice is the finding this measurement added, and it is why the
+    message below does not say "axis".** It also fails to parse, its trailing
+    axis is also right, and it is still 50.03% wrong -- because ``stickify``
+    rebuilds ``device_size`` from the *host* shape (``[4, 128, 64]``) while the
+    real buffer is ``[4, 256, 64]``, so the row stride is half what it should be
+    and the kernel reads the wrong rows. That is an *extent* mismatch, not an
+    axis mismatch, and a warning promising only "the axis may be wrong" would
+    have implied a correct axis is sufficient. It is not. What is actually true
+    is the weaker, honest claim: nothing about this layout was read, so nothing
+    about it is known.
+
+    The 3-D case shows the parse limit is not only about views: the device
+    layout for a rank-3 operand is not the ``[sticks, *others, eps]`` shape
+    ``stickify`` produces, so ``stick_dim_of`` cannot read it at all. Teaching
+    it to -- and teaching ``stickify`` to honour a view's real extents, which is
+    what the row slice needs -- is separate, larger work (Stage 2 layout
+    propagation), which is this item's stated non-goal.
+
+    The subject is "kernel tensor", not "kernel input". ``add_arg`` registers
+    every kernel *argument*, and an output passed in by the caller
+    (``def kernel(x, y, out)``) goes through exactly this path: calling it an
+    input printed ``kernel input 'out'``, which names the right buffer with the
+    wrong word. The relayout warnings can say input/output because they are
+    reached from the two sides separately; this one cannot tell, and says so.
+    """
+    _warn_once(
+        ("unparsed_layout", name),
+        f"spyre: kernel tensor {name!r} ({list(tensor.size())} {tensor.dtype})"
+        " has a device layout that does not parse as a tiled layout"
+        f" ({_detail_of(error)}); assuming the default trailing-dim stick axis"
+        f" (dim {tensor.dim() - 1}) and the device extents implied by the host"
+        " shape. Neither was read, so if either differs the kernel computes on"
+        " the wrong data -- measured 50% error for a row slice of a wider"
+        " device buffer. Pass a contiguous tensor, or restage it with"
+        " `.contiguous()` before transferring.",
+    )
+
+
+def _detail_of(error: exc.BackendUnsupported) -> str:
+    """The ``detail`` ``stick_dim_of`` raised with, without the boilerplate.
+
+    ``BackendUnsupported`` formats ``"Backend 'spyre' does not support:
+    {detail}"`` and ``_FixedMessage.__init__`` may append a ``While
+    processing:`` location block, neither of which belongs inside a one-line
+    warning that already says "spyre:". ``base_msg_len`` is the formatted
+    message's length *before* that suffix is added (``exc.py:23``), so it
+    trims the location without parsing it.
+    """
+    prefix = "does not support: "
+    message = str(error)[: error.base_msg_len]
+    _, separator, detail = message.partition(prefix)
+    return detail if separator else message
 
 
 @dataclasses.dataclass
@@ -372,9 +552,28 @@ class SpyreEmitter:
 
             backend = CompileEnvironment.current().backend
             recorded = backend.input_stick_dim(tensor)
-            stick_dim = (
-                recorded if recorded is not None else layout.stick_dim_of(tensor)
-            )
+            if recorded is None:
+                # **Nothing was recorded, and there are two reasons for that.**
+                # Either the input is a host/fake tensor with no device layout
+                # to read -- the ordinary case, where the trailing dim is
+                # torch-spyre's own default and the only defensible choice -- or
+                # the real tensor *had* a layout and it did not parse. The
+                # second used to be indistinguishable from the first: the
+                # exception was swallowed in ``record_input_layout`` and the
+                # trailing dim was assumed, so the kernel computed on an axis
+                # that was never read. Wrong numerics, nothing raised: bug
+                # #6/#11's mechanism, reached through a silent fallback.
+                #
+                # The fallback still happens -- see below for why it is not a
+                # raise -- but it is no longer silent, and this is the first
+                # point in the pipeline where the argument has a name to put in
+                # the message.
+                error = backend.input_layout_error(tensor)
+                if error is not None:
+                    _warn_unparsed_layout(name, tensor, error)
+                stick_dim = layout.stick_dim_of(tensor)
+            else:
+                stick_dim = recorded
         operand = Operand(
             sizes=list(tensor.size()),
             dtype=tensor.dtype,
@@ -529,7 +728,12 @@ class SpyreEmitter:
         return operand
 
     def emit_restickify(
-        self, source: Operand, stick_dim: int, symbols: list[sympy.Expr]
+        self,
+        source: Operand,
+        stick_dim: int,
+        symbols: list[sympy.Expr],
+        *,
+        reason: str | None = None,
     ) -> Operand:
         """Relayout ``source`` onto a new stick axis, as a visible node.
 
@@ -542,6 +746,21 @@ class SpyreEmitter:
         input and output to have *different* stick symbols, which is exactly the
         condition the caller detected, so a no-op relayout is rejected here
         instead of producing a spec the validator will refuse.
+
+        ``reason`` names the rule that asked for the relayout -- "pointwise
+        agreement axis", "reduction axis", "matmul DF16 stick rule" -- and is
+        carried only so the warning below can be specific. It has **no effect
+        on what is emitted**; the governing invariant is warn, never decide.
+
+        **Why the warning lives here and not at the three detection sites.**
+        This is the single chokepoint every input-side relayout passes through,
+        so the message cannot drift from the condition: it is true *because* the
+        op is emitted, not because a condition somewhere matched. The sites that
+        do *not* route through here therefore cannot produce a false positive --
+        the gather staging ``identity`` (:711), ``_stage_reduced_tile``,
+        ``_stage_advancing_operand`` and the destination-binding residency
+        decision (``compute_ops.py:259-262``), which only *reserves* ``hbm_pool``
+        residency and emits no relayout of its own.
         """
         from torch_spyre._inductor.constants import RESTICKIFY_OP
 
@@ -549,6 +768,24 @@ class SpyreEmitter:
             raise exc.BackendUnsupported(
                 "spyre",
                 f"restickify from stick axis {stick_dim} to itself is a no-op",
+            )
+
+        # Warned only for a *kernel argument*: an intermediate's layout is the
+        # emitter's own choice, so there is nothing a caller could do about it,
+        # while an argument's layout is the caller's and the round trip is
+        # avoidable by staging the tensor differently.
+        if _is_kernel_arg(source):
+            _warn_io_layout(
+                "input",
+                source,
+                source.stick_dim,
+                stick_dim,
+                f"spyre: kernel input {_describe(source)} is stickified on host"
+                f" dim {source.stick_dim}, but this kernel computes on dim"
+                f" {stick_dim}"
+                + (f" ({reason})" if reason else "")
+                + "; emitted a ReStickifyOpHBM (extra HBM round trip). Stage"
+                f" the tensor on dim {stick_dim} to avoid the copy.",
             )
 
         # The destination must live in HBM, as the op name says: an identical
@@ -716,6 +953,14 @@ class SpyreEmitter:
         an ``lx`` destination passes validation, compiles, launches and returns
         wrong data (measured max|d| ~1.0 on a [0,1) input versus fp16 rounding
         error for HBM), so a non-HBM destination fails loudly here.
+
+        Like :meth:`emit_restickify` this is the **single** chokepoint for its
+        side -- ``memory_ops.py:177`` is its only caller -- so the warning below
+        cannot describe a relayout that was not emitted. ``dest`` is by
+        construction the kernel's output argument (``memory_ops.host_operand``),
+        which is why the warning needs no arg test here; it is still asserted
+        rather than assumed, so a future non-argument destination stays silent
+        instead of printing unactionable advice.
         """
         from torch_spyre._inductor.constants import RESTICKIFY_OP
 
@@ -726,6 +971,18 @@ class SpyreEmitter:
         if "lx" in dest.allocation:
             raise exc.BackendUnsupported(
                 "spyre", "ReStickifyOpHBM cannot write an lx destination"
+            )
+        if _is_kernel_arg(dest):
+            _warn_io_layout(
+                "output",
+                dest,
+                source.stick_dim,
+                dest.stick_dim,
+                f"spyre: kernel output {_describe(dest)} is stickified on host"
+                f" dim {dest.stick_dim}, but the computed value sticks on dim"
+                f" {source.stick_dim}; emitted a closing ReStickifyOpHBM (extra"
+                " HBM round trip). Allocate the output with the matching stick"
+                " axis to avoid it.",
             )
         # A relayout needs a real work division: with every dim unsplit the
         # backend scheduler rejects the program with "Expect valid lower and

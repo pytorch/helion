@@ -143,9 +143,9 @@ def _(state: CodegenState) -> None:
     if len(value.sizes) != len(dest.sizes):
         raise exc.BackendUnsupported(
             "spyre",
-            f"storing a rank-{len(value.sizes)} value into a"
-            f" rank-{len(dest.sizes)} buffer: a Spyre reduction output keeps"
-            " the reduced dim, so use `keepdim=True` and an output tensor"
+            f"storing {value.name!r} (rank {len(value.sizes)}) into"
+            f" {dest.name!r} (rank {len(dest.sizes)}): a Spyre reduction output"
+            " keeps the reduced dim, so use `keepdim=True` and an output tensor"
             f" that keeps it ({value.sizes} rather than {dest.sizes})",
         )
 

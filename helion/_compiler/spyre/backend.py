@@ -421,6 +421,19 @@ class SpyreBackend(Backend):
         self._input_stick_dims: dict[int, int] = {}
         #: id(fake tensor) -> host rank, so output_stick_dim can match by rank.
         self._input_ranks: dict[int, int] = {}
+        #: id(fake tensor) -> why its real layout could not be parsed.
+        #:
+        #: The failure, not just the success. ``record_input_layout`` used to
+        #: discard a ``BackendUnsupported`` from ``stick_dim_of``, after which
+        #: ``add_arg`` re-derived the axis from the *fake* tensor and got the
+        #: default trailing dim -- an axis that was **assumed, not read**, with
+        #: nothing raised anywhere. That is bug #6/#11's exact failure mode, and
+        #: it is also the honest answer to "what happens when the layout is
+        #: totally incompatible": not an error, silence.
+        #:
+        #: Keyed on ``id(fake)`` beside ``_input_stick_dims``, which is the
+        #: id-identity the destination-binding work already relies on.
+        self._input_layout_errors: dict[int, exc.BackendUnsupported] = {}
 
     @property
     def name(self) -> str:
@@ -833,22 +846,38 @@ class SpyreBackend(Backend):
         # Narrowed to ``BackendUnsupported``, which is the only thing
         # ``stick_dim_of`` raises by design: an unsupported dtype (via
         # ``device_dtype``) or a ``device_size`` that cannot be reconciled with
-        # the host shape. Both of those genuinely do fail again later, at the
-        # point where the operand is used and the message can name it.
+        # the host shape.
         #
         # A bare ``except Exception`` here was the wrong shape for this hook in
         # particular: silently not recording a layout makes the backend assume
         # the default trailing-dim stick axis, which is **bug #6 and #11's
         # failure mode** -- wrong numerics with nothing raised, not a crash. So
         # anything that is not a described limitation now propagates.
+        #
+        # **The exception is recorded, not discarded.** This comment used to
+        # claim both failures "genuinely do fail again later, at the point
+        # where the operand is used and the message can name it". That is true
+        # for an unsupported dtype -- ``device_dtype`` rejects it by name at
+        # emission -- and was **false for the cannot-identify case**: nothing
+        # downstream re-raised it, so ``add_arg`` quietly fell back to the
+        # trailing dim. Keeping the error makes the claim true: ``add_arg``
+        # warns with the arg's name, which is the only place the name is known.
         try:
             self._input_stick_dims[id(fake)] = stick_dim_of(real)
             self._input_ranks[id(fake)] = real.dim()
-        except exc.BackendUnsupported:
-            pass
+        except exc.BackendUnsupported as e:
+            self._input_layout_errors[id(fake)] = e
 
     def input_stick_dim(self, fake: torch.Tensor) -> int | None:
         return self._input_stick_dims.get(id(fake))
+
+    def input_layout_error(self, fake: torch.Tensor) -> exc.BackendUnsupported | None:
+        """Why this input's real device layout could not be parsed, if it was not.
+
+        A recorded error and a recorded axis are mutually exclusive by
+        construction: ``record_input_layout`` writes one or the other.
+        """
+        return self._input_layout_errors.get(id(fake))
 
     def output_stick_dim(self, rank: int) -> int | None:
         """Stick axis every rank-``rank`` kernel tensor agrees on, if any.

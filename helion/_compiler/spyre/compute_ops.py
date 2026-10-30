@@ -184,7 +184,9 @@ def _emit_pointwise(
         inputs = [
             o
             if o.stick_dim == stick_dim
-            else emitter.emit_restickify(o, stick_dim, symbols)
+            else emitter.emit_restickify(
+                o, stick_dim, symbols, reason="pointwise agreement axis"
+            )
             for o in inputs
         ]
 
@@ -350,7 +352,7 @@ def _emit_reduction(
     # the operand may disagree with it (a transposed input). Relayout rather
     # than reduce along the wrong axis: that is bug #6's failure mode.
     if source.stick_dim != axis:
-        source = emitter.emit_restickify(source, axis, symbols)
+        source = emitter.emit_restickify(source, axis, symbols, reason="reduction axis")
 
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
@@ -574,7 +576,9 @@ def _reconcile_matmul_stick_axes(
         # emitted ReStickifyOpHBM non-degenerate -- emit_restickify rejects a
         # relayout onto the axis the operand already has.
         at_full = _dc.replace(operand, sizes=list(sizes))
-        return emitter.emit_restickify(at_full, want, symbols)
+        return emitter.emit_restickify(
+            at_full, want, symbols, reason="matmul DF16 stick rule"
+        )
 
     return (
         reconcile(x, "x", shape.x_sizes, [c0, c2]),
