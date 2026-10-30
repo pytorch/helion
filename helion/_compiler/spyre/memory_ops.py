@@ -159,16 +159,56 @@ def _(state: CodegenState) -> None:
         import sympy
 
         symbols = [sympy.Symbol(f"c{i}") for i in range(len(dest.sizes))]
-        # ReStickifyOpHBM reads and writes HBM. The value usually lands in lx,
-        # so redirect its producer into a pool buffer first and relayout from
-        # there; an lx source is rejected by the backend scheduler with
-        # "Expect valid lower and upper bound parameters".
-        staged = emitter.restage_to_pool(value)
-        emitter.emit_restickify_into(staged, dest, symbols)
+        # ``ReStickifyOpHBM`` reads and writes HBM, so the source must already
+        # be HBM-resident. It is: when the destination-binding pass saw this
+        # store it gave the value ``hbm_pool`` residency *at allocation time*
+        # for exactly this reason. ``restage_to_pool`` used to arrange that here
+        # by rewriting the producing spec, and it is gone -- the decision is now
+        # made before the value is ever emitted.
+        if "lx" in value.allocation:
+            raise exc.BackendUnsupported(
+                "spyre",
+                f"relayout of {value.name!r} from an lx buffer: a closing"
+                " ReStickifyOpHBM needs an HBM source, which the"
+                " destination-binding pass assigns when it binds the store."
+                " Reaching here means the pass declined the value but the"
+                " store still needs a relayout",
+            )
+        emitter.emit_restickify_into(value, dest, symbols)
         _mark_device_body(state)
         return
 
-    emitter.redirect_output(value, dest)
+    if value is dest:
+        # **The destination-binding pass bound this.** The producing OpSpec
+        # wrote ``dest`` directly, so there is nothing to redirect: the store is
+        # a no-op beyond keeping the device body non-empty. This is the only
+        # correct path now, and it is the point of the whole exercise --
+        # emission is a pure function of the annotated graph.
+        _mark_device_body(state)
+        return
+
+    # No fallback remains. ``redirect_output`` used to patch the already-emitted
+    # spec tree from here, and it is gone (see ``spyre/graph_passes.py``), so a
+    # value reaching this point was *declined* by the pass and there is nothing
+    # left to write its destination.
+    #
+    # **Raising is required, not merely tidier.** While the rewrite existed a
+    # silent decline was safe, because the fallback picked the work up; with it
+    # deleted the same silent decline would emit a kernel whose final value is
+    # never written to the output buffer -- the consumer reads whatever the
+    # previous launch left in that buffer. That is not hypothetical: it is the
+    # defect ``graph_passes_example.py::second_user`` gates, where the declined
+    # multi-user value made ``o2`` come back 100% wrong alone and 0.188%
+    # "correct" after another kernel happened to leave the right bytes behind.
+    # A loud refusal is the only answer that cannot be mistaken for a result.
+    raise exc.BackendUnsupported(
+        "spyre",
+        f"storing {value.name!r} into {dest.name!r}: the destination-binding"
+        " pass declined this value, so no OpSpec writes the destination."
+        " The usual cause is a stored value with another user, which needs its"
+        " own buffer plus an explicit copy; binding it to the destination would"
+        " make the other user read the output buffer",
+    )
     # Unconditional: a store whose subscript needs no index arithmetic leaves
     # the device body empty and DCE then rejects the loop. A reduction is the
     # case that exposed it (both the rank-dropped and the keepdim spelling),

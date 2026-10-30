@@ -59,14 +59,19 @@ def _(state: CodegenState) -> object:
     backend = cast("SpyreBackend", CompileEnvironment.current().backend)
     node = state.fx_node
     assert node is not None
-    operand = backend.emitter.add_intermediate(
-        node.name,
-        sizes,
-        fake_value.dtype,
-        # The accumulator sticks on its trailing dim, matching the reference's
-        # accumulator layout ([1, 64, 64] for a 64x32 fp16 acc).
-        len(sizes) - 1,
-        residency="lx",
+    # The accumulator sticks on its trailing dim, matching the reference's
+    # accumulator layout ([1, 64, 64] for a 64x32 fp16 acc).
+    stick_dim = len(sizes) - 1
+    # A bound destination makes the carry *be* the store target, which is what
+    # the emitter's own reference requires -- the K-tiled reference accumulates
+    # in place in HBM, its combine ``add`` reading and writing the same buffer.
+    # Allocating a fresh ``lx`` buffer here is what forced the store to reach
+    # back and rewrite every spec that touched the accumulator, including the
+    # combine's *input* arg inside a closed LoopSpec.
+    from .compute_ops import _bound_or_intermediate
+
+    operand = _bound_or_intermediate(
+        backend.emitter, node, sizes, fake_value.dtype, stick_dim
     )
     backend.emitter.mark_accumulator(operand, float(value))
     return expr_from_string(backend.emitter.bind_carry(operand))

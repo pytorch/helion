@@ -1590,6 +1590,10 @@ class DeviceIR:
             from .metal.mpp_graph_transform import rewrite_mpp_graphs
 
             rewrite_mpp_graphs(temp)
+        if CompileEnvironment.current().backend_name == "spyre":
+            from .spyre.graph_passes import rewrite_spyre_graphs
+
+            rewrite_spyre_graphs(temp, config)
         return temp.graphs
 
     def _hoist_inband_polls(self) -> None:

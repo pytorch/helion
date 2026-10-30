@@ -322,12 +322,9 @@ class SpyreEmitter:
         self.lx_size = 0
         #: Next free **byte offset** in the HBM pool, and -- because it only
         #: ever grows -- also the pool's total size. A true high-water mark:
-        #: see :meth:`redirect_output` for why it must not be decremented.
+        #: an offset handed back and reused would alias a buffer another
+        #: ``Operand`` still refers to.
         self.pool_size = 0
-        #: id(Operand) -> (OpSpec, index of its output arg), for the store rule.
-        self._producers: dict[int, tuple[Any, int]] = {}
-        #: id(Operand) -> the symbols its producing OpSpec indexed it with.
-        self._output_symbols: dict[int, list[Any]] = {}
         #: Accumulator buffers awaiting a fill OpSpec, and their fill values.
         #: Plan 2: the fill is emitted *before* the enclosing LoopSpec, which
         #: only the _for_loop handler can locate.
@@ -693,25 +690,18 @@ class SpyreEmitter:
             )
         )
 
-    def restage_to_pool(self, value: Operand) -> Operand:
-        """Move ``value`` out of ``lx`` into the HBM pool, in place.
-
-        ``ReStickifyOpHBM`` operates on HBM, so a value produced into ``lx``
-        cannot be relayouted directly. Rather than emit a copy, rebind the
-        producing OpSpec's output onto a pool buffer of the same layout --
-        the same rewrite ``redirect_output`` performs for a store.
-        """
-        if "lx" not in value.allocation:
-            return value
-        staged = self.add_intermediate(
-            f"{value.name or 'buf'}_staged",
-            list(value.sizes),
-            value.dtype,
-            value.stick_dim,
-            residency="hbm_pool",
-        )
-        self.redirect_output(value, staged)
-        return staged
+    # ``restage_to_pool`` lived here and is **gone** with the rewrite it was
+    # built on. It moved a value out of ``lx`` into the HBM pool by calling
+    # ``redirect_output`` on the producing spec, because a closing
+    # ``ReStickifyOpHBM`` needs an HBM source and that was discovered only once
+    # the store arrived -- too late, with the value already in ``lx``.
+    #
+    # The destination-binding pass decides residency *at allocation time*: a
+    # value whose store needs a relayout is given ``hbm_pool`` before it is ever
+    # emitted (``compute_ops._bound_or_intermediate``). Measured with that in
+    # place, this method was still *called* 10 times across the drivers but
+    # rewrote **nothing** every time -- it had become a pure no-op, which is why
+    # deleting it is a simplification rather than a behaviour change.
 
     def emit_restickify_into(
         self, source: Operand, dest: Operand, symbols: list[sympy.Expr]
@@ -1079,119 +1069,19 @@ class SpyreEmitter:
     def loop_depth(self) -> int:
         return len(self._stack) - 1
 
-    def redirect_output(self, value: Operand, dest: Operand) -> None:
-        """Rebind every reference to ``value`` onto ``dest``.
-
-        Plan 2's store rule. Rewriting only the producing OpSpec's *output* arg
-        is not enough for a loop carry: the combine op reads the accumulator as
-        an input too, so leaving those reads on the old ``lx`` buffer makes each
-        iteration overwrite instead of accumulate. A per-stick probe caught
-        exactly that -- only the last K-tile survived in the output.
-
-        The reference accumulates in place in HBM (golden/ref_matmul_ktiled.py's
-        combine ``add`` has arg0 and arg2 both ``hbm: 3``), so the accumulator
-        must *be* the store destination rather than a buffer copied out at the
-        end.
-
-        **The rewrite is keyed on operand identity, not on a value match**
-        (review finding (b)). It used to select args by
-        ``arg.allocation == old_alloc and arg.arg_index == old_index``, which is
-        not a key at all: the free path below hands ``{"lx": 0}`` straight back,
-        so the next ``add_intermediate`` mints a *second* ``Operand`` carrying
-        the identical pair, and a later ``redirect_output`` then rewrites args
-        belonging to the wrong buffer. That it worked relied on stores arriving
-        last-in-first-out -- an invariant neither enforced nor documented
-        anywhere, which is precisely the kind of load-bearing accident this
-        stack punishes.
-
-        ``_ARG_ORIGIN`` records the producing ``Operand`` for every emitted arg
-        at the one place that knows it (``Operand.tensor_arg``), so this walks
-        a real index. Note what that does *not* change: the retroactive rewrite
-        itself stays. SuperDSC has no store op, so a store must reach back
-        (opspec plan §2 sanctions this); removing it would mean deferring
-        OpSpec construction until the store is seen, which is a larger redesign
-        and is not justified by anything observed.
-        """
-        producer = self._producers.get(id(value))
-        if producer is None:
-            raise exc.BackendUnsupported(
-                "spyre", f"store of a value with no producing OpSpec: {value.name}"
-            )
-
-        symbols = self._output_symbols[id(value)]
-        origin = value.buffer_id
-
-        def rebind(arg: object) -> object:
-            if _ARG_ORIGIN.get(id(arg)) != origin:
-                return arg
-            replacement = dest.tensor_arg(
-                symbols,
-                is_input=arg.is_input,
-                tile_advance=arg.device_tile_advance_expr,
-            )
-            # Preserve a spec_name: it is how an IndirectAccess coordinate in
-            # another arg resolves to this one (superdsc.py:1277-1279), so
-            # dropping it on a rewrite would break a gather whose staged table
-            # is later redirected.
-            if getattr(arg, "name", None) is not None:
-                replacement.name = arg.name
-            return replacement
-
-        for spec in self._iter_op_specs(self._specs):
-            spec.args = [rebind(a) for a in spec.args]
-
-        if "lx" in value.allocation:
-            # The *count* is returned so a later intermediate can still prefer
-            # LX, but ``lx_size`` is deliberately **not** rewound -- for the
-            # same reason ``pool_size`` is not (see below). An LX address
-            # handed back and reused would alias a buffer that another
-            # ``Operand`` still carries in its ``allocation``, which is review
-            # finding (b)'s hazard; and since bug #15 these are real addresses,
-            # the aliasing would be a wrong answer rather than a harmless
-            # index collision.
-            self._n_lx -= 1
-        elif "hbm_pool" in value.allocation:
-            self._n_pool -= 1
-            # ``pool_size`` is deliberately **not** decremented. It was, and
-            # the arithmetic was asymmetric: allocation rounds up to a whole
-            # stick (``self.pool_size += -(-span // stride) * stride``) while
-            # the free subtracted the raw byte span. Any redirect therefore
-            # left ``pool_size`` *below* the true high-water mark, and the next
-            # ``allocation = {"hbm_pool": self.pool_size}`` handed out an offset
-            # that was no longer stick-aligned -- the exact condition
-            # ``layout.STICK_BYTES`` exists to prevent.
-            #
-            # Measured: a 200-byte span allocates 256 bytes (2 sticks) at
-            # offset 0, the free leaves ``pool_size`` at **56**, and the next
-            # buffer starts at byte 56 -- mid-stick, with 56 % 128 == 56.
-            # Nothing in the stack catches that. §3 rates G1's evidential
-            # weight as "nearly none" for this, and bug #5 is the precedent:
-            # overlapping ``hbm_pool`` buffers validated, bundled, compiled,
-            # launched, and returned ~95% wrong output.
-            #
-            # Rounding the free symmetrically would fix the alignment but keep
-            # a subtler hazard: the slot is handed back while
-            # ``redirect_output`` has only *rewritten* the args that referred
-            # to it, so a later allocation can reuse an offset another
-            # ``Operand`` still carries in ``allocation`` (review finding (b),
-            # T5). Not reclaiming at all removes both at the cost of some dead
-            # pool bytes, which is the cheap direction: the pool is sized once
-            # per kernel and nothing counts pool slots.
-        if value.name:
-            self.operands.pop(value.name, None)
-
-    @staticmethod
-    def _iter_op_specs(specs: Sequence[object]) -> list[OpSpec]:
-        """Every OpSpec in a spec tree, descending into LoopSpec bodies."""
-        out: list[object] = []
-        for spec in specs:
-            body = getattr(spec, "body", None)
-            if body is not None:
-                out.extend(SpyreEmitter._iter_op_specs(body))
-            elif hasattr(spec, "args"):
-                out.append(spec)
-        return out
-
+    # ``redirect_output`` and ``_iter_op_specs`` lived here, and they are
+    # **gone**. Between them they walked the whole emitted spec tree -- into
+    # closed ``LoopSpec`` bodies -- and rewrote ``spec.args`` so a store could
+    # retroactively tell an already-emitted op where to write. That is what
+    # made emission non-append-only, and it existed only because the emitter
+    # had to decide a buffer's identity before it could know it.
+    #
+    # ``spyre/graph_passes.py`` now decides it earlier, as a Device IR
+    # annotation, so the producing op writes its destination the first time.
+    # Deleted on evidence rather than hope: with the emitters honouring the
+    # annotation, a counter on this method read **zero** across all 13
+    # drivers (it had been called 37 times), and ``restage_to_pool``
+    # -- which layered a second rewrite on top -- became a pure no-op.
     def specs(self) -> list[object]:
         if self.loop_depth != 0:
             raise exc.BackendUnsupported("spyre", "unclosed loop at end of kernel")
@@ -1209,8 +1099,6 @@ class SpyreEmitter:
         op_info: dict[str, Any] | None = None,
         tiled_symbols: list[list[sympy.Symbol]] | None = None,
         tiled_symbol_trip_counts: dict[sympy.Symbol, int] | None = None,
-        output: Operand | None = None,
-        output_symbols: list[sympy.Expr] | None = None,
     ) -> OpSpec:
         """Build an ``OpSpec``, deriving the core mapping from the given space.
 
@@ -1219,13 +1107,23 @@ class SpyreEmitter:
         hard-errors if it is missing, and codegen "serializes this mapping but
         does not choose or reconstruct it".
 
-        ``output``/``output_symbols`` record which buffer this op writes, so a
-        later ``store`` can redirect it (plan 2).
+        This used to take ``output``/``output_symbols`` and record them in
+        ``_producers``/``_output_symbols``, so a later store could find the spec
+        to rewrite. Both dicts are gone with the rewrite: the destination is now
+        bound before emission, so an op's output buffer is simply one of its
+        ``args``.
+
+        Dropping them also closes a latent hazard they carried. Both were keyed
+        on ``id(output)`` and **neither was ever pruned** -- ``redirect_output``
+        popped the dead operand from ``self.operands`` but left these entries
+        behind, and nothing held a reference to the ``Operand`` that keyed them.
+        A collected operand's address could therefore be reused by a later one,
+        which would inherit a stale producing spec and a stale symbol list.
         """
         from torch_spyre._inductor.core_mapping import derive_operation_mapping
         from torch_spyre._inductor.op_spec import OpSpec
 
-        spec = OpSpec(
+        return OpSpec(
             op=op,
             is_reduction=is_reduction,
             iteration_space=iteration_space,
@@ -1237,8 +1135,3 @@ class SpyreEmitter:
                 tiled_symbol_trip_counts if tiled_symbol_trip_counts is not None else {}
             ),
         )
-        if output is not None:
-            assert output_symbols is not None
-            self._producers[id(output)] = (spec, len(args) - 1)
-            self._output_symbols[id(output)] = list(output_symbols)
-        return spec

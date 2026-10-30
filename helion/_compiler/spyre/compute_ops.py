@@ -198,9 +198,7 @@ def _emit_pointwise(
     if carry is not None and carry.sizes == sizes:
         out = carry
     else:
-        out = emitter.add_intermediate(
-            node.name, sizes, val.dtype, stick_dim, residency="lx"
-        )
+        out = _bound_or_intermediate(emitter, node, sizes, val.dtype, stick_dim)
 
     iteration_space = _iteration_space(symbols, sizes, splits, stick_dim, val.dtype)
     args = [o.tensor_arg(symbols, is_input=True) for o in inputs]
@@ -212,11 +210,56 @@ def _emit_pointwise(
             is_reduction=False,
             iteration_space=iteration_space,
             args=args,
-            output=out,
-            output_symbols=symbols,
         )
     )
     return out
+
+
+def _bound_or_intermediate(
+    emitter: SpyreEmitter,
+    node: Node,
+    sizes: list[int],
+    dtype: torch.dtype,
+    stick_dim: int,
+) -> Operand:
+    """This node's output buffer: the bound destination, or a fresh intermediate.
+
+    The whole point of the destination-binding graph pass. When the pass has
+    annotated this node, the output operand **is** the kernel's output buffer,
+    so the op writes its destination directly and the store has nothing left to
+    patch -- emission becomes append-only for this value.
+
+    Two annotated cases:
+
+    * **stick axes agree** -- bind straight to the destination.
+    * **stick axes disagree** -- the destination cannot be written directly,
+      because a ``ReStickifyOpHBM`` must read HBM. The *decision* is still made
+      early: give the value ``hbm_pool`` residency now, so the closing relayout
+      reads it where it lies. That is what retires ``restage_to_pool``, which
+      exists only because this was discovered too late, with the value already
+      in ``lx`` and its producing spec needing a rewrite.
+
+    Unannotated, or a shape the destination does not match, declines to the
+    existing ``lx`` intermediate and the store's rewrite path.
+    """
+    from .graph_passes import BINDING
+    from .graph_passes import bound_destination
+
+    bound = bound_destination(node, sizes, stick_dim, dtype)
+    if bound is None:
+        BINDING["fallback"] += 1
+        return emitter.add_intermediate(
+            node.name, sizes, dtype, stick_dim, residency="lx"
+        )
+    if not bound.relayout:
+        BINDING["bound"] += 1
+        emitter.bind(node.name, bound.operand)
+        return bound.operand
+
+    BINDING["relayout"] += 1
+    return emitter.add_intermediate(
+        node.name, sizes, dtype, stick_dim, residency="hbm_pool"
+    )
 
 
 def _carried_input(ctx: LoweringContext, node: Node) -> Operand | None:
@@ -312,9 +355,7 @@ def _emit_reduction(
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     out_sizes = [1 if d == axis else extent for d, extent in enumerate(sizes)]
-    out = emitter.add_intermediate(
-        node.name, out_sizes, val.dtype, axis, residency="lx"
-    )
+    out = _bound_or_intermediate(emitter, node, out_sizes, val.dtype, axis)
 
     # The reduced dim must not be split across cores: each core would produce a
     # partial with no combine step to merge them. The references keep it at
@@ -358,8 +399,6 @@ def _emit_reduction(
             args=args,
             tiled_symbols=tiled_symbols,
             tiled_symbol_trip_counts=trip_counts,
-            output=out,
-            output_symbols=symbols,
         )
     )
     return out
@@ -694,8 +733,6 @@ def _matmul_op_spec(
         args=[x_arg, y_arg, out_arg],
         tiled_symbols=tiled_symbols,
         tiled_symbol_trip_counts=trip_counts,
-        output=out,
-        output_symbols=[c0, c1],
     )
 
 
@@ -760,8 +797,8 @@ def _emit_matmul(
     x, y = _reconcile_matmul_stick_axes(emitter, shape, x=x, y=y)
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
-    out = emitter.add_intermediate(
-        node.name, [shape.m, shape.n], val.dtype, 1, residency="lx"
+    out = _bound_or_intermediate(
+        emitter, node, [shape.m, shape.n], val.dtype, _MATMUL_STICK_DIM["out"]
     )
 
     emitter.emit(_matmul_op_spec(emitter, op, x=x, y=y, out=out, shape=shape))
@@ -929,8 +966,6 @@ def _emit_addmm(backend: SpyreBackend, ctx: LoweringContext, node: Node) -> Oper
             ],
             tiled_symbols=tiled_symbols,
             tiled_symbol_trip_counts=trip_counts,
-            output=acc,
-            output_symbols=[c0, c1],
         )
     )
     return acc
