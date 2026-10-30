@@ -371,6 +371,27 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
+    def test_layernorm_rows(self):
+        # The second launch of ``matmul_layernorm_unfused``.
+        args = (
+            torch.randn([64, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+        )
+        check_example(
+            "matmul_layernorm",
+            args,
+            torch.nn.functional.layer_norm(
+                args[0].float(),
+                normalized_shape=(256,),
+                weight=args[1].float(),
+                bias=args[2].float(),
+            ).to(torch.float16),
+            fn_name="layernorm_rows",
+            block_sizes=[16],
+            static_shapes=True,
+        )
+
     @onlyBackends(["pallas", "cute", "triton"])
     def test_matmul_layernorm_half_dtype_multi_k_tile(self):
         """Guards K-loop accumulator precision when inputs are half-precision.
@@ -1875,6 +1896,31 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="grouped_gemm_jagged",
+        )
+
+    def test_grouped_gemm_shared_weight(self):
+        # The shared-weight formulation: one tile space over the packed rows,
+        # with ragged groups whose packed total (100 rows) ends in a partial
+        # tile.
+        torch.manual_seed(0)
+        K, N = 64, 64
+        dtype = torch.bfloat16
+        group_A = [
+            torch.randn(rows, K, device=DEVICE, dtype=dtype).contiguous()
+            for rows in (17, 50, 33)
+        ]
+        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        starts = [0]
+        for a in group_A:
+            starts.append(starts[-1] + int(a.size(0)))
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+        A_packed = torch.cat(group_A, dim=0).contiguous()
+        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
+        check_example(
+            "grouped_gemm",
+            (A_packed, B_shared, group_offsets),
+            expected,
+            fn_name="grouped_gemm_shared_weight",
         )
 
     @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
