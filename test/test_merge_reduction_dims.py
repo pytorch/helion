@@ -4,6 +4,7 @@ import copy
 from itertools import starmap
 import operator
 import pickle
+import re
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -13,6 +14,9 @@ import sympy
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+from test.test_reductions import _reduce_multi_dim_tile
+from test.test_triton_scalar_codegen import cpu_codegen as cpu_codegen
 
 from helion._compiler.active_blocks import unused_block_ids
 from helion._compiler.aten_lowering import resolve_reduction_sizes
@@ -26,6 +30,21 @@ from helion._compiler.variable_origin import BlockSizeOrigin
 from helion.language._tracing_ops import _get_symnode
 from helion.language._tracing_ops import _host_tensor
 from helion.language.memory_ops import store
+
+
+def test_multi_dim_fp16_reduction_codegen_casts_before_sum(cpu_codegen) -> None:
+    for transpose in (False, True):
+        x = torch.full((6, 3, 257), 1 + 2**-11)
+        if transpose:
+            x = x.transpose(1, 2).contiguous().transpose(1, 2)
+        bound = _reduce_multi_dim_tile._bind_isolated((x, "sum_fp16"))
+        config = bound.config_spec.default_config()
+        config["block_sizes"][0] = 2
+        code = bound.to_code(config)
+        device_code = code.split("def _reduce_multi_dim_tile(", 1)[0]
+        input_cast = re.search(r"tl\.cast\(\w+, tl\.float16\)", device_code)
+        assert input_cast is not None
+        assert input_cast.start() < device_code.index("tl.sum(")
 
 
 def test_reduction_metadata_survives_copy_and_pickle() -> None:
