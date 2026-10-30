@@ -16,6 +16,7 @@ import warnings
 
 import sympy
 import torch
+from torch import SymInt
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
@@ -423,6 +424,48 @@ def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer
     if (backed_var_to_val := getattr(shape_env, "backed_var_to_val", None)) is not None:
         return typing.cast("dict[sympy.Symbol, sympy.Integer]", backed_var_to_val)
     return shape_env.var_to_val  # pyrefly: ignore [deprecated]
+
+
+# Legacy ShapeEnv unifier retained for Helion.
+def _constrain_unify(shape_env: ShapeEnv, a: SymInt, b: SymInt) -> None:
+    """
+    Given two SymInts, constrain them so that they must be equal.  NB:
+    this will not work with SymInts that represent nontrivial expressions
+    (yet!)
+    """
+    # TODO: this does not install a deferred runtime assert yet
+
+    # TODO: Maybe dedupe this with _maybe_guard_rel?
+    # Update Feb 2024: this is extra important to do, this doesn't handle
+    # unbacked replacements properly nor does it generate deferred runtime
+    # asserts
+    if not isinstance(a, SymInt):
+        if not isinstance(b, SymInt):
+            if a != b:
+                raise AssertionError(f"Expected {a} == {b}")
+        else:
+            if not isinstance(b.node.expr, sympy.Symbol):
+                raise AssertionError("constraining non-Symbols NYI")
+            if b.node.shape_env is not shape_env:
+                raise AssertionError("b.node.shape_env must be shape_env")
+            shape_env.replacements[b.node.expr] = sympy.Integer(a)
+    else:
+        # TODO: Actually, we can support this as long as one of them is a symbol.
+        # NB: We can't actually do "unification" as our operators are not
+        # injective
+        if not isinstance(a.node.expr, sympy.Symbol):
+            raise AssertionError("constraining non-Symbols NYI")
+        if a.node.shape_env is not shape_env:
+            raise AssertionError("a.node.shape_env must be shape_env")
+        if not isinstance(b, SymInt):
+            shape_env.replacements[a.node.expr] = sympy.Integer(b)
+        else:
+            if a.node.shape_env is not b.node.shape_env:
+                raise AssertionError("a.node.shape_env must be b.node.shape_env")
+            if not isinstance(b.node.expr, sympy.Symbol):
+                raise AssertionError("constraining non-Symbols NYI")
+            new_var = shape_env._find(a.node.expr)
+            shape_env.replacements[b.node.expr] = new_var
 
 
 class CompileEnvironment:
@@ -1484,7 +1527,7 @@ class CompileEnvironment:
             if isinstance(source.value, torch.SymInt):
                 source_expr = _symint_expr(source.value)
                 if isinstance(source_expr, sympy.Symbol):
-                    self.shape_env._constrain_unify(source.value, info.var)
+                    _constrain_unify(self.shape_env, source.value, info.var)
                     # Match the block var's hint to the size it is now unified
                     # with, so both agree once the shared range is narrowed.
                     shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
