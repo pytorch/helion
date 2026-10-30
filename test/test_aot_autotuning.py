@@ -192,7 +192,7 @@ def _heuristic_for_older_gpu(
     )
     with (
         patch.dict(os.environ, {"HELION_HEURISTIC_DIR": str(tmp_path)}),
-        patch.object(TritonBackend, "_fitted_kernels", weakref.WeakSet()),
+        patch.object(TritonBackend, "_fitted_kernels", weakref.WeakSet(), create=True),
     ):
         AOTAutotuneCache.clear_caches()
         try:
