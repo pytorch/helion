@@ -934,6 +934,7 @@ def _make_vllm_linear(
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(scale.clone(), requires_grad=False)
+    layer.input_size_per_partition = 2 * weight.shape[1]
     layer.output_size_per_partition = output_size
     layer.input_global_scale_inv = torch.nn.Parameter(
         torch.tensor(input_scale, device="cuda", dtype=torch.float32),
